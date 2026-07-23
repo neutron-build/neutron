@@ -1600,6 +1600,22 @@ impl Executor {
     /// full materializing scan for RECOVERED tables — at 5M rows that scan
     /// tripped the query-memory ceiling and a plain `SELECT COUNT(*)` errored
     /// after reopen while working before it.
+    /// True when some table has a FOREIGN KEY referencing `table` — used by the
+    /// point-DELETE fast path to decline (the full path enforces referential
+    /// integrity). Best-effort: if the sync catalog snapshot is unavailable,
+    /// returns true so the safe full path runs.
+    fn table_is_fk_referenced(&self, table: &str) -> bool {
+        let Some(tables) = self.catalog.list_tables_sync() else {
+            return true;
+        };
+        tables.iter().any(|t| {
+            t.constraints.iter().any(|c| {
+                matches!(c, crate::catalog::TableConstraint::ForeignKey { ref_table, .. }
+                    if ref_table.eq_ignore_ascii_case(table))
+            })
+        })
+    }
+
     pub fn warm_table_caches_sync(&self) {
         let Some(tables) = self.catalog.list_tables_sync() else {
             return;
@@ -3656,6 +3672,27 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // The fast path writes new column values WITHOUT constraint
+                // enforcement. Decline (fall back to the full UPDATE path,
+                // which enforces) whenever an assigned column participates in a
+                // PRIMARY KEY / UNIQUE / FOREIGN KEY, or the table has any CHECK
+                // constraint — otherwise UPDATE silently bypassed CHECK and PK
+                // uniqueness (a duplicate PK could be produced by UPDATE).
+                {
+                    let assigned: std::collections::HashSet<&str> =
+                        assignments.iter().map(|(c, _)| c.as_str()).collect();
+                    let touches_keyed = table_def.constraints.iter().any(|c| match c {
+                        crate::catalog::TableConstraint::Check { .. } => true,
+                        crate::catalog::TableConstraint::PrimaryKey { columns, .. }
+                        | crate::catalog::TableConstraint::Unique { columns, .. }
+                        | crate::catalog::TableConstraint::ForeignKey { columns, .. } => {
+                            columns.iter().any(|col| assigned.contains(col.as_str()))
+                        }
+                    });
+                    if touches_keyed {
+                        return None;
+                    }
+                }
                 let pk_idx = table_def.column_index(where_col)?;
                 // Resolve all assignment column indexes upfront. If any column
                 // is not found, fall through to normal path. Each assignment
@@ -3725,6 +3762,14 @@ impl Executor {
                 where_val,
             } => {
                 if self.rls_active(table) {
+                    return None;
+                }
+                // The fast path deletes without enforcing referential
+                // integrity. Decline (fall back to the full DELETE, which runs
+                // enforce_fk_on_parent_mutation) whenever ANOTHER table has a
+                // FOREIGN KEY referencing this one — otherwise a fast-path
+                // DELETE could orphan child rows / bypass ON DELETE actions.
+                if self.table_is_fk_referenced(table) {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -4251,6 +4296,35 @@ impl Executor {
     // ========================================================================
 
     async fn execute_statement(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
+        // PostgreSQL transaction-error state: once a statement errors inside an
+        // explicit transaction, every subsequent statement is rejected until
+        // the transaction ends (ROLLBACK, or COMMIT which becomes a rollback).
+        let is_txn_end = matches!(
+            &stmt,
+            Statement::Commit { .. } | Statement::Rollback { .. }
+        );
+        {
+            let session = self.current_session();
+            let tx = session.txn_state.read().await;
+            if tx.active && tx.aborted && !is_txn_end {
+                return Err(ExecError::Runtime(
+                    "current transaction is aborted, commands ignored until end of transaction block"
+                        .into(),
+                ));
+            }
+        }
+        let result = self.execute_statement_inner(stmt).await;
+        if result.is_err() {
+            let session = self.current_session();
+            let mut tx = session.txn_state.write().await;
+            if tx.active {
+                tx.aborted = true;
+            }
+        }
+        result
+    }
+
+    async fn execute_statement_inner(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
         self.recompute_session_context(&self.current_session());
         // Track whether this is a DDL statement that modifies the catalog or metadata.
         let is_ddl = matches!(

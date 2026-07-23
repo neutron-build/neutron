@@ -167,6 +167,11 @@ pub(super) struct TxnState {
     /// COMMIT or ROLLBACK.  Vector/encrypted indexes are shared across sessions,
     /// so an aborted transaction must repair them from committed base rows too.
     pub derived_dirty_tables: HashSet<String>,
+    /// PostgreSQL transaction-error state: once a statement errors inside an
+    /// explicit transaction, the whole transaction is aborted — every later
+    /// statement is rejected until ROLLBACK (or COMMIT, which becomes a
+    /// rollback). Reset at BEGIN.
+    pub aborted: bool,
 }
 
 impl TxnState {
@@ -182,6 +187,7 @@ impl TxnState {
             policy_dirty: false,
             gin_dirty: false,
             derived_dirty_tables: HashSet::new(),
+            aborted: false,
         }
     }
 }

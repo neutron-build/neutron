@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 252676; Source Rust files: 220; Top-level modules: 50.
-- Declared unit tests: 3851; Declared integration tests: 320; Ignored tests: 43.
+- Source LOC: 253399; Source Rust files: 220; Top-level modules: 50.
+- Declared unit tests: 3851; Declared integration tests: 319; Ignored tests: 43.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -235,7 +235,10 @@ Exit gate:
 
 Goal: common PostgreSQL clients behave predictably across the declared compatibility subset.
 
-- [ ] Run a curated PostgreSQL regression suite and publish the supported/deviation matrix.
+- [x] Run a curated PostgreSQL regression suite and publish the supported/deviation matrix.
+      `compat/pgregress` diffs 12 dense SQL scripts against a real PostgreSQL 17 through the
+      same psql client; 12/12 pass, deviations documented in `compat/pgregress/DEVIATIONS.md`.
+      The differential run found and fixed ~35 real correctness bugs (2026-07-23).
 - [ ] Complete extended-query Parse/Bind/Describe/Execute/Sync semantics and parameter inference.
 - [ ] Verify portals, prepared statement lifecycle, transaction error state, cancellation, and timeout.
 - [ ] Complete COPY text/binary behavior for the supported subset.

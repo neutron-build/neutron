@@ -260,6 +260,11 @@ impl Executor {
         // GROUP BY
         let has_group_by = if let ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
             if !exprs.is_empty() {
+                // Reject ungrouped columns / nested aggregates here too — the
+                // plan path (HashAggregate) does not go through
+                // execute_aggregate, so its validator alone would miss grouped
+                // queries.
+                super::aggregate::validate_grouped_projection(&select.projection, exprs)?;
                 let input_rows = plan.estimated_rows();
                 let group_keys: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
                 let distinct_groups = (input_rows / 10).max(1);
@@ -3928,13 +3933,13 @@ impl Executor {
                 }
                 let val_str = val.to_string();
                 let pat_str = pat.to_string();
-                let esc = escape_char.as_ref().and_then(|v| {
-                    if let ast::Value::SingleQuotedString(s) = v {
-                        s.chars().next()
-                    } else {
-                        None
-                    }
-                });
+                // PostgreSQL's DEFAULT LIKE escape is backslash even with no
+                // explicit ESCAPE clause, so `LIKE 'a\\%b'` matches literal
+                // "a%b". Only `ESCAPE ''` disables escaping.
+                let esc = match escape_char.as_ref() {
+                    Some(ast::Value::SingleQuotedString(s)) => s.chars().next(),
+                    _ => Some('\\'),
+                };
                 let matched = Self::sql_like_match(&val_str, &pat_str, esc, false);
                 Ok(Value::Bool(if *negated { !matched } else { matched }))
             }
@@ -3952,13 +3957,13 @@ impl Executor {
                 }
                 let val_str = val.to_string();
                 let pat_str = pat.to_string();
-                let esc = escape_char.as_ref().and_then(|v| {
-                    if let ast::Value::SingleQuotedString(s) = v {
-                        s.chars().next()
-                    } else {
-                        None
-                    }
-                });
+                // PostgreSQL's DEFAULT LIKE escape is backslash even with no
+                // explicit ESCAPE clause, so `LIKE 'a\\%b'` matches literal
+                // "a%b". Only `ESCAPE ''` disables escaping.
+                let esc = match escape_char.as_ref() {
+                    Some(ast::Value::SingleQuotedString(s)) => s.chars().next(),
+                    _ => Some('\\'),
+                };
                 let matched = Self::sql_like_match(&val_str, &pat_str, esc, true);
                 Ok(Value::Bool(if *negated { !matched } else { matched }))
             }
@@ -4007,18 +4012,15 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_expr_plan(expr, row, meta)?;
-                if matches!(val, Value::Null) {
-                    return Ok(Value::Null);
-                }
-                let mut found = false;
+                let mut items = Vec::with_capacity(list.len());
                 for item in list {
-                    let item_val = self.eval_expr_plan(item, row, meta)?;
-                    if Self::plan_values_cmp(&val, &item_val) == std::cmp::Ordering::Equal {
-                        found = true;
-                        break;
-                    }
+                    items.push(self.eval_expr_plan(item, row, meta)?);
                 }
-                Ok(Value::Bool(if *negated { !found } else { found }))
+                // Full three-valued IN/NOT IN (a NULL in the list makes an
+                // otherwise-false result NULL). The old plan-path loop ignored
+                // NULLs entirely, so `x NOT IN (10, NULL)` wrongly returned
+                // true for non-matching x.
+                Ok(Self::in_three_valued(&val, &items, *negated))
             }
             _ => Ok(Value::Null),
         }
@@ -4683,7 +4685,27 @@ impl Executor {
                     let right_result = self.execute_set_expr(*right, cte_tables, &[]).await?;
 
                     let (left_cols, left_rows) = self.select_result_to_rows(left_result)?;
-                    let (_right_cols, right_rows) = self.select_result_to_rows(right_result)?;
+                    let (right_cols, right_rows) = self.select_result_to_rows(right_result)?;
+
+                    // Column-count agreement is required (PostgreSQL: "each
+                    // UNION/INTERSECT/EXCEPT query must have the same number of
+                    // columns"). Without this check, mismatched branches
+                    // produced malformed DataRows and a wire-protocol error
+                    // ("unexpected field count in D message") instead of a
+                    // clean SQL error.
+                    if left_cols.len() != right_cols.len() {
+                        return Err(ExecError::Unsupported(format!(
+                            "each {} query must have the same number of columns ({} vs {})",
+                            match op {
+                                ast::SetOperator::Union => "UNION",
+                                ast::SetOperator::Intersect => "INTERSECT",
+                                ast::SetOperator::Except => "EXCEPT",
+                                _ => "set-operation",
+                            },
+                            left_cols.len(),
+                            right_cols.len()
+                        )));
+                    }
 
                     let all = matches!(
                         set_quantifier,
@@ -6824,6 +6846,23 @@ impl Executor {
         cte_tables: &CteTableMap,
         order_by_cols: &[String],
     ) -> Result<SelectResult, ExecError> {
+        // Window functions are not allowed in WHERE / HAVING (PostgreSQL):
+        // they are computed after the row set is chosen, so they cannot filter
+        // it. Reject rather than silently mis-evaluate.
+        if let Some(w) = &select.selection
+            && super::helpers::contains_window_function(w)
+        {
+            return Err(ExecError::Unsupported(
+                "window functions are not allowed in WHERE".into(),
+            ));
+        }
+        if let Some(h) = &select.having
+            && super::helpers::contains_window_function(h)
+        {
+            return Err(ExecError::Unsupported(
+                "window functions are not allowed in HAVING".into(),
+            ));
+        }
         // Expression-only query: SELECT 1, SELECT 'hello', SELECT 1+1
         if select.from.is_empty() {
             return Ok(SelectResult::Projected(
@@ -8036,6 +8075,19 @@ impl Executor {
         col_meta: Option<&[ColMeta]>,
         projection: Option<&[SelectItem]>,
     ) -> Result<usize, ExecError> {
+        // A non-column ORDER BY expression that equals an OUTPUT column by its
+        // canonical text — e.g. `ORDER BY upper(dept)` over
+        // `SELECT upper(dept), count(*) ... GROUP BY upper(dept)`. The output
+        // column is named after the expression, but the underlying `dept`
+        // column is gone post-aggregation, so per-row re-evaluation fails and
+        // the sort silently no-ops. Match by canonical text instead.
+        if !matches!(expr, Expr::Identifier(_) | Expr::Value(_)) {
+            let canon = |s: &str| s.replace(char::is_whitespace, "").to_lowercase();
+            let want = canon(&expr.to_string());
+            if let Some(pos) = columns.iter().position(|(name, _)| canon(name) == want) {
+                return Ok(pos);
+            }
+        }
         match expr {
             Expr::Identifier(ident) => {
                 // First, try direct column name match

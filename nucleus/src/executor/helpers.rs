@@ -416,7 +416,16 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b)),
         (Value::Int32(a), Value::Int64(b)) => Some((*a as i64).cmp(b)),
         (Value::Int64(a), Value::Int32(b)) => Some(a.cmp(&(*b as i64))),
-        (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b),
+        // PostgreSQL orders NaN as GREATER than every other float and equal to
+        // itself (unlike IEEE): `'NaN' = 'NaN'` is true, `'NaN' > 'Infinity'`
+        // is true. `partial_cmp` alone returns None for any NaN → `= / >`
+        // wrongly false.
+        (Value::Float64(a), Value::Float64(b)) => Some(match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => a.partial_cmp(b)?,
+        }),
         // Cross-type: int ↔ float promotion
         (Value::Int32(a), Value::Float64(b)) => (*a as f64).partial_cmp(b),
         (Value::Float64(a), Value::Int32(b)) => a.partial_cmp(&(*b as f64)),
@@ -430,6 +439,15 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
             Some(sa.cmp(&sb))
         }
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
+        // Date ↔ Timestamp: a date compares as midnight of that day (PG:
+        // `TIMESTAMP '2024-01-01 00:00:00' = DATE '2024-01-01'` is true). Both
+        // use the 2000-01-01 epoch; a date is days, a timestamp is microseconds.
+        (Value::Date(d), Value::Timestamp(t)) | (Value::Date(d), Value::TimestampTz(t)) => {
+            Some((*d as i64 * 86_400_000_000).cmp(t))
+        }
+        (Value::Timestamp(t), Value::Date(d)) | (Value::TimestampTz(t), Value::Date(d)) => {
+            Some(t.cmp(&(*d as i64 * 86_400_000_000)))
+        }
         (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
         (Value::TimestampTz(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
         (Value::Timestamp(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
@@ -442,6 +460,29 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
         (Value::Null, _) => Some(std::cmp::Ordering::Less),
         (_, Value::Null) => Some(std::cmp::Ordering::Greater),
+        // Cross-type: NUMERIC ↔ integer / float. `2.0::numeric = 2::int` must
+        // be Equal; without these arms it fell through to `None` (predicate
+        // false), a silent wrong result for any mixed numeric/int comparison.
+        (Value::Numeric(n), Value::Int32(i)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| d.cmp(&rust_decimal::Decimal::from(*i))),
+        (Value::Numeric(n), Value::Int64(i)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| d.cmp(&rust_decimal::Decimal::from(*i))),
+        (Value::Int32(i), Value::Numeric(n)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| rust_decimal::Decimal::from(*i).cmp(&d)),
+        (Value::Int64(i), Value::Numeric(n)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| rust_decimal::Decimal::from(*i).cmp(&d)),
+        (Value::Numeric(n), Value::Float64(f)) => crate::types::parse_numeric(n)
+            .ok()
+            .and_then(|d| d.to_string().parse::<f64>().ok())
+            .and_then(|nf| nf.partial_cmp(f)),
+        (Value::Float64(f), Value::Numeric(n)) => crate::types::parse_numeric(n)
+            .ok()
+            .and_then(|d| d.to_string().parse::<f64>().ok())
+            .and_then(|nf| f.partial_cmp(&nf)),
         // Cross-type: text ↔ numeric / bool / date / timestamp coercion.
         //
         // Required because pgx's `QueryExecModeSimpleProtocol` interpolates
@@ -1960,12 +2001,23 @@ pub(super) fn compute_window_frame_bounds(
     frame: Option<&ast::WindowFrame>,
     current_row: usize,
     partition_size: usize,
+    has_order_by: bool,
 ) -> Result<(usize, usize), ExecError> {
     let frame = match frame {
         Some(f) => f,
         None => {
-            // Default: UNBOUNDED PRECEDING to CURRENT ROW
-            return Ok((0, current_row));
+            // SQL default frame depends on ORDER BY:
+            //  - with ORDER BY: RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+            //    (a running frame),
+            //  - WITHOUT ORDER BY: the WHOLE partition.
+            // Treating the no-ORDER-BY case as running made
+            // `SUM(v) OVER (PARTITION BY g)` and `COUNT(*) OVER ()` return
+            // running totals instead of the partition total.
+            if has_order_by {
+                return Ok((0, current_row));
+            } else {
+                return Ok((0, partition_size.saturating_sub(1)));
+            }
         }
     };
 
@@ -2232,15 +2284,46 @@ pub(super) fn json_to_sparse_vec(val: &Value) -> Result<crate::sparse::SparseVec
 /// SQL LIKE pattern matching (supports % and _) using O(n*m) DP to prevent ReDoS.
 pub(super) fn like_match(text: &str, pattern: &str) -> bool {
     let t: Vec<char> = text.chars().collect();
-    let p: Vec<char> = pattern.chars().collect();
+    // Pre-tokenize the pattern honoring the default backslash escape: `\%`,
+    // `\_`, `\\` become literal characters (Wildcard::Literal), so
+    // `LIKE 'a\%b'` matches the literal string "a%b" (the raw DP treated `\`
+    // as an ordinary char and never matched).
+    enum Tok {
+        Percent,
+        Underscore,
+        Literal(char),
+    }
+    let pc: Vec<char> = pattern.chars().collect();
+    let mut p: Vec<Tok> = Vec::with_capacity(pc.len());
+    let mut i = 0;
+    while i < pc.len() {
+        match pc[i] {
+            '\\' if i + 1 < pc.len() => {
+                p.push(Tok::Literal(pc[i + 1]));
+                i += 2;
+            }
+            '%' => {
+                p.push(Tok::Percent);
+                i += 1;
+            }
+            '_' => {
+                p.push(Tok::Underscore);
+                i += 1;
+            }
+            c => {
+                p.push(Tok::Literal(c));
+                i += 1;
+            }
+        }
+    }
     let m = p.len();
 
     // dp[j] = true means pattern[0..j] matches text[0..i] (updated per row)
     let mut dp = vec![false; m + 1];
     dp[0] = true;
-    // Initialize: leading '%' chars match empty text
+    // Initialize: leading '%' toks match empty text
     for j in 0..m {
-        if p[j] == '%' {
+        if matches!(p[j], Tok::Percent) {
             dp[j + 1] = dp[j];
         } else {
             break;
@@ -2253,12 +2336,9 @@ pub(super) fn like_match(text: &str, pattern: &str) -> bool {
         for j in 0..m {
             let old = dp[j + 1]; // save dp_prev[j+1] before overwrite
             dp[j + 1] = match p[j] {
-                '%' => {
-                    // dp_prev[j+1] (skip char in text) || dp[j] (skip % in pattern)
-                    old || dp[j]
-                }
-                '_' => prev, // dp_prev[j]: one char matched
-                c => prev && tc == c,
+                Tok::Percent => old || dp[j],
+                Tok::Underscore => prev,
+                Tok::Literal(c) => prev && tc == c,
             };
             prev = old;
         }

@@ -63,6 +63,7 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.aborted = false;
 
         txn.active = true;
         self.metrics.open_transactions.inc();
@@ -81,6 +82,17 @@ impl Executor {
         if !txn.active {
             return Ok(ExecResult::Command {
                 tag: "WARNING: no transaction in progress".into(),
+                rows_affected: 0,
+            });
+        }
+
+        // COMMIT of an aborted transaction becomes a ROLLBACK (PostgreSQL): the
+        // transaction hit a statement error, so nothing may be committed.
+        if txn.aborted {
+            drop(txn);
+            self.rollback_transaction().await?;
+            return Ok(ExecResult::Command {
+                tag: "ROLLBACK".into(),
                 rows_affected: 0,
             });
         }

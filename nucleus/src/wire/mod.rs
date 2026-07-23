@@ -775,9 +775,10 @@ impl NucleusHandler {
                     for row in &rows {
                         let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
                         for (i, value) in row.iter().enumerate() {
+                            let fmt = schema.get(i).map_or(FieldFormat::Text, |f| f.format());
                             match col_types.get(i) {
-                                Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
-                                None => encode_value(&mut encoder, value)?,
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
+                                None => encode_value(&mut encoder, value, fmt)?,
                             }
                         }
                         encoded.push(encoder.finish()?);
@@ -790,9 +791,10 @@ impl NucleusHandler {
                     let data_row_stream = stream::iter(rows).map(move |row| {
                         let mut encoder = DataRowEncoder::new(Arc::clone(&schema_ref));
                         for (i, value) in row.iter().enumerate() {
+                            let fmt = schema_ref.get(i).map_or(FieldFormat::Text, |f| f.format());
                             match col_types_ref.get(i) {
-                                Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
-                                None => encode_value(&mut encoder, value)?,
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
+                                None => encode_value(&mut encoder, value, fmt)?,
                             }
                         }
                         encoder.finish()
@@ -875,9 +877,11 @@ impl NucleusHandler {
                                 let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
                                 let encoded = (|| {
                                     for (i, value) in row.iter().enumerate() {
+                                        let fmt =
+                                            schema.get(i).map_or(FieldFormat::Text, |f| f.format());
                                         match col_types.get(i) {
-                                            Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
-                                            None => encode_value(&mut encoder, value)?,
+                                            Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
+                                            None => encode_value(&mut encoder, value, fmt)?,
                                         }
                                     }
                                     encoder.finish()
@@ -3647,6 +3651,7 @@ fn encode_value_typed(
     encoder: &mut DataRowEncoder,
     value: &Value,
     target: &DataType,
+    fmt: FieldFormat,
 ) -> PgWireResult<()> {
     match (value, target) {
         (Value::Int32(n), DataType::Int64) => return encoder.encode_field(&Some(*n as i64)),
@@ -3659,19 +3664,45 @@ fn encode_value_typed(
         (Value::Int64(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
         _ => {}
     }
-    encode_value(encoder, value)
+    encode_value(encoder, value, fmt)
 }
 
-/// Encode a Nucleus Value into a pgwire DataRowEncoder field.
-fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()> {
+/// Encode a Nucleus Value into a pgwire DataRowEncoder field. `fmt` is the
+/// column's wire format (Text/Binary) — temporal values render differently in
+/// text (see below).
+fn encode_value(encoder: &mut DataRowEncoder, value: &Value, fmt: FieldFormat) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<&str>),
         Value::Bool(b) => encoder.encode_field(&Some(*b)),
         Value::Int32(n) => encoder.encode_field(&Some(*n)),
         Value::Int64(n) => encoder.encode_field(&Some(*n)),
+        // Non-finite floats: PostgreSQL's text wire form is
+        // "Infinity"/"-Infinity"/"NaN"; f64's ToSqlText emits "inf"/"NaN".
+        // Encode the PG spelling as text so clients (and psql) display it
+        // correctly under the float8 RowDescription.
+        Value::Float64(n) if !n.is_finite() => {
+            let s = if n.is_nan() {
+                "NaN"
+            } else if *n < 0.0 {
+                "-Infinity"
+            } else {
+                "Infinity"
+            };
+            encoder.encode_field(&Some(s))
+        }
         Value::Float64(n) => encoder.encode_field(&Some(*n)),
         Value::Text(s) => encoder.encode_field(&Some(s.as_str())),
         Value::Jsonb(v) => encoder.encode_field(&Some(v.to_string().as_str())),
+        // In TEXT format, temporal values render via Nucleus's Display, which
+        // matches PostgreSQL's text form — most importantly it OMITS a
+        // `.000000` fractional part when microseconds are zero (chrono's
+        // ToSqlText always writes it). Binary format still uses the native
+        // chrono impls below so binary clients decode correctly.
+        Value::Timestamp(_) | Value::TimestampTz(_) | Value::Date(_)
+            if matches!(fmt, FieldFormat::Text) =>
+        {
+            encoder.encode_field(&Some(value.to_string().as_str()))
+        }
         // Temporal/decimal/bytea values encode through their native
         // postgres-types impls so BINARY-format result columns carry real
         // binary payloads (a text string under a binary RowDescription made
