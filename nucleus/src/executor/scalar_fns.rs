@@ -100,10 +100,12 @@ impl Executor {
             }
             "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
                 require_args(fname, &args, 1)?;
+                // Character count, not byte count (PostgreSQL): length('héllo')
+                // is 5, not 6.
                 match &args[0] {
-                    Value::Text(s) => Ok(Value::Int32(s.len() as i32)),
+                    Value::Text(s) => Ok(Value::Int32(s.chars().count() as i32)),
                     Value::Null => Ok(Value::Null),
-                    _ => Ok(Value::Int32(args[0].to_string().len() as i32)),
+                    _ => Ok(Value::Int32(args[0].to_string().chars().count() as i32)),
                 }
             }
             "TRIM" => {
@@ -203,13 +205,28 @@ impl Executor {
                     _ => Err(ExecError::Unsupported("REPLACE requires text args".into())),
                 }
             }
-            "POSITION" | "STRPOS" => {
+            // POSITION(substr IN string) — sqlparser yields args [substr, string].
+            "POSITION" => {
                 require_args(fname, &args, 2)?;
                 match (&args[0], &args[1]) {
                     (Value::Text(substr), Value::Text(s)) => {
-                        let pos = s.find(substr.as_str()).map(|i| i + 1).unwrap_or(0);
-                        Ok(Value::Int32(pos as i32))
+                        let pos = char_index_of(s, substr);
+                        Ok(Value::Int32(pos))
                     }
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    _ => Ok(Value::Int32(0)),
+                }
+            }
+            // strpos(string, substr) — arguments in the OPPOSITE order to
+            // POSITION; sharing the binding returned 0 for every found substr.
+            "STRPOS" => {
+                require_args(fname, &args, 2)?;
+                match (&args[0], &args[1]) {
+                    (Value::Text(s), Value::Text(substr)) => {
+                        let pos = char_index_of(s, substr);
+                        Ok(Value::Int32(pos))
+                    }
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     _ => Ok(Value::Int32(0)),
                 }
             }
@@ -217,8 +234,15 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 match &args[0] {
                     Value::Text(s) => {
-                        let n = value_to_i64(&args[1])? as usize;
-                        Ok(Value::Text(s.chars().take(n).collect()))
+                        let n = value_to_i64(&args[1])?;
+                        let chars: Vec<char> = s.chars().collect();
+                        // Negative n: all but the last |n| characters (PG).
+                        let take = if n >= 0 {
+                            (n as usize).min(chars.len())
+                        } else {
+                            chars.len().saturating_sub((-n) as usize)
+                        };
+                        Ok(Value::Text(chars[..take].iter().collect()))
                     }
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("LEFT requires text".into())),
@@ -228,9 +252,14 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 match &args[0] {
                     Value::Text(s) => {
-                        let n = value_to_i64(&args[1])? as usize;
+                        let n = value_to_i64(&args[1])?;
                         let chars: Vec<char> = s.chars().collect();
-                        let start = chars.len().saturating_sub(n);
+                        // Negative n: all but the first |n| characters (PG).
+                        let start = if n >= 0 {
+                            chars.len().saturating_sub(n as usize)
+                        } else {
+                            ((-n) as usize).min(chars.len())
+                        };
                         Ok(Value::Text(chars[start..].iter().collect()))
                     }
                     Value::Null => Ok(Value::Null),
@@ -587,6 +616,19 @@ impl Executor {
                         let factor = 10f64.powi(decimals);
                         Ok(Value::Float64((n * factor).round() / factor))
                     }
+                    // NUMERIC round is EXACT and half-away-from-zero (PG),
+                    // supporting an optional scale. round(2.5)=3, round(-2.5)=-3.
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| {
+                            Value::Numeric(
+                                d.round_dp_with_strategy(
+                                    decimals.max(0) as u32,
+                                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                                )
+                                .to_string(),
+                            )
+                        })
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("ROUND requires numeric".into())),
@@ -596,6 +638,9 @@ impl Executor {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
                     Value::Float64(n) => Ok(Value::Float64(n.ceil())),
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| Value::Numeric(d.ceil().to_string()))
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("CEIL requires numeric".into())),
@@ -605,6 +650,9 @@ impl Executor {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
                     Value::Float64(n) => Ok(Value::Float64(n.floor())),
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| Value::Numeric(d.floor().to_string()))
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("FLOOR requires numeric".into())),
@@ -704,6 +752,13 @@ impl Executor {
                         let factor = 10f64.powi(decimals);
                         Ok(Value::Float64((n * factor).trunc() / factor))
                     }
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| {
+                            Value::Numeric(
+                                d.trunc_with_scale(decimals.max(0) as u32).to_string(),
+                            )
+                        })
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("TRUNC requires numeric".into())),
@@ -858,11 +913,13 @@ impl Executor {
                     Ok(args[0].clone())
                 }
             }
+            // GREATEST/LEAST IGNORE NULL arguments (PostgreSQL); only an
+            // all-NULL argument list yields NULL. Propagating NULL was wrong.
             "GREATEST" => {
                 let mut best: Option<Value> = None;
                 for arg in &args {
                     if matches!(arg, Value::Null) {
-                        return Ok(Value::Null);
+                        continue;
                     }
                     best = Some(match best {
                         None => arg.clone(),
@@ -881,7 +938,7 @@ impl Executor {
                 let mut best: Option<Value> = None;
                 for arg in &args {
                     if matches!(arg, Value::Null) {
-                        return Ok(Value::Null);
+                        continue;
                     }
                     best = Some(match best {
                         None => arg.clone(),
@@ -1789,9 +1846,11 @@ impl Executor {
                     Value::Null => return Ok(Value::Null),
                     other => other.to_string(),
                 };
-                // Use FNV-1a hash (fast, non-crypto) formatted as hex
-                let hash = crate::blob::content_hash(text.as_bytes());
-                Ok(Value::Text(format!("{hash:016x}")))
+                // Real MD5 (PostgreSQL's md5() is the cryptographic digest as
+                // 32 lowercase hex chars). The prior FNV-1a stand-in produced
+                // a wrong 16-char value that no client would accept.
+                let digest = md5::compute(text.as_bytes());
+                Ok(Value::Text(format!("{digest:x}")))
             }
             "ENCODE" => {
                 require_args(fname, &args, 2)?;
@@ -5800,4 +5859,17 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         _ => return None,
     };
     Some(dt)
+}
+
+/// 1-based character index of `needle` in `haystack`, or 0 if absent — the
+/// POSITION/strpos return contract. Byte `find` then converted to a char
+/// index so multibyte text reports character positions like PostgreSQL.
+fn char_index_of(haystack: &str, needle: &str) -> i32 {
+    if needle.is_empty() {
+        return 1;
+    }
+    match haystack.find(needle) {
+        Some(byte_idx) => (haystack[..byte_idx].chars().count() + 1) as i32,
+        None => 0,
+    }
 }

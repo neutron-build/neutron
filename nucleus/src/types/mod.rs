@@ -16,6 +16,13 @@ use rust_decimal::Decimal;
 /// overflows the 96-bit coefficient is rejected by both.
 pub(crate) fn parse_numeric(value: &str) -> Result<Decimal, String> {
     let trimmed = value.trim();
+    // Accept scientific notation ('1e3', '1.5E-2') the way PostgreSQL does —
+    // `from_str_exact` rejects it, so fall back to the scientific parser.
+    if trimmed.contains(['e', 'E'])
+        && let Ok(d) = Decimal::from_scientific(trimmed)
+    {
+        return Ok(d);
+    }
     Decimal::from_str_exact(trimmed).map_err(|error| match error {
         rust_decimal::Error::Underflow => format!(
             "numeric value '{trimmed}' exceeds NUMERIC precision ceiling: Nucleus stores \
@@ -101,6 +108,11 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int32(n) => write!(f, "{n}"),
             Value::Int64(n) => write!(f, "{n}"),
+            // PostgreSQL spells float specials "Infinity"/"-Infinity"/"NaN";
+            // Rust's default is "inf"/"-inf"/"NaN".
+            Value::Float64(n) if n.is_infinite() => {
+                write!(f, "{}Infinity", if *n < 0.0 { "-" } else { "" })
+            }
             Value::Float64(n) => write!(f, "{n}"),
             Value::Text(s) => write!(f, "{s}"),
             Value::Jsonb(v) => write!(f, "{v}"),
@@ -821,9 +833,41 @@ impl Ord for Value {
                     _ => a.partial_cmp(&bf).unwrap_or(Ordering::Equal),
                 }
             }
+            // Numeric vs integer: exact decimal comparison (2.0::numeric = 2
+            // must be Equal). Falling through to type_rank made every
+            // numeric/int comparison unequal — a silent wrong result in any
+            // WHERE/JOIN/ORDER mixing the two.
+            (Value::Numeric(a), Value::Int32(b)) => cmp_numeric_int(a, i64::from(*b)),
+            (Value::Numeric(a), Value::Int64(b)) => cmp_numeric_int(a, *b),
+            (Value::Int32(a), Value::Numeric(b)) => {
+                cmp_numeric_int(b, i64::from(*a)).reverse()
+            }
+            (Value::Int64(a), Value::Numeric(b)) => cmp_numeric_int(b, *a).reverse(),
+            // Numeric vs float: compare in f64 (float is already inexact, so
+            // this matches PostgreSQL's numeric→float8 promotion for mixed
+            // comparisons).
+            (Value::Numeric(a), Value::Float64(b)) => parse_numeric(a)
+                .ok()
+                .and_then(|d| d.to_string().parse::<f64>().ok())
+                .and_then(|af| af.partial_cmp(b))
+                .unwrap_or(Ordering::Equal),
+            (Value::Float64(a), Value::Numeric(b)) => parse_numeric(b)
+                .ok()
+                .and_then(|d| d.to_string().parse::<f64>().ok())
+                .and_then(|bf| a.partial_cmp(&bf))
+                .unwrap_or(Ordering::Equal),
             // Fallback: compare by type rank for truly incompatible types
             _ => self.type_rank().cmp(&other.type_rank()),
         }
+    }
+}
+
+/// Compare a NUMERIC (decimal string) against an integer exactly.
+fn cmp_numeric_int(num: &str, int: i64) -> std::cmp::Ordering {
+    match parse_numeric(num) {
+        Ok(d) => d.cmp(&rust_decimal::Decimal::from(int)),
+        // Undecodable numeric: fall back to string compare (deterministic).
+        _ => num.cmp(&int.to_string()),
     }
 }
 

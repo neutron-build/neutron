@@ -16,7 +16,11 @@ use super::helpers::*;
 use super::session::sync_block_on;
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
-use crate::types::{DataType, Row, Value};
+use crate::types::{DataType, Row, Value, parse_numeric};
+
+/// Seconds between the Unix epoch (1970-01-01) and Nucleus's internal temporal
+/// epoch (2000-01-01). EXTRACT(EPOCH ...) reports seconds since 1970 (PG).
+const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
 
 // ---------------------------------------------------------------------------
 // Lazy Materialization — Phase 2C
@@ -229,6 +233,11 @@ impl Executor {
             | Expr::Array(_)
             | Expr::AnyOp { .. }
             | Expr::AllOp { .. }
+            // CASE in constant context (`SELECT CASE ... END` with no FROM) —
+            // was missing from the delegation list and hit the catch-all error.
+            | Expr::Case { .. }
+            | Expr::Like { .. }
+            | Expr::ILike { .. }
             | Expr::CompoundFieldAccess { .. } => {
                 let empty_row: Row = Vec::new();
                 let empty_meta: Vec<ColMeta> = Vec::new();
@@ -236,9 +245,21 @@ impl Executor {
             }
             // Subqueries in constant context
             Expr::Subquery(subquery) => {
-                let sub_result = sync_block_on(self.execute_query(*subquery.clone()))?;
-                match sub_result {
+                self.check_subquery_depth()?;
+                let sub_result = sync_block_on(self.execute_query(*subquery.clone()));
+                self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+                match sub_result? {
                     ExecResult::Select { rows, .. } => {
+                        // Scalar subquery: 0 rows → NULL, 1 row → its value,
+                        // >1 row → error (PostgreSQL: "more than one row
+                        // returned by a subquery used as an expression").
+                        // Silently taking the first row was a wrong result.
+                        if rows.len() > 1 {
+                            return Err(ExecError::Runtime(
+                                "more than one row returned by a subquery used as an expression"
+                                    .into(),
+                            ));
+                        }
                         if rows.is_empty() || rows[0].is_empty() {
                             Ok(Value::Null)
                         } else {
@@ -429,6 +450,37 @@ impl Executor {
     ///
     /// This is what makes `WHERE x NOT IN (..)` correctly exclude NULL-involved
     /// rows instead of including them.
+    /// Values for the right operand of `x op ANY/ALL (...)`: a subquery's whole
+    /// first column (correlated refs substituted), an array value, or a
+    /// Postgres array-literal text.
+    fn any_all_operand(
+        &self,
+        right: &Expr,
+        row: &Row,
+        col_meta: &[ColMeta],
+    ) -> Result<Vec<Value>, ExecError> {
+        let inner = match right {
+            Expr::Nested(e) => e.as_ref(),
+            other => other,
+        };
+        if let Expr::Subquery(subquery) = inner {
+            self.check_subquery_depth()?;
+            let resolved = substitute_outer_refs_in_query(subquery, row, col_meta);
+            let sub_result = sync_block_on(self.execute_query(resolved));
+            self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+            return match sub_result? {
+                ExecResult::Select { rows, .. } => {
+                    Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect())
+                }
+                _ => Ok(Vec::new()),
+            };
+        }
+        let r = self.eval_row_expr(right, row, col_meta)?;
+        coerce_to_array(r).ok_or_else(|| {
+            ExecError::Unsupported("ANY/ALL requires an array or subquery".into())
+        })
+    }
+
     pub(super) fn in_three_valued(val: &Value, candidates: &[Value], negated: bool) -> Value {
         // Empty set is decisive regardless of `val` (including NULL): IN → FALSE,
         // NOT IN → TRUE. Must precede the NULL-val check below.
@@ -691,6 +743,14 @@ impl Executor {
                 ast::BinaryOperator::StringConcat => Ok(Value::Text(format!("{l}{r}"))),
                 _ => Err(ExecError::Unsupported(format!("op on text: {op}"))),
             },
+            // `||` with one text operand coerces the other to text (PostgreSQL:
+            // `'a' || 1` = 'a1'). NULL was already handled above (yields NULL).
+            (Value::Text(l), r) if matches!(op, ast::BinaryOperator::StringConcat) => {
+                Ok(Value::Text(format!("{l}{r}")))
+            }
+            (l, Value::Text(r)) if matches!(op, ast::BinaryOperator::StringConcat) => {
+                Ok(Value::Text(format!("{l}{r}")))
+            }
             _ => Err(ExecError::Unsupported(format!(
                 "type mismatch for {op}: {left:?} vs {right:?}"
             ))),
@@ -925,6 +985,17 @@ impl Executor {
                         .map(Value::Int64)
                         .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
+                    (ast::UnaryOperator::Minus, Value::Numeric(raw)) => Ok(Value::Numeric(
+                        parse_numeric(&raw)
+                            .map(|d| (-d).to_string())
+                            .unwrap_or_else(|_| {
+                                if let Some(stripped) = raw.strip_prefix('-') {
+                                    stripped.to_string()
+                                } else {
+                                    format!("-{raw}")
+                                }
+                            }),
+                    )),
                     (
                         ast::UnaryOperator::Minus,
                         Value::Interval {
@@ -1242,24 +1313,26 @@ impl Executor {
                             "year" => Ok(Value::Int32(y)),
                             "month" => Ok(Value::Int32(m as i32)),
                             "day" => Ok(Value::Int32(day as i32)),
-                            "dow" | "dayofweek" => {
-                                let jdn = d + 2451545;
-                                Ok(Value::Int32(jdn.rem_euclid(7)))
-                            }
+                            // PG DOW: Sunday=0..Saturday=6. 2000-01-01 (d=0) is
+                            // a Saturday, so DOW = (d + 6) mod 7 (the old
+                            // +2451545 offset was off by one).
+                            "dow" | "dayofweek" => Ok(Value::Int32((d + 6).rem_euclid(7))),
                             "doy" | "dayofyear" => {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
                                 Ok(Value::Int32(d - jan1 + 1))
                             }
-                            "epoch" => Ok(Value::Int64(d as i64 * 86400)),
+                            // PG epoch is seconds since 1970-01-01; Nucleus's
+                            // internal epoch is 2000-01-01 (offset 946684800s).
+                            "epoch" => Ok(Value::Int64(d as i64 * 86400 + PG_EPOCH_OFFSET_SECS)),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field_str}) from date"
                             ))),
                         }
                     }
-                    Value::Timestamp(ts) => {
-                        let total_secs = ts / 1_000_000;
-                        let days = (total_secs / 86400) as i32;
-                        let time_secs = total_secs % 86400;
+                    Value::Timestamp(ts) | Value::TimestampTz(ts) => {
+                        let total_secs = ts.div_euclid(1_000_000);
+                        let days = total_secs.div_euclid(86400) as i32;
+                        let time_secs = total_secs.rem_euclid(86400);
                         let (y, m, day) = crate::types::days_to_ymd(days);
                         match field_str.as_str() {
                             "year" => Ok(Value::Int32(y)),
@@ -1268,7 +1341,12 @@ impl Executor {
                             "hour" => Ok(Value::Int32((time_secs / 3600) as i32)),
                             "minute" => Ok(Value::Int32(((time_secs % 3600) / 60) as i32)),
                             "second" => Ok(Value::Int32((time_secs % 60) as i32)),
-                            "epoch" => Ok(Value::Int64(total_secs)),
+                            "dow" | "dayofweek" => Ok(Value::Int32((days + 6).rem_euclid(7))),
+                            "doy" | "dayofyear" => {
+                                let jan1 = crate::types::ymd_to_days(y, 1, 1);
+                                Ok(Value::Int32(days - jan1 + 1))
+                            }
+                            "epoch" => Ok(Value::Int64(total_secs + PG_EPOCH_OFFSET_SECS)),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field_str}) from timestamp"
                             ))),
@@ -1285,8 +1363,7 @@ impl Executor {
                                 "second" => Ok(Value::Int32(second as i32)),
                                 "dow" | "dayofweek" => {
                                     let d = crate::types::ymd_to_days(y, m, day);
-                                    let jdn = d + 2451545;
-                                    Ok(Value::Int32(jdn.rem_euclid(7)))
+                                    Ok(Value::Int32((d + 6).rem_euclid(7)))
                                 }
                                 "doy" | "dayofyear" => {
                                     let d = crate::types::ymd_to_days(y, m, day);
@@ -1298,7 +1375,7 @@ impl Executor {
                                     let day_secs = d as i64 * 86400;
                                     let time_secs =
                                         hour as i64 * 3600 + minute as i64 * 60 + second as i64;
-                                    Ok(Value::Int64(day_secs + time_secs))
+                                    Ok(Value::Int64(day_secs + time_secs + PG_EPOCH_OFFSET_SECS))
                                 }
                                 _ => Err(ExecError::Unsupported(format!(
                                     "EXTRACT({field_str}) from text"
@@ -1344,21 +1421,32 @@ impl Executor {
                 ..
             } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
-                // Right side should evaluate to an array or subquery. A text
-                // value in Postgres array-literal form ('{a,b}') also counts —
-                // that is how array PARAMETERS arrive after wire substitution.
-                let r = self.eval_row_expr(right, row, col_meta)?;
-                match coerce_to_array(r) {
-                    Some(vals) => {
-                        let found = vals.iter().any(|v| {
-                            self.eval_binary_op(&l, compare_op, v).ok() == Some(Value::Bool(true))
-                        });
-                        Ok(Value::Bool(found))
+                // Right side: a subquery's whole first column, an array value,
+                // or a Postgres array-literal text ('{a,b}', how array params
+                // arrive). A subquery evaluated via eval_row_expr would collapse
+                // to its first cell, so gather the column explicitly.
+                let vals = self.any_all_operand(right, row, col_meta)?;
+                // `op ANY (empty)` = FALSE; NULL element makes an otherwise-FALSE
+                // result NULL (three-valued), matching PostgreSQL.
+                let mut any_true = false;
+                let mut any_null = matches!(l, Value::Null);
+                for v in &vals {
+                    match self.eval_binary_op(&l, compare_op, v)? {
+                        Value::Bool(true) => {
+                            any_true = true;
+                            break;
+                        }
+                        Value::Null => any_null = true,
+                        _ => {}
                     }
-                    None => Err(ExecError::Unsupported(
-                        "ANY requires array or subquery".into(),
-                    )),
                 }
+                Ok(if any_true {
+                    Value::Bool(true)
+                } else if any_null {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                })
             }
             Expr::AllOp {
                 left,
@@ -1367,18 +1455,28 @@ impl Executor {
                 ..
             } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
-                let r = self.eval_row_expr(right, row, col_meta)?;
-                match coerce_to_array(r) {
-                    Some(vals) => {
-                        let all_match = vals.iter().all(|v| {
-                            self.eval_binary_op(&l, compare_op, v).ok() == Some(Value::Bool(true))
-                        });
-                        Ok(Value::Bool(all_match))
+                let vals = self.any_all_operand(right, row, col_meta)?;
+                // `op ALL (empty)` = TRUE; any FALSE makes it FALSE; otherwise a
+                // NULL element makes it NULL.
+                let mut all_true = true;
+                let mut any_null = matches!(l, Value::Null) && !vals.is_empty();
+                for v in &vals {
+                    match self.eval_binary_op(&l, compare_op, v)? {
+                        Value::Bool(false) => {
+                            all_true = false;
+                            break;
+                        }
+                        Value::Null => any_null = true,
+                        _ => {}
                     }
-                    None => Err(ExecError::Unsupported(
-                        "ALL requires array or subquery".into(),
-                    )),
                 }
+                Ok(if !all_true {
+                    Value::Bool(false)
+                } else if any_null {
+                    Value::Null
+                } else {
+                    Value::Bool(true)
+                })
             }
             // -- Array constructor --
             Expr::Array(ast::Array { elem, .. }) => {
@@ -1575,23 +1673,55 @@ impl Executor {
                 Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Text(val.to_string())),
             },
-            ast::DataType::Int(_) | ast::DataType::Integer(_) => match val {
+            ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => match val {
                 Value::Null => Ok(Value::Null),
                 Value::Int32(_) => Ok(val),
-                Value::Int64(n) => Ok(Value::Int32(n as i32)),
-                Value::Float64(n) => Ok(Value::Int32(n as i32)),
+                Value::Int64(n) => i32::try_from(n)
+                    .map(Value::Int32)
+                    .map_err(|_| ExecError::Runtime("integer out of range".into())),
+                // PostgreSQL rounds float8→int half-to-even (42.5→42, 43.5→44,
+                // 42.7→43); NUMERIC→int rounds half-AWAY-from-zero (42.5→43),
+                // matching PG's distinct numeric/float rounding rules.
+                Value::Float64(n) => f64_to_i32(n).map(Value::Int32),
+                Value::Numeric(s) => parse_numeric(&s)
+                    .ok()
+                    .and_then(|d| {
+                        d.round_dp_with_strategy(
+                            0,
+                            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                        )
+                        .to_string()
+                        .parse::<i32>()
+                        .ok()
+                    })
+                    .map(Value::Int32)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                 Value::Bool(b) => Ok(Value::Int32(if b { 1 } else { 0 })),
                 Value::Text(s) => s
+                    .trim()
                     .parse::<i32>()
                     .map(Value::Int32)
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to INT"))),
                 _ => Err(ExecError::Unsupported("cannot cast to INT".to_string())),
             },
-            ast::DataType::BigInt(_) => match val {
+            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => match val {
                 Value::Null => Ok(Value::Null),
                 Value::Int32(n) => Ok(Value::Int64(n as i64)),
                 Value::Int64(_) => Ok(val),
-                Value::Float64(n) => Ok(Value::Int64(n as i64)),
+                Value::Float64(n) => f64_to_i64(n).map(Value::Int64),
+                Value::Numeric(s) => parse_numeric(&s)
+                    .ok()
+                    .and_then(|d| {
+                        d.round_dp_with_strategy(
+                            0,
+                            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                        )
+                        .to_string()
+                        .parse::<i64>()
+                        .ok()
+                    })
+                    .map(Value::Int64)
+                    .ok_or_else(|| ExecError::Runtime("bigint out of range".into())),
                 Value::Bool(b) => Ok(Value::Int64(if b { 1 } else { 0 })),
                 Value::Text(s) => s
                     .parse::<i64>()
@@ -1599,20 +1729,32 @@ impl Executor {
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to BIGINT"))),
                 _ => Err(ExecError::Unsupported("cannot cast to BIGINT".to_string())),
             },
-            ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
-                match val {
-                    Value::Null => Ok(Value::Null),
-                    Value::Int32(n) => Ok(Value::Float64(n as f64)),
-                    Value::Int64(n) => Ok(Value::Float64(n as f64)),
-                    Value::Float64(_) => Ok(val),
-                    Value::Bool(b) => Ok(Value::Float64(if b { 1.0 } else { 0.0 })),
-                    Value::Text(s) => s
-                        .parse::<f64>()
-                        .map(Value::Float64)
-                        .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to FLOAT"))),
-                    _ => Err(ExecError::Unsupported("cannot cast to FLOAT".to_string())),
-                }
-            }
+            // float8/float4 are the PostgreSQL spellings of double/real; without
+            // these arms `x::float8` fell to the catch-all cast error, so every
+            // float-cast expression (incl. Infinity/NaN literals) errored.
+            ast::DataType::Float(_)
+            | ast::DataType::Double(_)
+            | ast::DataType::DoublePrecision
+            | ast::DataType::Float4
+            | ast::DataType::Float8 => match val {
+                Value::Null => Ok(Value::Null),
+                Value::Int32(n) => Ok(Value::Float64(n as f64)),
+                Value::Int64(n) => Ok(Value::Float64(n as f64)),
+                Value::Float64(_) => Ok(val),
+                Value::Numeric(s) => parse_numeric(&s)
+                    .ok()
+                    .and_then(|d| d.to_string().parse::<f64>().ok())
+                    .map(Value::Float64)
+                    .ok_or_else(|| ExecError::Runtime("invalid numeric".into())),
+                Value::Bool(b) => Ok(Value::Float64(if b { 1.0 } else { 0.0 })),
+                // f64::parse handles 'Infinity'/'-Infinity'/'NaN' (PG-compatible).
+                Value::Text(s) => s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::Float64)
+                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to FLOAT"))),
+                _ => Err(ExecError::Unsupported("cannot cast to FLOAT".to_string())),
+            },
             ast::DataType::Boolean => match val {
                 Value::Null => Ok(Value::Null),
                 Value::Bool(_) => Ok(val),
@@ -1745,20 +1887,52 @@ impl Executor {
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to REAL"))),
                 _ => Err(ExecError::Unsupported("cannot cast to REAL".to_string())),
             },
-            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => match val {
-                Value::Int32(_) => Ok(val),
-                Value::Int64(n) => Ok(Value::Int32(n as i32)),
-                Value::Float64(n) => Ok(Value::Int32(n as i32)),
-                Value::Text(s) => s
-                    .parse::<i32>()
-                    .map(Value::Int32)
-                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))),
-                _ => Err(ExecError::Unsupported(
-                    "cannot cast to SMALLINT".to_string(),
-                )),
-            },
+            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => {
+                let n = match val {
+                    Value::Int32(n) => i64::from(n),
+                    Value::Int64(n) => n,
+                    Value::Float64(f) => i64::from(f64_to_i32(f)?),
+                    Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+                        ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))
+                    })?,
+                    _ => {
+                        return Err(ExecError::Unsupported("cannot cast to SMALLINT".to_string()));
+                    }
+                };
+                if (i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&n) {
+                    Ok(Value::Int32(n as i32))
+                } else {
+                    Err(ExecError::Runtime("smallint out of range".into()))
+                }
+            }
             _ => Err(ExecError::Unsupported(format!("cast to {target}"))),
         }
+    }
+}
+
+/// PostgreSQL float8→int4 semantics: round half-to-even, error out of range.
+fn f64_to_i32(n: f64) -> Result<i32, ExecError> {
+    if n.is_nan() || n.is_infinite() {
+        return Err(ExecError::Runtime("cannot cast non-finite to integer".into()));
+    }
+    let r = n.round_ties_even();
+    if r >= i32::MIN as f64 && r <= i32::MAX as f64 {
+        Ok(r as i32)
+    } else {
+        Err(ExecError::Runtime("integer out of range".into()))
+    }
+}
+
+/// PostgreSQL float8→int8 semantics: round half-to-even, error out of range.
+fn f64_to_i64(n: f64) -> Result<i64, ExecError> {
+    if n.is_nan() || n.is_infinite() {
+        return Err(ExecError::Runtime("cannot cast non-finite to bigint".into()));
+    }
+    let r = n.round_ties_even();
+    if r >= i64::MIN as f64 && r < 9_223_372_036_854_775_808.0 {
+        Ok(r as i64)
+    } else {
+        Err(ExecError::Runtime("bigint out of range".into()))
     }
 }
 

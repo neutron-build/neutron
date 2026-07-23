@@ -2766,6 +2766,7 @@ dependencies = [
  "js-sys",
  "libc",
  "lz4_flex",
+ "md5",
  "mimalloc",
  "mongodb",
  "mysql_async",

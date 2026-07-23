@@ -414,9 +414,13 @@ impl MvccMemoryEngine {
 
         // Phase 1: check every key before reserving any (avoid partial reservation).
         for (cid, key) in &keys {
-            // (a) concurrent uncommitted insert holding this key?
+            // (a) an uncommitted insert already holds this key. A DIFFERENT
+            // txn holding it is a write-write conflict; the SAME txn holding it
+            // (a second INSERT of the same key within one transaction, incl. a
+            // multi-row `VALUES (1,..),(1,..)`) is itself a duplicate — both
+            // must be rejected. The prior `owner != txn_id` guard let the
+            // same-transaction duplicate through.
             if let Some(&owner) = reservations.get(&(table.to_string(), *cid, key.clone()))
-                && owner != txn_id
                 && self.txn_mgr.get_status(owner) != TxnStatus::Aborted
             {
                 return Err(MvccError::UniqueViolation {

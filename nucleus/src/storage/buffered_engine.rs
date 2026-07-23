@@ -380,6 +380,14 @@ impl StorageEngine for BufferedDiskEngine {
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // Inside a transaction the inner engine's index reflects only COMMITTED
+        // rows — it cannot see this transaction's own buffered inserts. A unique
+        // check that trusted it would miss an in-transaction duplicate (a second
+        // INSERT of the same key within one BEGIN..COMMIT was accepted). Return
+        // None so the caller falls back to `scan`, which the buffer overlays.
+        if self.is_in_txn() {
+            return Ok(None);
+        }
         self.inner.index_lookup_sync(table, index_name, value)
     }
 
