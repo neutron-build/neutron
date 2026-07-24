@@ -81,6 +81,28 @@ pub(super) fn sync_block_on<F: std::future::Future + Send>(fut: F) -> F::Output
 where
     F::Output: Send,
 {
+    // SECURITY: `block_on` drives the future as a NEW task, and tokio
+    // task-locals are per-task — they are NOT inherited. Running the future
+    // bare therefore loses CURRENT_SESSION and STORAGE_SESSION_ID, so
+    // `current_session()` falls back to the bootstrap superuser session:
+    // every correlated subquery evaluated through this helper would execute
+    // with RLS bypassed and with the wrong storage-session visibility.
+    // Re-establish both scopes inside the new task.
+    let session = CURRENT_SESSION.try_with(|s| s.clone()).ok();
+    let storage_sid = crate::storage::STORAGE_SESSION_ID.try_with(|id| *id).ok();
+    let fut = async move {
+        match (session, storage_sid) {
+            (Some(sess), Some(sid)) => {
+                CURRENT_SESSION
+                    .scope(sess, crate::storage::STORAGE_SESSION_ID.scope(sid, fut))
+                    .await
+            }
+            (Some(sess), None) => CURRENT_SESSION.scope(sess, fut).await,
+            (None, Some(sid)) => crate::storage::STORAGE_SESSION_ID.scope(sid, fut).await,
+            (None, None) => fut.await,
+        }
+    };
+
     let handle = tokio::runtime::Handle::current();
     if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
         tokio::task::block_in_place(|| handle.block_on(fut))

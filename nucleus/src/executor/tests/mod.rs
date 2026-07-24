@@ -50,6 +50,7 @@ mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_query;
 mod test_rls;
+mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
 mod test_scalar_fns;
 mod test_specialty_persistence;
 mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
