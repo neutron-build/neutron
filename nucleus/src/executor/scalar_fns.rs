@@ -983,7 +983,16 @@ impl Executor {
                 "PostgreSQL 16.0 (Nucleus {} — The Definitive Database)",
                 env!("CARGO_PKG_VERSION")
             ))),
-            "CURRENT_DATABASE" => Ok(Value::Text("nucleus".to_string())),
+            "CURRENT_DATABASE" | "CURRENT_CATALOG" => Ok(Value::Text("nucleus".to_string())),
+            // to_regtype('name') resolves a type name to its OID, NULL when
+            // unknown (psycopg's TypeInfo.fetch probes extension types this
+            // way and treats an empty result as "type not installed").
+            "TO_REGTYPE" => Ok(match args.first() {
+                Some(Value::Text(s)) => super::expr::regtype_oid(s)
+                    .map(Value::Int32)
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            }),
             "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
             "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER" => {
                 Ok(Value::Text("nucleus".to_string()))

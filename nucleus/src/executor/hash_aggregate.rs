@@ -249,11 +249,7 @@ fn projection_output_names(projection: &[SelectItem]) -> Vec<String> {
     projection
         .iter()
         .map(|item| match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.clone(),
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
-                parts[1].value.clone()
-            }
-            SelectItem::UnnamedExpr(e) => format!("{e}"),
+            SelectItem::UnnamedExpr(e) => crate::executor::helpers::default_output_name(e),
             SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
             _ => String::new(),
         })

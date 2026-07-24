@@ -759,8 +759,10 @@ mod tests {
 
         let res = run(
             &ex,
-            "SELECT m.label, g.generate_series, g.generate_series * m.factor AS result
-             FROM generate_series(1, 3) g
+            // PostgreSQL rule: a table alias on a base-type SRF names its
+            // single output column, and a column alias list wins outright.
+            "SELECT m.label, g.n, g.n * m.factor AS result
+             FROM generate_series(1, 3) g(n)
              JOIN multipliers m ON 1=1
              ORDER BY 1, 2",
         )

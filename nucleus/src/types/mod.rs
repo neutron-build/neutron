@@ -113,7 +113,7 @@ impl fmt::Display for Value {
             Value::Float64(n) if n.is_infinite() => {
                 write!(f, "{}Infinity", if *n < 0.0 { "-" } else { "" })
             }
-            Value::Float64(n) => write!(f, "{n}"),
+            Value::Float64(n) => write!(f, "{}", pg_float_text(*n)),
             Value::Text(s) => write!(f, "{s}"),
             Value::Jsonb(v) => write!(f, "{v}"),
             Value::Date(days) => {
@@ -307,8 +307,47 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
     jdn - 2451545 // subtract J2000 epoch
 }
 
+/// PostgreSQL float8 text form: shortest round-trip digits, positional
+/// notation while the exponent is in [-4, 15), otherwise scientific with a
+/// signed, two-digit-minimum exponent ("1e+100", "1e-05") — matching
+/// PostgreSQL 12+ shortest-Ryu output.
+pub fn pg_float_text(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".into();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity" } else { "Infinity" }.into();
+    }
+    let sci = format!("{n:e}");
+    let (_, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    if (-4..15).contains(&exp) {
+        n.to_string()
+    } else {
+        let (mant, _) = sci.split_once('e').unwrap();
+        if exp < 0 {
+            format!("{mant}e-{:02}", -exp)
+        } else {
+            format!("{mant}e+{exp:02}")
+        }
+    }
+}
+
 /// Strict ISO date parser used by casts and write coercion.
+///
+/// Tolerates a trailing UTC-offset token ("1999-12-31 -08") — JDBC sends
+/// dates that way; PostgreSQL parses and ignores the offset for `date`.
 pub fn parse_date(value: &str) -> Result<i32, String> {
+    let value = value.trim();
+    let value = match value.split_once(char::is_whitespace) {
+        Some((date, zone))
+            if zone.starts_with(['+', '-']) && split_zone_suffix(zone).is_ok() =>
+        {
+            date
+        }
+        Some(_) => return Err(format!("invalid date value: {value}")),
+        None => value,
+    };
     let parts: Vec<&str> = value.trim().split('-').collect();
     if parts.len() != 3 {
         return Err(format!("invalid date value: {value}"));
@@ -329,11 +368,61 @@ pub fn parse_date(value: &str) -> Result<i32, String> {
 }
 
 /// Strict ISO timestamp-without-time-zone parser with microsecond precision.
+///
+/// A trailing UTC offset (`Z`, `+HH`, `-HH:MM`, …) is accepted and ignored,
+/// matching PostgreSQL's `timestamp` input rule (keep the wall-clock time).
 pub fn parse_timestamp(value: &str) -> Result<i64, String> {
+    parse_timestamp_with_zone(value).map(|(us, _)| us)
+}
+
+/// ISO timestamp parser for `timestamptz`: a trailing UTC offset shifts the
+/// wall-clock time to UTC (PostgreSQL stores timestamptz normalized to UTC).
+/// Without an offset the value is taken as already-UTC (server runs in UTC).
+pub fn parse_timestamptz(value: &str) -> Result<i64, String> {
+    parse_timestamp_with_zone(value).map(|(us, offset)| us - offset.unwrap_or(0) * 1_000_000)
+}
+
+/// Split a trailing UTC-offset suffix (`Z`, `±HH`, `±HH:MM`, `±HHMM`,
+/// `±HH:MM:SS`) off an ISO time string. Returns (time, offset_seconds).
+fn split_zone_suffix(time: &str) -> Result<(&str, Option<i64>), String> {
+    if let Some(stripped) = time.strip_suffix(['Z', 'z']) {
+        return Ok((stripped, Some(0)));
+    }
+    // The time-of-day portion never contains '+'/'-', so any sign marks the
+    // start of an offset.
+    let Some(pos) = time.find(['+', '-']) else {
+        return Ok((time, None));
+    };
+    let (time, zone) = time.split_at(pos);
+    let sign: i64 = if zone.starts_with('-') { -1 } else { 1 };
+    let digits = &zone[1..];
+    let fields: Vec<&str> = digits.split(':').collect();
+    let parse_field = |s: &str| -> Result<i64, String> {
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("invalid time zone offset: {zone}"));
+        }
+        s.parse::<i64>().map_err(|_| format!("invalid time zone offset: {zone}"))
+    };
+    let (hours, minutes, seconds) = match fields.as_slice() {
+        [hhmm] if hhmm.len() == 4 => (parse_field(&hhmm[..2])?, parse_field(&hhmm[2..])?, 0),
+        [hh] => (parse_field(hh)?, 0, 0),
+        [hh, mm] => (parse_field(hh)?, parse_field(mm)?, 0),
+        [hh, mm, ss] => (parse_field(hh)?, parse_field(mm)?, parse_field(ss)?),
+        _ => return Err(format!("invalid time zone offset: {zone}")),
+    };
+    if hours > 15 || minutes > 59 || seconds > 59 {
+        return Err(format!("time zone displacement out of range: {zone}"));
+    }
+    Ok((time, Some(sign * (hours * 3600 + minutes * 60 + seconds))))
+}
+
+fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<i64>), String> {
     let value = value.trim();
     let (date, time) = value
         .split_once([' ', 'T'])
         .map_or((value, "00:00:00"), |parts| parts);
+    let (time, zone_offset) = split_zone_suffix(time)?;
+    let time = time.trim_end();
     let days = parse_date(date)? as i64;
     let pieces: Vec<&str> = time.split(':').collect();
     if pieces.len() != 3 {
@@ -371,6 +460,7 @@ pub fn parse_timestamp(value: &str) -> Result<i64, String> {
         .and_then(|base| base.checked_add(minute as i64 * 60_000_000))
         .and_then(|base| base.checked_add(second as i64 * 1_000_000))
         .and_then(|base| base.checked_add(fraction as i64))
+        .map(|us| (us, zone_offset))
         .ok_or_else(|| "timestamp value out of range".to_string())
 }
 
@@ -538,7 +628,9 @@ impl Value {
             (Value::Text(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
             (Value::Text(s), DataType::Date) => parse_date(s).map(Value::Date),
             (Value::Text(s), DataType::Timestamp) => parse_timestamp(s).map(Value::Timestamp),
-            (Value::Text(s), DataType::TimestampTz) => parse_timestamp(s).map(Value::TimestampTz),
+            (Value::Text(s), DataType::TimestampTz) => {
+                parse_timestamptz(s).map(Value::TimestampTz)
+            }
             (Value::Text(s), DataType::Uuid) => parse_uuid(s).map(Value::Uuid),
             (Value::Text(s), DataType::Bytea) => parse_bytea_text(s).map(Value::Bytea),
             (Value::Text(s), DataType::Jsonb) => serde_json::from_str(s)

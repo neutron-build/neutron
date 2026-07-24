@@ -453,12 +453,14 @@ impl Executor {
     /// Values for the right operand of `x op ANY/ALL (...)`: a subquery's whole
     /// first column (correlated refs substituted), an array value, or a
     /// Postgres array-literal text.
+    /// `None` means the array operand itself was NULL — the whole ANY/ALL
+    /// comparison is then NULL (PostgreSQL: `x = ANY(NULL::text[])` is NULL).
     fn any_all_operand(
         &self,
         right: &Expr,
         row: &Row,
         col_meta: &[ColMeta],
-    ) -> Result<Vec<Value>, ExecError> {
+    ) -> Result<Option<Vec<Value>>, ExecError> {
         let inner = match right {
             Expr::Nested(e) => e.as_ref(),
             other => other,
@@ -469,16 +471,19 @@ impl Executor {
             let sub_result = sync_block_on(self.execute_query(resolved));
             self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
             return match sub_result? {
-                ExecResult::Select { rows, .. } => {
-                    Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect())
-                }
-                _ => Ok(Vec::new()),
+                ExecResult::Select { rows, .. } => Ok(Some(
+                    rows.into_iter().filter_map(|r| r.into_iter().next()).collect(),
+                )),
+                _ => Ok(Some(Vec::new())),
             };
         }
         let r = self.eval_row_expr(right, row, col_meta)?;
-        coerce_to_array(r).ok_or_else(|| {
-            ExecError::Unsupported("ANY/ALL requires an array or subquery".into())
-        })
+        if matches!(r, Value::Null) {
+            return Ok(None);
+        }
+        coerce_to_array(r)
+            .map(Some)
+            .ok_or_else(|| ExecError::Unsupported("ANY/ALL requires an array or subquery".into()))
     }
 
     pub(super) fn in_three_valued(val: &Value, candidates: &[Value], negated: bool) -> Value {
@@ -775,12 +780,16 @@ impl Executor {
 
     /// Parallel WHERE filter for large result sets using Rayon.
     /// Falls back to serial for small sets (below `PARALLEL_THRESHOLD`).
-    pub(super) fn parallel_filter(
+    /// WHERE filter that PROPAGATES evaluation errors. An unresolvable column
+    /// or failing expression must surface as an error — treating it as
+    /// row-doesn't-match silently returned wrong (empty) results for typos
+    /// like `WHERE zzz > 3`.
+    pub(super) fn try_parallel_filter(
         &self,
         rows: Vec<Row>,
         where_expr: &Expr,
         col_meta: &[ColMeta],
-    ) -> Vec<Row> {
+    ) -> Result<Vec<Row>, ExecError> {
         /// Minimum row count before switching to parallel evaluation.
         const PARALLEL_THRESHOLD: usize = 10_000;
 
@@ -788,9 +797,42 @@ impl Executor {
             // Parallel path using Rayon (server builds only)
             #[cfg(feature = "server")]
             {
-                rows.into_par_iter()
-                    .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
-                    .collect()
+                // Rayon workers can't see the session task-local, so capture
+                // the cancel flag here and poll it per row.
+                let session = self.current_session_for_cancel();
+                let run = || {
+                    rows.into_par_iter()
+                        .map(|row| {
+                            if session
+                                .cancel_requested
+                                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                return Err(ExecError::Runtime(Self::CANCEL_MESSAGE.into()));
+                            }
+                            self.eval_where(where_expr, &row, col_meta)
+                                .map(|keep| (keep, row))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|pairs| {
+                            pairs
+                                .into_iter()
+                                .filter_map(|(keep, row)| keep.then_some(row))
+                                .collect()
+                        })
+                };
+                // A long rayon collect blocks this tokio worker; without
+                // block_in_place the runtime can stall its IO driver behind
+                // the compute, delaying even NEW connections (observed: a
+                // CancelRequest not read until the filter finished).
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        tokio::task::block_in_place(run)
+                    }
+                    _ => run(),
+                }
             }
             #[cfg(not(feature = "server"))]
             {
@@ -798,9 +840,13 @@ impl Executor {
             }
         } else {
             // Serial path for small result sets or non-server (WASM) builds
-            rows.into_iter()
-                .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
-                .collect()
+            let mut out = Vec::new();
+            for row in rows {
+                if self.eval_where(where_expr, &row, col_meta)? {
+                    out.push(row);
+                }
+            }
+            Ok(out)
         }
     }
 
@@ -1425,7 +1471,9 @@ impl Executor {
                 // or a Postgres array-literal text ('{a,b}', how array params
                 // arrive). A subquery evaluated via eval_row_expr would collapse
                 // to its first cell, so gather the column explicitly.
-                let vals = self.any_all_operand(right, row, col_meta)?;
+                let Some(vals) = self.any_all_operand(right, row, col_meta)? else {
+                    return Ok(Value::Null);
+                };
                 // `op ANY (empty)` = FALSE; NULL element makes an otherwise-FALSE
                 // result NULL (three-valued), matching PostgreSQL.
                 let mut any_true = false;
@@ -1455,7 +1503,9 @@ impl Executor {
                 ..
             } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
-                let vals = self.any_all_operand(right, row, col_meta)?;
+                let Some(vals) = self.any_all_operand(right, row, col_meta)? else {
+                    return Ok(Value::Null);
+                };
                 // `op ALL (empty)` = TRUE; any FALSE makes it FALSE; otherwise a
                 // NULL element makes it NULL.
                 let mut all_true = true;
@@ -1572,6 +1622,32 @@ impl Executor {
                             let key = self.eval_row_expr(key_expr, row, col_meta)?;
                             self.eval_json_arrow(&base, &key)
                         }
+                        // Composite field access `(expr).field` — PostgreSQL
+                        // record syntax. Nucleus represents the only composite
+                        // producer (_pg_expandarray) as a JSON object, so
+                        // extract the field with a typed result (JDBC compares
+                        // `(keys).x` against integer attnum).
+                        AccessExpr::Dot(Expr::Identifier(field)) => match &base {
+                            Value::Jsonb(serde_json::Value::Object(map)) => {
+                                Ok(match map.get(&field.value) {
+                                    None | Some(serde_json::Value::Null) => Value::Null,
+                                    Some(serde_json::Value::Number(n)) => {
+                                        if let Some(i) = n.as_i64() {
+                                            Value::Int64(i)
+                                        } else {
+                                            Value::Float64(n.as_f64().unwrap_or(f64::NAN))
+                                        }
+                                    }
+                                    Some(serde_json::Value::String(s)) => Value::Text(s.clone()),
+                                    Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
+                                    Some(other) => Value::Jsonb(other.clone()),
+                                })
+                            }
+                            Value::Null => Ok(Value::Null),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "field access on non-composite value: {expr}"
+                            ))),
+                        },
                         _ => Err(ExecError::Unsupported(format!("expression: {expr}"))),
                     }
                 } else {
@@ -1646,6 +1722,17 @@ impl Executor {
                     .unwrap_or(Value::Int32(*n as i32)),
                 _ => Value::Null,
             }),
+            // ::regproc — function-name pseudo-type. Nucleus renders regproc
+            // values as their text name already, so the cast is the identity
+            // on text (prisma casts pg_type.typinput::regproc::text).
+            ast::DataType::Custom(name, _)
+                if name.to_string().eq_ignore_ascii_case("regproc") =>
+            {
+                Ok(match &val {
+                    Value::Text(_) | Value::Int32(_) | Value::Int64(_) => val,
+                    _ => Value::Null,
+                })
+            }
             // '<type name>'::regtype — sqlparser has no first-class REGTYPE, so
             // it arrives as a custom type. Resolves to the type OID.
             ast::DataType::Custom(name, _)

@@ -1938,57 +1938,42 @@ pub(super) fn value_to_ast_expr(val: &Value) -> Expr {
 
 /// Substitute outer column references in an expression tree with literal values.
 /// Used for correlated subqueries where inner expressions reference outer table columns.
-pub(super) fn substitute_outer_refs(expr: &Expr, outer_row: &Row, outer_meta: &[ColMeta]) -> Expr {
-    match expr {
-        Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
-            let table = &idents[0].value;
-            let col = &idents[1].value;
-            // Look for a match in outer columns
-            for (i, meta) in outer_meta.iter().enumerate() {
-                if let Some(ref t) = meta.table
-                    && t.eq_ignore_ascii_case(table)
-                    && meta.name.eq_ignore_ascii_case(col)
-                    && let Some(val) = outer_row.get(i)
-                {
-                    return value_to_ast_expr(val);
-                }
-            }
-            expr.clone()
-        }
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(substitute_outer_refs(left, outer_row, outer_meta)),
-            op: op.clone(),
-            right: Box::new(substitute_outer_refs(right, outer_row, outer_meta)),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(substitute_outer_refs(inner, outer_row, outer_meta)),
-        },
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_outer_refs(
-            inner, outer_row, outer_meta,
-        ))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_outer_refs(
-            inner, outer_row, outer_meta,
-        ))),
-        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_outer_refs(
-            inner, outer_row, outer_meta,
-        ))),
-        _ => expr.clone(),
-    }
-}
-
-/// Substitute outer column references in a query's WHERE/selection clauses.
+/// Substitute outer column references throughout a correlated subquery —
+/// projection, WHERE, and any nested expressions.
 pub(super) fn substitute_outer_refs_in_query(
     query: &ast::Query,
     outer_row: &Row,
     outer_meta: &[ColMeta],
 ) -> ast::Query {
+    use core::ops::ControlFlow;
     let mut q = query.clone();
-    if let ast::SetExpr::Select(ref mut sel) = *q.body
-        && let Some(ref selection) = sel.selection
-    {
-        sel.selection = Some(substitute_outer_refs(selection, outer_row, outer_meta));
-    }
+    let _ = sqlparser::ast::visit_expressions_mut(&mut q, |node: &mut Expr| {
+        if let Expr::CompoundIdentifier(idents) = node
+            && idents.len() >= 2
+        {
+            let col = idents[idents.len() - 1].value.clone();
+            let qual: String = idents[..idents.len() - 1]
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let qual_last = idents[idents.len() - 2].value.clone();
+            for (i, meta) in outer_meta.iter().enumerate() {
+                if let Some(ref t) = meta.table
+                    && meta.name.eq_ignore_ascii_case(&col)
+                    && (t.eq_ignore_ascii_case(&qual)
+                        || t.rsplit('.')
+                            .next()
+                            .is_some_and(|last| last.eq_ignore_ascii_case(&qual_last)))
+                    && let Some(val) = outer_row.get(i)
+                {
+                    *node = value_to_ast_expr(val);
+                    break;
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
     q
 }
 
@@ -2543,5 +2528,29 @@ pub(super) fn json_contains(left: &serde_json::Value, right: &serde_json::Value)
             b.iter().all(|bv| a.iter().any(|av| json_contains(av, bv)))
         }
         (a, b) => a == b,
+    }
+}
+
+/// PostgreSQL's default output-column name for an unaliased projection:
+/// identifiers name after their last path component, function calls after the
+/// bare (lowercased) function name, parenthesized expressions after their
+/// inner expression. Everything else keeps its rendered form.
+pub(super) fn default_output_name(expr: &sqlparser::ast::Expr) -> String {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .unwrap_or_else(|| format!("{expr}")),
+        Expr::Function(f) => f
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|i| i.value.to_lowercase())
+            .unwrap_or_else(|| format!("{expr}")),
+        Expr::Nested(inner) => default_output_name(inner),
+        _ => format!("{expr}"),
     }
 }

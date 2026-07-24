@@ -154,6 +154,15 @@ pub enum ExecResult {
     Command { tag: String, rows_affected: usize },
     /// Result of COPY ... TO STDOUT: pre-formatted copy data ready to stream.
     CopyOut { data: String, row_count: usize },
+    /// Result of COPY ... TO STDOUT WITH (FORMAT binary): the complete
+    /// PostgreSQL binary-copy payload (signature + tuples + trailer). The
+    /// wire layer sends it under a format=1 CopyOutResponse with one column
+    /// format code per column.
+    CopyOutBinary {
+        data: Vec<u8>,
+        row_count: usize,
+        columns: usize,
+    },
     /// Streaming COPY ... TO STDOUT: rows are pulled in batches and formatted on
     /// the fly, so a full-table export never buffers the whole table. The pgwire
     /// path formats + sends CopyData per batch; non-wire consumers collapse it to
@@ -191,6 +200,13 @@ impl std::fmt::Debug for ExecResult {
                 .debug_struct("CopyOut")
                 .field("data", data)
                 .field("row_count", row_count)
+                .finish(),
+            ExecResult::CopyOutBinary {
+                row_count, columns, ..
+            } => f
+                .debug_struct("CopyOutBinary")
+                .field("row_count", row_count)
+                .field("columns", columns)
                 .finish(),
             ExecResult::CopyOutStream {
                 columns, is_csv, ..
@@ -2332,6 +2348,12 @@ impl Executor {
     }
 
     /// Get the session for the given ID, falling back to the default session.
+    /// Column (name, type) pairs for a table from the sync schema cache —
+    /// used by the wire layer to decode binary COPY payloads.
+    pub fn table_column_types(&self, table: &str) -> Option<Vec<(String, DataType)>> {
+        self.table_columns.read().get(table).cloned()
+    }
+
     fn get_session(&self, id: u64) -> Arc<Session> {
         self.sessions
             .read()
@@ -2455,6 +2477,49 @@ impl Executor {
             ));
         }
         self.execute(sql).await
+    }
+
+    /// Message used for wire-initiated query cancellation; the pg error codec
+    /// maps it to SQLSTATE 57014 (query_canceled).
+    pub(super) const CANCEL_MESSAGE: &'static str = "canceling statement due to user request";
+
+    /// Flag the session's currently-executing statement for cooperative
+    /// cancellation (wire CancelRequest). Long compute loops observe the flag
+    /// and abort with SQLSTATE 57014; the flag clears at the next statement.
+    pub fn request_session_cancel(&self, session_id: u64) {
+        self.get_session(session_id)
+            .cancel_requested
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Drop any pending cancel on the session. The wire layer calls this at
+    /// each CLIENT command boundary (simple query / Execute / Describe) — NOT
+    /// per internal executor entry, because one client command may run
+    /// several internal statements (e.g. the Describe probe) and a cancel
+    /// arriving during any of them targets the same client command.
+    pub fn clear_session_cancel(&self, session_id: u64) {
+        self.get_session(session_id)
+            .cancel_requested
+            .store(false, Ordering::Relaxed);
+    }
+
+    /// Error out if the current session's statement has been cancelled.
+    /// Cheap (one relaxed atomic load) — called from the executor's long
+    /// loops (filters, joins, aggregates) to bound cancellation latency.
+    /// Consumes the flag when it fires so the cancel affects one command.
+    #[inline]
+    pub(super) fn check_cancelled(&self) -> Result<(), ExecError> {
+        let session = self.current_session();
+        if session.cancel_requested.swap(false, Ordering::Relaxed) {
+            return Err(ExecError::Runtime(Self::CANCEL_MESSAGE.into()));
+        }
+        Ok(())
+    }
+
+    /// Current session handle for capturing the cancel flag before entering
+    /// rayon (worker threads can't read the task-local).
+    pub(super) fn current_session_for_cancel(&self) -> Arc<Session> {
+        self.current_session()
     }
 
     /// Get the current session from the task-local, or the default session
@@ -4758,7 +4823,8 @@ impl Executor {
                 ExecResult::Command { rows_affected, .. } => {
                     self.metrics.rows_returned.inc_by(*rows_affected as u64);
                 }
-                ExecResult::CopyOut { row_count, .. } => {
+                ExecResult::CopyOut { row_count, .. }
+                | ExecResult::CopyOutBinary { row_count, .. } => {
                     self.metrics.rows_returned.inc_by(*row_count as u64);
                 }
                 // A streaming result's row count is not known until it drains at
@@ -6361,7 +6427,71 @@ impl Executor {
                         name: "typcollation".into(),
                         dtype: DataType::Int32,
                     },
+                    // JDBC's getColumns query joins on these: no domain types,
+                    // so typnotnull=false, typbasetype=0, typtypmod=-1.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typnotnull".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typbasetype".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typtypmod".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typelem".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // psycopg's TypeInfo query selects these: no array types
+                    // exposed (typarray=0), default delimiter ','.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typarray".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typdelim".into(),
+                        dtype: DataType::Text,
+                    },
+                    // Input-function name (prisma's describe checks it to
+                    // detect array types via 'array_in'); scalar spelling.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typinput".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
+                let domain_cols = |rows: &mut Vec<Vec<Value>>| {
+                    for row in rows.iter_mut() {
+                        let typname = match &row[1] {
+                            Value::Text(n) => n.clone(),
+                            _ => String::new(),
+                        };
+                        row.extend([
+                            Value::Bool(false),
+                            Value::Int32(0),
+                            Value::Int32(-1),
+                            Value::Int32(0),
+                            Value::Int32(0),
+                            Value::Int32(0),
+                            Value::Text(",".into()),
+                            Value::Text(format!("{typname}in")),
+                        ]);
+                    }
+                };
                 let mut seen = std::collections::HashSet::new();
                 let mut rows = Vec::new();
                 for t in &tables {
@@ -6395,6 +6525,7 @@ impl Executor {
                         ]);
                     }
                 }
+                domain_cols(&mut rows);
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_class" | "pg_class" => {
@@ -7347,12 +7478,18 @@ impl Executor {
                         name: "attndims".into(),
                         dtype: DataType::Int32,
                     },
+                    // Fixed byte width of the column's type (JDBC getColumns).
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attlen".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (ti, t) in tables.iter().enumerate() {
                     let rel_oid = 16384 + ti as i32;
                     for (ci, c) in t.columns.iter().enumerate() {
-                        let (type_oid, _, _, _) = pg_type_info(&c.data_type);
+                        let (type_oid, typlen, _, _) = pg_type_info(&c.data_type);
                         rows.push(vec![
                             Value::Int32(rel_oid),
                             Value::Text(c.name.clone()),
@@ -7371,10 +7508,33 @@ impl Executor {
                             Value::Text(String::new()),
                             Value::Bool(false),
                             Value::Int32(0),
+                            Value::Int32(typlen),
                         ]);
                     }
                 }
                 Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_depend" | "pg_depend" => {
+                // Object dependencies. Nucleus tracks none of the dependency
+                // classes clients inspect (extension membership etc.) — an
+                // empty relation lets pgcli's completion query run.
+                let cols = [
+                    ("classid", DataType::Int32),
+                    ("objid", DataType::Int32),
+                    ("objsubid", DataType::Int32),
+                    ("refclassid", DataType::Int32),
+                    ("refobjid", DataType::Int32),
+                    ("refobjsubid", DataType::Int32),
+                    ("deptype", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
             }
             "pg_catalog.pg_attrdef" | "pg_attrdef" => {
                 // Column defaults. Nucleus stores defaults in table metadata,

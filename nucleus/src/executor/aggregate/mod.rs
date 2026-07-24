@@ -196,7 +196,7 @@ fn agg_static_columns(
     for item in projection {
         match item {
             SelectItem::UnnamedExpr(expr) => {
-                cols.push((format!("{expr}"), infer_expr_type(expr, col_meta)));
+                cols.push((crate::executor::helpers::default_output_name(expr), infer_expr_type(expr, col_meta)));
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 cols.push((alias.value.clone(), infer_expr_type(expr, col_meta)));
@@ -319,7 +319,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -415,7 +415,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -456,7 +456,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, &null_indices, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -529,7 +529,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -652,7 +652,7 @@ impl Executor {
                         SelectItem::UnnamedExpr(expr) => {
                             let val =
                                 self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                            cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                            cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                             row.push(val);
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
@@ -1517,7 +1517,7 @@ impl Executor {
 
         for item in &select.projection {
             let (col_name, expr) = match item {
-                SelectItem::UnnamedExpr(e) => (format!("{e}"), e),
+                SelectItem::UnnamedExpr(e) => (crate::executor::helpers::default_output_name(e), e),
                 SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
                 SelectItem::Wildcard(_) => {
                     // Expand wildcard

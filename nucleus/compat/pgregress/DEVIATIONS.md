@@ -52,3 +52,28 @@ exactly (12/12 core scripts pass).
   collations are not implemented. The harness pins PostgreSQL to `--locale=C`
   so ordering is comparable; against a locale-collated PostgreSQL, text sort
   order will differ.
+
+## NUMERIC display scale
+
+- **Trailing zeros are normalized away.** Nucleus stores numerics normalized
+  (`'-0.5000'::numeric` displays `-0.5`; PostgreSQL preserves the input's
+  display scale and shows `-0.5000`, and rescales values to a column's
+  declared `NUMERIC(p,s)` scale). Comparisons and arithmetic are unaffected —
+  only the displayed trailing zeros differ. (Found by the binary-COPY
+  differential harness; `compat/copybinary` seeds avoid trailing-zero scale.)
+
+## Query cancellation granularity
+
+- **Cancellation is observed at executor checkpoints, not preemptively.**
+  A wire `CancelRequest` (SQLSTATE 57014) interrupts the running statement at
+  the next cooperative check (per-row in large filters, per-outer-row in
+  cross joins) or at the next await point — the same granularity as
+  `statement_timeout`. A phase with no checkpoint runs to its end before the
+  cancel is honoured; the client always gets the cancel error, but worst-case
+  latency is that phase's duration.
+
+## statement_timeout units
+
+- `SET statement_timeout = N` now follows PostgreSQL: a bare `N` is
+  **milliseconds** (with `ms`/`s`/`min`/`h` suffixes accepted). Earlier
+  Nucleus builds read it as seconds.

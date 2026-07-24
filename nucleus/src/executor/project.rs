@@ -68,9 +68,12 @@ impl Executor {
                     // the correct column type instead of defaulting to TEXT.
                     if let Some(first) = rows.first() {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
-                        columns.push((format!("{expr}"), value_type(&val)));
+                        columns.push((super::helpers::default_output_name(expr), value_type(&val)));
                     } else {
-                        columns.push((format!("{expr}"), infer_expr_type(expr, col_meta)));
+                        columns.push((
+                            super::helpers::default_output_name(expr),
+                            infer_expr_type(expr, col_meta),
+                        ));
                     }
                     col_indices.push(usize::MAX); // sentinel
                     expr_items.push(Some(expr));
