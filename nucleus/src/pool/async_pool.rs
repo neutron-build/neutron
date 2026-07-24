@@ -64,6 +64,30 @@ impl AsyncConnectionPool {
         Ok(id)
     }
 
+    /// Acquire a connection slot **without waiting**.
+    ///
+    /// Returns [`PoolError::PoolExhausted`] immediately when the server is at
+    /// `max_connections`. The pgwire accept loop uses this instead of
+    /// [`Self::acquire`]: awaiting a slot inline in the accept loop makes one
+    /// over-limit client block *every* subsequent connection for the whole
+    /// acquire timeout (30 s by default), turning "the connection limit was
+    /// reached" into a total listener outage.
+    pub async fn try_acquire(&self, client_addr: &str) -> Result<ConnectionId, PoolError> {
+        let permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PoolError::PoolExhausted)?;
+
+        let id = {
+            let mut pool = self.inner.lock().await;
+            pool.acquire(client_addr)?
+        };
+
+        self.held_permits.lock().await.insert(id, permit);
+        Ok(id)
+    }
+
     /// Release a connection slot back to the pool.
     pub async fn release(&self, id: ConnectionId) {
         {
@@ -209,6 +233,41 @@ mod tests {
 
         pool.release(id2).await;
         pool.release(id3).await;
+    }
+
+    /// The accept loop depends on this being non-blocking: at capacity it must
+    /// fail *now*, not after `acquire_timeout_ms`.
+    #[tokio::test]
+    async fn try_acquire_fails_immediately_at_capacity() {
+        // 5 s acquire timeout: if `try_acquire` waited, this test would take
+        // 5 s instead of microseconds.
+        let mut cfg = test_config(2);
+        cfg.acquire_timeout_ms = 5_000;
+        let pool = AsyncConnectionPool::new(cfg);
+
+        // Just under the limit: both succeed.
+        let id1 = pool.try_acquire("client1").await.unwrap();
+        let id2 = pool.try_acquire("client2").await.unwrap();
+        assert_eq!(pool.available_permits(), 0);
+
+        // One over the limit: refused, and refused promptly.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            pool.try_acquire("client3").await,
+            Err(PoolError::PoolExhausted)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "try_acquire blocked for {:?}; the accept loop would stall",
+            started.elapsed()
+        );
+
+        // Freeing a slot re-admits.
+        pool.close(id1).await;
+        let id3 = pool.try_acquire("client3").await.unwrap();
+        assert!(id3 > 0);
+        pool.close(id2).await;
+        pool.close(id3).await;
     }
 
     #[tokio::test]

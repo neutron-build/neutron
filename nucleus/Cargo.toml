@@ -72,6 +72,11 @@ js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 getrandom = { version = "0.2", optional = true }
 
+# Free-space probing for the disk watermark guard (`src/ops/disk.rs`) needs
+# `statvfs`; on non-Unix targets the probe reports Unsupported instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["server"]
 server = [

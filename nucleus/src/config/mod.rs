@@ -89,6 +89,41 @@ pub struct StorageConfig {
     pub use_direct_io: bool,
     #[serde(default)]
     pub memory_mode: bool,
+    /// How often to sample free space on the data directory's filesystem.
+    /// 0 disables the disk watermark monitor entirely.
+    #[serde(default = "default_disk_check_interval_secs")]
+    pub disk_check_interval_secs: u64,
+    /// Percentage of free space below which an operator alert is logged.
+    #[serde(default = "default_disk_warn_free_pct")]
+    pub disk_warn_free_pct: f64,
+    /// Percentage of free space below which the server refuses writes
+    /// (SQLSTATE 53100) instead of failing mid-write when the disk fills.
+    #[serde(default = "default_disk_readonly_free_pct")]
+    pub disk_readonly_free_pct: f64,
+    /// Absolute free-space floor in MB. A percentage margin is meaningless on
+    /// a small volume, so this triggers read-only independently.
+    #[serde(default = "default_disk_min_free_mb")]
+    pub disk_min_free_mb: u64,
+    /// Free space must climb back above this percentage before writes resume
+    /// (hysteresis), so the server cannot flap at the watermark.
+    #[serde(default = "default_disk_resume_free_pct")]
+    pub disk_resume_free_pct: f64,
+}
+
+fn default_disk_check_interval_secs() -> u64 {
+    30
+}
+fn default_disk_warn_free_pct() -> f64 {
+    10.0
+}
+fn default_disk_readonly_free_pct() -> f64 {
+    3.0
+}
+fn default_disk_min_free_mb() -> u64 {
+    256
+}
+fn default_disk_resume_free_pct() -> f64 {
+    6.0
 }
 
 fn default_data_dir() -> String {
@@ -109,6 +144,23 @@ impl Default for StorageConfig {
             page_size: default_page_size(),
             use_direct_io: false,
             memory_mode: false,
+            disk_check_interval_secs: default_disk_check_interval_secs(),
+            disk_warn_free_pct: default_disk_warn_free_pct(),
+            disk_readonly_free_pct: default_disk_readonly_free_pct(),
+            disk_min_free_mb: default_disk_min_free_mb(),
+            disk_resume_free_pct: default_disk_resume_free_pct(),
+        }
+    }
+}
+
+impl StorageConfig {
+    /// The disk watermarks derived from this config.
+    pub fn disk_watermarks(&self) -> crate::ops::DiskWatermarks {
+        crate::ops::DiskWatermarks {
+            warn_free_pct: self.disk_warn_free_pct,
+            readonly_free_pct: self.disk_readonly_free_pct,
+            min_free_bytes: self.disk_min_free_mb.saturating_mul(1024 * 1024),
+            resume_free_pct: self.disk_resume_free_pct,
         }
     }
 }
@@ -366,6 +418,16 @@ pub struct NucleusConfig {
     pub logging: LoggingConfig,
 }
 
+/// Push an error when `value` is not one of `allowed` (case-insensitive).
+fn check_enum(errors: &mut Vec<String>, setting: &str, value: &str, allowed: &[&str]) {
+    if !allowed.iter().any(|a| value.eq_ignore_ascii_case(a)) {
+        errors.push(format!(
+            "{setting} must be one of {} (got {value:?})",
+            allowed.join(", ")
+        ));
+    }
+}
+
 impl NucleusConfig {
     /// Load config from a TOML file, then overlay environment variables.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -513,6 +575,31 @@ impl NucleusConfig {
         {
             self.storage.use_direct_io = b;
         }
+        if let Ok(v) = env::var("NUCLEUS_DISK_CHECK_INTERVAL_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.storage.disk_check_interval_secs = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_DISK_WARN_FREE_PCT")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            self.storage.disk_warn_free_pct = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_DISK_READONLY_FREE_PCT")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            self.storage.disk_readonly_free_pct = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_DISK_MIN_FREE_MB")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.storage.disk_min_free_mb = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_DISK_RESUME_FREE_PCT")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            self.storage.disk_resume_free_pct = n;
+        }
 
         // wal (additional)
         if let Ok(v) = env::var("NUCLEUS_WAL_SEGMENT_SIZE_MB")
@@ -563,6 +650,123 @@ impl NucleusConfig {
     /// Merge CLI arguments into the config, overriding any TOML / env values.
     ///
     /// Only `Some` values are applied; `None` means "use the existing value".
+    /// Reject a configuration that cannot do what it says, *before* the
+    /// server starts serving.
+    ///
+    /// The failure mode this prevents is the quiet one: a typo'd or inverted
+    /// setting that leaves a limit unenforced or a watermark unreachable, and
+    /// is only discovered when the safety net was supposed to catch something.
+    /// Every message names the setting and the value it got.
+    ///
+    /// Returns all problems at once so an operator fixes the file in one pass.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if self.server.max_connections == 0 {
+            errors.push(
+                "server.max_connections must be at least 1 (got 0): the server would refuse every connection"
+                    .to_string(),
+            );
+        }
+        if self.pool.min_idle > self.server.max_connections {
+            errors.push(format!(
+                "pool.min_idle ({}) must not exceed server.max_connections ({}): the pool could never reach its idle floor",
+                self.pool.min_idle, self.server.max_connections
+            ));
+        }
+        if self.storage.page_size < 512 || !self.storage.page_size.is_power_of_two() {
+            errors.push(format!(
+                "storage.page_size must be a power of two of at least 512 (got {})",
+                self.storage.page_size
+            ));
+        }
+        if self.storage.data_dir.trim().is_empty() {
+            errors.push("storage.data_dir must not be empty".to_string());
+        }
+        // A memory ceiling smaller than the buffers carved out of it is not a
+        // ceiling; the subsystems would be over-committed from the start.
+        if self.server.max_memory_mb > 0 {
+            let reserved = self.storage.buffer_pool_size_mb + self.cache.max_memory_mb;
+            if reserved > self.server.max_memory_mb {
+                errors.push(format!(
+                    "storage.buffer_pool_size_mb ({}) + cache.max_memory_mb ({}) = {reserved} MB exceeds server.max_memory_mb ({}): the global memory limit would be blown before a single query runs",
+                    self.storage.buffer_pool_size_mb,
+                    self.cache.max_memory_mb,
+                    self.server.max_memory_mb
+                ));
+            }
+        }
+        if self.metrics.enabled && self.metrics.port == self.server.port {
+            errors.push(format!(
+                "metrics.port ({}) must differ from server.port ({})",
+                self.metrics.port, self.server.port
+            ));
+        }
+        if self.metrics.enabled && !self.metrics.endpoint.starts_with('/') {
+            errors.push(format!(
+                "metrics.endpoint must start with '/' (got {:?})",
+                self.metrics.endpoint
+            ));
+        }
+
+        // Enumerated strings: a typo here silently selects the default
+        // behaviour, so fail instead of guessing.
+        check_enum(
+            &mut errors,
+            "wal.sync_mode",
+            &self.wal.sync_mode,
+            &["fsync", "fdatasync", "async", "none", "off"],
+        );
+        check_enum(
+            &mut errors,
+            "cache.eviction_policy",
+            &self.cache.eviction_policy,
+            &["lru", "lfu", "fifo", "random"],
+        );
+        check_enum(
+            &mut errors,
+            "replication.mode",
+            &self.replication.mode,
+            &["standalone", "primary", "replica"],
+        );
+        check_enum(
+            &mut errors,
+            "replication.sync_mode",
+            &self.replication.sync_mode,
+            &["async", "sync"],
+        );
+        check_enum(
+            &mut errors,
+            "logging.level",
+            &self.logging.level,
+            &["trace", "debug", "info", "warn", "error", "off"],
+        );
+        check_enum(
+            &mut errors,
+            "logging.format",
+            &self.logging.format,
+            &["text", "json"],
+        );
+
+        if self.replication.mode.eq_ignore_ascii_case("replica")
+            && self.replication.primary_host.is_none()
+        {
+            errors.push(
+                "replication.mode = \"replica\" requires replication.primary_host".to_string(),
+            );
+        }
+
+        if let Err(e) = self.storage.disk_watermarks().validate() {
+            errors.push(e);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     pub fn merge_cli_args(
         &mut self,
         host: Option<&str>,
@@ -999,6 +1203,7 @@ port = 5555
                 page_size: 4096,
                 use_direct_io: true,
                 memory_mode: false,
+                ..StorageConfig::default()
             },
             wal: WalConfig::default(),
             pool: PoolConfig::default(),
@@ -1198,5 +1403,167 @@ port = 5555
         cfg.merge_cli_args(None, Some(9999), None, None, None);
         assert_eq!(cfg.server.host, "127.0.0.1"); // unchanged
         assert_eq!(cfg.server.port, 9999); // changed
+    }
+
+    // -----------------------------------------------------------------
+    // validate() — startup config gates
+    // -----------------------------------------------------------------
+
+    /// The shipped defaults must pass their own validator, or every fresh
+    /// install fails to start.
+    #[test]
+    fn default_config_is_valid() {
+        assert_eq!(NucleusConfig::default().validate(), Ok(()));
+    }
+
+    /// A realistic hand-written config must also pass.
+    #[test]
+    fn representative_config_is_valid() {
+        let mut cfg = NucleusConfig::default();
+        cfg.server.max_connections = 200;
+        cfg.server.max_memory_mb = 4096;
+        cfg.storage.buffer_pool_size_mb = 1024;
+        cfg.cache.enabled = true;
+        cfg.cache.max_memory_mb = 512;
+        cfg.metrics.enabled = true;
+        cfg.metrics.port = 9100;
+        cfg.logging.level = "debug".to_string();
+        cfg.logging.format = "json".to_string();
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    fn errors_of(cfg: &NucleusConfig) -> Vec<String> {
+        cfg.validate().unwrap_err()
+    }
+
+    fn assert_flags(cfg: &NucleusConfig, needle: &str) {
+        let errs = errors_of(cfg);
+        assert!(
+            errs.iter().any(|e| e.contains(needle)),
+            "expected an error mentioning {needle:?}, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn zero_max_connections_is_rejected() {
+        let mut cfg = NucleusConfig::default();
+        cfg.server.max_connections = 0;
+        assert_flags(&cfg, "server.max_connections");
+    }
+
+    #[test]
+    fn pool_min_idle_above_max_connections_is_rejected() {
+        let mut cfg = NucleusConfig::default();
+        cfg.server.max_connections = 10;
+        cfg.pool.min_idle = 25;
+        assert_flags(&cfg, "pool.min_idle");
+        // Just under: fine.
+        cfg.pool.min_idle = 10;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn overcommitted_memory_budget_is_rejected() {
+        let mut cfg = NucleusConfig::default();
+        cfg.server.max_memory_mb = 512;
+        cfg.storage.buffer_pool_size_mb = 400;
+        cfg.cache.max_memory_mb = 200; // 600 > 512
+        assert_flags(&cfg, "exceeds server.max_memory_mb");
+        // Just under the ceiling: accepted.
+        cfg.cache.max_memory_mb = 112;
+        assert_eq!(cfg.validate(), Ok(()));
+        // 0 means "no global limit", so over-commit is not checkable.
+        cfg.server.max_memory_mb = 0;
+        cfg.cache.max_memory_mb = 4096;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn bad_page_size_is_rejected() {
+        let mut cfg = NucleusConfig::default();
+        cfg.storage.page_size = 5000; // not a power of two
+        assert_flags(&cfg, "storage.page_size");
+        cfg.storage.page_size = 256; // too small
+        assert_flags(&cfg, "storage.page_size");
+        cfg.storage.page_size = 8192;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn typoed_enums_fail_instead_of_silently_defaulting() {
+        let mut cfg = NucleusConfig::default();
+        cfg.wal.sync_mode = "fsyncc".to_string();
+        assert_flags(&cfg, "wal.sync_mode");
+
+        let mut cfg = NucleusConfig::default();
+        cfg.logging.level = "verbose".to_string();
+        assert_flags(&cfg, "logging.level");
+
+        let mut cfg = NucleusConfig::default();
+        cfg.cache.eviction_policy = "mru".to_string();
+        assert_flags(&cfg, "cache.eviction_policy");
+
+        // Values the codebase actually uses must all pass.
+        let mut cfg = NucleusConfig::default();
+        cfg.wal.sync_mode = "fdatasync".to_string();
+        cfg.cache.eviction_policy = "lfu".to_string();
+        cfg.replication.mode = "primary".to_string();
+        cfg.replication.sync_mode = "sync".to_string();
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn replica_without_a_primary_host_is_rejected() {
+        let mut cfg = NucleusConfig::default();
+        cfg.replication.mode = "replica".to_string();
+        assert_flags(&cfg, "primary_host");
+        cfg.replication.primary_host = Some("10.0.0.2".to_string());
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn metrics_port_colliding_with_the_sql_port_is_rejected() {
+        let mut cfg = NucleusConfig::default();
+        cfg.metrics.enabled = true;
+        cfg.metrics.port = cfg.server.port;
+        assert_flags(&cfg, "metrics.port");
+        // Disabled metrics cannot collide.
+        cfg.metrics.enabled = false;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn inverted_disk_watermarks_are_rejected_at_startup() {
+        // read-only above warn: the server would degrade without ever warning.
+        let mut cfg = NucleusConfig::default();
+        cfg.storage.disk_readonly_free_pct = 20.0;
+        cfg.storage.disk_warn_free_pct = 10.0;
+        assert_flags(&cfg, "without ever warning");
+
+        // resume below read-only: the server would flap at the boundary.
+        let mut cfg = NucleusConfig::default();
+        cfg.storage.disk_resume_free_pct = 1.0;
+        cfg.storage.disk_readonly_free_pct = 5.0;
+        assert_flags(&cfg, "flap");
+    }
+
+    #[test]
+    fn every_validation_problem_is_reported_at_once() {
+        let mut cfg = NucleusConfig::default();
+        cfg.server.max_connections = 0;
+        cfg.storage.page_size = 3;
+        cfg.logging.format = "xml".to_string();
+        let errs = errors_of(&cfg);
+        assert!(errs.len() >= 3, "expected all problems at once, got {errs:?}");
+    }
+
+    #[test]
+    fn disk_watermarks_come_from_config_including_the_mb_to_bytes_conversion() {
+        let mut cfg = NucleusConfig::default();
+        cfg.storage.disk_min_free_mb = 512;
+        cfg.storage.disk_readonly_free_pct = 4.5;
+        let marks = cfg.storage.disk_watermarks();
+        assert_eq!(marks.min_free_bytes, 512 * 1024 * 1024);
+        assert_eq!(marks.readonly_free_pct, 4.5);
     }
 }

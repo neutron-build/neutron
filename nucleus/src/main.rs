@@ -507,6 +507,7 @@ async fn cmd_start(cfg: StartConfig) {
     let config_path = data.join("nucleus.toml");
     let mut config = match NucleusConfig::load(&config_path) {
         Ok(cfg) => {
+            // `NucleusConfig::load` already overlays NUCLEUS_* env vars.
             eprintln!("Loaded config from {}", config_path.display());
             cfg
         }
@@ -557,6 +558,22 @@ async fn cmd_start(cfg: StartConfig) {
 
     // Derive subsystem budgets from the global memory limit
     config.apply_memory_budget();
+
+    // Refuse to start on a configuration that cannot do what it says. Doing
+    // this before the listener binds means an inverted watermark or a typo'd
+    // enum surfaces immediately, not the first time the safety net was
+    // supposed to catch something.
+    if let Err(problems) = config.validate() {
+        eprintln!("Refusing to start: invalid configuration");
+        for p in &problems {
+            eprintln!("  - {p}");
+        }
+        eprintln!(
+            "Fix {} (or the corresponding NUCLEUS_* environment variables) and retry.",
+            config_path.display()
+        );
+        std::process::exit(1);
+    }
 
     // Configure tracing with config-driven log level
     let log_directive = format!("nucleus={}", config.logging.level);
@@ -988,6 +1005,41 @@ async fn cmd_start(cfg: StartConfig) {
             "Query memory budget: {} MB (hash-join circuit-breaker)",
             config.server.max_memory_mb
         );
+    }
+
+    // Disk watermark monitor: sample free space on the data directory's
+    // filesystem and degrade the executor's write-admission gate to read-only
+    // *before* the filesystem fills, rather than discovering ENOSPC partway
+    // through a write. Writes resume automatically once free space climbs back
+    // above the (higher) resume watermark. In-memory mode has no data
+    // directory to watch.
+    if !memory && config.storage.disk_check_interval_secs > 0 {
+        let marks = config.storage.disk_watermarks();
+        let guard = Arc::new(nucleus::ops::DiskGuard::with_fs_probe(
+            data.clone(),
+            marks,
+            executor.service().clone(),
+        ));
+        // Evaluate once synchronously: starting up on an already-full disk
+        // must come up read-only, not accept writes until the first tick.
+        let first = guard.evaluate();
+        tracing::info!(
+            "Disk watermarks: warn<{:.1}% readonly<{:.1}% resume>{:.1}% min-free={} MB — {}",
+            marks.warn_free_pct,
+            marks.readonly_free_pct,
+            marks.resume_free_pct,
+            config.storage.disk_min_free_mb,
+            first.detail
+        );
+        let interval = std::time::Duration::from_secs(config.storage.disk_check_interval_secs);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // the first tick completes immediately
+            loop {
+                ticker.tick().await;
+                guard.evaluate();
+            }
+        });
     }
 
     // Commit-time durability default (config wal.synchronous_commit;
@@ -1707,8 +1759,20 @@ async fn cmd_start(cfg: StartConfig) {
     //   3. Run synchronous work (disk flush) on a blocking thread so it
     //      cannot stall a tokio worker.
     const SHUTDOWN_DEADLINE_SECS: u64 = 5;
+    /// How long to wait for in-flight connections before flushing. Must stay
+    /// comfortably under `SHUTDOWN_DEADLINE_SECS` so the flush and the
+    /// watchdog both still have room.
+    const DRAIN_BUDGET_SECS: u64 = 2;
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let shutdown_for_handler = shutdown_notify.clone();
+    // Drain coordinator: makes "stop accepting → finish in-flight work →
+    // persist → exit" an enforced order. Before this, the signal handler
+    // flushed and called `process::exit(0)` immediately after notifying the
+    // accept loop, so the accept loop's own drain never got to run and a
+    // request could be executing while the flush ran and the process died.
+    let drain = nucleus::ops::ShutdownCoordinator::new();
+    let drain_for_handler = drain.clone();
+    let drain_for_accept = drain.clone();
     let disk_for_shutdown = disk_engine.clone();
     let workers_for_shutdown = workers.clone();
     let runtime_for_shutdown = runtime.clone();
@@ -1751,6 +1815,25 @@ async fn cmd_start(cfg: StartConfig) {
         // ports are released and no new work is admitted.
         shutdown_for_handler.notify_waiters();
 
+        // Wait (bounded) for in-flight connections to finish BEFORE tearing
+        // down the runtime and flushing. An idle client costs the full budget,
+        // which is the price of not cutting off a request mid-write.
+        match drain_for_handler
+            .await_drain(std::time::Duration::from_secs(DRAIN_BUDGET_SECS))
+            .await
+        {
+            nucleus::ops::DrainOutcome::Drained { started_with } => {
+                if started_with > 0 {
+                    tracing::info!("Drained {started_with} in-flight connection(s)");
+                }
+            }
+            nucleus::ops::DrainOutcome::TimedOut { remaining } => {
+                tracing::warn!(
+                    "Shutdown drain timed out after {DRAIN_BUDGET_SECS}s with {remaining} connection(s) still active; continuing to flush"
+                );
+            }
+        }
+
         // Log runtime stats before shutdown
         let stats = runtime_for_shutdown.stats();
         tracing::info!(
@@ -1785,6 +1868,7 @@ async fn cmd_start(cfg: StartConfig) {
                 Err(e) => tracing::error!("Flush task panicked: {e}"),
             }
         }
+        drain_for_handler.mark_persisted();
         tracing::info!("Nucleus stopped.");
         // Hard-exit immediately; do not wait for the runtime to drop
         // background tasks (some of which never check a shutdown flag).
@@ -1991,15 +2075,39 @@ async fn cmd_start(cfg: StartConfig) {
             }
         };
 
-        // Acquire a connection slot from the pool
+        // Acquire a connection slot from the pool.
+        //
+        // `try_acquire`, not `acquire`: awaiting a slot here would block the
+        // accept loop for the whole acquire timeout (30 s by default) the
+        // moment the limit is reached, so a single over-limit client would
+        // stall every other connection — a limit that turns into an outage.
+        // And a refused client gets a real `FATAL 53300` frame instead of a
+        // silently dropped socket, which clients report as "server closed the
+        // connection unexpectedly".
         let pool_ref = conn_pool.clone();
-        let conn_id = match pool_ref.acquire(&peer_addr.to_string()).await {
+        let conn_id = match pool_ref.try_acquire(&peer_addr.to_string()).await {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!("Rejected connection from {peer_addr}: {e}");
-                drop(socket);
+                tracing::warn!(
+                    "Rejected connection from {peer_addr}: {e} (limit {})",
+                    config.server.max_connections
+                );
+                metrics.connections_rejected.inc();
+                let limit = config.server.max_connections;
+                tokio::spawn(async move {
+                    nucleus::wire::overload::refuse_too_many_connections(socket, limit).await;
+                });
                 continue;
             }
+        };
+
+        // Register the connection with the drain coordinator. `None` means
+        // shutdown already began between accept and here — refuse rather than
+        // start work the drain would then have to wait for.
+        let Some(inflight) = drain_for_accept.try_admit() else {
+            tracing::debug!("Refusing connection from {peer_addr}: server is shutting down");
+            pool_ref.release_with_metadata_cleanup(conn_id).await;
+            continue;
         };
 
         let core = router.route();
@@ -2025,39 +2133,36 @@ async fn cmd_start(cfg: StartConfig) {
             metrics_ref.active_connections.dec();
             router_ref.connection_ended(core);
             pool_ref.release_with_metadata_cleanup(conn_id).await;
+            // Dropped last so the drain coordinator only considers this
+            // connection finished after its cleanup has run. Dropping on a
+            // panic unwind too, so a blown-up connection cannot wedge
+            // shutdown.
+            drop(inflight);
         });
     }
 
-    // Drain in-flight connections with a tight timeout. Must be smaller than
-    // SHUTDOWN_DEADLINE_SECS in the signal handler so the watchdog has slack
-    // to actually fire if drain stalls.
-    if !connection_tasks.is_empty() {
-        let active = connection_tasks.len();
-        tracing::info!("Waiting for {active} in-flight connection(s) to finish (2s timeout)...");
-        let drain_deadline = tokio::time::sleep(std::time::Duration::from_secs(2));
-        tokio::pin!(drain_deadline);
-        loop {
-            tokio::select! {
-                result = connection_tasks.join_next() => {
-                    match result {
-                        Some(_) => {
-                            if connection_tasks.is_empty() {
-                                tracing::info!("All connections drained");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                _ = &mut drain_deadline => {
-                    let remaining = connection_tasks.len();
-                    tracing::warn!("Shutdown timeout: aborting {remaining} remaining connection(s)");
-                    connection_tasks.abort_all();
-                    break;
-                }
-            }
-        }
+    // The signal handler owns the ordered shutdown sequence (drain → flush →
+    // exit) and terminates the process itself. Returning from `main` here
+    // would end the process *before* that flush ran — which is what used to
+    // happen: this function's own 2 s drain finished first and dropped off the
+    // end of `main`, so "Data flushed to disk successfully" never appeared on
+    // a SIGTERM and durability rested entirely on the WAL.
+    //
+    // Wait for the handler to report persistence instead. The wait is bounded
+    // by the same deadline as the handler's hard-exit watchdog, so a wedged
+    // flush still cannot hang the process. Draining is *not* repeated here:
+    // two sequential 2 s drains would nearly exhaust the 5 s budget.
+    let persist_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_DEADLINE_SECS);
+    while !drain.is_persisted() && std::time::Instant::now() < persist_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    if !drain.is_persisted() {
+        tracing::warn!(
+            "Exiting without a confirmed flush: shutdown exceeded {SHUTDOWN_DEADLINE_SECS}s"
+        );
+    }
+    connection_tasks.abort_all();
 }
 
 /// Process an incoming cluster message (JoinCluster, Heartbeat, Raft RPCs, ForwardDml, etc.).
