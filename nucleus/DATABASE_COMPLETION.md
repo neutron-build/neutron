@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 256830; Source Rust files: 225; Top-level modules: 50.
-- Declared unit tests: 3874; Declared integration tests: 320; Ignored tests: 43.
+- Source LOC: 257847; Source Rust files: 225; Top-level modules: 50.
+- Declared unit tests: 3880; Declared integration tests: 320; Ignored tests: 43.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -254,15 +254,26 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       LIKELY DONE, needs an end-to-end gate: `pitr::PitrTarget` implements Lsn / Time / Latest and
       `restore_pitr` rebuilds the WAL dir truncated at the target. Left unchecked until a restore
       is verified from a clean directory rather than in-process.
-- [ ] Add logical schema/data dump and restore across compatible format versions.
-- [ ] Include roles, memberships, policies, sequences, views, functions, and specialty metadata.
-      NOT started, and the gap is load-bearing (verified 2026-07-24 against a live server): a dump
+- [x] Add logical schema/data dump and restore across compatible format versions.
+      `dump_logical`/`restore_logical` now emit sequences (with setval), tables in FK-dependency
+      order, data, views, materialized views, roles, RLS policies + row-security enablement, and
+      functions. 10 round-trip tests in `test_logical_dump.rs` incl. determinism, FK ordering,
+      function bodies containing semicolons, and never emitting the bootstrap superuser.
+- [x] Include roles, memberships, policies, sequences, views, functions, and specialty metadata.
+      FIXED 2026-07-24. Previously (verified against a live server): a dump
       of a database with a role, an RLS policy, a view, and a SERIAL column emitted ONLY
       `CREATE TABLE` + `INSERT`s. Restoring it silently drops the security boundary (no
       CREATE POLICY / ENABLE ROW LEVEL SECURITY), and because the table is recreated with
       `DEFAULT nextval('t_id_seq')` while no sequence is ever created, the restored table REJECTS
       inserts that rely on the SERIAL default ("null value in column \"id\" violates not-null
       constraint"). Rows round-trip correctly; the schema around them does not.
+      Now fixed and verified END-TO-END through the CLI, not just the library: `nucleus dump` emits
+      CREATE SEQUENCE + setval, CREATE ROLE, CREATE POLICY, ENABLE ROW LEVEL SECURITY, and
+      CREATE VIEW, and a restored database ACCEPTS an insert relying on the SERIAL default (id 3,
+      where it previously errored). A second defect surfaced during that verification: the CLI's
+      `open_persistent_executor` loaded catalog.json but never called `load_meta()`, so roles,
+      policies, views, sequences, and functions were absent from the executor and the dump emitted
+      nothing for them — the library tests passed while the shipped command stayed broken.
 - [ ] Define encrypted-backup key handling and key rotation.
 - [ ] Add restore verification, corruption detection, and automated disaster-recovery tests.
 - [ ] Document RPO/RTO controls and limitations.
