@@ -80,6 +80,26 @@ pub(crate) fn decode_scram_verifier(encoded: &str) -> Option<(Vec<u8>, Vec<u8>)>
     (parts.next().is_none()).then_some((salt, salted))
 }
 
+/// Turn the literal supplied to `PASSWORD '…'` into the stored credential.
+///
+/// A literal that is ALREADY a well-formed stored verifier is kept verbatim
+/// instead of being hashed a second time — the same rule PostgreSQL applies to
+/// `PASSWORD 'SCRAM-SHA-256$…'`. Without it a logical dump could not carry role
+/// credentials at all (the plaintext is never retained), so restoring a dump
+/// would leave every role unable to log in. Anything that is not a valid
+/// verifier is treated as a plaintext password and hashed.
+pub(crate) fn store_password_literal(literal: &str) -> String {
+    #[cfg(feature = "server")]
+    if decode_scram_verifier(literal).is_some() {
+        return literal.to_string();
+    }
+    #[cfg(not(feature = "server"))]
+    if literal.starts_with("EMBEDDED-BLAKE3$") {
+        return literal.to_string();
+    }
+    encode_scram_verifier(literal)
+}
+
 mod admin;
 mod aggregate;
 mod cache;
