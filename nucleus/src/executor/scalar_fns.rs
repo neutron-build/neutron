@@ -30,6 +30,16 @@ impl Executor {
     ) -> Result<Value, ExecError> {
         let args = self.extract_fn_args(func, row, col_meta)?;
 
+        // SECURITY ORDERING: strip the schema qualifier BEFORE any policy check
+        // reads the name. psql and ORMs schema-qualify builtin calls
+        // (pg_catalog.array_length, …) and the prefix never changes semantics.
+        // This strip used to sit AFTER the specialty fail-closed guard below,
+        // which made the guard trivially defeatable: `pg_catalog.kv_set(...)`
+        // did not match the "KV_" prefix, sailed past the check, and only THEN
+        // had its prefix removed — so it executed. Every policy decision in this
+        // function must see the same canonical name the dispatcher executes.
+        let fname = fname.strip_prefix("PG_CATALOG.").unwrap_or(fname);
+
         // Specialty stores do not yet carry table-policy metadata. When any
         // RLS policy is active for this principal, allowing their direct SQL
         // functions would create an alternate read/write channel around the
@@ -72,13 +82,6 @@ impl Executor {
                 "{fname} is unavailable while row-level security is active because this specialty-store surface has no policy-aware access path"
             )));
         }
-
-        // psql and ORMs schema-qualify builtin calls (pg_catalog.array_length,
-        // pg_catalog.pg_get_userbyid, …). The prefix never changes semantics —
-        // every builtin lives in pg_catalog — so strip it once here instead of
-        // duplicating a "PG_CATALOG.X" alternate on every match arm. (Arms that
-        // still spell out both forms predate this and are harmlessly redundant.)
-        let fname = fname.strip_prefix("PG_CATALOG.").unwrap_or(fname);
 
         match fname {
             // -- String functions --

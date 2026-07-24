@@ -89,7 +89,7 @@ foreign-key cascade paths, and trigger bodies. The core attack set runs against
 **all five storage engines** (memory, MVCC, columnar, LSM, disk), since each
 implements its own scan and lookup paths.
 
-Two defects that matrix found, both fixed:
+Three defects that matrix found, all fixed:
 
 - **Subquery identity loss.** Correlated subqueries are evaluated per row from
   a synchronous context through `sync_block_on`, which drives the future as a
@@ -107,6 +107,20 @@ Two defects that matrix found, both fixed:
   client asking "who am I" got the bootstrap name. They now report the session
   principal: `SESSION_USER` is the authenticated login role, `CURRENT_USER` and
   `CURRENT_ROLE` the effective role after `SET ROLE`.
+
+- **Schema-qualifying defeated the specialty fail-closed guard.** The guard
+  that refuses specialty-store functions while RLS is active read the raw
+  function name, and the `PG_CATALOG.` prefix strip ran AFTER it. So
+  `kv_set(...)` was correctly denied while `pg_catalog.kv_set(...)` did not
+  match the `KV_` prefix list, passed the check, and only then had its
+  qualifier removed — executing normally. That is a one-token bypass of every
+  specialty surface, and reachable by ordinary clients rather than only an
+  attacker, since psql and ORMs schema-qualify builtins as a matter of course.
+  The strip now runs BEFORE any policy decision, so every check sees the same
+  canonical name the dispatcher executes. Pinned by
+  `schema_qualifying_a_specialty_call_does_not_bypass_the_fail_closed_guard`,
+  which also asserts an ordinary qualified builtin (`pg_catalog.upper`) still
+  resolves, so the fix cannot be "corrected" into breaking psql.
 
 Not covered by the in-process matrix: replica/follower reads (needs a live
 cluster) and the wire-level protocol surfaces, which `compat/` covers

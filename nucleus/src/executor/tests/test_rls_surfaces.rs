@@ -958,3 +958,48 @@ async fn trigger_bodies_do_not_launder_protected_rows() {
         rows(&r[0])
     );
 }
+
+// ============================================================================
+// Group J — schema-qualified specialty calls
+// ============================================================================
+
+/// The specialty fail-closed guard must read the SAME canonical name the
+/// dispatcher executes.
+///
+/// Regression pin: the `PG_CATALOG.` prefix strip used to run AFTER this
+/// guard, so `pg_catalog.kv_set(...)` did not match the `KV_` prefix list,
+/// sailed past the check, and only then had its qualifier removed — giving a
+/// one-token bypass of every specialty fail-closed surface while RLS was
+/// active. psql and ORMs schema-qualify builtins routinely, so this was
+/// reachable by ordinary clients, not just an attacker.
+#[tokio::test]
+async fn schema_qualifying_a_specialty_call_does_not_bypass_the_fail_closed_guard() {
+    let ex = test_executor();
+    let sid = setup(&ex).await;
+
+    // Both spellings of the same call must be refused identically.
+    for sql in [
+        "SELECT KV_SET('k', 'v')",
+        "SELECT pg_catalog.KV_SET('k', 'v')",
+        "SELECT PG_CATALOG.KV_SET('k', 'v')",
+        "SELECT pg_catalog.kv_set('k', 'v')",
+        "SELECT DOC_INSERT('c', '{\"a\":1}')",
+        "SELECT pg_catalog.doc_insert('c', '{\"a\":1}')",
+        "SELECT pg_catalog.graph_add_node('n')",
+        "SELECT pg_catalog.cdc_count()",
+    ] {
+        let r = exec_session(&ex, sid, sql).await;
+        assert!(
+            r.is_err(),
+            "specialty surface reachable under RLS via `{sql}` — the fail-closed \
+             guard was bypassed"
+        );
+    }
+
+    // Guard against over-correction: an ordinary schema-qualified builtin must
+    // still work, since stripping the prefix is what makes psql/ORMs function.
+    let r = exec_session(&ex, sid, "SELECT pg_catalog.upper('abc')")
+        .await
+        .expect("schema-qualified ordinary builtin must still resolve");
+    assert_eq!(scalar(&r[0]), &Value::Text("ABC".into()));
+}
