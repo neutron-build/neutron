@@ -77,6 +77,14 @@ impl Executor {
                 ));
             }
         };
+        if format == "binary" {
+            // Binary COPY FROM decodes at the wire layer (it needs the raw
+            // byte stream); the inline/embedded path only carries text lines.
+            return Err(ExecError::Unsupported(
+                "COPY FROM STDIN WITH (FORMAT binary) is only supported over the wire protocol"
+                    .into(),
+            ));
+        }
         let table_def = self.get_table(&table_name).await?;
         let num_cols = table_def.columns.len();
         let mut count = 0;
@@ -158,7 +166,11 @@ impl Executor {
                 // materialized path (shared formatters). RLS or an explicit column
                 // subset falls back below.
                 #[cfg(feature = "server")]
-                if columns.is_empty() && !self.any_rls_active() && self.copy_streaming_enabled() {
+                if format != "binary"
+                    && columns.is_empty()
+                    && !self.any_rls_active()
+                    && self.copy_streaming_enabled()
+                {
                     let storage = self.storage_for(&table);
                     let source_iter = Box::new(super::scan_stream::ChunkedScanIter::new(
                         storage,
@@ -200,13 +212,69 @@ impl Executor {
         // shared query-memory budget so a full-table export can't OOM the box.
         let _mem = self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?;
 
+        // A named column subset projects (and reorders) the output columns.
+        let (columns, rows, col_types) = match &source {
+            ast::CopySource::Table {
+                table_name,
+                columns: named,
+            } if !named.is_empty() => {
+                let table = crate::sql::object_name_key(table_name);
+                let table_def = self.get_table(&table).await?;
+                let mut idxs = Vec::with_capacity(named.len());
+                let mut types = Vec::with_capacity(named.len());
+                for c in named {
+                    let pos = table_def
+                        .columns
+                        .iter()
+                        .position(|tc| tc.name.eq_ignore_ascii_case(&c.value))
+                        .ok_or_else(|| ExecError::ColumnNotFound(c.value.clone()))?;
+                    idxs.push(pos);
+                    types.push(table_def.columns[pos].data_type.clone());
+                }
+                let projected: Vec<Row> = rows
+                    .iter()
+                    .map(|r| idxs.iter().map(|&i| r[i].clone()).collect())
+                    .collect();
+                (columns, projected, Some(types))
+            }
+            ast::CopySource::Table { table_name, .. } => {
+                let table = crate::sql::object_name_key(table_name);
+                let table_def = self.get_table(&table).await?;
+                let types = table_def
+                    .columns
+                    .iter()
+                    .map(|c| c.data_type.clone())
+                    .collect();
+                (columns, rows, Some(types))
+            }
+            ast::CopySource::Query(_) => (columns, rows, None),
+        };
+
+        let row_count = rows.len();
+        if format == "binary" {
+            // Types come from the table definition; for COPY (query) infer
+            // from the first row's values.
+            let types = match col_types {
+                Some(t) => t,
+                None => rows
+                    .first()
+                    .map(|r| r.iter().map(super::helpers::value_type).collect())
+                    .unwrap_or_default(),
+            };
+            let data = encode_copy_binary(&rows, &types)?;
+            return Ok(ExecResult::CopyOutBinary {
+                data,
+                row_count,
+                columns: columns.len(),
+            });
+        }
+
         let mut output = String::new();
         if include_header {
             output.push_str(&format_copy_header(&columns, is_csv, delimiter));
         }
         output.push_str(&format_copy_body(&rows, is_csv, delimiter));
 
-        let row_count = rows.len();
         Ok(ExecResult::CopyOut {
             data: output,
             row_count,
@@ -337,4 +405,121 @@ pub(crate) fn format_copy_body(rows: &[Row], is_csv: bool, delimiter: char) -> S
         }
     }
     out
+}
+
+/// Encode rows as a complete PostgreSQL binary-COPY payload
+/// (signature + per-tuple field data + trailer).
+pub(super) fn encode_copy_binary(
+    rows: &[Row],
+    types: &[DataType],
+) -> Result<Vec<u8>, ExecError> {
+    let mut out = Vec::with_capacity(19 + rows.len() * (2 + types.len() * 8));
+    out.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+    out.extend_from_slice(&0u32.to_be_bytes()); // flags
+    out.extend_from_slice(&0u32.to_be_bytes()); // header extension length
+    for row in rows {
+        out.extend_from_slice(&(types.len() as i16).to_be_bytes());
+        for (i, ty) in types.iter().enumerate() {
+            match row.get(i).unwrap_or(&Value::Null) {
+                Value::Null => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                v => {
+                    let bytes = encode_binary_field(v, ty)?;
+                    out.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    out.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&(-1i16).to_be_bytes());
+    Ok(out)
+}
+
+/// One value in PostgreSQL binary wire encoding, per the declared column type.
+fn encode_binary_field(v: &Value, ty: &DataType) -> Result<Vec<u8>, ExecError> {
+    let unsupported = || {
+        ExecError::Unsupported(format!(
+            "binary COPY does not support values of type {ty}"
+        ))
+    };
+    Ok(match (v, ty) {
+        (Value::Bool(b), _) => vec![*b as u8],
+        (Value::Int32(n), DataType::Int64) => (*n as i64).to_be_bytes().to_vec(),
+        (Value::Int32(n), DataType::Float64) => (*n as f64).to_be_bytes().to_vec(),
+        (Value::Int64(n), DataType::Int32) => i32::try_from(*n)
+            .map_err(|_| ExecError::Runtime(format!("integer out of range: {n}")))?
+            .to_be_bytes()
+            .to_vec(),
+        (Value::Int64(n), DataType::Float64) => (*n as f64).to_be_bytes().to_vec(),
+        (Value::Int32(n), _) => n.to_be_bytes().to_vec(),
+        (Value::Int64(n), _) => n.to_be_bytes().to_vec(),
+        (Value::Float64(f), _) => f.to_be_bytes().to_vec(),
+        (Value::Text(s), _) => s.as_bytes().to_vec(),
+        (Value::Bytea(b), _) => b.clone(),
+        // Nucleus stores dates/timestamps against the PostgreSQL epoch
+        // (2000-01-01), so the stored representation IS the wire encoding.
+        (Value::Date(days), _) => days.to_be_bytes().to_vec(),
+        (Value::Timestamp(us), _) | (Value::TimestampTz(us), _) => us.to_be_bytes().to_vec(),
+        (Value::Uuid(bytes), _) => bytes.to_vec(),
+        (Value::Numeric(s), _) => encode_binary_numeric(s)?,
+        (Value::Jsonb(j), _) => {
+            // jsonb binary format: version byte then the JSON text.
+            let mut b = vec![1u8];
+            b.extend_from_slice(j.to_string().as_bytes());
+            b
+        }
+        _ => return Err(unsupported()),
+    })
+}
+
+/// PostgreSQL binary NUMERIC (NBASE-10000): u16 ndigits, i16 weight,
+/// u16 sign, u16 dscale, then ndigits base-10000 digit words.
+fn encode_binary_numeric(text: &str) -> Result<Vec<u8>, ExecError> {
+    let t = text.trim();
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int_part, frac_part) = t.split_once('.').unwrap_or((t, ""));
+    if int_part.chars().chain(frac_part.chars()).any(|c| !c.is_ascii_digit()) {
+        return Err(ExecError::Runtime(format!("invalid numeric value: {text}")));
+    }
+    let dscale = frac_part.len() as u16;
+
+    // Left-pad the integer digits to a 4-digit boundary, right-pad the
+    // fraction, then group into base-10000 words.
+    let int_digits = int_part.trim_start_matches('0');
+    let lead_pad = (4 - int_digits.len() % 4) % 4;
+    let mut digits: Vec<u8> = Vec::with_capacity(lead_pad + int_digits.len() + frac_part.len() + 3);
+    digits.resize(lead_pad, 0);
+    digits.extend(int_digits.bytes().map(|b| b - b'0'));
+    let int_words = digits.len() / 4;
+    digits.extend(frac_part.bytes().map(|b| b - b'0'));
+    while !digits.len().is_multiple_of(4) {
+        digits.push(0);
+    }
+    let mut words: Vec<u16> = digits
+        .chunks(4)
+        .map(|c| c.iter().fold(0u16, |acc, d| acc * 10 + *d as u16))
+        .collect();
+    let mut weight = int_words as i16 - 1;
+    // Strip leading zero words (adjusting weight) and trailing zero words.
+    while words.first() == Some(&0) {
+        words.remove(0);
+        weight -= 1;
+    }
+    while words.last() == Some(&0) {
+        words.pop();
+    }
+    if words.is_empty() {
+        weight = 0;
+    }
+    let mut out = Vec::with_capacity(8 + words.len() * 2);
+    out.extend_from_slice(&(words.len() as u16).to_be_bytes());
+    out.extend_from_slice(&weight.to_be_bytes());
+    out.extend_from_slice(&if neg { 0x4000u16 } else { 0u16 }.to_be_bytes());
+    out.extend_from_slice(&dscale.to_be_bytes());
+    for w in words {
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+    Ok(out)
 }

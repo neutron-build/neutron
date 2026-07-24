@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 253399; Source Rust files: 220; Top-level modules: 50.
-- Declared unit tests: 3851; Declared integration tests: 319; Ignored tests: 43.
+- Source LOC: 254536; Source Rust files: 220; Top-level modules: 50.
+- Declared unit tests: 3851; Declared integration tests: 320; Ignored tests: 43.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -239,19 +239,42 @@ Goal: common PostgreSQL clients behave predictably across the declared compatibi
       `compat/pgregress` diffs 12 dense SQL scripts against a real PostgreSQL 17 through the
       same psql client; 12/12 pass, deviations documented in `compat/pgregress/DEVIATIONS.md`.
       The differential run found and fixed ~35 real correctness bugs (2026-07-23).
-- [ ] Complete extended-query Parse/Bind/Describe/Execute/Sync semantics and parameter inference.
-- [ ] Verify portals, prepared statement lifecycle, transaction error state, cancellation, and timeout.
-- [ ] Complete COPY text/binary behavior for the supported subset.
-- [ ] Normalize SQLSTATE/error fields, notices, command tags, row descriptions, and type OIDs.
-- [ ] Verify TLS/SCRAM negotiation and pooler reconnect/session-reset behavior.
+- [x] Complete extended-query Parse/Bind/Describe/Execute/Sync semantics and parameter inference.
+      Exercised end-to-end by pgjdbc (`compat/jdbc`, 158 checks: named server statements past
+      prepareThreshold, binary parameter AND result transfer, Describe metadata, pipelined
+      Parse+Describe+Bind+Execute), psycopg (`compat/pooler/prepared_txn.py`), and the ORM matrix.
+- [x] Verify portals, prepared statement lifecycle, transaction error state, cancellation, and
+      timeout. Wire CancelRequest implemented (BackendKeyData key issue + cooperative cancel
+      checkpoints in filter/join loops, SQLSTATE 57014; verified via psql Ctrl-C and pgjdbc
+      setQueryTimeout). Transaction error state returns 25P02. statement_timeout follows PG
+      millisecond units. Cancellation granularity documented in `compat/pgregress/DEVIATIONS.md`.
+- [x] Complete COPY text/binary behavior for the supported subset. `COPY ... WITH (FORMAT binary)`
+      both directions, differentially verified against PostgreSQL 17 (`compat/copybinary`:
+      PG→Nucleus, Nucleus→PG, subset round-trip, malformed-stream rejection). Unsupported types
+      fail loudly (0A000/22P04), never a plausible wrong result.
+- [x] Normalize SQLSTATE/error fields, notices, command tags, row descriptions, and type OIDs.
+      Command tags: row counts only on row-affecting tags (was "CREATE TABLE 0"). Row
+      descriptions: PostgreSQL default output-column naming (qualified refs name by last
+      component, functions/aggregates by bare lowercased name) across direct, plan, aggregate,
+      window, and streaming paths. SQLSTATEs added: 25P02, 57014, 22P04. Float8 text output uses
+      PG exponent spelling ("1e+100").
+- [x] Verify TLS/SCRAM negotiation and pooler reconnect/session-reset behavior. TLS (auto
+      self-signed) + SCRAM-SHA-256 live-verified via psql sslmode=require. PgBouncer session +
+      transaction pooling PASS (`compat/pooler`): churn, concurrent multiplexing, DISCARD ALL
+      server reset, prepared statements across server-connection swaps, pinned interactive
+      transactions.
 - [x] Test psql, libpq/psycopg, tokio-postgres, SQLAlchemy, and TWO JS ORMs (Drizzle via
       postgres-js, Prisma via quaint): the `compat/orm` harness runs each ORM's canonical
       migrate→CRUD→transaction→reflection flow against a release server and all three PASS
       (2026-07-21; findings log in `compat/orm/README.md`). psql meta-commands live-verified
-      against psql 17. pgcli, JDBC, and Npgsql remain untested.
+      against psql 17. JDBC (pgjdbc 42.7.7) PASS via `compat/jdbc` (2026-07-23; findings in its
+      README — the harness flushed 8 engine bug classes, all fixed). pgcli runs clean (queries,
+      \d, completion metadata — needed pg_depend). Npgsql remains untested (no .NET toolchain
+      on the dev box).
 - [x] Add compatibility tests for migrations, introspection, transactions, and prepared queries
       (`compat/orm` harness: drizzle-kit push, prisma db push, SQLAlchemy create_all + inspector
-      reflection, interactive transactions, prepared statements). Pooler behavior remains untested.
+      reflection, interactive transactions, prepared statements). Pooler behavior covered by
+      `compat/pooler` (2026-07-23).
 
 Exit gate:
 

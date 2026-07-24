@@ -573,12 +573,30 @@ impl Executor {
         }
         let combined_meta: Vec<ColMeta> =
             left_meta.iter().chain(right_meta.iter()).cloned().collect();
-        let mut rows = Vec::with_capacity(product);
-        for lr in left_rows {
-            for rr in right_rows {
-                rows.push(lr.iter().chain(rr.iter()).cloned().collect());
+        let materialize = || {
+            let mut rows = Vec::with_capacity(product);
+            for lr in left_rows {
+                // Cartesian products are a long non-yielding loop — observe
+                // wire cancellation between outer rows.
+                self.check_cancelled()?;
+                for rr in right_rows {
+                    rows.push(lr.iter().chain(rr.iter()).cloned().collect());
+                }
             }
-        }
+            Ok::<_, ExecError>(rows)
+        };
+        // Long blocking materialization on a tokio worker stalls the IO
+        // driver (delays unrelated connections, including CancelRequests) —
+        // notify the runtime.
+        let rows = match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                    && product > 100_000 =>
+            {
+                tokio::task::block_in_place(materialize)?
+            }
+            _ => materialize()?,
+        };
         Ok((combined_meta, rows))
     }
 }

@@ -1296,3 +1296,34 @@ mod binary_params {
         server.abort();
     }
 }
+
+// ============================================================================
+// Prisma schema-engine describe shape: catalog query with a text[] parameter
+// ============================================================================
+
+/// Prisma's describe pipeline sends `... WHERE nspname = ANY ( $1 )` with a
+/// binary text[] parameter through tokio-postgres (quaint). The result must
+/// carry the selected column — an empty DataRow panics the schema engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn prisma_namespaces_query_shape() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    for (label, sql) in [
+        ("plain", "SELECT nspname FROM pg_namespace WHERE nspname = ANY ( $1 )"),
+        ("alias", "SELECT namespace.nspname as namespace_name FROM pg_namespace as namespace WHERE namespace.nspname = ANY ( $1 )"),
+        (
+            "orderby",
+            "SELECT namespace.nspname as namespace_name FROM pg_namespace as namespace WHERE namespace.nspname = ANY ( $1 ) ORDER BY namespace_name",
+        ),
+    ] {
+        let rows = client
+            .query(sql, &[&vec!["public".to_string()]])
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(rows.len(), 1, "{label}: one matching namespace");
+        assert_eq!(rows[0].len(), 1, "{label}: row must carry the column");
+    }
+
+    server.abort();
+}

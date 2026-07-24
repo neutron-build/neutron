@@ -48,7 +48,9 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::response::{CommandComplete, NotificationResponse};
-use pgwire::messages::startup::{Authentication, PasswordMessageFamily};
+use pgwire::api::cancel::CancelHandler;
+use pgwire::messages::cancel::CancelRequest;
+use pgwire::messages::startup::{Authentication, PasswordMessageFamily, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use compression::WireCompressor;
@@ -506,6 +508,7 @@ struct CopyInfo {
     columns: Option<Vec<String>>,
     delimiter: u8,
     is_csv: bool,
+    is_binary: bool,
     has_header: bool,
 }
 
@@ -514,6 +517,7 @@ struct CopyInProgress {
     columns: Option<Vec<String>>,
     delimiter: u8,
     is_csv: bool,
+    is_binary: bool,
     has_header: bool,
     data: Vec<u8>,
     session_id: u64,
@@ -565,6 +569,12 @@ pub struct NucleusHandler {
     // ── Large Objects ────────────────────────────────────────────────────
     /// Per-connection large object descriptors: peer addr → LargeObjectState.
     lo_state: parking_lot::Mutex<std::collections::HashMap<String, LargeObjectState>>,
+
+    // ── Query cancellation (wire CancelRequest) ──────────────────────────
+    /// Cancel keys handed out in BackendKeyData: pid → (secret, session_id).
+    cancel_keys: parking_lot::RwLock<std::collections::HashMap<i32, (SecretKey, u64)>>,
+    /// Per-session cancel signal, raced against query execution.
+    cancel_notifies: parking_lot::RwLock<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>,
 }
 
 impl NucleusHandler {
@@ -595,6 +605,8 @@ impl NucleusHandler {
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
             lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -662,6 +674,8 @@ impl NucleusHandler {
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
             lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -823,13 +837,30 @@ impl NucleusHandler {
                 if tag.eq_ignore_ascii_case("COMMIT") || tag.eq_ignore_ascii_case("ROLLBACK") {
                     return Ok(Response::TransactionEnd(Tag::new(wire_tag)));
                 }
-                Ok(Response::Execution(
-                    Tag::new(wire_tag).with_rows(rows_affected),
-                ))
+                // PostgreSQL appends a row count only to row-affecting tags
+                // ("INSERT 0 2", "UPDATE 3"); DDL/utility tags are bare
+                // ("CREATE TABLE", "DISCARD ALL" — never "CREATE TABLE 0").
+                let counted = matches!(
+                    tag.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str(),
+                    "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "COPY" | "FETCH" | "MOVE" | "MERGE"
+                );
+                if counted {
+                    Ok(Response::Execution(
+                        Tag::new(wire_tag).with_rows(rows_affected),
+                    ))
+                } else {
+                    Ok(Response::Execution(Tag::new(wire_tag)))
+                }
             }
             ExecResult::CopyOut { row_count, .. } => {
                 Ok(Response::Execution(Tag::new("COPY").with_rows(row_count)))
             }
+            // Binary COPY TO is sent inline by the simple-query loop; the
+            // extended protocol has no inline path (same constraint as the
+            // streaming variant below).
+            ExecResult::CopyOutBinary { .. } => Err(PgWireError::ApiError(
+                "binary COPY TO STDOUT requires the simple query protocol".into(),
+            )),
             // Streaming SELECT: pull batches lazily from the producer and encode
             // rows as they arrive, so peak memory is O(batch) and the first row
             // reaches the client without materializing the whole result. Reaches
@@ -967,25 +998,51 @@ impl NucleusHandler {
 
         let fut = self.executor.execute_with_session(session_id, sql);
 
+        // Race execution against a wire CancelRequest for this session.
+        // `biased` checks the cancel signal first so a cancel that arrived
+        // while execution was inside a blocking (non-yielding) region still
+        // wins at the next poll. Granularity matches statement_timeout: the
+        // cancel takes effect at the executor's next await point.
+        let cancel = self.cancel_notifies.read().get(&session_id).cloned();
+        let fut = async move {
+            match cancel {
+                Some(notify) => {
+                    tokio::select! {
+                        biased;
+                        _ = notify.notified() => Err(PgWireError::UserError(Box::new(
+                            ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "57014".to_owned(), // query_canceled
+                                "canceling statement due to user request".to_owned(),
+                            ),
+                        ))),
+                        result = fut => result.map_err(exec_error_to_pgwire),
+                    }
+                }
+                None => fut.await.map_err(exec_error_to_pgwire),
+            }
+        };
+
         // Per-session statement_timeout overrides the global default.
-        // SET statement_timeout = N (seconds) to configure per-connection.
-        let timeout_secs = self
+        // Units follow PostgreSQL: a bare number is MILLISECONDS; "Ns"/"Nms"
+        // suffixes are accepted. The server-config default stays in seconds.
+        let timeout_ms = self
             .executor
             .get_session_setting(session_id, "statement_timeout")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(self.statement_timeout_secs);
+            .and_then(|v| parse_timeout_ms(&v))
+            .unwrap_or(self.statement_timeout_secs * 1000);
 
-        if timeout_secs > 0 {
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
-                Ok(result) => result.map_err(exec_error_to_pgwire),
+        if timeout_ms > 0 {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut).await {
+                Ok(result) => result,
                 Err(_elapsed) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
                     "57014".to_owned(), // query_canceled
-                    format!("canceling statement due to statement timeout ({timeout_secs}s)",),
+                    format!("canceling statement due to statement timeout ({timeout_ms}ms)",),
                 )))),
             }
         } else {
-            fut.await.map_err(exec_error_to_pgwire)
+            fut.await
         }
     }
 
@@ -1341,7 +1398,19 @@ impl StartupHandler for NucleusHandler {
                 // TO STDOUT stream by default for it (bounded-memory export).
                 self.executor.mark_session_stream_capable(session_id);
                 let addr = client.socket_addr().to_string();
-                self.session_registry.write().insert(addr, session_id);
+                self.session_registry.write().insert(addr.clone(), session_id);
+
+                // Issue the cancellation key sent in BackendKeyData (during
+                // finish_authentication) and register it so a later
+                // CancelRequest on a fresh connection can interrupt this
+                // session's running query.
+                let pid = self.connection_pid(&addr);
+                let secret = SecretKey::I32(rand::random::<i32>());
+                client.set_pid_and_secret_key(pid, secret.clone());
+                self.cancel_keys.write().insert(pid, (secret, session_id));
+                self.cancel_notifies
+                    .write()
+                    .insert(session_id, Arc::new(tokio::sync::Notify::new()));
 
                 if !auth_required {
                     finish_authentication(client, &self.parameter_provider).await?;
@@ -1469,6 +1538,9 @@ impl SimpleQueryHandler for NucleusHandler {
     {
         let peer_addr_str = client.socket_addr().to_string();
         let session_id = self.session_id_from_client(client);
+        // New client command: a cancel for a previous command must not leak
+        // into this one.
+        self.executor.clear_session_cancel(session_id);
 
         // Inside an active transaction, all autocommit fast paths are disabled:
         // they bypass the session's MVCC snapshot and write straight to storage,
@@ -1552,6 +1624,19 @@ impl SimpleQueryHandler for NucleusHandler {
         // Detect COPY ... FROM STDIN and enter copy-in mode.
         if let Some(copy_info) = detect_copy_from_stdin(query) {
             let peer_addr = client.socket_addr();
+            let is_binary = copy_info.is_binary;
+            // Binary CopyInResponse advertises per-column binary format codes.
+            let ncols = if is_binary {
+                match &copy_info.columns {
+                    Some(cols) => cols.len(),
+                    None => self
+                        .executor
+                        .table_column_types(&copy_info.table)
+                        .map_or(0, |c| c.len()),
+                }
+            } else {
+                0
+            };
             self.copy_state.lock().insert(
                 peer_addr,
                 CopyInProgress {
@@ -1559,12 +1644,18 @@ impl SimpleQueryHandler for NucleusHandler {
                     columns: copy_info.columns,
                     delimiter: copy_info.delimiter,
                     is_csv: copy_info.is_csv,
+                    is_binary,
                     has_header: copy_info.has_header,
                     data: Vec::new(),
                     session_id,
                 },
             );
-            return Ok(vec![Response::CopyIn(CopyResponse::new(0, 0, vec![]))]);
+            let response = if is_binary {
+                CopyResponse::new(1, ncols, vec![1; ncols])
+            } else {
+                CopyResponse::new(0, 0, vec![])
+            };
+            return Ok(vec![Response::CopyIn(response)]);
         }
 
         let results = self.execute_sql_session(session_id, query).await?;
@@ -1572,6 +1663,39 @@ impl SimpleQueryHandler for NucleusHandler {
         let mut responses = Vec::new();
         let mut bytes_estimate: u64 = 0;
         for result in results {
+            // COPY TO STDOUT (FORMAT binary): one binary payload under a
+            // format=1 CopyOutResponse with per-column binary format codes.
+            if let crate::executor::ExecResult::CopyOutBinary {
+                data,
+                row_count,
+                columns,
+            } = result
+            {
+                use pgwire::api::copy::send_copy_out_response;
+                bytes_estimate += data.len() as u64;
+                send_copy_out_response(
+                    client,
+                    CopyResponse::new(1, columns, vec![1; columns]),
+                )
+                .await?;
+                const CHUNK_SIZE: usize = 65_536;
+                for chunk in data.chunks(CHUNK_SIZE) {
+                    client
+                        .send(PgWireBackendMessage::CopyData(CopyData::new(
+                            bytes::Bytes::copy_from_slice(chunk),
+                        )))
+                        .await?;
+                }
+                client
+                    .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                    .await?;
+                client
+                    .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                        format!("COPY {row_count}"),
+                    )))
+                    .await?;
+                continue;
+            }
             // COPY TO STDOUT: stream rows directly rather than returning a Response.
             if let crate::executor::ExecResult::CopyOut { data, row_count } = result {
                 use pgwire::api::copy::send_copy_out_response;
@@ -1793,6 +1917,26 @@ impl ExtendedQueryHandler for NucleusHandler {
     {
         let parsed_stmt = &portal.statement.statement;
         let session_id = self.session_id_from_client(client);
+        // NOTE: no cancel-flag clear at entry. Extended-protocol clients
+        // pipeline Parse+Describe+Bind+Execute in one batch; a cancel that
+        // lands while the Describe probe runs targets this same client
+        // operation, and clearing at Execute entry would drop it. Instead the
+        // flag clears when this Execute finishes (drop guard), so a cancel
+        // that arrived too late to stop this command can't leak into the
+        // next one.
+        struct ClearCancelOnDrop {
+            executor: Arc<Executor>,
+            session_id: u64,
+        }
+        impl Drop for ClearCancelOnDrop {
+            fn drop(&mut self) {
+                self.executor.clear_session_cancel(self.session_id);
+            }
+        }
+        let _clear_cancel = ClearCancelOnDrop {
+            executor: self.executor.clone(),
+            session_id,
+        };
         let peer_addr_str = client.socket_addr().to_string();
         let rls_active = self.executor.session_has_active_rls(session_id);
 
@@ -1968,7 +2112,44 @@ impl CopyHandler for NucleusHandler {
             return Ok(());
         };
 
-        let rows = parse_copy_rows(&state.data, state.delimiter, state.is_csv, state.has_header);
+        let rows = if state.is_binary {
+            // Resolve the target column types so each binary field can be
+            // decoded into the text-literal form the INSERT path expects.
+            let all = self.executor.table_column_types(&state.table).ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P01".to_owned(),
+                    format!("relation \"{}\" does not exist", state.table),
+                )))
+            })?;
+            let types: Vec<DataType> = match &state.columns {
+                Some(cols) => cols
+                    .iter()
+                    .map(|c| {
+                        all.iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(c))
+                            .map(|(_, t)| t.clone())
+                            .ok_or_else(|| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "42703".to_owned(),
+                                    format!("column \"{c}\" does not exist"),
+                                )))
+                            })
+                    })
+                    .collect::<PgWireResult<_>>()?,
+                None => all.into_iter().map(|(_, t)| t).collect(),
+            };
+            parse_copy_binary_rows(&state.data, &types).map_err(|msg| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P04".to_owned(), // bad_copy_file_format
+                    msg,
+                )))
+            })?
+        } else {
+            parse_copy_rows(&state.data, state.delimiter, state.is_csv, state.has_header)
+        };
         let row_count = rows.len();
 
         // Insert in batches of 500 rows.
@@ -2036,6 +2217,7 @@ impl NucleusHandler {
             }
             ExecResult::Command { tag, .. } => tag.len() as u64 + 16,
             ExecResult::CopyOut { data, .. } => data.len() as u64,
+            ExecResult::CopyOutBinary { data, .. } => data.len() as u64,
             // Row count unknown until drained; estimate from the header only.
             ExecResult::SelectStream { columns, .. } => columns.len() as u64 * 32,
             ExecResult::CopyOutStream { columns, .. } => columns.len() as u64 * 32,
@@ -2065,7 +2247,11 @@ impl NucleusHandler {
                 self.notification_registry.remove_channel_if_empty(ch);
             }
         }
-        self.connection_pids.write().remove(peer_addr);
+        if let Some(pid) = self.connection_pids.write().remove(peer_addr)
+            && let Some((_, session_id)) = self.cancel_keys.write().remove(&pid)
+        {
+            self.cancel_notifies.write().remove(&session_id);
+        }
         // Clean up large object descriptors.
         self.lo_state.lock().remove(peer_addr);
     }
@@ -2526,6 +2712,74 @@ impl PgWireServerHandlers for NucleusServer {
 
     fn copy_handler(&self) -> Arc<impl CopyHandler> {
         self.handler.clone()
+    }
+
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
+        self.handler.clone()
+    }
+}
+
+#[async_trait]
+impl CancelHandler for NucleusHandler {
+    /// Handle a wire CancelRequest (arrives on its own short-lived
+    /// connection). The (pid, secret) pair must match what BackendKeyData
+    /// advertised; on mismatch the request is silently ignored, per protocol.
+    async fn on_cancel_request(&self, request: CancelRequest) {
+        // Protocol 3.0 carries the secret as i32, 3.2 as bytes — a client may
+        // echo the key in either form, so compare canonical byte values.
+        fn secret_matches(a: &SecretKey, b: &SecretKey) -> bool {
+            let as_bytes = |k: &SecretKey| -> Vec<u8> {
+                match k {
+                    SecretKey::I32(v) => v.to_be_bytes().to_vec(),
+                    SecretKey::Bytes(b) => b.to_vec(),
+                }
+            };
+            constant_time_eq(&as_bytes(a), &as_bytes(b))
+        }
+        let session = {
+            let keys = self.cancel_keys.read();
+            match keys.get(&request.pid) {
+                Some((secret, session_id)) if secret_matches(secret, &request.secret_key) => {
+                    Some(*session_id)
+                }
+                _ => None,
+            }
+        };
+        match session {
+            Some(session_id) => {
+                tracing::info!(pid = request.pid, session_id, "query cancel request accepted");
+                // Cooperative flag: long compute loops poll it (rayon filters,
+                // cartesian products) — this is what interrupts CPU-bound work.
+                self.executor.request_session_cancel(session_id);
+                // Notify: wakes the wire-level race for executions parked at
+                // an await point.
+                if let Some(notify) = self.cancel_notifies.read().get(&session_id) {
+                    notify.notify_one();
+                }
+            }
+            None => {
+                tracing::debug!(pid = request.pid, "query cancel request ignored (key mismatch)");
+            }
+        }
+    }
+}
+
+/// Parse a statement_timeout setting into milliseconds, following
+/// PostgreSQL's convention: bare integers are milliseconds; "s"/"ms"/"min"
+/// suffixes are honoured. Returns None for unparseable values.
+fn parse_timeout_ms(v: &str) -> Option<u64> {
+    let v = v.trim().trim_matches('\'');
+    if let Ok(n) = v.parse::<u64>() {
+        return Some(n);
+    }
+    let (num, unit) = v.split_at(v.find(|c: char| c.is_ascii_alphabetic())?);
+    let n = num.trim().parse::<u64>().ok()?;
+    match unit.trim() {
+        "ms" => Some(n),
+        "s" => Some(n * 1000),
+        "min" => Some(n * 60_000),
+        "h" => Some(n * 3_600_000),
+        _ => None,
     }
 }
 
@@ -3690,6 +3944,11 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value, fmt: FieldFormat) -
             };
             encoder.encode_field(&Some(s))
         }
+        // TEXT-format floats render via Value's Display, which spells the
+        // exponent PostgreSQL-style ("1e+100", not Rust's "1e100").
+        Value::Float64(_) if matches!(fmt, FieldFormat::Text) => {
+            encoder.encode_field(&Some(value.to_string().as_str()))
+        }
         Value::Float64(n) => encoder.encode_field(&Some(*n)),
         Value::Text(s) => encoder.encode_field(&Some(s.as_str())),
         Value::Jsonb(v) => encoder.encode_field(&Some(v.to_string().as_str())),
@@ -3725,9 +3984,23 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value, fmt: FieldFormat) -
             encoder.encode_field(&Some(d))
         }
         Value::Bytea(b) => encoder.encode_field(&Some(b.as_slice())),
-        // Numeric stays text-rendered (its string form is exact and NUMERIC
-        // binary is only requested by drivers that also accept text); same
-        // for uuid/array/vector/interval, which have no enabled native impl.
+        // BINARY-format NUMERIC must carry the NBASE-10000 wire encoding —
+        // pgjdbc switches result transfer to binary once a statement is
+        // server-prepared and rejects text bytes under a binary column.
+        Value::Numeric(s) if matches!(fmt, FieldFormat::Binary) => {
+            match rust_decimal::Decimal::from_str_exact(s) {
+                Ok(d) => encoder.encode_field(&Some(d)),
+                Err(_) => Err(PgWireError::ApiError(
+                    format!("numeric value not binary-encodable: {s}").into(),
+                )),
+            }
+        }
+        // BINARY-format UUID is the 16 raw bytes (the &[u8] impl writes raw).
+        Value::Uuid(b) if matches!(fmt, FieldFormat::Binary) => {
+            encoder.encode_field(&Some(b.as_slice()))
+        }
+        // Text-rendered forms are exact for the remaining types; array/vector/
+        // interval have no enabled native binary impl.
         Value::Numeric(_)
         | Value::Uuid(_)
         | Value::Array(_)
@@ -3935,6 +4208,7 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
 
     let mut delimiter = b'\t';
     let mut is_csv = false;
+    let mut is_binary = false;
     let mut has_header = false;
 
     for opt in options {
@@ -3942,6 +4216,9 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
             CopyOption::Format(f) if f.value.to_uppercase() == "CSV" => {
                 is_csv = true;
                 delimiter = b',';
+            }
+            CopyOption::Format(f) if f.value.to_uppercase() == "BINARY" => {
+                is_binary = true;
             }
             CopyOption::Delimiter(d) => delimiter = d as u8,
             CopyOption::Header(h) => has_header = h,
@@ -3954,8 +4231,94 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
         columns: col_names,
         delimiter,
         is_csv,
+        is_binary,
         has_header,
     })
+}
+
+/// Parse a PostgreSQL binary-COPY payload into rows of optional text-literal
+/// fields (the same form the text path produces, so both feed one INSERT
+/// builder). Fails loudly on a malformed stream or an undecodable type.
+fn parse_copy_binary_rows(
+    data: &[u8],
+    types: &[DataType],
+) -> Result<Vec<Vec<Option<String>>>, String> {
+    const SIG: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
+    if data.len() < 19 || &data[..11] != SIG {
+        return Err("invalid binary COPY signature".into());
+    }
+    let ext_len = u32::from_be_bytes(data[15..19].try_into().unwrap()) as usize;
+    let mut pos = 19 + ext_len;
+    let mut rows = Vec::new();
+    loop {
+        if pos + 2 > data.len() {
+            return Err("unexpected end of binary COPY data".into());
+        }
+        let nfields = i16::from_be_bytes(data[pos..pos + 2].try_into().unwrap());
+        pos += 2;
+        if nfields == -1 {
+            break; // trailer
+        }
+        let mut row = Vec::with_capacity(nfields as usize);
+        for i in 0..nfields as usize {
+            if pos + 4 > data.len() {
+                return Err("unexpected end of binary COPY tuple".into());
+            }
+            let len = i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            if len == -1 {
+                row.push(None);
+                continue;
+            }
+            let len = len as usize;
+            if pos + len > data.len() {
+                return Err("binary COPY field extends past end of data".into());
+            }
+            let ty = types.get(i).ok_or_else(|| {
+                format!("binary COPY row has more fields than target columns ({nfields})")
+            })?;
+            let oid = data_type_to_pg(ty).oid();
+            let text = decode_copy_binary_field(oid, &data[pos..pos + len]).ok_or_else(|| {
+                format!("cannot decode binary COPY field of type {ty}")
+            })?;
+            row.push(Some(text));
+            pos += len;
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Decode one binary COPY field into its text-literal form.
+fn decode_copy_binary_field(oid: u32, b: &[u8]) -> Option<String> {
+    match oid {
+        16 if b.len() == 1 => Some(if b[0] != 0 { "true" } else { "false" }.into()),
+        21 if b.len() == 2 => Some(i16::from_be_bytes(b.try_into().ok()?).to_string()),
+        23 if b.len() == 4 => Some(i32::from_be_bytes(b.try_into().ok()?).to_string()),
+        20 if b.len() == 8 => Some(i64::from_be_bytes(b.try_into().ok()?).to_string()),
+        700 if b.len() == 4 => Some(float_literal(f32::from_be_bytes(b.try_into().ok()?) as f64)),
+        701 if b.len() == 8 => Some(float_literal(f64::from_be_bytes(b.try_into().ok()?))),
+        // Text family: the binary encoding IS the UTF-8 text.
+        18 | 19 | 25 | 114 | 1042 | 1043 => Some(String::from_utf8(b.to_vec()).ok()?),
+        // jsonb: version byte then JSON text.
+        3802 if !b.is_empty() && b[0] == 1 => Some(String::from_utf8(b[1..].to_vec()).ok()?),
+        _ => match decode_binary_param_typed(oid, b)? {
+            DecodedParam::Null => None,
+            DecodedParam::Numeric(s) | DecodedParam::Bool(s) | DecodedParam::Text(s) => Some(s),
+        },
+    }
+}
+
+/// Float text form the SQL parser accepts (PostgreSQL spellings for the
+/// non-finite values).
+fn float_literal(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".into()
+    } else if f.is_infinite() {
+        if f < 0.0 { "-Infinity".into() } else { "Infinity".into() }
+    } else {
+        f.to_string()
+    }
 }
 
 /// Parse accumulated COPY data bytes into rows of optional string fields.

@@ -65,7 +65,8 @@ impl Executor {
                 let actual_rows = match &exec_result {
                     ExecResult::Select { rows, .. } => rows.len(),
                     ExecResult::Command { rows_affected, .. } => *rows_affected,
-                    ExecResult::CopyOut { row_count, .. } => *row_count,
+                    ExecResult::CopyOut { row_count, .. }
+                    | ExecResult::CopyOutBinary { row_count, .. } => *row_count,
                     // Materialized just above, so a stream can't reach here.
                     ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => {
                         unreachable!("stream materialized before EXPLAIN ANALYZE row count")
@@ -1688,13 +1689,13 @@ impl Executor {
         rows: Vec<Row>,
         col_meta: &[ColMeta],
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
-    ) -> Vec<Row> {
+    ) -> Result<Vec<Row>, ExecError> {
         let Some(pushdown_map) = pushdown else {
-            return rows;
+            return Ok(rows);
         };
         let factor_names = Self::table_factor_names(factor);
         if factor_names.is_empty() {
-            return rows;
+            return Ok(rows);
         }
         let mut preds = Vec::new();
         for name in &factor_names {
@@ -1703,10 +1704,10 @@ impl Executor {
             }
         }
         let Some(expr) = Self::combine_predicates(preds) else {
-            return rows;
+            return Ok(rows);
         };
         // Parallel Rayon filter for large sets, serial for small
-        self.parallel_filter(rows, &expr, col_meta)
+        self.try_parallel_filter(rows, &expr, col_meta)
     }
 
     pub(super) async fn try_execute_index_join_for_factor(
@@ -2759,9 +2760,19 @@ impl Executor {
                                 (col_spec.as_str(), None)
                             };
                         if let Some(idx) = Self::resolve_plan_col_idx(&meta, col_name) {
+                            // Output name: alias, else the PostgreSQL default
+                            // for the spec expression ("COUNT(*)" -> "count",
+                            // "t.k" -> "k"); internal plan names keep the full
+                            // expression text so specs resolve unambiguously.
+                            let display = match alias {
+                                Some(a) => a.to_string(),
+                                None => Self::parse_expr_string(col_name)
+                                    .map(|e| super::helpers::default_output_name(&e))
+                                    .unwrap_or_else(|_| meta[idx].name.clone()),
+                            };
                             proj_meta.push(ColMeta {
                                 table: meta[idx].table.clone(),
-                                name: alias.unwrap_or(&meta[idx].name).to_string(),
+                                name: display,
                                 dtype: meta[idx].dtype.clone(),
                             });
                             proj_items.push(ProjItem::ColIdx(idx));
@@ -2788,7 +2799,9 @@ impl Executor {
                                 upstream_dt.unwrap_or_else(|| infer_expr_type(&expr, &meta));
                             proj_meta.push(ColMeta {
                                 table: None,
-                                name: alias.unwrap_or(col_name).to_string(),
+                                name: alias.map(str::to_string).unwrap_or_else(|| {
+                                    super::helpers::default_output_name(&expr)
+                                }),
                                 dtype,
                             });
                             proj_items.push(ProjItem::Expr(Box::new(expr)));
@@ -3562,8 +3575,26 @@ impl Executor {
             .next_back()
             .unwrap_or(col_spec)
             .trim_matches('"');
-        meta.iter()
+        if let Some(idx) = meta
+            .iter()
             .position(|c| c.name.eq_ignore_ascii_case(unqualified))
+        {
+            return Some(idx);
+        }
+
+        // Expression spec vs default-named output column: plan nodes name
+        // aggregate outputs PostgreSQL-style ("count"), while sort/projection
+        // specs carry the stringified expression ("COUNT(*)"). Bridge by
+        // deriving the default output name from the parsed spec.
+        if let Ok(expr) = Self::parse_expr_string(trimmed) {
+            let derived = super::helpers::default_output_name(&expr);
+            if !derived.eq_ignore_ascii_case(trimmed) {
+                return meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&derived));
+            }
+        }
+        None
     }
 
     pub(super) fn resolve_plan_col_idx_for_join_side(
@@ -4469,6 +4500,14 @@ impl Executor {
                 (None, None)
             };
 
+            // Keep the projection for ORDER BY resolution over aggregate
+            // output: columns carry PostgreSQL default names ("upper"), so an
+            // `ORDER BY upper(dept)` key resolves by matching the projection
+            // item's expression text (the source column is gone post-agg).
+            let projection_for_sort: Option<Vec<SelectItem>> = match &*query.body {
+                SetExpr::Select(sel) => Some(sel.projection.clone()),
+                _ => None,
+            };
             let result = self
                 .execute_set_expr(*query.body, &cte_tables, &order_by_cols)
                 .await?;
@@ -4483,7 +4522,14 @@ impl Executor {
                             ref mut rows,
                         } = exec_result
                     {
-                        self.apply_order_by(rows, columns, &ob, None, None, top_k)?;
+                        self.apply_order_by(
+                            rows,
+                            columns,
+                            &ob,
+                            None,
+                            projection_for_sort.as_deref(),
+                            top_k,
+                        )?;
                     }
                     if let Some(lc) = limit_clause
                         && let ExecResult::Select { ref mut rows, .. } = exec_result
@@ -4644,7 +4690,14 @@ impl Executor {
             {
                 if let Some(ob) = deferred_order {
                     let top_k = self.extract_top_k(deferred_limit.as_ref());
-                    self.apply_order_by(rows, columns, &ob, None, None, top_k)?;
+                    self.apply_order_by(
+                        rows,
+                        columns,
+                        &ob,
+                        None,
+                        projection_for_sort.as_deref(),
+                        top_k,
+                    )?;
                 }
                 if let Some(lc) = deferred_limit {
                     self.apply_limit_offset(rows, &lc)?;
@@ -5413,7 +5466,7 @@ impl Executor {
             };
             let col_label = alias
                 .map(|a| a.value.clone())
-                .unwrap_or_else(|| format!("{expr}"));
+                .unwrap_or_else(|| super::helpers::default_output_name(expr));
 
             match expr {
                 Expr::Function(func) if func.over.is_none() => {
@@ -6957,7 +7010,7 @@ impl Executor {
                         indices.into_iter().map(|i| rows[i].clone()).collect()
                     } else {
                         // Parallel Rayon filter for large sets, serial for small
-                        self.parallel_filter(rows, expr, &col_meta)
+                        self.try_parallel_filter(rows, expr, &col_meta)?
                     }
                 } else {
                     rows
@@ -6995,7 +7048,7 @@ impl Executor {
                             .collect()
                     } else {
                         // Parallel Rayon filter for large sets, serial for small
-                        self.parallel_filter(combined_rows, expr, &col_meta)
+                        self.try_parallel_filter(combined_rows, expr, &col_meta)?
                     }
                 } else {
                     combined_rows
@@ -7009,6 +7062,38 @@ impl Executor {
         // choke point — the plan executor is gated at its own scan sites — so a
         // large GROUP BY/ORDER BY here can't OOM the box.
         drop(self.reserve_query_memory(Self::estimate_rows_bytes(&filtered))?);
+
+        // Set-returning `information_schema._pg_expandarray(arr)` in the
+        // projection (JDBC's getPrimaryKeys/getIndexInfo shape): expand each
+        // input row into one row per array element, materialize the composite
+        // {x: element, n: ordinal} as a synthetic JSON column, and rewrite
+        // every call in the projection to reference it. All calls in one
+        // projection expand in lockstep, matching PostgreSQL for the
+        // identical-argument form these queries use.
+        let mut srf_select_storage;
+        let (select, col_meta, filtered) =
+            if let Some(arg) = find_pg_expandarray_arg(&select.projection) {
+                let mut expanded = Vec::new();
+                for row in &filtered {
+                    let arr = self.eval_row_expr(&arg, row, &col_meta)?;
+                    for (i, elem) in srf_array_elements(&arr).into_iter().enumerate() {
+                        let mut r = row.clone();
+                        r.push(Value::Jsonb(serde_json::json!({"x": elem, "n": i as i64 + 1})));
+                        expanded.push(r);
+                    }
+                }
+                let mut meta = col_meta.clone();
+                meta.push(ColMeta {
+                    table: None,
+                    name: "__pg_expandarray".into(),
+                    dtype: DataType::Jsonb,
+                });
+                srf_select_storage = select.clone();
+                rewrite_pg_expandarray(&mut srf_select_storage.projection);
+                (&srf_select_storage, meta, expanded)
+            } else {
+                (select, col_meta, filtered)
+            };
 
         // Check for window functions
         let has_window = select.projection.iter().any(|item| match item {
@@ -7120,7 +7205,7 @@ impl Executor {
                     right_rows0,
                     &right_meta,
                     pushdown,
-                );
+                )?;
 
                 if let Some(join_expr) = Self::combine_predicates(remaining_preds.clone())
                     && let Some((left_keys, right_keys, residual)) =
@@ -7185,7 +7270,7 @@ impl Executor {
         let (mut col_meta, rows0) = self
             .load_table_factor_with_ctes(&first.relation, cte_tables, first_pushdown.as_ref())
             .await?;
-        let mut rows = self.apply_pushdown_for_factor(&first.relation, rows0, &col_meta, pushdown);
+        let mut rows = self.apply_pushdown_for_factor(&first.relation, rows0, &col_meta, pushdown)?;
 
         for join in &first.joins {
             // Check for LATERAL derived table
@@ -7216,7 +7301,7 @@ impl Executor {
                 .load_table_factor_with_ctes(&join.relation, cte_tables, right_pushdown.as_ref())
                 .await?;
             let right_rows =
-                self.apply_pushdown_for_factor(&join.relation, right_rows0, &right_meta, pushdown);
+                self.apply_pushdown_for_factor(&join.relation, right_rows0, &right_meta, pushdown)?;
             let (new_meta, new_rows) = self.execute_join(
                 &col_meta,
                 &rows,
@@ -7234,7 +7319,7 @@ impl Executor {
                 .load_table_factor_with_ctes(&twj.relation, cte_tables, twj_pushdown.as_ref())
                 .await?;
             let right_rows =
-                self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown);
+                self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown)?;
 
             // Optimization: implicit hash join for comma-separated FROM
             // Instead of O(N*M) cross join + filter, try to extract equi-join
@@ -7372,7 +7457,7 @@ impl Executor {
                             join_pushdown.as_ref(),
                         )
                         .await?;
-                    let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown);
+                    let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown)?;
                     let (nm, nr) =
                         self.execute_join(&col_meta, &rows, &jm, &jr, &join.join_operator)?;
                     col_meta = nm;
@@ -7400,7 +7485,7 @@ impl Executor {
                 let (jm, jr0) = self
                     .load_table_factor_with_ctes(&join.relation, cte_tables, join_pushdown.as_ref())
                     .await?;
-                let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown);
+                let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown)?;
                 let (nm, nr) =
                     self.execute_join(&col_meta, &rows, &jm, &jr, &join.join_operator)?;
                 col_meta = nm;
@@ -7441,7 +7526,16 @@ impl Executor {
                             }
                         })
                         .collect();
-                    return self.execute_table_function(&func_name, &arg_values, &label);
+                    let col_alias = alias
+                        .as_ref()
+                        .and_then(|a| a.columns.first())
+                        .map(|c| c.name.value.clone());
+                    return self.execute_table_function(
+                        &func_name,
+                        &arg_values,
+                        &label,
+                        col_alias.as_deref(),
+                    );
                 }
 
                 // Check CTE first
@@ -7518,7 +7612,7 @@ impl Executor {
                         self.try_index_scan_sync(&table_name, &label, where_expr)
                 {
                     let filtered_rows = if let Some(ref expr) = remaining_where {
-                        self.parallel_filter(rows, expr, &col_meta)
+                        self.try_parallel_filter(rows, expr, &col_meta)?
                     } else {
                         rows
                     };
@@ -7611,7 +7705,11 @@ impl Executor {
                     })
                     .collect();
 
-                self.execute_table_function(&func_name, &fn_args, &alias_name)
+                let col_alias = alias
+                    .as_ref()
+                    .and_then(|a| a.columns.first())
+                    .map(|c| c.name.value.clone());
+                self.execute_table_function(&func_name, &fn_args, &alias_name, col_alias.as_deref())
             }
             TableFactor::UNNEST {
                 alias, array_exprs, ..
@@ -7717,6 +7815,7 @@ impl Executor {
         name: &str,
         args: &[Value],
         alias: &str,
+        column_alias: Option<&str>,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
         match name {
             "generate_series" => {
@@ -7755,9 +7854,12 @@ impl Executor {
                     ));
                 }
 
+                // PostgreSQL: for a function returning a base type, a column
+                // alias (`g(x)`) or plain table alias (`g`) names the single
+                // output column; bare calls keep the function name.
                 let col_meta = vec![ColMeta {
                     table: Some(alias.into()),
-                    name: "generate_series".into(),
+                    name: column_alias.unwrap_or(alias).into(),
                     dtype: DataType::Int64,
                 }];
 
@@ -8085,6 +8187,19 @@ impl Executor {
             let canon = |s: &str| s.replace(char::is_whitespace, "").to_lowercase();
             let want = canon(&expr.to_string());
             if let Some(pos) = columns.iter().position(|(name, _)| canon(name) == want) {
+                return Ok(pos);
+            }
+            // Output columns carry PostgreSQL default names ("upper", not
+            // "upper(dept)"), so also match the ORDER BY expression against
+            // the projection items' expression text — position i of the
+            // projection IS output column i (when no wildcard expands).
+            if let Some(proj) = projection
+                && proj.len() == columns.len()
+                && let Some(pos) = proj.iter().position(|item| {
+                    matches!(item, SelectItem::UnnamedExpr(e)
+                        if canon(&e.to_string()) == want)
+                })
+            {
                 return Ok(pos);
             }
         }
@@ -9799,5 +9914,77 @@ mod ast_cache_tests {
 
         // The substituted template should produce the same SQL as parsing sql2 directly
         assert_eq!(template[0].to_string(), stmts2[0].to_string());
+    }
+}
+
+// ============================================================================
+// information_schema._pg_expandarray SRF support (JDBC metadata queries)
+// ============================================================================
+
+fn is_pg_expandarray(name: &ast::ObjectName) -> bool {
+    name.0
+        .last()
+        .and_then(|p| p.as_ident())
+        .is_some_and(|i| i.value.eq_ignore_ascii_case("_pg_expandarray"))
+}
+
+/// Find the argument of the first `_pg_expandarray(...)` call anywhere in the
+/// projection (bare, aliased, or inside composite access like `(call).n`).
+pub(super) fn find_pg_expandarray_arg(projection: &[SelectItem]) -> Option<Expr> {
+    use core::ops::ControlFlow;
+    let mut found: Option<Expr> = None;
+    let items = projection.to_vec();
+    let _ = sqlparser::ast::visit_expressions(&items, |e: &Expr| {
+        if found.is_none()
+            && let Expr::Function(f) = e
+            && is_pg_expandarray(&f.name)
+            && let ast::FunctionArguments::List(arg_list) = &f.args
+            && let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg))) =
+                arg_list.args.first()
+        {
+            found = Some(arg.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+/// Replace every `_pg_expandarray(...)` call in the projection with a
+/// reference to the synthetic expansion column.
+pub(super) fn rewrite_pg_expandarray(projection: &mut Vec<SelectItem>) {
+    use core::ops::ControlFlow;
+    let _ = sqlparser::ast::visit_expressions_mut(projection, |e: &mut Expr| {
+        if let Expr::Function(f) = e
+            && is_pg_expandarray(&f.name)
+        {
+            *e = Expr::Identifier(ast::Ident::new("__pg_expandarray"));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Elements of an array value for SRF expansion. pg_index.indkey is an
+/// int2vector rendered as space-separated text; real arrays expand directly.
+pub(super) fn srf_array_elements(v: &Value) -> Vec<serde_json::Value> {
+    match v {
+        Value::Text(s) => s
+            .split_whitespace()
+            .map(|tok| match tok.parse::<i64>() {
+                Ok(n) => serde_json::json!(n),
+                Err(_) => serde_json::json!(tok),
+            })
+            .collect(),
+        Value::Array(items) => items
+            .iter()
+            .map(|it| match it {
+                Value::Int32(n) => serde_json::json!(*n as i64),
+                Value::Int64(n) => serde_json::json!(*n),
+                Value::Float64(f) => serde_json::json!(*f),
+                Value::Bool(b) => serde_json::json!(*b),
+                other => serde_json::json!(other.to_string()),
+            })
+            .collect(),
+        Value::Null => Vec::new(),
+        other => vec![serde_json::json!(other.to_string())],
     }
 }

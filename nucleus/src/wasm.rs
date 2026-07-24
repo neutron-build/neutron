@@ -175,9 +175,16 @@ fn exec_result_to_js(r: ExecResult) -> JsResultRepr {
             affected: Some(row_count),
             message: Some(data),
         },
+        ExecResult::CopyOutBinary { row_count, .. } => JsResultRepr {
+            kind: "copy_out_binary".into(),
+            columns: None,
+            rows: None,
+            affected: Some(row_count),
+            message: None,
+        },
         // The executor materializes results before they reach the WASM boundary.
-        ExecResult::SelectStream { .. } => unreachable!(
-            "SelectStream must be materialized before the WASM result adapter"
+        ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => unreachable!(
+            "streams must be materialized before the WASM result adapter"
         ),
     }
 }

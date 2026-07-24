@@ -228,6 +228,10 @@ pub struct Session {
     /// separately gated on the explicit `stream_results` setting.
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(super) stream_capable_consumer: AtomicBool,
+    /// Set by a wire CancelRequest while a query runs on this session; the
+    /// executor's long loops check it cooperatively and abort with SQLSTATE
+    /// 57014. Cleared at each statement start.
+    pub(super) cancel_requested: AtomicBool,
 }
 
 impl Default for Session {
@@ -268,6 +272,7 @@ impl Session {
             last_activity_ms: AtomicU64::new(now_millis()),
             executing: AtomicBool::new(false),
             stream_capable_consumer: AtomicBool::new(false),
+            cancel_requested: AtomicBool::new(false),
         }
     }
 
