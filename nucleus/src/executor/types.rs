@@ -301,6 +301,11 @@ impl GlobalPreparedCache {
         }
     }
 
+    /// Clear every cached prepared statement.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Insert a prepared statement. Evicts the least-accessed entry if full.
     pub fn insert(&mut self, sql: String, stmt: std::sync::Arc<PreparedStmt>) {
         if self.entries.len() >= self.max_entries
