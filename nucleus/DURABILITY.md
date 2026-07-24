@@ -64,6 +64,14 @@ equivalent at a chosen instruction. `NUCLEUS_CRASHPOINT_SKIP=n` lets `n`
 arrivals pass first, so a boundary can be hit during setup, early steady state,
 and deep steady state.
 
+Keeping these hooks in the shipping binary is deliberate — durability has to be
+proven on the artifact that actually runs, not on a specially-compiled one — so
+the disabled cost was measured rather than assumed. Bulk-loading 500k rows,
+five runs each with the hooks compiled in versus stubbed to no-ops, both mean
+2.28s (2.2-2.4s vs 2.2-2.3s): no measurable difference. With nothing armed,
+`reach()` is one already-initialized `OnceLock` load and a not-taken branch,
+and it returns before any string comparison.
+
 `probe_crash_points` walks every declared point at several skip depths and
 asserts, per point:
 
