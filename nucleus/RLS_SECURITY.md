@@ -71,6 +71,47 @@ Unsupported expressions are rejected instead of being accepted without enforceme
 - Principal-less cluster query/DML messages and the binary protocol's SQL execution path fail closed
   whenever committed RLS policy exists; neither may silently execute as the bootstrap superuser.
 
+## Adversarial surface matrix
+
+`src/executor/tests/test_rls_surfaces.rs` is the attack suite behind the M5 exit
+gate. For a table with one hidden row it attempts exfiltration through every
+alternate path and fails if the hidden row's content escapes: scan fast paths
+(index point lookup, index-only, SIMD, top-k, negated predicate, OFFSET),
+aggregates and window functions, set operations (UNION/INTERSECT/EXCEPT),
+CTEs, correlated and nested subqueries, `NOT IN`/`NOT EXISTS` probes, streaming
+operators (scan, aggregate, distinct, join, sort), all five COPY export shapes
+(text, CSV, binary, column subset, `COPY (query)`), write-path echoes
+(`INSERT..SELECT`, `RETURNING` on hidden rows, upsert `ON CONFLICT DO UPDATE`,
+`COPY FROM` write checks), views and materialized views, cache and prepared-plan
+reuse across principals, specialty indexes over protected tables (vector KNN,
+text search), diagnostics (`EXPLAIN`, `EXPLAIN ANALYZE`), constraint and
+foreign-key cascade paths, and trigger bodies. The core attack set runs against
+**all five storage engines** (memory, MVCC, columnar, LSM, disk), since each
+implements its own scan and lookup paths.
+
+Two defects that matrix found, both fixed:
+
+- **Subquery identity loss.** Correlated subqueries are evaluated per row from
+  a synchronous context through `sync_block_on`, which drives the future as a
+  new tokio task. Task-locals are per-task and are not inherited, so the
+  subquery lost `CURRENT_SESSION` and fell back to the bootstrap superuser
+  session — executing with RLS fully bypassed, and with the wrong storage
+  session (so it could also read past its own transaction). `sync_block_on`
+  now re-establishes both scopes inside the new task. The regression pin reads
+  the principal and the visible-row count from *inside* a subquery, so it fails
+  on any recurrence rather than only when a hidden value reaches the projection.
+- **Identity functions ignored the session.** `CURRENT_USER`, `CURRENT_ROLE`,
+  and `SESSION_USER` returned the constant `nucleus` for every session. Policy
+  predicates were unaffected (the policy compiler resolves the principal
+  separately), so this was a wrong-answer bug rather than a bypass, but any
+  client asking "who am I" got the bootstrap name. They now report the session
+  principal: `SESSION_USER` is the authenticated login role, `CURRENT_USER` and
+  `CURRENT_ROLE` the effective role after `SET ROLE`.
+
+Not covered by the in-process matrix: replica/follower reads (needs a live
+cluster) and the wire-level protocol surfaces, which `compat/` covers
+separately.
+
 ## Deliberate limitations
 
 - Constraint errors (for example unique and foreign-key checks) can reveal that a hidden key exists,

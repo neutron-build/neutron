@@ -994,8 +994,27 @@ impl Executor {
                 _ => Value::Null,
             }),
             "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
-            "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER" => {
-                Ok(Value::Text("nucleus".to_string()))
+            // Identity functions report the SESSION's principal, not a fixed
+            // name. PostgreSQL semantics: SESSION_USER is the authenticated
+            // login role and is unaffected by SET ROLE; CURRENT_USER (and its
+            // synonym CURRENT_ROLE) is the effective role. An unauthenticated
+            // embedded session has no login role and keeps the bootstrap
+            // identity.
+            "SESSION_USER" => {
+                let session = self.current_session();
+                let login = session.authenticated_user.read().clone();
+                Ok(Value::Text(login.unwrap_or_else(|| "nucleus".to_string())))
+            }
+            "CURRENT_USER" | "CURRENT_ROLE" => {
+                let session = self.current_session();
+                let effective = session
+                    .current_role
+                    .read()
+                    .clone()
+                    .or_else(|| session.authenticated_user.read().clone());
+                Ok(Value::Text(
+                    effective.unwrap_or_else(|| "nucleus".to_string()),
+                ))
             }
 
             // -- Date/time functions --

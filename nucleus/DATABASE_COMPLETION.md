@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 254536; Source Rust files: 220; Top-level modules: 50.
-- Declared unit tests: 3851; Declared integration tests: 320; Ignored tests: 43.
+- Source LOC: 255538; Source Rust files: 221; Top-level modules: 50.
+- Declared unit tests: 3865; Declared integration tests: 320; Ignored tests: 43.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -211,8 +211,18 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
 
 ### RLS and masking
 
-- [ ] Complete adversarial RLS coverage for all relational reads/writes, COPY, constraints, triggers,
+- [x] Complete adversarial RLS coverage for all relational reads/writes, COPY, constraints, triggers,
       views, caches, prepared statements, exports, CDC, replicas, and engine variants.
+      `src/executor/tests/test_rls_surfaces.rs` is an exfiltration matrix: for a table with one
+      hidden row it attacks scan fast paths, aggregates/windows, set ops, CTEs, correlated and
+      nested subqueries, streaming operators, all five COPY export shapes, write-path echoes
+      (RETURNING, upsert, INSERT..SELECT, COPY FROM), views/matviews, cache and prepared-plan reuse
+      across principals, specialty indexes on protected tables, EXPLAIN/EXPLAIN ANALYZE, FK cascade
+      paths, and trigger bodies — with the core set run against ALL FIVE storage engines. It found
+      two real defects, both fixed (2026-07-24): correlated subqueries lost the session task-local
+      through `sync_block_on` and executed as the bootstrap superuser with RLS bypassed; and
+      CURRENT_USER/CURRENT_ROLE/SESSION_USER returned a constant instead of the session principal.
+      NOT covered in-process: replica/follower reads (needs a live cluster).
 - [ ] Implement column-masking DDL, catalog persistence, transactionality, and executor enforcement.
 - [ ] Define policy-aware materialized-view refresh and invocation semantics.
 - [ ] Add policy alteration/introspection commands or explicitly constrain v1 to create/drop.
