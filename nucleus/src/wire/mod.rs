@@ -11,6 +11,7 @@
 pub mod compression;
 pub mod error_codec;
 pub mod kv_fast_path;
+pub mod overload;
 
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -1593,6 +1594,14 @@ impl SimpleQueryHandler for NucleusHandler {
             && !rls_active
             && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query)
         {
+            // This path executes against the KV store directly, so it must
+            // consult the degraded-mode gate itself — otherwise a read-only
+            // server would still accept `SELECT kv_set(...)`.
+            if kv_cmd.is_write()
+                && let Err(e) = self.executor.service().admit_write("KV write")
+            {
+                return Err(exec_error_to_pgwire(e));
+            }
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             // A KV write must be durable before it is acked — this path bypasses
             // execute()'s commit-time force, so force here (no-op under

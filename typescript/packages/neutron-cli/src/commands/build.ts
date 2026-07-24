@@ -237,9 +237,21 @@ export async function build(): Promise<void> {
       })
     );
     try { fs.unlinkSync(cssEntryPath); } catch {}
-    // Remove the JS lib output — we only need the extracted CSS.
+    // Remove the JS lib output from the CSS-extraction build — we only need
+    // the extracted CSS. Preserve any JS files that were copied here from
+    // publicDir (e.g. sw.js, service workers, third-party widgets) so user
+    // assets aren't silently dropped by the CSS-extraction cleanup.
+    const publicDir = userConfig.publicDir
+      ? String(userConfig.publicDir)
+      : path.join(cwd, "public");
+    const publicJsFiles = new Set<string>();
+    if (fs.existsSync(publicDir)) {
+      for (const f of fs.readdirSync(publicDir)) {
+        if (f.endsWith(".js") || f.endsWith(".mjs")) publicJsFiles.add(f);
+      }
+    }
     for (const f of fs.readdirSync(outputDir)) {
-      if (f.endsWith(".mjs") || f.endsWith(".js")) {
+      if ((f.endsWith(".mjs") || f.endsWith(".js")) && !publicJsFiles.has(f)) {
         try { fs.unlinkSync(path.join(outputDir, f)); } catch {}
       }
     }
