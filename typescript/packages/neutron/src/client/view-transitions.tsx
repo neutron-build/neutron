@@ -27,8 +27,20 @@ main:not(main main) { view-transition-name: neutron-main; }
   mix-blend-mode: normal;
   height: 100%;
 }
+/* Hide the old root snapshot: with both snapshots frozen at opacity 1 the
+   browser's plus-lighter compositing double-exposes any unnamed content
+   (ghosted text). Static chrome outside neutron-main swaps instantly. */
+::view-transition-old(root) { opacity: 0; }
 ::view-transition-group(root) { animation: none; isolation: auto; }
 ::view-transition-image-pair(root) { isolation: auto; }
+
+/* Freeze the main group's geometry morph (pages of different heights would
+   squish mid-transition) and opt out of plus-lighter so opacity animations
+   read as a plain crossfade instead of an additive ghost. */
+::view-transition-group(neutron-main) { animation: none; }
+::view-transition-image-pair(neutron-main) { isolation: isolate; }
+::view-transition-old(neutron-main),
+::view-transition-new(neutron-main) { mix-blend-mode: normal; }
 
 ::view-transition-old(neutron-main) { animation: neutronFadeOut 150ms ease both; }
 ::view-transition-new(neutron-main) { animation: neutronFadeIn  150ms ease both; }
@@ -40,6 +52,21 @@ const BOOTSTRAP = `
 (() => {
   if (window.__NEUTRON_VIEW_TRANSITIONS__) return;
   window.__NEUTRON_VIEW_TRANSITIONS__ = true;
+
+  // Tag cross-document transitions with the navigation type ('push',
+  // 'traverse', 'replace', 'reload') on both the outgoing and incoming
+  // page so CSS can style direction via :active-view-transition-type().
+  window.addEventListener('pageswap', function(event) {
+    if (event.viewTransition && event.activation) {
+      event.viewTransition.types.add(event.activation.navigationType);
+    }
+  });
+  window.addEventListener('pagereveal', function(event) {
+    var activation = window.navigation && window.navigation.activation;
+    if (event.viewTransition && activation) {
+      event.viewTransition.types.add(activation.navigationType);
+    }
+  });
 
   // Prefetch same-origin links on pointer-enter so forward clicks feel
   // instant. The browser still owns navigation, so bfcache and cross-doc

@@ -56,8 +56,12 @@ pub enum ErrorCode {
     InternalError,
     /// Generic runtime error
     RuntimeError,
-    /// Insufficient resources (memory pressure, disk full, etc.)
+    /// Insufficient resources (memory pressure, etc.)
     InsufficientResources,
+    /// The data directory's filesystem is out of usable space
+    DiskFull,
+    /// A write was attempted while the server is in read-only mode
+    ReadOnlySqlTransaction,
 }
 
 /// Protocol-independent error details.
@@ -171,6 +175,10 @@ impl ErrorCodec for PgWireErrorCodec {
             ExecError::MemoryExceeded(msg) => {
                 ErrorDetails::new(ErrorCode::InsufficientResources, msg.clone())
             }
+            ExecError::DiskFull(msg) => ErrorDetails::new(ErrorCode::DiskFull, msg.clone()),
+            ExecError::ReadOnly(msg) => {
+                ErrorDetails::new(ErrorCode::ReadOnlySqlTransaction, msg.clone())
+            }
         }
     }
 
@@ -199,6 +207,8 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::InternalError => "XX000".to_string(),
             ErrorCode::RuntimeError => "22000".to_string(),
             ErrorCode::InsufficientResources => "53200".to_string(),
+            ErrorCode::DiskFull => "53100".to_string(),
+            ErrorCode::ReadOnlySqlTransaction => "25006".to_string(),
         }
     }
 }
@@ -283,6 +293,10 @@ impl ErrorCodec for BinaryErrorCodec {
             ExecError::MemoryExceeded(msg) => {
                 ErrorDetails::new(ErrorCode::InsufficientResources, msg.clone())
             }
+            ExecError::DiskFull(msg) => ErrorDetails::new(ErrorCode::DiskFull, msg.clone()),
+            ExecError::ReadOnly(msg) => {
+                ErrorDetails::new(ErrorCode::ReadOnlySqlTransaction, msg.clone())
+            }
         }
     }
 
@@ -313,6 +327,8 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::InternalError => "5000".to_string(),
             ErrorCode::RuntimeError => "4999".to_string(),
             ErrorCode::InsufficientResources => "5002".to_string(),
+            ErrorCode::DiskFull => "5003".to_string(),
+            ErrorCode::ReadOnlySqlTransaction => "5004".to_string(),
         }
     }
 }
@@ -410,6 +426,45 @@ mod tests {
         let details = codec.encode(&err);
         assert_eq!(details.code, ErrorCode::UniqueViolation);
         assert_eq!(codec.code_to_string(ErrorCode::UniqueViolation), "2001");
+    }
+
+    #[test]
+    fn test_pgwire_codec_disk_full_is_53100() {
+        let codec = PgWireErrorCodec;
+        let err = ExecError::DiskFull("read-only: 1% free".to_string());
+        let details = codec.encode(&err);
+        assert_eq!(details.code, ErrorCode::DiskFull);
+        assert_eq!(codec.code_to_string(ErrorCode::DiskFull), "53100");
+        assert!(details.message.contains("1% free"));
+    }
+
+    #[test]
+    fn test_pgwire_codec_read_only_is_25006() {
+        let codec = PgWireErrorCodec;
+        let err = ExecError::ReadOnly("operator maintenance".to_string());
+        let details = codec.encode(&err);
+        assert_eq!(details.code, ErrorCode::ReadOnlySqlTransaction);
+        assert_eq!(
+            codec.code_to_string(ErrorCode::ReadOnlySqlTransaction),
+            "25006"
+        );
+    }
+
+    #[test]
+    fn test_binary_codec_disk_full_and_read_only_are_distinct() {
+        let codec = BinaryErrorCodec;
+        assert_eq!(
+            codec.encode(&ExecError::DiskFull("x".into())).code,
+            ErrorCode::DiskFull
+        );
+        assert_eq!(
+            codec.encode(&ExecError::ReadOnly("x".into())).code,
+            ErrorCode::ReadOnlySqlTransaction
+        );
+        assert_ne!(
+            codec.code_to_string(ErrorCode::DiskFull),
+            codec.code_to_string(ErrorCode::ReadOnlySqlTransaction)
+        );
     }
 
     #[test]
