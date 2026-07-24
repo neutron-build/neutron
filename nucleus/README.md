@@ -25,7 +25,12 @@ unsupported stub with weaker auth); Arrow Flight SQL is the planned future fast 
 
 Cross-model rollback works in-process, but crash-atomic commit across model-specific WALs is not
 yet claimed. Physical backup v1, logical dump/restore, and PITR over the SQL WAL exist; encrypted
-and model-specific-WAL PITR do not. Client compatibility validated so far: psql 17 meta-commands,
+and model-specific-WAL PITR do not. Physical backup is a directory copy with no
+write coordination, so it must be taken against a STOPPED instance. The logical
+dump currently emits tables and rows ONLY -- it omits roles, RLS policies, views,
+and sequence state, and because it emits `DEFAULT nextval(...)` without creating
+the sequence, a restored table rejects inserts that rely on a SERIAL default.
+Treat logical dump as a data-only export, not a full-database backup. Client compatibility validated so far: psql 17 meta-commands,
 tokio-postgres, psycopg v3, and three ORMs end-to-end (Drizzle, Prisma, SQLAlchemy — see
 `compat/orm/`). Operational hardening is incomplete.
 
