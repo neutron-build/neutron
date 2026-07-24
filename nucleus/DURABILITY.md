@@ -11,6 +11,13 @@ Observed from a live server data directory (`nucleus start --data <dir>`), one
 row per durable artifact. "Authoritative" means recovery reads it as the source
 of truth; anything absent from this list is derived and rebuildable.
 
+**Caveat on the Contents/Recovery columns.** The file list is empirical — every
+path below was observed on disk. The per-file *role* was initially inferred from
+each file's name and owning subsystem, and at least one inference was wrong (see
+the geo correction below). Treat the Contents and Recovery columns for the
+specialty-model WALs as pending per-model verification; the SQL/catalog/meta rows
+and the compaction behavior are directly exercised by the crash matrix.
+
 | Path | Model / subsystem | Contents | Recovery |
 |------|-------------------|----------|----------|
 | `nucleus.db` | SQL relational | Page-structured row data | Replayed against by the WAL below |
@@ -22,7 +29,7 @@ of truth; anything absent from this list is derived and rebuildable.
 | `doc/doc.wal` | Document | Document inserts/updates/deletes | Replayed on open |
 | `graph/graph.wal` | Graph | Node/edge mutations | Replayed on open |
 | `fts/fts.wal` | Full-text search | Index mutations | Replayed on open |
-| `geo/geo.wal` | Geospatial | R-tree mutations | Replayed on open |
+| `geo/geo.wal` | Geospatial | **NOTHING — see correction below** | Not replayed |
 | `vector/vector.wal` | Vector | Vector inserts/deletes | Replayed on open |
 | `vector/index_meta.json` | Vector | HNSW index parameters | Loaded on open; index graph is rebuilt from vectors |
 | `timeseries/ts_wal.bin` | Time series | Point appends | Replayed on open |
@@ -39,6 +46,29 @@ buffer pool.
 
 Not in the data directory: PITR archive segments, which live wherever
 `NUCLEUS_WAL_ARCHIVE_DIR` points (see `src/pitr.rs`).
+
+### Correction: `geo/geo.wal` is a placeholder, not durable state
+
+An earlier revision of this table listed `geo/geo.wal` as holding "R-tree
+mutations" and being "replayed on open". That was wrong, and it is worth
+recording why: the file genuinely appears in a live data directory, and its role
+was inferred from its name rather than from a writer.
+
+In fact `GeoWal::open` is called once at startup, its recovered state is
+DISCARDED into `_state`, the handle is parked on the executor, and nothing ever
+appends to it or reads it back (`geo_wal` appears exactly three times in the
+tree: declaration, `None` initialiser, assignment). The code says so directly:
+
+> `// R-tree rebuild is available via crate::geo::wal::rebuild_rtree(&state)`
+> `// when a GeoIndex is added to the executor. For now, store the WAL handle.`
+
+So the file is an empty placeholder for unimplemented geo persistence. Geo
+support today is computational (`GEO_DISTANCE`, `GEO_WITHIN`, `GEO_AREA`) with
+no persisted geo store behind it. Nothing is lost on crash because nothing is
+kept.
+
+The lesson generalises: a file existing in the data directory proves the
+subsystem *opened* something, not that it *persists* anything.
 
 ## Durability modes
 
