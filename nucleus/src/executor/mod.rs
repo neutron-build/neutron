@@ -2434,6 +2434,23 @@ impl Executor {
         }
     }
 
+    /// Drop every derived in-memory query cache: result cache, plan cache, AST
+    /// cache, global prepared cache, and the uncorrelated-subquery cache.
+    ///
+    /// This is the "cache-free reference" switch used by the cache-coherence
+    /// oracle: clearing these must never change a query's result, so any
+    /// divergence between a warm executor and one cleared through this call is
+    /// a stale-cache bug. Specialty indexes are deliberately NOT touched — the
+    /// oracle isolates them with a separate index-free reference side.
+    pub fn clear_all_query_caches(&self) {
+        self.query_cache_invalidate_all();
+        self.plan_cache.write().clear();
+        self.ast_cache.write().clear();
+        self.global_prepared_cache.write().clear();
+        self.uncorrelated_subquery_cache.write().clear();
+        *self.plan_cache_key_hint.lock() = None;
+    }
+
     /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.
     /// Returns `Some(key)` if a hint was stored, `None` otherwise.
     /// Used by the wire protocol handler to carry the normalized SQL key

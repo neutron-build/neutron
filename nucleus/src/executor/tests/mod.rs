@@ -33,7 +33,9 @@ pub(super) fn scalar(result: &ExecResult) -> &Value {
 }
 
 mod test_admin;
+mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_collections;
+mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
 mod test_ddl;
 mod test_dml;
