@@ -1614,11 +1614,6 @@ impl DatalogWal {
             self.writer.lock().flush()?;
         }
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
         // Guard the length prefix: a payload over 4 GiB would silently truncate
         // when cast to u32 and corrupt the snapshot on replay. Fail loudly instead.
         let plen = u32::try_from(payload.len()).map_err(|_| {
@@ -1627,15 +1622,34 @@ impl DatalogWal {
                 "datalog checkpoint payload exceeds 4 GiB",
             )
         })?;
-        w.write_all(&[WAL_SNAPSHOT])?;
-        w.write_all(&plen.to_le_bytes())?;
-        w.write_all(&payload)?;
-        w.flush()?;
-        drop(w);
 
+        // CRASH SAFETY: stage + fsync + atomic rename, rather than truncating
+        // the live log and rewriting it in place (a crash in that window lost
+        // every fact and rule).
+        let tmp_path = self.path.with_extension("wal.compacting");
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut w = BufWriter::new(file);
+            w.write_all(&[WAL_SNAPSHOT])?;
+            w.write_all(&plen.to_le_bytes())?;
+            w.write_all(&payload)?;
+            w.flush()?;
+            w.get_ref().sync_all()?;
+        }
+        let mut guard = self.writer.lock();
+        std::fs::rename(&tmp_path, &self.path)?;
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
         // Re-open in append mode for future writes
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *guard = BufWriter::new(file);
         Ok(())
     }
 

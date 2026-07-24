@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 255538; Source Rust files: 221; Top-level modules: 50.
-- Declared unit tests: 3865; Declared integration tests: 320; Ignored tests: 43.
+- Source LOC: 256828; Source Rust files: 225; Top-level modules: 50.
+- Declared unit tests: 3874; Declared integration tests: 320; Ignored tests: 43.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -161,21 +161,79 @@ Exit gate:
 
 Goal: every durable model has proven, deterministic crash behavior.
 
-- [ ] Inventory the authoritative files, WALs, manifests, and checkpoints for every data model.
-- [ ] Add subprocess kill points before/after WAL append, fsync, data write, checkpoint, and rename.
-- [ ] Test torn headers/records, truncated WALs, invalid checksums, duplicate replay, and corrupt tails.
-- [ ] Test disk-full, permission loss, fsync/write errors, read-only media, and interrupted checkpoint.
-- [ ] Verify replay idempotency through repeated crash/recovery cycles.
-- [ ] Verify catalog, metadata, security policy, specialty index, and row state recover consistently.
-- [ ] Establish explicit durability modes and fsync guarantees.
-- [ ] Add on-disk format manifests and forward migration tests.
-- [ ] Reject unsupported downgrade/format combinations without modifying data.
+- [x] Inventory the authoritative files, WALs, manifests, and checkpoints for every data model.
+      `DURABILITY.md` tables every durable artifact (observed from a live data directory, not
+      assumed): SQL data + segmented WAL, catalog.json, meta.json, and a per-model WAL for KV,
+      collections, document, graph, FTS, geo, vector (+ index_meta.json), time series, columnar,
+      datalog, streams, CDC, and blob (+ segments), plus what is explicitly derived and rebuildable.
+- [x] Add subprocess kill points before/after WAL append, fsync, data write, checkpoint, and rename.
+      `storage::crashpoint` declares 11 named boundaries; `NUCLEUS_CRASHPOINT=<name>` makes the
+      process `abort()` there (no unwind, no Drop, no flush — power-loss equivalent at a chosen
+      instruction), with `NUCLEUS_CRASHPOINT_SKIP=n` to hit setup vs deep steady state.
+      `probe_crash_points` walks every point at several skip depths and reports points it could NOT
+      reach rather than counting them as passes.
+- [x] Test torn headers/records, truncated WALs, invalid checksums, duplicate replay, and corrupt tails.
+      `probe_durability_torn`: 0 findings over ~9.5k lossy recoveries — no panics, every recovered
+      row was committed, CRC gate honored.
+- [x] Test disk-full, permission loss, fsync/write errors, read-only media, and interrupted checkpoint.
+      `storage::crashpoint::io_fault` injects ENOSPC / permission-denied / generic I/O errors at
+      `wal.append`, `wal.fsync`, and `meta.write`; `probe_io_faults` walks 21 point x kind x depth
+      combinations and asserts the failure SURFACES (a write that cannot be made durable must never
+      report success), that every acknowledged row survives recovery, and that no corrupt or
+      half-applied record remains. 0 findings. Interrupted checkpoint is covered by
+      `checkpoint.before/mid_rewrite/after`. Read-only media is simulated via injected
+      PermissionDenied rather than an actually read-only mount.
+- [x] Verify replay idempotency through repeated crash/recovery cycles.
+      `probe_crash_points` invariant 4 reopens each crashed database three times and requires an
+      identical row set.
+- [x] Verify catalog, metadata, security policy, specialty index, and row state recover consistently.
+      Row state: the crash matrix (prefix + fsync-survival + idempotency). Catalog, metadata, and
+      specialty state: `test_durability_format::catalog_metadata_and_specialty_state_all_survive_reopen`
+      asserts PRIMARY KEY/CHECK/NOT NULL constraints, SERIAL sequence continuity, views, and vector
+      KNN all survive a real restart. Security policy: `test_meta_persistence::
+      test_rls_policy_and_role_verifier_survive_restart` proves a bound principal is still filtered
+      after reopen.
+- [x] Establish explicit durability modes and fsync guarantees.
+      `DURABILITY.md` documents fsync (default) / fdatasync / none and what each loses. The crash
+      matrix asserts the fsync contract directly: every commit the child fsynced must be present
+      after recovery.
+- [x] Add on-disk format manifests and forward migration tests.
+      Data pages carry magic + `DB_FORMAT_VERSION` in the meta page; backup manifests carry
+      `format_version` and restore is format-locked (`src/backup.rs`). A current-format database
+      still opens and reads back (`the_current_format_still_opens`), which is the control that keeps
+      the rejection tests honest.
+- [x] Reject unsupported downgrade/format combinations without modifying data.
+      `test_durability_format` fingerprints every file, attempts to open a future-format and a
+      foreign file, and asserts the refusal names the format problem AND rewrites/deletes nothing.
+      This found a real defect (fixed): format validation ran AFTER WAL recovery, so a rejected open
+      had already replayed WAL records into the file and truncated the WAL to 0 bytes — destroying
+      data it then declined to read. Validation is now the first thing `open_inner` does, straight
+      off disk, before any buffer pool or recovery exists.
 
 Exit gate:
 
 - The crash matrix yields either the previous committed state or the new committed state, never a
   partial committed state or silent corruption.
+  Status: holds at all 11 crash points (`probe_crash_points`, 0 findings) after fixing a
+  total-data-loss defect the matrix found — see below.
 - Recovery failures are actionable errors and do not continue with suspect data.
+  Status: holds across 21 injected I/O-failure combinations (`probe_io_faults`, 0 findings), and a
+  rejected open now provably rewrites/deletes nothing.
+
+Scope limits on the above, stated plainly (full list in `DURABILITY.md`): named crash points cover
+the SQL/MVCC WAL, catalog rename, and compaction paths — the specialty-model WALs are covered by
+reopen tests and by the same stage-and-rename fix, but not yet by crash points of their own.
+Read-only media is simulated with injected PermissionDenied rather than an actually read-only
+mount. Multi-node/replica crash behavior is out of scope here (M9).
+
+**Defect the crash matrix found (fixed).** WAL compaction truncated the live WAL in place and then
+rewrote it from recovered state, so a crash in that window destroyed the only durable copy — the
+matrix caught it losing all 40 fsynced rows at `checkpoint.mid_rewrite`. Compaction runs on EVERY
+reopen of a populated database, which made a power loss during startup a total-data-loss event for
+a database whose every commit had been fsynced and acknowledged. Compaction now stages the baseline
+in a temp file, fsyncs it, renames it over the live WAL atomically, and fsyncs the directory. The
+same truncate-then-rewrite pattern was then found and fixed in the geo and datalog checkpoints
+(the graph and blob WALs already used stage-and-rename correctly).
 
 ## Milestone 4 — Backup, restore, and point-in-time recovery
 

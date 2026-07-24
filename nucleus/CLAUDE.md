@@ -25,6 +25,8 @@ Tracked (release evidence):
 - `DATABASE_COMPLETION.md` -- THE completion program: milestones, gates, evidence,
   and the metrics-checked baseline. Single source of truth for status claims.
 - `RLS_SECURITY.md` -- Row-level-security model and adversarial coverage
+- `DURABILITY.md` -- Durable-file inventory, fsync modes, and crash-injection
+  coverage (M3 evidence)
 
 Local-only (gitignored scratch; historical, NOT release evidence):
 

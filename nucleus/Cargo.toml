@@ -176,6 +176,16 @@ path = "src/bin/probe_crash_subprocess.rs"
 required-features = ["server", "rusqlite"]
 
 [[bin]]
+name = "probe_crash_points"
+path = "src/bin/probe_crash_points.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_io_faults"
+path = "src/bin/probe_io_faults.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "probe_distributed"
 path = "src/bin/probe_distributed.rs"
 required-features = ["server", "rusqlite"]

@@ -358,6 +358,11 @@ impl MetaPersistence {
         let json =
             serde_json::to_string_pretty(&snapshot).map_err(|e| format!("meta serialize: {e}"))?;
 
+        // meta.json carries sequences, views, extensions, and the policy
+        // catalog: a write failure here must surface, never be swallowed.
+        if let Some(e) = crate::storage::crashpoint::io_fault("meta.write") {
+            return Err(format!("meta write: {e}"));
+        }
         let tmp = self.path.with_extension("json.tmp");
         {
             let mut f = std::fs::File::create(&tmp).map_err(|e| format!("meta write tmp: {e}"))?;
@@ -365,7 +370,9 @@ impl MetaPersistence {
                 .map_err(|e| format!("meta write: {e}"))?;
             f.sync_all().map_err(|e| format!("meta fsync: {e}"))?;
         }
+        crate::storage::crashpoint::reach("meta.before_rename");
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("meta rename: {e}"))?;
+        crate::storage::crashpoint::reach("meta.after_rename");
         Ok(())
     }
 

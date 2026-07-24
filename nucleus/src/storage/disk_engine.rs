@@ -437,6 +437,34 @@ impl DiskEngine {
             .map_err(|e| StorageError::Io(e.to_string()))?;
 
         let is_new = file_size == 0;
+
+        // T1.1 / M3: validate the on-disk format BEFORE anything mutates the
+        // database. This check used to live after WAL recovery, which meant a
+        // foreign or future-format file had already had WAL records replayed
+        // into it and its WAL truncated by the time we refused to open it —
+        // destroying data we then declined to read. Read the meta page
+        // straight off disk here so a rejection is provably non-destructive.
+        if !is_new {
+            let mut meta = [0u8; PAGE_SIZE];
+            if disk.read_page(0, &mut meta).is_ok() {
+                let magic = &meta[page::META_MAGIC..page::META_MAGIC + 8];
+                if magic != page::MAGIC_BYTES && magic.iter().any(|&b| b != 0) {
+                    return Err(StorageError::Io(format!(
+                        "{}: not a Nucleus database (bad magic bytes)",
+                        path.display()
+                    )));
+                }
+                let stored_version = page::read_u32(&meta, page::META_DB_VERSION);
+                if stored_version > page::DB_FORMAT_VERSION {
+                    return Err(StorageError::Io(format!(
+                        "{}: on-disk format v{stored_version} is newer than this build supports                          (v{}). Upgrade Nucleus to open this database.",
+                        path.display(),
+                        page::DB_FORMAT_VERSION
+                    )));
+                }
+            }
+        }
+
         let mut initial_pages = if is_new {
             // New database — write meta page
             let mut meta = [0u8; PAGE_SIZE];
