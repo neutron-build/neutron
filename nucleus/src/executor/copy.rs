@@ -89,27 +89,49 @@ impl Executor {
         let num_cols = table_def.columns.len();
         let mut count = 0;
 
-        let non_null_values: Vec<&str> = values.iter().filter_map(|v| v.as_deref()).collect();
-
-        let mut lines_iter = non_null_values.iter();
+        let mut payload_rows = self.copy_payload_rows(&values, &format, delimiter, num_cols);
 
         // Skip header if present
-        if has_header && format == "csv" {
-            let _ = lines_iter.next();
+        if has_header && !payload_rows.is_empty() {
+            payload_rows.remove(0);
         }
 
-        for line in lines_iter {
-            let fields = if format == "csv" {
-                self.parse_csv_line(line, delimiter)
+        // UNIQUE/PRIMARY KEY column sets, mirroring execute_insert.
+        // ReplacingMergeTree-style tables keep multiple versions per key and so
+        // opt out, exactly as they do on the INSERT path.
+        let unique_col_sets: Vec<Vec<usize>> =
+            if crate::columnar::replacing_config(&table_name).is_some() {
+                Vec::new()
             } else {
-                // Text format: tab-delimited
-                line.split(delimiter).map(|s| s.to_string()).collect()
+                use crate::catalog::TableConstraint;
+                table_def
+                    .constraints
+                    .iter()
+                    .filter_map(|c| match c {
+                        TableConstraint::PrimaryKey { columns, .. }
+                        | TableConstraint::Unique { columns, .. } => {
+                            let idxs: Vec<usize> = columns
+                                .iter()
+                                .filter_map(|n| table_def.column_index(n))
+                                .collect();
+                            (idxs.len() == columns.len()).then_some(idxs)
+                        }
+                        _ => None,
+                    })
+                    .collect()
             };
+        let storage = self.storage_for(&table_name);
 
+        for fields in &payload_rows {
             let mut row = Vec::with_capacity(num_cols);
             for (i, field) in fields.iter().enumerate() {
                 if i < num_cols {
-                    let parsed = self.parse_field(field, &table_def.columns[i].data_type);
+                    let parsed = match field {
+                        // `\N` is the text-format NULL marker; it must not be
+                        // parsed as the literal two-character string.
+                        None => Value::Null,
+                        Some(text) => self.parse_field(text, &table_def.columns[i].data_type),
+                    };
                     row.push(parsed);
                 }
             }
@@ -117,8 +139,26 @@ impl Executor {
             while row.len() < num_cols {
                 row.push(Value::Null);
             }
+            self.check_unique_constraints(&table_name, &table_def, &row, None)
+                .await?;
             self.enforce_rls_new_row(&table_name, crate::security::PolicyCommand::Insert, &row)?;
-            self.storage.insert(&table_name, row).await?;
+            if unique_col_sets.is_empty() {
+                storage.insert(&table_name, row).await?;
+            } else {
+                // Same atomic path INSERT uses: a bare append would let COPY be
+                // the one write that can silently duplicate a primary key.
+                storage
+                    .insert_unique(&table_name, row, &unique_col_sets)
+                    .await
+                    .map_err(|e| match e {
+                        crate::storage::StorageError::UniqueViolation(m) => {
+                            ExecError::ConstraintViolation(format!(
+                                "duplicate key value violates unique constraint: {m}"
+                            ))
+                        }
+                        other => ExecError::Storage(other),
+                    })?;
+            }
             count += 1;
         }
 
@@ -126,14 +166,105 @@ impl Executor {
         // covered by the is_dml_write invalidation in the statement dispatcher.
         // Invalidate the query-result cache here so a previously cached SELECT
         // doesn't serve a stale (pre-COPY) row set for up to the cache TTL.
+        //
+        // The same gap applies to every derived structure: the rows went in
+        // through a bare storage append, so B-tree/GIN/vector/encrypted postings
+        // and zone maps still describe the pre-COPY table. A specialty index
+        // that is merely stale (rather than absent) is worse than no index at
+        // all — the scan intersects against it and silently drops the new rows.
+        // Rebuild once for the whole batch rather than per row.
         if count > 0 {
             self.query_cache_invalidate_all();
+            self.rebuild_table_derived_state(&table_name).await;
         }
 
         Ok(ExecResult::Command {
             tag: format!("COPY {count}"),
             rows_affected: count,
         })
+    }
+
+    /// Reconstruct COPY payload rows from the flat token list sqlparser returns.
+    ///
+    /// `Statement::Copy::values` is NOT a list of lines. `Parser::parse_tab_value`
+    /// walks the payload token by token and pushes an entry on every tab *and*
+    /// every newline, so row boundaries are erased and only the field sequence
+    /// survives. It also emits two artifacts that must be stripped:
+    ///
+    ///   * a leading `Some("")` — the newline that ends the `COPY ... STDIN;`
+    ///     line itself is consumed as a field terminator;
+    ///   * a spurious `Some("")` after every `\N` — the NULL marker pushes
+    ///     `None` without clearing the pending content, so the delimiter that
+    ///     follows pushes the empty accumulator as an extra field.
+    ///
+    /// Treating each entry as a whole line (the previous behaviour) therefore
+    /// turned an N-column row into N one-column rows, dropped `\N` fields
+    /// outright, and inserted one all-NULL row per statement from the leading
+    /// artifact — silent data corruption on every text-format `COPY FROM STDIN`,
+    /// which is the shape `pg_dump` emits.
+    ///
+    /// Only the tab case loses row structure: a custom `DELIMITER` and CSV are
+    /// not tokenizer-significant, so for those each surviving entry really is
+    /// one line and is split here instead.
+    pub(super) fn copy_payload_rows(
+        &self,
+        values: &[Option<String>],
+        format: &str,
+        delimiter: char,
+        num_cols: usize,
+    ) -> Vec<Vec<Option<String>>> {
+        // Strip the leading newline artifact.
+        let body = match values.first() {
+            Some(Some(first)) if first.is_empty() => &values[1..],
+            _ => values,
+        };
+
+        // Drop the empty field each `\N` leaves behind, keeping the NULL itself.
+        let mut fields: Vec<Option<String>> = Vec::with_capacity(body.len());
+        let mut skip_next_empty = false;
+        for value in body {
+            match value {
+                None => {
+                    fields.push(None);
+                    skip_next_empty = true;
+                }
+                Some(text) => {
+                    if skip_next_empty && text.is_empty() {
+                        skip_next_empty = false;
+                        continue;
+                    }
+                    skip_next_empty = false;
+                    fields.push(Some(text.clone()));
+                }
+            }
+        }
+
+        let field_per_entry = format != "csv" && delimiter == '\t';
+        if field_per_entry {
+            if num_cols == 0 {
+                return Vec::new();
+            }
+            return fields
+                .chunks(num_cols)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+        }
+
+        // Line-oriented: each entry is a whole line to be split here.
+        fields
+            .into_iter()
+            .flatten()
+            .map(|line| {
+                if format == "csv" {
+                    self.parse_csv_line(&line, delimiter)
+                        .into_iter()
+                        .map(Some)
+                        .collect()
+                } else {
+                    line.split(delimiter).map(|s| Some(s.to_string())).collect()
+                }
+            })
+            .collect()
     }
 
     pub(super) async fn execute_copy_to(
