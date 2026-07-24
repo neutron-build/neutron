@@ -240,11 +240,29 @@ same truncate-then-rewrite pattern was then found and fixed in the geo and datal
 Goal: recover a production database without requiring a byte-for-byte stopped-directory copy.
 
 - [ ] Add an online-consistent physical snapshot coordinated with writes and checkpoints.
+      NOT started (verified 2026-07-24): `backup::backup_data_dir` is a recursive directory copy
+      plus a manifest, with no coordination against writes or checkpoints. The CLI help says to run
+      it against a stopped instance, but nothing enforces that — run live, it prints "Backup
+      complete" for a torn snapshot. This is the milestone's stated goal, so M4 cannot close
+      without it.
 - [ ] Add backup manifests with checksums, format version, database identity, and encryption metadata.
+      PARTIAL: `BackupManifest` carries nucleus_version, format, created_unix, source, and
+      format_version (restore is format-locked). Missing: per-file checksums, a database identity,
+      and encryption metadata.
 - [ ] Add WAL archiving with monotonic positions and retention management.
 - [ ] Add restore-to-latest and restore-to-time/position workflows.
+      LIKELY DONE, needs an end-to-end gate: `pitr::PitrTarget` implements Lsn / Time / Latest and
+      `restore_pitr` rebuilds the WAL dir truncated at the target. Left unchecked until a restore
+      is verified from a clean directory rather than in-process.
 - [ ] Add logical schema/data dump and restore across compatible format versions.
 - [ ] Include roles, memberships, policies, sequences, views, functions, and specialty metadata.
+      NOT started, and the gap is load-bearing (verified 2026-07-24 against a live server): a dump
+      of a database with a role, an RLS policy, a view, and a SERIAL column emitted ONLY
+      `CREATE TABLE` + `INSERT`s. Restoring it silently drops the security boundary (no
+      CREATE POLICY / ENABLE ROW LEVEL SECURITY), and because the table is recreated with
+      `DEFAULT nextval('t_id_seq')` while no sequence is ever created, the restored table REJECTS
+      inserts that rely on the SERIAL default ("null value in column \"id\" violates not-null
+      constraint"). Rows round-trip correctly; the schema around them does not.
 - [ ] Define encrypted-backup key handling and key rotation.
 - [ ] Add restore verification, corruption detection, and automated disaster-recovery tests.
 - [ ] Document RPO/RTO controls and limitations.
