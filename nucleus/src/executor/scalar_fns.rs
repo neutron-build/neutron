@@ -73,6 +73,14 @@ impl Executor {
             )));
         }
 
+        // Specialty-store writes reach the engine as ordinary `SELECT kv_set(…)`
+        // queries, so the statement-level admission gate cannot see them. Check
+        // the degraded-mode gate here too, or a read-only server would still
+        // accept KV/document/graph/vector writes.
+        if self.service.is_read_only() && super::admission::scalar_fn_mutates(fname) {
+            self.service.admit_write(fname)?;
+        }
+
         match fname {
             // -- String functions --
             "UPPER" => {

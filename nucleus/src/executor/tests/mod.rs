@@ -49,6 +49,7 @@ mod test_module_wiring;
 mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_query;
+mod test_read_only_mode; // M10: degraded read-only write admission
 mod test_rls;
 mod test_scalar_fns;
 mod test_specialty_persistence;

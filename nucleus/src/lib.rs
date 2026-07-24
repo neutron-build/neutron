@@ -22,6 +22,7 @@ pub mod inference;
 pub mod kv;
 pub mod memory;
 pub mod metrics;
+pub mod ops;
 pub mod pitr;
 pub mod planner;
 pub mod procedures;

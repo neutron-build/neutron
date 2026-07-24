@@ -81,6 +81,7 @@ pub(crate) fn decode_scram_verifier(encoded: &str) -> Option<(Vec<u8>, Vec<u8>)>
 }
 
 mod admin;
+mod admission;
 mod aggregate;
 mod cache;
 mod copy;
@@ -293,6 +294,10 @@ pub struct Executor {
     /// Memory budget for query execution — prevents OOM from giant JOINs / sorts.
     /// Shared across all concurrent queries; default 256 MB.
     query_memory: Arc<crate::allocator::MemoryBudget>,
+    /// Write-admission gate. Read on every statement that could mutate state;
+    /// flipped to read-only by the disk watermark guard or by an operator so
+    /// the database degrades safely instead of failing mid-write.
+    service: Arc<crate::ops::ServiceState>,
     /// Current subquery nesting depth (safety limit against stack overflow).
     query_depth: AtomicU32,
     /// Global prepared statement cache: SQL text → Arc<PreparedStmt>.
@@ -475,6 +480,7 @@ impl Executor {
                 "query_executor",
                 256 * 1024 * 1024, // 256 MB default
             )),
+            service: Arc::new(crate::ops::ServiceState::new()),
             query_depth: AtomicU32::new(0),
             global_prepared_cache: parking_lot::RwLock::new(GlobalPreparedCache::new(4096)),
             uncorrelated_subquery_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -3240,6 +3246,21 @@ impl Executor {
     ) -> Option<Result<ExecResult, ExecError>> {
         use crate::wire::kv_fast_path::SqlFastPathCommand;
 
+        // The OLTP fast path bypasses `execute_statement`, so it needs its own
+        // degraded-mode gate; otherwise a read-only server would still accept
+        // single-row INSERT/UPDATE/DELETE.
+        if self.service.is_read_only()
+            && !matches!(cmd, SqlFastPathCommand::PointSelect { .. })
+        {
+            let label = match cmd {
+                SqlFastPathCommand::SimpleInsert { .. } => "INSERT",
+                SqlFastPathCommand::PointUpdate { .. } => "UPDATE",
+                SqlFastPathCommand::PointDelete { .. } => "DELETE",
+                SqlFastPathCommand::PointSelect { .. } => unreachable!(),
+            };
+            return Some(Err(self.service.admit_write(label).unwrap_err()));
+        }
+
         match cmd {
             SqlFastPathCommand::PointSelect {
                 table,
@@ -3938,6 +3959,11 @@ impl Executor {
     // ========================================================================
 
     async fn execute_statement(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
+        // Write-admission gate: when the server has degraded to read-only
+        // (disk watermark or operator request), refuse anything that could add
+        // durable state before it touches storage. One relaxed atomic load on
+        // the healthy path.
+        self.admit_statement(&stmt)?;
         self.recompute_session_context(&self.current_session());
         // Track whether this is a DDL statement that modifies the catalog or metadata.
         let is_ddl = matches!(
@@ -6384,6 +6410,16 @@ pub enum ExecError {
     Runtime(String),
     #[error("memory limit exceeded: {0}")]
     MemoryExceeded(String),
+    /// The server refused a write because a disk watermark was crossed
+    /// (SQLSTATE `53100`). Distinct from [`ExecError::ReadOnly`] so operators
+    /// and clients can tell "free space and retry" apart from "someone put
+    /// this server in read-only mode".
+    #[error("disk space exhausted: {0}")]
+    DiskFull(String),
+    /// The server refused a write because it is in read-only mode for a
+    /// non-disk reason (SQLSTATE `25006`).
+    #[error("read-only mode: {0}")]
+    ReadOnly(String),
 }
 
 #[cfg(all(test, feature = "server"))]
