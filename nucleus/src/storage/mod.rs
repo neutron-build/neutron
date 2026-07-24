@@ -17,6 +17,7 @@ pub mod compression;
 #[cfg(feature = "server")]
 pub mod disk;
 #[cfg(feature = "server")]
+pub mod crashpoint;
 pub mod disk_engine;
 pub mod encrypted_index;
 pub mod encryption;
