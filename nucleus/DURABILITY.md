@@ -28,13 +28,11 @@ and the compaction behavior are directly exercised by the crash matrix.
 | `kv/collections.wal` | KV collections | Collection mutations | Replayed on open |
 | `doc/doc.wal` | Document | Document inserts/updates/deletes | Replayed on open |
 | `graph/graph.wal` | Graph | Node/edge mutations | Replayed on open |
-| `fts/fts.wal` | Full-text search | Index mutations | Replayed on open |
-| `geo/geo.wal` | Geospatial | **NOTHING — see correction below** | Not replayed |
+| `fts_index.json` | Full-text search | Whole serialised inverted index | Loaded on open and **overrides** the WAL replay below; rewritten in full on every mutation, non-atomically |
 | `vector/vector.wal` | Vector | Vector inserts/deletes | Replayed on open |
 | `vector/index_meta.json` | Vector | HNSW index parameters | Loaded on open; index graph is rebuilt from vectors |
 | `timeseries/ts_wal.bin` | Time series | Point appends | Replayed on open |
 | `columnar/columnar.wal` | Columnar | Column-segment mutations | Replayed on open |
-| `datalog/datalog.wal` | Datalog | Facts and rules | Replayed on open |
 | `streams/streams.wal` | Streams | Stream appends | Replayed on open |
 | `cdc/cdc.wal` | CDC | Change events | Replayed on open |
 | `blob/blob.wal` | Blob | Blob metadata | Replayed on open |
@@ -47,28 +45,29 @@ buffer pool.
 Not in the data directory: PITR archive segments, which live wherever
 `NUCLEUS_WAL_ARCHIVE_DIR` points (see `src/pitr.rs`).
 
-### Correction: `geo/geo.wal` is a placeholder, not durable state
+### Present in the data directory but NOT authoritative
 
-An earlier revision of this table listed `geo/geo.wal` as holding "R-tree
-mutations" and being "replayed on open". That was wrong, and it is worth
-recording why: the file genuinely appears in a live data directory, and its role
-was inferred from its name rather than from a writer.
+These files are created and opened at startup and never written to afterwards.
+Their presence is not evidence of durability — verified by diffing every file
+size across a single mutation on a live server.
 
-In fact `GeoWal::open` is called once at startup, its recovered state is
-DISCARDED into `_state`, the handle is parked on the executor, and nothing ever
-appends to it or reads it back (`geo_wal` appears exactly three times in the
-tree: declaration, `None` initialiser, assignment). The code says so directly:
+| Path | Reality |
+|------|---------|
+| `geo/geo.wal` | `GeoWal::open` runs once, its state is discarded into `_state`, and the handle is parked on the executor. Nothing appends or reads it. Geo is computational only (`GEO_DISTANCE`, `GEO_WITHIN`, `GEO_AREA`, `ST_*`); there is no `GEO_ADD`, so there is no state to persist. |
+| `datalog/datalog.wal` | Same pattern — declaration, `None` init, one assignment, no writer. Unlike geo, `DATALOG_ASSERT` *does* mutate state, so asserted facts are silently lost on restart. |
+| `fts/fts.wal` | Opened and replayed at startup, but the SQL `FTS_*` path never appends to it, and `load_fts_index()` overwrites the replayed result with `fts_index.json` when that file parses. A corrupt snapshot fails silently and starts the server with a stale index. |
 
-> `// R-tree rebuild is available via crate::geo::wal::rebuild_rtree(&state)`
-> `// when a GeoIndex is added to the executor. For now, store the WAL handle.`
+No on-disk artifact at all: **datalog**, **sparse vectors**, and **tensors**
+accept writes and lose them on restart. See `docs/MODEL_SEMANTICS.md` for the
+per-model durability, transaction and RLS matrix and the method behind it.
 
-So the file is an empty placeholder for unimplemented geo persistence. Geo
-support today is computational (`GEO_DISTANCE`, `GEO_WITHIN`, `GEO_AREA`) with
-no persisted geo store behind it. Nothing is lost on crash because nothing is
-kept.
-
-The lesson generalises: a file existing in the data directory proves the
-subsystem *opened* something, not that it *persists* anything.
+The generalisable lesson, learned by getting this table wrong once: a file
+existing in the data directory proves the subsystem *opened* something, not that
+it *persists* anything. An earlier revision of this document inferred each
+file's role from its name and listed `geo/geo.wal` and `datalog/datalog.wal` as
+"replayed on open"; neither is ever written. Every row above is now backed by
+diffing file sizes across a single mutation on a live server, which finds the
+real writer instead of the plausible one.
 
 ## Durability modes
 
@@ -84,6 +83,14 @@ subsystem *opened* something, not that it *persists* anything.
 commit acknowledged under `fsync` must survive a power loss; that is the
 contract `probe_crash_points` invariant 3 checks directly by comparing the
 child's last fsynced id against what recovery returns.
+
+**This mode applies to the SQL WAL only.** At the commit boundary
+`force_specialty_durability()` additionally fsyncs the KV, KV-collections, time
+series, vector, graph and streams logs. The document, FTS, blob and columnar
+logs are *not* fsynced on the commit path — they are `write` + `flush` into the
+OS page cache, so an acknowledged write to those models survives a process
+crash but not necessarily a power failure. CDC is excluded deliberately (it
+appends per changed row; its source rows are already durable in the SQL WAL).
 
 ## Crash-injection coverage
 
@@ -191,3 +198,11 @@ database still opening as the control.
 - Read-only *media* is simulated by injected `PermissionDenied` rather than an
   actually read-only mount.
 - Multi-node / replica crash behavior is out of scope here (M9).
+- Datalog, sparse vectors and tensors have **no durable store at all** — writes
+  are acknowledged and lost on restart, with no error. See
+  `docs/MODEL_SEMANTICS.md`.
+- The FTS snapshot is rewritten whole with `std::fs::write` (no temp + rename,
+  no fsync) and a parse failure on load is swallowed, so a crash mid-rewrite
+  silently starts the server with a stale index.
+- There is no shared commit record between the SQL WAL and the model WALs, so a
+  transaction spanning both is not atomic across a crash by construction.
