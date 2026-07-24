@@ -325,10 +325,39 @@ Goal: operators can observe, control, diagnose, and safely stop the database.
 - [ ] Add health, readiness, startup, recovery, and degraded-state reporting.
 - [ ] Add structured slow-query logs, query IDs, EXPLAIN diagnostics, and tracing integration.
 - [ ] Enforce connection, query-time, transaction-idle, memory, temporary-space, and tenant limits.
-- [ ] Add disk watermarks, safe read-only/degraded mode, and operator alerts.
-- [ ] Verify graceful shutdown drains requests and persists all required state.
-- [ ] Validate configuration eagerly and redact secrets from logs/status output.
+- [x] Add disk watermarks, safe read-only/degraded mode, and operator alerts.
+- [x] Verify graceful shutdown drains requests and persists all required state.
+- [x] Validate configuration eagerly and redact secrets from logs/status output.
 - [ ] Add maintenance commands for checkpoints, vacuum/GC, statistics, compaction, and integrity check.
+
+Evidence (partial — see the open items above):
+
+- Connection limit: the pgwire accept loop takes a slot non-blockingly, so one
+  over-limit client no longer stalls the listener for the 30 s acquire timeout,
+  and a refused client receives `FATAL` / SQLSTATE `53300` with a hint naming
+  `server.max_connections`. Counted by `nucleus_connections_rejected_total`.
+  Verified with `psql` at `NUCLEUS_SERVER_MAX_CONNECTIONS=2`: the third
+  connection is refused in 0 s, the listener answers immediately afterwards,
+  and freeing a holder re-admits. Query-time, transaction-idle, and memory
+  limits are enforced elsewhere (T1.2/T1.3); temporary-space and tenant limits
+  are NOT implemented, so this item stays open.
+- Disk watermarks: `src/ops/disk.rs` samples free space on the data directory
+  and drives `ServiceState` to read-only before ENOSPC, with hysteresis and an
+  absolute min-free floor; writes then fail with SQLSTATE `53100` naming the
+  directory, the free space, the watermarks, and the two recovery actions.
+  Reads, transaction control, and `VACUUM` stay available. Admission is
+  fail-closed at the statement gate, the specialty-store SQL functions, and the
+  OLTP fast path. Verified through `psql` with an unreachable min-free floor.
+- Graceful shutdown: the flush previously never ran on SIGTERM — `main`
+  returned before the signal handler reached it. The order is now enforced and
+  observable (stop accepting, bounded drain, flush, exit) and verified by
+  sending SIGTERM with a live client: the drain waits, the flush logs, and
+  committed data survives restart.
+- Config validation: `NucleusConfig::validate()` refuses to start on
+  over-committed memory budgets, typo'd enums, a replica without a primary
+  host, port collisions, and inverted or flapping disk watermarks, reporting
+  every problem at once. `src/ops/redact.rs` centralises secret detection for
+  logs and status output.
 
 Exit gate:
 
