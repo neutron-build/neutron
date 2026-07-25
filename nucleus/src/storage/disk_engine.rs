@@ -1723,7 +1723,28 @@ impl DiskEngine {
 
     /// Allocate a new data page for a table, linking it at the end of the chain.
     /// Reuses a page from the free list if available, otherwise allocates a new page.
+    ///
+    /// # Lock order
+    ///
+    /// `tables` (L1) is taken FIRST, before the free list (L4), the pool (L5/L6),
+    /// and `txn_state` (L2) — every lock this function needs sits below it in the
+    /// order documented on [`FrameDescriptor::latch`]. This used to run the other
+    /// way: `reuse_free_page` took L4 and `record_dirty_page` took L2 before L1
+    /// was acquired. That was not a deadlock, because both released their guards
+    /// before returning and so L4 and L1 were never held at once — but it left the
+    /// inversion sitting directly on the rule the engine's deadlock-freedom
+    /// argument rests on. Any later change that held the free-list lock across the
+    /// linking step, or consulted `tables` while holding it, would have closed the
+    /// cycle against the `free_page` paths that correctly take L1 then L4, and it
+    /// would have looked like a local, harmless edit.
     fn alloc_data_page(&self, table: &str) -> Result<u32, StorageError> {
+        let mut tables = self.tables.write();
+        // Fail before allocating: an unknown table used to leak the page it had
+        // already taken off the free list.
+        if !tables.contains_key(table) {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        }
+
         let page_id = match self.reuse_free_page()? {
             Some(reused_id) => reused_id,
             None => self
@@ -1743,7 +1764,6 @@ impl DiskEngine {
         self.record_dirty_page(page_id); // new page allocated during txn
 
         // Find the last page in the chain and link to the new page
-        let mut tables = self.tables.write();
         let meta = tables
             .get_mut(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
