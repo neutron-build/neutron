@@ -4721,4 +4721,84 @@ mod tests {
             "rows were lost or duplicated by concurrent churn"
         );
     }
+
+    /// A DELETE that follows a row-growing UPDATE in the same transaction must
+    /// still delete the row.
+    ///
+    /// `BufferedDiskEngine` replays its buffer op-by-op at COMMIT. The UPDATE
+    /// grows the row past its slot, so `update_at` relocates it — into an
+    /// earlier dead slot if one exists, which is why the prior DELETE below is
+    /// load-bearing. The buffered DELETE still names the original position,
+    /// where `delete_at` finds a dead slot and silently continues. The client
+    /// is told `DELETE 1`, the row survives, and it survives a reopen: on-disk
+    /// data loss from ordinary single-session SQL.
+    #[tokio::test]
+    async fn buffered_delete_after_growing_update_is_not_lost() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("relocate.db"), catalog.clone()).unwrap());
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, storage));
+
+        run(&ex, "CREATE TABLE t (id BIGINT PRIMARY KEY, c TEXT)").await;
+        run(&ex, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").await;
+        // Leaves a dead slot ahead of id=3 for the grown row to relocate into.
+        run(&ex, "DELETE FROM t WHERE id = 2").await;
+
+        run(&ex, "BEGIN").await;
+        run(&ex, "UPDATE t SET c = repeat('q', 2000) WHERE id = 3").await;
+        run(&ex, "DELETE FROM t WHERE id = 3").await;
+        run(&ex, "COMMIT").await;
+
+        let remaining = run(&ex, "SELECT COUNT(*) FROM t WHERE id = 3").await;
+        assert_eq!(
+            *scalar(&remaining[0]),
+            Value::Int64(0),
+            "COMMIT reported the DELETE succeeded but the row is still present"
+        );
+
+        let total = run(&ex, "SELECT COUNT(*) FROM t").await;
+        assert_eq!(
+            *scalar(&total[0]),
+            Value::Int64(1),
+            "only id=1 should remain"
+        );
+    }
+
+    /// The same shape with a second UPDATE instead of a DELETE: the later write
+    /// must win. If the first UPDATE relocates the row, a second UPDATE aimed at
+    /// the original position lands on a dead slot and is silently dropped,
+    /// leaving the *earlier* value behind.
+    #[tokio::test]
+    async fn buffered_update_after_growing_update_keeps_the_later_value() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("relocate2.db"), catalog.clone()).unwrap());
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, storage));
+
+        run(&ex, "CREATE TABLE t (id BIGINT PRIMARY KEY, c TEXT)").await;
+        run(&ex, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").await;
+        run(&ex, "DELETE FROM t WHERE id = 2").await;
+
+        run(&ex, "BEGIN").await;
+        run(&ex, "UPDATE t SET c = repeat('q', 2000) WHERE id = 3").await;
+        run(&ex, "UPDATE t SET c = 'final' WHERE id = 3").await;
+        run(&ex, "COMMIT").await;
+
+        let v = run(&ex, "SELECT c FROM t WHERE id = 3").await;
+        assert_eq!(
+            *scalar(&v[0]),
+            Value::Text("final".into()),
+            "the later UPDATE in the transaction was dropped"
+        );
+    }
 }
