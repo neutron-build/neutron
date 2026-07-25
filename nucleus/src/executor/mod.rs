@@ -4321,7 +4321,7 @@ impl Executor {
     async fn execute_statements_dispatch(
         &self,
         sql: &str,
-        statements: Vec<Statement>,
+        #[cfg_attr(not(feature = "server"), allow(unused_mut))] mut statements: Vec<Statement>,
     ) -> Result<Vec<ExecResult>, ExecError> {
         #[cfg(not(feature = "server"))]
         let _ = sql;
@@ -4387,13 +4387,31 @@ impl Executor {
                     } else {
                         let repl = self.raft_replicator.read().clone();
                         if let Some(replicator) = repl {
-                            if let Err(e) = replicator.propose_and_await(sql).await {
-                                if has_security_ddl {
-                                    return Err(ExecError::Runtime(format!(
-                                        "security catalog replication failed: {e}"
-                                    )));
+                            match replicator.propose_and_await(sql).await {
+                                Ok(replicated) => {
+                                    // Execute exactly what was replicated. The
+                                    // determinism gate may have folded volatile
+                                    // functions into leader-evaluated literals;
+                                    // running the original text here would make
+                                    // the leader disagree with its own followers.
+                                    if replicated != sql {
+                                        statements = self.parse_with_ast_cache(&replicated)?;
+                                    }
                                 }
-                                tracing::warn!("Raft propose failed: {e}");
+                                // A refusal must never fall through to a local
+                                // write: a leader-only write IS the divergence
+                                // the refusal exists to prevent.
+                                Err(crate::distributed::ProposeError::Nondeterministic(e)) => {
+                                    return Err(ExecError::Runtime(e.to_string()));
+                                }
+                                Err(e) => {
+                                    if has_security_ddl {
+                                        return Err(ExecError::Runtime(format!(
+                                            "security catalog replication failed: {e}"
+                                        )));
+                                    }
+                                    tracing::warn!("Raft propose failed: {e}");
+                                }
                             }
                         } else {
                             if has_security_ddl {

@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 265610; Source Rust files: 236; Top-level modules: 51.
-- Declared unit tests: 3989; Declared integration tests: 335; Ignored tests: 45.
+- Source LOC: 268467; Source Rust files: 239; Top-level modules: 51.
+- Declared unit tests: 4020; Declared integration tests: 335; Ignored tests: 45.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,972 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -548,12 +548,51 @@ Goal: convert the current Raft/runtime implementation into a restart-safe replic
 
 ### Consensus persistence and state machine
 
-- [ ] Persist current term, voted-for, replicated log, commit index, and snapshot metadata atomically.
+- [x] Persist current term, voted-for, replicated log, commit index, and snapshot metadata atomically.
 - [ ] Wire InstallSnapshot through real transport and restore executor/catalog state from snapshots.
-- [ ] Replace unconstrained raw-SQL replication with deterministic commands or reject nondeterminism.
+- [x] Replace unconstrained raw-SQL replication with deterministic commands or reject nondeterminism.
 - [ ] Define handling when a command commits to quorum but local execution fails.
 - [ ] Add request identifiers, deduplication, retry, and exactly-once-visible application semantics.
 - [ ] Replicate multi-statement transactions and schema/security changes atomically.
+
+Evidence (consensus persistence): `src/raft/storage.rs` fsyncs term, vote and log
+before the RPC response that depends on them leaves the node; `RaftNode::open`
+restores them. `src/bin/probe_raft_crash.rs` drives a child process that answers an
+RPC and then dies at each of the six declared `raft.*` crashpoints
+(`std::process::abort` — no unwinding, no `Drop`, no buffer flush), and asserts the
+granted vote and the acknowledged entries are still binding after restart. Reverting
+vote restoration produced three DOUBLE VOTE findings; reverting log restoration
+produced two PHANTOM ACK findings. The lib tests were likewise reverted in three
+independent slices (hard state, log, gate) and each time only the matching tests
+failed, never the pre-existing Raft suite.
+
+Scope, stated precisely: term, vote, log entries and snapshot metadata/data are
+written and fsync'd before the dependent response. `commit_index` is *checkpointed*
+(stride 64), so a restart may report it low and relearn it from the leader — it can
+never come back high. `last_applied` is restored only to the snapshot boundary, so
+entries between the snapshot and the commit index are re-applied on restart; SQL
+commands are not idempotent, so that re-application is a real gap owned by the
+unchecked "exactly-once-visible application semantics" item, not by this one.
+Crash injection demonstrates survival of process death, not of power loss — the page
+cache outlives an aborted process, so a missing fsync would still pass that harness.
+
+Evidence (deterministic replication): `src/raft/determinism.rs` classifies every
+function reference in the parsed statement, folds clock/RNG volatility to
+leader-evaluated literals, and refuses session/connection/process/sequence
+volatility by name. Folding is fail-closed: the rewrite is re-rendered, re-parsed
+and re-classified, and is accepted only if the render round-trips byte-identically
+and no volatile reference survives. `propose_and_await` returns the SQL that was
+replicated and the executor runs *that*, so the leader cannot drift from its own
+followers, and a `ProposeError::Nondeterministic` is a hard statement error rather
+than falling through to a leader-only local write. The replay tests apply the log
+command to two independent databases through the real executor and compare stored
+values, each preceded by a control assertion proving the raw statement genuinely
+diverges over the same interval; with the gate disabled both replay tests fail.
+Residual, by design: volatility reached indirectly through a catalog `DEFAULT`, a
+trigger body or a generated column is not visible to a statement-level gate (the
+DDL that introduces such a `DEFAULT` is caught). Implicit `SERIAL` defaults are
+treated as deterministic because a sequence is replicated state advanced by the same
+command order.
 
 ### Cluster lifecycle
 

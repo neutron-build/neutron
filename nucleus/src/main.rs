@@ -1313,8 +1313,15 @@ async fn cmd_start(cfg: StartConfig) {
             })
             .collect()
     };
-    let (raft_replicator, apply_rx) =
-        nucleus::distributed::RaftReplicator::new(node_id, initial_peers, transport.clone());
+    // A server with a data directory gets durable Raft state; memory mode has
+    // nowhere to put it and is explicitly not restart-safe.
+    let raft_dir = if memory { None } else { Some(data.join("raft")) };
+    let (raft_replicator, apply_rx) = nucleus::distributed::RaftReplicator::with_storage(
+        node_id,
+        initial_peers,
+        transport.clone(),
+        raft_dir,
+    );
     let raft_replicator = Arc::new(raft_replicator);
 
     // Register initial peers with the transport.

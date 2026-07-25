@@ -186,6 +186,11 @@ path = "src/bin/probe_crash_points.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "probe_raft_crash"
+path = "src/bin/probe_raft_crash.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "probe_io_faults"
 path = "src/bin/probe_io_faults.rs"
 required-features = ["server"]
