@@ -197,12 +197,17 @@ impl Executor {
         if self.storage.supports_mvcc() {
             self.storage.abort_txn().await?;
         } else if let Some(snapshot) = txn.snapshot.take() {
-            // Legacy: restore each table to its snapshotted state.
+            // Legacy: restore each table to its snapshotted state. Positions
+            // come from scan_physical, never from `0..len` — an engine is free
+            // to address rows by something other than a dense scan ordinal
+            // (the paged engine uses physical (page, slot) addresses), and
+            // synthesising ordinals there would write over unrelated pages.
             for (table_name, original_rows) in &snapshot {
-                if let Ok(current_rows) = self.storage.scan(table_name).await
+                if let Ok(current_rows) = self.storage.scan_physical(table_name).await
                     && !current_rows.is_empty()
                 {
-                    let positions: Vec<usize> = (0..current_rows.len()).collect();
+                    let positions: Vec<usize> =
+                        current_rows.iter().map(|(pos, _)| *pos).collect();
                     let _ = self.storage.delete(table_name, &positions).await;
                 }
                 for row in original_rows {
@@ -337,10 +342,12 @@ impl Executor {
             if let Some(pos) = pos {
                 let (_, snapshot) = txn.savepoints[pos].clone();
                 for (table_name, original_rows) in &snapshot {
-                    if let Ok(current_rows) = self.storage.scan(table_name).await
+                    // scan_physical, not `0..len` — see rollback above.
+                    if let Ok(current_rows) = self.storage.scan_physical(table_name).await
                         && !current_rows.is_empty()
                     {
-                        let positions: Vec<usize> = (0..current_rows.len()).collect();
+                        let positions: Vec<usize> =
+                            current_rows.iter().map(|(pos, _)| *pos).collect();
                         let _ = self.storage.delete(table_name, &positions).await;
                     }
                     for row in original_rows {
