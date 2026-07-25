@@ -537,6 +537,48 @@ Still open in this milestone:
   publishes change events for transactions that never committed.
 - Vector rollback is not durable (no compensating record in `vector/vector.wal`).
 
+### `BEGIN ISOLATION LEVEL SERIALIZABLE` is accepted and silently ignored on disk
+
+Found 2026-07-25 by repointing the concurrency harnesses at the shipped engine.
+This is the same defect shape as the savepoint bug above — `BufferedDiskEngine`
+inheriting a silent no-op default from `StorageEngine` — in a second method.
+
+`StorageEngine::set_next_isolation_level` (`src/storage/mod.rs:413`) defaults to
+`{}`. Only `MvccStorageAdapter` implements it (`src/storage/mvcc.rs:2315`), so on
+`BufferedDiskEngine` and `DiskEngine` the executor parses the requested level
+(`src/executor/mod.rs:4758-4771`), hands it to the engine, and it is discarded
+with no error and no warning. `buffered_engine.rs` has no read-set, write-set, or
+conflict tracking of any kind, so no conflict can be detected; its own header
+already records "no full MVCC snapshot isolation between concurrent sessions"
+(`src/storage/buffered_engine.rs:22-25`) — what is new is that a client asking
+for a stronger level is told nothing and silently gets none of it.
+
+**Measured over the wire**, `nucleus start` + two `psql` clients, identical script
+against a real PostgreSQL 17 as control:
+
+| | Session A | Session B | Counter 0 → |
+|---|---|---|---|
+| PostgreSQL 17 | `ERROR: could not serialize access due to concurrent update`, ROLLBACK | COMMIT | 1, one txn aborted |
+| Nucleus, disk | COMMIT | COMMIT | 1, **both committed, one increment lost** |
+
+Both transactions ran `BEGIN ISOLATION LEVEL SERIALIZABLE`, read `v = 0`, wrote
+`v = 0 + 1`, and committed. `probe_concurrency_threads --engine buffered-disk`
+reproduces it in-process: 40 rounds, 83 invariant violations, 0 of 40
+write-conflict trials detected, against 40 of 40 on `mvcc`.
+
+Not introduced by this branch — the no-op default is on `main`
+(`nucleus/src/storage/mod.rs:338` there). It went unseen because every harness
+that asserts isolation ran on `MvccStorageAdapter`, the one engine that
+implements the method.
+
+- [ ] Decide the contract: implement conflict detection on the paged engines, or
+      reject `SERIALIZABLE`/`REPEATABLE READ` with a clear error instead of
+      accepting and ignoring them. Silently downgrading is the one option that
+      loses data without telling anyone.
+- [ ] Reconcile `docs/MODEL_SEMANTICS.md:263-271` with whichever is chosen — it
+      currently calls `SHOW transaction_isolation` "advisory" but does not say a
+      requested level is discarded, or that lost updates follow.
+
 Exit gate:
 
 - Cross-model transactions expose all effects or none after every injected crash point.
