@@ -50,15 +50,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Confirm this is Linux
-        # probe_soak's RSS leak gate reads /proc/self/status. On macOS it is a
-        # SILENT no-op — the harness passes without ever checking for a leak.
-        # Fail loudly rather than record a meaningless green.
+        # The leak gate no longer depends on /proc — it reads RSS via ps where
+        # /proc is absent, and treats unreadable RSS as a failure rather than a
+        # silent pass (that silent pass was a permanent green on macOS until it
+        # was fixed). This job still pins Linux because the soak is the
+        # reference measurement: its numbers are only comparable run to run if
+        # the OS, allocator, and page-cache behavior stay fixed.
         run: |
           test "$(uname -s)" = "Linux" || {
-            echo "probe_soak's leak gate needs /proc; this runner is $(uname -s)" >&2
+            echo "the soak is the reference measurement and is pinned to Linux; this runner is $(uname -s)" >&2
             exit 1
           }
-          test -r /proc/self/status
 
       - name: Build soak harness
         run: cargo build --release --locked --features server --bin probe_soak
