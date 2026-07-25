@@ -1,5 +1,11 @@
 name: Nucleus Release
 
+# Release signing stays on GitHub-hosted runners on purpose. Cosign keyless
+# signing derives its identity from GitHub's OIDC issuer, and SLSA provenance
+# is only worth something when a third party can verify the builder — neither
+# survives a move to a self-hosted runner on a private LAN. Fast correctness
+# gates for the source of truth live in `.forgejo/workflows/`.
+
 on:
   push:
     branches: [main]
@@ -14,14 +20,14 @@ on:
       - ".github/workflows/nucleus-release.yml"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: 1
+  IMAGE: ghcr.io/neutron-build/nucleus
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -74,11 +80,65 @@ jobs:
         working-directory: nucleus
 
   # ---------------------------------------------------------------------------
+  # SBOM: CycloneDX 1.5 over the resolved dependency graph.
+  # Runs on every push/PR, not just tags, so a dependency change that breaks
+  # SBOM generation is caught before a release depends on it.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      # --target all covers every platform's conditional dependencies, so one
+      # SBOM describes all four released binaries rather than only the host's.
+      # --license-accept-named BSL-1.1 is required: BSL-1.1 is not an SPDX
+      # identifier, and without it the crate's own license is reported as an
+      # unparsable expression.
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --all \
+            --target all \
+            --license-accept-named BSL-1.1 \
+            --override-filename nucleus.cdx
+          ls -l nucleus.cdx.json
+        working-directory: nucleus
+
+      - name: Sanity-check the SBOM
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          bom = json.load(open("nucleus/nucleus.cdx.json"))
+          assert bom["specVersion"] == "1.5", bom["specVersion"]
+          comps = bom.get("components", [])
+          assert len(comps) > 200, f"only {len(comps)} components — graph looks truncated"
+          assert bom["metadata"]["component"]["name"] == "nucleus"
+          missing = [c["name"] for c in comps if not c.get("hashes")]
+          print(f"{len(comps)} components, {len(missing)} without hashes")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleus-sbom
+          path: nucleus/nucleus.cdx.json
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # Release builds: only on nucleus/v* tags, after CI passes
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    needs: [test, clippy]
+    needs: [test, clippy, sbom]
     if: startsWith(github.ref, 'refs/tags/nucleus/v')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -129,7 +189,7 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --bin nucleus --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin nucleus --target ${{ matrix.target }}
         working-directory: nucleus
         env:
           CARGO_PROFILE_RELEASE_STRIP: "true"
@@ -137,7 +197,7 @@ jobs:
 
       - name: Build (cross)
         if: ${{ matrix.cross }}
-        run: cross build --release --bin nucleus --target ${{ matrix.target }}
+        run: cross build --release --locked --bin nucleus --target ${{ matrix.target }}
         working-directory: nucleus
         env:
           CARGO_PROFILE_RELEASE_STRIP: "true"
@@ -150,44 +210,94 @@ jobs:
       - name: Package
         id: package
         run: |
-          # Unversioned asset name so /releases/latest/download/<asset> resolves
-          # without needing to know the version in the URL.
-          ARCHIVE="nucleus-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
-          tar czf "$ARCHIVE" -C "nucleus/target/${{ matrix.target }}/release" nucleus
-          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          V="${{ steps.version.outputs.version }}"
+          BASE="nucleus-${{ matrix.os }}-${{ matrix.arch }}"
+          SRC="nucleus/target/${{ matrix.target }}/release"
+          # Versioned name is the artifact of record — you cannot test an
+          # upgrade or a rollback when every release ships the same filename.
+          tar czf "${BASE}-${V}.tar.gz" -C "$SRC" nucleus
+          # Unversioned alias so /releases/latest/download/<asset> still
+          # resolves without knowing the version.
+          cp "${BASE}-${V}.tar.gz" "${BASE}.tar.gz"
+          # Raw binary too, for the container image job.
+          mkdir -p "dist/${{ matrix.arch }}"
+          cp "$SRC/nucleus" "dist/${{ matrix.arch }}/nucleus"
+          ls -l ${BASE}*.tar.gz
 
-      - name: Upload artifact
+      - name: Upload archives
         uses: actions/upload-artifact@v4
         with:
-          name: nucleus-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ steps.package.outputs.archive }}
+          name: archive-${{ matrix.os }}-${{ matrix.arch }}
+          path: nucleus-${{ matrix.os }}-${{ matrix.arch }}*.tar.gz
+          retention-days: 1
+
+      - name: Upload raw linux binary for the container image
+        if: matrix.os == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/nucleus
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # GitHub Release: collect all platform archives, checksum, publish
+  # GitHub Release: collect archives, attach the SBOM, checksum, sign, publish
   # ---------------------------------------------------------------------------
   release:
     name: Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/nucleus/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Keyless cosign signing and SLSA provenance both mint short-lived
+      # certificates from this token. No key material is stored anywhere.
+      id-token: write
+      attestations: write
     steps:
-      - name: Download all artifacts
+      - name: Download platform archives
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: nucleus-*
+          pattern: archive-*
           merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: nucleus-sbom
+          path: artifacts
 
       - name: Generate checksums
         working-directory: artifacts
         run: |
-          sha256sum nucleus-*.tar.gz > checksums.txt
+          sha256sum nucleus-*.tar.gz nucleus.cdx.json > checksums.txt
           cat checksums.txt
 
       - name: Extract version
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/nucleus/}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless: the signing certificate binds this repository, workflow and
+      # ref, and the signature is logged to the Rekor public transparency log.
+      # A `.cosign.bundle` is self-contained — verification needs no key and
+      # no network fetch of the certificate.
+      - name: Sign artifacts (cosign keyless)
+        working-directory: artifacts
+        run: |
+          for f in nucleus-*.tar.gz nucleus.cdx.json checksums.txt; do
+            cosign sign-blob --yes \
+              --bundle "${f}.cosign.bundle" \
+              "$f"
+          done
+          ls -l *.cosign.bundle
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "artifacts/nucleus-*.tar.gz"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -196,22 +306,22 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/nucleus-*.tar.gz
+            artifacts/nucleus.cdx.json
             artifacts/checksums.txt
+            artifacts/*.cosign.bundle
           body: |
             ## Nucleus ${{ steps.version.outputs.version }}
 
             Multi-model database engine — SQL, KV, Graph, Document, Vector, FTS, TimeSeries, Blob, Columnar, Datalog, PubSub, Geo, and Streams in a single binary.
 
+            Read the support tiers in `README.md` before deploying: Nucleus is a
+            developer preview, and distributed mode is unsupported.
+
             ### Quick start
 
             ```bash
-            # Download and extract
-            tar xzf nucleus-<os>-<arch>.tar.gz
-
-            # Start the server (PostgreSQL wire protocol on :5432)
-            ./nucleus serve
-
-            # Connect with any PostgreSQL client
+            tar xzf nucleus-<os>-<arch>-${{ steps.version.outputs.version }}.tar.gz
+            ./nucleus start --data ./nucleus_data
             psql -h 127.0.0.1 -p 5432
             ```
 
@@ -221,25 +331,65 @@ jobs:
             sha256sum -c checksums.txt
             ```
 
+            ### Verify signatures (no key needed)
+
+            Every asset is signed with Sigstore keyless signing and logged to
+            the Rekor transparency log. The certificate identity below is what
+            makes the signature meaningful — checking only that a signature
+            exists proves nothing.
+
+            ```bash
+            cosign verify-blob \
+              --bundle nucleus-linux-amd64-${{ steps.version.outputs.version }}.tar.gz.cosign.bundle \
+              --certificate-identity-regexp '^https://github\.com/neutron-build/neutron/\.github/workflows/nucleus-release\.yml@' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              nucleus-linux-amd64-${{ steps.version.outputs.version }}.tar.gz
+            ```
+
+            ### Verify build provenance
+
+            ```bash
+            gh attestation verify nucleus-linux-amd64-${{ steps.version.outputs.version }}.tar.gz \
+              --repo neutron-build/neutron
+            ```
+
+            ### Software bill of materials
+
+            `nucleus.cdx.json` — CycloneDX 1.5, covering the resolved
+            dependency graph for all released targets.
+
             ### Platforms
 
             | File | OS | Arch |
             |------|----|------|
-            | `nucleus-linux-amd64.tar.gz` | Linux | x86_64 |
-            | `nucleus-linux-arm64.tar.gz` | Linux | aarch64 |
-            | `nucleus-darwin-arm64.tar.gz` | macOS | Apple Silicon |
-            | `nucleus-darwin-amd64.tar.gz` | macOS | Intel |
+            | `nucleus-linux-amd64-<version>.tar.gz` | Linux | x86_64 (glibc) |
+            | `nucleus-linux-arm64-<version>.tar.gz` | Linux | aarch64 (glibc) |
+            | `nucleus-darwin-arm64-<version>.tar.gz` | macOS | Apple Silicon |
+            | `nucleus-darwin-amd64-<version>.tar.gz` | macOS | Intel |
+
+            No musl/static build and no Windows build. macOS binaries are
+            **not** notarized — clear the quarantine bit with
+            `xattr -d com.apple.quarantine ./nucleus`.
+
+            ### Container
+
+            ```
+            docker pull ghcr.io/neutron-build/nucleus:${{ steps.version.outputs.version }}
+            ```
+
+            linux/amd64 and linux/arm64.
 
   # ---------------------------------------------------------------------------
-  # Docker: build and push linux/amd64 image to GHCR on main or release tag
+  # Container image, main branch: amd64, built from source, tagged :latest
   # ---------------------------------------------------------------------------
-  docker:
-    name: Docker (linux/amd64)
+  docker-main:
+    name: Container (main, linux/amd64)
     needs: [test, clippy]
-    if: >
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/nucleus/v'))
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -253,21 +403,92 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/neutron-build/nucleus
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=match,pattern=nucleus/v(.*),group=1
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: ./nucleus
+          file: ./nucleus/Dockerfile
+          platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Container image, release tags: multi-arch from the already-built binaries.
+  #
+  # Compiling this crate under QEMU for arm64 takes 45-90 minutes. The release
+  # job has already produced a native binary per architecture, so `Dockerfile.dist`
+  # only needs emulation for `apt-get` and `groupadd` — seconds, not an hour.
+  # ---------------------------------------------------------------------------
+  docker-release:
+    name: Container (release, multi-arch)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/nucleus/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: ctx/dist
+          pattern: bin-linux-*
+
+      - name: Lay out the build context
+        run: |
+          # download-artifact expands each artifact into its own directory.
+          mv ctx/dist/bin-linux-amd64 ctx/dist/amd64
+          mv ctx/dist/bin-linux-arm64 ctx/dist/arm64
+          chmod +x ctx/dist/amd64/nucleus ctx/dist/arm64/nucleus
+          cp nucleus/Dockerfile.dist ctx/Dockerfile
+          find ctx -type f -exec ls -l {} +
+          file ctx/dist/amd64/nucleus ctx/dist/arm64/nucleus
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/nucleus/}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push multi-arch image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./ctx
+          file: ./ctx/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image by digest
+        run: |
+          cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+
+      - name: Attest image provenance (SLSA)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

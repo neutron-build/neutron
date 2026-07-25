@@ -1,0 +1,118 @@
+name: Nucleus gates
+
+# Forgejo (`origin`) is the source of truth. Before this file existed, every
+# gate in the repository fired only on the GitHub mirror, so a push here was
+# verified by nothing. These are the same gates as
+# `.github/workflows/nucleus.yml`, minus the pieces that need GitHub-hosted
+# runners (see `.forgejo/README.md` for the split).
+
+on:
+  push:
+    paths:
+      - "nucleus/**"
+      - ".forgejo/workflows/nucleus-gates.yml"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - ".forgejo/workflows/nucleus-gates.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: nucleus-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+  # Persistent across runs on a self-hosted runner, which is the whole point of
+  # running here: a cold `nucleus` build is 20+ minutes. Both paths must exist
+  # and be writable by the runner user — see `.forgejo/README.md`.
+  CARGO_HOME: /var/cache/forgejo-runner/cargo
+  CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-gates
+
+jobs:
+  gates:
+    name: Gates
+    runs-on: nucleus-lab
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          cargo --version
+          rustc --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - name: Doc metrics match source
+        run: sh scripts/metrics.sh --check
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy (all targets)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Server library tests
+        run: cargo test --lib -q
+
+      - name: Embedded core-only tests
+        run: cargo test --no-default-features --lib -q
+
+      - name: Embedded core-only lint
+        run: cargo clippy --no-default-features --lib -- -D warnings
+
+      - name: Dependency license policy
+        run: bash scripts/check-licenses.sh
+
+      - name: Reviewed unsafe-code boundary
+        run: bash scripts/check-unsafe.sh
+
+  integration:
+    name: Integration tests
+    runs-on: nucleus-lab
+    timeout-minutes: 180
+    env:
+      CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-integration
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Non-ignored integration tests, serially
+        run: cargo test --test '*' -q -- --test-threads=1
+
+  probes:
+    name: Probe suite (ci scale)
+    runs-on: nucleus-lab
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-probe
+      PROBE_SCALE: ci
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run every probe harness at ci scale
+        run: bash scripts/probe.sh
+
+      # Deliberately not `actions/upload-artifact`: artifact-API support varies
+      # by Forgejo version, and a gate that fails because its *reporting* step
+      # is unsupported is worse than one that prints to the job log.
+      - name: Dump probe artifacts on failure
+        if: failure()
+        run: |
+          for f in probe-artifacts/*.log; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            cat "$f"
+          done
