@@ -195,11 +195,15 @@ pub struct DiskEngine {
     txn_state: parking_lot::Mutex<Option<DiskTxnState>>,
     /// Monotonically increasing transaction ID counter for WAL records.
     next_txn_id: AtomicU64,
-    /// Serializes `save_table_directory` writers: it rewrites meta page 0
-    /// (and any overflow pages) through `frame_data_mut` without a latch, so
-    /// two concurrent commit-time forces could interleave torn directory
-    /// bytes. Only the directory save is serialized — the WAL force itself
-    /// stays concurrent so group commit keeps batching fsyncs.
+    /// Serializes `save_table_directory` writers. Frame latches now make each
+    /// individual page write atomic, but the directory spans page 0 plus a
+    /// chain of overflow pages, and a latch is only ever held on one of them
+    /// at a time (see the lock order on `FrameDescriptor::latch`). Two
+    /// concurrent saves would therefore still interleave at page boundaries
+    /// and leave a directory whose meta page and overflow chain describe
+    /// different table sets. Outermost lock in the storage stack (L0). Only
+    /// the directory save is serialized — the WAL force itself stays
+    /// concurrent so group commit keeps batching fsyncs.
     dir_save_lock: parking_lot::Mutex<()>,
 }
 
@@ -640,17 +644,15 @@ impl DiskEngine {
         let (fl_head, fl_count, stored_format_version) = if is_new {
             (INVALID_PAGE_ID, 0u32, page::DB_FORMAT_VERSION)
         } else {
-            let frame_id = pool
-                .fetch_page(0)
+            let pg = pool
+                .read_guard(0)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = pool.frame_data(frame_id);
 
             // Magic check. Databases created before the magic stamp existed have
             // zeros here — accept those (legacy). A non-zero mismatch is a
             // foreign or corrupt file: refuse.
             let magic = &pg[page::META_MAGIC..page::META_MAGIC + 8];
             if magic != page::MAGIC_BYTES && magic.iter().any(|&b| b != 0) {
-                pool.unpin(frame_id);
                 return Err(StorageError::Io(format!(
                     "{}: not a Nucleus database (bad magic bytes)",
                     path.display()
@@ -659,9 +661,8 @@ impl DiskEngine {
 
             // Version check. A stored version newer than we support means an
             // older binary must not touch a database written by a newer one.
-            let stored_version = page::read_u32(pg, page::META_DB_VERSION);
+            let stored_version = page::read_u32(&pg, page::META_DB_VERSION);
             if stored_version > page::DB_FORMAT_VERSION {
-                pool.unpin(frame_id);
                 return Err(StorageError::Io(format!(
                     "{}: database format version {stored_version} is newer than this \
                      build supports (max {}); upgrade Nucleus to open it",
@@ -670,9 +671,9 @@ impl DiskEngine {
                 )));
             }
 
-            let head = page::read_u32(pg, META_FREE_LIST_HEAD);
-            let count = page::read_u32(pg, META_FREE_PAGE_COUNT);
-            pool.unpin(frame_id);
+            let head = page::read_u32(&pg, META_FREE_LIST_HEAD);
+            let count = page::read_u32(&pg, META_FREE_PAGE_COUNT);
+            drop(pg);
             // Backwards compat: zeroed meta page means no free list
             let head = if head == 0 { INVALID_PAGE_ID } else { head };
             if stored_version < page::DB_FORMAT_VERSION {
@@ -930,121 +931,86 @@ impl DiskEngine {
         // Collect existing overflow page IDs so we can reuse them
         let mut existing_overflow_pages: Vec<u32> = Vec::new();
         {
-            let frame_id = self
-                .pool
-                .fetch_page(0)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let overflow_ptr_offset = PAGE_SIZE - 4;
-            let mut ov_page = page::read_u32(pg, overflow_ptr_offset);
-            self.pool.unpin(frame_id);
+            let mut ov_page = {
+                let pg = self
+                    .pool
+                    .read_guard(0)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                page::read_u32(&pg, PAGE_SIZE - 4)
+            };
             // Guard: page 0 is the meta page itself; treat 0 as no overflow
             // (backwards compat with databases created before overflow pointer was initialized)
             while ov_page != INVALID_PAGE_ID && ov_page != 0 {
                 existing_overflow_pages.push(ov_page);
-                let ofid = self
+                let opg = self
                     .pool
-                    .fetch_page(ov_page)
+                    .read_guard(ov_page)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
-                let opg = self.pool.frame_data(ofid);
-                ov_page = page::read_u32(opg, 0);
-                self.pool.unpin(ofid);
+                ov_page = page::read_u32(&opg, 0);
             }
         }
 
-        // Write to meta page (page 0)
-        let frame_id = self
+        // Split the directory into the meta-page chunk plus overflow chunks,
+        // and resolve every overflow page ID BEFORE any page is latched. This
+        // used to hold the meta page's frame while allocating overflow pages,
+        // which is exactly the "allocate under a latch" shape rule (A) forbids
+        // — see the lock order on `FrameDescriptor::latch`.
+        let first_chunk_len = dir_buf.len().min(meta_dir_capacity);
+        let overflow_chunks: Vec<&[u8]> = dir_buf[first_chunk_len..]
+            .chunks(overflow_capacity)
+            .collect();
+
+        let mut overflow_ids: Vec<u32> = Vec::with_capacity(overflow_chunks.len());
+        for i in 0..overflow_chunks.len() {
+            match existing_overflow_pages.get(i) {
+                Some(&pid) => overflow_ids.push(pid),
+                None => overflow_ids.push(
+                    self.pool
+                        .new_page_id()
+                        .map_err(|e| StorageError::Io(e.to_string()))?,
+                ),
+            }
+        }
+
+        // Write the overflow chain, one page under one latch at a time.
+        for (i, chunk) in overflow_chunks.iter().enumerate() {
+            let next = overflow_ids.get(i + 1).copied().unwrap_or(INVALID_PAGE_ID);
+            let mut cur_pg = self
+                .pool
+                .write_guard(overflow_ids[i])
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            cur_pg.fill(0);
+            page::write_u32(&mut cur_pg, 0, next);
+            cur_pg[4..4 + chunk.len()].copy_from_slice(chunk);
+            cur_pg.set_dirty();
+        }
+
+        // Write the meta page (page 0) last, in a single latched pass.
+        let fl_head = *self.free_list_head.lock();
+        let fl_count = *self.free_page_count.lock();
+        let mut pg = self
             .pool
-            .fetch_page(0)
+            .write_guard(0)
             .map_err(|e| StorageError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data_mut(frame_id);
         // Stamp the current format version: the entries below are written in v2
         // layout (with per-table epoch), so the meta page must advertise v2.
         // This is what transparently upgrades a v1 database on its first
         // directory save after open (T0.3 / T1.1).
-        page::write_u32(pg, page::META_DB_VERSION, page::DB_FORMAT_VERSION);
+        page::write_u32(&mut pg, page::META_DB_VERSION, page::DB_FORMAT_VERSION);
         // Zero the directory area first
         pg[META_TABLE_DIR_START..].fill(0);
-
-        let first_chunk_len = dir_buf.len().min(meta_dir_capacity);
         pg[META_TABLE_DIR_START..META_TABLE_DIR_START + first_chunk_len]
             .copy_from_slice(&dir_buf[..first_chunk_len]);
-
-        let mut remaining = &dir_buf[first_chunk_len..];
-        if remaining.is_empty() {
-            // No overflow needed — write INVALID_PAGE_ID as overflow pointer
-            let overflow_ptr_offset = PAGE_SIZE - 4;
-            page::write_u32(pg, overflow_ptr_offset, INVALID_PAGE_ID);
-        } else {
-            // Reuse existing overflow page or allocate a new one
-            let mut reuse_idx = 0usize;
-            let (overflow_page_id, overflow_frame_id) = if reuse_idx < existing_overflow_pages.len()
-            {
-                let pid = existing_overflow_pages[reuse_idx];
-                reuse_idx += 1;
-                let fid = self
-                    .pool
-                    .fetch_page(pid)
-                    .map_err(|e| StorageError::Io(e.to_string()))?;
-                (pid, fid)
-            } else {
-                self.pool
-                    .new_page()
-                    .map_err(|e| StorageError::Io(e.to_string()))?
-            };
-            let overflow_ptr_offset = PAGE_SIZE - 4;
-            page::write_u32(pg, overflow_ptr_offset, overflow_page_id);
-
-            // Write overflow pages in a chain
-            let mut cur_frame_id = overflow_frame_id;
-            loop {
-                let chunk_len = remaining.len().min(overflow_capacity);
-                let cur_pg = self.pool.frame_data_mut(cur_frame_id);
-                cur_pg.fill(0);
-                cur_pg[4..4 + chunk_len].copy_from_slice(&remaining[..chunk_len]);
-                remaining = &remaining[chunk_len..];
-
-                if remaining.is_empty() {
-                    // No more overflow — terminate chain
-                    page::write_u32(cur_pg, 0, INVALID_PAGE_ID);
-                    self.pool.mark_dirty(cur_frame_id);
-                    self.pool.unpin(cur_frame_id);
-                    break;
-                } else {
-                    // Reuse next existing overflow page or allocate new
-                    let (next_page_id, next_frame_id) = if reuse_idx < existing_overflow_pages.len()
-                    {
-                        let pid = existing_overflow_pages[reuse_idx];
-                        reuse_idx += 1;
-                        let fid = self
-                            .pool
-                            .fetch_page(pid)
-                            .map_err(|e| StorageError::Io(e.to_string()))?;
-                        (pid, fid)
-                    } else {
-                        self.pool
-                            .new_page()
-                            .map_err(|e| StorageError::Io(e.to_string()))?
-                    };
-                    page::write_u32(cur_pg, 0, next_page_id);
-                    self.pool.mark_dirty(cur_frame_id);
-                    self.pool.unpin(cur_frame_id);
-                    cur_frame_id = next_frame_id;
-                }
-            }
-        }
-
+        page::write_u32(
+            &mut pg,
+            PAGE_SIZE - 4,
+            overflow_ids.first().copied().unwrap_or(INVALID_PAGE_ID),
+        );
         // Persist free list head and count into meta page while we have it.
-        {
-            let pg = self.pool.frame_data_mut(frame_id);
-            let fl_head = *self.free_list_head.lock();
-            let fl_count = *self.free_page_count.lock();
-            page::write_u32(pg, META_FREE_LIST_HEAD, fl_head);
-            page::write_u32(pg, META_FREE_PAGE_COUNT, fl_count);
-            page::write_checksum(pg);
-        }
-        self.pool.mark_dirty(frame_id);
-        self.pool.unpin(frame_id);
+        page::write_u32(&mut pg, META_FREE_LIST_HEAD, fl_head);
+        page::write_u32(&mut pg, META_FREE_PAGE_COUNT, fl_count);
+        page::write_checksum(&mut pg);
+        pg.set_dirty();
 
         Ok(())
     }
@@ -1060,39 +1026,34 @@ impl DiskEngine {
         let meta_dir_capacity = PAGE_SIZE - META_TABLE_DIR_START - 4;
         let overflow_capacity = PAGE_SIZE - 4;
 
-        let frame_id = self
-            .pool
-            .fetch_page(0)
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data(frame_id);
-
-        let dir_area = &pg[META_TABLE_DIR_START..];
-        if dir_area.len() < 4 {
-            self.pool.unpin(frame_id);
-            return Ok(());
-        }
-
         // Collect all directory bytes from meta page and overflow pages
         let mut dir_data = Vec::new();
-        let first_chunk_len = meta_dir_capacity.min(dir_area.len() - 4);
-        dir_data.extend_from_slice(&dir_area[..first_chunk_len]);
+        let mut overflow_page_id = {
+            let pg = self
+                .pool
+                .read_guard(0)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
 
-        // Read overflow page pointer (last 4 bytes of meta page)
-        let overflow_ptr_offset = PAGE_SIZE - 4;
-        let mut overflow_page_id = page::read_u32(pg, overflow_ptr_offset);
-        self.pool.unpin(frame_id);
+            let dir_area = &pg[META_TABLE_DIR_START..];
+            if dir_area.len() < 4 {
+                return Ok(());
+            }
+            let first_chunk_len = meta_dir_capacity.min(dir_area.len() - 4);
+            dir_data.extend_from_slice(&dir_area[..first_chunk_len]);
+
+            // Read overflow page pointer (last 4 bytes of meta page)
+            page::read_u32(&pg, PAGE_SIZE - 4)
+        };
 
         // Follow overflow page chain
         while overflow_page_id != INVALID_PAGE_ID {
-            let ofid = self
+            let opg = self
                 .pool
-                .fetch_page(overflow_page_id)
+                .read_guard(overflow_page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let opg = self.pool.frame_data(ofid);
-            let next_overflow = page::read_u32(opg, 0);
+            let next_overflow = page::read_u32(&opg, 0);
             let chunk_len = overflow_capacity.min(opg.len() - 4);
             dir_data.extend_from_slice(&opg[4..4 + chunk_len]);
-            self.pool.unpin(ofid);
             overflow_page_id = next_overflow;
         }
 
@@ -1196,9 +1157,10 @@ impl DiskEngine {
             let mut last = first_page;
             if last != INVALID_PAGE_ID {
                 loop {
-                    let fid = self.pool.fetch_page(last).unwrap();
-                    let next = get_next_page(self.pool.frame_data(fid));
-                    self.pool.unpin(fid);
+                    let next = {
+                        let pg = self.pool.read_guard(last).unwrap();
+                        get_next_page(&pg)
+                    };
                     if next == INVALID_PAGE_ID {
                         break;
                     }
@@ -1305,6 +1267,40 @@ impl DiskEngine {
         None
     }
 
+    /// Read the live tuple a `RowId` names, or `None` if the address no longer
+    /// resolves to one.
+    ///
+    /// A B-tree entry stores a `(page_id, slot_idx)` that nothing revalidates:
+    /// VACUUM compacts a page and renumbers its slots without touching the
+    /// index, and a page unlinked by VACUUM or DROP TABLE goes on the free list
+    /// and comes back as some other table's page. An index scan can therefore
+    /// arrive with a slot index past the page's slot array, or with an offset
+    /// and length that address bytes outside the page — which used to index a
+    /// slice out of range and take down the connection's task. Bounds are
+    /// checked here so a stale entry yields no row instead of a panic.
+    ///
+    /// This does NOT make stale entries correct: an entry that happens to land
+    /// on an in-range slot still returns whatever row now occupies it. Keeping
+    /// index entries in step with VACUUM is a separate, unfixed defect.
+    fn read_tuple_at(pg: &PageBuf, slot_idx: u16, col_types: &[DataType]) -> Option<Row> {
+        if page::read_u16(pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
+            return None;
+        }
+        if slot_idx >= page::read_u16(pg, page::DATA_SLOT_COUNT) {
+            return None;
+        }
+        let entry = page::read_slot(pg, slot_idx);
+        if entry.is_dead() {
+            return None;
+        }
+        let off = entry.offset() as usize;
+        let len = entry.length() as usize;
+        if off < page::DATA_HEADER_SIZE || off.checked_add(len)? > PAGE_SIZE {
+            return None;
+        }
+        tuple::deserialize_row(&pg[off..off + len], col_types)
+    }
+
     /// Is the tuple now at a position still the row the caller read?
     fn same_row_identity(expected: &Row, actual: &Row, identity: Option<&Vec<usize>>) -> bool {
         match identity {
@@ -1364,51 +1360,63 @@ impl DiskEngine {
         let identity = verifying.then(|| self.identity_cols(table)).flatten();
         let mut count = 0usize;
 
+        // Index maintenance for the rows removed on the current page. Collected
+        // under the page's write latch and drained after it is released:
+        // `index_delete` takes `indexes` (L3), which must never be acquired
+        // while a frame latch (L6) is held. Doing it afterwards is safe because
+        // a B-tree entry is keyed by (key, RowId): if another session recycles
+        // the freed slot in the gap, its entry carries a different key, so this
+        // delete cannot remove it.
+        let mut unindex: Vec<(u16, Row)> = Vec::new();
+
         for (page_id, slots) in self.group_by_page(table, targets)? {
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            unindex.clear();
             let mut dirty = false;
-            for (slot_idx, expected) in slots {
-                let pg = self.pool.frame_data(frame_id);
-                if page::read_u16(pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
-                    break;
-                }
-                if slot_idx >= page::read_u16(pg, page::DATA_SLOT_COUNT) {
-                    continue;
-                }
-                let entry = page::read_slot(pg, slot_idx);
-                // The row was deleted by someone else in the meantime.
-                if entry.is_dead() {
-                    continue;
-                }
-                let off = entry.offset() as usize;
-                let len = entry.length() as usize;
-                let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
-                if let Some(expected) = &expected {
-                    match &current {
-                        Some(row)
-                            if Self::same_row_identity(expected, row, identity.as_ref()) => {}
-                        // A different row occupies the address now — the slot
-                        // was freed and recycled while the caller was resolving
-                        // the rest of the statement. Leave it alone.
-                        _ => continue,
+            {
+                let mut pg = self
+                    .pool
+                    .write_guard(page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                for (slot_idx, expected) in slots {
+                    if page::read_u16(&pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
+                        break;
                     }
+                    if slot_idx >= page::read_u16(&pg, page::DATA_SLOT_COUNT) {
+                        continue;
+                    }
+                    let entry = page::read_slot(&pg, slot_idx);
+                    // The row was deleted by someone else in the meantime.
+                    if entry.is_dead() {
+                        continue;
+                    }
+                    let off = entry.offset() as usize;
+                    let len = entry.length() as usize;
+                    let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
+                    if let Some(expected) = &expected {
+                        match &current {
+                            Some(row)
+                                if Self::same_row_identity(expected, row, identity.as_ref()) => {}
+                            // A different row occupies the address now — the slot
+                            // was freed and recycled while the caller was resolving
+                            // the rest of the statement. Leave it alone.
+                            _ => continue,
+                        }
+                    }
+                    if has_indexes && let Some(row) = current {
+                        unindex.push((slot_idx, row));
+                    }
+                    page::delete_tuple(&mut pg, slot_idx);
+                    pg.set_dirty();
+                    dirty = true;
+                    count += 1;
                 }
-                if has_indexes && let Some(row) = &current {
-                    self.index_delete(table, page_id, slot_idx, row);
-                }
-                let pg_mut = self.pool.frame_data_mut(frame_id);
-                page::delete_tuple(pg_mut, slot_idx);
-                dirty = true;
-                count += 1;
             }
             if dirty {
-                self.pool.mark_dirty(frame_id);
                 self.record_dirty_page(page_id);
             }
-            self.pool.unpin(frame_id);
+            for (slot_idx, row) in unindex.drain(..) {
+                self.index_delete(table, page_id, slot_idx, &row);
+            }
         }
 
         Ok(count)
@@ -1437,85 +1445,102 @@ impl DiskEngine {
                 .map(|(pos, expected, new_row)| (pos, (expected, new_row))),
         )?;
 
+        // Deferred index maintenance, same rule as `delete_at`: `indexes` (L3)
+        // is never taken under a frame latch (L6). An entry here is either the
+        // old row to unindex, the new row to index, or both.
+        enum IndexOp {
+            Remove(u32, u16, Row),
+            Add(u32, u16, Row),
+        }
+        // Rows that outgrew their page and must be placed elsewhere. Deferred
+        // for the same reason: `insert_sync` fetches other pages, and rule (A)
+        // forbids fetching a page while latched.
+        let mut relocate: Vec<(Vec<u8>, Row)> = Vec::new();
+        let mut index_ops: Vec<IndexOp> = Vec::new();
+
         for (page_id, slots) in grouped {
-            let mut frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+            index_ops.clear();
+            relocate.clear();
             let mut dirty = false;
-            for (slot_idx, (expected, new_row)) in slots {
-                let pg = self.pool.frame_data(frame_id);
-                if page::read_u16(pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
-                    break;
-                }
-                if slot_idx >= page::read_u16(pg, page::DATA_SLOT_COUNT) {
-                    continue;
-                }
-                let entry = page::read_slot(pg, slot_idx);
-                if entry.is_dead() {
-                    continue;
-                }
-                let off = entry.offset() as usize;
-                let len = entry.length() as usize;
-                let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
-                if let Some(expected) = &expected {
-                    match &current {
-                        Some(row)
-                            if Self::same_row_identity(expected, row, identity.as_ref()) => {}
-                        _ => continue,
-                    }
-                }
-                if has_indexes && let Some(row) = &current {
-                    self.index_delete(table, page_id, slot_idx, row);
-                }
-
-                let new_data = tuple::serialize_row(&new_row, &col_types);
-                let pg_mut = self.pool.frame_data_mut(frame_id);
-                if page::update_tuple_in_place(pg_mut, slot_idx, &new_data) {
-                    // Row keeps its address, so positions other sessions hold
-                    // for it stay valid.
-                    if has_indexes {
-                        self.index_insert(table, page_id, slot_idx, &new_row)?;
-                    }
-                    dirty = true;
-                    count += 1;
-                    continue;
-                }
-
-                // Grew past its slot — free it and place the row elsewhere. The
-                // row's address changes; anyone holding the old one now sees a
-                // dead slot and skips, which is a lost update rather than a
-                // write onto an unrelated row.
-                page::delete_tuple(pg_mut, slot_idx);
-                dirty = true;
-                if let Some(new_slot_idx) = page::insert_tuple(pg_mut, &new_data) {
-                    if has_indexes {
-                        self.index_insert(table, page_id, new_slot_idx, &new_row)?;
-                    }
-                    count += 1;
-                    continue;
-                }
-                // No room on this page: release the frame, place the row, then
-                // re-pin so the remaining slots on this page can be processed.
-                self.pool.mark_dirty(frame_id);
-                self.record_dirty_page(page_id);
-                self.pool.unpin(frame_id);
-                dirty = false;
-                let (new_page_id, new_slot_idx) = self.insert_sync(table, &new_data)?;
-                if has_indexes {
-                    self.index_insert(table, new_page_id, new_slot_idx, &new_row)?;
-                }
-                count += 1;
-                frame_id = self
+            {
+                let mut pg = self
                     .pool
-                    .fetch_page(page_id)
+                    .write_guard(page_id)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
+                for (slot_idx, (expected, new_row)) in slots {
+                    if page::read_u16(&pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
+                        break;
+                    }
+                    if slot_idx >= page::read_u16(&pg, page::DATA_SLOT_COUNT) {
+                        continue;
+                    }
+                    let entry = page::read_slot(&pg, slot_idx);
+                    if entry.is_dead() {
+                        continue;
+                    }
+                    let off = entry.offset() as usize;
+                    let len = entry.length() as usize;
+                    let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
+                    if let Some(expected) = &expected {
+                        match &current {
+                            Some(row)
+                                if Self::same_row_identity(expected, row, identity.as_ref()) => {}
+                            _ => continue,
+                        }
+                    }
+                    if has_indexes && let Some(row) = current {
+                        index_ops.push(IndexOp::Remove(page_id, slot_idx, row));
+                    }
+
+                    let new_data = tuple::serialize_row(&new_row, &col_types);
+                    if page::update_tuple_in_place(&mut pg, slot_idx, &new_data) {
+                        // Row keeps its address, so positions other sessions hold
+                        // for it stay valid.
+                        if has_indexes {
+                            index_ops.push(IndexOp::Add(page_id, slot_idx, new_row));
+                        }
+                        pg.set_dirty();
+                        dirty = true;
+                        count += 1;
+                        continue;
+                    }
+
+                    // Grew past its slot — free it and place the row elsewhere.
+                    // The row's address changes; anyone holding the old one now
+                    // sees a dead slot and skips, which is a lost update rather
+                    // than a write onto an unrelated row.
+                    page::delete_tuple(&mut pg, slot_idx);
+                    pg.set_dirty();
+                    dirty = true;
+                    if let Some(new_slot_idx) = page::insert_tuple(&mut pg, &new_data) {
+                        if has_indexes {
+                            index_ops.push(IndexOp::Add(page_id, new_slot_idx, new_row));
+                        }
+                        count += 1;
+                        continue;
+                    }
+                    // No room left on this page — place it after the latch drops.
+                    relocate.push((new_data, new_row));
+                    count += 1;
+                }
             }
             if dirty {
-                self.pool.mark_dirty(frame_id);
                 self.record_dirty_page(page_id);
             }
-            self.pool.unpin(frame_id);
+            for (new_data, new_row) in relocate.drain(..) {
+                let (new_page_id, new_slot_idx) = self.insert_sync(table, &new_data)?;
+                if has_indexes {
+                    index_ops.push(IndexOp::Add(new_page_id, new_slot_idx, new_row));
+                }
+            }
+            for op in index_ops.drain(..) {
+                match op {
+                    IndexOp::Remove(pid, slot, row) => self.index_delete(table, pid, slot, &row),
+                    IndexOp::Add(pid, slot, row) => {
+                        self.index_insert(table, pid, slot, &row)?;
+                    }
+                }
+            }
         }
 
         Ok(count)
@@ -1532,14 +1557,13 @@ impl DiskEngine {
         let pages = self.table_pages(table)?;
         let mut out = Vec::new();
         for page_id in pages {
-            let frame_id = self
+            let pg = self
                 .pool
-                .fetch_page(page_id)
+                .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let slot_count = page::read_u16(pg, page::DATA_SLOT_COUNT);
+            let slot_count = page::read_u16(&pg, page::DATA_SLOT_COUNT);
             for slot_idx in 0..slot_count {
-                let entry = page::read_slot(pg, slot_idx);
+                let entry = page::read_slot(&pg, slot_idx);
                 if entry.is_dead() {
                     continue;
                 }
@@ -1559,7 +1583,6 @@ impl DiskEngine {
                 }
                 out.push((encode_row_pos(page_id, slot_idx), row));
             }
-            self.pool.unpin(frame_id);
         }
         Ok(out)
     }
@@ -1569,14 +1592,14 @@ impl DiskEngine {
         let mut head = self.free_list_head.lock();
         let mut count = self.free_page_count.lock();
 
-        let frame_id = self
-            .pool
-            .fetch_page(page_id)
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data_mut(frame_id);
-        page::init_free_page(pg, *head);
-        self.pool.mark_dirty(frame_id);
-        self.pool.unpin(frame_id);
+        {
+            let mut pg = self
+                .pool
+                .write_guard(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            page::init_free_page(&mut pg, *head);
+            pg.set_dirty();
+        }
 
         *head = page_id;
         *count += 1;
@@ -1593,13 +1616,13 @@ impl DiskEngine {
         }
 
         let page_id = *head;
-        let frame_id = self
-            .pool
-            .fetch_page(page_id)
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data(frame_id);
-        let next = page::read_u32(pg, page::FREE_NEXT_PAGE);
-        self.pool.unpin(frame_id);
+        let next = {
+            let pg = self
+                .pool
+                .read_guard(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            page::read_u32(&pg, page::FREE_NEXT_PAGE)
+        };
 
         *head = if next == 0 { INVALID_PAGE_ID } else { next };
         *count = count.saturating_sub(1);
@@ -1612,16 +1635,14 @@ impl DiskEngine {
         let head = *self.free_list_head.lock();
         let count = *self.free_page_count.lock();
 
-        let frame_id = self
+        let mut pg = self
             .pool
-            .fetch_page(0)
+            .write_guard(0)
             .map_err(|e| StorageError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data_mut(frame_id);
-        page::write_u32(pg, META_FREE_LIST_HEAD, head);
-        page::write_u32(pg, META_FREE_PAGE_COUNT, count);
-        page::write_checksum(pg);
-        self.pool.mark_dirty(frame_id);
-        self.pool.unpin(frame_id);
+        page::write_u32(&mut pg, META_FREE_LIST_HEAD, head);
+        page::write_u32(&mut pg, META_FREE_PAGE_COUNT, count);
+        page::write_checksum(&mut pg);
+        pg.set_dirty();
         Ok(())
     }
 
@@ -1654,13 +1675,13 @@ impl DiskEngine {
                 )));
             }
             pages.push(page_id);
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let next = get_next_page(pg);
-            self.pool.unpin(frame_id);
+            let next = {
+                let pg = self
+                    .pool
+                    .read_guard(page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                get_next_page(&pg)
+            };
             page_id = next;
         }
         Ok(pages)
@@ -1669,23 +1690,23 @@ impl DiskEngine {
     /// Allocate a new data page for a table, linking it at the end of the chain.
     /// Reuses a page from the free list if available, otherwise allocates a new page.
     fn alloc_data_page(&self, table: &str) -> Result<u32, StorageError> {
-        let (page_id, frame_id) = if let Some(reused_id) = self.reuse_free_page()? {
-            let fid = self
+        let page_id = match self.reuse_free_page()? {
+            Some(reused_id) => reused_id,
+            None => self
                 .pool
-                .fetch_page(reused_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            (reused_id, fid)
-        } else {
-            self.pool
-                .new_page()
-                .map_err(|e| StorageError::Io(e.to_string()))?
+                .new_page_id()
+                .map_err(|e| StorageError::Io(e.to_string()))?,
         };
-        let pg = self.pool.frame_data_mut(frame_id);
-        page::init_data_page(pg, 1);
-        set_next_page(pg, INVALID_PAGE_ID);
-        self.pool.mark_dirty(frame_id);
+        {
+            let mut pg = self
+                .pool
+                .write_guard(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            page::init_data_page(&mut pg, 1);
+            set_next_page(&mut pg, INVALID_PAGE_ID);
+            pg.set_dirty();
+        }
         self.record_dirty_page(page_id); // new page allocated during txn
-        self.pool.unpin(frame_id);
 
         // Find the last page in the chain and link to the new page
         let mut tables = self.tables.write();
@@ -1699,15 +1720,15 @@ impl DiskEngine {
             // Link from the cached last page (O(1) instead of chain walk)
             let last = meta.last_page;
             if last != INVALID_PAGE_ID {
-                let fid = self
-                    .pool
-                    .fetch_page(last)
-                    .map_err(|e| StorageError::Io(e.to_string()))?;
-                let pg_mut = self.pool.frame_data_mut(fid);
-                set_next_page(pg_mut, page_id);
-                self.pool.mark_dirty(fid);
+                {
+                    let mut pg = self
+                        .pool
+                        .write_guard(last)
+                        .map_err(|e| StorageError::Io(e.to_string()))?;
+                    set_next_page(&mut pg, page_id);
+                    pg.set_dirty();
+                }
                 self.record_dirty_page(last);
-                self.pool.unpin(fid);
             }
         }
         meta.last_page = page_id;
@@ -1726,44 +1747,42 @@ impl DiskEngine {
 
         // Phase 1: Compact each page — remove dead slots, defragment
         for &page_id in &pages {
-            let frame_id = self
+            // The whole read-decide-compact sequence runs under one write
+            // latch: compaction moves every live tuple's offset, so a reader
+            // interleaving with it would resolve slots against the old layout.
+            let mut pg = self
                 .pool
-                .fetch_page(page_id)
+                .write_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let dead_count = page::dead_tuple_count(pg);
-            let frag_free = page::read_u16(pg, page::DATA_FRAG_FREE) as usize;
+            let dead_count = page::dead_tuple_count(&pg);
+            let frag_free = page::read_u16(&pg, page::DATA_FRAG_FREE) as usize;
             pages_scanned += 1;
 
             if dead_count > 0 || frag_free > 0 {
                 dead_reclaimed += dead_count;
                 bytes_reclaimed += frag_free;
 
-                // Compact: rewrite only live tuples, reset dead slots
-                let pg_mut = self.pool.frame_data_mut(frame_id);
-
                 // Collect live tuples before rewriting
-                let slot_count = page::read_u16(pg_mut, page::DATA_SLOT_COUNT);
+                let slot_count = page::read_u16(&pg, page::DATA_SLOT_COUNT);
                 let mut live_tuples: Vec<Vec<u8>> = Vec::new();
                 for i in 0..slot_count {
-                    let entry = page::read_slot(pg_mut, i);
+                    let entry = page::read_slot(&pg, i);
                     if !entry.is_dead() {
                         let off = entry.offset() as usize;
                         let len = entry.length() as usize;
-                        live_tuples.push(pg_mut[off..off + len].to_vec());
+                        live_tuples.push(pg[off..off + len].to_vec());
                     }
                 }
 
                 // Re-initialize the page and re-insert live tuples
-                let next_page = get_next_page(pg_mut);
-                page::init_data_page(pg_mut, 1);
-                set_next_page(pg_mut, next_page);
+                let next_page = get_next_page(&pg);
+                page::init_data_page(&mut pg, 1);
+                set_next_page(&mut pg, next_page);
                 for tuple_data in &live_tuples {
-                    page::insert_tuple(pg_mut, tuple_data);
+                    page::insert_tuple(&mut pg, tuple_data);
                 }
-                self.pool.mark_dirty(frame_id);
+                pg.set_dirty();
             }
-            self.pool.unpin(frame_id);
         }
 
         // Phase 2: Remove completely empty pages from the chain
@@ -1778,26 +1797,23 @@ impl DiskEngine {
         let mut cur_page_id = meta.first_page;
 
         while cur_page_id != INVALID_PAGE_ID {
-            let frame_id = self
-                .pool
-                .fetch_page(cur_page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let live_count = page::live_tuple_count(pg);
-            let next = get_next_page(pg);
-            self.pool.unpin(frame_id);
+            let (live_count, next) = {
+                let pg = self
+                    .pool
+                    .read_guard(cur_page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                (page::live_tuple_count(&pg), get_next_page(&pg))
+            };
 
             if live_count == 0 && (prev_page_id.is_some() || next != INVALID_PAGE_ID) {
                 // Empty page — unlink from chain (keep at least one page)
                 if let Some(prev_id) = prev_page_id {
-                    let prev_frame = self
+                    let mut prev_pg = self
                         .pool
-                        .fetch_page(prev_id)
+                        .write_guard(prev_id)
                         .map_err(|e| StorageError::Io(e.to_string()))?;
-                    let prev_pg = self.pool.frame_data_mut(prev_frame);
-                    set_next_page(prev_pg, next);
-                    self.pool.mark_dirty(prev_frame);
-                    self.pool.unpin(prev_frame);
+                    set_next_page(&mut prev_pg, next);
+                    prev_pg.set_dirty();
                 } else {
                     // Removing the first page — update table meta
                     meta.first_page = next;
@@ -2035,13 +2051,13 @@ impl StorageEngine for DiskEngine {
         // Walk the page chain and add each page to the free list for reuse.
         let mut page_id = meta.first_page;
         while page_id != INVALID_PAGE_ID {
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let next = get_next_page(pg);
-            self.pool.unpin(frame_id);
+            let next = {
+                let pg = self
+                    .pool
+                    .read_guard(page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                get_next_page(&pg)
+            };
             self.free_page(page_id)?;
             page_id = next;
         }
@@ -2066,37 +2082,51 @@ impl StorageEngine for DiskEngine {
                 .unwrap_or(INVALID_PAGE_ID)
         };
         if last_page_id != INVALID_PAGE_ID {
-            let frame_id = self
-                .pool
-                .fetch_page(last_page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data_mut(frame_id);
-            if let Some(slot_idx) = page::insert_tuple(pg, &data) {
-                self.pool.mark_dirty(frame_id);
+            // Write-latched: `page::insert_tuple` claims a slot by advancing
+            // the page's free-space pointer and slot count. Two sessions
+            // appending to the same last page without this latch both read the
+            // same free offset and write their tuples on top of each other.
+            // That is the concrete race this whole latching pass exists for.
+            let placed = {
+                let mut pg = self
+                    .pool
+                    .write_guard(last_page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let slot = page::insert_tuple(&mut pg, &data);
+                if slot.is_some() {
+                    pg.set_dirty();
+                }
+                slot
+            };
+            if let Some(slot_idx) = placed {
                 self.record_dirty_page(last_page_id);
-                self.pool.unpin(frame_id);
+                // Index maintenance takes `indexes` (L3) — outside the latch.
                 self.index_insert(table, last_page_id, slot_idx, &row)?;
                 return Ok(());
             }
-            self.pool.unpin(frame_id);
         }
 
         // Last page full or no pages yet — allocate a new one
         let page_id = self.alloc_data_page(table)?;
-        let frame_id = self
-            .pool
-            .fetch_page(page_id)
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data_mut(frame_id);
-        let slot_idx = page::insert_tuple(pg, &data)
-            .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
-        self.pool.mark_dirty(frame_id);
+        let slot_idx = {
+            let mut pg = self
+                .pool
+                .write_guard(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let slot = page::insert_tuple(&mut pg, &data)
+                .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
+            pg.set_dirty();
+            slot
+        };
         self.record_dirty_page(page_id);
-        self.pool.unpin(frame_id);
-        // Update last_page for future appends
-        if let Some(meta) = self.tables.write().get_mut(table) {
-            meta.last_page = page_id;
-        }
+        // `alloc_data_page` already published `last_page = page_id` in the same
+        // `tables` write section that linked the page into the chain. Setting
+        // it again here was a lost update: two sessions that both found the old
+        // last page full allocate P then Q (chain ... -> P -> Q, last_page = Q),
+        // and whichever of them ran this line second rewound `last_page` to its
+        // own page. The next allocation then relinked from the wrong tail and
+        // unlinked everything past it — rows that scanned fine a moment earlier
+        // vanished.
         self.index_insert(table, page_id, slot_idx, &row)?;
         Ok(())
     }
@@ -2124,12 +2154,11 @@ impl StorageEngine for DiskEngine {
                 self.pool.prefetch_pages(&pages[next_batch_start..end]);
             }
 
-            let frame_id = self
+            let pg = self
                 .pool
-                .fetch_page(page_id)
+                .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
+            for (_slot_idx, tuple_data) in page::iter_tuples(&pg) {
                 match tuple::deserialize_row(tuple_data, &col_types) {
                     Some(row) => rows.push(row),
                     // A tuple that fails to deserialize indicates corruption. Don't
@@ -2140,7 +2169,6 @@ impl StorageEngine for DiskEngine {
                     ),
                 }
             }
-            self.pool.unpin(frame_id);
         }
 
         Ok(rows)
@@ -2175,12 +2203,11 @@ impl StorageEngine for DiskEngine {
                 self.pool.prefetch_pages(&pages[next_batch_start..end]);
             }
 
-            let frame_id = self
+            let pg = self
                 .pool
-                .fetch_page(page_id)
+                .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
+            for (_slot_idx, tuple_data) in page::iter_tuples(&pg) {
                 match tuple::deserialize_row(tuple_data, &col_types) {
                     Some(row) => rows.push(row),
                     None => tracing::error!(
@@ -2189,11 +2216,9 @@ impl StorageEngine for DiskEngine {
                     ),
                 }
                 if rows.len() >= limit {
-                    self.pool.unpin(frame_id);
                     return Ok(rows);
                 }
             }
-            self.pool.unpin(frame_id);
         }
 
         Ok(rows)
@@ -2221,19 +2246,17 @@ impl StorageEngine for DiskEngine {
                 self.pool.prefetch_pages(&pages[next_batch_start..end]);
             }
 
-            let frame_id = self
+            let pg = self
                 .pool
-                .fetch_page(page_id)
+                .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
+            for (_slot_idx, tuple_data) in page::iter_tuples(&pg) {
                 if let Some(row) =
                     tuple::deserialize_row_projected(tuple_data, &col_types, projection)
                 {
                     rows.push(row);
                 }
             }
-            self.pool.unpin(frame_id);
         }
 
         Ok(rows)
@@ -2263,24 +2286,31 @@ impl StorageEngine for DiskEngine {
                 self.pool.prefetch_pages(&pages[next_batch_start..end]);
             }
 
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
-                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types) {
-                    batch.push(row);
-                    if batch.len() >= batch_size {
-                        let chunk = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
-                        if tx.send(chunk).await.is_err() {
-                            self.pool.unpin(frame_id);
-                            return Ok(());
-                        }
+            // Deserialize the whole page under the latch, then release it
+            // before awaiting on the channel. A frame latch must never be held
+            // across an `.await` — it would pin a page for as long as the
+            // consumer takes to drain, blocking every writer on it.
+            let page_rows: Vec<Row> = {
+                let pg = self
+                    .pool
+                    .read_guard(page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                page::iter_tuples(&pg)
+                    .into_iter()
+                    .filter_map(|(_slot_idx, tuple_data)| {
+                        tuple::deserialize_row(tuple_data, &col_types)
+                    })
+                    .collect()
+            };
+            for row in page_rows {
+                batch.push(row);
+                if batch.len() >= batch_size {
+                    let chunk = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                    if tx.send(chunk).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
-            self.pool.unpin(frame_id);
         }
 
         // Send remaining rows
@@ -2294,10 +2324,8 @@ impl StorageEngine for DiskEngine {
         let pages = self.table_pages(table).ok()?;
         let mut count = 0;
         for &page_id in &pages {
-            let frame_id = self.pool.fetch_page(page_id).ok()?;
-            let pg = self.pool.frame_data(frame_id);
-            count += page::count_live_tuples(pg);
-            self.pool.unpin(frame_id);
+            let pg = self.pool.read_guard(page_id).ok()?;
+            count += page::count_live_tuples(&pg);
         }
         Some(count)
     }
@@ -2697,27 +2725,35 @@ impl DiskEngine {
         let mut btree = BTreeIndex::create(self.pool.clone(), col_type.clone())
             .map_err(|e| StorageError::Io(e.to_string()))?;
 
-        // Populate the index from existing data
+        // Populate the index from existing data. The page's rows are copied out
+        // under its read latch and the latch released before `btree.insert`,
+        // which allocates and latches index pages of its own — rule (B).
         let mut page_id = first_page;
         while page_id != INVALID_PAGE_ID {
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            for (slot_idx, tuple_data) in page::iter_tuples(pg) {
-                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types)
-                    && col_idx < row.len()
-                {
-                    let key = serialize_index_key(&row[col_idx]);
-                    let rid = RowId { page_id, slot_idx };
-                    btree
-                        .insert(&key, rid)
-                        .map_err(|e| StorageError::Io(e.to_string()))?;
-                }
+            let (entries, next) = {
+                let pg = self
+                    .pool
+                    .read_guard(page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let entries: Vec<(u16, Vec<u8>)> = page::iter_tuples(&pg)
+                    .into_iter()
+                    .filter_map(|(slot_idx, tuple_data)| {
+                        let row = tuple::deserialize_row(tuple_data, &col_types)?;
+                        if col_idx < row.len() {
+                            Some((slot_idx, serialize_index_key(&row[col_idx])))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                (entries, get_next_page(&pg))
+            };
+            for (slot_idx, key) in entries {
+                let rid = RowId { page_id, slot_idx };
+                btree
+                    .insert(&key, rid)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
             }
-            let next = get_next_page(pg);
-            self.pool.unpin(frame_id);
             page_id = next;
         }
 
@@ -2770,23 +2806,22 @@ impl DiskEngine {
             .lookup(&key)
             .map_err(|e| StorageError::Io(e.to_string()))?;
 
+        // `indexes` (L3) is still held here while data pages are fetched and
+        // read-latched (L5, L6). That is the CORRECT direction of the lock
+        // order, not a violation: nothing ever takes a frame latch and then
+        // reaches for `indexes`. The sites that used to want that shape
+        // (`delete_at` / `update_at`) now defer their index work until after
+        // the latch drops, which is what makes holding `indexes` across a page
+        // fetch safe here.
         let mut rows = Vec::with_capacity(row_ids.len());
         for rid in row_ids {
-            let frame_id = self
+            let pg = self
                 .pool
-                .fetch_page(rid.page_id)
+                .read_guard(rid.page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let entry = page::read_slot(pg, rid.slot_idx);
-            if !entry.is_dead() {
-                let off = entry.offset() as usize;
-                let len = entry.length() as usize;
-                let tuple_data = &pg[off..off + len];
-                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types) {
-                    rows.push(row);
-                }
+            if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types) {
+                rows.push(row);
             }
-            self.pool.unpin(frame_id);
         }
         Ok(rows)
     }
@@ -2830,21 +2865,13 @@ impl DiskEngine {
 
         let mut rows = Vec::with_capacity(key_rids.len());
         for (_, rid) in key_rids {
-            let frame_id = self
+            let pg = self
                 .pool
-                .fetch_page(rid.page_id)
+                .read_guard(rid.page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let entry = page::read_slot(pg, rid.slot_idx);
-            if !entry.is_dead() {
-                let off = entry.offset() as usize;
-                let len = entry.length() as usize;
-                let tuple_data = &pg[off..off + len];
-                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types) {
-                    rows.push(row);
-                }
+            if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types) {
+                rows.push(row);
             }
-            self.pool.unpin(frame_id);
         }
         Ok(rows)
     }
@@ -2872,8 +2899,15 @@ impl DiskEngine {
     }
 
     /// Maintain indexes after a delete.
+    ///
+    /// Takes `indexes` for WRITING even though `BTreeIndex::delete` only needs
+    /// `&self`. `delete` mutates the leaf page it lands on; under a read lock
+    /// two deleters — or a deleter and a concurrent `index_insert` splitting
+    /// the same leaf — rewrote the same entry array at once. `indexes` is the
+    /// B-tree's structural lock (see the module docs on `btree.rs`), so every
+    /// mutating entry point must hold it exclusively.
     fn index_delete(&self, table: &str, page_id: u32, slot_idx: u16, row: &Row) {
-        let indexes = self.indexes.read();
+        let indexes = self.indexes.write();
         for (idx_name, idx) in indexes.iter() {
             if idx.table == table && idx.col_idx < row.len() {
                 let key = serialize_index_key(&row[idx.col_idx]);
@@ -2891,32 +2925,36 @@ impl DiskEngine {
         // Try existing pages
         let pages = self.table_pages(table)?;
         for &page_id in &pages {
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data_mut(frame_id);
-            if let Some(slot_idx) = page::insert_tuple(pg, data) {
-                self.pool.mark_dirty(frame_id);
+            let placed = {
+                let mut pg = self
+                    .pool
+                    .write_guard(page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let slot = page::insert_tuple(&mut pg, data);
+                if slot.is_some() {
+                    pg.set_dirty();
+                }
+                slot
+            };
+            if let Some(slot_idx) = placed {
                 self.record_dirty_page(page_id);
-                self.pool.unpin(frame_id);
                 return Ok((page_id, slot_idx));
             }
-            self.pool.unpin(frame_id);
         }
 
         // Allocate new page
         let page_id = self.alloc_data_page(table)?;
-        let frame_id = self
-            .pool
-            .fetch_page(page_id)
-            .map_err(|e| StorageError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data_mut(frame_id);
-        let slot_idx = page::insert_tuple(pg, data)
-            .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
-        self.pool.mark_dirty(frame_id);
+        let slot_idx = {
+            let mut pg = self
+                .pool
+                .write_guard(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let slot = page::insert_tuple(&mut pg, data)
+                .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
+            pg.set_dirty();
+            slot
+        };
         self.record_dirty_page(page_id);
-        self.pool.unpin(frame_id);
         Ok((page_id, slot_idx))
     }
 }
@@ -5706,6 +5744,266 @@ mod tests {
             "id=6 was overwritten by a stale position: {:?}",
             ids(&rows)
         );
+    }
+
+    // ── frame latching: page bytes are not a free-for-all ─────────────────
+    //
+    // `DiskEngine` used to mutate and read page bytes through
+    // `BufferPool::frame_data_mut` / `frame_data` without ever taking the
+    // pool's frame latch, and `index_delete` mutated the B-tree holding only
+    // `indexes.read()`. Both are byte-level data races, and both are visible
+    // from the engine's own API once several writers land on ONE page.
+    //
+    // Every test below is wrapped in a hard timeout. Latching introduces
+    // blocking locks on the write path, so a lock-order mistake would show up
+    // as a test that never returns rather than one that fails — see the lock
+    // order documented on `FrameDescriptor::latch`.
+
+    /// Fail loudly instead of hanging forever.
+    async fn bounded<F: std::future::Future>(secs: u64, label: &str, fut: F) -> F::Output {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+            Ok(v) => v,
+            Err(_) => panic!("{label}: timed out after {secs}s — probable deadlock"),
+        }
+    }
+
+    /// Many sessions appending to the SAME page at once. Every insert takes
+    /// the append fast path onto `meta.last_page`, so `page::insert_tuple`
+    /// runs concurrently on one frame: without the write latch, two callers
+    /// read the same `DATA_FREE_END` and write their tuples on top of each
+    /// other, so rows go missing and slot offsets overlap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_inserts_onto_one_page_keep_every_row() {
+        bounded(
+            120,
+            "concurrent_inserts_onto_one_page_keep_every_row",
+            async {
+                let tmp = tempfile::tempdir().unwrap();
+                let (engine, catalog) = setup_engine(tmp.path()).await;
+                register_simple_table(&catalog, "t").await;
+                engine.create_table("t").await.unwrap();
+                let engine = Arc::new(engine);
+
+                // 8 writers x 40 rows. Rows are tiny, so all 320 land on the
+                // first few pages and the writers collide constantly.
+                const WRITERS: i32 = 8;
+                const PER_WRITER: i32 = 40;
+                let mut tasks = Vec::new();
+                for w in 0..WRITERS {
+                    let engine = engine.clone();
+                    tasks.push(tokio::spawn(async move {
+                        for k in 0..PER_WRITER {
+                            let id = w * 1_000 + k;
+                            engine.insert("t", simple_row(id, "row")).await.unwrap();
+                        }
+                    }));
+                }
+                for t in tasks {
+                    t.await.unwrap();
+                }
+
+                let rows = engine.scan("t").await.unwrap();
+                let mut got = ids(&rows);
+                got.sort_unstable();
+                let want: Vec<i32> = (0..WRITERS)
+                    .flat_map(|w| (0..PER_WRITER).map(move |k| w * 1_000 + k))
+                    .collect();
+                let mut want_sorted = want.clone();
+                want_sorted.sort_unstable();
+                assert_eq!(
+                    got.len(),
+                    want_sorted.len(),
+                    "concurrent same-page inserts lost or duplicated rows: \
+                     {} of {} survived",
+                    got.len(),
+                    want_sorted.len()
+                );
+                assert_eq!(got, want_sorted, "concurrent same-page inserts corrupted rows");
+            },
+        )
+        .await;
+    }
+
+    /// Concurrent index maintenance. `index_delete` used to run under
+    /// `indexes.read()`, so two deleters — or a deleter and an inserter
+    /// splitting the same leaf — rewrote one B-tree leaf's entry array at
+    /// once. The corruption reads back as an out-of-bounds slice in
+    /// `btree::extract_key`, or as index lookups that miss live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_index_maintenance_keeps_the_btree_readable() {
+        bounded(
+            120,
+            "concurrent_index_maintenance_keeps_the_btree_readable",
+            async {
+                let tmp = tempfile::tempdir().unwrap();
+                let (engine, catalog) = setup_engine(tmp.path()).await;
+                register_simple_table(&catalog, "t").await;
+                engine.create_table("t").await.unwrap();
+                engine.create_index("t", "ix", 0).await.unwrap();
+                let engine = Arc::new(engine);
+
+                // Seed rows every worker will churn.
+                const WORKERS: i32 = 6;
+                const PER_WORKER: i32 = 30;
+                for w in 0..WORKERS {
+                    for k in 0..PER_WORKER {
+                        engine
+                            .insert("t", simple_row(w * 1_000 + k, "seed"))
+                            .await
+                            .unwrap();
+                    }
+                }
+
+                let mut tasks = Vec::new();
+                for w in 0..WORKERS {
+                    let engine = engine.clone();
+                    tasks.push(tokio::spawn(async move {
+                        for round in 0..4 {
+                            for k in 0..PER_WORKER {
+                                let id = w * 1_000 + k;
+                                let hits = engine
+                                    .scan_where_eq_positions("t", 0, &Value::Int32(id))
+                                    .await
+                                    .unwrap();
+                                if let Some((pos, row)) = hits.first() {
+                                    // Alternate widths so some updates stay in
+                                    // place and some move the row to a new slot.
+                                    let name = if round % 2 == 0 {
+                                        format!("r{round}")
+                                    } else {
+                                        "x".repeat(48)
+                                    };
+                                    let _ = engine
+                                        .update_if_unchanged(
+                                            "t",
+                                            &[(*pos, row.clone(), simple_row(id, &name))],
+                                        )
+                                        .await;
+                                }
+                                // Concurrent readers through the index.
+                                let _ = engine.index_lookup("t", "ix", &Value::Int32(id)).await;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }));
+                }
+                for t in tasks {
+                    t.await.unwrap();
+                }
+
+                // Every seeded id must still be findable through the index,
+                // exactly once, and the index must agree with the heap.
+                for w in 0..WORKERS {
+                    for k in 0..PER_WORKER {
+                        let id = w * 1_000 + k;
+                        let via_index = engine
+                            .index_lookup("t", "ix", &Value::Int32(id))
+                            .await
+                            .unwrap()
+                            .expect("index_lookup returned no index");
+                        assert_eq!(
+                            via_index.len(),
+                            1,
+                            "index lost or duplicated id={id}: {via_index:?}"
+                        );
+                    }
+                }
+                let rows = engine.scan("t").await.unwrap();
+                assert_eq!(
+                    rows.len(),
+                    (WORKERS * PER_WORKER) as usize,
+                    "concurrent index churn lost or duplicated heap rows"
+                );
+            },
+        )
+        .await;
+    }
+
+    /// Deadlock canary for the lock order. Runs, at the same time, every path
+    /// that mixes an engine-level lock with a frame latch: index lookups (hold
+    /// `indexes`, fetch data pages), updates that relocate rows (latch a page,
+    /// then allocate another), page allocation (holds `tables`, latches
+    /// pages), vacuum (holds `tables`, latches and frees pages), and directory
+    /// saves (hold `dir_save_lock`, latch the meta page and its overflow
+    /// chain). A cycle between any two of them hangs; the timeout turns that
+    /// into a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_lock_paths_do_not_deadlock() {
+        bounded(120, "mixed_lock_paths_do_not_deadlock", async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (engine, catalog) = setup_engine(tmp.path()).await;
+            register_simple_table(&catalog, "t").await;
+            engine.create_table("t").await.unwrap();
+            engine.create_index("t", "ix", 0).await.unwrap();
+            let engine = Arc::new(engine);
+
+            for id in 0..200 {
+                engine.insert("t", simple_row(id, "seed")).await.unwrap();
+            }
+
+            let mut tasks = Vec::new();
+
+            // Writer: grows rows so they relocate across pages, forcing
+            // allocation from inside the update path.
+            for w in 0..2 {
+                let engine = engine.clone();
+                tasks.push(tokio::spawn(async move {
+                    for round in 0..6 {
+                        for id in (w * 100)..(w * 100 + 100) {
+                            let hits = engine
+                                .scan_where_eq_positions("t", 0, &Value::Int32(id))
+                                .await
+                                .unwrap();
+                            if let Some((pos, row)) = hits.first() {
+                                let name = "y".repeat(16 + (round * 24) as usize);
+                                let _ = engine
+                                    .update_if_unchanged(
+                                        "t",
+                                        &[(*pos, row.clone(), simple_row(id, &name))],
+                                    )
+                                    .await;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }));
+            }
+
+            // Reader through the index (holds `indexes` while fetching pages).
+            {
+                let engine = engine.clone();
+                tasks.push(tokio::spawn(async move {
+                    for _ in 0..300 {
+                        for id in [0, 50, 100, 150, 199] {
+                            let _ = engine.index_lookup("t", "ix", &Value::Int32(id)).await;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }));
+            }
+
+            // Vacuum + directory save, both of which hold engine locks across
+            // page latches.
+            {
+                let engine = engine.clone();
+                tasks.push(tokio::spawn(async move {
+                    for _ in 0..40 {
+                        let _ = engine.vacuum("t").await;
+                        engine.flush().unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                }));
+            }
+
+            for t in tasks {
+                t.await.unwrap();
+            }
+
+            // Nothing was lost along the way.
+            let rows = engine.scan("t").await.unwrap();
+            assert_eq!(rows.len(), 200, "mixed concurrent paths lost rows");
+        })
+        .await;
     }
 }
 
