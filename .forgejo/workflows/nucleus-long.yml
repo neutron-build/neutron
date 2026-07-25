@@ -99,3 +99,25 @@ jobs:
             echo "===== $f ====="
             cat "$f"
           done
+
+  cache-oracle-deep:
+    name: Cache-coherence oracle (deep sweep)
+    runs-on: nucleus-lab
+    # Minutes, not hours — but it lives here rather than in the push gates
+    # because it is far too slow to sit in front of every commit.
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-long-oracle
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      # The push gates run this oracle at its default of 6 seeds, which is a
+      # speed compromise and NOT a coverage claim: the zone-map/rollback
+      # divergence fixed in this file's regression test first appeared at seed
+      # ~1140. A green default-depth run means nothing about the rare classes,
+      # so the deep sweep has to run somewhere. It runs here.
+      - name: Deep oracle sweep
+        run: cargo test --lib --features server oracle_deep_run_catches_rare_divergences -- --ignored --nocapture

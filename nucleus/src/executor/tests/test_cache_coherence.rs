@@ -837,3 +837,78 @@ async fn dropping_policy_invalidates_filtered_cache() {
         "stale result served after DROP POLICY left the table deny-all"
     );
 }
+
+/// A rolled-back INSERT must not leave the zone map describing rows that no
+/// longer exist.
+///
+/// Zone-map granule stats are shared process state, not per-session. An INSERT
+/// inside a transaction merged its values into them immediately, and only
+/// DELETE/UPDATE — and only when they actually matched rows — marked the table
+/// for post-transaction repair. So a transaction that inserted and then rolled
+/// back left `min/max` describing its vanished row. When the stale granule's
+/// `row_count` happens to match the live table's, `can_skip_granule` trusts it
+/// and prunes a granule holding LIVE rows: a range predicate silently returns
+/// nothing while an equality predicate on the same row returns it.
+///
+/// Found by the cache-coherence oracle at ~1140 seeds, far past its default of
+/// 6 — which is why `oracle_deep_run_catches_rare_divergences` now exists.
+#[tokio::test]
+async fn rolled_back_insert_does_not_poison_zone_map_pruning() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY, val INT)").await;
+    exec(&ex, "INSERT INTO t VALUES (3, 17)").await;
+    exec(&ex, "INSERT INTO t VALUES (11, 11)").await;
+    // Clears the zone map (documented fast path: empty means "no pruning").
+    exec(&ex, "DELETE FROM t WHERE id = 11").await;
+
+    // A transaction inserts a row whose value is BELOW the survivor's, then
+    // rolls back. Post-rollback the table holds exactly one row (id=3, val=17),
+    // so a stale one-row granule claiming val=[12,12] looks perfectly credible.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "INSERT INTO t VALUES (12, 12)").await;
+    exec(&ex, "ROLLBACK").await;
+
+    let rows_now = rows(&exec(&ex, "SELECT id, val FROM t ORDER BY id").await[0]).clone();
+    assert_eq!(
+        rows_now,
+        vec![vec![Value::Int32(3), Value::Int32(17)]],
+        "rollback must leave exactly the pre-transaction row"
+    );
+
+    // The bug: this returned [] because the granule claimed max(val) = 12.
+    let r = exec(&ex, "SELECT id FROM t WHERE val > 13").await;
+    assert_eq!(
+        rows(&r[0]),
+        &vec![vec![Value::Int32(3)]],
+        "range predicate must see the live row; stale zone map pruned it"
+    );
+    let r = exec(&ex, "SELECT id FROM t WHERE val >= 17").await;
+    assert_eq!(
+        rows(&r[0]),
+        &vec![vec![Value::Int32(3)]],
+        "boundary predicate must see the live row"
+    );
+
+    // And the stats themselves must describe the surviving row, not the ghost.
+    for g in ex.zone_map_granules_for_test("t") {
+        if let Some(c) = g.column_stats.get(&1) {
+            assert_eq!(
+                (c.min_value.clone(), c.max_value.clone()),
+                (Value::Int32(17), Value::Int32(17)),
+                "granule stats still describe the rolled-back row"
+            );
+        }
+    }
+}
+
+/// The oracle's default of 6 seeds is a CI-speed compromise, not a coverage
+/// claim. The zone-map/rollback divergence above only appeared at ~1140 seeds,
+/// so a default-depth green run must not be read as "the oracle found nothing".
+/// This runs a deeper sweep, ignored by default; run it with `--ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "deep oracle sweep (~1500 seeds, minutes); run with --ignored"]
+async fn oracle_deep_run_catches_rare_divergences() {
+    for seed in 0..1500u64 {
+        run_seed(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(seed + 1), 24).await;
+    }
+}

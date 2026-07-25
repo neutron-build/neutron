@@ -589,6 +589,15 @@ impl Executor {
                     self.zone_map_index
                         .update_granule(zm_table_id, granule_id, granule);
                 }
+                // The zone map is shared process state, not per-session: these
+                // stats describe rows this transaction has not committed. If the
+                // transaction later ROLLS BACK, the map keeps describing rows
+                // that no longer exist and `can_skip_granule` prunes granules
+                // holding LIVE rows — a silent wrong result on any range
+                // predicate. Mark the table so COMMIT/ROLLBACK rebuilds it.
+                // (Only DELETE/UPDATE marked it before, and only when they
+                // actually matched rows, so a rolled-back INSERT went unrepaired.)
+                self.mark_derived_dirty_in_txn(&table_name).await;
             }
 
             // Compute UNIQUE/PRIMARY KEY column sets. If any exist, insert each row
@@ -1788,6 +1797,27 @@ impl Executor {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Record that `table` has derived state (zone map, postings) reflecting
+    /// uncommitted rows, so the transaction's COMMIT or ROLLBACK rebuilds it.
+    /// A no-op outside a transaction, where the mutation is already durable.
+    pub(super) async fn mark_derived_dirty_in_txn(&self, table: &str) {
+        let session = self.current_session();
+        let mut txn = session.txn_state.write().await;
+        if txn.active {
+            txn.derived_dirty_tables.insert(table.to_string());
+        }
+    }
+
+    /// Test-only: dump a table's zone-map granules for diagnosis.
+    #[cfg(test)]
+    pub(crate) fn zone_map_granules_for_test(
+        &self,
+        table_name: &str,
+    ) -> Vec<crate::storage::granule_stats::GranuleStats> {
+        self.zone_map_index
+            .get_table_granules(table_name_to_id(table_name))
     }
 
     /// Rebuild a table's zone map from its current rows after a mutation that
