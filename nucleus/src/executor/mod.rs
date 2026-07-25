@@ -105,6 +105,7 @@ mod admission;
 mod aggregate;
 mod cache;
 pub(crate) mod copy;
+mod cross_model;
 mod ddl;
 mod dml;
 mod expr;
@@ -2249,8 +2250,27 @@ impl Executor {
     }
 
     /// Drop a session when a connection closes, freeing its state.
+    ///
+    /// A client that disconnects mid-transaction must not leave half of it
+    /// behind. `drop_storage_session` discards the uncommitted SQL rows, so the
+    /// cross-model half has to be reverted here too — otherwise a plain TCP
+    /// close splits the transaction (SQL rolled back, KV/graph/doc writes
+    /// permanent) with no crash and no timing window involved. The idle-in-
+    /// transaction sweep already does this via `rollback_transaction`; before
+    /// M8 the two abandonment paths disagreed.
+    ///
+    /// Synchronous on purpose: every disconnect path (pgwire cleanup, the
+    /// binary protocol handler, embedded callers) is sync, and the revert needs
+    /// no async work.
     pub fn drop_session(&self, id: u64) {
-        self.sessions.write().remove(&id);
+        let session = self.sessions.write().remove(&id);
+        if let Some(session) = session {
+            let cross_model = session.cross_model.lock().take();
+            if let Some(cm) = cross_model {
+                self.cross_model_revert(cm.base, cm.fts_ops);
+                self.metrics.open_transactions.dec();
+            }
+        }
         self.storage.drop_storage_session(id);
     }
 
@@ -2282,6 +2302,13 @@ impl Executor {
             }
             actions.push("ROLLBACK active transaction".into());
             self.metrics.open_transactions.dec();
+        }
+
+        // Pool return abandons the transaction the same way a disconnect does,
+        // so the cross-model half must be reverted with it.
+        let cross_model = session.cross_model.lock().take();
+        if let Some(cm) = cross_model {
+            self.cross_model_revert(cm.base, cm.fts_ops);
         }
 
         // Collect info about what will be cleared
@@ -3186,7 +3213,13 @@ impl Executor {
 
     /// Convenience: put data into the blob store.
     pub fn blob_store_put(&self, key: &str, data: &[u8], content_type: Option<&str>) {
-        self.blob_store.write().put(key, data, content_type);
+        let mut store = self.blob_store.write();
+        self.cross_model_before_blob(&store);
+        store.clear_touched();
+        store.put(key, data, content_type);
+        let touched = store.take_touched();
+        drop(store);
+        self.cross_model_after_blob(touched);
     }
 
     /// Convenience: check if a blob exists.
@@ -3206,7 +3239,14 @@ impl Executor {
 
     /// Convenience: delete a blob.
     pub fn blob_store_delete(&self, key: &str) -> bool {
-        self.blob_store.write().delete(key)
+        let mut store = self.blob_store.write();
+        self.cross_model_before_blob(&store);
+        store.clear_touched();
+        let removed = store.delete(key);
+        let touched = store.take_touched();
+        drop(store);
+        self.cross_model_after_blob(touched);
+        removed
     }
 
     /// Get a reference to the datalog store.
@@ -3515,8 +3555,14 @@ impl Executor {
             .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
         let result = {
             let mut gs = self.graph_store.write();
-            execute_cypher(&mut gs, &parsed)
-                .map_err(|e| ExecError::Unsupported(format!("Cypher execution error: {e:?}")))?
+            self.cross_model_before_graph(&gs);
+            gs.clear_touched();
+            let outcome = execute_cypher(&mut gs, &parsed)
+                .map_err(|e| ExecError::Unsupported(format!("Cypher execution error: {e:?}")));
+            let touched = gs.take_touched();
+            drop(gs);
+            self.cross_model_after_graph(touched);
+            outcome?
         };
         // Convert CypherResult columns/rows to SQL types.
         let columns: Vec<(String, DataType)> = result

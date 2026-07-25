@@ -60,11 +60,19 @@ enum BufferedOp {
 /// Transaction state — holds buffered operations until commit/abort.
 struct TxnBuffer {
     ops: Vec<BufferedOp>,
+    /// Savepoint stack: `(name, ops.len() at SAVEPOINT time)`.
+    ///
+    /// Nothing in this buffer has touched the underlying engine yet, so a
+    /// savepoint is just a mark and `ROLLBACK TO SAVEPOINT` is a truncate.
+    savepoints: Vec<(String, usize)>,
 }
 
 impl TxnBuffer {
     fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            ops: Vec::new(),
+            savepoints: Vec::new(),
+        }
     }
 }
 
@@ -314,6 +322,56 @@ impl StorageEngine for BufferedDiskEngine {
     async fn abort_txn(&self) -> Result<(), StorageError> {
         // Discard this session's buffered operations.
         self.txn_bufs.write().remove(&current_session_id());
+        Ok(())
+    }
+
+    /// Mark the current position in the write buffer.
+    ///
+    /// Savepoints were previously inherited from the `StorageEngine` default,
+    /// which is a silent `Ok(())` no-op. Because this engine also reports
+    /// `supports_mvcc() == true`, the executor delegated to it and believed the
+    /// work was done, so on the disk stack that every server deployment runs,
+    /// `ROLLBACK TO SAVEPOINT` acknowledged success and discarded nothing. The
+    /// in-memory `MvccStorageAdapter` implements savepoints properly, which is
+    /// why the library test suite never saw it.
+    async fn savepoint(&self, name: &str) -> Result<(), StorageError> {
+        let mut bufs = self.txn_bufs.write();
+        let Some(txn) = bufs.get_mut(&current_session_id()) else {
+            return Err(StorageError::NoActiveTransaction);
+        };
+        let mark = txn.ops.len();
+        txn.savepoints.push((name.to_string(), mark));
+        Ok(())
+    }
+
+    /// Discard every buffered operation made after the named savepoint.
+    async fn rollback_to_savepoint(&self, name: &str) -> Result<(), StorageError> {
+        let mut bufs = self.txn_bufs.write();
+        let Some(txn) = bufs.get_mut(&current_session_id()) else {
+            return Err(StorageError::NoActiveTransaction);
+        };
+        let Some(pos) = txn.savepoints.iter().rposition(|(n, _)| n == name) else {
+            return Err(StorageError::Io(format!("savepoint {name} does not exist")));
+        };
+        let mark = txn.savepoints[pos].1;
+        txn.ops.truncate(mark);
+        // The savepoint stays live after rolling back to it (Postgres
+        // semantics); the ones nested inside it do not.
+        txn.savepoints.truncate(pos + 1);
+        Ok(())
+    }
+
+    /// Drop the named savepoint and everything nested inside it, keeping the
+    /// buffered work.
+    async fn release_savepoint(&self, name: &str) -> Result<(), StorageError> {
+        let mut bufs = self.txn_bufs.write();
+        let Some(txn) = bufs.get_mut(&current_session_id()) else {
+            return Err(StorageError::NoActiveTransaction);
+        };
+        let Some(pos) = txn.savepoints.iter().rposition(|(n, _)| n == name) else {
+            return Err(StorageError::Io(format!("savepoint {name} does not exist")));
+        };
+        txn.savepoints.truncate(pos);
         Ok(())
     }
 

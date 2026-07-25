@@ -459,6 +459,9 @@ pub struct DocumentStore {
     cold: Option<parking_lot::Mutex<crate::storage::lsm::LsmTree>>,
     /// Maximum documents in hot (in-memory) tier before eviction to cold.
     max_hot_docs: usize,
+    /// Document ids mutated since the last `clear_touched` — the transaction
+    /// write-set the executor drains under the same write guard.
+    txn_touched: HashSet<u64>,
 }
 
 impl Default for DocumentStore {
@@ -476,7 +479,18 @@ impl DocumentStore {
             wal: None,
             cold: None,
             max_hot_docs: usize::MAX,
+            txn_touched: HashSet::new(),
         }
+    }
+
+    /// Forget any recorded mutations (called before a mutating operation).
+    pub fn clear_touched(&mut self) {
+        self.txn_touched.clear();
+    }
+
+    /// Take the document ids mutated since the last `clear_touched`.
+    pub fn take_touched(&mut self) -> HashSet<u64> {
+        std::mem::take(&mut self.txn_touched)
     }
 
     /// Open a WAL-backed document store rooted at `dir`.
@@ -503,6 +517,7 @@ impl DocumentStore {
             wal: Some(Arc::clone(&wal)),
             cold,
             max_hot_docs: 50_000,
+            txn_touched: HashSet::new(),
         };
         // Restore documents from WAL state.
         for (doc_id, jsonb) in state.docs {
@@ -534,6 +549,7 @@ impl DocumentStore {
         }
         self.gin.insert(id, &doc);
         self.docs.insert(id, doc);
+        self.txn_touched.insert(id);
         if self.cold.is_some() {
             self.maybe_evict();
         }
@@ -554,6 +570,7 @@ impl DocumentStore {
         }
         self.gin.insert(id, &doc);
         self.docs.insert(id, doc);
+        self.txn_touched.insert(id);
         if id >= self.next_id {
             self.next_id = id + 1;
         }
@@ -571,6 +588,7 @@ impl DocumentStore {
                 eprintln!("document WAL: failed to log delete {id}: {e}");
             }
             self.gin.remove(id, &old);
+            self.txn_touched.insert(id);
             true
         } else {
             // Try cold tier
@@ -584,6 +602,7 @@ impl DocumentStore {
                         eprintln!("document WAL: failed to log delete {id}: {e}");
                     }
                     cold.lock().delete(key.to_vec());
+                    self.txn_touched.insert(id);
                     return true;
                 }
             }
@@ -912,7 +931,27 @@ impl DocumentStore {
         }
     }
 
+    /// Revert only the document ids in `touched`, using `snap` as the
+    /// before-image. Documents this transaction never wrote are left as they
+    /// are, so a ROLLBACK cannot destroy another session's committed inserts.
+    ///
+    /// Durable: `insert_with_id`/`delete` append compensating records to the
+    /// document WAL, so a crash after ROLLBACK does not resurrect the writes.
+    pub fn txn_restore_scoped(&mut self, snap: &DocTxnSnapshot, touched: &HashSet<u64>) {
+        for id in touched {
+            match snap.docs.get(id) {
+                Some(doc) => self.insert_with_id(*id, doc.clone()),
+                None => {
+                    self.delete(*id);
+                }
+            }
+        }
+        // The restore itself is not a client mutation.
+        self.txn_touched.clear();
+    }
+
     /// Restore document state from a transaction snapshot (for ROLLBACK).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn txn_restore(&mut self, snap: DocTxnSnapshot) {
         self.docs = snap.docs;
         self.gin = snap.gin;

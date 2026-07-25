@@ -33,7 +33,7 @@
 pub mod segment;
 pub mod wal;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -294,6 +294,24 @@ impl ChunkStore {
         }
     }
 
+    /// Re-acquire a reference to an already-stored chunk. Used by a scoped
+    /// rollback to restore the reference counts a reverted blob held, without
+    /// rewriting the chunk data (the transaction pin kept it readable).
+    /// Returns false when the chunk is unknown to the store.
+    fn retain(&mut self, hash: &ChunkHash) -> bool {
+        let Some(r) = self.refs.get_mut(hash) else {
+            return false;
+        };
+        if r.count == 0 {
+            self.stored_bytes += r.len as usize;
+            if let Some(disk) = &mut self.disk {
+                disk.revive(hash);
+            }
+        }
+        r.count += 1;
+        true
+    }
+
     /// Get a chunk by hash. Served from the RAM cache when hot; falls back to
     /// a segment read (and refills the cache) in disk mode.
     pub fn get(&self, hash: &ChunkHash) -> Option<Vec<u8>> {
@@ -520,6 +538,9 @@ pub struct BlobStore {
     chunk_size: usize,
     /// Optional WAL for durability.
     wal: Option<Arc<BlobWal>>,
+    /// Blob keys mutated since the last `clear_touched` — the transaction
+    /// write-set the executor drains under the same write guard.
+    txn_touched: HashSet<String>,
 }
 
 impl Default for BlobStore {
@@ -541,7 +562,18 @@ impl BlobStore {
             blobs: HashMap::new(),
             chunk_size,
             wal: None,
+            txn_touched: HashSet::new(),
         }
+    }
+
+    /// Forget any recorded mutations (called before a mutating operation).
+    pub fn clear_touched(&mut self) {
+        self.txn_touched.clear();
+    }
+
+    /// Take the blob keys mutated since the last `clear_touched`.
+    pub fn take_touched(&mut self) -> HashSet<String> {
+        std::mem::take(&mut self.txn_touched)
     }
 
     /// Open a disk-tiered, WAL-backed blob store at `dir`.
@@ -630,6 +662,7 @@ impl BlobStore {
             blobs,
             chunk_size,
             wal: Some(Arc::new(wal)),
+            txn_touched: HashSet::new(),
         };
 
         // A legacy WAL embedded chunk data; now that it lives in segments,
@@ -703,6 +736,7 @@ impl BlobStore {
         };
 
         self.blobs.insert(key.to_string(), meta);
+        self.txn_touched.insert(key.to_string());
     }
 
     /// Compose a new blob from the chunks of existing blobs, in order —
@@ -777,6 +811,7 @@ impl BlobStore {
             index,
         };
         self.blobs.insert(key.to_string(), meta);
+        self.txn_touched.insert(key.to_string());
         true
     }
 
@@ -851,6 +886,7 @@ impl BlobStore {
         for hash in &meta.chunk_hashes {
             self.chunks.release(hash);
         }
+        self.txn_touched.insert(key.to_string());
         true
     }
 
@@ -869,6 +905,7 @@ impl BlobStore {
                 eprintln!("blob WAL: failed to log tag for '{key}': {e}");
             }
             meta.tags.insert(tag_key.to_string(), tag_value.to_string());
+            self.txn_touched.insert(key.to_string());
             true
         } else {
             false
@@ -952,7 +989,56 @@ impl BlobStore {
         }
     }
 
+    /// Revert only the blob keys in `touched`, using `snap` as the
+    /// before-image. Blobs this transaction never wrote are left alone, so a
+    /// ROLLBACK cannot destroy another session's committed blob writes.
+    ///
+    /// Durable: every reverted key gets a compensating WAL record. Chunk
+    /// reference counts are repaired only for the chunks the reverted
+    /// manifests reference — the snapshot's transaction pin kept that data
+    /// physically readable, so `retain` can re-acquire without rewriting.
+    pub fn txn_restore_scoped(&mut self, snap: &BlobTxnSnapshot, touched: &HashSet<String>) {
+        for key in touched {
+            let current = self.blobs.remove(key);
+            if let Some(ref meta) = current {
+                for hash in &meta.chunk_hashes {
+                    self.chunks.release(hash);
+                }
+            }
+            match snap.blobs.get(key) {
+                Some(meta) => {
+                    for hash in &meta.chunk_hashes {
+                        self.chunks.retain(hash);
+                    }
+                    if let Some(wal) = &self.wal
+                        && let Err(e) = wal.log_store_meta(
+                            key,
+                            meta.content_type.as_deref(),
+                            meta.size,
+                            &meta.wal_chunks(),
+                            &meta.wal_tags(),
+                        )
+                    {
+                        eprintln!("blob WAL: failed to log rollback restore for '{key}': {e}");
+                    }
+                    self.blobs.insert(key.clone(), meta.clone());
+                }
+                None => {
+                    if current.is_some()
+                        && let Some(wal) = &self.wal
+                        && let Err(e) = wal.log_delete(key)
+                    {
+                        eprintln!("blob WAL: failed to log rollback delete for '{key}': {e}");
+                    }
+                }
+            }
+        }
+        // The restore itself is not a client mutation.
+        self.txn_touched.clear();
+    }
+
     /// Restore mutable blob state from a transaction snapshot (for ROLLBACK).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn txn_restore(&mut self, snap: BlobTxnSnapshot) {
         // The WAL already holds entries for the rolled-back mutations; log
         // corrective entries so a replay reconstructs the restored state.
