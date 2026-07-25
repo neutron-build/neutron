@@ -482,7 +482,6 @@ fn check_rollback_count(ctx: &Ctx, tbl: &str, rng: &mut Rng, v: &mut Violations)
 
 // ─── Scenario driver ──────────────────────────────────────────────────────────
 
-/// One complete scenario: fresh table, run all invariants with a mix of keys.
 /// Whether the engine gives a transaction a stable snapshot for its lifetime.
 ///
 /// This is not cosmetic bookkeeping — invariant 5 is only meaningful where it
@@ -493,6 +492,15 @@ fn check_rollback_count(ctx: &Ctx, tbl: &str, rng: &mut Rng, v: &mut Violations)
 /// after its `BEGIN`. Asserting stable re-reads against a read-committed engine
 /// reports the documented contract as a violation, so invariant 5 is skipped
 /// rather than failed. `MemoryEngine` provides no isolation at all.
+fn provides_snapshot_isolation(kind: Option<EngineKind>) -> bool {
+    match kind {
+        None => true, // historical in-process MvccStorageAdapter
+        Some(EngineKind::Mvcc) | Some(EngineKind::DurableMvcc) => true,
+        Some(EngineKind::Disk) | Some(EngineKind::BufferedDisk) => false,
+        Some(EngineKind::Memory) => false,
+    }
+}
+
 /// Whether the engine isolates uncommitted writes between sessions at all.
 ///
 /// Invariants 1-4 and 6 all assume a transaction's writes are invisible to
@@ -513,15 +521,7 @@ fn provides_transaction_isolation(kind: Option<EngineKind>) -> bool {
     }
 }
 
-fn provides_snapshot_isolation(kind: Option<EngineKind>) -> bool {
-    match kind {
-        None => true, // historical in-process MvccStorageAdapter
-        Some(EngineKind::Mvcc) | Some(EngineKind::DurableMvcc) => true,
-        Some(EngineKind::Disk) | Some(EngineKind::BufferedDisk) => false,
-        Some(EngineKind::Memory) => false,
-    }
-}
-
+/// One complete scenario: fresh table, run all invariants with a mix of keys.
 fn run_scenario(
     ex: Arc<Executor>,
     seed: u64,
