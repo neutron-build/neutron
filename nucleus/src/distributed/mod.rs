@@ -6,7 +6,7 @@
 //! everything is synchronous and testable without an async runtime.
 
 pub mod replicator;
-pub use replicator::RaftReplicator;
+pub use replicator::{ProposeError, RaftReplicator};
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
