@@ -34,11 +34,12 @@
 #![allow(unused)]
 #![allow(clippy::all)] // internal fuzz harness
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, OnceLock};
 
 use nucleus::catalog::Catalog;
 use nucleus::executor::{ExecResult, Executor};
+use nucleus::metrics::harness::{EngineConfig, EngineKind, HarnessDb};
 use nucleus::storage::MvccStorageAdapter;
 use nucleus::types::Value;
 
@@ -116,12 +117,70 @@ fn new_rt() -> tokio::runtime::Runtime {
         .expect("worker runtime")
 }
 
-// ─── Fresh executor per round (in-memory MVCC) ────────────────────────────────
-fn fresh_executor() -> Arc<Executor> {
-    Arc::new(Executor::new(
-        Arc::new(Catalog::new()),
-        Arc::new(MvccStorageAdapter::new()),
-    ))
+// ─── Fresh executor per round ─────────────────────────────────────────────────
+
+/// Engine selected by `--engine`; `None` keeps the historical in-process
+/// `MvccStorageAdapter`. A process-wide cell rather than a threaded parameter
+/// because all four invariant routines allocate their own executor, and the
+/// selection is fixed for the whole run.
+static ENGINE: OnceLock<Option<EngineKind>> = OnceLock::new();
+static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One round's database. Dropping it closes the engine before removing the
+/// directory — a paged engine holds WAL and data-file handles until then.
+struct RoundDb {
+    ex: Arc<Executor>,
+    db: Option<HarnessDb>,
+    dir: Option<std::path::PathBuf>,
+}
+
+impl Drop for RoundDb {
+    fn drop(&mut self) {
+        self.db.take();
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+impl std::ops::Deref for RoundDb {
+    type Target = Arc<Executor>;
+    fn deref(&self) -> &Arc<Executor> {
+        &self.ex
+    }
+}
+
+fn fresh_executor() -> RoundDb {
+    let kind = *ENGINE.get().unwrap_or(&None);
+    let Some(kind) = kind else {
+        return RoundDb {
+            ex: Arc::new(Executor::new(
+                Arc::new(Catalog::new()),
+                Arc::new(MvccStorageAdapter::new()),
+            )),
+            db: None,
+            dir: None,
+        };
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "nucleus-probe-threads-{}-{}",
+        std::process::id(),
+        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rt = tokio::runtime::Handle::current();
+    let db = tokio::task::block_in_place(|| {
+        rt.block_on(HarnessDb::open(kind, &dir, EngineConfig::default()))
+    })
+    .unwrap_or_else(|e| {
+        println!("FAIL: could not open engine {}: {e:?}", kind.name());
+        std::process::exit(1);
+    });
+    RoundDb {
+        ex: db.executor().clone(),
+        db: Some(db),
+        dir: Some(dir),
+    }
 }
 
 /// DDL + one auto-committed setup statement, run on a throwaway session.
@@ -670,6 +729,8 @@ fn main_impl() {
     let mut seed: u64 = 0xC0FFEE_77;
     let mut rounds = 150usize;
     let mut max_report = 12usize;
+    // None = the historical in-process MvccStorageAdapter (RAM, no WAL).
+    let mut engine: Option<EngineKind> = None;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -686,15 +747,44 @@ fn main_impl() {
                 i += 1;
                 max_report = args[i].parse().unwrap();
             }
+            "--engine" => {
+                i += 1;
+                match EngineKind::parse(&args[i]) {
+                    Some(k) => engine = Some(k),
+                    None => {
+                        let names: Vec<&str> = EngineKind::ALL.iter().map(|k| k.name()).collect();
+                        println!(
+                            "unknown --engine {:?}; expected one of: {}",
+                            args[i],
+                            names.join(", ")
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
     }
+    let _ = ENGINE.set(engine);
     // Silence per-call panics (we catch_unwind around executor calls).
     std::panic::set_hook(Box::new(|_| {}));
 
+    let engine_label = match engine {
+        Some(k) => k.name(),
+        None => "mvcc (in-process, no WAL)",
+    };
     println!("Nucleus real-thread MVCC concurrency invariant checker");
-    println!("seed={seed} rounds={rounds} (4 invariants/round, genuine OS-thread contention)\n");
+    println!("seed={seed} rounds={rounds} engine={engine_label}");
+    println!("(4 invariants/round, genuine OS-thread contention)");
+    if engine.is_none_or(|k| !k.has_buffer_pool()) {
+        println!(
+            "NOTE: this engine has no paged storage — nothing below exercises \
+             DiskEngine's\n      buffer-pool frame latches under real thread \
+             contention. Pass --engine buffered-disk."
+        );
+    }
+    println!();
 
     let mut rng = Rng(seed | 1);
     let mut report = Report {
