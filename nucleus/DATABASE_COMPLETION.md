@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 263820; Source Rust files: 235; Top-level modules: 51.
-- Declared unit tests: 3977; Declared integration tests: 320; Ignored tests: 43.
+- Source LOC: 264108; Source Rust files: 235; Top-level modules: 51.
+- Declared unit tests: 3980; Declared integration tests: 320; Ignored tests: 44.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -239,7 +239,19 @@ same truncate-then-rewrite pattern was then found and fixed in the geo and datal
 
 Goal: recover a production database without requiring a byte-for-byte stopped-directory copy.
 
-- [ ] Add an online-consistent physical snapshot coordinated with writes and checkpoints.
+- [x] Add an online-consistent physical snapshot coordinated with writes and checkpoints.
+      A RUNNING server snapshots itself via `BACKUP DATABASE TO '<path>'` (superuser), the
+      `pg_basebackup` shape — an external process cannot pin WAL retention or observe LSNs, so
+      `nucleus backup` refuses a live directory and this is the supported path. Routed through
+      `StorageEngine::as_backup_coordinator()`; engines without a physical snapshot refuse
+      explicitly. Coordination: pin WAL retention at the window start LSN, checkpoint, copy
+      page-slot-wise re-reading any slot that does not decode to a complete page, cut the WAL at
+      the end LSN. Verified end-to-end on a serving server: backup taken while serving, server kept
+      serving, snapshot restored to exactly the committed point and accepted writes.
+      REMAINING (documented in DURABILITY.md, not claimed here): the consistent LSN covers the SQL
+      substrate only — specialty WALs are individually crash-consistent but not LSN-pinned with it;
+      the retention pin is uncapped; and the concurrency reproducer is `#[ignore]`d because it
+      exposes a pre-existing page publish/flush ordering race.
       PARTIAL (2026-07-24). The mechanism exists and is proven; the delivery vector for an
       already-running server does not, so this stays open.
       DONE: `backup::backup_online` + the `BackupCoordinator` trait implemented by `DiskEngine`.

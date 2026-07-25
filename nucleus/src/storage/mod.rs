@@ -103,6 +103,19 @@ impl FilterOp {
 /// Principle 1: subsystems interact through clean abstractions.
 #[async_trait::async_trait]
 pub trait StorageEngine: Send + Sync {
+    /// The backup coordinator for this engine, when it has one.
+    ///
+    /// This is the route a RUNNING server uses to back itself up. An external
+    /// process cannot take a consistent snapshot of a live data directory —
+    /// it holds no locks and sees no LSNs — which is why PostgreSQL has
+    /// `pg_basebackup` talk to the server rather than read its files. The
+    /// executor holds an `Arc<dyn StorageEngine>` with no path to the concrete
+    /// engine underneath, so the trait must offer the handle explicitly.
+    /// Engines with no physical snapshot (memory, MVCC) correctly return None.
+    fn as_backup_coordinator(&self) -> Option<&dyn crate::backup::BackupCoordinator> {
+        None
+    }
+
     async fn create_table(&self, table: &str) -> Result<(), StorageError>;
     async fn drop_table(&self, table: &str) -> Result<(), StorageError>;
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError>;
