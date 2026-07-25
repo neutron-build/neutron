@@ -149,8 +149,59 @@ exists. `test_durability_format` fingerprints every file in the directory and
 asserts a rejected open rewrites and deletes nothing, with a current-format
 database still opening as the control.
 
+Restore inherits the same rule. `backup::restore_data_dir` verifies every
+manifest checksum, the on-disk format version, the destination's liveness lock,
+and the destination's database identity **before** it removes anything; the
+same fingerprint technique proves a refused restore leaves the destination
+byte-for-byte unchanged. Restore compatibility keys on `format_version` rather
+than the release string, so patch releases interoperate; manifests written
+before that field existed fall back to the exact-version lock.
+
+## Backup consistency
+
+A data directory that a live instance has open carries an OS lock
+(`backup::DataDirLock`, `nucleus.lock`, taken by `nucleus start`). `nucleus
+backup` refuses such a directory: a plain recursive copy of a database being
+written to is torn, and until this guard existed the command printed "Backup
+complete" over it. The check is liveness, not file existence — a lock file left
+behind by a crashed process does not block the backup you most need after a
+crash. `--allow-in-use` still permits the copy and stamps
+`taken_while_in_use: true` into the manifest, so the caveat outlives the
+command that produced it.
+
+`backup::backup_online` takes a snapshot that is consistent *while writes
+continue*, coordinated through `BackupCoordinator`:
+
+1. Pin WAL retention at the window's start LSN, then checkpoint. The pin makes
+   `SegmentedWal::truncate_before` clamp to it, so a checkpoint firing during
+   the copy cannot reclaim the records the snapshot still needs.
+2. Copy the data file one page slot at a time, re-reading any slot that does
+   not decode to a complete page (checksum-verified, with the buffer pool's
+   own never-written-free-page exemption). A slot that never resolves aborts
+   the backup rather than entering the snapshot.
+3. Sync and seal the WAL, naming the LSN the snapshot is consistent through.
+4. Copy the WAL byte-exactly truncated at that LSN, via the same
+   `copy_segment_prefix_upto_lsn` primitive PITR uses.
+
+Restoring and opening the result replays that WAL through ordinary recovery,
+landing on exactly the state a crash at `consistent_lsn` would have recovered.
+The consistency point covers the SQL substrate; the specialty-model WALs and
+catalog JSON are copied after it and are individually crash-consistent but not
+pinned to the same LSN.
+
 ## Known gaps
 
+- While an online backup holds its retention pin, the WAL is not reclaimed.
+  On a write-heavy database a long backup therefore grows the WAL for its whole
+  duration, and each checkpoint's segment rescan gets more expensive. The pin
+  is released on every exit path including failures
+  (`online_backup_aborts_rather_than_snapshot_an_unreadable_page` proves the
+  failure path), but there is no cap on how much WAL a slow backup may retain
+  and no abort-if-exceeded control.
+- An online backup of an *already running* server is not reachable: `nucleus
+  backup --online` opens the data directory itself, so it serves only the case
+  where no other process holds it. A running server is refused, not backed up.
+  Closing this needs an admin command that reaches the live engine handle.
 - Crash points are declared on the SQL/MVCC WAL, catalog rename, and
   compaction paths. The specialty-model WALs listed above are covered by
   reopen tests and by the same stage-and-rename fix, but not yet by named

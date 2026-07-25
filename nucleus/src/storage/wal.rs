@@ -157,6 +157,26 @@ pub trait WalBackend: Send + Sync {
     fn rotate(&self) -> std::io::Result<()> {
         Ok(())
     }
+    /// The next LSN this backend will assign. `0` when the backend does not
+    /// track LSNs.
+    fn current_lsn(&self) -> u64 {
+        0
+    }
+    /// Hold every segment carrying a record at or after `lsn`, regardless of
+    /// what a concurrent checkpoint asks `truncate_before` to reclaim.
+    ///
+    /// An online physical backup pins retention for the duration of the copy:
+    /// the snapshot's data file may lag the WAL by the whole copy window, so
+    /// the records that bring it forward must still exist when the copy
+    /// finishes. Without the pin a checkpoint mid-backup silently deletes the
+    /// only records that could repair the snapshot. Returns `false` when the
+    /// backend has nothing to pin (single-file WAL: it is never reclaimed
+    /// while open).
+    fn pin_retention(&self, _lsn: u64) -> bool {
+        false
+    }
+    /// Release a retention pin taken by [`WalBackend::pin_retention`].
+    fn unpin_retention(&self) {}
 }
 
 /// The write-ahead log.
@@ -374,6 +394,9 @@ impl WalBackend for Wal {
     fn sync_up_to(&self, lsn: u64) -> std::io::Result<()> {
         Wal::sync_up_to(self, lsn)
     }
+    fn current_lsn(&self) -> u64 {
+        Wal::current_lsn(self)
+    }
 }
 
 impl Wal {
@@ -575,6 +598,10 @@ pub struct SegmentedWal {
     /// it — so no WAL segment is ever reclaimed without first being preserved.
     /// `None` (the default) means no archiving and zero behavior change.
     archive_dir: Option<std::path::PathBuf>,
+    /// Retention floor held by an in-progress online backup. `0` = unpinned.
+    /// While non-zero, `truncate_before` never reclaims a segment holding a
+    /// record at or after this LSN — see [`WalBackend::pin_retention`].
+    retention_pin: AtomicU64,
 }
 
 struct ActiveSegment {
@@ -648,6 +675,7 @@ impl SegmentedWal {
             // (named after this WAL's directory), so multiple databases in one
             // process never collide. Unset → no archiving.
             archive_dir: Self::archive_dir_from_env(dir),
+            retention_pin: AtomicU64::new(0),
         })
     }
 
@@ -835,7 +863,17 @@ impl SegmentedWal {
     /// enabled, a segment is archived before deletion and is NEVER deleted if
     /// archiving fails — the "no acknowledged write is ever unrecoverable"
     /// guarantee takes precedence over reclaiming disk.
+    ///
+    /// An active retention pin (see [`SegmentedWal::pin_retention`]) clamps
+    /// `before_lsn`: a checkpoint that fires during an online backup must not
+    /// reclaim the records that backup still needs to reach consistency.
     pub fn truncate_before(&self, before_lsn: u64) -> std::io::Result<usize> {
+        let pin = self.retention_pin.load(Ordering::Acquire);
+        let before_lsn = if pin == 0 {
+            before_lsn
+        } else {
+            before_lsn.min(pin)
+        };
         let active = self.active.lock();
         let active_seg = active.segment_number;
         drop(active);
@@ -883,6 +921,38 @@ impl SegmentedWal {
     /// Get the current (next to be assigned) LSN.
     pub fn current_lsn(&self) -> u64 {
         self.next_lsn.load(Ordering::Acquire)
+    }
+
+    /// Hold every segment carrying a record at or after `lsn` until
+    /// [`SegmentedWal::unpin_retention`]. Idempotent; a lower pin wins, so
+    /// overlapping backups all keep the records they need.
+    pub fn pin_retention(&self, lsn: u64) {
+        let lsn = lsn.max(1);
+        let mut cur = self.retention_pin.load(Ordering::Acquire);
+        loop {
+            if cur != 0 && cur <= lsn {
+                return;
+            }
+            match self.retention_pin.compare_exchange_weak(
+                cur,
+                lsn,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Release the retention pin.
+    pub fn unpin_retention(&self) {
+        self.retention_pin.store(0, Ordering::Release);
+    }
+
+    /// The current retention pin (`0` when unpinned). Test/introspection hook.
+    pub fn retention_pin(&self) -> u64 {
+        self.retention_pin.load(Ordering::Acquire)
     }
 
     /// Get the most recent checkpoint LSN.
@@ -1037,6 +1107,16 @@ impl WalBackend for SegmentedWal {
     }
     fn sync_up_to(&self, lsn: u64) -> std::io::Result<()> {
         SegmentedWal::sync_up_to(self, lsn)
+    }
+    fn current_lsn(&self) -> u64 {
+        SegmentedWal::current_lsn(self)
+    }
+    fn pin_retention(&self, lsn: u64) -> bool {
+        SegmentedWal::pin_retention(self, lsn);
+        true
+    }
+    fn unpin_retention(&self) {
+        SegmentedWal::unpin_retention(self);
     }
 }
 
@@ -1312,7 +1392,7 @@ pub(crate) fn segment_file_path(dir: &Path, segment_number: u64) -> std::path::P
 }
 
 /// List all segment numbers in a WAL directory.
-fn list_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
+pub(crate) fn list_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
     let mut segments = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -1644,6 +1724,86 @@ mod tests {
 
         assert!(removed > 0, "should have removed some segments");
         assert!(segs_after < segs_before, "fewer segments after truncation");
+    }
+
+    #[test]
+    fn retention_pin_survives_a_checkpoint_truncate() {
+        // The sharp failure this prevents: an online backup copies the data
+        // file over some window; a checkpoint fires mid-copy and truncates the
+        // WAL past the window's start; the records that would have brought the
+        // copied pages forward are gone, and the snapshot is silently
+        // unrecoverable. The pin must beat the truncate.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let wal = SegmentedWal::open(&wal_dir, 20_000).unwrap();
+        let page = [7u8; PAGE_SIZE];
+
+        // Records that predate the backup window — these are reclaimable.
+        wal.log_page_write(1, 0, &page).unwrap();
+        wal.log_page_write(2, 1, &page).unwrap();
+
+        // Backup begins here.
+        let pin_lsn = wal.current_lsn();
+        wal.pin_retention(pin_lsn);
+        assert_eq!(wal.retention_pin(), pin_lsn);
+
+        // Writes during the copy window — the snapshot needs every one of them.
+        let mut window_lsns = Vec::new();
+        for txn in 3..8u64 {
+            window_lsns.push(wal.log_page_write(txn, txn as u32, &page).unwrap());
+        }
+        let cp_lsn = wal.log_checkpoint().unwrap();
+        wal.sync().unwrap();
+
+        // A checkpoint asks to reclaim everything below it — including the
+        // whole window.
+        wal.truncate_before(cp_lsn).unwrap();
+
+        let surviving: std::collections::HashSet<u64> = wal
+            .read_all_records()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.lsn)
+            .collect();
+        for lsn in &window_lsns {
+            assert!(
+                surviving.contains(lsn),
+                "checkpoint reclaimed LSN {lsn}, which the in-progress backup still needs \
+                 (pin was {pin_lsn})"
+            );
+        }
+
+        // Once the backup releases the pin, the same request reclaims freely.
+        wal.unpin_retention();
+        assert_eq!(wal.retention_pin(), 0);
+        wal.truncate_before(cp_lsn).unwrap();
+        let after: std::collections::HashSet<u64> = wal
+            .read_all_records()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.lsn)
+            .collect();
+        assert!(
+            after.len() < surviving.len(),
+            "releasing the pin must let the checkpoint reclaim: {} -> {}",
+            surviving.len(),
+            after.len()
+        );
+    }
+
+    #[test]
+    fn retention_pin_keeps_the_lowest_of_overlapping_pins() {
+        // Two backups in flight: the older one's needs must win, or the
+        // younger one's begin silently shortens the older one's retention.
+        let dir = tempfile::tempdir().unwrap();
+        let wal = SegmentedWal::open(&dir.path().join("wal"), 20_000).unwrap();
+        wal.pin_retention(50);
+        wal.pin_retention(90);
+        assert_eq!(wal.retention_pin(), 50, "a later, higher pin must not raise the floor");
+        wal.pin_retention(20);
+        assert_eq!(wal.retention_pin(), 20, "a lower pin must lower the floor");
+        wal.unpin_retention();
+        assert_eq!(wal.retention_pin(), 0);
     }
 
     #[test]
