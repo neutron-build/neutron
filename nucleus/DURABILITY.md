@@ -301,3 +301,12 @@ limit, surfacing as "File name too long".
   silently starts the server with a stale index.
 - There is no shared commit record between the SQL WAL and the model WALs, so a
   transaction spanning both is not atomic across a crash by construction.
+- **ROLLBACK durability is per-store, and vector is not covered.** A `ROLLBACK`
+  used to revert memory only and leave the mutation records in the specialty
+  WAL, so a crash after a successful rollback resurrected the rolled-back writes
+  on replay; blob was the sole store logging compensating records. KV strings,
+  document, graph, and time series now write compensating records as part of the
+  revert, and FTS rewrites `fts_index.json` (the file that wins on reopen).
+  `vector/vector.wal` is still **not** compensated: a rolled-back HNSW insert can
+  come back on replay until the index is rebuilt. Datalog needs no compensation
+  because `datalog/datalog.wal` is never written (see above).
