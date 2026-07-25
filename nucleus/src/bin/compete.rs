@@ -36,6 +36,7 @@ use mysql_async::prelude::*;
 
 use nucleus::catalog::Catalog;
 use nucleus::executor::Executor;
+use nucleus::metrics::latency::percentile_duration;
 use nucleus::storage::{MvccStorageAdapter, StorageEngine};
 use nucleus::types::Value;
 use nucleus::wire::{NucleusHandler, NucleusServer};
@@ -315,14 +316,6 @@ impl Stats {
         s
     }
 
-    fn median_us(&self) -> f64 {
-        let s = self.sorted();
-        if s.is_empty() {
-            return 0.0;
-        }
-        s[s.len() / 2].as_nanos() as f64 / 1_000.0
-    }
-
     fn avg_us(&self) -> f64 {
         if self.samples.is_empty() {
             return 0.0;
@@ -331,24 +324,22 @@ impl Stats {
         total.as_nanos() as f64 / self.samples.len() as f64 / 1_000.0
     }
 
+    // Percentiles come from `nucleus::metrics::latency` so every harness in the
+    // tree reports the same number for the same samples.
+    fn pct_us(&self, p: f64) -> f64 {
+        percentile_duration(&self.sorted(), p).as_nanos() as f64 / 1_000.0
+    }
+
     fn p50_us(&self) -> f64 {
-        self.median_us()
+        self.pct_us(50.0)
     }
 
     fn p95_us(&self) -> f64 {
-        let s = self.sorted();
-        if s.is_empty() {
-            return 0.0;
-        }
-        s[(s.len() as f64 * 0.95) as usize].as_nanos() as f64 / 1_000.0
+        self.pct_us(95.0)
     }
 
     fn p99_us(&self) -> f64 {
-        let s = self.sorted();
-        if s.is_empty() {
-            return 0.0;
-        }
-        s[std::cmp::min((s.len() as f64 * 0.99) as usize, s.len() - 1)].as_nanos() as f64 / 1_000.0
+        self.pct_us(99.0)
     }
 
     fn ops_per_sec(&self) -> f64 {
