@@ -2161,47 +2161,21 @@ impl CopyHandler for NucleusHandler {
         };
         let row_count = rows.len();
 
-        // Insert in batches of 500 rows.
-        const BATCH: usize = 500;
-        for chunk in rows.chunks(BATCH) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let col_clause = match &state.columns {
-                Some(cols) => format!(
-                    " ({})",
-                    cols.iter()
-                        .map(|c| format!("\"{c}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                None => String::new(),
-            };
-            let mut sql = format!("INSERT INTO {}{} VALUES ", state.table, col_clause);
-            let mut first_row = true;
-            for row_fields in chunk {
-                if !first_row {
-                    sql.push_str(", ");
-                }
-                first_row = false;
-                sql.push('(');
-                for (i, val) in row_fields.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    match val {
-                        None => sql.push_str("NULL"),
-                        Some(s) => {
-                            sql.push('\'');
-                            sql.push_str(&sanitize_sql_text_literal(s));
-                            sql.push('\'');
-                        }
-                    }
-                }
-                sql.push(')');
-            }
+        // Run the whole payload as ONE INSERT statement.
+        //
+        // COPY is a bulk INSERT and PostgreSQL's is all-or-nothing within the
+        // statement. Splitting it into 500-row chunks made COPY the one write
+        // that could be half-applied: a constraint violation in chunk 2 left
+        // chunk 1 committed. Handing the executor a pre-built AST also drops
+        // the round-trip through SQL *text*, so no field has to survive literal
+        // escaping on its way into the table.
+        if row_count > 0 {
+            let statement = self
+                .executor
+                .copy_insert_statement(&state.table, state.columns.as_deref(), rows)
+                .map_err(exec_error_to_pgwire)?;
             self.executor
-                .execute_with_session(state.session_id, &sql)
+                .execute_statements_with_session(state.session_id, vec![statement])
                 .await
                 .map_err(exec_error_to_pgwire)?;
         }
@@ -4360,21 +4334,22 @@ fn parse_copy_rows(
 fn split_copy_line(line: &str, delimiter: u8, is_csv: bool) -> Vec<Option<String>> {
     let delim = delimiter as char;
     if is_csv {
+        // An *unquoted* empty field is NULL (PostgreSQL's default CSV NULL
+        // string is the empty string); a *quoted* empty field (`""`) is the
+        // empty string. Tracking `was_quoted` is what keeps the two apart.
         let mut result = Vec::new();
         let mut chars = line.chars().peekable();
         let mut current = String::new();
-        loop {
-            match chars.next() {
-                None => {
-                    result.push(if current.is_empty() {
-                        None
-                    } else {
-                        Some(current)
-                    });
-                    break;
-                }
-                Some('"') => {
-                    // Quoted field.
+        let mut was_quoted = false;
+        let finish = |current: &mut String, was_quoted: bool| -> Option<String> {
+            let text = std::mem::take(current);
+            (was_quoted || !text.is_empty()).then_some(text)
+        };
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    was_quoted = true;
+                    // Quoted section.
                     loop {
                         match chars.next() {
                             None => break,
@@ -4383,34 +4358,21 @@ fn split_copy_line(line: &str, delimiter: u8, is_csv: bool) -> Vec<Option<String
                                     chars.next();
                                     current.push('"');
                                 } else {
-                                    break; // end of quoted field
+                                    break; // end of quoted section
                                 }
                             }
                             Some(ch) => current.push(ch),
                         }
                     }
-                    // Skip optional delimiter after closing quote.
-                    if chars.peek() == Some(&delim) {
-                        chars.next();
-                        result.push(if current.is_empty() {
-                            None
-                        } else {
-                            Some(current.clone())
-                        });
-                        current.clear();
-                    }
                 }
-                Some(c) if c == delim => {
-                    result.push(if current.is_empty() {
-                        None
-                    } else {
-                        Some(current.clone())
-                    });
-                    current.clear();
+                c if c == delim => {
+                    result.push(finish(&mut current, was_quoted));
+                    was_quoted = false;
                 }
-                Some(c) => current.push(c),
+                c => current.push(c),
             }
         }
+        result.push(finish(&mut current, was_quoted));
         result
     } else {
         // PostgreSQL text format: tab (or custom) delimiter, `\N` = NULL.
