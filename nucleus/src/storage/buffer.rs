@@ -944,6 +944,48 @@ impl BufferPool {
         }
     }
 
+    /// The underlying disk manager (physical backup reads slots through it so
+    /// the copy honors the file's compression/encryption layout).
+    pub fn disk(&self) -> &DiskManager {
+        &self.disk
+    }
+
+    /// The next LSN the WAL will assign (`0` when no WAL is configured).
+    pub fn wal_current_lsn(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.current_lsn())
+    }
+
+    /// Force every WAL record up to and including `lsn` to stable storage.
+    pub fn wal_sync_up_to(&self, lsn: u64) -> Result<(), BufferError> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.sync_up_to(lsn).map_err(BufferError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Seal the active WAL segment so everything logged so far is in an
+    /// inactive, copyable segment.
+    pub fn wal_rotate(&self) -> Result<(), BufferError> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.rotate().map_err(BufferError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Hold WAL segments carrying records at or after `lsn` against
+    /// checkpoint truncation (online backup). Returns `false` when the
+    /// backend does not support pinning.
+    pub fn wal_pin_retention(&self, lsn: u64) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.pin_retention(lsn))
+    }
+
+    /// Release a WAL retention pin.
+    pub fn wal_unpin_retention(&self) {
+        if let Some(wal) = self.wal.as_ref() {
+            wal.unpin_retention();
+        }
+    }
+
     /// Truncate WAL segments before the given LSN to reclaim disk space.
     pub fn wal_truncate_before(&self, before_lsn: u64) -> Result<usize, BufferError> {
         match self.wal.as_ref() {
