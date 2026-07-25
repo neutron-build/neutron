@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 256830; Source Rust files: 225; Top-level modules: 50.
-- Declared unit tests: 3874; Declared integration tests: 320; Ignored tests: 43.
+- Source LOC: 258533; Source Rust files: 225; Top-level modules: 50.
+- Declared unit tests: 3887; Declared integration tests: 320; Ignored tests: 43.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -240,15 +240,43 @@ same truncate-then-rewrite pattern was then found and fixed in the geo and datal
 Goal: recover a production database without requiring a byte-for-byte stopped-directory copy.
 
 - [ ] Add an online-consistent physical snapshot coordinated with writes and checkpoints.
-      NOT started (verified 2026-07-24): `backup::backup_data_dir` is a recursive directory copy
-      plus a manifest, with no coordination against writes or checkpoints. The CLI help says to run
-      it against a stopped instance, but nothing enforces that — run live, it prints "Backup
-      complete" for a torn snapshot. This is the milestone's stated goal, so M4 cannot close
-      without it.
-- [ ] Add backup manifests with checksums, format version, database identity, and encryption metadata.
-      PARTIAL: `BackupManifest` carries nucleus_version, format, created_unix, source, and
-      format_version (restore is format-locked). Missing: per-file checksums, a database identity,
-      and encryption metadata.
+      PARTIAL (2026-07-24). The mechanism exists and is proven; the delivery vector for an
+      already-running server does not, so this stays open.
+      DONE: `backup::backup_online` + the `BackupCoordinator` trait implemented by `DiskEngine`.
+      It pins WAL retention at the window's start LSN (so a checkpoint firing mid-copy cannot
+      reclaim the records the snapshot still needs), checkpoints, copies the data file one page
+      slot at a time re-reading any slot that does not decode to a complete page, then copies the
+      WAL byte-exactly truncated at the window's end LSN using the same prefix cut PITR uses. The
+      restored snapshot replays through ordinary recovery to exactly the state a crash at
+      `consistent_lsn` would have recovered. Proven by
+      `online_backup_is_consistent_under_concurrent_writes_and_checkpoints` (a concurrent writer
+      and a concurrent checkpointer run across the whole window; every row committed before the
+      backup began is present after restore and no row appears that was never inserted) and by
+      `retention_pin_survives_a_checkpoint_truncate`. A page that cannot be read intact ABANDONS
+      the backup rather than snapshotting a torn page
+      (`online_backup_aborts_rather_than_snapshot_an_unreadable_page`).
+      DONE: the silent-torn-success hole is closed. An open instance holds an OS lock on its data
+      directory (`backup::DataDirLock`, taken in `cmd_start`); `nucleus backup` refuses a locked
+      directory with an actionable error, and the deliberate override (`--allow-in-use`) records
+      `taken_while_in_use: true` in the manifest so an inconsistent snapshot can never be mistaken
+      for a consistent one later. A stale lock file from a crashed process does not block a backup
+      (the check is liveness, not file existence).
+      NOT DONE: backing up a *running* server online. `nucleus backup --online` opens the data
+      directory itself, so it works only when no other process holds it — the running-server case
+      is refused, not served. Closing this needs an admin/SQL command that reaches the live
+      server's engine handle (the executor holds `Arc<dyn StorageEngine>`, with no route to the
+      `DiskEngine` underneath).
+      NOT DONE: cross-model consistency. The consistency point covers the SQL substrate (data file
+      + segmented WAL). The specialty-model WALs and catalog JSON are copied after it; each is
+      individually crash-consistent but none is pinned to the same LSN.
+- [x] Add backup manifests with checksums, format version, database identity, and encryption metadata.
+      DONE (2026-07-24). `BackupManifest` carries per-file BLAKE3 checksums (path + length + hash
+      for every file under `data/`), `format_version`, a stable `database_id` (an id file created
+      in the data directory before the copy, so it travels inside the snapshot), `encryption`
+      (encrypted / compressed / algorithm / key_id — never key material), and the consistency
+      fields `online` / `consistent_lsn` / `taken_while_in_use`. Restore compatibility now keys on
+      the on-disk format version rather than the release string, so patch releases interoperate;
+      manifests predating the field fall back to the old exact-version lock.
 - [ ] Add WAL archiving with monotonic positions and retention management.
 - [ ] Add restore-to-latest and restore-to-time/position workflows.
       LIKELY DONE, needs an end-to-end gate: `pitr::PitrTarget` implements Lsn / Time / Latest and
@@ -265,6 +293,16 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       constraint"). Rows round-trip correctly; the schema around them does not.
 - [ ] Define encrypted-backup key handling and key rotation.
 - [ ] Add restore verification, corruption detection, and automated disaster-recovery tests.
+      PARTIAL (2026-07-24). DONE: `restore_data_dir` verifies every manifest checksum before it
+      touches the destination and refuses a snapshot that is corrupted, truncated, missing a file,
+      or carrying an extra one — naming the offending paths. The refusal is provably
+      non-destructive (`corrupted_snapshot_is_rejected_without_touching_the_destination` compares
+      a content fingerprint of the destination before and after). `verify_snapshot` is public so an
+      archived snapshot can be validated without running a restore. Restore also refuses a
+      destination a live instance holds, and refuses to overwrite a *different* database (identity
+      mismatch) even with `--force`. NOT DONE: automated disaster-recovery tests (scheduled
+      restore-and-verify runs), and logical comparison of restored contents across every durable
+      model.
 - [ ] Document RPO/RTO controls and limitations.
 
 Exit gate:
