@@ -21,6 +21,18 @@
 //! Usage:
 //!   cargo run --release --features "server rusqlite" --bin fuzz
 //!   cargo run --release --features "server rusqlite" --bin fuzz -- --seed 42 --iterations 5000
+//!   cargo run --release --features "server rusqlite" --bin fuzz -- --engine buffered-disk
+//!
+//! `--engine` selects which storage engine the oracle runs against. It defaults
+//! to `mvcc` (RAM-resident, no WAL) purely for speed, and that default is a
+//! coverage hole worth stating plainly: every paged-storage defect found so far
+//! — scan-ordinal row addressing, missing buffer-pool frame latches, VACUUM slot
+//! renumbering — lives in `DiskEngine`, which `mvcc` does not exercise at all.
+//! `MvccStorageAdapter` passed the 8-way soak that both paged engines failed. To
+//! aim this oracle at what `nucleus serve` actually runs, pass
+//! `--engine buffered-disk`; `--engine disk` isolates paged storage from the
+//! buffering layer. Paged engines open a fresh temp directory per iteration and
+//! fsync on commit, so they are far slower — lower `--iterations` accordingly.
 //!
 //! Methodology notes (to avoid false positives — dialect differences, not bugs):
 //!   - ORDER BY uses only NOT NULL columns + the unique `id` tiebreaker, so row
@@ -33,10 +45,13 @@
 //!   - Set operations compared unordered (set semantics, no ORDER BY needed).
 
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus::catalog::Catalog;
 use nucleus::executor::{ExecResult, Executor};
+use nucleus::metrics::harness::{EngineConfig, EngineKind, HarnessDb};
 use nucleus::storage::{MvccStorageAdapter, StorageEngine};
 use nucleus::types::Value;
 use rusqlite::Connection;
@@ -685,14 +700,70 @@ fn dump_inserts(schema: &Schema, rows: &[Vec<String>]) -> String {
     )
 }
 
+/// Monotonic suffix so concurrently-live temp directories never collide.
+static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One Nucleus instance under test, owning any on-disk directory it needs.
+///
+/// Dropping this closes the engine *before* removing the directory — a paged
+/// engine still holds WAL and data-file handles until its `HarnessDb` is gone.
+struct NucleusUnderTest {
+    ex: Arc<Executor>,
+    db: Option<HarnessDb>,
+    dir: Option<PathBuf>,
+}
+
+impl Drop for NucleusUnderTest {
+    fn drop(&mut self) {
+        self.db.take();
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Open a fresh Nucleus for one candidate.
+///
+/// `None` keeps the historical path — a bare in-process `MvccStorageAdapter`
+/// with no persistence — so an unflagged run is byte-for-byte the oracle it has
+/// always been. `Some(kind)` routes through the same [`HarnessDb`] the scale
+/// harnesses use, which is what makes `--engine buffered-disk` measure the
+/// engine `nucleus serve` constructs rather than a RAM stand-in for it.
+fn open_nucleus(kind: Option<EngineKind>) -> Option<NucleusUnderTest> {
+    let Some(kind) = kind else {
+        let cat = Arc::new(Catalog::new());
+        let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+        return Some(NucleusUnderTest {
+            ex: Arc::new(Executor::new(cat, st)),
+            db: None,
+            dir: None,
+        });
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "nucleus-fuzz-{}-{}",
+        std::process::id(),
+        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rt = tokio::runtime::Handle::current();
+    let db = tokio::task::block_in_place(|| {
+        rt.block_on(HarnessDb::open(kind, &dir, EngineConfig::default()))
+    })
+    .ok()?;
+    Some(NucleusUnderTest {
+        ex: db.executor().clone(),
+        db: Some(db),
+        dir: Some(dir),
+    })
+}
+
 /// Replay an op sequence on a fresh Nucleus + fresh SQLite, run `q` on both,
 /// and report whether they diverge. `None` if the candidate is structurally
 /// invalid (some op errors on either engine) — such a candidate is unusable for
 /// minimization. SELECTs in `ops` are run for side effects (cache priming).
-fn replay_diverges(ops: &[String], q: &str, ordered: bool) -> Option<bool> {
-    let cat = Arc::new(Catalog::new());
-    let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
-    let ex = Arc::new(Executor::new(cat, st));
+fn replay_diverges(ops: &[String], q: &str, ordered: bool, kind: Option<EngineKind>) -> Option<bool> {
+    let nut = open_nucleus(kind)?;
+    let ex = nut.ex.clone();
     let sqlite = Connection::open_in_memory().ok()?;
     for op in ops {
         let is_select = op.trim_start().to_uppercase().starts_with("SELECT");
@@ -721,7 +792,7 @@ fn replay_diverges(ops: &[String], q: &str, ordered: bool) -> Option<bool> {
 /// Delta-debug an op sequence down to a minimal subsequence that still makes
 /// `q` diverge. Op 0 (CREATE TABLE) is always kept. Greedy single-op removal to
 /// a fixpoint — small op counts make this cheap and the result is a drop-in repro.
-fn minimize(ops: &[String], q: &str, ordered: bool) -> Vec<String> {
+fn minimize(ops: &[String], q: &str, ordered: bool, kind: Option<EngineKind>) -> Vec<String> {
     let mut cur: Vec<String> = ops.to_vec();
     let mut changed = true;
     while changed {
@@ -730,7 +801,7 @@ fn minimize(ops: &[String], q: &str, ordered: bool) -> Vec<String> {
         while i < cur.len() {
             let mut cand = cur.clone();
             cand.remove(i);
-            if replay_diverges(&cand, q, ordered) == Some(true) {
+            if replay_diverges(&cand, q, ordered, kind) == Some(true) {
                 cur = cand;
                 changed = true;
             } else {
@@ -749,6 +820,8 @@ fn main_impl() {
     // 0 = default random (8..47 rows). Set high (e.g. 9000) to cross the
     // 8192-row zone-map granule boundary and exercise multi-granule pruning.
     let mut fixed_rows: usize = 0;
+    // None = the historical in-process MvccStorageAdapter (RAM, no WAL).
+    let mut engine: Option<EngineKind> = None;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -773,6 +846,17 @@ fn main_impl() {
                 i += 1;
                 fixed_rows = args[i].parse().unwrap();
             }
+            "--engine" => {
+                i += 1;
+                match EngineKind::parse(&args[i]) {
+                    Some(k) => engine = Some(k),
+                    None => {
+                        let names: Vec<&str> = EngineKind::ALL.iter().map(|k| k.name()).collect();
+                        println!("unknown --engine {:?}; expected one of: {}", args[i], names.join(", "));
+                        std::process::exit(2);
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -781,8 +865,21 @@ fn main_impl() {
     // Silence the default panic printer; catch_unwind captures the message.
     std::panic::set_hook(Box::new(|_| {}));
 
+    let engine_label = match engine {
+        Some(k) => k.name(),
+        None => "mvcc (in-process, no WAL)",
+    };
     println!("Nucleus ⇄ SQLite differential fuzzer (schema+DML+expr coverage)");
-    println!("seed={seed} iterations={iterations} queries/iter={queries_per}\n");
+    println!("seed={seed} iterations={iterations} queries/iter={queries_per}");
+    println!("engine={engine_label}");
+    if engine.is_none_or(|k| !k.has_buffer_pool()) {
+        println!(
+            "NOTE: this engine has no buffer pool or paged storage, so nothing \
+             below covers DiskEngine.\n      Pass --engine buffered-disk to \
+             aim the oracle at what `nucleus serve` runs."
+        );
+    }
+    println!();
 
     let mut total = 0usize;
     let mut divergences = 0usize;
@@ -801,9 +898,11 @@ fn main_impl() {
         let inserts = gen_inserts(&schema, &mut rng, rows);
         let mut next_id = rows as i64 + 1;
 
-        let catalog = Arc::new(Catalog::new());
-        let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
-        let ex = Arc::new(Executor::new(catalog, storage));
+        let Some(nut) = open_nucleus(engine) else {
+            println!("FAIL: could not open engine {engine_label} for iteration {iter}");
+            std::process::exit(1);
+        };
+        let ex = nut.ex.clone();
         let sqlite = Connection::open_in_memory().unwrap();
 
         // Replayable op-log for faithful repros. WHERE-filtered scans can go
@@ -915,10 +1014,11 @@ fn main_impl() {
                             // bug needs the mutation history (MVCC/index state),
                             // not just the rows — so the op-log below is the repro.
                             let fresh_match = {
-                                let cat = Arc::new(Catalog::new());
-                                let st: Arc<dyn StorageEngine> =
-                                    Arc::new(MvccStorageAdapter::new());
-                                let fx = Arc::new(Executor::new(cat, st));
+                                let fresh = open_nucleus(engine);
+                                let fx = match &fresh {
+                                    Some(n) => n.ex.clone(),
+                                    None => break 'outer,
+                                };
                                 let ok = exec_nucleus(&fx, &ddl).is_ok()
                                     && exec_nucleus(&fx, &live_data).is_ok();
                                 if ok {
@@ -935,10 +1035,11 @@ fn main_impl() {
                             // live executor does not, the trigger is something the
                             // op-log omits (e.g. the post-mutation snapshot probes).
                             let oplog_match = {
-                                let cat = Arc::new(Catalog::new());
-                                let st: Arc<dyn StorageEngine> =
-                                    Arc::new(MvccStorageAdapter::new());
-                                let rx = Arc::new(Executor::new(cat, st));
+                                let replay = open_nucleus(engine);
+                                let rx = match &replay {
+                                    Some(n) => n.ex.clone(),
+                                    None => break 'outer,
+                                };
                                 let mut ok = true;
                                 for op in &ops {
                                     let is_select =
@@ -991,7 +1092,7 @@ fn main_impl() {
                             // Minimal replayable sequence — delta-debugged when the
                             // op-log reproduces, else the full sequence.
                             let repro = if oplog_match == Some(false) {
-                                minimize(&ops, &q, ordered)
+                                minimize(&ops, &q, ordered, engine)
                             } else {
                                 ops.clone()
                             };
