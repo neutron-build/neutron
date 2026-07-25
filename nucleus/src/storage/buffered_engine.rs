@@ -25,7 +25,7 @@
 //!   committed state rather than a stable snapshot)
 //! - Buffered data is in memory — very large transactions may use significant RAM
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -34,11 +34,30 @@ use super::disk_engine::DiskEngine;
 use super::{StorageEngine, StorageError};
 use crate::types::{Row, Value};
 
+/// First synthetic position handed out for a row that exists only in a
+/// transaction buffer.
+///
+/// Positions are the inner [`DiskEngine`]'s stable row addresses —
+/// `(page_id, slot_idx)` packed into a `usize`, which occupies the low 48 bits.
+/// A row that has not reached the engine yet has no address, so the buffered
+/// view numbers it from above that range; the two spaces can then never
+/// collide, and a mutation aimed at a not-yet-written row is recognisable as
+/// such. Before stable addresses, positions were scan ordinals over the
+/// buffered view and a buffered DELETE/UPDATE replayed at COMMIT landed on
+/// whichever row happened to sit at that ordinal in the engine.
+const PENDING_POS_BASE: usize = 1 << 48;
+
+fn is_pending_pos(pos: usize) -> bool {
+    pos >= PENDING_POS_BASE
+}
+
 /// A buffered write operation within a transaction.
 #[derive(Debug, Clone)]
 enum BufferedOp {
     Insert {
         table: String,
+        /// Synthetic position this row answers to until it is written.
+        pending_pos: usize,
         row: Row,
     },
     Delete {
@@ -64,7 +83,12 @@ struct TxnBuffer {
     ///
     /// Nothing in this buffer has touched the underlying engine yet, so a
     /// savepoint is just a mark and `ROLLBACK TO SAVEPOINT` is a truncate.
+    /// That only holds while the op log stays append-only, so a buffered row
+    /// that is later deleted or updated is resolved at COMMIT rather than
+    /// edited in place here.
     savepoints: Vec<(String, usize)>,
+    /// Next synthetic position for a buffered insert.
+    next_pending: usize,
 }
 
 impl TxnBuffer {
@@ -72,7 +96,14 @@ impl TxnBuffer {
         Self {
             ops: Vec::new(),
             savepoints: Vec::new(),
+            next_pending: PENDING_POS_BASE,
         }
+    }
+
+    fn take_pending_pos(&mut self) -> usize {
+        let pos = self.next_pending;
+        self.next_pending += 1;
+        pos
     }
 }
 
@@ -115,17 +146,64 @@ impl BufferedDiskEngine {
     }
 
     /// Apply all buffered operations to the underlying engine.
+    ///
+    /// Ops naming a synthetic position never reach the engine: a DELETE of a
+    /// row this transaction inserted cancels that insert, and an UPDATE of one
+    /// rewrites the row the insert will write. Everything else names a real
+    /// engine address and is replayed in order.
     async fn apply_buffer(&self, ops: Vec<BufferedOp>) -> Result<(), StorageError> {
+        // Resolve the fate of each buffered insert before replaying anything.
+        let mut cancelled: HashSet<usize> = HashSet::new();
+        let mut rewritten: HashMap<usize, Row> = HashMap::new();
+        for op in &ops {
+            match op {
+                BufferedOp::Delete { positions, .. } => {
+                    for pos in positions.iter().copied().filter(|p| is_pending_pos(*p)) {
+                        cancelled.insert(pos);
+                        rewritten.remove(&pos);
+                    }
+                }
+                BufferedOp::Update { updates, .. } => {
+                    for (pos, row) in updates.iter().filter(|(p, _)| is_pending_pos(*p)) {
+                        if !cancelled.contains(pos) {
+                            rewritten.insert(*pos, row.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for op in ops {
             match op {
-                BufferedOp::Insert { table, row } => {
+                BufferedOp::Insert {
+                    table,
+                    pending_pos,
+                    row,
+                } => {
+                    if cancelled.contains(&pending_pos) {
+                        continue;
+                    }
+                    let row = rewritten.remove(&pending_pos).unwrap_or(row);
                     self.inner.insert(&table, row).await?;
                 }
                 BufferedOp::Delete { table, positions } => {
-                    self.inner.delete(&table, &positions).await?;
+                    let positions: Vec<usize> = positions
+                        .into_iter()
+                        .filter(|p| !is_pending_pos(*p))
+                        .collect();
+                    if !positions.is_empty() {
+                        self.inner.delete(&table, &positions).await?;
+                    }
                 }
                 BufferedOp::Update { table, updates } => {
-                    self.inner.update(&table, &updates).await?;
+                    let updates: Vec<(usize, Row)> = updates
+                        .into_iter()
+                        .filter(|(p, _)| !is_pending_pos(*p))
+                        .collect();
+                    if !updates.is_empty() {
+                        self.inner.update(&table, &updates).await?;
+                    }
                 }
                 BufferedOp::CreateTable { table } => {
                     self.inner.create_table(&table).await?;
@@ -136,6 +214,45 @@ impl BufferedDiskEngine {
             }
         }
         Ok(())
+    }
+
+    /// This session's view of a table as `(position, row)` pairs: the engine's
+    /// committed rows at their real addresses, with this transaction's own
+    /// buffered writes overlaid at synthetic ones.
+    async fn overlay(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        let mut rows = self.inner.scan_physical(table).await?;
+
+        let bufs = self.txn_bufs.read();
+        let Some(txn) = bufs.get(&current_session_id()) else {
+            return Ok(rows);
+        };
+        for op in &txn.ops {
+            match op {
+                BufferedOp::Insert {
+                    table: t,
+                    pending_pos,
+                    row,
+                } if t == table => {
+                    rows.push((*pending_pos, row.clone()));
+                }
+                BufferedOp::Delete {
+                    table: t,
+                    positions,
+                } if t == table => {
+                    let drop: HashSet<usize> = positions.iter().copied().collect();
+                    rows.retain(|(pos, _)| !drop.contains(pos));
+                }
+                BufferedOp::Update { table: t, updates } if t == table => {
+                    for (pos, new_row) in updates {
+                        if let Some(slot) = rows.iter_mut().find(|(p, _)| p == pos) {
+                            slot.1 = new_row.clone();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -171,8 +288,10 @@ impl StorageEngine for BufferedDiskEngine {
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            let pending_pos = txn.take_pending_pos();
             txn.ops.push(BufferedOp::Insert {
                 table: table.to_string(),
+                pending_pos,
                 row,
             });
             return Ok(());
@@ -181,49 +300,44 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
-        let mut rows = self.inner.scan(table).await?;
-
-        // If this session is in a transaction, apply ITS buffered ops so it
-        // reads its own uncommitted writes (other sessions' buffers stay
-        // invisible).
-        let bufs = self.txn_bufs.read();
-        if let Some(txn) = bufs.get(&current_session_id()) {
-            for op in &txn.ops {
-                match op {
-                    BufferedOp::Insert { table: t, row } if t == table => {
-                        rows.push(row.clone());
-                    }
-                    BufferedOp::Delete {
-                        table: t,
-                        positions,
-                    } if t == table => {
-                        // Mark deleted positions (apply in reverse order to handle shifts)
-                        let mut deleted = vec![false; rows.len()];
-                        for &pos in positions {
-                            if pos < deleted.len() {
-                                deleted[pos] = true;
-                            }
-                        }
-                        rows = rows
-                            .into_iter()
-                            .enumerate()
-                            .filter(|(i, _)| !deleted.get(*i).copied().unwrap_or(false))
-                            .map(|(_, r)| r)
-                            .collect();
-                    }
-                    BufferedOp::Update { table: t, updates } if t == table => {
-                        for (pos, new_row) in updates {
-                            if *pos < rows.len() {
-                                rows[*pos] = new_row.clone();
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        // Outside a transaction there is nothing to overlay, so take the inner
+        // engine's own scan (which is cheaper than materializing positions).
+        if !self.is_in_txn() {
+            return self.inner.scan(table).await;
         }
+        Ok(self
+            .overlay(table)
+            .await?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
+    }
 
-        Ok(rows)
+    async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        if !self.is_in_txn() {
+            return self.inner.scan_physical(table).await;
+        }
+        self.overlay(table).await
+    }
+
+    async fn scan_where_eq_positions(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &Value,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        if !self.is_in_txn() {
+            return self
+                .inner
+                .scan_where_eq_positions(table, col_idx, value)
+                .await;
+        }
+        Ok(self
+            .overlay(table)
+            .await?
+            .into_iter()
+            .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v.loose_eq(value)))
+            .collect())
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
@@ -281,6 +395,36 @@ impl StorageEngine for BufferedDiskEngine {
             return Ok(updates.len());
         }
         self.inner.update(table, updates).await
+    }
+
+    async fn update_if_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<usize, StorageError> {
+        if self.is_in_txn() {
+            // Buffered writes are this session's alone and are replayed against
+            // the engine only at COMMIT, so nothing can have moved underneath
+            // them yet; the identity re-check happens when the buffer applies.
+            let plain: Vec<(usize, Row)> = updates
+                .iter()
+                .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
+                .collect();
+            return self.update(table, &plain).await;
+        }
+        self.inner.update_if_unchanged(table, updates).await
+    }
+
+    async fn delete_if_unchanged(
+        &self,
+        table: &str,
+        targets: &[(usize, Row)],
+    ) -> Result<usize, StorageError> {
+        if self.is_in_txn() {
+            let positions: Vec<usize> = targets.iter().map(|(pos, _)| *pos).collect();
+            return self.delete(table, &positions).await;
+        }
+        self.inner.delete_if_unchanged(table, targets).await
     }
 
     async fn sync_schema(&self, table: &str) -> Result<(), StorageError> {
@@ -707,11 +851,16 @@ mod tests {
         engine.insert("t", row(3, "c")).await.unwrap();
 
         engine.begin_txn().await.unwrap();
-        engine.delete("t", &[1]).await.unwrap(); // delete row at position 1 ("b")
+        let b = engine.scan_physical("t").await.unwrap()[1].0; // the row "b"
+        engine.delete("t", &[b]).await.unwrap();
         engine.commit_txn().await.unwrap();
 
         let rows = engine.inner().scan("t").await.unwrap();
         assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| r[1] != Value::Text("b".to_string())),
+            "committed delete removed the wrong row: {rows:?}"
+        );
     }
 
     #[tokio::test]
@@ -722,12 +871,59 @@ mod tests {
         engine.insert("t", row(1, "old")).await.unwrap();
 
         engine.begin_txn().await.unwrap();
-        engine.update("t", &[(0, row(1, "new"))]).await.unwrap();
+        let pos = engine.scan_physical("t").await.unwrap()[0].0;
+        engine.update("t", &[(pos, row(1, "new"))]).await.unwrap();
         engine.commit_txn().await.unwrap();
 
         let rows = engine.inner().scan("t").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][1], Value::Text("new".to_string()));
+    }
+
+    #[tokio::test]
+    async fn buffered_row_can_be_deleted_and_updated_before_commit() {
+        // A row inserted inside a transaction has no engine address yet, so
+        // the buffered view numbers it separately. A DELETE or UPDATE naming
+        // one of those positions has to act on the pending insert; replaying it
+        // against the engine would hit whatever committed row sat at that
+        // number.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = setup(tmp.path().join("pending_ops.db").as_path()).await;
+
+        engine.insert("t", row(1, "committed")).await.unwrap();
+        engine.insert("t", row(2, "committed")).await.unwrap();
+
+        engine.begin_txn().await.unwrap();
+        engine.insert("t", row(3, "doomed")).await.unwrap();
+        engine.insert("t", row(4, "revised")).await.unwrap();
+
+        let view = engine.scan_physical("t").await.unwrap();
+        assert_eq!(view.len(), 4, "buffered inserts must be visible in-txn");
+        let doomed = view.iter().find(|(_, r)| r[0] == Value::Int32(3)).unwrap().0;
+        let revised = view.iter().find(|(_, r)| r[0] == Value::Int32(4)).unwrap().0;
+
+        engine.delete("t", &[doomed]).await.unwrap();
+        engine
+            .update("t", &[(revised, row(4, "final"))])
+            .await
+            .unwrap();
+        engine.commit_txn().await.unwrap();
+
+        let mut rows = engine.inner().scan("t").await.unwrap();
+        rows.sort_by_key(|r| format!("{:?}", r[0]));
+        assert_eq!(rows.len(), 3, "committed row set is wrong: {rows:?}");
+        assert!(
+            rows.iter().all(|r| r[0] != Value::Int32(3)),
+            "a row deleted before COMMIT was written anyway: {rows:?}"
+        );
+        assert!(
+            rows.contains(&row(4, "final")),
+            "an update to a buffered row was lost: {rows:?}"
+        );
+        assert!(
+            rows.contains(&row(1, "committed")) && rows.contains(&row(2, "committed")),
+            "buffered ops damaged committed rows: {rows:?}"
+        );
     }
 
     #[tokio::test]
