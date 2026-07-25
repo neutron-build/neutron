@@ -10,3 +10,6 @@
 /test_*
 /format_test
 !/tests/
+
+# Scratch repro SQL (padded-row workloads etc.) — never commit
+ins*.sql

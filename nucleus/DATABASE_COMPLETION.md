@@ -930,6 +930,54 @@ it spreads writes across pages, so only a same-page repro reaches it.
   encrypted run was redone after `CREATE INDEX ... USING encrypted` failed for a missing
   `NUCLEUS_ENCRYPTION_KEY`, which would otherwise have measured a plain scan.
 
+### Found by independent review of the storage diff (2026-07-25)
+
+An external review of `rv/base-storage..HEAD` (16 files, 5,047 lines) returned three
+correctness findings. All three were verified here before being recorded; none was found by
+any harness in this repository, and two are the same silent-trait-default shape as the
+savepoint and isolation-level defects already recorded under M8.
+
+- [ ] **`BEGIN; UPDATE (grows a row); DELETE; COMMIT;` silently loses the DELETE.**
+      **Confirmed by measurement**, on the shipped `BufferedDiskEngine`, from ordinary SQL with
+      no concurrency. `update_if_unchanged`/`delete_if_unchanged`
+      (`storage/buffered_engine.rs:400-428`) drop the caller's read row when in a transaction and
+      buffer only `(pos, new_row)`; `apply_buffer` (`:199-206`) then replays through plain
+      `inner.update`/`inner.delete`, so the identity re-check this branch added never runs on the
+      engine the server ships. At apply time the grown row no longer fits its slot, `update_at`
+      relocates it, and the buffered DELETE addresses the now-dead original slot, where
+      `delete_at` sees `entry.is_dead()` and silently continues.
+      Minimal repro: three rows, `DELETE` one to leave a dead slot, then
+      `BEGIN; UPDATE t SET c = repeat('q',2000) WHERE id=3; DELETE FROM t WHERE id=3; COMMIT;`
+      — `DELETE 1` is reported, the row remains, **and it survives a server restart**. A later
+      explicit DELETE does work, so it is this sequence specifically. The in-code comment at
+      `buffered_engine.rs:406-408` claiming "the identity re-check happens when the buffer
+      applies" is false in both directions: `apply_buffer` calls the unchecked methods, and
+      `BufferedOp::Update` does not carry the read row for a check to use.
+      Note the review's paired claim that UPDATE-then-UPDATE loses the second update did **not**
+      reproduce; only the grow-then-DELETE sequence does.
+- [ ] **`update_unique` has no row-identity re-check on the paged engines.** The trait default
+      (`storage/mod.rs:138-145`) is a plain `self.update()` with no expected row, and only
+      `MvccStorageAdapter` overrides it (`mvcc.rs:2304`) — where it is unnecessary, because its
+      positions are stable version indices. `DiskEngine` and `BufferedDiskEngine` inherit the
+      unchecked path. Every UPDATE touching a PK or UNIQUE column routes here
+      (`dml.rs:2049-2062`, `:2242-2263`), so the slot-recycling race that `update_if_unchanged`
+      was added to close is still open on precisely the updates where the resulting corruption is
+      a duplicate primary key. Verified by inspection; the concurrency window is real but was not
+      reproduced here. The branch's own regression test updates a non-PK column, so it exercises
+      only the protected path.
+- [ ] **The `insert` fast path can write into another table's page.** `DiskEngine::insert`
+      snapshots `meta.last_page` under `tables.read()`, drops the lock, then latches that page;
+      the `page::get_page_type(&pg) == PAGE_TYPE_DATA` guard (`disk_engine.rs:2260`) distinguishes
+      "on the free list" from "not on the free list", which is strictly weaker than "still mine".
+      If VACUUM frees the page and another table's `alloc_data_page` then pops it and calls
+      `init_data_page` — which re-stamps `PAGE_TYPE_DATA` (`:1760`) — the guard passes and this
+      session writes its row into the other table's page and plants an index entry addressing a
+      page it no longer owns. VACUUM's index purge cannot help: the entry is created after VACUUM
+      released `tables`. `DROP TABLE` gives the same shape. Confirmed there is **no owner or table
+      id in the data page header** (`page.rs:31-47`; `DATA_RESERVED` is unused), so no owner check
+      is possible today. Cheapest fix is re-reading `tables[table].last_page` under the write
+      latch and falling through to `alloc_data_page` on mismatch.
+
 ### What larger runs require
 
 The 10M–100M row range in this milestone was deliberately not run. At the measured 1M-row footprint
