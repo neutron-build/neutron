@@ -761,6 +761,123 @@ pub fn parse_budget_file(src: &str) -> Result<BudgetFile, String> {
     })
 }
 
+// ============================================================================
+// Probe engine selection
+// ============================================================================
+
+/// Parse `--engine <name>` out of the process arguments.
+///
+/// Shared by the `probe_*` binaries so engine selection is one implementation
+/// rather than one per probe. `None` means the flag was absent, which every
+/// probe treats as "keep the historical in-process engine" — the flag adds
+/// reach without moving any existing default.
+///
+/// This exists because engine coverage was the single largest blind spot in the
+/// probe suite: harnesses asserting storage invariants ran `MvccStorageAdapter`,
+/// the one engine whose behaviour diverges most from what `nucleus serve`
+/// constructs, and reported green while paged-storage defects sat unfound.
+pub fn engine_from_args() -> Option<EngineKind> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--engine" {
+            let Some(raw) = args.get(i + 1) else {
+                eprintln!("--engine requires a value");
+                std::process::exit(2);
+            };
+            match EngineKind::parse(raw) {
+                Some(k) => return Some(k),
+                None => {
+                    let names: Vec<&str> = EngineKind::ALL.iter().map(|k| k.name()).collect();
+                    eprintln!(
+                        "unknown --engine {raw:?}; expected one of: {}",
+                        names.join(", ")
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A probe's database, owning any temp directory it needed.
+///
+/// Drop closes the engine before removing the directory: a paged engine holds
+/// WAL and data-file handles until its [`HarnessDb`] is gone, and removing the
+/// directory first leaves it writing into unlinked files.
+pub struct ProbeDb {
+    executor: Arc<Executor>,
+    db: Option<HarnessDb>,
+    dir: Option<PathBuf>,
+}
+
+impl ProbeDb {
+    pub fn executor(&self) -> &Arc<Executor> {
+        &self.executor
+    }
+
+    /// How the run should describe what it measured. Never let a summary say
+    /// only "passed" — it has to say what it passed *on*.
+    pub fn label(&self) -> String {
+        match &self.db {
+            Some(db) => db.kind().name().to_string(),
+            None => "mvcc (in-process, no WAL)".to_string(),
+        }
+    }
+
+    /// True when the engine under test has paged storage, i.e. when the run
+    /// covers `DiskEngine` at all.
+    pub fn covers_paged_storage(&self) -> bool {
+        self.db.as_ref().is_some_and(|db| db.kind().has_buffer_pool())
+    }
+}
+
+impl Drop for ProbeDb {
+    fn drop(&mut self) {
+        self.db.take();
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+static PROBE_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Open a probe database on `kind`, or the historical in-process
+/// `MvccStorageAdapter` when `kind` is `None`.
+///
+/// Must be called from inside a multi-threaded tokio runtime — paged engines
+/// open asynchronously and this bridges via `block_in_place`, matching how the
+/// probe binaries already call into the executor.
+pub fn open_probe_db(kind: Option<EngineKind>, label: &str) -> Result<ProbeDb, HarnessError> {
+    let Some(kind) = kind else {
+        let catalog = Arc::new(Catalog::new());
+        let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+        return Ok(ProbeDb {
+            executor: Arc::new(Executor::new(catalog, storage)),
+            db: None,
+            dir: None,
+        });
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "nucleus-{label}-{}-{}",
+        std::process::id(),
+        PROBE_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rt = tokio::runtime::Handle::current();
+    let db = tokio::task::block_in_place(|| {
+        rt.block_on(HarnessDb::open(kind, &dir, EngineConfig::default()))
+    })?;
+    Ok(ProbeDb {
+        executor: db.executor().clone(),
+        db: Some(db),
+        dir: Some(dir),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
