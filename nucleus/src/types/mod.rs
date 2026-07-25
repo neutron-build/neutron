@@ -498,6 +498,27 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
     Ok(bytes)
 }
 
+/// Parse pgvector's text form, `[1,2.5,3]`, into f32 components.
+pub fn parse_vector_text(s: &str) -> Result<Vec<f32>, String> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .ok_or_else(|| format!("invalid vector literal (expected [...]): {s}"))?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|component| {
+            component
+                .trim()
+                .parse::<f32>()
+                .map_err(|error| format!("invalid vector component '{component}': {error}"))
+        })
+        .collect()
+}
+
 // ============================================================================
 // Type coercion and casting
 // ============================================================================
@@ -637,6 +658,11 @@ impl Value {
                 .map(Value::Jsonb)
                 .map_err(|error| format!("invalid JSON: {error}")),
             (Value::Text(_), DataType::UserDefined(_)) => Ok(self.clone()),
+            // pgvector's text input form. A VECTOR column fed a bare `[1,2,3]`
+            // (COPY text format, or a plain string literal) must become a real
+            // Vector; storing the Text would leave the column physically mixed
+            // and invisible to every vector index.
+            (Value::Text(s), DataType::Vector(_)) => parse_vector_text(s).map(Value::Vector),
             // Numeric conversions
             (Value::Numeric(s), DataType::Int32) => s
                 .parse::<i32>()
