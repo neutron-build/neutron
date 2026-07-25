@@ -2304,11 +2304,16 @@ impl StorageEngine for MvccStorageAdapter {
     async fn update_unique(
         &self,
         table: &str,
-        updates: &[(usize, Row)],
+        updates: &[(usize, Row, Row)],
         unique_col_sets: &[Vec<usize>],
     ) -> Result<usize, StorageError> {
-        self.update_impl(table, updates, Some(unique_col_sets))
-            .await
+        // Positions here are stable version indices, not physical addresses,
+        // so nothing can move underneath them and the read row is not needed.
+        let plain: Vec<(usize, Row)> = updates
+            .iter()
+            .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
+            .collect();
+        self.update_impl(table, &plain, Some(unique_col_sets)).await
     }
     // -- Transaction lifecycle --
 
