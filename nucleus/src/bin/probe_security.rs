@@ -19,12 +19,10 @@
 #![allow(clippy::all)] // internal fuzz harness
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nucleus::catalog::Catalog;
 use nucleus::executor::Executor;
-use nucleus::storage::{MvccStorageAdapter, StorageEngine};
+use nucleus::metrics::harness::{engine_from_args, open_probe_db};
 
 // ---------------------------------------------------------------------------
 // Deterministic xorshift-64 PRNG (same structure as other probe bins)
@@ -259,13 +257,29 @@ fn main_impl() {
 
     std::panic::set_hook(Box::new(|_| {}));
 
-    println!("Nucleus security/DoS fuzzer (resource-exhaustion guards)");
-    println!("seed={seed}  timeout_per_query={QUERY_TIMEOUT:?}\n");
-
     // ── Shared executor (stateless SQL; no model data needed for most tests) ──
-    let catalog = Arc::new(Catalog::new());
-    let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
-    let ex = Arc::new(Executor::new(catalog, storage));
+    let probe = match open_probe_db(engine_from_args(), "probe-security") {
+        Ok(p) => p,
+        Err(e) => {
+            println!("FAIL: could not open engine: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    let ex = probe.executor().clone();
+
+    println!("Nucleus security/DoS fuzzer (resource-exhaustion guards)");
+    println!(
+        "seed={seed}  timeout_per_query={QUERY_TIMEOUT:?}  engine={}",
+        probe.label()
+    );
+    if !probe.covers_paged_storage() {
+        println!(
+            "NOTE: no paged storage under test — an adversarial query that hangs \
+             or panics\n      only once real page I/O and latching are in the \
+             path cannot be found here.\n      Pass --engine buffered-disk."
+        );
+    }
+    println!();
 
     let rt = tokio::runtime::Handle::current();
     // Seed a table so FROM-clause subqueries have something to scan.
