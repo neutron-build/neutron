@@ -24,7 +24,7 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 273095; Source Rust files: 241; Top-level modules: 51.
+- Source LOC: 273115; Source Rust files: 241; Top-level modules: 51.
 - Declared unit tests: 4057; Declared integration tests: 337; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,031 passing tests, 0 failing.
@@ -887,17 +887,48 @@ it spreads writes across pages, so only a same-page repro reaches it.
   it, 8 more independently, including runs under concurrent build load), and base `0de4495` was 6/6
   clean. Recorded rather than closed: "not reproducible in 37 runs" is not the same as explained,
   and it is not claimed to be pre-existing.
-- **`alloc_data_page` takes L4 (`free_list_head`) before L1 (`tables`), inverting the documented
-  lock order** in `FrameDescriptor::latch`. It is not a deadlock today only because
-  `reuse_free_page` releases the free-list lock before returning. That is a latent trap sitting
-  directly on the rule the engine's deadlock-freedom argument rests on, and it should be corrected
-  before anything else is built on that order.
+- ~~**`alloc_data_page` takes L4 (`free_list_head`) before L1 (`tables`)**~~ — **FIXED
+  2026-07-25.** Verified as recorded first: `reuse_free_page`'s guards drop at its return
+  (`disk_engine.rs:1663`) and `tables` was taken afterwards, so L4 and L1 were never held at once
+  and there was no cycle. `record_dirty_page` (L2) was also called before L1. `tables` is now
+  acquired first, above every lock the function needs, which is the order the deadlock-freedom
+  argument assumes; a missing table now also fails before a page is taken off the free list rather
+  than leaking it. Verified: lib 4040/0, 8-way soak clean on `buffered-disk` and `disk`,
+  index coherence 60k mutations / 0 divergences across all five engines, paged fuzzer 37.5k
+  operations / 0 divergences.
 - **Databases vacuumed by a pre-`008c13a` build may already carry stale index entries.** The fix
   prevents new ones; it does not repair existing ones. `rebuild_table_indexes` is the repair path
-  and nothing currently invokes it for this.
-- **Executor-level positional indexes were not audited against VACUUM** — IvfFlat postings,
-  encrypted-index postings, and GIN are keyed by their own ordinals rather than by
-  `(page_id, slot_idx)`, and were out of scope for the slot-identity work.
+  (`storage/disk_engine.rs:2568`, reached from `ddl.rs` and `dml.rs`) and nothing invokes it for
+  this. Confirmed 2026-07-25 that there is also **no `REINDEX` statement and no CLI repair
+  command** — grep for `reindex` in `executor/ddl.rs` and `main.rs` returns nothing — so an
+  operator carrying an affected directory has no supported way to repair it short of dump and
+  reload. Still open; needs either a `REINDEX` surface or a one-shot repair invoked on open when
+  a pre-fix format marker is seen.
+
+- **Most probe binaries run a RAM engine, so their evidence describes a stand-in.** Audited
+  2026-07-25 across all 40 harnesses: 8 drive the real server binary over the wire, 3 construct a
+  `DiskEngine` directly, 1 (`probe_soak`) selects via `HarnessDb` — and 24 build
+  `MvccStorageAdapter` or `MemoryEngine` unconditionally. Three of the most load-bearing were
+  repointed this session (`fuzz`, `probe_concurrency`, `probe_concurrency_threads`, each gaining
+  `--engine`); the remaining ~21 are unaudited. `probe_index_coherence` is a narrower case: it
+  *can* run `--engines disk` but defaults to `mvcc,memory,columnar`, and cannot express
+  `buffered-disk` at all (`make_engine` has no such arm), so the shipped engine is unreachable
+  there. Run with `disk` included it is clean — 60k mutations, 0 divergences across five engines.
+- ~~**Executor-level positional indexes were not audited against VACUUM**~~ — **AUDITED
+  2026-07-25, no defect.** IvfFlat, encrypted, and GIN postings are indeed positional
+  (`executor/mod.rs:5272`, `:5492-5494`), and `execute_vacuum` (`ddl.rs:3183`) rebuilds none of
+  them. They are nonetheless correct across VACUUM, and the reason is structural rather than
+  lucky: Phase 1 preserves slot identity, and Phase 2 frees only pages holding **no live tuple**,
+  so the sequence of live rows an ordinal counts is invariant under both. The B-tree needed
+  purging precisely because its entries are physical `(page_id, slot_idx)` addresses; ordinals
+  name no page, so freeing one cannot invalidate them. DML is separately safe because
+  `incremental_maintenance_eligible` returns false for all three, forcing a full rebuild.
+  Measured on a live server, 600 padded rows per table, DELETE of half, then VACUUM reporting
+  7-8 pages actually freed: IvfFlat KNN returned the correct 5 nearest, GIN containment returned
+  the correct row and a group count identical to the non-indexed control, and the encrypted index
+  returned correct rows with deleted keys absent. Each index was confirmed present first — the
+  encrypted run was redone after `CREATE INDEX ... USING encrypted` failed for a missing
+  `NUCLEUS_ENCRYPTION_KEY`, which would otherwise have measured a plain scan.
 
 ### What larger runs require
 
