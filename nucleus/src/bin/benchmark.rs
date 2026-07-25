@@ -15,6 +15,7 @@ use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UT
 
 use nucleus::embedded::Database;
 use nucleus::graph::Direction;
+use nucleus::metrics::latency::percentile_duration;
 use nucleus::types::Value;
 
 // ─── Published competitor reference numbers ──────────────────────────────────
@@ -88,28 +89,19 @@ impl Stats {
         s
     }
 
+    // Percentiles come from `nucleus::metrics::latency` so every harness in the
+    // tree reports the same number for the same samples. The local copies used
+    // to disagree with `stress.rs` on where p95 sits.
     fn p50(&self) -> Duration {
-        let s = self.sorted();
-        if s.is_empty() {
-            return Duration::ZERO;
-        }
-        s[s.len() / 2]
+        percentile_duration(&self.sorted(), 50.0)
     }
 
     fn p95(&self) -> Duration {
-        let s = self.sorted();
-        if s.is_empty() {
-            return Duration::ZERO;
-        }
-        s[(s.len() as f64 * 0.95) as usize]
+        percentile_duration(&self.sorted(), 95.0)
     }
 
     fn p99(&self) -> Duration {
-        let s = self.sorted();
-        if s.is_empty() {
-            return Duration::ZERO;
-        }
-        s[std::cmp::min((s.len() as f64 * 0.99) as usize, s.len() - 1)]
+        percentile_duration(&self.sorted(), 99.0)
     }
 
     fn avg(&self) -> Duration {

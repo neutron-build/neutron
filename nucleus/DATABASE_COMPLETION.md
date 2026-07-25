@@ -24,10 +24,10 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 246599; Source Rust files: 221; Top-level modules: 50.
-- Declared unit tests: 3917; Declared integration tests: 317; Ignored tests: 155;
+- Source LOC: 248940; Source Rust files: 223; Top-level modules: 50.
+- Declared unit tests: 3940; Declared integration tests: 319; Ignored tests: 156;
   Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,768 passing tests and 113 ignored native-binary
+- The most recent full library run executed 3,813 passing tests and 113 ignored native-binary
   test stubs. Core-only executed 1,853 passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -338,17 +338,160 @@ Exit gate:
 
 Goal: establish repeatable performance and capacity boundaries without correctness shortcuts.
 
+### Harness substrate (prerequisite)
+
+Before any of the measurements below could mean anything, the harnesses had to measure the engine
+the server runs. `probe_soak` opened `Database::durable_mvcc` and `tests/scale_load.rs` constructed
+`MvccStorageAdapter::new()` — both the RAM-resident `RwLock<Vec<MvccRow>>` adapter, while `main.rs`
+runs `BufferedDiskEngine` over the paged `DiskEngine`. Every number those harnesses produced
+described a database nobody deploys, and the output never said which engine it came from.
+
+- [x] Repoint the scale harnesses at the engine the server runs, with engine choice explicit and
+      named in the output. `src/metrics/harness.rs` provides `EngineKind`
+      (`buffered-disk` | `disk` | `durable-mvcc` | `mvcc` | `memory`) and `HarnessDb`, which
+      reproduces `main.rs`'s startup path (persisted catalog, `open_segmented_with_sync`, configured
+      buffer-pool frames, `BufferedDiskEngine`, `new_with_persistence` + `load_meta`). `probe_soak
+      --engine` and `NUCLEUS_SCALE_ENGINE` both default to `buffered-disk`; the RAM engines stay
+      selectable for deliberate comparison and are labelled as not-the-server-engine when used.
+- [x] Report p50/p95/p99 from one implementation. `src/metrics/latency.rs` holds the only percentile
+      code in the tree; `benchmark.rs`, `stress.rs`, and `compete.rs` were consolidated onto it.
+      The three former copies disagreed (`floor(n*p)` vs `round(p*(n-1))`), so the same samples
+      produced different p95 values depending on which binary printed them.
+- [x] Make gates that cannot run say so instead of passing. The RSS leak gate returned 0 on any
+      platform without `/proc`, i.e. a silent green on macOS; RSS now reads via `ps` off Linux and an
+      unreadable RSS is a FAILURE. The gate is additionally marked NOT EVALUATED (never a pass) when
+      the working set is still growing across the measurement window, since RSS growth is then data
+      rather than a leak. Durability/recovery checks are skipped, with an explicit note, for engines
+      that make no durability claim.
+
+### Measurements
+
 - [ ] Define representative OLTP, analytical, mixed, specialty, and distributed workloads.
+      Partial: mixed OLTP + specialty-index churn (`probe_soak`) and bulk-load/analytical
+      (`scale_load`) exist. No distributed workload.
 - [ ] Benchmark 1M–100M row scales and sustained concurrency with p50/p95/p99 latency.
-- [ ] Track memory, disk, write amplification, WAL/checkpoint cost, cache hit rate, and recovery time.
+      Partial: 1M rows and 8-way sustained concurrency are measured with full percentiles
+      (evidence below). 10M–100M is unrun — see "What larger runs require".
+- [x] Track memory, disk, write amplification, WAL/checkpoint cost, cache hit rate, and recovery time.
+      All are reported by both harnesses. Write amplification is physical bytes (WAL + data-file
+      growth) over logical bytes, where logical bytes come from the engine's own
+      `storage::tuple::serialize_row`, so it is a measured ratio rather than an estimate. Checkpoint
+      cost and recovery time had no counter anywhere in the tree and are timed directly
+      (`HarnessDb::checkpoint`, `HarnessDb::open_elapsed`); the remaining quantities come from the
+      existing `BufferPoolStats` and WAL counters.
 - [ ] Measure vector recall/latency, filtered ANN behavior, FTS relevance, graph traversal, and TS ingest.
-- [ ] Add regression budgets for critical workloads and retain machine/config metadata.
+- [x] Add regression budgets for critical workloads and retain machine/config metadata.
+      `probe_soak --write-budget` / `--budget`. A budget records engine, machine fingerprint,
+      storage config, workload shape, slack, `runs_recorded`, and whether every contributing run
+      passed its invariants. The checker refuses to compare when any of engine, machine, config, or
+      workload differ, and says so rather than passing. Checked-in envelope:
+      `scale-budgets/probe_soak-buffered-disk-macos-aarch64-m4.json`.
+
+      Two things had to be fixed for this to be a real tripwire rather than a decorative one.
+      First, a single run does not resolve tightly enough to budget: measured here, two runs at the
+      *same seed* differ by ~2.6x at `insert.p95_us` and ~4x at `recovery_ms`, because a
+      time-bounded concurrent workload does not replay deterministically. Rather than inflate the
+      slack until nothing can fail, `--write-budget` merges into an existing budget, relaxing each
+      bound to the worst value seen and counting `runs_recorded`; the committed file is an envelope
+      over 3 runs and was then verified to hold against an independent fourth run at a different
+      seed. Bands are `recorded_slack` for p50/throughput, 2x for p95, 3x for p99 and the
+      once-per-run stopwatch readings — these catch gross regressions, not small ones, which the
+      file states in its own header. Second, the first budget parser silently dropped the first
+      bound in the file, so the `mixed.ops_per_sec` throughput floor was never enforced and runs
+      still printed "all bounds satisfied"; the parser now lives in `src/metrics/harness.rs` under
+      `cargo test --lib` coverage, with a regression test for exactly that. Verified by hand that a
+      deliberately tightened budget trips both the max and the min side.
 - [ ] Test memory pressure, disk pressure, long transactions, connection storms, and multi-day soak.
 - [ ] Optimize only after differential correctness gates cover the affected fast path.
 
 Exit gate:
 
 - Published results are reproducible, include tail latency/correctness, and define safe capacity limits.
+
+### Evidence
+
+All numbers below were produced on one machine and are reproducible with the commands shown. They
+are not a performance claim for any other hardware.
+
+Machine: macOS 15 / aarch64, Apple M4, 10 logical CPUs, 24 GB RAM, `--release`, nucleus 0.1.1.
+Engine config in every run: buffer pool 32 MB, segmented WAL 64 MB, `sync=fsync` (the server
+defaults from `src/config/mod.rs`).
+
+Bulk load and analytics, 1M rows, unindexed table (`cargo test --release --test scale_load
+scale_rows_on_selected_engine -- --ignored --nocapture`, `NUCLEUS_SCALE_ROWS=1000000`):
+
+| Measurement | `buffered-disk` (server engine) | `mvcc` (RAM engine, for comparison) |
+|---|---|---|
+| Bulk load | 184,870 rows/s (5.4 s); batch p50 4.8 ms / p95 6.6 ms / p99 7.6 ms | 726,220 rows/s (1.4 s); batch p50 1.1 ms / p95 1.2 ms / p99 1.3 ms |
+| `COUNT(*)` | 0.002 s | 0.000 s |
+| `SUM(amt)` | 0.060 s | 0.074 s |
+| Filtered count | 0.075 s | 0.007 s |
+| Point lookup (no index) | 0.054 s | 0.007 s |
+| RSS | 289 MB | 297 MB |
+| Disk footprint | 39.2 MB | n/a (RAM-resident) |
+| WAL written / syncs | 79.2 MB / 1002 | n/a |
+| Write amplification | 5.91x (118.4 MB physical / 20.0 MB logical) | n/a |
+| Buffer-pool hit rate | 100.00% (1,035,660 hits / 0 misses) | n/a |
+| Checkpoint | 84.1 ms | n/a |
+| Recovery (reopen) | 28.4 ms | n/a |
+
+Every aggregate was asserted exact, before and after reopen, on both engines. The server engine is
+3.9x slower to load and 7.7x slower on the point lookup than the RAM engine the harness used to
+measure by default — that gap is the size of the error in the old numbers.
+
+Sustained concurrency, 8 workers, 120 s, mixed SQL + KV against a table carrying a PK, a secondary
+btree, an HNSW vector index, and an encrypted index; ~1,285 live rows at steady state
+(`./target/release/probe_soak --engine buffered-disk --duration-secs 120 --concurrency 8 --seed
+424242`):
+
+| Operation | count | p50 | p95 | p99 |
+|---|---|---|---|---|
+| insert | 2349 | 15.0 ms | 68.1 ms | 145.0 ms |
+| update | 779 | 479.0 ms | 791.4 ms | 1044.8 ms |
+| select | 674 | 0.09 ms | 6.8 ms | 12.0 ms |
+| kv_set | 400 | 4.0 ms | 14.0 ms | 19.0 ms |
+| delete | 1072 | 501.2 ms | 797.4 ms | 1071.2 ms |
+
+44 ops/s aggregate, 0 errors. RSS 46 -> 81 MB peak with 1 MB post-warmup growth over a plateaued
+working set (leak gate evaluated and passed). Disk 424.3 MB, WAL 1327.9 MB written / 3999 syncs,
+write amplification 12,236x, buffer-pool hit rate 99.88%, checkpoint 836.0 ms, recovery 59.0 ms.
+
+The write-amplification figures are worth reading together: 5.91x for a 1M-row bulk load of 20 MB of
+logical payload, against 12,236x for small concurrent row-at-a-time writes. WAL logging is
+page-granular, so a workload of tiny rows pays a full page per write. That is a design consequence,
+not a defect, but it sets the practical write-throughput ceiling for row-at-a-time workloads.
+
+### Defect found by repointing the harnesses
+
+Repointing `probe_soak` at the server's engine immediately surfaced a data-integrity failure that
+the RAM-engine harness could not see: **concurrent UPDATE/DELETE churn produces duplicate primary-key
+rows on the paged engine.** The post-soak coherence oracle reports "N duplicate PK id(s) present
+after churn", and the duplicates survive reopen. Isolation runs, all with `--seed 777
+--duration-secs 20`:
+
+| Engine | Concurrency | Result |
+|---|---|---|
+| `buffered-disk` | 8 | FAIL — 2 duplicate PK ids |
+| `disk` | 8 | FAIL — 5 duplicate PK ids |
+| `durable-mvcc` | 8 | pass |
+| `disk` | 1 | pass (1685 ops) |
+
+So the defect is in the paged `DiskEngine` path, not in the `BufferedDiskEngine` buffering layer,
+and it requires concurrency. Every worker id is globally unique and inserted exactly once, so a
+duplicate can only come from an UPDATE or DELETE leaving the prior row version live. It is not fixed
+here: this milestone's own rule is that optimization and engine surgery follow the differential
+correctness gates, and this belongs with the correctness milestones. `scale-budgets/` records that
+its source run failed invariants so no reader mistakes those bounds for a clean baseline.
+
+### What larger runs require
+
+The 10M–100M row range in this milestone was deliberately not run. At the measured 1M-row footprint
+of 39.2 MB and 184,870 rows/s on the server engine, a 100M-row load extrapolates to roughly 3.9 GB
+of data plus a WAL that reached 79.2 MB per million rows before truncation, and around 9 minutes of
+pure load time before any read or churn phase. That needs a dedicated machine with headroom for the
+data directory and no competing build, not a shared development box; the extrapolation is arithmetic
+from the 1M measurement, not a measurement. The harness itself takes the scale as a parameter
+(`NUCLEUS_SCALE_ROWS`, `probe_soak --rows-target`), so the larger runs need hardware, not code.
 
 ## Milestone 12 — Packaging, migration, and public documentation
 
