@@ -33,22 +33,22 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Model | Durable on ack | Survives restart | Undone by ROLLBACK | Crash-atomic with SQL | RLS fail-closed |
 |---|---|---|---|---|---|
 | SQL / relational | **fsync** | yes | **yes** | n/a (is the SQL commit) | **enforced** (policies) |
-| KV (scalar) | fsync | yes | yes, but **clobbers other sessions** | **no** | yes (SQL); **no** over RESP |
+| KV (scalar) | fsync | yes | yes, **session-scoped** | **no** | yes (SQL); **no** over RESP |
 | KV collections | fsync | yes | **no** | **no** | yes (SQL); **no** over RESP |
-| Document | **page cache** | yes | yes, but **clobbers other sessions** | **no** | yes |
-| Graph | fsync | yes | yes, but **clobbers other sessions** | **no** | yes |
+| Document | **page cache** | yes | yes, **session-scoped** | **no** | yes |
+| Graph | fsync | yes | yes, **session-scoped** | **no** | yes |
 | FTS | **page cache** | yes, via `fts_index.json` (see below) | partial (undo log, best-effort) | **no** | yes |
 | Geo | **none** | n/a — no state | n/a | n/a | n/a (pure functions) |
-| Vector (HNSW) | fsync | yes | yes, but **clobbers other sessions** | **no** | decorative (see below) |
+| Vector (HNSW) | fsync | yes | yes, **session-scoped** | **no** | decorative (see below) |
 | Vector (IvfFlat) | **none** (rebuilt) | rebuilt from base rows | via rebuild | n/a | decorative |
-| Time series | fsync | yes | yes, but **clobbers other sessions** | **no** | yes |
+| Time series | fsync | yes | yes, **session-scoped** | **no** | yes |
 | Columnar *store* (`COLUMNAR_*`) | **page cache** | yes | **no** | **no** | yes |
 | Columnar *engine* (`engine='columnar'`) | **fsync** | yes | **yes** | yes | via table policies |
 | Datalog | **none** | **NO — lost on restart** | yes (in-memory) | **no** | yes |
 | Streams (SQL `STREAM_*`) | fsync (entries only) | entries yes; **groups/acks no** | **no** | **no** | yes |
 | Streams (RESP `XADD`) | **none** | **NO** | **no** | **no** | **no** |
 | CDC | **page cache** (by design) | yes | **no** | **no** — emitted pre-commit | yes (metadata only) |
-| Blob / large objects | **page cache** | manifests yes; payload racy | yes, but **clobbers other sessions** | **no** | yes |
+| Blob / large objects | **page cache** | manifests yes; payload racy | yes, **session-scoped** | **no** | yes |
 | Pub/Sub | **none** | **NO** | **no** | **no** | yes |
 | Branch / version | **none** | **NO** | **no** | **no** | yes |
 | Tensor | **none** | **NO** | **no** | **no** | yes |
@@ -56,7 +56,7 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Encrypted index | derived | rebuilt from plaintext rows | repaired by rebuild | n/a | yes |
 | Stored procedures | **none** | **NO** | **no** | **no** | partial (`CALL` ungated) |
 
-### The five facts that matter most
+### The facts that matter most
 
 1. **Nothing outside the relational model is crash-atomic with the SQL
    transaction.** Specialty stores append to their own WALs at *statement* time,
@@ -65,21 +65,44 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
    SQL row rolled back and the KV/document/graph/time-series writes from the
    same transaction present and permanent.
 
-2. **A ROLLBACK in one session destroys other sessions' committed specialty
-   writes.** The stores are process-global; `BEGIN` deep-clones them and
-   `ROLLBACK` assigns the clone back wholesale. **[verified]** Session B's
-   committed, acknowledged `KV_SET` was gone after an unrelated session A rolled
-   back.
+2. **~~A ROLLBACK in one session destroys other sessions' committed specialty
+   writes.~~ FIXED (M8).** The stores are still process-global, but `BEGIN` no
+   longer deep-clones them and `ROLLBACK` no longer assigns a clone back
+   wholesale. Each session now records the entities it wrote and reverts exactly
+   those. **[verified]** `tests/cross_model_txn_wire.rs` drives two pgwire
+   sessions: B's committed `KV_SET` / `DOC_INSERT` / `GRAPH_ADD_NODE` survive
+   A's `ROLLBACK`, and A's own writes still disappear. Reverting the scoping
+   fails all three.
 
 3. **There is no isolation on specialty stores at all.** **[verified]** Session B
    read session A's uncommitted `KV_SET`, uncommitted `DOC_INSERT`, and
    uncommitted `GRAPH_ADD_NODE` while A's transaction was still open.
 
-4. **`ROLLBACK TO SAVEPOINT` undoes nothing outside the relational tables.**
-   **[verified]** KV and document writes made after a savepoint survived the
-   rollback and committed.
+4. **~~`ROLLBACK TO SAVEPOINT` undoes nothing outside the relational tables.~~
+   FIXED (M8) — and it undid nothing *inside* them either, on disk.** A
+   savepoint now opens a cross-model level whose write-set is reverted on
+   `ROLLBACK TO SAVEPOINT`. Separately, `BufferedDiskEngine` — the engine every
+   disk deployment runs — reported `supports_mvcc() == true` while inheriting
+   the `StorageEngine` default `savepoint` / `rollback_to_savepoint` /
+   `release_savepoint`, all of which are silent `Ok(())` no-ops, so the
+   *relational* half acknowledged success and discarded nothing. Only the
+   in-memory `MvccStorageAdapter` implemented them, which is why the library
+   suite never saw it. Both halves are fixed and covered by
+   `tests/cross_model_txn_wire.rs`.
 
-5. **The documented RLS "fail closed" guard is bypassed by schema-qualifying the
+5. **A crash after a successful `ROLLBACK` no longer resurrects the
+   rolled-back specialty writes** (M8). Previously `txn_restore` reverted memory
+   and left the `SET` / `insert` records in the specialty WAL, so replay brought
+   them back; blob was the only store logging compensating records. KV,
+   document, graph, and time series now write compensating records as part of
+   the revert, and FTS rewrites `fts_index.json` (the file that wins on reopen).
+   **Vector and datalog are not covered**: the vector WAL still holds the
+   rolled-back HNSW inserts until the index is rebuilt, and datalog has no live
+   WAL to compensate (see the corrections table). **[verified]** copy the live
+   data directory after `BEGIN; kv_set; ROLLBACK`, reopen it, and the key is
+   absent; removing only the compensating records brings it back.
+
+6. **The documented RLS "fail closed" guard is bypassed by schema-qualifying the
    call.** **[verified]** As a non-superuser under active RLS,
    `SELECT pg_catalog.kv_get(...)` / `pg_catalog.kv_set(...)` /
    `pg_catalog.doc_count()` all succeeded, while the unqualified names were
@@ -96,7 +119,8 @@ These claims in the current tracked docs are **wrong or stale**:
 | `DURABILITY.md:49` | `fsync` mode — "Data + metadata flushed before a commit is acknowledged / loses nothing acknowledged" | True for the SQL WAL and six specialty WALs. **False** for document, FTS, blob, the columnar store, and CDC — none is in `force_specialty_durability` (`src/executor/mod.rs:3074-3110`). `sync_mode` applies only to the segmented SQL WAL. |
 | `DURABILITY.md:12-13` | "anything absent from this list is derived and rebuildable" | Branch/version, tensor, sparse, and stored procedures are absent **and not rebuildable** — there is no authoritative source to rebuild them from. |
 | `RLS_SECURITY.md:64-66` | specialty surfaces "fail closed while RLS is active" | Holds for the unqualified names **[verified for 27 functions]**, but is defeated by the `pg_catalog.` prefix **[verified]**, and does not cover the RESP protocol at all. |
-| `src/executor/txn.rs:6-7` | "**All** specialty stores (KV, Graph, Doc, Datalog, FTS, TimeSeries, Blob, Vector) are snapshotted at BEGIN and restored on ROLLBACK" | The parenthetical list is accurate; the word "All" is not. KV *collections*, columnar store, streams, CDC, pub/sub, branch, version, tensor, sparse, and procedures are **not** in `CrossModelSnapshots` (`src/executor/session.rs:156-166`) and are never rolled back. Reword to "the eight snapshotted stores". |
+| `src/executor/txn.rs:6-7` | "**All** specialty stores (KV, Graph, Doc, Datalog, FTS, TimeSeries, Blob, Vector) are snapshotted at BEGIN and restored on ROLLBACK" | **Corrected in M8.** The parenthetical list was accurate; the word "All" was not. KV *collections*, columnar store, streams, CDC, pub/sub, branch, version, tensor, sparse, and procedures are still outside the enlisted set and are never rolled back. |
+| `src/storage/mod.rs:413-423` + `src/storage/buffered_engine.rs` | `StorageEngine::savepoint` / `rollback_to_savepoint` / `release_savepoint` default to `Ok(())` | **Fixed in M8.** `BufferedDiskEngine` inherited all three while also reporting `supports_mvcc() == true`, so on every disk deployment `ROLLBACK TO SAVEPOINT` acknowledged success and discarded nothing. The defaults are still silent no-ops for any other engine that forgets to override them. |
 | `RLS_SECURITY.md:66` (list) | names `vector search/mutation` as guarded | The three guarded names — `VECTOR_SEARCH`, `VECTOR_INSERT`, `VECTOR_DELETE` — **do not exist**. **[verified]** all three return `unknown function`. The real vector surface (`VECTOR_DISTANCE`, `VECTOR_DIMS`, `VECTOR_L2_DISTANCE`, …) escapes the guard. |
 
 ---
@@ -113,24 +137,40 @@ store is one field on the single `Executor` — e.g. `kv_store`
 state lives on the per-connection `Session`
 (`src/executor/session.rs:169-197`). Nothing bridges the two.
 
-**`CrossModelSnapshots` is a deep clone, not an undo log.**
-`src/executor/session.rs:156-166` holds snapshots for exactly eight stores: kv,
-graph, doc, datalog, fts, ts, blob, vector. `begin_transaction` populates all
-eight unconditionally on **every** `BEGIN`, whether or not the transaction
-touches them (`src/executor/txn.rs:50-59`) — so a `BEGIN` on a database with a
-1M-vector HNSW index copies the whole index. `rollback_transaction`
-(`src/executor/txn.rs:215-240`) assigns each snapshot back over the global store.
-FTS is the sole exception: it uses a real undo log
-(`begin_undo_log`, `src/fts/mod.rs:676`).
+**`CrossModelTxn` is a per-session write-set, not a deep clone** (M8;
+`src/executor/cross_model.rs`). It replaced `CrossModelSnapshots`, which held
+whole-store clones of eight stores, populated unconditionally on **every**
+`BEGIN` — so a `BEGIN` on a database with a 1M-vector HNSW index copied the
+whole index — and which `rollback_transaction` assigned back over the global
+store wholesale, discarding everything any other session had committed since.
 
-Because the assignment is wholesale, a rollback is a **global state rewind**, not
-a per-transaction undo. Everything any other session committed after this
-transaction's `BEGIN` is discarded.
+Now each store's before-image is captured **lazily**, at this session's first
+write to that store, and every mutation records the entities it touched:
 
-**Savepoints do not exist for specialty stores.** `execute_savepoint`
-(`src/executor/txn.rs:269-303`) and `execute_rollback_to_savepoint`
-(`:329-378`) capture and restore relational rows and the security catalog only.
-Neither references `txn.cross_model`.
+- Stores the executor owns exclusively (graph, document, datalog, time series,
+  blob) accumulate their write-set inside the store itself, so Cypher writes and
+  any future mutation path are covered structurally rather than by call-site
+  bookkeeping. The executor clears the accumulator before the call and drains it
+  afterwards under the same write guard, so the record belongs to exactly one
+  session.
+- The KV scalar store records at the SQL call site instead, because RESP and the
+  wire KV fast path also write it and are autocommit — an in-store accumulator
+  would attribute their writes to whichever transaction drained next.
+- FTS keeps the op-scoped undo log it already had, but the hook no longer uses
+  `try_write` on the async transaction lock (which silently dropped the undo
+  record under contention, leaving an unrollbackable mutation); the write-set
+  lives behind a `parking_lot` mutex on the session.
+
+`ROLLBACK` reverts exactly the recorded entities, and each store writes
+compensating records into its own WAL while doing so. A SQL-only transaction now
+captures nothing at all.
+
+**Savepoints cover specialty stores** (M8). `SAVEPOINT` opens a nested
+cross-model level with its own lazily captured before-images and its own
+write-set; `ROLLBACK TO SAVEPOINT` reverts that level and keeps the savepoint
+live; `RELEASE` discards the level and keeps the writes. Writes are recorded
+into every open level, so rolling back to an outer savepoint still reverts work
+done while an inner one was open.
 
 **Commit-time fsync covers six of the fourteen WALs.**
 `force_specialty_durability` (`src/executor/mod.rs:3074-3110`) group-syncs KV
@@ -283,15 +323,18 @@ Caveats:
 
 Checkpointed from `src/main.rs:1453`.
 
-**Transactions.** `txn_snapshot` (`src/kv/mod.rs:1447-1458`) deep-clones every
-non-expired entry across all 64 shards; `txn_restore` (`:1461-1480`) clears all
-64 shards and re-inserts. **[verified]** cross-session clobber: A `BEGIN` →
-B `KV_SET('B_committed', …)` + ack → A `ROLLBACK` → the key is gone, for
-everyone, permanently. Writes are visible to other sessions the instant the
-statement runs **[verified]**. Savepoints do not cover KV **[verified]**.
-`txn_restore` writes no compensating WAL records, so a clean ROLLBACK followed by
-a crash resurrects the rolled-back writes. **[verified]** an uncommitted
-`KV_SET` survived `kill -9` and was present after restart.
+**Transactions (rewritten in M8).** The snapshot is now taken lazily, on this
+session's first KV write, and `txn_restore_scoped` (`src/kv/mod.rs:1469`) reverts
+only the keys this session touched, logging a compensating `SET`/`DELETE`/
+`EXPIRE` per key. The pre-M8 behaviour — `txn_restore` clearing all 64 shards and
+re-inserting a `BEGIN`-time clone, so an unrelated session's acknowledged
+`KV_SET` vanished for everyone, and a crash after `ROLLBACK` resurrected the
+rolled-back write — is covered by regression tests in
+`tests/cross_model_txn_wire.rs`. `FLUSHDB` is scoped to every key in the
+before-image, so keys another session created after this `BEGIN` are wiped by
+the flush and cannot be restored; that is inherent to `FLUSHDB`.
+**Still true:** writes are visible to other sessions the instant the statement
+runs **[verified]** — there is no isolation. Savepoints now cover KV.
 
 **Policy.** All function names start with `KV_` and match the guard prefix at
 `src/executor/scalar_fns.rs:44` — **[verified]** `KV_GET` and `KV_SET` are denied
@@ -375,14 +418,16 @@ a surviving document**.
 The encoding itself is exhaustive and lossless (`src/document/mod.rs:212-257`),
 though JSON numbers were already coerced to `f64` at parse time.
 
-**Transactions.** `txn_snapshot` (`src/document/mod.rs:907-913`) deep-clones the
-whole `docs` map, the whole GIN index, and `next_id`; `txn_restore` (`:916-920`)
-assigns all three back. Cross-session clobber applies **[verified — document
-count reverted from 2 to 1 after an unrelated rollback]**, and is worse than KV
-because rewinding `next_id` makes the next insert reuse ids another session
-already consumed. Dirty reads **[verified]**. Savepoints do not cover it
-**[verified]**. Uncommitted documents survive a crash as committed
-**[verified]**.
+**Transactions (rewritten in M8).** `txn_restore_scoped`
+(`src/document/mod.rs`) reverts only the document ids this session wrote, via
+`insert_with_id`/`delete`, which log compensating WAL records and keep the GIN
+index consistent. `next_id` is no longer rewound, so a rollback can no longer
+hand out ids another session already consumed. The whole-map assign, the
+cross-session clobber, and the crash-resurrection of a rolled-back insert are
+covered by `tests/cross_model_txn_wire.rs`.
+**Still true:** dirty reads **[verified]** — no isolation. Savepoints now cover
+it. Documents written by a transaction that is still open survive a crash as
+committed (that is the unfixed commit-atomicity half of M8).
 
 **Policy.** All names match the `DOC_` prefix — **[verified]** `DOC_COUNT` and
 `DOC_INSERT` are denied under active RLS, and **[verified]** allowed again via
@@ -420,15 +465,17 @@ log correctly (`src/graph/mod.rs:503`, `:516`) but no Cypher `SET` clause routes
 to them — `cypher_executor.rs` only calls
 `create_node`/`create_edge`/`delete_node`. **[code]**
 
-**Transactions.** `txn_snapshot` (`src/graph/mod.rs:569-580`) deep-clones nodes,
-edges, both adjacency maps, both indexes, and both id counters; `txn_restore`
-(`:583-592`) assigns all seven back. Cross-session clobber applies **[verified —
-node count reverted from 2 to 1]**, and because `next_node_id` is rewound,
-subsequent nodes reuse another session's ids. Dirty reads **[verified]**.
-Savepoints do not cover it. Uncommitted nodes survive a crash as committed
-**[verified]**. A clean ROLLBACK writes no compensating WAL record, so the
-rolled-back nodes come back if the process then crashes — and disappear
-permanently if the checkpoint wins the race.
+**Transactions (rewritten in M8).** The store records the node and edge ids it
+mutates — inside `create_node`/`delete_node`/`create_edge`/`delete_edge`/
+`set_*_property`, so Cypher writes are covered by construction — and
+`txn_restore_scoped` reverts exactly those, logging compensating
+`add`/`del` records. Id counters are never rewound, so a rollback cannot hand
+out ids another session is already using. Deleting a node records the edges it
+cascades, so those are reverted with it; edges the transaction never touched are
+left alone even when they dangle off a reverted node (that residual case needs
+isolation, not scoping).
+**Still true:** dirty reads **[verified]**. Nodes written by an open transaction
+survive a crash as committed.
 
 **Policy.** `GRAPH_` prefix plus an explicit `CYPHER` entry — **[verified]** both
 denied under RLS. `Executor::execute_cypher_query`
@@ -470,14 +517,16 @@ frozen and never appended to again**. **[verified]** on a restarted server,
 mid-write leaves truncated JSON, `from_json` fails at `:891`, and the executor
 **silently falls back to the stale WAL-replayed index** with no warning.
 
-**Transactions.** FTS is the one model with a real undo log
-(`begin_undo_log`, `src/fts/mod.rs:676`), so it does **not** clobber other
-sessions — `undo` (`:702-726`) only reverses this session's own operations. But
-recording is best-effort: `src/executor/scalar_fns.rs:4177` uses a non-blocking
-`try_write()`, and if it fails the operation is silently not recorded and will
-not be undone. If A adds doc 7 and B overwrites doc 7, A's rollback deletes B's
-version. Savepoints do not cover it. `save_fts_index` is not undone on rollback,
-so the on-disk JSON retains the rolled-back document until the next mutation.
+**Transactions.** FTS already had a real op-scoped undo log, so it never
+clobbered other sessions — `undo` only reverses this session's own operations.
+M8 fixed the two gaps around it: recording no longer uses a non-blocking
+`try_write()` on the async transaction lock (which silently dropped the undo
+record under contention, leaving a mutation that `ROLLBACK` could not undo), and
+`save_fts_index` now runs as part of the revert, so the on-disk JSON — the file
+that wins over the WAL on reopen — no longer retains the rolled-back document.
+Savepoints now cover it, via a mark into the op log.
+**Still true:** if A adds doc 7 and B overwrites doc 7, A's rollback deletes B's
+version. That is a write-write conflict on one id and needs isolation.
 
 **Policy.** `FTS_` prefix — **[verified]** `FTS_SEARCH` denied under RLS.
 `TO_TSVECTOR`, `TO_TSQUERY`, `PLAINTO_TSQUERY`, and `LEVENSHTEIN` escape the
@@ -563,15 +612,17 @@ Two silent-degradation hazards:
   if it is truncated, a PK-keyed index silently downgrades to positional keying —
   a different id space entirely.
 
-**Transactions.** `BEGIN` clones the entire `vector_indexes` map — every HNSW
-graph in the process — at `src/executor/txn.rs:58`; `ROLLBACK` assigns it back at
-`:237-239`. Cross-session clobber applies, and here it becomes **permanent**:
-the next background `checkpoint_vector_wal` (≤ 5 min) snapshots the clobbered
-memory and atomically replaces the WAL (`src/vector/wal.rs:218`), erasing the
-other session's committed, fsynced write from disk too. **[code]** Savepoints do
-not cover it. The WAL has no transactional record types, so an uncommitted write
-that shares another session's group-commit fsync becomes durable and replays as
-committed.
+**Transactions (partly fixed in M8).** `BEGIN` no longer clones the entire
+`vector_indexes` map — every HNSW graph in the process — so the clobber (and the
+permanent version of it, where the next `checkpoint_vector_wal` wrote the
+clobbered memory back over the WAL) is gone. The map is now captured lazily and
+only index names this session created are reverted; index maintenance driven by
+DML is still repaired through the existing `derived_dirty_tables` rebuild.
+**Not fixed:** the revert is in-memory only — no compensating record is written
+to `vector/vector.wal`, so a rolled-back HNSW insert can still come back on
+replay until the index is rebuilt. The WAL still has no transactional record
+types, so an uncommitted write that shares another session's group-commit fsync
+becomes durable and replays as committed.
 
 **Policy — the guard is decorative.** It names three functions that do not
 exist; every real vector function escapes it. **[verified]** `VECTOR_DISTANCE`
@@ -650,14 +701,15 @@ rewrites the WAL as a single record containing only the survivors
 Retention takes a write lock and the snapshot a read lock as two separate
 critical sections, so the pair is not atomic.
 
-**Transactions.** `txn_snapshot` (`src/timeseries/mod.rs:1914-1919`) deep-clones
-every series' timestamp, value, and tag columns on every `BEGIN`. Cross-session
-clobber applies, and the next `snapshot()` makes it permanent by rewriting the
-WAL from clobbered memory. The code explicitly excludes the WAL from the restore
-(`:1911-1912`), so **a ROLLBACK reverts memory but leaves the insert records in
-the log** — whether they come back after a crash is a race between the crash and
-the next checkpoint. Savepoints do not cover it. Uncommitted points survive a
-crash as committed **[verified]**.
+**Transactions (rewritten in M8).** The snapshot is lazy and
+`txn_restore_scoped` reverts only the series this session wrote, rewriting each
+one into the WAL as delete-series followed by create-series plus a batch of the
+before-image points — so the revert is durable and replay reconstructs the
+restored series instead of resurrecting the rolled-back points. Untouched series
+are left alone, which also removes the "next `snapshot()` makes the clobber
+permanent" path. Savepoints now cover it.
+**Still true:** points written by an open transaction survive a crash as
+committed **[verified]**.
 
 **Policy.** `TS_` prefix — **[verified]** `TS_COUNT` denied. **Over-blocking
 bug:** the prefix also catches PostgreSQL's text-search functions `TS_RANK`
@@ -758,10 +810,13 @@ runs on every open against a file that is always empty. Ironically the unused
 WAL is the best-engineered one in the tree — its checkpoint is the only
 subsystem that fsyncs the containing directory (`src/datalog/mod.rs:1645-1649`).
 
-**Transactions.** Datalog *is* in `CrossModelSnapshots`, so `ROLLBACK` restores
-it — a full deep clone of facts, indexes, rules, and derived tuples on every
-`BEGIN` (`src/datalog/mod.rs:1482-1497`), regardless of whether the transaction
-uses datalog. Cross-session clobber applies. Savepoints do not.
+**Transactions (rewritten in M8).** The clone is now lazy — a transaction that
+does not use datalog captures nothing — and `txn_restore_scoped` reverts only the
+predicates this session asserted, retracted, or cleared, plus the rules it
+added, leaving other predicates untouched. `derived` is a memoized evaluation
+cache and is simply invalidated. Savepoints now cover it. There are no
+compensating WAL records because there is no live datalog WAL to compensate:
+nothing is durable here in the first place (see above).
 
 **Policy.** `DATALOG_` prefix — **[verified]** `DATALOG_QUERY` denied under RLS.
 

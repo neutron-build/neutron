@@ -2828,9 +2828,15 @@ impl Executor {
                     .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
                 let result = {
                     let mut gs = self.graph_store.write();
-                    execute_cypher(&mut gs, &parsed).map_err(|e| {
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let outcome = execute_cypher(&mut gs, &parsed).map_err(|e| {
                         ExecError::Unsupported(format!("Cypher execution error: {e:?}"))
-                    })?
+                    });
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    outcome?
                 };
                 // Convert CypherResult to a JSON-like text representation.
                 // Format: columns as header, rows as JSON arrays.
@@ -2922,6 +2928,7 @@ impl Executor {
                         estimated, key
                     )));
                 }
+                self.cross_model_touch_kv(&key);
                 self.kv_store.set(&key, value, ttl);
                 Ok(Value::Text("OK".into()))
             }
@@ -2933,6 +2940,7 @@ impl Executor {
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
                 };
+                self.cross_model_touch_kv(&key);
                 let deleted = self.kv_store.del(&key);
                 if deleted {
                     self.memory_allocator.lock().release("kv", key.len() + 96);
@@ -2973,6 +2981,7 @@ impl Executor {
                 } else {
                     1
                 };
+                self.cross_model_touch_kv(&key);
                 match self.kv_store.incr_by(&key, amount) {
                     Ok(v) => Ok(Value::Int64(v)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
@@ -2995,6 +3004,7 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let ttl = val_to_u64(&args[1], "KV_EXPIRE ttl")?;
+                self.cross_model_touch_kv(&key);
                 Ok(Value::Bool(self.kv_store.expire(&key, ttl)))
             }
             "KV_SETNX" => {
@@ -3026,6 +3036,7 @@ impl Executor {
                         estimated
                     )));
                 }
+                self.cross_model_touch_kv(&key);
                 let was_set = self.kv_store.setnx_ttl(&key, args[1].clone(), ttl);
                 if !was_set {
                     // Key already existed, release the reservation
@@ -3042,6 +3053,7 @@ impl Executor {
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
                 };
+                self.cross_model_touch_kv(&key);
                 let deleted = self.kv_store.cdel(&key, &args[1]);
                 if deleted {
                     self.memory_allocator.lock().release("kv", key.len() + 96);
@@ -3059,6 +3071,7 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let ttl = val_to_u64(&args[2], "KV_CEXPIRE ttl")?;
+                self.cross_model_touch_kv(&key);
                 Ok(Value::Bool(self.kv_store.cexpire(&key, &args[1], ttl)))
             }
             "KV_DBSIZE" => {
@@ -3067,6 +3080,7 @@ impl Executor {
             }
             "KV_FLUSHDB" => {
                 // kv_flushdb() → 'OK'
+                self.cross_model_touch_kv_all();
                 self.kv_store.flushdb();
                 Ok(Value::Text("OK".into()))
             }
@@ -3977,14 +3991,22 @@ impl Executor {
                         ));
                     }
                 };
-                self.ts_store.write().insert(
-                    &series,
-                    crate::timeseries::DataPoint {
-                        timestamp: ts,
-                        tags: vec![],
-                        value: val,
-                    },
-                );
+                {
+                    let mut store = self.ts_store.write();
+                    self.cross_model_before_ts(&store);
+                    store.clear_touched();
+                    store.insert(
+                        &series,
+                        crate::timeseries::DataPoint {
+                            timestamp: ts,
+                            tags: vec![],
+                            value: val,
+                        },
+                    );
+                    let touched = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_ts(touched);
+                }
                 Ok(Value::Text("OK".into()))
             }
             "TS_COUNT" => {
@@ -4067,7 +4089,16 @@ impl Executor {
                 };
                 let jv = parse_json_to_doc(&json_text)
                     .map_err(|e| ExecError::Unsupported(format!("DOC_INSERT invalid JSON: {e}")))?;
-                let id = self.doc_store.write().insert(jv);
+                let id = {
+                    let mut store = self.doc_store.write();
+                    self.cross_model_before_doc(&store);
+                    store.clear_touched();
+                    let id = store.insert(jv);
+                    let touched = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_doc(touched);
+                    id
+                };
                 Ok(Value::Int64(id as i64))
             }
             "DOC_UPDATE" => {
@@ -4089,14 +4120,25 @@ impl Executor {
                 if store.get(id).is_none() {
                     return Ok(Value::Bool(false));
                 }
+                self.cross_model_before_doc(&store);
+                store.clear_touched();
                 store.insert_with_id(id, jv);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_doc(touched);
                 Ok(Value::Bool(true))
             }
             "DOC_DELETE" => {
                 // doc_delete(id) → bool (true if the document existed).
                 require_args(fname, &args, 1)?;
                 let id = val_to_u64(&args[0], "DOC_DELETE id")?;
-                let removed = self.doc_store.write().delete(id);
+                let mut store = self.doc_store.write();
+                self.cross_model_before_doc(&store);
+                store.clear_touched();
+                let removed = store.delete(id);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_doc(touched);
                 Ok(Value::Bool(removed))
             }
             "DOC_GET" => {
@@ -4185,13 +4227,7 @@ impl Executor {
                 self.fts_index.write().add_document(doc_id, &text);
                 self.save_fts_index();
                 // Record mutation for potential rollback
-                if let Ok(mut txn) = self.current_session().txn_state.try_write()
-                    && txn.active
-                    && let Some(ref mut cm) = txn.cross_model
-                    && let Some(ref mut fts_log) = cm.fts
-                {
-                    fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
-                }
+                self.cross_model_fts_added(doc_id);
                 Ok(Value::Bool(true))
             }
             "FTS_INDEX_FACETED" => {
@@ -4234,13 +4270,7 @@ impl Executor {
                     .write()
                     .add_document_with_facets(doc_id, &text, facets);
                 self.save_fts_index();
-                if let Ok(mut txn) = self.current_session().txn_state.try_write()
-                    && txn.active
-                    && let Some(ref mut cm) = txn.cross_model
-                    && let Some(ref mut fts_log) = cm.fts
-                {
-                    fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
-                }
+                self.cross_model_fts_added(doc_id);
                 Ok(Value::Bool(true))
             }
             "FTS_REMOVE" => {
@@ -4253,13 +4283,7 @@ impl Executor {
                 }
                 let doc_id = val_to_u64(&args[0], "FTS_REMOVE doc_id")?;
                 // Capture state before removal for potential rollback
-                if let Ok(mut txn) = self.current_session().txn_state.try_write()
-                    && txn.active
-                    && let Some(ref mut cm) = txn.cross_model
-                    && let Some(ref mut fts_log) = cm.fts
-                {
-                    self.fts_index.read().record_remove(fts_log, doc_id);
-                }
+                self.cross_model_fts_removing(doc_id);
                 self.fts_index.write().remove_document(doc_id);
                 self.save_fts_index();
                 self.memory_allocator.lock().release("fts", 64);
@@ -4459,9 +4483,15 @@ impl Executor {
                 } else {
                     None
                 };
-                self.blob_store
-                    .write()
-                    .put(&key, &data, content_type.as_deref());
+                {
+                    let mut store = self.blob_store.write();
+                    self.cross_model_before_blob(&store);
+                    store.clear_touched();
+                    store.put(&key, &data, content_type.as_deref());
+                    let touched = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_blob(touched);
+                }
                 Ok(Value::Bool(true))
             }
             "BLOB_GET" => {
@@ -4497,7 +4527,13 @@ impl Executor {
                         ));
                     }
                 };
-                let removed = self.blob_store.write().delete(&key);
+                let mut store = self.blob_store.write();
+                self.cross_model_before_blob(&store);
+                store.clear_touched();
+                let removed = store.delete(&key);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_blob(touched);
                 Ok(Value::Bool(removed))
             }
             "BLOB_META" => {
@@ -4561,7 +4597,13 @@ impl Executor {
                         ));
                     }
                 };
-                let ok = self.blob_store.write().set_tag(&key, &tag_key, &tag_val);
+                let mut store = self.blob_store.write();
+                self.cross_model_before_blob(&store);
+                store.clear_touched();
+                let ok = store.set_tag(&key, &tag_key, &tag_val);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_blob(touched);
                 Ok(Value::Bool(ok))
             }
             "BLOB_LIST" => {
@@ -4617,9 +4659,18 @@ impl Executor {
                 let stmt = parse_cypher(&cypher).map_err(|e| {
                     ExecError::Unsupported(format!("GRAPH_QUERY parse error: {e:?}"))
                 })?;
-                let result = execute_cypher(&mut self.graph_store.write(), &stmt).map_err(|e| {
-                    ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}"))
-                })?;
+                let result = {
+                    let mut gs = self.graph_store.write();
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let outcome = execute_cypher(&mut gs, &stmt).map_err(|e| {
+                        ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}"))
+                    });
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    outcome?
+                };
                 // Serialize result to JSON
                 let cols_json = result
                     .columns
@@ -4668,7 +4719,16 @@ impl Executor {
                 } else {
                     std::collections::BTreeMap::new()
                 };
-                let id = self.graph_store.write().create_node(vec![label], props);
+                let id = {
+                    let mut gs = self.graph_store.write();
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let id = gs.create_node(vec![label], props);
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    id
+                };
                 Ok(Value::Int64(id as i64))
             }
             "GRAPH_ADD_EDGE" => {
@@ -4698,11 +4758,17 @@ impl Executor {
                 } else {
                     std::collections::BTreeMap::new()
                 };
-                match self
-                    .graph_store
-                    .write()
-                    .create_edge(from, to, edge_type, props)
-                {
+                let created = {
+                    let mut gs = self.graph_store.write();
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let created = gs.create_edge(from, to, edge_type, props);
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    created
+                };
+                match created {
                     Some(eid) => Ok(Value::Int64(eid as i64)),
                     None => Ok(Value::Null),
                 }
@@ -4716,7 +4782,14 @@ impl Executor {
                     ));
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_NODE")?;
-                Ok(Value::Bool(self.graph_store.write().delete_node(id)))
+                let mut gs = self.graph_store.write();
+                self.cross_model_before_graph(&gs);
+                gs.clear_touched();
+                let removed = gs.delete_node(id);
+                let touched = gs.take_touched();
+                drop(gs);
+                self.cross_model_after_graph(touched);
+                Ok(Value::Bool(removed))
             }
             "GRAPH_DELETE_EDGE" => {
                 // graph_delete_edge(edge_id) → true/false
@@ -4727,7 +4800,14 @@ impl Executor {
                     ));
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_EDGE")?;
-                Ok(Value::Bool(self.graph_store.write().delete_edge(id)))
+                let mut gs = self.graph_store.write();
+                self.cross_model_before_graph(&gs);
+                gs.clear_touched();
+                let removed = gs.delete_edge(id);
+                let touched = gs.take_touched();
+                drop(gs);
+                self.cross_model_after_graph(touched);
+                Ok(Value::Bool(removed))
             }
             "GRAPH_NEIGHBORS" => {
                 // graph_neighbors(node_id, direction?) → JSON array of {neighbor_id, edge_id, edge_type}
@@ -4927,7 +5007,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_assert(&input) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_assert(&input);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
@@ -4939,7 +5029,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_rule(&input) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_rule(&input);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
@@ -4963,7 +5063,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_retract(&input) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_retract(&input);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
@@ -4975,7 +5085,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_clear(&pred) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_clear(&pred);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }

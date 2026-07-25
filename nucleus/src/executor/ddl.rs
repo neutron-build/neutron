@@ -1461,6 +1461,7 @@ impl Executor {
                         }
                     }
 
+                    self.cross_model_touch_vector(&index_name);
                     self.vector_indexes.write().insert(
                         index_name.clone(),
                         VectorIndexEntry {
@@ -1531,6 +1532,7 @@ impl Executor {
                         }
                     }
 
+                    self.cross_model_touch_vector(&index_name);
                     self.vector_indexes.write().insert(
                         index_name.clone(),
                         VectorIndexEntry {

@@ -12,7 +12,7 @@
 
 pub mod compression;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
@@ -1354,6 +1354,9 @@ pub struct TimeSeriesStore {
     last_values: HashMap<String, DataPoint>,
     /// Optional WAL for durability.
     wal: Option<TsWal>,
+    /// Series mutated since the last `clear_touched` — the transaction
+    /// write-set the executor drains under the same write guard.
+    txn_touched: HashSet<String>,
 }
 
 impl TimeSeriesStore {
@@ -1364,6 +1367,7 @@ impl TimeSeriesStore {
             retention: None,
             last_values: HashMap::new(),
             wal: None,
+            txn_touched: HashSet::new(),
         }
     }
 
@@ -1410,7 +1414,18 @@ impl TimeSeriesStore {
             retention: None,
             last_values,
             wal: Some(wal),
+            txn_touched: HashSet::new(),
         })
+    }
+
+    /// Forget any recorded mutations (called before a mutating operation).
+    pub fn clear_touched(&mut self) {
+        self.txn_touched.clear();
+    }
+
+    /// Take the series mutated since the last `clear_touched`.
+    pub fn take_touched(&mut self) -> HashSet<String> {
+        std::mem::take(&mut self.txn_touched)
     }
 
     /// Set retention policy.
@@ -1424,12 +1439,14 @@ impl TimeSeriesStore {
             wal.log_delete_series(series_name);
         }
         self.last_values.remove(series_name);
+        self.txn_touched.insert(series_name.to_string());
         self.series.remove(series_name).is_some()
     }
 
     /// Insert a data point.
     pub fn insert(&mut self, series_name: &str, point: DataPoint) {
         let is_new = !self.series.contains_key(series_name);
+        self.txn_touched.insert(series_name.to_string());
         // Log to WAL if enabled
         if let Some(ref wal) = self.wal {
             if is_new {
@@ -1580,6 +1597,9 @@ impl Series {
             .collect()
     }
 }
+
+/// One WAL-shaped data point: `(timestamp, value, tags)`.
+type WalPoint = (u64, f64, Vec<(String, String)>);
 
 /// Snapshot of `TimeSeriesStore` mutable state for transaction rollback.
 pub struct TsTxnSnapshot {
@@ -1918,7 +1938,61 @@ impl TimeSeriesStore {
         }
     }
 
+    /// Revert only the series in `touched`, using `snap` as the before-image.
+    /// Series this transaction never wrote are left alone, so a ROLLBACK cannot
+    /// destroy points another session committed since BEGIN.
+    ///
+    /// Durable: each reverted series is rewritten into the WAL as
+    /// delete-then-recreate, so replay after a crash reconstructs the restored
+    /// state rather than resurrecting the rolled-back points.
+    pub fn txn_restore_scoped(&mut self, snap: &TsTxnSnapshot, touched: &HashSet<String>) {
+        for name in touched {
+            if let Some(ref wal) = self.wal {
+                wal.log_delete_series(name);
+            }
+            match snap.series.get(name) {
+                Some(series) => {
+                    if let Some(ref wal) = self.wal {
+                        wal.log_create_series(name, self.partition_size);
+                        let points: Vec<WalPoint> = (0..series
+                            .timestamps
+                            .len())
+                            .map(|i| {
+                                let tags: Vec<(String, String)> = series
+                                    .tag_columns
+                                    .iter()
+                                    .filter_map(|(k, col)| {
+                                        col.get(i)
+                                            .and_then(|v| v.clone())
+                                            .map(|v| (k.clone(), v))
+                                    })
+                                    .collect();
+                                (series.timestamps[i], series.values[i], tags)
+                            })
+                            .collect();
+                        if !points.is_empty() {
+                            wal.log_insert_batch(name, &points);
+                        }
+                    }
+                    self.series.insert(name.clone(), series.clone());
+                }
+                None => {
+                    self.series.remove(name);
+                }
+            }
+            match snap.last_values.get(name) {
+                Some(point) => {
+                    self.last_values.insert(name.clone(), point.clone());
+                }
+                None => {
+                    self.last_values.remove(name);
+                }
+            }
+        }
+    }
+
     /// Restore mutable TimeSeries state from a transaction snapshot (for ROLLBACK).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn txn_restore(&mut self, snap: TsTxnSnapshot) {
         self.series = snap.series;
         self.last_values = snap.last_values;
