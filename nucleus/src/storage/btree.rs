@@ -12,6 +12,29 @@
 //!
 //! Keys are serialized using the same tuple format as row data, making
 //! the B-tree type-agnostic (any column type can be indexed).
+//!
+//! # Concurrency
+//!
+//! This B-tree has no latch crabbing and no structure-modification protocol.
+//! It is not internally concurrent, and it does not pretend to be: TREE
+//! STRUCTURE is serialized one level up, by `DiskEngine::indexes`
+//! (`RwLock<HashMap<String, IndexMeta>>`). Every mutating entry point —
+//! `insert`, `delete` — is reached only through `DiskEngine::index_insert` /
+//! `index_delete`, which hold that lock for WRITING; `lookup` / `range_scan`
+//! are reached holding it for READING. Two mutators therefore never run at
+//! once, and no reader ever observes a split in progress.
+//!
+//! The frame latches taken here are for a different adversary: the buffer
+//! pool's flusher and evictor, which write frames out without consulting
+//! `indexes` at all. Without them, `flush_dirty_batch` can copy a leaf to disk
+//! halfway through a `write_leaf_entries`, and the torn image is read back as
+//! a slot offset past the end of the page — an out-of-bounds panic in
+//! `extract_key`.
+//!
+//! Every page access below is a `read_guard` / `write_guard`, and no code path
+//! holds two at once: splits copy the source page into a `Vec`, drop the
+//! latch, and write each destination page separately. See the lock-order
+//! doctrine on `FrameDescriptor::latch`.
 
 use std::sync::Arc;
 
@@ -90,11 +113,12 @@ pub struct BTreeIndex {
 impl BTreeIndex {
     /// Create a new empty B-tree index. Allocates a root leaf page.
     pub fn create(pool: Arc<BufferPool>, key_type: DataType) -> Result<Self, BTreeError> {
-        let (page_id, frame_id) = pool.new_page().map_err(|e| BTreeError::Io(e.to_string()))?;
-        let pg = pool.frame_data_mut(frame_id);
-        init_index_page(pg, true); // leaf
-        pool.mark_dirty(frame_id);
-        pool.unpin(frame_id);
+        let (page_id, mut pg) = pool
+            .new_page_guard()
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
+        init_index_page(&mut pg, true); // leaf
+        pg.set_dirty();
+        drop(pg);
 
         Ok(Self {
             root_page: page_id,
@@ -124,14 +148,11 @@ impl BTreeIndex {
     /// Find all RowIds matching the given key.
     pub fn lookup(&self, key: &[u8]) -> Result<Vec<RowId>, BTreeError> {
         let leaf = self.find_leaf(key)?;
-        let frame_id = self
+        let pg = self
             .pool
-            .fetch_page(leaf)
+            .read_guard(leaf)
             .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data(frame_id);
-        let results = scan_leaf_for_key(pg, key);
-        self.pool.unpin(frame_id);
-        Ok(results)
+        Ok(scan_leaf_for_key(&pg, key))
     }
 
     // ========================================================================
@@ -155,16 +176,15 @@ impl BTreeIndex {
         let mut page_id = leaf;
 
         while page_id != INVALID_PAGE_ID {
-            let frame_id = self
+            let pg = self
                 .pool
-                .fetch_page(page_id)
+                .read_guard(page_id)
                 .map_err(|e| BTreeError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let count = page::read_u16(pg, IDX_ENTRY_COUNT);
+            let count = page::read_u16(&pg, IDX_ENTRY_COUNT);
             let mut pos = IDX_HEADER_SIZE;
 
             for _ in 0..count {
-                let (key, row_id, next_pos) = read_leaf_entry(pg, pos);
+                let (key, row_id, next_pos) = read_leaf_entry(&pg, pos);
                 pos = next_pos;
 
                 // Check range — key is a borrowed slice, no allocation for skipped entries
@@ -176,15 +196,13 @@ impl BTreeIndex {
                 if let Some(ek) = end_key
                     && key > ek
                 {
-                    self.pool.unpin(frame_id);
                     return Ok(results);
                 }
                 // Only allocate for entries that pass the range filter
                 results.push((key.to_vec(), row_id));
             }
 
-            let next = page::read_u32(pg, IDX_RIGHT_SIBLING);
-            self.pool.unpin(frame_id);
+            let next = page::read_u32(&pg, IDX_RIGHT_SIBLING);
             page_id = next;
         }
 
@@ -198,21 +216,20 @@ impl BTreeIndex {
     /// Insert a (key, RowId) entry into the B-tree.
     pub fn insert(&mut self, key: &[u8], row_id: RowId) -> Result<(), BTreeError> {
         let leaf = self.find_leaf(key)?;
-        let frame_id = self
-            .pool
-            .fetch_page(leaf)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-
-        // Try to insert into the leaf
-        let pg = self.pool.frame_data_mut(frame_id);
-        if try_insert_leaf(pg, key, &row_id) {
-            self.pool.mark_dirty(frame_id);
-            self.pool.unpin(frame_id);
-            return Ok(());
+        // Try to insert into the leaf. The latch is released before the split
+        // path, which allocates pages — rule (A): no allocation under a latch.
+        {
+            let mut pg = self
+                .pool
+                .write_guard(leaf)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            if try_insert_leaf(&mut pg, key, &row_id) {
+                pg.set_dirty();
+                return Ok(());
+            }
         }
 
         // Leaf is full — need to split
-        self.pool.unpin(frame_id);
         self.split_and_insert(leaf, key, row_id)?;
         Ok(())
     }
@@ -224,16 +241,14 @@ impl BTreeIndex {
     /// Delete a (key, RowId) entry from the B-tree.
     pub fn delete(&self, key: &[u8], row_id: RowId) -> Result<bool, BTreeError> {
         let leaf = self.find_leaf(key)?;
-        let frame_id = self
+        let mut pg = self
             .pool
-            .fetch_page(leaf)
+            .write_guard(leaf)
             .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data_mut(frame_id);
-        let deleted = delete_leaf_entry(pg, key, &row_id);
+        let deleted = delete_leaf_entry(&mut pg, key, &row_id);
         if deleted {
-            self.pool.mark_dirty(frame_id);
+            pg.set_dirty();
         }
-        self.pool.unpin(frame_id);
         Ok(deleted)
     }
 
@@ -245,19 +260,19 @@ impl BTreeIndex {
     fn find_leaf(&self, key: &[u8]) -> Result<u32, BTreeError> {
         let mut page_id = self.root_page;
         loop {
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| BTreeError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let is_leaf = pg[IDX_IS_LEAF] != 0;
-            if is_leaf {
-                self.pool.unpin(frame_id);
-                return Ok(page_id);
-            }
-            // Internal node: find the child to descend into
-            let child = find_child(pg, key);
-            self.pool.unpin(frame_id);
+            // One latch at a time: the child page is fetched only after this
+            // guard drops, so descending the tree never holds two latches.
+            let child = {
+                let pg = self
+                    .pool
+                    .read_guard(page_id)
+                    .map_err(|e| BTreeError::Io(e.to_string()))?;
+                if pg[IDX_IS_LEAF] != 0 {
+                    return Ok(page_id);
+                }
+                // Internal node: find the child to descend into
+                find_child(&pg, key)
+            };
             page_id = child;
         }
     }
@@ -266,19 +281,17 @@ impl BTreeIndex {
     fn find_leftmost_leaf(&self) -> Result<u32, BTreeError> {
         let mut page_id = self.root_page;
         loop {
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| BTreeError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let is_leaf = pg[IDX_IS_LEAF] != 0;
-            if is_leaf {
-                self.pool.unpin(frame_id);
-                return Ok(page_id);
-            }
-            // Go to leftmost child
-            let child = page::read_u32(pg, LEFTMOST_CHILD_OFFSET);
-            self.pool.unpin(frame_id);
+            let child = {
+                let pg = self
+                    .pool
+                    .read_guard(page_id)
+                    .map_err(|e| BTreeError::Io(e.to_string()))?;
+                if pg[IDX_IS_LEAF] != 0 {
+                    return Ok(page_id);
+                }
+                // Go to leftmost child
+                page::read_u32(&pg, LEFTMOST_CHILD_OFFSET)
+            };
             page_id = child;
         }
     }
@@ -294,16 +307,19 @@ impl BTreeIndex {
         key: &[u8],
         row_id: RowId,
     ) -> Result<(), BTreeError> {
-        // Read all entries from the leaf
-        let frame_id = self
-            .pool
-            .fetch_page(leaf_page_id)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data(frame_id);
-        let mut entries = collect_leaf_entries(pg);
-        let old_sibling = page::read_u32(pg, IDX_RIGHT_SIBLING);
-        let parent = page::read_u32(pg, IDX_PARENT);
-        self.pool.unpin(frame_id);
+        // Read all entries from the leaf into local memory, then release the
+        // latch. The split writes each destination page under its own latch.
+        let (mut entries, old_sibling, parent) = {
+            let pg = self
+                .pool
+                .read_guard(leaf_page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            (
+                collect_leaf_entries(&pg),
+                page::read_u32(&pg, IDX_RIGHT_SIBLING),
+                page::read_u32(&pg, IDX_PARENT),
+            )
+        };
 
         // Add the new entry and sort
         let entry_bytes = encode_leaf_entry(key, &row_id);
@@ -323,44 +339,42 @@ impl BTreeIndex {
         let split_key = extract_key(&right_entries[0]).to_vec();
 
         // Allocate new right page
-        let (right_page_id, right_frame) = self
+        let (right_page_id, mut rpg) = self
             .pool
-            .new_page()
+            .new_page_guard()
             .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let rpg = self.pool.frame_data_mut(right_frame);
-        init_index_page(rpg, true);
-        page::write_u32(rpg, IDX_RIGHT_SIBLING, old_sibling);
-        page::write_u32(rpg, IDX_PARENT, parent);
-        write_leaf_entries(rpg, right_entries);
-        self.pool.mark_dirty(right_frame);
-        self.pool.unpin(right_frame);
+        init_index_page(&mut rpg, true);
+        page::write_u32(&mut rpg, IDX_RIGHT_SIBLING, old_sibling);
+        page::write_u32(&mut rpg, IDX_PARENT, parent);
+        write_leaf_entries(&mut rpg, right_entries);
+        rpg.set_dirty();
+        drop(rpg);
 
         // Rewrite left page
-        let left_frame = self
-            .pool
-            .fetch_page(leaf_page_id)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let lpg = self.pool.frame_data_mut(left_frame);
-        init_index_page(lpg, true);
-        page::write_u32(lpg, IDX_RIGHT_SIBLING, right_page_id);
-        page::write_u32(lpg, IDX_PARENT, parent);
-        write_leaf_entries(lpg, left_entries);
-        self.pool.mark_dirty(left_frame);
-        self.pool.unpin(left_frame);
+        {
+            let mut lpg = self
+                .pool
+                .write_guard(leaf_page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            init_index_page(&mut lpg, true);
+            page::write_u32(&mut lpg, IDX_RIGHT_SIBLING, right_page_id);
+            page::write_u32(&mut lpg, IDX_PARENT, parent);
+            write_leaf_entries(&mut lpg, left_entries);
+            lpg.set_dirty();
+        }
 
         // Insert split key into parent
         if parent == INVALID_PAGE_ID {
             // Root was a leaf — create new root
-            let (new_root_id, root_frame) = self
+            let (new_root_id, mut rpg) = self
                 .pool
-                .new_page()
+                .new_page_guard()
                 .map_err(|e| BTreeError::Io(e.to_string()))?;
-            let rpg = self.pool.frame_data_mut(root_frame);
-            init_index_page(rpg, false); // internal node
-            page::write_u32(rpg, LEFTMOST_CHILD_OFFSET, leaf_page_id);
-            insert_internal_entry(rpg, &split_key, right_page_id);
-            self.pool.mark_dirty(root_frame);
-            self.pool.unpin(root_frame);
+            init_index_page(&mut rpg, false); // internal node
+            page::write_u32(&mut rpg, LEFTMOST_CHILD_OFFSET, leaf_page_id);
+            insert_internal_entry(&mut rpg, &split_key, right_page_id);
+            rpg.set_dirty();
+            drop(rpg);
 
             // Update parent pointers
             self.set_parent(leaf_page_id, new_root_id)?;
@@ -381,26 +395,23 @@ impl BTreeIndex {
         key: &[u8],
         right_child: u32,
     ) -> Result<(), BTreeError> {
-        // Check if the parent has space for this entry
-        let frame_id = self
-            .pool
-            .fetch_page(parent_page_id)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data(frame_id);
-        let has_space = internal_has_space(pg, key.len());
-        self.pool.unpin(frame_id);
+        // Check if the parent has space for this entry, and insert under the
+        // same latch so the answer cannot go stale between the two.
+        let has_space = {
+            let mut pg = self
+                .pool
+                .write_guard(parent_page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            let has_space = internal_has_space(&pg, key.len());
+            if has_space {
+                insert_internal_entry(&mut pg, key, right_child);
+                pg.set_dirty();
+            }
+            has_space
+        };
 
         if has_space {
-            // Simple case: parent has room, just insert
-            let frame_id = self
-                .pool
-                .fetch_page(parent_page_id)
-                .map_err(|e| BTreeError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data_mut(frame_id);
-            insert_internal_entry(pg, key, right_child);
-            self.pool.mark_dirty(frame_id);
-            self.pool.unpin(frame_id);
-
+            // set_parent takes its own latch — never nested inside the parent's.
             self.set_parent(right_child, parent_page_id)?;
             return Ok(());
         }
@@ -417,16 +428,18 @@ impl BTreeIndex {
         key: &[u8],
         right_child: u32,
     ) -> Result<(), BTreeError> {
-        // Read all existing entries and the leftmost child from this internal node
-        let frame_id = self
-            .pool
-            .fetch_page(internal_page_id)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data(frame_id);
-        let mut entries = collect_internal_entries(pg);
-        let _leftmost_child = page::read_u32(pg, LEFTMOST_CHILD_OFFSET);
-        let grandparent = page::read_u32(pg, IDX_PARENT);
-        self.pool.unpin(frame_id);
+        // Read all existing entries and the leftmost child from this internal
+        // node into local memory, then release the latch.
+        let (mut entries, grandparent) = {
+            let pg = self
+                .pool
+                .read_guard(internal_page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            (
+                collect_internal_entries(&pg),
+                page::read_u32(&pg, IDX_PARENT),
+            )
+        };
 
         // Add the new entry and sort by key
         entries.push((key.to_vec(), right_child));
@@ -447,30 +460,29 @@ impl BTreeIndex {
         let new_right_leftmost = promoted_child;
 
         // Allocate the new right internal page
-        let (right_page_id, right_frame) = self
+        let (right_page_id, mut rpg) = self
             .pool
-            .new_page()
+            .new_page_guard()
             .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let rpg = self.pool.frame_data_mut(right_frame);
-        init_index_page(rpg, false); // internal node
-        page::write_u32(rpg, LEFTMOST_CHILD_OFFSET, new_right_leftmost);
-        page::write_u32(rpg, IDX_PARENT, grandparent);
-        write_internal_entries(rpg, &right_entries);
-        self.pool.mark_dirty(right_frame);
-        self.pool.unpin(right_frame);
+        init_index_page(&mut rpg, false); // internal node
+        page::write_u32(&mut rpg, LEFTMOST_CHILD_OFFSET, new_right_leftmost);
+        page::write_u32(&mut rpg, IDX_PARENT, grandparent);
+        write_internal_entries(&mut rpg, &right_entries);
+        rpg.set_dirty();
+        drop(rpg);
 
         // Rewrite the left (original) page with only the left entries
-        let left_frame = self
-            .pool
-            .fetch_page(internal_page_id)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let lpg = self.pool.frame_data_mut(left_frame);
-        // Preserve leftmost child (unchanged) and parent
-        // Clear entries area and rewrite
-        write_internal_entries(lpg, &left_entries);
-        // leftmost_child stays the same (was already set)
-        self.pool.mark_dirty(left_frame);
-        self.pool.unpin(left_frame);
+        {
+            let mut lpg = self
+                .pool
+                .write_guard(internal_page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            // Preserve leftmost child (unchanged) and parent
+            // Clear entries area and rewrite
+            write_internal_entries(&mut lpg, &left_entries);
+            // leftmost_child stays the same (was already set)
+            lpg.set_dirty();
+        }
 
         // Update parent pointers for children that moved to the new right page
         self.set_parent(new_right_leftmost, right_page_id)?;
@@ -481,16 +493,15 @@ impl BTreeIndex {
         // Promote the middle key to the grandparent
         if grandparent == INVALID_PAGE_ID {
             // We're splitting the root — create a new root
-            let (new_root_id, root_frame) = self
+            let (new_root_id, mut rpg) = self
                 .pool
-                .new_page()
+                .new_page_guard()
                 .map_err(|e| BTreeError::Io(e.to_string()))?;
-            let rpg = self.pool.frame_data_mut(root_frame);
-            init_index_page(rpg, false); // internal node
-            page::write_u32(rpg, LEFTMOST_CHILD_OFFSET, internal_page_id);
-            insert_internal_entry(rpg, &promoted_key, right_page_id);
-            self.pool.mark_dirty(root_frame);
-            self.pool.unpin(root_frame);
+            init_index_page(&mut rpg, false); // internal node
+            page::write_u32(&mut rpg, LEFTMOST_CHILD_OFFSET, internal_page_id);
+            insert_internal_entry(&mut rpg, &promoted_key, right_page_id);
+            rpg.set_dirty();
+            drop(rpg);
 
             self.set_parent(internal_page_id, new_root_id)?;
             self.set_parent(right_page_id, new_root_id)?;
@@ -505,14 +516,12 @@ impl BTreeIndex {
     }
 
     fn set_parent(&self, page_id: u32, parent: u32) -> Result<(), BTreeError> {
-        let frame_id = self
+        let mut pg = self
             .pool
-            .fetch_page(page_id)
+            .write_guard(page_id)
             .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let pg = self.pool.frame_data_mut(frame_id);
-        page::write_u32(pg, IDX_PARENT, parent);
-        self.pool.mark_dirty(frame_id);
-        self.pool.unpin(frame_id);
+        page::write_u32(&mut pg, IDX_PARENT, parent);
+        pg.set_dirty();
         Ok(())
     }
 }
