@@ -182,6 +182,57 @@ pub trait StorageEngine: Send + Sync {
     /// Update rows at the given scan-order positions with new row values.
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError>;
 
+    /// Update rows the caller resolved earlier, carrying the row it read
+    /// (`(position, read, new)`), and apply each write only if the position
+    /// still addresses that row.
+    ///
+    /// A statement resolves positions, then awaits — triggers, RLS, CHECK/FK
+    /// constraints, derived-index maintenance — before writing. On an engine
+    /// whose positions are physical addresses, the row can be deleted and its
+    /// address handed to a different row inside that window, and a write that
+    /// trusted the address alone would overwrite an unrelated row (leaving two
+    /// rows with the same primary key). Engines whose positions are stable row
+    /// identities for the life of the row need no re-check.
+    ///
+    /// Default: ignore the read row and delegate to `update()`.
+    async fn update_if_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<usize, StorageError> {
+        let plain: Vec<(usize, Row)> = updates
+            .iter()
+            .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
+            .collect();
+        self.update(table, &plain).await
+    }
+
+    /// Delete counterpart of [`update_if_unchanged`](Self::update_if_unchanged):
+    /// `(position, row the caller read)`.
+    ///
+    /// Default: ignore the positions and re-resolve each target against a fresh
+    /// scan by matching the row. An engine whose positions are dense scan
+    /// ordinals (`MemoryEngine` removes from a `Vec`, so every later ordinal
+    /// shifts down) renumbers on every delete, including the ones a cascade
+    /// performs partway through this same statement, so an ordinal resolved
+    /// earlier means nothing by the time it is used. Each target consumes at
+    /// most one row, so a target list that is a subset of several identical
+    /// rows deletes only as many as were asked for.
+    async fn delete_if_unchanged(
+        &self,
+        table: &str,
+        targets: &[(usize, Row)],
+    ) -> Result<usize, StorageError> {
+        let mut current = self.scan_physical(table).await?;
+        let mut positions = Vec::with_capacity(targets.len());
+        for (_, wanted) in targets {
+            if let Some(i) = current.iter().position(|(_, row)| row == wanted) {
+                positions.push(current.remove(i).0);
+            }
+        }
+        self.delete(table, &positions).await
+    }
+
     /// Re-read a table's column schema from the catalog into any cache the
     /// engine keeps. Called after ALTER TABLE so an engine that caches its own
     /// column types (e.g. the disk engine's meta page) stays consistent with

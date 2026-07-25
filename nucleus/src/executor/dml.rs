@@ -449,9 +449,15 @@ impl Executor {
                             // Skip this row silently
                         }
                         ast::OnConflictAction::DoUpdate(do_update) => {
-                            // Find the conflicting row and update it
-                            let existing_rows =
-                                self.storage_for(&table_name).scan(&table_name).await?;
+                            // Find the conflicting row and update it.
+                            // scan_physical: the position is fed back to
+                            // update(), which addresses physical rows, so it
+                            // must be the engine's own position and not a scan
+                            // ordinal.
+                            let existing_rows = self
+                                .storage_for(&table_name)
+                                .scan_physical(&table_name)
+                                .await?;
                             let conflict_cols = self.get_conflict_columns(&table_def, conflict);
                             let conflict_indices: Vec<usize> = conflict_cols
                                 .iter()
@@ -470,7 +476,7 @@ impl Executor {
                                 });
                             }
 
-                            for (pos, existing) in existing_rows.iter().enumerate() {
+                            for (pos, existing) in existing_rows.iter().map(|(p, r)| (*p, r)) {
                                 let matches = conflict_indices.iter().all(|&i| {
                                     i < row.len() && i < existing.len() && row[i] == existing[i]
                                 });
@@ -929,7 +935,12 @@ impl Executor {
         }
 
         // Lazy scan: only fetched when no index is available for a constraint.
-        let mut existing_rows: Option<Vec<Row>> = None;
+        // scan_physical, not scan: `skip_row_idx` is an engine position (an
+        // MVCC version index, or a physical (page, slot) address on the paged
+        // engine), so comparing it against a scan-order ordinal skipped the
+        // wrong row — an UPDATE that rewrote a PK column to its own current
+        // value reported a spurious duplicate.
+        let mut existing_rows: Option<Vec<(usize, Row)>> = None;
 
         for col_indices in &unique_col_sets {
             // Fast path for the common single-column unique/primary-key case.
@@ -976,10 +987,11 @@ impl Executor {
 
                 // Scan fallback: used for UPDATE path or when no index is registered.
                 if existing_rows.is_none() {
-                    existing_rows = Some(self.storage_for(table_name).scan(table_name).await?);
+                    existing_rows =
+                        Some(self.storage_for(table_name).scan_physical(table_name).await?);
                 }
                 let rows = existing_rows.as_ref().unwrap();
-                for (row_idx, existing) in rows.iter().enumerate() {
+                for (row_idx, existing) in rows.iter().map(|(p, r)| (*p, r)) {
                     if skip_row_idx == Some(row_idx) {
                         continue;
                     }
@@ -1009,10 +1021,11 @@ impl Executor {
                 continue;
             }
             if existing_rows.is_none() {
-                existing_rows = Some(self.storage_for(table_name).scan(table_name).await?);
+                existing_rows =
+                        Some(self.storage_for(table_name).scan_physical(table_name).await?);
             }
             let rows = existing_rows.as_ref().unwrap();
-            for (row_idx, existing) in rows.iter().enumerate() {
+            for (row_idx, existing) in rows.iter().map(|(p, r)| (*p, r)) {
                 // Skip the row being updated (for UPDATE operations)
                 if skip_row_idx == Some(row_idx) {
                     continue;
@@ -1334,7 +1347,17 @@ impl Executor {
                                 }
 
                                 // Find child rows that reference the old values
-                                let child_rows = child_storage.scan(child_table).await?;
+                                // scan_physical, not scan: the positions below
+                                // are fed back to update()/delete(), which
+                                // address physical rows. `child_positions`
+                                // carries the engine's position for each
+                                // ordinal so the two spaces stay separate.
+                                let (child_positions, child_rows): (Vec<usize>, Vec<Row>) =
+                                    child_storage
+                                        .scan_physical(child_table)
+                                        .await?
+                                        .into_iter()
+                                        .unzip();
                                 let matching_positions: Vec<usize> = child_rows
                                     .iter()
                                     .enumerate()
@@ -1408,7 +1431,13 @@ impl Executor {
                                         )
                                         .await?;
                                         if apply {
-                                            child_storage.update(child_table, &updates).await?;
+                                            let at: Vec<(usize, Row)> = updates
+                                                .iter()
+                                                .map(|(pos, row)| {
+                                                    (child_positions[*pos], row.clone())
+                                                })
+                                                .collect();
+                                            child_storage.update(child_table, &at).await?;
                                             self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
@@ -1458,7 +1487,13 @@ impl Executor {
                                         )
                                         .await?;
                                         if apply {
-                                            child_storage.update(child_table, &updates).await?;
+                                            let at: Vec<(usize, Row)> = updates
+                                                .iter()
+                                                .map(|(pos, row)| {
+                                                    (child_positions[*pos], row.clone())
+                                                })
+                                                .collect();
+                                            child_storage.update(child_table, &at).await?;
                                             self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
@@ -1533,7 +1568,13 @@ impl Executor {
                                         )
                                         .await?;
                                         if apply {
-                                            child_storage.update(child_table, &updates).await?;
+                                            let at: Vec<(usize, Row)> = updates
+                                                .iter()
+                                                .map(|(pos, row)| {
+                                                    (child_positions[*pos], row.clone())
+                                                })
+                                                .collect();
+                                            child_storage.update(child_table, &at).await?;
                                             self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
@@ -1553,7 +1594,17 @@ impl Executor {
                                 }
 
                                 // Find child rows that reference these values
-                                let child_rows = child_storage.scan(child_table).await?;
+                                // scan_physical, not scan: the positions below
+                                // are fed back to update()/delete(), which
+                                // address physical rows. `child_positions`
+                                // carries the engine's position for each
+                                // ordinal so the two spaces stay separate.
+                                let (child_positions, child_rows): (Vec<usize>, Vec<Row>) =
+                                    child_storage
+                                        .scan_physical(child_table)
+                                        .await?
+                                        .into_iter()
+                                        .unzip();
                                 let matching_positions: Vec<usize> = child_rows
                                     .iter()
                                     .enumerate()
@@ -1624,20 +1675,22 @@ impl Executor {
                                         )
                                         .await?;
                                         if apply {
-                                            let current_rows =
-                                                child_storage.scan(child_table).await?;
-                                            let current_positions: Vec<usize> = current_rows
+                                            // Delete at the positions matched
+                                            // above, carrying the rows read
+                                            // there so a position whose slot
+                                            // was recycled in the meantime is
+                                            // skipped rather than acted on.
+                                            let targets: Vec<(usize, Row)> = matching_positions
                                                 .iter()
-                                                .enumerate()
-                                                .filter(|(_, row)| {
-                                                    rows_to_delete
-                                                        .iter()
-                                                        .any(|target| target == *row)
+                                                .map(|&pos| {
+                                                    (
+                                                        child_positions[pos],
+                                                        child_rows[pos].clone(),
+                                                    )
                                                 })
-                                                .map(|(position, _)| position)
                                                 .collect();
                                             child_storage
-                                                .delete(child_table, &current_positions)
+                                                .delete_if_unchanged(child_table, &targets)
                                                 .await?;
                                             self.rebuild_table_derived_state(child_table).await;
                                         }
@@ -1688,7 +1741,13 @@ impl Executor {
                                         )
                                         .await?;
                                         if apply {
-                                            child_storage.update(child_table, &updates).await?;
+                                            let at: Vec<(usize, Row)> = updates
+                                                .iter()
+                                                .map(|(pos, row)| {
+                                                    (child_positions[*pos], row.clone())
+                                                })
+                                                .collect();
+                                            child_storage.update(child_table, &at).await?;
                                             self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
@@ -1741,7 +1800,13 @@ impl Executor {
                                         )
                                         .await?;
                                         if apply {
-                                            child_storage.update(child_table, &updates).await?;
+                                            let at: Vec<(usize, Row)> = updates
+                                                .iter()
+                                                .map(|(pos, row)| {
+                                                    (child_positions[*pos], row.clone())
+                                                })
+                                                .collect();
+                                            child_storage.update(child_table, &at).await?;
                                             self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
@@ -2205,7 +2270,24 @@ impl Executor {
                     other => ExecError::Storage(other),
                 })?
         } else {
-            storage.update(&table_name, &updates).await?
+            // Carry the row each position was resolved from. Statement
+            // execution awaits between resolving a position and writing it —
+            // triggers, RLS, constraints, derived-index maintenance — and on
+            // the paged engine a position is a physical address whose slot a
+            // concurrent DELETE + INSERT can hand to a different row inside
+            // that window. Writing on the address alone overwrote that row and
+            // left two rows with the same primary key.
+            let verified: Vec<(usize, Row, Row)> = updates
+                .iter()
+                .filter_map(|(pos, new_row)| {
+                    row_by_pos
+                        .get(pos)
+                        .map(|old| (*pos, (*old).clone(), new_row.clone()))
+                })
+                .collect();
+            storage
+                .update_if_unchanged(&table_name, &verified)
+                .await?
         };
 
         // Rebuild zone map stats — column values may have changed, making
@@ -2444,18 +2526,24 @@ impl Executor {
             }
         }
 
-        let current_rows = self
-            .storage_for(&table_name)
-            .scan_physical(&table_name)
-            .await?;
-        let current_positions: Vec<usize> = current_rows
+        // Delete each row at the position it was resolved at, carrying the row
+        // that was read there. Execution awaited in between (triggers, FK
+        // cascades, derived-index maintenance), and on the paged engine a
+        // position is a physical address whose slot a concurrent DELETE +
+        // INSERT can hand to a different row in that window; the engine drops
+        // any target that no longer holds the row this statement matched.
+        //
+        // This replaces re-resolving the targets by scanning the whole table
+        // and matching on row equality, which was both O(rows x deletes) and
+        // still racy — the re-scan was itself another await earlier than the
+        // delete, and on a table with duplicate rows it matched arbitrary ones.
+        let targets: Vec<(usize, Row)> = positions
             .iter()
-            .filter(|(_, row)| deleted_rows.iter().any(|target| target == row))
-            .map(|(position, _)| *position)
+            .filter_map(|pos| row_by_pos.get(pos).map(|row| (*pos, (*row).clone())))
             .collect();
         let count = self
             .storage_for(&table_name)
-            .delete(&table_name, &current_positions)
+            .delete_if_unchanged(&table_name, &targets)
             .await?;
 
         // Rebuild zone map stats — row positions have shifted after delete, so

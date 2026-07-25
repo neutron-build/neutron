@@ -2273,6 +2273,34 @@ impl StorageEngine for MvccStorageAdapter {
         self.update_impl(table, updates, None).await
     }
 
+    /// Positions here are version indices, which name one version for as long
+    /// as it exists and are never reassigned, so there is nothing to re-check:
+    /// the read row can only have been superseded, and the visibility rules in
+    /// `update_impl`/`delete` already decide that. Overrides the trait default,
+    /// which re-resolves by scanning (correct only for scan-ordinal engines,
+    /// and it would match an unrelated row that happens to be equal).
+    async fn update_if_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<usize, StorageError> {
+        let plain: Vec<(usize, Row)> = updates
+            .iter()
+            .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
+            .collect();
+        self.update(table, &plain).await
+    }
+
+    /// See [`Self::update_if_unchanged`].
+    async fn delete_if_unchanged(
+        &self,
+        table: &str,
+        targets: &[(usize, Row)],
+    ) -> Result<usize, StorageError> {
+        let positions: Vec<usize> = targets.iter().map(|(pos, _)| *pos).collect();
+        self.delete(table, &positions).await
+    }
+
     async fn update_unique(
         &self,
         table: &str,
