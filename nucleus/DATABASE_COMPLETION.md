@@ -576,14 +576,96 @@ Goal: users can install, operate, upgrade, migrate, and understand the supported
 - [ ] Add PostgreSQL/SQLite import and export workflows with validation reports.
 - [ ] Add upgrade, rollback, backup, restore, PITR, security, cluster, and incident runbooks.
 - [ ] Publish SQL syntax/types/functions and PostgreSQL deviation references.
-- [ ] Publish every data model's durability, transaction, policy, and consistency semantics.
-- [ ] Generate command/config references from code where practical.
-- [ ] Keep `README.md` concise and link to detailed, versioned operational docs.
+- [x] Publish every data model's durability, transaction, policy, and consistency semantics
+      (`docs/MODEL_SEMANTICS.md`, `DURABILITY.md`, `RLS_SECURITY.md`). The matrix is measured
+      against a live server (write → `kill -9` → restart → read back), not inferred: that method
+      is what established that datalog, sparse vectors and tensors have **no durable store at
+      all**, and that `geo/geo.wal` and `datalog/datalog.wal` are opened but never written.
+- [x] Generate command/config references from code where practical
+      (`sh scripts/gen-reference.sh` → `docs/CLI_REFERENCE.md` from the clap definitions,
+      `docs/CONFIG_REFERENCE.md` from `src/config/mod.rs`). Regenerated 2026-07-24, which
+      closed real drift: `backup --online` / `--allow-in-use` and the five M10
+      `NUCLEUS_DISK_*` watermark keys were missing from the published references.
+- [x] Keep `README.md` concise and link to detailed, versioned operational docs. The SQL-semantics
+      prose moved to `docs/SQL_SEMANTICS.md`; a documentation index replaces it, and two dangling
+      references to gitignored scratch files (`STATUS.md`, `NUCLEUS-ROADMAP.md`) are gone.
 
 Exit gate:
 
 - A new user can install, migrate sample data, secure, back up, restore, upgrade, and diagnose Nucleus
   using only version-matched documentation.
+
+### M12 evidence and what is still open (2026-07-24)
+
+Written is not validated. This section separates the two, because a deployment
+manifest that has never been applied is a hypothesis.
+
+**CI on the source of truth.** `origin` is the self-hosted Forgejo instance and
+GitHub is a one-way mirror, yet all 23 workflows fired only on the mirror — a
+push to the authoritative remote was verified by **zero** gates.
+`.forgejo/workflows/` now carries the same gates (`metrics.sh --check`,
+`cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --lib`,
+core-only build/test/lint, license and unsafe policy, integration tests, the
+`ci`-scale probe sweep), plus `nucleus-compat.yml` for the headless
+PostgreSQL-differential/ORM/JDBC harnesses and `nucleus-long.yml` for the soak
+and full-scale probe sweep that **cannot exist on GitHub at all**, because
+hosted jobs are capped at 6 hours.
+
+- Verified: all 26 workflow files pass `python3 scripts/check-workflows.py`
+  (YAML parse, job/step structure, `runs-on` labels resolvable, and — for the
+  Forgejo tree — no dependency on GitHub-only OIDC/attestation actions).
+- **Not verified: no job has ever run.** No Forgejo Actions runner exists.
+  `.forgejo/README.md` §2 is the exact registration procedure, and §2.7 is its
+  acceptance test. This is owner-action-only: it needs a registration token
+  from the admin UI and root on a host.
+
+**Signing, provenance and SBOM** (`.github/workflows/nucleus-release.yml`):
+CycloneDX 1.5 SBOM via `cargo-cyclonedx`, cosign **keyless** signing of every
+release asset, `actions/attest-build-provenance` for SLSA provenance, versioned
+asset names alongside the unversioned `latest` aliases, and a multi-arch
+(amd64 + arm64) image built by `Dockerfile.dist` from the already-compiled
+binaries rather than by compiling under QEMU.
+
+- Verified: SBOM generation was run locally against this exact manifest —
+  343 components with SHA-256 hashes, spec 1.5. `--license-accept-named
+  BSL-1.1` is **required**, because BSL-1.1 is not an SPDX identifier and the
+  crate's own license otherwise reports as an unparsable expression.
+- Not verified: no release tag has been cut, so the signing, attestation and
+  multi-arch image steps have never executed.
+- Deliberately unchanged: release signing stays on GitHub-hosted runners.
+  Keyless cosign derives its identity from GitHub's OIDC issuer, and provenance
+  from a self-hosted runner on the same LAN as the databases under test is not
+  independently verifiable.
+- Still absent: macOS notarization (needs an Apple Developer Program
+  membership; the scripts already exist in `desktop/`), musl/static builds,
+  Windows, and crates.io publication.
+
+**Deployment paths** (`deploy/`, with per-artifact status in
+`deploy/README.md`):
+
+| Path | Status |
+|---|---|
+| `Dockerfile` | Rewritten: non-root uid 10001, `HEALTHCHECK`, BuildKit cache mounts, wider `.dockerignore`. Parses (reaches `STEP 1/5`); **never built or run** — the dev machine's podman VM has a faulting overlay store that rejects *every* image, including `debian:bookworm-slim`. |
+| `Dockerfile.dist` | Multi-arch release path from prebuilt binaries. Parses (`STEP 1/13`); never built. |
+| `deploy/systemd/nucleus.service` | Written against the binary's real behaviour — `Type=simple` because there is no `sd_notify`, and `TimeoutStopSec=120` because the drain budget is a hard 2 s but the flush after it is unbounded. **Never loaded by systemd.** The hardening block is the most likely thing to block first start. |
+| `deploy/k3s/*.yaml` | `kubeconform -strict -kubernetes-version 1.31.0`: 5 resources, 0 invalid. **Never applied.** `replicas: 1` is a hard constraint, not a default — M9 is incomplete, so a second replica would silently disagree with the first. |
+
+`deploy/README.md` carries the acceptance sequence for each path. Until those
+run, this checkbox stays unchecked.
+
+**Runbooks** (`docs/runbooks/`): backup/restore/PITR, upgrade, rollback,
+security and incident are written, each against measured engine behaviour
+(watermark thresholds, error codes, the 2 s drain, the unbounded retention pin
+during an online backup). **The cluster runbook is deliberately absent** and
+the item therefore stays unchecked: Raft hard state is never persisted and
+replication ships raw SQL strings, so any cluster procedure written today would
+document a system that loses data on restart. Rolling upgrade is blocked on the
+same milestone plus two installable versions.
+
+**Still entirely open:** PostgreSQL/SQLite import-export (12.3), and the
+generated SQL syntax/type/function inventory (12.5 — `compat/pgregress/DEVIATIONS.md`
+and the new `docs/SQL_SEMANTICS.md` cover deviations and designed behaviour,
+but nothing is generated from the parser or catalog yet).
 
 ## Final feature-complete audit
 

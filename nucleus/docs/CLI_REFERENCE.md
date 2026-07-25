@@ -16,7 +16,7 @@ Commands:
   version       Show Nucleus server version and build info
   status        Show status of a running Nucleus instance
   shell         Interactive SQL shell (psql-like REPL)
-  backup        Back up a data directory to a portable snapshot (physical, v1)
+  backup        Back up a data directory to a portable snapshot (physical)
   restore       Restore a data directory from a snapshot created by `backup`
   dump          Logical (portable SQL) dump of every table — survives format/schema changes and replays through the constraint-safe executor, unlike the physical `backup`. Take it against a stopped or quiesced instance
   load          Restore a logical dump produced by `nucleus dump` into a data directory (creates it if missing) by replaying the SQL through the executor
@@ -176,9 +176,9 @@ Options:
 ## `nucleus backup`
 
 ```
-Back up a data directory to a portable snapshot (physical, v1).
+Back up a data directory to a portable snapshot (physical).
 
-Take it against a STOPPED instance for a consistent snapshot. Restore requires the same Nucleus version (physical snapshots are version-locked).
+Refuses to run against a data directory a live instance holds: a plain copy of a database being written to is torn, and a torn snapshot that reports success is worse than no snapshot. Restore requires a build on the same on-disk format version.
 
 Usage: nucleus backup [OPTIONS] --output <OUTPUT>
 
@@ -193,6 +193,12 @@ Options:
 
       --force
           Overwrite the destination if it already exists
+
+      --online
+          Take a coordinated snapshot (checkpoint + WAL-pinned copy cut at a named LSN) by opening the database. Plaintext, uncompressed data files only — a plain copy needs no key, this does
+
+      --allow-in-use
+          Copy a data directory that a live instance holds. The result may be TORN; it is recorded as inconsistent in the snapshot's manifest
 
   -h, --help
           Print help (see a summary with '-h')

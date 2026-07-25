@@ -1,0 +1,74 @@
+name: Nucleus compatibility
+
+# The headless client/ORM/PostgreSQL-differential harnesses. Every one of these
+# SKIPs (exit 0) when its toolchain is absent, so this workflow is honest on a
+# bare runner and only becomes a real gate once the runner has the toolchains
+# listed in `.forgejo/README.md`. Read the summary step: a run that is all-SKIP
+# proves nothing.
+
+on:
+  push:
+    paths:
+      - "nucleus/**"
+      - ".forgejo/workflows/nucleus-compat.yml"
+  workflow_dispatch:
+  schedule:
+    # 03:00 daily — compat needs a release build, so keep it off the PR path.
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: nucleus-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CARGO_HOME: /var/cache/forgejo-runner/cargo
+  CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-compat
+
+jobs:
+  compat:
+    name: Client and ORM compatibility
+    runs-on: nucleus-lab
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record which toolchains are present
+        run: |
+          echo "node:    $(node --version 2>/dev/null || echo ABSENT)"
+          echo "python3: $(python3 --version 2>&1 || echo ABSENT)"
+          echo "java:    $(java -version 2>&1 | head -1 || echo ABSENT)"
+          echo "psql:    $(psql --version 2>/dev/null || echo ABSENT)"
+          echo "initdb:  $(command -v initdb || echo ABSENT)"
+          echo "pgbouncer: $(command -v pgbouncer || echo ABSENT)"
+          echo "dotnet:  $(dotnet --version 2>/dev/null || echo ABSENT)"
+
+      # The harnesses each default to building; build once here and pass
+      # --no-build so the release binary is compiled a single time.
+      - name: Build release nucleus
+        run: cargo build --release --locked --bin nucleus
+
+      # run.sh resolves the binary as <nucleus>/target/release/nucleus, which
+      # CARGO_TARGET_DIR moves elsewhere. Give it the path it expects.
+      - name: Link release binary where the harnesses look for it
+        run: |
+          mkdir -p target/release
+          ln -sf "$CARGO_TARGET_DIR/release/nucleus" target/release/nucleus
+          ls -l target/release/nucleus
+
+      - name: PostgreSQL 17 regression differential
+        run: sh compat/pgregress/run.sh --no-build
+
+      - name: Binary COPY round-trip differential
+        run: sh compat/copybinary/run.sh
+
+      - name: ORM end-to-end (Drizzle, Prisma, SQLAlchemy)
+        run: sh compat/orm/run.sh --no-build
+
+      - name: JDBC (pgjdbc)
+        run: sh compat/jdbc/run.sh --no-build

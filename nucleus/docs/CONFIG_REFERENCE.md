@@ -28,6 +28,11 @@ falls back to its default.
 | `page_size` | `usize` | `16384` | `-` | - |
 | `use_direct_io` | `bool` | `false` | `NUCLEUS_STORAGE_USE_DIRECT_IO` | - |
 | `memory_mode` | `bool` | `false` | `NUCLEUS_STORAGE_MEMORY_MODE` | - |
+| `disk_check_interval_secs` | `u64` | `30` | `NUCLEUS_DISK_CHECK_INTERVAL_SECS` | How often to sample free space on the data directory's filesystem. 0 disables the disk watermark monitor entirely. |
+| `disk_warn_free_pct` | `f64` | `10.0` | `NUCLEUS_DISK_WARN_FREE_PCT` | Percentage of free space below which an operator alert is logged. |
+| `disk_readonly_free_pct` | `f64` | `3.0` | `NUCLEUS_DISK_READONLY_FREE_PCT` | Percentage of free space below which the server refuses writes (SQLSTATE 53100) instead of failing mid-write when the disk fills. |
+| `disk_min_free_mb` | `u64` | `256` | `NUCLEUS_DISK_MIN_FREE_MB` | Absolute free-space floor in MB. A percentage margin is meaningless on a small volume, so this triggers read-only independently. |
+| `disk_resume_free_pct` | `f64` | `6.0` | `NUCLEUS_DISK_RESUME_FREE_PCT` | Free space must climb back above this percentage before writes resume (hysteresis), so the server cannot flap at the watermark. |
 
 ## `[wal]`
 
@@ -115,11 +120,17 @@ probe hooks, not supported configuration.
 | `NUCLEUS_CACHE_DEFAULT_TTL_SECS` | `src/config/mod.rs` |
 | `NUCLEUS_CACHE_ENABLED` | `src/config/mod.rs` |
 | `NUCLEUS_CACHE_MAX_MEMORY_MB` | `src/config/mod.rs` |
+| `NUCLEUS_CACHE_ORACLE_ITERS` | `src/executor/tests/test_cache_coherence.rs` |
 | `NUCLEUS_CLUSTER_TOKEN` | `src/main.rs` |
 | `NUCLEUS_CRASHPOINT` | `src/bin/probe_crash_points.rs` |
 | `NUCLEUS_CRASHPOINT_HIT` | `src/bin/probe_crash_points.rs` |
 | `NUCLEUS_CRASHPOINT_SKIP` | `src/bin/probe_crash_points.rs` |
 | `NUCLEUS_DISABLE_QUERY_CACHE` | `src/bin/compete.rs` |
+| `NUCLEUS_DISK_CHECK_INTERVAL_SECS` | `src/config/mod.rs` |
+| `NUCLEUS_DISK_MIN_FREE_MB` | `src/config/mod.rs` |
+| `NUCLEUS_DISK_READONLY_FREE_PCT` | `src/config/mod.rs` |
+| `NUCLEUS_DISK_RESUME_FREE_PCT` | `src/config/mod.rs` |
+| `NUCLEUS_DISK_WARN_FREE_PCT` | `src/config/mod.rs` |
 | `NUCLEUS_ENCRYPT_KEY` | `src/main.rs` |
 | `NUCLEUS_ENCRYPT_PASSPHRASE` | `src/main.rs` |
 | `NUCLEUS_ENCRYPTION_KEY` | `src/bin/probe_index_coherence.rs` |
