@@ -818,6 +818,45 @@ here: this milestone's own rule is that optimization and engine surgery follow t
 correctness gates, and this belongs with the correctness milestones. `scale-budgets/` records that
 its source run failed invariants so no reader mistakes those bounds for a clean baseline.
 
+**Resolved after the fact, in two independent commits.** The hypothesis above — "an UPDATE or DELETE
+leaving the prior row version live" — was right about the symptom and wrong about the mechanism, and
+there turned out to be two mechanisms, not one.
+
+1. `DiskEngine`'s `usize` position was a *live-row scan ordinal*: `delete`/`update` walked the page
+   chain counting live tuples to the n-th. The executor resolves positions and then awaits (triggers,
+   RLS, CHECK/FK, cascades, index maintenance) before using them, so any concurrent DELETE of an
+   earlier row renumbered every later ordinal in that window and the deferred write landed on a
+   different row. `MvccStorageAdapter` hands out stable version indices, which is exactly why
+   `durable-mvcc` passed. Positions are now packed `(page_id, slot_idx)` physical addresses with
+   re-read guards for callers that resolve before awaiting.
+2. `DiskEngine` never took the buffer pool's frame latches at any of ~45 sites, so two concurrent
+   `insert_tuple` calls could claim the same `DATA_FREE_END` or the same dead slot. The targeted
+   repro failed 6 of 6 runs, one panicking on a slice out of bounds inside `btree::extract_key`.
+
+Both paged engines now pass the 8-way soak. Note the soak alone was never sufficient to catch (2):
+it spreads writes across pages, so only a same-page repro reaches it.
+
+### Open observations from the storage work, not closed
+
+- **One `SOAK FAILED` on `buffered-disk` that was never attributed.** It occurred on the first run
+  after the VACUUM change; the run's output was truncated before the `FAIL:` line was captured, so
+  the reason is unknown. Error rate was 0 and row counts matched across reopen, which narrows it to
+  coherence or checkpoint. It has not recurred in 37 subsequent runs (21 + 8 by the agent that saw
+  it, 8 more independently, including runs under concurrent build load), and base `0de4495` was 6/6
+  clean. Recorded rather than closed: "not reproducible in 37 runs" is not the same as explained,
+  and it is not claimed to be pre-existing.
+- **`alloc_data_page` takes L4 (`free_list_head`) before L1 (`tables`), inverting the documented
+  lock order** in `FrameDescriptor::latch`. It is not a deadlock today only because
+  `reuse_free_page` releases the free-list lock before returning. That is a latent trap sitting
+  directly on the rule the engine's deadlock-freedom argument rests on, and it should be corrected
+  before anything else is built on that order.
+- **Databases vacuumed by a pre-`008c13a` build may already carry stale index entries.** The fix
+  prevents new ones; it does not repair existing ones. `rebuild_table_indexes` is the repair path
+  and nothing currently invokes it for this.
+- **Executor-level positional indexes were not audited against VACUUM** — IvfFlat postings,
+  encrypted-index postings, and GIN are keyed by their own ordinals rather than by
+  `(page_id, slot_idx)`, and were out of scope for the slot-identity work.
+
 ### What larger runs require
 
 The 10M–100M row range in this milestone was deliberately not run. At the measured 1M-row footprint
