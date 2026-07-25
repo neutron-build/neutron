@@ -974,3 +974,64 @@ fn split_sql_statements(script: &str) -> Vec<String> {
     }
     out
 }
+
+// ============================================================================
+// Online physical backup, driven by the LIVE server
+// ============================================================================
+
+impl super::Executor {
+    /// Take an online physical backup of this RUNNING instance into `output`.
+    ///
+    /// This is the `pg_basebackup` shape: the backup is coordinated by the
+    /// process that owns the data directory, not by an external command trying
+    /// to read files out from under it. An outside process holds no lock, sees
+    /// no LSN, and cannot pin WAL retention, so it can only ever produce a torn
+    /// copy of a live database — which is why the CLI refuses one. Routing
+    /// through the live engine is what makes an online snapshot of a serving
+    /// database possible at all.
+    ///
+    /// Returns the manifest describing the snapshot.
+    #[cfg(feature = "server")]
+    pub async fn backup_online_to(
+        &self,
+        output: &std::path::Path,
+        force: bool,
+    ) -> Result<crate::backup::BackupManifest, ExecError> {
+        self.require_security_admin("take a physical backup")?;
+
+        let data_dir = self.data_dir.clone().ok_or_else(|| {
+            ExecError::Unsupported(
+                "this instance has no data directory (in-memory or embedded); \
+                 physical backup requires disk-backed storage"
+                    .into(),
+            )
+        })?;
+
+        // Flush catalog + metadata first so the snapshot carries the schema,
+        // roles, and policies that match its rows. Without this the copied
+        // catalog.json/meta.json could trail the data file by an unbounded
+        // amount, and a restore would come up with a schema that does not
+        // describe what it restored.
+        let _ = self.persist_catalog().await;
+
+        let coord = self
+            .storage
+            .as_backup_coordinator()
+            .ok_or_else(|| {
+                ExecError::Unsupported(
+                    "the active storage engine has no physical snapshot (only the \
+                     disk engine does); use a logical dump instead"
+                        .into(),
+                )
+            })?;
+
+        crate::backup::backup_online(
+            &data_dir,
+            output,
+            force,
+            env!("CARGO_PKG_VERSION"),
+            coord,
+        )
+        .map_err(|e| ExecError::Runtime(format!("online backup failed: {e}")))
+    }
+}

@@ -226,7 +226,51 @@ The consistency point covers the SQL substrate; the specialty-model WALs and
 catalog JSON are copied after it and are individually crash-consistent but not
 pinned to the same LSN.
 
+## Online backup of a running server
+
+An external process cannot take a consistent snapshot of a live data directory:
+it holds no lock, observes no LSN, and cannot pin WAL retention, so it can only
+produce a torn copy. `nucleus backup` therefore REFUSES a directory held by a
+running instance (liveness try-lock, so a lock left by a crashed process does
+not block the backup you most need after a crash).
+
+That left no way to back up a serving database, which is the milestone's actual
+goal. The fix follows PostgreSQL's `pg_basebackup` shape: the **running server
+snapshots itself**, coordinated from inside the process that owns the directory.
+
+```sql
+BACKUP DATABASE TO '/backups/nucleus-2026-07-24';   -- superuser only
+```
+
+`StorageEngine::as_backup_coordinator()` is the route — the executor holds an
+`Arc<dyn StorageEngine>` with no path to the concrete engine, so the trait
+offers the handle explicitly. Engines with no physical snapshot (memory, MVCC)
+return `None` and the command refuses with an explanation rather than producing
+something that merely looks like a backup. Verified end-to-end: a server serving
+traffic backed itself up, kept serving, and the snapshot restored to exactly the
+rows committed at the backup point (excluding a row inserted afterwards) into a
+database that then accepted writes.
+
+A destination inside the data directory is refused: the tree copy would
+otherwise descend into the snapshot it is writing until the path exceeded the OS
+limit, surfacing as "File name too long".
+
 ## Known gaps
+
+- **Page publish/flush ordering race (pre-existing).** Traversing a page chain
+  can fetch a page id that is reachable before its bytes are on disk, so
+  `fetch_page(..).unwrap()` panics with `UnexpectedEof` under buffer-pool
+  pressure. Normally the pool serves such a page from memory and hides it; the
+  page-by-page reads of an online backup add enough eviction pressure to expose
+  it roughly one run in three. The reproducer is
+  `online_backup_is_consistent_under_concurrent_writes_and_checkpoints`, kept as
+  an `#[ignore]`d test rather than deleted. The fix is buffer-pool ordering
+  (publish a page id only after its bytes are flushed), not a backup change.
+- **Cross-model backup consistency.** The consistent LSN covers the SQL
+  substrate. Specialty-model WALs and catalog JSON are copied after it: each is
+  individually crash-consistent, none is LSN-pinned with the SQL point.
+- **An unbounded retention pin.** WAL retention is held for the whole backup
+  window with no cap, so a very long backup grows the WAL without limit.
 
 - While an online backup holds its retention pin, the WAL is not reclaimed.
   On a write-heavy database a long backup therefore grows the WAL for its whole

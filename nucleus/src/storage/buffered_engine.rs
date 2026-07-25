@@ -133,6 +133,14 @@ impl BufferedDiskEngine {
 
 #[async_trait::async_trait]
 impl StorageEngine for BufferedDiskEngine {
+    fn as_backup_coordinator(&self) -> Option<&dyn crate::backup::BackupCoordinator> {
+        // Delegate to the disk engine underneath: the buffering layer holds no
+        // durable state of its own, and per-session transaction buffers are
+        // uncommitted by definition, so they are correctly excluded from a
+        // snapshot.
+        self.inner.as_backup_coordinator()
+    }
+
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             txn.ops.push(BufferedOp::CreateTable {

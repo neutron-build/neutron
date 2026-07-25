@@ -3998,7 +3998,9 @@ impl Executor {
                 // 'I' = INSERT, 'W' = WITH, 'B' = BEGIN, 'E' = EXPLAIN/EXECUTE,
                 // 'G' = GRANT, 'T' = TRUNCATE/TABLE, 'L' = LOCK/LISTEN,
                 // 'N' = NOTIFY, 'V' = VALUES/VACUUM, 'P' = PREPARE
-                b'I' | b'W' | b'B' | b'E' | b'G' | b'T' | b'L' | b'N' | b'V' | b'P' => true,
+                b'I' | b'W' | b'E' | b'G' | b'T' | b'L' | b'N' | b'V' | b'P' => true,
+                // 'B' could be BACKUP (extension) or BEGIN (standard)
+                b'B' => !Self::starts_with_ci(trimmed, "BACKUP"),
                 // 'U' could be UNSUBSCRIBE or UPDATE/UNLISTEN — check
                 b'U' => {
                     let second = trimmed
@@ -4083,6 +4085,44 @@ impl Executor {
                 return Ok(vec![self.execute_cache_stats()?]);
             }
             // REFRESH MATERIALIZED VIEW <name> — re-execute the query and update cached rows.
+            // BACKUP DATABASE TO '<path>' [FORCE]
+            //
+            // The pg_basebackup shape: a RUNNING server snapshots itself. The
+            // `nucleus backup` CLI deliberately refuses a live data directory
+            // (an outside process cannot pin WAL retention or observe LSNs, so
+            // it can only produce a torn copy), which left no way to back up a
+            // serving database. This is that way.
+            #[cfg(feature = "server")]
+            if upper.starts_with("BACKUP DATABASE TO ") {
+                let rest = trimmed["BACKUP DATABASE TO ".len()..].trim().trim_end_matches(';');
+                let force = rest.to_uppercase().ends_with(" FORCE");
+                let path_part = if force {
+                    rest[..rest.len() - " FORCE".len()].trim()
+                } else {
+                    rest
+                };
+                let path = path_part.trim_matches('\'').trim_matches('"');
+                if path.is_empty() {
+                    return Err(ExecError::Unsupported(
+                        "BACKUP DATABASE TO requires a destination path".into(),
+                    ));
+                }
+                let manifest = self
+                    .backup_online_to(std::path::Path::new(path), force)
+                    .await?;
+                return Ok(vec![ExecResult::Select {
+                    columns: vec![
+                        ("destination".into(), DataType::Text),
+                        ("consistent_lsn".into(), DataType::Int64),
+                        ("database_id".into(), DataType::Text),
+                    ],
+                    rows: vec![vec![
+                        Value::Text(path.to_string()),
+                        Value::Int64(manifest.consistent_lsn as i64),
+                        Value::Text(manifest.database_id.clone()),
+                    ]],
+                }]);
+            }
             if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
                 self.require_security_admin("refresh materialized views")?;
                 let view_name = trimmed[26..].trim().trim_end_matches(';').to_string();

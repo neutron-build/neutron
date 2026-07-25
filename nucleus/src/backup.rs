@@ -420,6 +420,7 @@ pub fn backup_data_dir_opts(
     // and a restore could never tell one database from another.
     let db_id = database_id(data_dir);
 
+    reject_nested_destination(data_dir, output_dir)?;
     prepare_output_dir(output_dir, force)?;
     let snapshot_data = output_dir.join(DATA_SUBDIR);
     copy_dir_filtered(data_dir, &snapshot_data, &|rel| !is_runtime_only(rel))?;
@@ -464,6 +465,7 @@ pub fn backup_online(
     // `backup_data_dir_opts`).
     let db_id = database_id(data_dir);
 
+    reject_nested_destination(data_dir, output_dir)?;
     prepare_output_dir(output_dir, force)?;
     let snapshot_data = output_dir.join(DATA_SUBDIR);
     std::fs::create_dir_all(&snapshot_data)?;
@@ -566,6 +568,50 @@ fn copy_wal_upto(src_dir: &Path, dst_dir: &Path, end_lsn: u64) -> io::Result<()>
         if crate::storage::wal::copy_segment_prefix_upto_lsn(&src, &dst, end_lsn)?.is_none() {
             let _ = std::fs::remove_file(&dst);
         }
+    }
+    Ok(())
+}
+
+/// Refuse a destination inside the source data directory.
+///
+/// The tree copy would descend into the snapshot it is writing and copy it into
+/// itself until the path exceeds the OS limit, surfacing as a baffling
+/// "File name too long" rather than "you asked for something impossible".
+/// `BACKUP DATABASE TO '/var/lib/nucleus/data/backup'` is an easy thing to type,
+/// so it must fail clearly and immediately.
+fn reject_nested_destination(data_dir: &Path, output_dir: &Path) -> io::Result<()> {
+    let src = data_dir.canonicalize().unwrap_or_else(|_| data_dir.to_path_buf());
+    // The destination usually does not exist yet: canonicalize its nearest
+    // existing ancestor, then re-attach the remainder.
+    let mut probe = output_dir.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let dst = loop {
+        if let Ok(mut c) = probe.canonicalize() {
+            for part in tail.iter().rev() {
+                c.push(part);
+            }
+            break c;
+        }
+        match probe.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                if !probe.pop() {
+                    break output_dir.to_path_buf();
+                }
+            }
+            None => break output_dir.to_path_buf(),
+        }
+    };
+    if dst.starts_with(&src) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "backup destination {} is inside the data directory {} — the snapshot would \
+                 copy itself recursively. Choose a destination outside the data directory.",
+                dst.display(),
+                src.display()
+            ),
+        ));
     }
     Ok(())
 }

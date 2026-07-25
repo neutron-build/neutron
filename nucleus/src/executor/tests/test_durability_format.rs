@@ -284,3 +284,110 @@ async fn catalog_metadata_and_specialty_state_all_survive_reopen() {
         knn.err()
     );
 }
+
+// ============================================================================
+// Online backup driven by the live instance
+// ============================================================================
+
+/// A RUNNING instance must be able to snapshot itself.
+///
+/// The CLI deliberately refuses to copy a live data directory, because an
+/// outside process holds no lock, observes no LSN, and cannot pin WAL
+/// retention — it can only produce a torn copy. That left no way at all to back
+/// up a serving database, which is the milestone's actual goal. The fix routes
+/// the backup through the live engine (the `pg_basebackup` shape: the server
+/// snapshots itself), reachable from the executor via
+/// `StorageEngine::as_backup_coordinator`.
+#[tokio::test]
+async fn a_live_instance_can_snapshot_itself_and_the_snapshot_restores() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ex = open_executor(tmp.path()).await;
+    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    for i in 1..=50 {
+        exec(&ex, &format!("INSERT INTO t VALUES ({i}, 'row{i}')")).await;
+    }
+
+    // The executor is holding the data directory open — exactly the case the
+    // CLI refuses — and must still be able to snapshot itself.
+    let outside = tempfile::tempdir().unwrap();
+    let out = outside.path().join("snap");
+    let manifest = ex
+        .backup_online_to(&out, false)
+        .await
+        .expect("a live instance must be able to back itself up");
+    assert!(manifest.online, "manifest must record an online snapshot");
+    assert!(
+        manifest.consistent_lsn > 0,
+        "an online snapshot must name the LSN it is consistent through"
+    );
+    assert!(
+        !manifest.database_id.is_empty(),
+        "snapshot must carry a database identity"
+    );
+
+    // The instance keeps serving after the backup window closes.
+    exec(&ex, "INSERT INTO t VALUES (51, 'after-backup')").await;
+    let r = exec(&ex, "SELECT COUNT(*) FROM t").await;
+    assert_eq!(scalar(&r[0]), &Value::Int64(51));
+
+    // The snapshot restores to the committed point, and is USABLE — not merely
+    // present. A restore that cannot take a write is not a backup.
+    let restored = outside.path().join("restored");
+    crate::backup::restore_data_dir(&out, &restored, false, env!("CARGO_PKG_VERSION"))
+        .expect("restore the online snapshot");
+    let ex2 = open_executor(&restored).await;
+    let r = exec(&ex2, "SELECT COUNT(*) FROM t").await;
+    let n = match scalar(&r[0]) {
+        Value::Int64(v) => *v,
+        Value::Int32(v) => i64::from(*v),
+        other => panic!("unexpected count type: {other:?}"),
+    };
+    assert!(
+        (50..=51).contains(&n),
+        "restored snapshot must hold the rows committed by the backup point, got {n}"
+    );
+    exec(&ex2, "INSERT INTO t VALUES (100, 'post-restore')").await;
+}
+
+/// An engine with no physical snapshot must say so, not silently produce
+/// something that looks like a backup.
+#[tokio::test]
+async fn an_engine_without_a_physical_snapshot_refuses_clearly() {
+    let ex = test_executor(); // memory engine
+    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let err = ex
+        .backup_online_to(&tmp.path().join("snap"), false)
+        .await
+        .expect_err("a memory engine has no physical snapshot");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("physical snapshot") || msg.contains("data directory"),
+        "refusal should explain why, got: {msg}"
+    );
+}
+
+/// A destination inside the data directory must be refused, clearly.
+///
+/// Found while writing the test above: the tree copy descends into the snapshot
+/// it is writing and copies it into itself until the path exceeds the OS limit,
+/// which surfaced as "File name too long" — a message that tells the operator
+/// nothing. `BACKUP DATABASE TO '/var/lib/nucleus/data/backup'` is an easy
+/// thing to type.
+#[tokio::test]
+async fn a_backup_destination_inside_the_data_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ex = open_executor(tmp.path()).await;
+    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    exec(&ex, "INSERT INTO t VALUES (1)").await;
+
+    let err = ex
+        .backup_online_to(&tmp.path().join("inner_snap"), false)
+        .await
+        .expect_err("a destination inside the data directory must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("inside the data directory"),
+        "refusal must explain the nesting problem, got: {msg}"
+    );
+}
