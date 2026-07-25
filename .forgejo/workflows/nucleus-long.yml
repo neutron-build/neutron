@@ -1,0 +1,101 @@
+name: Nucleus long-running
+
+# The reason a Forgejo runner is worth standing up at all.
+#
+# GitHub-hosted jobs are capped at 6 hours, which makes a multi-hour soak, a
+# 10M+ row scale load, and a full-scale probe sweep impossible there. A
+# self-hosted runner has no such cap, so those gates live here and only here.
+#
+# Nothing in this workflow runs on push — it is scheduled and manual. It is
+# also the workflow that must NOT share a machine with a benchmark: timings
+# recorded here are latency-sensitive.
+
+on:
+  schedule:
+    # 01:00 Sunday. A full sweep plus a soak is hours, not minutes.
+    - cron: "0 1 * * 0"
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "probe_soak duration in seconds"
+        required: false
+        default: "10800"
+      rows_target:
+        description: "probe_soak --rows-target (0 = leave at harness default)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: nucleus-long
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CARGO_HOME: /var/cache/forgejo-runner/cargo
+  CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-long
+
+jobs:
+  soak:
+    name: Soak
+    runs-on: nucleus-lab
+    # 24h. This value is the whole point of the runner; do not lower it to
+    # match GitHub's cap.
+    timeout-minutes: 1440
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm this is Linux
+        # probe_soak's RSS leak gate reads /proc/self/status. On macOS it is a
+        # SILENT no-op — the harness passes without ever checking for a leak.
+        # Fail loudly rather than record a meaningless green.
+        run: |
+          test "$(uname -s)" = "Linux" || {
+            echo "probe_soak's leak gate needs /proc; this runner is $(uname -s)" >&2
+            exit 1
+          }
+          test -r /proc/self/status
+
+      - name: Build soak harness
+        run: cargo build --release --locked --features server --bin probe_soak
+
+      - name: Soak
+        run: |
+          SECS="${{ github.event.inputs.soak_seconds }}"
+          ROWS="${{ github.event.inputs.rows_target }}"
+          [ -n "$SECS" ] || SECS=10800
+          ARGS="--duration-secs $SECS --concurrency 8 --leak-limit-mb 256"
+          if [ -n "$ROWS" ] && [ "$ROWS" != "0" ]; then
+            ARGS="$ARGS --rows-target $ROWS"
+          fi
+          echo "probe_soak $ARGS"
+          "$CARGO_TARGET_DIR/release/probe_soak" $ARGS
+
+  probe-full:
+    name: Probe suite (full scale)
+    runs-on: nucleus-lab
+    timeout-minutes: 1440
+    env:
+      CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-long-probe
+      PROBE_SCALE: full
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Full-scale probe sweep
+        run: bash scripts/probe.sh
+
+      - name: Dump probe artifacts on failure
+        if: failure()
+        run: |
+          for f in probe-artifacts/*.log; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            cat "$f"
+          done
