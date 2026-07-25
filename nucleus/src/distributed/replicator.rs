@@ -41,6 +41,34 @@ use crate::raft::{
 };
 use crate::transport::{Message, NodeId, RaftCommand, RaftEntry, TcpTransport};
 
+/// Why a proposal did not reach the log.
+///
+/// [`ProposeError::Nondeterministic`] is kept distinct from the transient
+/// failures on purpose: a caller may reasonably fall back to a local write when
+/// a quorum is briefly unreachable, but doing so after a determinism refusal
+/// would write on the leader only — which is precisely the silent divergence the
+/// refusal exists to prevent. Callers must treat it as fatal for the statement.
+#[derive(Debug, Clone)]
+pub enum ProposeError {
+    /// The statement cannot be replicated without replicas disagreeing.
+    Nondeterministic(crate::raft::determinism::NondeterminismError),
+    /// This node is not the leader (or lost leadership mid-proposal).
+    NotLeader(String),
+    /// The entry could not be made durable or acknowledged by a quorum.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for ProposeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProposeError::Nondeterministic(e) => write!(f, "{e}"),
+            ProposeError::NotLeader(m) | ProposeError::Unavailable(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for ProposeError {}
+
 // ── RaftReplicator ────────────────────────────────────────────────────────────
 
 /// Drives consensus and replication for a single Nucleus cluster node.
@@ -77,8 +105,48 @@ impl RaftReplicator {
         peers: Vec<(NodeId, String)>,
         transport: Arc<TcpTransport>,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        Self::with_storage(node_id, peers, transport, None::<std::path::PathBuf>)
+    }
+
+    /// Create a replicator whose Raft state is durable under `raft_dir`.
+    ///
+    /// Passing `None` yields a volatile node: usable for tests and for
+    /// memory-mode servers, but **not** restart-safe. A server with a data
+    /// directory must pass one, or a restart can cost a second leader in a term
+    /// that already had one.
+    pub fn with_storage(
+        node_id: NodeId,
+        peers: Vec<(NodeId, String)>,
+        transport: Arc<TcpTransport>,
+        raft_dir: Option<impl AsRef<std::path::Path>>,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
         let peer_ids: Vec<NodeId> = peers.iter().map(|(id, _)| *id).collect();
-        let raft = Arc::new(Mutex::new(RaftNode::new(node_id, peer_ids)));
+        let node = match raft_dir {
+            Some(dir) => match RaftNode::open(node_id, peer_ids.clone(), dir.as_ref()) {
+                Ok(node) => {
+                    tracing::info!(
+                        "raft: restored durable state from {} (term {}, voted_for {:?}, log to {})",
+                        dir.as_ref().display(),
+                        node.current_term,
+                        node.voted_for,
+                        node.last_log_index()
+                    );
+                    node
+                }
+                Err(e) => {
+                    // Falling back to volatile state would silently drop the
+                    // restart guarantee, so say so loudly rather than pretend.
+                    tracing::error!(
+                        "raft: could not open durable state at {}: {e}. \
+                         Running WITHOUT restart safety — a crash can elect a second leader.",
+                        dir.as_ref().display()
+                    );
+                    RaftNode::new(node_id, peer_ids)
+                }
+            },
+            None => RaftNode::new(node_id, peer_ids),
+        };
+        let raft = Arc::new(Mutex::new(node));
 
         let (apply_tx, apply_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -181,16 +249,38 @@ impl RaftReplicator {
     /// Propose a SQL statement to the Raft log and wait until a majority of nodes
     /// have acknowledged it. Only callable on the leader; returns an error otherwise.
     ///
-    /// After this returns `Ok(())`, the caller should execute the SQL locally so the
-    /// client connection gets a real result. Followers will execute via `apply_rx`.
-    pub async fn propose_and_await(&self, sql: &str) -> Result<(), String> {
+    /// # Determinism
+    ///
+    /// The statement is **not** replicated verbatim. It first passes through
+    /// [`crate::raft::determinism::prepare_for_replication`], which either proves
+    /// it deterministic, folds clock/RNG volatility to leader-evaluated literals,
+    /// or refuses it. On success this returns the SQL the caller **must** execute
+    /// locally — that is the same string the followers will apply, so the leader
+    /// cannot drift from its own replicas. Executing the original `sql` after a
+    /// fold would reintroduce exactly the divergence this gate removes.
+    pub async fn propose_and_await(&self, sql: &str) -> Result<String, ProposeError> {
+        let prepared = crate::raft::determinism::prepare_for_replication(sql)
+            .map_err(ProposeError::Nondeterministic)?;
+        let replicated = prepared.into_sql();
+
         let log_index = {
             let mut raft = self.raft.lock().await;
             if raft.role != Role::Leader {
-                return Err("not leader".to_string());
+                return Err(ProposeError::NotLeader("not leader".to_string()));
             }
-            raft.append_entry(Command::Sql(sql.to_string()))
-                .ok_or_else(|| "failed to append to log (not leader)".to_string())?
+            match raft.append_entry(Command::Sql(replicated.clone())) {
+                Some(idx) => idx,
+                None if raft.durability_failed() => {
+                    return Err(ProposeError::Unavailable(
+                        "cannot append to the Raft log: durable state is unwritable".to_string(),
+                    ));
+                }
+                None => {
+                    return Err(ProposeError::NotLeader(
+                        "failed to append to log (not leader)".to_string(),
+                    ));
+                }
+            }
         };
 
         let (tx, rx) = oneshot::channel();
@@ -201,14 +291,18 @@ impl RaftReplicator {
 
         // Wait for quorum commit (5 s timeout).
         match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => Ok(replicated),
             Ok(Err(_)) => {
                 self.pending.lock().await.remove(&log_index);
-                Err("proposal oneshot dropped".to_string())
+                Err(ProposeError::Unavailable(
+                    "proposal oneshot dropped".to_string(),
+                ))
             }
             Err(_) => {
                 self.pending.lock().await.remove(&log_index);
-                Err("quorum timeout: no majority ack within 5 s".to_string())
+                Err(ProposeError::Unavailable(
+                    "quorum timeout: no majority ack within 5 s".to_string(),
+                ))
             }
         }
     }

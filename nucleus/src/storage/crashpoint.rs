@@ -72,6 +72,23 @@ pub const ALL_POINTS: &[&str] = &[
     "meta.after_rename",
 ];
 
+/// Raft durability boundaries, kept separate from [`ALL_POINTS`] because a SQL
+/// workload never reaches them — listing them there would make
+/// `probe_crash_points` report six permanent, bogus coverage gaps. They are
+/// driven by `probe_raft_crash` instead.
+///
+/// These are the windows Raft's safety proof depends on: a vote or an
+/// acknowledged entry lost across one of them lets a single term elect two
+/// leaders, or drops a write a client was already told was committed.
+pub const ALL_RAFT_POINTS: &[&str] = &[
+    "raft.before_hardstate_fsync",
+    "raft.after_hardstate_fsync",
+    "raft.before_hardstate_rename",
+    "raft.after_hardstate_rename",
+    "raft.before_log_fsync",
+    "raft.after_log_fsync",
+];
+
 // ============================================================================
 // I/O fault injection
 // ============================================================================
@@ -86,7 +103,15 @@ static IO_SEEN: AtomicU64 = AtomicU64::new(0);
 static IO_SKIP: OnceLock<u64> = OnceLock::new();
 
 /// Every I/O fault point the engine declares.
-pub const ALL_IO_POINTS: &[&str] = &["wal.append", "wal.fsync", "meta.write"];
+pub const ALL_IO_POINTS: &[&str] = &[
+    "wal.append",
+    "wal.fsync",
+    "meta.write",
+    // A Raft node that cannot persist must refuse to vote or acknowledge
+    // rather than answer from memory; these points make that path testable.
+    "raft.hardstate_write",
+    "raft.log_append",
+];
 
 fn io_armed() -> Option<&'static str> {
     IO_ARMED
@@ -172,7 +197,7 @@ mod tests {
     fn disabled_crashpoints_are_inert() {
         // With nothing armed (the default in the test process), every declared
         // point must be a no-op. If this ever aborts, the suite dies loudly.
-        for p in ALL_POINTS {
+        for p in ALL_POINTS.iter().chain(ALL_RAFT_POINTS) {
             reach(p);
         }
     }
@@ -187,7 +212,7 @@ mod tests {
     #[test]
     fn point_names_are_unique_and_namespaced() {
         let mut seen = std::collections::HashSet::new();
-        for p in ALL_POINTS {
+        for p in ALL_POINTS.iter().chain(ALL_RAFT_POINTS) {
             assert!(seen.insert(*p), "duplicate crashpoint name: {p}");
             assert!(
                 p.contains('.'),
