@@ -191,10 +191,12 @@ enum Commands {
         json: bool,
     },
 
-    /// Back up a data directory to a portable snapshot (physical, v1).
+    /// Back up a data directory to a portable snapshot (physical).
     ///
-    /// Take it against a STOPPED instance for a consistent snapshot. Restore
-    /// requires the same Nucleus version (physical snapshots are version-locked).
+    /// Refuses to run against a data directory a live instance holds: a plain
+    /// copy of a database being written to is torn, and a torn snapshot that
+    /// reports success is worse than no snapshot. Restore requires a build on
+    /// the same on-disk format version.
     Backup {
         /// Data directory to back up.
         #[arg(short, long, default_value = "nucleus_data")]
@@ -207,6 +209,17 @@ enum Commands {
         /// Overwrite the destination if it already exists.
         #[arg(long)]
         force: bool,
+
+        /// Take a coordinated snapshot (checkpoint + WAL-pinned copy cut at a
+        /// named LSN) by opening the database. Plaintext, uncompressed data
+        /// files only — a plain copy needs no key, this does.
+        #[arg(long)]
+        online: bool,
+
+        /// Copy a data directory that a live instance holds. The result may be
+        /// TORN; it is recorded as inconsistent in the snapshot's manifest.
+        #[arg(long)]
+        allow_in_use: bool,
     },
 
     /// Restore a data directory from a snapshot created by `backup`.
@@ -412,8 +425,10 @@ async fn main() {
             data,
             output,
             force,
+            online,
+            allow_in_use,
         }) => {
-            cmd_backup(data, output, force);
+            cmd_backup(data, output, force, online, allow_in_use);
         }
         Some(Commands::Restore { input, data, force }) => {
             cmd_restore(input, data, force);
@@ -733,6 +748,32 @@ async fn cmd_start(cfg: StartConfig) {
             std::fs::create_dir_all(&data).expect("failed to create data directory");
             tracing::info!("Created data directory: {}", data.display());
         }
+
+        // Announce that this directory is live. `nucleus backup` observes this
+        // lock and refuses to take a plain directory copy out from under a
+        // running writer — a copy that would look successful and restore into
+        // a torn database. Held for the process lifetime; released by the
+        // kernel on exit, so a crash never leaves a lock that blocks recovery.
+        match nucleus::backup::DataDirLock::acquire(&data) {
+            Ok(Some(lock)) => {
+                // Deliberately leaked: the lock must outlive every scope in
+                // this function and die only with the process.
+                std::mem::forget(lock);
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "{} is already locked by another Nucleus instance; continuing, but two \
+                     writers on one data directory will corrupt it",
+                    data.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("could not lock data directory {}: {e}", data.display());
+            }
+        }
+        // Give the database a stable identity so a restore can tell this
+        // database from a different one.
+        let _ = nucleus::backup::database_id(&data);
 
         // Load persisted catalog (table/index definitions) from previous session
         let catalog_path = data.join("catalog.json");
@@ -2336,8 +2377,14 @@ fn cmd_init(data: PathBuf) {
     println!("Start with: nucleus start --data {}", data.display());
 }
 
-fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
-    match nucleus::backup::backup_data_dir(&data, &output, force, env!("CARGO_PKG_VERSION")) {
+fn cmd_backup(data: PathBuf, output: PathBuf, force: bool, online: bool, allow_in_use: bool) {
+    let version = env!("CARGO_PKG_VERSION");
+    let result = if online {
+        backup_online_via_engine(&data, &output, force, version, allow_in_use)
+    } else {
+        nucleus::backup::backup_data_dir_opts(&data, &output, force, version, allow_in_use)
+    };
+    match result {
         Ok(manifest) => {
             println!(
                 "Backup complete: {} -> {}",
@@ -2345,6 +2392,25 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
                 output.display()
             );
             println!("  Nucleus version: {}", manifest.nucleus_version);
+            println!("  On-disk format:  v{}", manifest.format_version);
+            println!("  Database id:     {}", manifest.database_id);
+            println!("  Files:           {} (BLAKE3 checksummed)", manifest.files.len());
+            if manifest.online {
+                println!("  Consistency:     online, consistent through LSN {}", manifest.consistent_lsn);
+            } else if manifest.taken_while_in_use {
+                println!(
+                    "  Consistency:     NONE — copied while the database was in use. \
+                     This snapshot may be torn and is recorded as such in its manifest."
+                );
+            } else {
+                println!("  Consistency:     offline copy of a quiesced directory");
+            }
+            if manifest.encryption.encrypted {
+                println!(
+                    "  At rest:         encrypted ({}) — restoring needs the same key",
+                    manifest.encryption.algorithm.as_deref().unwrap_or("unknown")
+                );
+            }
             println!(
                 "  Restore with: nucleus restore --input {} --data <dir>",
                 output.display()
@@ -2355,6 +2421,84 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
             std::process::exit(1);
         }
     }
+}
+
+/// Take a coordinated online snapshot by opening the data directory's SQL
+/// engine ourselves: checkpoint, pin WAL retention, copy the data file with
+/// every page slot validated, then cut the WAL at a named LSN.
+///
+/// Opt-in rather than the default for one reason: this process must open the
+/// data file, and it has no way to know an encrypted or compressed database's
+/// settings from the outside. Guessing wrong is caught by page checksums (the
+/// open fails loudly rather than snapshotting garbage), but a plain directory
+/// copy needs no such guess, so it stays the default.
+fn backup_online_via_engine(
+    data: &std::path::Path,
+    output: &std::path::Path,
+    force: bool,
+    version: &str,
+    allow_in_use: bool,
+) -> std::io::Result<nucleus::backup::BackupManifest> {
+    use nucleus::backup::{DataDirLock, backup_data_dir_opts, backup_online};
+
+    if !data.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("data directory does not exist: {}", data.display()),
+        ));
+    }
+
+    // Take the directory lock for the duration of the backup. Failing to get
+    // it means a live instance owns the directory.
+    let _lock = match DataDirLock::acquire(data)? {
+        Some(lock) => lock,
+        None => {
+            if allow_in_use {
+                eprintln!(
+                    "warning: {} is open by a running instance; taking an INCONSISTENT copy \
+                     because the in-use override was given",
+                    data.display()
+                );
+                return backup_data_dir_opts(data, output, force, version, true);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                format!(
+                    "{} is open by a running Nucleus instance. A snapshot taken from outside \
+                     that instance would be TORN. Stop the server and re-run, or pass \
+                     --allow-in-use to accept an inconsistent copy (it is recorded as \
+                     inconsistent in the manifest).",
+                    data.display()
+                ),
+            ));
+        }
+    };
+
+    let db_path = data.join("nucleus.db");
+    if !db_path.is_file() {
+        // No SQL data file (fresh or non-SQL directory) — nothing to
+        // coordinate with; a plain copy is exactly right and is honest about
+        // having no LSN consistency point.
+        return backup_data_dir_opts(data, output, force, version, false);
+    }
+
+    let catalog = Arc::new(Catalog::new());
+    let engine = DiskEngine::open_segmented(
+        &db_path,
+        catalog,
+        nucleus::storage::buffer::DEFAULT_POOL_SIZE,
+        64,
+    )
+    .map_err(
+        |e| {
+            std::io::Error::other(format!(
+                "could not open {} for an online backup: {e}. If this database is encrypted or \
+                 compressed, take the backup without --online (the plain copy needs no key).",
+                db_path.display()
+            ))
+        },
+    )?;
+    backup_online(data, output, force, version, &engine)
 }
 
 #[allow(clippy::too_many_arguments)]

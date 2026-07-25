@@ -173,6 +173,10 @@ struct DiskTxnState {
 
 /// Disk-backed storage engine.
 pub struct DiskEngine {
+    /// Path of the primary data file (its `.wal` / `.wal.d` siblings hold the
+    /// WAL). Needed by physical backup, which must copy this file through the
+    /// page-verified path and the rest of the directory verbatim.
+    path: std::path::PathBuf,
     pool: Arc<BufferPool>,
     /// Table name → table metadata.
     tables: RwLock<HashMap<String, TableMeta>>,
@@ -631,6 +635,7 @@ impl DiskEngine {
         };
 
         let mut engine = Self {
+            path: path.to_path_buf(),
             pool,
             tables: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
@@ -797,6 +802,32 @@ impl DiskEngine {
             let _ = self.pool.wal_truncate_before(cp_lsn);
         }
         Ok(())
+    }
+
+    /// How many times a page slot is re-read before an online backup gives up
+    /// on getting a complete image of it. A page write is a single
+    /// fixed-size write, so a slot caught mid-write resolves on the next read;
+    /// the retries exist so a pathologically hot page cannot fail a backup,
+    /// and the cap exists so genuine on-disk corruption fails LOUDLY instead
+    /// of spinning forever.
+    const BACKUP_SLOT_READ_ATTEMPTS: u32 = 16;
+
+    /// Whether raw slot bytes decode to a complete, self-consistent page.
+    ///
+    /// Mirrors the buffer pool's own admission rule (`fetch_page`): a page is
+    /// acceptable if its checksum verifies, or if it is a never-yet-written
+    /// free page (all-zero checksum field). Anything else is a half-written
+    /// page and must not enter a snapshot.
+    fn slot_is_complete_page(disk: &DiskManager, raw: &[u8], scratch: &mut PageBuf) -> bool {
+        if disk.decode_slot(raw, scratch).is_err() {
+            return false;
+        }
+        if page::get_page_type(scratch) == page::PAGE_TYPE_FREE
+            && page::read_u32(scratch, page::HEADER_CHECKSUM) == 0
+        {
+            return true;
+        }
+        page::verify_checksum(scratch)
     }
 
     /// Save the table directory (table_name → first_page_id + col_types) to the meta page.
@@ -1451,6 +1482,120 @@ impl DiskEngine {
     /// orphans — directory tables the catalog no longer knows about (T0.3).
     pub fn table_names(&self) -> Vec<String> {
         self.tables.read().keys().cloned().collect()
+    }
+}
+
+/// Online physical backup coordination.
+///
+/// The window between `backup_begin` and `backup_end` is the interval the
+/// snapshot's data file may lag the WAL by. Two things make it safe:
+///
+/// 1. **Retention is pinned** at the window's start LSN, so a checkpoint firing
+///    mid-backup cannot reclaim the records that bring the copied pages
+///    forward. Without this, a long copy on a busy database silently produces
+///    an unrecoverable snapshot.
+/// 2. **Every page write inside the window is WAL-logged as a full image
+///    before it reaches the data file** (the buffer pool's write-ahead
+///    protocol), so replaying the window over the copy repairs every page the
+///    copy caught stale.
+///
+/// The copy itself refuses to write a half-written page (`snapshot_data_file`),
+/// so the only difference between a copied page and its final state is *age*,
+/// which is exactly what redo fixes.
+impl crate::backup::BackupCoordinator for DiskEngine {
+    fn backup_begin(&self) -> std::io::Result<u64> {
+        // Pin BEFORE the checkpoint: the checkpoint's own truncate_before must
+        // already be clamped when it runs, or it can reclaim the window's
+        // first records before the pin exists.
+        let start = self.pool.wal_current_lsn().max(1);
+        self.pool.wal_pin_retention(start);
+        self.checkpoint()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Seal, so the window's records begin in a fresh segment.
+        self.pool
+            .wal_rotate()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(start)
+    }
+
+    fn backup_end(&self) -> std::io::Result<u64> {
+        // Name the consistency point first, then make exactly that point
+        // durable. Taking it after the sync would let records written during
+        // the sync inflate the claim beyond what is on disk.
+        let end = self.pool.wal_current_lsn().saturating_sub(1);
+        self.pool
+            .wal_sync_up_to(end)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.pool
+            .wal_rotate()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(end)
+    }
+
+    fn backup_release(&self) {
+        self.pool.wal_unpin_retention();
+    }
+
+    fn data_file_path(&self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+
+    fn snapshot_data_file(&self, dst: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let disk = self.pool.disk();
+        let slots = disk.slot_count()?;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(dst)?;
+        let mut out = std::io::BufWriter::new(file);
+        let mut raw: Vec<u8> = Vec::new();
+        let mut scratch: Box<PageBuf> = Box::new([0u8; PAGE_SIZE]);
+        for page_id in 0..slots {
+            let mut complete = false;
+            for attempt in 0..Self::BACKUP_SLOT_READ_ATTEMPTS {
+                match disk.read_slot_raw(page_id, &mut raw) {
+                    Ok(()) => {}
+                    // The file was measured before the loop; a short read here
+                    // means it shrank underneath us, which a live engine never
+                    // does. Surface it rather than pad the snapshot.
+                    Err(e) => return Err(e),
+                }
+                if Self::slot_is_complete_page(disk, &raw, &mut scratch) {
+                    complete = true;
+                    break;
+                }
+                // Give the writer the moment it needs to finish the page.
+                std::thread::sleep(std::time::Duration::from_millis(1 + u64::from(attempt)));
+            }
+            if !complete {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "page {page_id} of {} never read back as a complete image after {} \
+                         attempts — the backup was ABANDONED rather than write a torn page \
+                         into a snapshot that would look restorable",
+                        self.path.display(),
+                        Self::BACKUP_SLOT_READ_ATTEMPTS
+                    ),
+                ));
+            }
+            out.write_all(&raw)?;
+        }
+        out.flush()?;
+        out.into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .sync_all()
+    }
+
+    fn encryption_info(&self) -> crate::backup::BackupEncryption {
+        let disk = self.pool.disk();
+        crate::backup::BackupEncryption {
+            encrypted: disk.is_encrypted(),
+            compressed: disk.is_compressed(),
+            algorithm: disk.is_encrypted().then(|| "aes-256-gcm".to_string()),
+            key_id: None,
+        }
     }
 }
 
@@ -4802,6 +4947,300 @@ mod tests {
         }
     }
 
+    // ── Online physical backup ─────────────────────────────────────────
+    //
+    // The property under test is the one that used to be silently false: a
+    // snapshot taken while the database is being written to must restore into
+    // a *usable, non-lying* database — every row that was committed before the
+    // backup started is present, and every row present is one that was really
+    // inserted (no torn pages reconstituted as garbage).
+
+    /// Restore a snapshot into a fresh directory and return the row ids it
+    /// contains.
+    async fn ids_after_restore(snap: &std::path::Path, dst: &std::path::Path) -> Vec<i32> {
+        crate::backup::restore_data_dir(snap, dst, false, env!("CARGO_PKG_VERSION"))
+            .expect("restore of a freshly taken snapshot must succeed");
+        let catalog = Arc::new(Catalog::new());
+        register_simple_table(&catalog, "t").await;
+        let engine = DiskEngine::open_segmented_with_sync(
+            &dst.join("nucleus.db"),
+            catalog,
+            DEFAULT_POOL_SIZE,
+            64,
+            wal::SyncMode::Fsync,
+        )
+        .expect("a restored snapshot must open");
+        engine.create_table("t").await.unwrap();
+        engine
+            .scan("t")
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Int32(n) => *n,
+                other => panic!("restored row has a non-Int32 id: {other:?} (torn page?)"),
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn online_backup_is_consistent_under_concurrent_writes_and_checkpoints() {
+        use crate::backup::backup_online;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("nucleus.db");
+
+        let catalog = Arc::new(Catalog::new());
+        register_simple_table(&catalog, "t").await;
+        let engine = Arc::new(
+            DiskEngine::open_segmented_with_sync(
+                &db_path,
+                catalog,
+                DEFAULT_POOL_SIZE,
+                4,
+                wal::SyncMode::Fsync,
+            )
+            .unwrap(),
+        );
+        engine.create_table("t").await.unwrap();
+
+        // Baseline: committed and checkpointed before the backup begins, so it
+        // must survive no matter what the concurrent load does.
+        const BASELINE: i32 = 800;
+        for i in 0..BASELINE {
+            engine
+                .insert("t", simple_row(i, &format!("base{i}")))
+                .await
+                .unwrap();
+        }
+        engine.checkpoint().unwrap();
+
+        // Concurrent load: a writer inserting new ids, and a checkpointer
+        // trying to reclaim WAL out from under the in-flight backup.
+        //
+        // Both are hard-bounded. An unbounded writer here is not a stronger
+        // test, it is a runaway: retention is pinned for the whole window, so
+        // every extra insert both grows the WAL and slows the checkpointer
+        // that keeps rescanning it, and on a loaded machine the two feed each
+        // other. Bounding them keeps the test a correctness test.
+        const MAX_LIVE_WRITES: i32 = 4_000;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inserted = Arc::new(parking_lot::Mutex::new(Vec::<i32>::new()));
+
+        let writer = {
+            let engine = engine.clone();
+            let stop = stop.clone();
+            let inserted = inserted.clone();
+            tokio::spawn(async move {
+                let mut id = 10_000i32;
+                while !stop.load(AtomicOrdering::Relaxed) && id < 10_000 + MAX_LIVE_WRITES {
+                    if engine
+                        .insert("t", simple_row(id, &format!("live{id}")))
+                        .await
+                        .is_ok()
+                    {
+                        inserted.lock().push(id);
+                    }
+                    id += 1;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let checkpointer = {
+            let engine = engine.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut rounds = 0;
+                while !stop.load(AtomicOrdering::Relaxed) && rounds < 200 {
+                    let _ = engine.checkpoint();
+                    rounds += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+
+        // Wait for the writer to be DEMONSTRABLY running before opening the
+        // window, rather than sleeping a fixed 20ms and hoping. Under
+        // full-suite load the writer task can be starved for longer than any
+        // fixed sleep, commit nothing during the window, and trip the
+        // "did this test exercise the online path" precondition below — a
+        // flake that reports as a durability failure. Requiring observed
+        // forward progress first makes the overlap deterministic; the bounded
+        // loop still fails loudly if the writer never runs at all.
+        {
+            let start = std::time::Instant::now();
+            let base = inserted.lock().len();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                if inserted.lock().len() > base + 2 {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "concurrent writer never made progress; the online path cannot be exercised"
+                );
+            }
+        }
+
+        let snap = tmp.path().join("snap");
+        let written_before_window = inserted.lock().len();
+        let manifest = {
+            let engine = engine.clone();
+            let data_dir = data_dir.clone();
+            let snap = snap.clone();
+            tokio::task::spawn_blocking(move || {
+                backup_online(
+                    &data_dir,
+                    &snap,
+                    false,
+                    env!("CARGO_PKG_VERSION"),
+                    engine.as_ref(),
+                )
+            })
+            .await
+            .unwrap()
+            .expect("online backup must succeed while writes are in flight")
+        };
+        let written_after_window = inserted.lock().len();
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        writer.await.unwrap();
+        checkpointer.await.unwrap();
+
+        // The whole point of the test: rows really were committed while the
+        // backup was running. Without this the assertions below would pass
+        // against a quiesced database and prove nothing.
+        assert!(
+            written_after_window > written_before_window,
+            "no rows were committed during the backup window ({written_before_window} -> \
+             {written_after_window}); the test did not exercise the online path"
+        );
+
+        assert!(manifest.online, "manifest must record that this was online");
+        assert!(
+            manifest.consistent_lsn > 0,
+            "an online snapshot must name the LSN it is consistent through"
+        );
+        assert!(
+            !manifest.files.is_empty(),
+            "manifest must checksum the snapshot's files"
+        );
+        assert!(!manifest.database_id.is_empty());
+        assert!(!manifest.taken_while_in_use);
+
+        let live_ids: std::collections::HashSet<i32> =
+            inserted.lock().iter().copied().collect();
+        drop(engine);
+
+        let restored = ids_after_restore(&snap, &tmp.path().join("restored")).await;
+        let restored_set: std::collections::HashSet<i32> = restored.iter().copied().collect();
+
+        assert_eq!(
+            restored.len(),
+            restored_set.len(),
+            "restored database contains duplicate ids — replay corrupted it"
+        );
+        // (a) Nothing committed before the backup started may be missing.
+        for i in 0..BASELINE {
+            assert!(
+                restored_set.contains(&i),
+                "row {i}, committed and checkpointed BEFORE the backup began, is missing \
+                 from the restored snapshot"
+            );
+        }
+        // (b) Nothing may appear that was never inserted. A torn page copied
+        //     into the snapshot would surface here as an id from nowhere.
+        for id in &restored_set {
+            assert!(
+                (*id >= 0 && *id < BASELINE) || live_ids.contains(id),
+                "restored database contains id {id}, which was never inserted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn online_backup_aborts_rather_than_snapshot_an_unreadable_page() {
+        use crate::backup::backup_online;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("nucleus.db");
+
+        let catalog = Arc::new(Catalog::new());
+        register_simple_table(&catalog, "t").await;
+        let engine = DiskEngine::open_segmented_with_sync(
+            &db_path,
+            catalog,
+            DEFAULT_POOL_SIZE,
+            64,
+            wal::SyncMode::Fsync,
+        )
+        .unwrap();
+        engine.create_table("t").await.unwrap();
+        for i in 0..200 {
+            engine
+                .insert("t", simple_row(i, &format!("r{i}")))
+                .await
+                .unwrap();
+        }
+        engine.checkpoint().unwrap();
+
+        // Damage a data page underneath the engine — media error, bad sector,
+        // or a page caught permanently mid-write. The backup must NOT copy it.
+        let slots = {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+            let slots = f.metadata().unwrap().len() / PAGE_SIZE as u64;
+            assert!(slots >= 2, "test needs at least one non-meta page");
+            f.seek(SeekFrom::Start((slots - 1) * PAGE_SIZE as u64)).unwrap();
+            f.write_all(&[0xA5u8; 256]).unwrap();
+            f.sync_all().unwrap();
+            slots
+        };
+
+        let err = backup_online(
+            &data_dir,
+            &tmp.path().join("snap"),
+            false,
+            env!("CARGO_PKG_VERSION"),
+            &engine,
+        )
+        .expect_err("a backup that cannot read a page intact must fail, not succeed quietly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("never read back as a complete image") && msg.contains("ABANDONED"),
+            "error must say the backup was abandoned and why: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("page {}", slots - 1)),
+            "error must name the page that could not be read: {msg}"
+        );
+
+        // The retention pin must be released even on the failure path, or the
+        // live database can never reclaim WAL again.
+        let before = wal::list_segments(&db_path.with_extension("wal.d"))
+            .map(|s| s.len())
+            .unwrap_or(0);
+        assert!(before > 0);
+        let cp = engine.pool.wal_current_lsn();
+        engine.pool.wal_rotate().unwrap();
+        engine.pool.wal_truncate_before(cp).unwrap();
+        let after = wal::list_segments(&db_path.with_extension("wal.d"))
+            .map(|s| s.len())
+            .unwrap_or(0);
+        assert!(
+            after < before,
+            "a failed backup leaked its WAL retention pin: truncation reclaimed nothing \
+             ({before} -> {after} segments)"
+        );
+    }
 }
 
 // ============================================================================
