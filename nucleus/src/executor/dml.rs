@@ -75,6 +75,18 @@ fn coerce_value_for_write(
         }
         return Ok(());
     }
+    // Postgres array-literal text (`{a,b}`) into a real Array. Without this an
+    // ARRAY column can only be written from an ARRAY[...] expression — a text
+    // literal, which is all COPY has, would fail the cast below.
+    if matches!(column.data_type, DataType::Array(_))
+        && let Value::Text(text) = value
+    {
+        let trimmed = text.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            *value = Value::Array(super::expr::parse_pg_array_literal(trimmed));
+            return Ok(());
+        }
+    }
     if matches!(column.data_type, DataType::Interval)
         && let Value::Text(text) = value
     {
@@ -606,6 +618,44 @@ impl Executor {
                         })
                         .collect()
                 };
+            // Keys duplicated *within* this statement are invisible to the
+            // per-row `check_unique_constraints` above: the earlier rows are
+            // still staged here, not in storage. Without this pass the write
+            // loop below inserts the first row and then fails on the second,
+            // leaving the statement half-applied — which is exactly how a COPY
+            // payload carrying its own duplicate key used to land rows before
+            // erroring. ON CONFLICT owns duplicate handling, so it opts out.
+            if !unique_col_sets.is_empty() && inserted_rows.len() > 1 && on_conflict.is_none() {
+                for col_indices in &unique_col_sets {
+                    let mut seen: std::collections::HashSet<Vec<Value>> =
+                        std::collections::HashSet::with_capacity(inserted_rows.len());
+                    for row in &inserted_rows {
+                        let key: Vec<Value> = col_indices
+                            .iter()
+                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        // NULL is never equal to NULL for uniqueness.
+                        if key.iter().any(|v| matches!(v, Value::Null)) {
+                            continue;
+                        }
+                        if !seen.insert(key.clone()) {
+                            let cols = col_indices
+                                .iter()
+                                .map(|&i| table_def.columns[i].name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let vals = key
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "duplicate key value violates unique constraint: ({cols}) = ({vals}) appears twice in the same statement"
+                            )));
+                        }
+                    }
+                }
+            }
             let storage = self.storage_for(&table_name);
             if unique_col_sets.is_empty() {
                 storage.insert_batch(&table_name, inserted_rows).await?;
