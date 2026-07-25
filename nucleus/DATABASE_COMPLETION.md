@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 264108; Source Rust files: 235; Top-level modules: 51.
-- Declared unit tests: 3980; Declared integration tests: 320; Ignored tests: 44.
+- Source LOC: 264403; Source Rust files: 235; Top-level modules: 51.
+- Declared unit tests: 3987; Declared integration tests: 327; Ignored tests: 44.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -99,7 +99,7 @@ Goal: close known semantic holes before expanding interfaces.
 - [x] Verify constraints and cascades across transactions and restart.
 - [x] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
 - [x] Add deterministic transaction-ID exhaustion/wraparound behavior.
-- [ ] Ensure query caches and specialty indexes invalidate on every relevant DDL/DML transition.
+- [x] Ensure query caches and specialty indexes invalidate on every relevant DDL/DML transition.
 
 Evidence:
 
@@ -150,6 +150,21 @@ Evidence:
   implicit transaction path returns a stable `transaction ID space exhausted` storage error before
   mutating state; deterministic near-boundary tests prove the final allocatable ID, repeated
   terminal failure, read/write rejection, and absence of reserved active IDs.
+- Cache/index coherence is proved by a two-sided differential oracle
+  (`executor::tests::test_cache_coherence`): a hot executor with warm caches and B-tree/GIN/HNSW
+  indexes and a cold reference executor with every cache dropped and no specialty index receive the
+  same randomized DDL/DML stream, and every probe must agree on rows and column metadata. The
+  transition set covers DML, upsert, COPY FROM, a COPY that must be *rejected*, TRUNCATE, index DDL,
+  column DDL, table rename, DROP TABLE, view DDL, and committed/rolled-back transactions;
+  `cache_oracle_precondition_every_transition_really_runs` stops any transition from silently
+  no-opping. COPY FROM was the last uncovered write: it bypassed the INSERT path entirely, so it
+  skipped NOT NULL/CHECK validation, never coerced a field to its declared column type, and applied
+  rows one at a time so a mid-payload violation left the earlier rows behind. It now runs as a
+  single INSERT statement on both the executor and the pgwire path, which makes it all-or-nothing
+  like PostgreSQL's and gives it the same incremental index maintenance as every other write.
+  `tests/copy_wire_constraints.rs` drives the pgwire path over the raw simple-query protocol (the
+  one `psql \copy` uses) rather than `tokio_postgres::copy_in`, which prepares over the extended
+  protocol and never reaches the COPY interception at all.
 
 Exit gate:
 

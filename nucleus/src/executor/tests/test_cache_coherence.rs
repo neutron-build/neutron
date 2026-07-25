@@ -307,6 +307,28 @@ async fn one_transition(o: &mut Oracle, rng: &mut Rng, next_id: &mut i64) {
         9 => {
             o.mutate("TRUNCATE TABLE t").await;
         }
+        15 => {
+            // A COPY that must be REJECTED. COPY now shares the INSERT write
+            // path, so it validates every row before writing any: the good
+            // first row must not land, and no cache or specialty index may be
+            // left describing a row that was never inserted. (Before that, a
+            // rejected COPY still committed everything ahead of the bad row.)
+            let good = *next_id;
+            *next_id += 1;
+            let (vg, vb) = (rng.below(20) as i64, rng.below(20) as i64);
+            // Second row reuses the first row's id, violating the PRIMARY KEY.
+            o.mutate(&format!(
+                "COPY t FROM STDIN;\n{good}\t{vg}\ts{}\t{{\"k\": {}}}\t[0,0,0,1]\n{good}\t{vb}\ts{}\t{{\"k\": {}}}\t[0,0,0,1]\n\\.",
+                vg % 7,
+                vg % 5,
+                vb % 7,
+                vb % 5
+            ))
+            .await;
+            // The rejected id must be absent on BOTH sides.
+            o.probe(&format!("SELECT id, val FROM t WHERE id = {good}"))
+                .await;
+        }
         10 => {
             // Committed transaction.
             let id = *next_id;

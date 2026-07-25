@@ -92,7 +92,10 @@ async fn copy_from_stdin_text_reconstructs_rows() {
 #[tokio::test]
 async fn copy_from_stdin_text_honours_null_marker() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, qty INT)").await;
+    // No PRIMARY KEY: `id` must be nullable for the `\N`-in-the-first-column
+    // case below. (A NULL primary key is rejected — see
+    // `copy_from_enforces_not_null`.)
+    exec(&ex, "CREATE TABLE t (id INT, name TEXT, qty INT)").await;
     exec(
         &ex,
         "COPY t FROM STDIN;\n1\t\\N\t10\n2\tbob\t\\N\n\\N\tcarol\t30\n\\.",
@@ -118,20 +121,189 @@ async fn copy_from_stdin_text_preserves_empty_and_spaced_fields() {
     exec(&ex, "COPY t FROM STDIN;\n1\ta b\n2\t\n\\.").await;
 
     let got = exec(&ex, "SELECT id, name FROM t ORDER BY id").await;
-    // NOTE: the second row's empty field lands as NULL rather than ''. That is
-    // `parse_field`'s blanket empty-string-is-NULL rule, a separate (and in text
-    // format, non-Postgres) behaviour — not the reconstruction under test. What
-    // matters here is that the field still occupies its own column and does not
-    // shift or drop the row.
+    // The second row's empty field is the empty STRING, not NULL: in
+    // PostgreSQL's text format only `\N` is NULL. (This used to land as NULL —
+    // `parse_field` applied a blanket empty-string-is-NULL rule that belongs to
+    // CSV, not text.)
     assert_eq!(
         rows(&got[0]),
         &vec![
             vec![Value::Int32(1), Value::Text("a b".into())],
-            vec![Value::Int32(2), Value::Null],
+            vec![Value::Int32(2), Value::Text(String::new())],
         ],
         "an embedded space must not split a field, and an empty trailing field \
          must not collapse the row"
     );
+}
+
+/// PostgreSQL's text format distinguishes an empty field from `\N`: the first is
+/// the empty string, the second is NULL. Collapsing them (the old behaviour)
+/// silently rewrites data on the way in and makes the two indistinguishable on
+/// the way back out.
+#[tokio::test]
+async fn copy_from_text_empty_field_is_empty_string_not_null() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").await;
+    exec(&ex, "COPY t FROM STDIN;\n1\t\n2\t\\N\n\\.").await;
+
+    let got = exec(&ex, "SELECT id, name FROM t ORDER BY id").await;
+    assert_eq!(
+        rows(&got[0]),
+        &vec![
+            vec![Value::Int32(1), Value::Text(String::new())],
+            vec![Value::Int32(2), Value::Null],
+        ],
+        "an empty text-format field is '', only \\N is NULL"
+    );
+
+    // And the difference must be observable through SQL, not just by inspecting
+    // the stored value.
+    let got = exec(&ex, "SELECT COUNT(*) FROM t WHERE name IS NULL").await;
+    assert_eq!(scalar(&got[0]), &Value::Int64(1));
+    let got = exec(&ex, "SELECT COUNT(*) FROM t WHERE name = ''").await;
+    assert_eq!(scalar(&got[0]), &Value::Int64(1));
+}
+
+/// CSV is the other way round: an unquoted empty field IS NULL (PostgreSQL's
+/// default CSV NULL string is the empty string), while a quoted `""` is the
+/// empty string.
+#[tokio::test]
+async fn copy_from_csv_distinguishes_empty_from_quoted_empty() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE c (id INT PRIMARY KEY, name TEXT)").await;
+    exec(&ex, "COPY c FROM STDIN WITH (FORMAT CSV);\n1,\n2,\"\"\n\\.").await;
+
+    let got = exec(&ex, "SELECT id, name FROM c ORDER BY id").await;
+    assert_eq!(
+        rows(&got[0]),
+        &vec![
+            vec![Value::Int32(1), Value::Null],
+            vec![Value::Int32(2), Value::Text(String::new())],
+        ],
+        "an unquoted empty CSV field is NULL; a quoted one is ''"
+    );
+}
+
+// ── Constraint enforcement (COPY is a bulk INSERT, not a bypass) ────────────
+
+/// COPY is the loader most likely to ingest untrusted data, so it is the worst
+/// possible place to skip validation. It used to write through a bare storage
+/// append that never consulted NOT NULL or CHECK at all.
+#[tokio::test]
+async fn copy_from_enforces_not_null() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE n (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
+
+    let bad = ex.execute("COPY n FROM STDIN;\n1\t\\N\n\\.").await;
+    assert!(bad.is_err(), "COPY accepted NULL in a NOT NULL column");
+
+    let got = exec(&ex, "SELECT COUNT(*) FROM n").await;
+    assert_eq!(scalar(&got[0]), &Value::Int64(0));
+}
+
+#[tokio::test]
+async fn copy_from_enforces_check_constraints() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE ck (id INT PRIMARY KEY, qty INT CHECK (qty > 0))",
+    )
+    .await;
+
+    let bad = ex.execute("COPY ck FROM STDIN;\n1\t-5\n\\.").await;
+    assert!(bad.is_err(), "COPY accepted a row violating CHECK (qty > 0)");
+
+    let got = exec(&ex, "SELECT COUNT(*) FROM ck").await;
+    assert_eq!(scalar(&got[0]), &Value::Int64(0));
+}
+
+/// PostgreSQL's COPY is all-or-nothing within the statement. A violation on the
+/// third row must leave the table exactly as it was — not two rows heavier.
+#[tokio::test]
+async fn copy_from_is_atomic_across_the_whole_payload() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE a (id INT PRIMARY KEY, qty INT CHECK (qty > 0))",
+    )
+    .await;
+
+    let bad = ex
+        .execute("COPY a FROM STDIN;\n1\t10\n2\t20\n3\t-1\n4\t40\n\\.")
+        .await;
+    assert!(bad.is_err(), "the third row violates CHECK (qty > 0)");
+
+    let got = exec(&ex, "SELECT COUNT(*) FROM a").await;
+    assert_eq!(
+        scalar(&got[0]),
+        &Value::Int64(0),
+        "a failed COPY must leave ZERO rows — rows 1 and 2 must not survive"
+    );
+
+    // The same holds when the failure is a unique violation inside the payload.
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE a (id INT PRIMARY KEY, qty INT)").await;
+    let bad = ex
+        .execute("COPY a FROM STDIN;\n1\t10\n2\t20\n1\t30\n\\.")
+        .await;
+    assert!(bad.is_err(), "id 1 appears twice in one payload");
+    let got = exec(&ex, "SELECT COUNT(*) FROM a").await;
+    assert_eq!(
+        scalar(&got[0]),
+        &Value::Int64(0),
+        "a payload that duplicates a key inside itself must insert nothing"
+    );
+
+    // ...and when it clashes with a row already in the table.
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE a (id INT PRIMARY KEY, qty INT)").await;
+    exec(&ex, "INSERT INTO a VALUES (9, 1)").await;
+    let bad = ex
+        .execute("COPY a FROM STDIN;\n1\t10\n2\t20\n9\t30\n\\.")
+        .await;
+    assert!(bad.is_err(), "id 9 already exists");
+    let got = exec(&ex, "SELECT COUNT(*) FROM a").await;
+    assert_eq!(
+        scalar(&got[0]),
+        &Value::Int64(1),
+        "only the pre-existing row may remain"
+    );
+}
+
+/// A COPY field must land in its column's declared type, exactly as the same
+/// literal would through INSERT. The old `parse_field` only understood
+/// INT/BIGINT/DOUBLE/BOOLEAN and left everything else as raw `Text`, so a DATE
+/// column silently stored a string.
+#[tokio::test]
+async fn copy_from_coerces_fields_to_the_declared_column_type() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE ty (id INT PRIMARY KEY, d DATE, ts TIMESTAMP, flag BOOLEAN, tags TEXT[])",
+    )
+    .await;
+    exec(
+        &ex,
+        "COPY ty FROM STDIN;\n1\t2024-03-26\t2024-03-26 12:34:56\tt\t{a,b}\n\\.",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO ty VALUES (2, '2024-03-26', '2024-03-26 12:34:56', true, ARRAY['a','b'])",
+    )
+    .await;
+
+    let copied = exec(&ex, "SELECT d, ts, flag, tags FROM ty WHERE id = 1").await;
+    let inserted = exec(&ex, "SELECT d, ts, flag, tags FROM ty WHERE id = 2").await;
+    assert_eq!(
+        rows(&copied[0]),
+        rows(&inserted[0]),
+        "COPY and INSERT of the same literals must store identical values"
+    );
+
+    // A field that cannot be the declared type is an error, not a silent Text.
+    let bad = ex.execute("COPY ty FROM STDIN;\n3\tnot-a-date\t\\N\t\\N\t\\N\n\\.").await;
+    assert!(bad.is_err(), "COPY stored an unparseable DATE as text");
 }
 
 #[tokio::test]
@@ -255,4 +427,36 @@ async fn copy_from_stdin_empty_payload_inserts_nothing() {
     }
     let got = exec(&ex, "SELECT COUNT(*) FROM e").await;
     assert_eq!(scalar(&got[0]), &Value::Int64(0));
+}
+
+/// COPY now shares the INSERT write path, so it inherits INSERT's guarantees —
+/// and INSERT had a hole. `check_unique_constraints` runs per row against
+/// *storage*, but a multi-row statement stages every row and writes them
+/// afterwards, so rows in the same statement are invisible to one another. The
+/// only backstop was `StorageEngine::insert_unique`, whose trait default is a
+/// plain insert — so on any engine without atomic unique support (MemoryEngine,
+/// which is what `nucleus start --memory` runs) a single statement could
+/// silently store two rows with the same PRIMARY KEY.
+#[tokio::test]
+async fn one_statement_cannot_duplicate_a_primary_key() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE z (id INT PRIMARY KEY, q INT)").await;
+
+    let bad = ex.execute("INSERT INTO z VALUES (1, 10), (1, 20)").await;
+    assert!(
+        bad.is_err(),
+        "one INSERT statement stored the same primary key twice"
+    );
+    let got = exec(&ex, "SELECT COUNT(*) FROM z").await;
+    assert_eq!(
+        scalar(&got[0]),
+        &Value::Int64(0),
+        "the rejected statement must not leave its first row behind"
+    );
+
+    // Multiple NULLs are still allowed in a plain UNIQUE column.
+    exec(&ex, "CREATE TABLE zu (id INT PRIMARY KEY, tag TEXT UNIQUE)").await;
+    exec(&ex, "INSERT INTO zu VALUES (1, NULL), (2, NULL)").await;
+    let got = exec(&ex, "SELECT COUNT(*) FROM zu").await;
+    assert_eq!(scalar(&got[0]), &Value::Int64(2));
 }

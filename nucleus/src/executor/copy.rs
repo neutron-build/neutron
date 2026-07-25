@@ -87,7 +87,6 @@ impl Executor {
         }
         let table_def = self.get_table(&table_name).await?;
         let num_cols = table_def.columns.len();
-        let mut count = 0;
 
         let mut payload_rows = self.copy_payload_rows(&values, &format, delimiter, num_cols);
 
@@ -96,92 +95,123 @@ impl Executor {
             payload_rows.remove(0);
         }
 
-        // UNIQUE/PRIMARY KEY column sets, mirroring execute_insert.
-        // ReplacingMergeTree-style tables keep multiple versions per key and so
-        // opt out, exactly as they do on the INSERT path.
-        let unique_col_sets: Vec<Vec<usize>> =
-            if crate::columnar::replacing_config(&table_name).is_some() {
-                Vec::new()
-            } else {
-                use crate::catalog::TableConstraint;
-                table_def
-                    .constraints
-                    .iter()
-                    .filter_map(|c| match c {
-                        TableConstraint::PrimaryKey { columns, .. }
-                        | TableConstraint::Unique { columns, .. } => {
-                            let idxs: Vec<usize> = columns
-                                .iter()
-                                .filter_map(|n| table_def.column_index(n))
-                                .collect();
-                            (idxs.len() == columns.len()).then_some(idxs)
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            };
-        let storage = self.storage_for(&table_name);
-
-        for fields in &payload_rows {
-            let mut row = Vec::with_capacity(num_cols);
-            for (i, field) in fields.iter().enumerate() {
-                if i < num_cols {
-                    let parsed = match field {
-                        // `\N` is the text-format NULL marker; it must not be
-                        // parsed as the literal two-character string.
-                        None => Value::Null,
-                        Some(text) => self.parse_field(text, &table_def.columns[i].data_type),
-                    };
-                    row.push(parsed);
-                }
-            }
-            // Pad with nulls if needed
-            while row.len() < num_cols {
-                row.push(Value::Null);
-            }
-            self.check_unique_constraints(&table_name, &table_def, &row, None)
-                .await?;
-            self.enforce_rls_new_row(&table_name, crate::security::PolicyCommand::Insert, &row)?;
-            if unique_col_sets.is_empty() {
-                storage.insert(&table_name, row).await?;
-            } else {
-                // Same atomic path INSERT uses: a bare append would let COPY be
-                // the one write that can silently duplicate a primary key.
-                storage
-                    .insert_unique(&table_name, row, &unique_col_sets)
-                    .await
-                    .map_err(|e| match e {
-                        crate::storage::StorageError::UniqueViolation(m) => {
-                            ExecError::ConstraintViolation(format!(
-                                "duplicate key value violates unique constraint: {m}"
-                            ))
-                        }
-                        other => ExecError::Storage(other),
-                    })?;
-            }
-            count += 1;
-        }
+        let count = self.copy_insert_rows(&table_name, None, payload_rows).await?;
 
         // COPY FROM is a bulk write but is not a Statement::Insert, so it is not
         // covered by the is_dml_write invalidation in the statement dispatcher.
         // Invalidate the query-result cache here so a previously cached SELECT
         // doesn't serve a stale (pre-COPY) row set for up to the cache TTL.
-        //
-        // The same gap applies to every derived structure: the rows went in
-        // through a bare storage append, so B-tree/GIN/vector/encrypted postings
-        // and zone maps still describe the pre-COPY table. A specialty index
-        // that is merely stale (rather than absent) is worse than no index at
-        // all — the scan intersects against it and silently drops the new rows.
-        // Rebuild once for the whole batch rather than per row.
+        // (Derived structures — B-tree/GIN/vector/encrypted postings and zone
+        // maps — are now maintained by the INSERT path itself.)
         if count > 0 {
             self.query_cache_invalidate_all();
-            self.rebuild_table_derived_state(&table_name).await;
         }
 
         Ok(ExecResult::Command {
             tag: format!("COPY {count}"),
             rows_affected: count,
         })
+    }
+
+    /// Insert one parsed COPY payload as a single `INSERT` statement.
+    ///
+    /// COPY is a bulk INSERT and gets no exemption from anything INSERT
+    /// enforces — and being the loader most likely to ingest untrusted data, it
+    /// is the worst place to skip validation. The hand-rolled append loop this
+    /// replaces skipped NOT NULL and CHECK entirely, never coerced a field to
+    /// its declared column type (a DATE column got the raw `Value::Text`), and
+    /// wrote row by row, so a violation partway down a payload left every
+    /// earlier row inserted.
+    ///
+    /// `execute_insert` fixes all of that at once: it validates *every* row
+    /// before it writes *any* — which is exactly PostgreSQL's all-or-nothing
+    /// COPY — and it is the single place that enforces NOT NULL / CHECK / FK /
+    /// enum / RLS `WITH CHECK` / UNIQUE, applies DEFAULTs to columns the
+    /// payload omits, fires triggers, and maintains every derived index.
+    ///
+    /// Fields cross over as text literals, exactly as a client would have
+    /// spelled them in `VALUES`, so the INSERT path's own coercion decides how
+    /// each one lands in its declared type.
+    pub(crate) async fn copy_insert_rows(
+        &self,
+        table: &str,
+        columns: Option<&[String]>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<usize, ExecError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let insert = self.build_copy_insert(table, columns, rows)?;
+        match self.execute_insert(insert).await? {
+            ExecResult::Command { rows_affected, .. } => Ok(rows_affected),
+            other => Err(ExecError::Runtime(format!(
+                "COPY insert returned an unexpected result: {other:?}"
+            ))),
+        }
+    }
+
+    /// The `INSERT` statement a wire-protocol COPY payload is equivalent to.
+    ///
+    /// The wire handler runs this through the normal statement dispatcher, so a
+    /// `\copy` gets byte-for-byte the same validation, atomicity and cache
+    /// invalidation as an `INSERT` a client typed itself.
+    #[cfg(feature = "server")]
+    pub fn copy_insert_statement(
+        &self,
+        table: &str,
+        columns: Option<&[String]>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<ast::Statement, ExecError> {
+        Ok(ast::Statement::Insert(
+            self.build_copy_insert(table, columns, rows)?,
+        ))
+    }
+
+    /// Build the `INSERT` AST for a COPY payload.
+    ///
+    /// A one-row skeleton is parsed and its `VALUES` swapped out: hand-building
+    /// the AST would pin ~30 `Insert`/`Query` struct fields to this exact
+    /// sqlparser version for no benefit, and the skeleton is a few bytes of SQL.
+    fn build_copy_insert(
+        &self,
+        table: &str,
+        columns: Option<&[String]>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<ast::Insert, ExecError> {
+        fn quote(ident: &str) -> String {
+            format!("\"{}\"", ident.replace('"', "\"\""))
+        }
+        // The catalog key is the canonical (already case-resolved) name, so it
+        // must be quoted back verbatim rather than re-folded by the parser.
+        let target = table.split('.').map(quote).collect::<Vec<_>>().join(".");
+        let col_clause = match columns {
+            Some(cols) if !cols.is_empty() => format!(
+                " ({})",
+                cols.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ")
+            ),
+            _ => String::new(),
+        };
+        let skeleton = format!("INSERT INTO {target}{col_clause} VALUES (NULL)");
+        let mut statements = crate::sql::parse(&skeleton)?;
+        let Some(ast::Statement::Insert(mut insert)) = statements.pop() else {
+            return Err(ExecError::Runtime(format!(
+                "COPY target is not a valid insert target: {table}"
+            )));
+        };
+        let value_rows: Vec<Vec<ast::Expr>> = rows
+            .into_iter()
+            .map(|fields| fields.into_iter().map(copy_field_expr).collect())
+            .collect();
+        let source = insert
+            .source
+            .as_mut()
+            .ok_or_else(|| ExecError::Runtime("INSERT skeleton has no source".into()))?;
+        *source.body = ast::SetExpr::Values(ast::Values {
+            explicit_row: false,
+            value_keyword: false,
+            rows: value_rows,
+        });
+        Ok(insert)
     }
 
     /// Reconstruct COPY payload rows from the flat token list sqlparser returns.
@@ -257,11 +287,12 @@ impl Executor {
             .map(|line| {
                 if format == "csv" {
                     self.parse_csv_line(&line, delimiter)
-                        .into_iter()
-                        .map(Some)
-                        .collect()
                 } else {
-                    line.split(delimiter).map(|s| Some(s.to_string())).collect()
+                    // Text format: `\N` is the NULL marker and nothing else is
+                    // NULL — an empty field is the empty string.
+                    line.split(delimiter)
+                        .map(|s| (s != "\\N").then(|| s.to_string()))
+                        .collect()
                 }
             })
             .collect()
@@ -412,9 +443,14 @@ impl Executor {
         })
     }
 
-    pub(super) fn parse_csv_line(&self, line: &str, delimiter: char) -> Vec<String> {
+    /// Split one CSV line into fields. An *unquoted* empty field is NULL —
+    /// PostgreSQL's default CSV NULL string is the empty string — while a
+    /// *quoted* empty field (`""`) is the empty string. Collapsing the two
+    /// loses a distinction PostgreSQL keeps.
+    pub(super) fn parse_csv_line(&self, line: &str, delimiter: char) -> Vec<Option<String>> {
         let mut fields = Vec::new();
         let mut current_field = String::new();
+        let mut was_quoted = false;
         let mut in_quotes = false;
         let mut chars = line.chars().peekable();
 
@@ -431,51 +467,46 @@ impl Executor {
                         }
                     } else {
                         in_quotes = true;
+                        was_quoted = true;
                     }
                 }
                 c if c == delimiter && !in_quotes => {
-                    fields.push(current_field.clone());
-                    current_field.clear();
+                    fields.push(csv_field(&mut current_field, was_quoted));
+                    was_quoted = false;
                 }
                 _ => {
                     current_field.push(ch);
                 }
             }
         }
-        fields.push(current_field);
+        fields.push(csv_field(&mut current_field, was_quoted));
         fields
     }
 
     pub(super) fn value_to_text_string(&self, value: &Value) -> String {
         value_to_text_string_impl(value)
     }
+}
 
-    pub(super) fn parse_field(&self, field: &str, data_type: &DataType) -> Value {
-        match field {
-            "" => Value::Null,    // Empty field = NULL in CSV
-            "\\N" => Value::Null, // Explicit NULL marker
-            s => match data_type {
-                DataType::Int32 => s
-                    .parse::<i32>()
-                    .map(Value::Int32)
-                    .unwrap_or(Value::Text(s.to_string())),
-                DataType::Int64 => s
-                    .parse::<i64>()
-                    .map(Value::Int64)
-                    .unwrap_or(Value::Text(s.to_string())),
-                DataType::Float64 => s
-                    .parse::<f64>()
-                    .map(Value::Float64)
-                    .unwrap_or(Value::Text(s.to_string())),
-                DataType::Bool => match s.to_lowercase().as_str() {
-                    "t" | "true" | "1" => Value::Bool(true),
-                    "f" | "false" | "0" => Value::Bool(false),
-                    _ => Value::Text(s.to_string()),
-                },
-                _ => Value::Text(s.to_string()),
-            },
-        }
-    }
+/// One COPY field as the literal expression the INSERT path evaluates. `None`
+/// is the format's NULL marker; `Some(text)` is a text literal — **including
+/// `Some("")`**, the empty string, which PostgreSQL's text format distinguishes
+/// from `\N`.
+fn copy_field_expr(field: Option<String>) -> ast::Expr {
+    ast::Expr::Value(ast::ValueWithSpan {
+        value: match field {
+            None => ast::Value::Null,
+            Some(text) => ast::Value::SingleQuotedString(text),
+        },
+        span: sqlparser::tokenizer::Span::empty(),
+    })
+}
+
+/// Finish one CSV field: quoted means "a value, possibly empty"; unquoted and
+/// empty means NULL.
+fn csv_field(current: &mut String, was_quoted: bool) -> Option<String> {
+    let text = std::mem::take(current);
+    (was_quoted || !text.is_empty()).then_some(text)
 }
 
 // ── Shared COPY TO formatting (used by both the materialized and streaming
