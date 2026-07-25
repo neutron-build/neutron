@@ -1270,18 +1270,19 @@ impl DiskEngine {
     /// Read the live tuple a `RowId` names, or `None` if the address no longer
     /// resolves to one.
     ///
-    /// A B-tree entry stores a `(page_id, slot_idx)` that nothing revalidates:
-    /// VACUUM compacts a page and renumbers its slots without touching the
-    /// index, and a page unlinked by VACUUM or DROP TABLE goes on the free list
-    /// and comes back as some other table's page. An index scan can therefore
-    /// arrive with a slot index past the page's slot array, or with an offset
-    /// and length that address bytes outside the page — which used to index a
-    /// slice out of range and take down the connection's task. Bounds are
-    /// checked here so a stale entry yields no row instead of a panic.
+    /// A B-tree entry stores a `(page_id, slot_idx)` that nothing revalidates,
+    /// so an index scan can arrive with a slot index past the page's slot
+    /// array, or with an offset and length that address bytes outside the page
+    /// — which used to index a slice out of range and take down the
+    /// connection's task. Bounds are checked here so such an entry yields no
+    /// row instead of a panic.
     ///
-    /// This does NOT make stale entries correct: an entry that happens to land
-    /// on an in-range slot still returns whatever row now occupies it. Keeping
-    /// index entries in step with VACUUM is a separate, unfixed defect.
+    /// This is a backstop, not the guarantee. Bounds checking converts a crash
+    /// into a silent wrong answer whenever a stale address happens to land on
+    /// an in-range slot, so the addresses themselves have to stay true:
+    /// `vacuum_table` preserves slot identity when it compacts and purges every
+    /// entry addressing a page it frees, and `drop_table` drops the table's
+    /// indexes before its pages reach the free list.
     fn read_tuple_at(pg: &PageBuf, slot_idx: u16, col_types: &[DataType]) -> Option<Row> {
         if page::read_u16(pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
             return None;
@@ -1606,6 +1607,39 @@ impl DiskEngine {
         Ok(())
     }
 
+    /// Push a page onto the free list, but only if it still holds no live
+    /// tuple. Returns `(freed, next_page)`; `next_page` is the successor link
+    /// read under the SAME latch that made the decision.
+    ///
+    /// The check and the conversion have to be one latched step. VACUUM used to
+    /// read emptiness under a read latch, drop it, and only then take the write
+    /// latch inside `free_page`. An insert landing on the page in that gap was
+    /// freed along with it — the row silently gone, and its fresh index entry
+    /// left addressing a page now on the engine-wide free list.
+    ///
+    /// Locks: free list (L4) before the frame latch (L6), the same order
+    /// `free_page` uses, and exactly one latch at a time.
+    fn free_page_if_empty(&self, page_id: u32) -> Result<(bool, u32), StorageError> {
+        let mut head = self.free_list_head.lock();
+        let mut count = self.free_page_count.lock();
+
+        let mut pg = self
+            .pool
+            .write_guard(page_id)
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let next = get_next_page(&pg);
+        if page::get_page_type(&pg) != page::PAGE_TYPE_DATA || page::live_tuple_count(&pg) != 0 {
+            return Ok((false, next));
+        }
+        page::init_free_page(&mut pg, *head);
+        pg.set_dirty();
+        drop(pg);
+
+        *head = page_id;
+        *count += 1;
+        Ok((true, next))
+    }
+
     /// Pop a page from the free list. Returns `None` if the list is empty.
     fn reuse_free_page(&self) -> Result<Option<u32>, StorageError> {
         let mut head = self.free_list_head.lock();
@@ -1736,8 +1770,54 @@ impl DiskEngine {
         Ok(page_id)
     }
 
-    /// Vacuum a single table: compact dead tuples within pages, remove fully-empty
-    /// pages from the page chain. Returns (pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed).
+    /// Vacuum a single table: defragment pages in place, then unlink and free
+    /// pages that hold no live tuple. Returns (pages_scanned, dead_reclaimed,
+    /// pages_freed, bytes_reclaimed).
+    ///
+    /// # VACUUM and the B-tree
+    ///
+    /// A B-tree entry is a physical address, `(page_id, slot_idx)`, and nothing
+    /// revalidates it. VACUUM is the only operation that can change what such an
+    /// address means without going through the index-maintenance hooks, so it
+    /// has to hold the addresses still or fix the entries itself.
+    ///
+    /// **Slot renumbering.** Phase 1 used to re-initialise each page and
+    /// re-insert its live tuples, which packed them into slots `0..n` and moved
+    /// every survivor. A B-tree entry naming a slot that happened to still be in
+    /// range then resolved to whatever row had moved into it: a silently wrong
+    /// row, no error, no way for a caller to tell. This is fixed by
+    /// construction rather than by rewriting entries — `page::compact_page`
+    /// defragments the tuple bytes while leaving each live tuple at its
+    /// original slot index, so no address changes and there is nothing to
+    /// maintain. What that costs is stated below.
+    ///
+    /// **Page freeing.** Phase 2 still changes addresses in the one way that
+    /// cannot be designed away: an emptied page is unlinked and pushed onto the
+    /// ENGINE-WIDE free list, from which any table can claim it. An entry left
+    /// addressing that page reads another table's bytes through this table's
+    /// column types. So before the phase releases its locks, every index entry
+    /// addressing a page it freed is purged.
+    ///
+    /// # What preserving slot identity costs
+    ///
+    /// Re-initialising the page also reset the slot array, returning 4 bytes per
+    /// dead slot to the contiguous free region. Keeping the array means those
+    /// bytes stay reserved until `page::insert_tuple` reuses the dead slot,
+    /// which it does in preference to appending. The reservation is therefore
+    /// bounded by the page's high-water mark of live tuples — on a 16 KB page
+    /// holding ~500 short rows, at most ~2 KB, and it is lent out again on the
+    /// next insert rather than lost. Tuple bytes, which are the bulk of the
+    /// reclaimable space, are recovered in full either way. This is the same
+    /// trade PostgreSQL makes with line pointers, and for the same reason: the
+    /// index points at them.
+    ///
+    /// # Locks
+    ///
+    /// Phase 2 holds `tables` (L1) so the chain cannot be relinked underneath
+    /// the walk, and `indexes` (L3) so no session can read through — or add to —
+    /// an index between a page reaching the free list and the purge that clears
+    /// it. Both are taken in level order, before the free list (L4) and any
+    /// frame latch (L6), and no latch is ever held while another is taken.
     fn vacuum_table(&self, table: &str) -> Result<(usize, usize, usize, usize), StorageError> {
         let pages = self.table_pages(table)?;
         let mut pages_scanned = 0usize;
@@ -1745,87 +1825,135 @@ impl DiskEngine {
         let mut pages_freed = 0usize;
         let mut bytes_reclaimed = 0usize;
 
-        // Phase 1: Compact each page — remove dead slots, defragment
+        // ── Phase 1: defragment each page, preserving slot identity ────────
         for &page_id in &pages {
             // The whole read-decide-compact sequence runs under one write
-            // latch: compaction moves every live tuple's offset, so a reader
-            // interleaving with it would resolve slots against the old layout.
+            // latch: compaction moves every live tuple's byte offset, so a
+            // reader interleaving with it would resolve slots against the old
+            // layout.
             let mut pg = self
                 .pool
                 .write_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let dead_count = page::dead_tuple_count(&pg);
             let frag_free = page::read_u16(&pg, page::DATA_FRAG_FREE) as usize;
             pages_scanned += 1;
 
-            if dead_count > 0 || frag_free > 0 {
-                dead_reclaimed += dead_count;
+            // Gate on fragmented bytes, not on the dead-slot count. Dead slots
+            // now survive compaction (that is the point), so gating on them
+            // would make VACUUM re-compact the same already-clean page on every
+            // pass. `page::delete_tuple` credits every dead tuple's length to
+            // `DATA_FRAG_FREE` and `compact_page` zeroes it, so this reads
+            // "there is fragmented space to recover" exactly once per delete.
+            if frag_free > 0 {
+                dead_reclaimed += page::dead_tuple_count(&pg);
                 bytes_reclaimed += frag_free;
-
-                // Collect live tuples before rewriting
-                let slot_count = page::read_u16(&pg, page::DATA_SLOT_COUNT);
-                let mut live_tuples: Vec<Vec<u8>> = Vec::new();
-                for i in 0..slot_count {
-                    let entry = page::read_slot(&pg, i);
-                    if !entry.is_dead() {
-                        let off = entry.offset() as usize;
-                        let len = entry.length() as usize;
-                        live_tuples.push(pg[off..off + len].to_vec());
-                    }
-                }
-
-                // Re-initialize the page and re-insert live tuples
-                let next_page = get_next_page(&pg);
-                page::init_data_page(&mut pg, 1);
-                set_next_page(&mut pg, next_page);
-                for tuple_data in &live_tuples {
-                    page::insert_tuple(&mut pg, tuple_data);
-                }
+                page::compact_page(&mut pg);
                 pg.set_dirty();
             }
         }
 
-        // Phase 2: Remove completely empty pages from the chain
-        // We need to re-walk the chain because compaction may have emptied pages
+        // ── Phase 2: unlink and free pages with no live tuple ──────────────
         let mut tables = self.tables.write();
-        let meta = match tables.get_mut(table) {
-            Some(m) => m,
+        let first_page = match tables.get(table) {
+            Some(m) => m.first_page,
             None => return Ok((pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed)),
         };
+        let indexes = self.indexes.write();
 
+        let mut freed_set: HashSet<u32> = HashSet::new();
         let mut prev_page_id: Option<u32> = None;
-        let mut cur_page_id = meta.first_page;
+        let mut cur_page_id = first_page;
+        let mut new_first = first_page;
+        let mut new_last = INVALID_PAGE_ID;
 
         while cur_page_id != INVALID_PAGE_ID {
-            let (live_count, next) = {
+            // A table always keeps at least one page, so its first page is only
+            // a candidate when something follows it.
+            let next_peek = {
                 let pg = self
                     .pool
                     .read_guard(cur_page_id)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
-                (page::live_tuple_count(&pg), get_next_page(&pg))
+                get_next_page(&pg)
+            };
+            let sole_page = prev_page_id.is_none() && next_peek == INVALID_PAGE_ID;
+
+            let (freed, next) = if sole_page {
+                (false, next_peek)
+            } else {
+                self.free_page_if_empty(cur_page_id)?
             };
 
-            if live_count == 0 && (prev_page_id.is_some() || next != INVALID_PAGE_ID) {
-                // Empty page — unlink from chain (keep at least one page)
-                if let Some(prev_id) = prev_page_id {
-                    let mut prev_pg = self
-                        .pool
-                        .write_guard(prev_id)
-                        .map_err(|e| StorageError::Io(e.to_string()))?;
-                    set_next_page(&mut prev_pg, next);
-                    prev_pg.set_dirty();
-                } else {
-                    // Removing the first page — update table meta
-                    meta.first_page = next;
+            if freed {
+                match prev_page_id {
+                    Some(prev_id) => {
+                        let mut prev_pg = self
+                            .pool
+                            .write_guard(prev_id)
+                            .map_err(|e| StorageError::Io(e.to_string()))?;
+                        set_next_page(&mut prev_pg, next);
+                        prev_pg.set_dirty();
+                    }
+                    // Removing the first page — the table meta moves forward.
+                    None => new_first = next,
                 }
-                // Add unlinked page to the free list for reuse
-                self.free_page(cur_page_id)?;
+                freed_set.insert(cur_page_id);
                 pages_freed += 1;
-                // Don't advance prev_page_id since we removed the current node
-                cur_page_id = next;
+                // Don't advance prev_page_id since we removed the current node.
             } else {
                 prev_page_id = Some(cur_page_id);
-                cur_page_id = next;
+                new_last = cur_page_id;
+            }
+            cur_page_id = next;
+        }
+
+        if pages_freed > 0 {
+            // `last_page` is the insert fast path's entry point and the link
+            // `alloc_data_page` chains the next page off. Leaving it on a freed
+            // page meant the next allocation wrote a chain pointer into a
+            // free-list node, corrupting the free list.
+            if let Some(meta) = tables.get_mut(table) {
+                meta.first_page = new_first;
+                meta.last_page = new_last;
+            }
+
+            // Purge every index entry addressing a freed page — across ALL
+            // indexes, not just this table's, because the page is now claimable
+            // by any table and an entry from any index that still names it is
+            // the same cross-table read. This is the only work VACUUM does that
+            // scales with index size, and it is paid only on a pass that
+            // actually frees a page.
+            for (idx_name, idx) in indexes.iter() {
+                let entries = match idx.btree.range_scan(None, None) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "nucleus::storage",
+                            index = idx_name.as_str(),
+                            "vacuum could not scan index to purge freed-page entries: {e}"
+                        );
+                        continue;
+                    }
+                };
+                for (key, rid) in entries {
+                    if !freed_set.contains(&rid.page_id) {
+                        continue;
+                    }
+                    tracing::warn!(
+                        target: "nucleus::storage",
+                        index = idx_name.as_str(),
+                        page_id = rid.page_id,
+                        slot_idx = rid.slot_idx,
+                        "vacuum purged an index entry addressing a page it freed"
+                    );
+                    if let Err(e) = idx.btree.delete(&key, rid) {
+                        tracing::error!(
+                            target: "nucleus::storage",
+                            index = idx_name.as_str(),
+                            "vacuum failed to purge a freed-page index entry: {e}"
+                        );
+                    }
+                }
             }
         }
 
@@ -2048,6 +2176,17 @@ impl StorageEngine for DiskEngine {
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
         drop(tables);
 
+        // Drop this table's indexes FIRST. Its pages are about to go on the
+        // engine-wide free list, and an index left behind still holds entries
+        // addressing them — the same cross-table read VACUUM's purge closes.
+        // The storage index also outlived its table entirely: `indexes` is
+        // keyed by index name across all tables, so a later CREATE TABLE
+        // reusing the name inherited the dead B-tree.
+        {
+            let mut indexes = self.indexes.write();
+            indexes.retain(|_, idx| idx.table != table);
+        }
+
         // Walk the page chain and add each page to the free list for reuse.
         let mut page_id = meta.first_page;
         while page_id != INVALID_PAGE_ID {
@@ -2092,11 +2231,21 @@ impl StorageEngine for DiskEngine {
                     .pool
                     .write_guard(last_page_id)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
-                let slot = page::insert_tuple(&mut pg, &data);
-                if slot.is_some() {
-                    pg.set_dirty();
+                // `last_page` was read outside the latch, and this is the one
+                // page access in the engine that does not walk the chain under
+                // `tables`. VACUUM can have freed the page in the gap, in which
+                // case it is now a free-list node and writing a tuple into it
+                // would put a live row on a page any table can claim. Fall
+                // through to allocating instead.
+                if page::get_page_type(&pg) == page::PAGE_TYPE_DATA {
+                    let slot = page::insert_tuple(&mut pg, &data);
+                    if slot.is_some() {
+                        pg.set_dirty();
+                    }
+                    slot
+                } else {
+                    None
                 }
-                slot
             };
             if let Some(slot_idx) = placed {
                 self.record_dirty_page(last_page_id);
@@ -4870,6 +5019,448 @@ mod tests {
 
         // Data still intact
         assert_eq!(engine.scan("t").await.unwrap().len(), 7);
+    }
+
+    // ── VACUUM vs. the B-tree ──────────────────────────────────────
+    //
+    // A B-tree entry is a physical address, `(page_id, slot_idx)`. VACUUM is
+    // the only operation that can change what a live row's address means
+    // without going through the index-maintenance hooks, in two ways:
+    //
+    //   1. Compacting a page used to re-initialise it and re-insert the live
+    //      tuples, which renumbered every slot. An entry naming a slot that is
+    //      still in range then resolved to whatever row moved into it — a
+    //      silently wrong row, no error.
+    //   2. Freeing an emptied page puts it on the ENGINE-WIDE free list, so it
+    //      comes back as some other table's page. An entry still addressing it
+    //      then reads another table's bytes through this table's column types.
+    //
+    // (1) is now impossible by construction: compaction preserves slot indices.
+    // (2) is closed by purging, before the page is published to the free list,
+    // every index entry that addresses it.
+
+    /// Ids present in a set of rows, sorted.
+    fn sorted_ids(rows: &[Row]) -> Vec<i32> {
+        let mut v = ids(rows);
+        v.sort_unstable();
+        v
+    }
+
+    /// Every `(key, RowId)` currently in an index, for invariant checks.
+    fn index_entries(engine: &DiskEngine, index: &str) -> Vec<(Vec<u8>, RowId)> {
+        let indexes = engine.indexes.read();
+        indexes
+            .get(index)
+            .expect("index missing")
+            .btree
+            .range_scan(None, None)
+            .unwrap()
+    }
+
+    /// Positions of every live row that lives on `page_id`.
+    async fn positions_on_page(engine: &DiskEngine, table: &str, page_id: u32) -> Vec<usize> {
+        engine
+            .scan_physical(table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(pos, _)| pos)
+            .filter(|&pos| decode_row_pos(pos).0 == page_id)
+            .collect()
+    }
+
+    /// THE renumbering defect. VACUUM compacts a page; every index entry
+    /// pointing into it must still name the row it was created for.
+    #[tokio::test]
+    async fn vacuum_keeps_index_entries_on_their_own_rows() {
+        bounded(60, "vacuum_keeps_index_entries_on_their_own_rows", async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (engine, catalog) = setup_engine(tmp.path()).await;
+            register_simple_table(&catalog, "t").await;
+            engine.create_table("t").await.unwrap();
+            engine.create_index("t", "ix", 0).await.unwrap();
+
+            for id in 1..=10 {
+                engine
+                    .insert("t", simple_row(id, &format!("v{id}")))
+                    .await
+                    .unwrap();
+            }
+
+            // Delete the three rows at the FRONT of the page, so compaction has
+            // to move every survivor down if it renumbers at all.
+            let targets = at(&engine, "t", &[0, 1, 2]).await;
+            assert_eq!(engine.delete("t", &targets).await.unwrap(), 3);
+
+            let (_, dead, _, _) = engine.vacuum_table("t").unwrap();
+            assert_eq!(dead, 3, "vacuum did not reclaim the dead tuples");
+
+            // Each surviving id must still resolve, through the index, to its
+            // own row. Renumbering makes this return a DIFFERENT row (or none).
+            for id in 4..=10 {
+                let rows = engine
+                    .index_lookup("t", "ix", &Value::Int32(id))
+                    .await
+                    .unwrap()
+                    .expect("index_lookup returned no index");
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "index entry for id={id} resolved to {} rows after VACUUM",
+                    rows.len()
+                );
+                assert_eq!(
+                    rows[0][0],
+                    Value::Int32(id),
+                    "index entry for id={id} resolved to a DIFFERENT row after VACUUM: {:?}",
+                    rows[0]
+                );
+            }
+
+            // And the index still answers for the whole surviving set.
+            let all = engine
+                .index_lookup_range("t", "ix", &Value::Int32(1), &Value::Int32(10))
+                .await
+                .unwrap()
+                .expect("index_lookup_range returned no index");
+            assert_eq!(sorted_ids(&all), (4..=10).collect::<Vec<i32>>());
+        })
+        .await;
+    }
+
+    /// THE free-list crossing, end to end and with no injected state: a first
+    /// VACUUM invalidates entries by renumbering, the rows behind them are then
+    /// deleted (so index maintenance cannot find the stale entries to remove
+    /// them), a second VACUUM frees the now-empty page, and a new table picks
+    /// it up off the free list. The stale entry must not read that table.
+    #[tokio::test]
+    async fn stale_index_entry_never_reads_another_table() {
+        bounded(120, "stale_index_entry_never_reads_another_table", async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (engine, catalog) = setup_engine(tmp.path()).await;
+            register_simple_table(&catalog, "t").await;
+            register_simple_table(&catalog, "u").await;
+            engine.create_table("t").await.unwrap();
+            engine.create_index("t", "ix", 0).await.unwrap();
+
+            // Two pages' worth of rows.
+            for id in 0..1200 {
+                engine
+                    .insert("t", simple_row(id, &format!("row_{id:04}")))
+                    .await
+                    .unwrap();
+            }
+            let pages = engine.table_pages("t").unwrap();
+            assert!(pages.len() >= 2, "need >= 2 pages, got {}", pages.len());
+            let victim = pages[1];
+
+            // Round 1: delete half of the victim page's rows and vacuum. This
+            // is what used to renumber the survivors out from under the index.
+            let on_victim = positions_on_page(&engine, "t", victim).await;
+            assert!(on_victim.len() >= 4);
+            let half = on_victim.len() / 2;
+            engine.delete("t", &on_victim[..half]).await.unwrap();
+            engine.vacuum_table("t").unwrap();
+
+            // Round 2: delete the rest of the victim page, then vacuum again so
+            // the empty page is unlinked and published to the free list.
+            let rest = positions_on_page(&engine, "t", victim).await;
+            let victim_ids: Vec<i32> = engine
+                .scan_physical("t")
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|(pos, _)| decode_row_pos(*pos).0 == victim)
+                .map(|(_, row)| match row[0] {
+                    Value::Int32(v) => v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            engine.delete("t", &rest).await.unwrap();
+            let (_, _, freed, _) = engine.vacuum_table("t").unwrap();
+            assert!(freed >= 1, "the emptied page was not freed");
+
+            // No index entry may address a freed page.
+            let live_pages: HashSet<u32> = engine.table_pages("t").unwrap().into_iter().collect();
+            for (_, rid) in index_entries(&engine, "ix") {
+                assert!(
+                    live_pages.contains(&rid.page_id),
+                    "index entry addresses page {} which is no longer in table t's chain",
+                    rid.page_id
+                );
+            }
+
+            // A new table now takes the freed page off the free list.
+            engine.create_table("u").await.unwrap();
+            for id in 0..1200 {
+                engine
+                    .insert("u", simple_row(100_000 + id, &format!("u_{id:04}")))
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                engine.table_pages("u").unwrap().contains(&victim),
+                "test did not reproduce the reuse it is about to check"
+            );
+
+            // Every id whose row lived on the recycled page is gone from t, and
+            // looking it up must not surface table u's rows.
+            for id in victim_ids {
+                let rows = engine
+                    .index_lookup("t", "ix", &Value::Int32(id))
+                    .await
+                    .unwrap()
+                    .expect("index_lookup returned no index");
+                assert!(
+                    rows.is_empty(),
+                    "index lookup for deleted id={id} returned {rows:?} — a stale entry read \
+                     into a page that now belongs to table u"
+                );
+            }
+
+            // t's surviving rows are all still reachable through the index.
+            let survivors = engine.scan("t").await.unwrap();
+            for id in ids(&survivors) {
+                let rows = engine
+                    .index_lookup("t", "ix", &Value::Int32(id))
+                    .await
+                    .unwrap()
+                    .expect("index_lookup returned no index");
+                assert_eq!(rows.len(), 1, "surviving id={id} lost its index entry");
+                assert_eq!(rows[0][0], Value::Int32(id));
+            }
+        })
+        .await;
+    }
+
+    /// The purge itself, driven directly: an entry addressing a page VACUUM is
+    /// about to free must not survive the free. Injected rather than grown so
+    /// the purge is exercised even once renumbering can no longer create one.
+    #[tokio::test]
+    async fn vacuum_purges_index_entries_addressing_pages_it_frees() {
+        bounded(
+            120,
+            "vacuum_purges_index_entries_addressing_pages_it_frees",
+            async {
+                let tmp = tempfile::tempdir().unwrap();
+                let (engine, catalog) = setup_engine(tmp.path()).await;
+                register_simple_table(&catalog, "t").await;
+                register_simple_table(&catalog, "u").await;
+                engine.create_table("t").await.unwrap();
+                engine.create_index("t", "ix", 0).await.unwrap();
+
+                for id in 0..1200 {
+                    engine
+                        .insert("t", simple_row(id, &format!("row_{id:04}")))
+                        .await
+                        .unwrap();
+                }
+                let pages = engine.table_pages("t").unwrap();
+                assert!(pages.len() >= 2);
+                let victim = pages[1];
+
+                // Empty the victim page.
+                let on_victim = positions_on_page(&engine, "t", victim).await;
+                engine.delete("t", &on_victim).await.unwrap();
+
+                // Plant an entry addressing it, standing in for any entry that
+                // outlived its row for any reason.
+                let ghost_key = serialize_index_key(&Value::Int32(4242));
+                {
+                    let mut indexes = engine.indexes.write();
+                    indexes
+                        .get_mut("ix")
+                        .unwrap()
+                        .btree
+                        .insert(
+                            &ghost_key,
+                            RowId {
+                                page_id: victim,
+                                slot_idx: 0,
+                            },
+                        )
+                        .unwrap();
+                }
+                assert!(
+                    index_entries(&engine, "ix")
+                        .iter()
+                        .any(|(_, r)| r.page_id == victim),
+                    "planting the stale entry did not take"
+                );
+
+                let (_, _, freed, _) = engine.vacuum_table("t").unwrap();
+                assert!(freed >= 1, "the emptied page was not freed");
+
+                assert!(
+                    !index_entries(&engine, "ix")
+                        .iter()
+                        .any(|(_, r)| r.page_id == victim),
+                    "VACUUM published page {victim} to the free list with an index entry still \
+                     addressing it"
+                );
+
+                // Hand the page to another table and confirm nothing reads it.
+                engine.create_table("u").await.unwrap();
+                for id in 0..1200 {
+                    engine
+                        .insert("u", simple_row(100_000 + id, &format!("u_{id:04}")))
+                        .await
+                        .unwrap();
+                }
+                assert!(engine.table_pages("u").unwrap().contains(&victim));
+
+                let rows = engine
+                    .index_lookup("t", "ix", &Value::Int32(4242))
+                    .await
+                    .unwrap()
+                    .expect("index_lookup returned no index");
+                assert!(
+                    rows.is_empty(),
+                    "stale entry read into table u's page: {rows:?}"
+                );
+            },
+        )
+        .await;
+    }
+
+    /// VACUUM must not leave `last_page` pointing at a page it freed: the
+    /// insert fast path writes through that pointer, and `alloc_data_page`
+    /// links the next page off it — into a free-list node.
+    #[tokio::test]
+    async fn vacuum_does_not_strand_the_last_page_pointer() {
+        bounded(120, "vacuum_does_not_strand_the_last_page_pointer", async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (engine, catalog) = setup_engine(tmp.path()).await;
+            register_simple_table(&catalog, "t").await;
+            engine.create_table("t").await.unwrap();
+
+            for id in 0..1200 {
+                engine
+                    .insert("t", simple_row(id, &format!("row_{id:04}")))
+                    .await
+                    .unwrap();
+            }
+            let pages = engine.table_pages("t").unwrap();
+            assert!(pages.len() >= 2);
+            let last = *pages.last().unwrap();
+
+            // Empty the trailing page only.
+            let on_last = positions_on_page(&engine, "t", last).await;
+            let expected_survivors = 1200 - on_last.len();
+            engine.delete("t", &on_last).await.unwrap();
+            let (_, _, freed, _) = engine.vacuum_table("t").unwrap();
+            assert!(freed >= 1, "the emptied trailing page was not freed");
+
+            let chain = engine.table_pages("t").unwrap();
+            assert!(!chain.contains(&last), "freed page still in the chain");
+            let meta_last = engine.tables.read().get("t").unwrap().last_page;
+            assert!(
+                chain.contains(&meta_last),
+                "last_page = {meta_last} is not in the page chain {chain:?} — the next insert \
+                 would write through a freed page"
+            );
+
+            // Keep inserting past the point where a new page is needed.
+            for id in 10_000..11_500 {
+                engine
+                    .insert("t", simple_row(id, &format!("post_{id:05}")))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                engine.scan("t").await.unwrap().len(),
+                expected_survivors + 1500,
+                "rows lost after inserting through a vacuumed tail"
+            );
+        })
+        .await;
+    }
+
+    /// The price of preserving slot identity, measured rather than asserted in
+    /// prose. Re-initialising a page also reset its slot array, returning
+    /// `SLOT_SIZE` bytes per dead slot to the contiguous free region;
+    /// compacting in place keeps them reserved until an insert reuses the slot.
+    /// Two things bound that: the reservation is a small fraction of the page,
+    /// and it is lent back on the next inserts rather than lost.
+    #[tokio::test]
+    async fn vacuum_slot_retention_is_bounded_and_reusable() {
+        bounded(60, "vacuum_slot_retention_is_bounded_and_reusable", async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (engine, catalog) = setup_engine(tmp.path()).await;
+            register_simple_table(&catalog, "t").await;
+            engine.create_table("t").await.unwrap();
+
+            // Fill exactly one page with rows of a realistic width.
+            let mut inserted = 0usize;
+            while engine.table_pages("t").unwrap().len() < 2 {
+                engine
+                    .insert(
+                        "t",
+                        simple_row(inserted as i32, &format!("padpadpadpadpadpad_{inserted:06}")),
+                    )
+                    .await
+                    .unwrap();
+                inserted += 1;
+            }
+            let page_id = engine.table_pages("t").unwrap()[0];
+
+            // Delete a third of the page's rows, spread across it.
+            let victims: Vec<usize> = engine
+                .scan_physical("t")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(pos, _)| pos)
+                .filter(|&pos| decode_row_pos(pos).0 == page_id)
+                .enumerate()
+                .filter_map(|(i, pos)| (i % 3 == 0).then_some(pos))
+                .collect();
+            let deleted = engine.delete("t", &victims).await.unwrap();
+            assert_eq!(deleted, victims.len());
+
+            engine.vacuum_table("t").unwrap();
+
+            let (dead, slots, frag) = {
+                let pg = engine.pool.read_guard(page_id).unwrap();
+                (
+                    page::dead_tuple_count(&pg),
+                    page::slot_count(&pg),
+                    page::read_u16(&pg, page::DATA_FRAG_FREE) as usize,
+                )
+            };
+            assert_eq!(frag, 0, "compaction left fragmented bytes behind");
+            assert_eq!(dead, deleted, "dead slots did not survive compaction");
+
+            // The retained bytes, as a share of the page. On a 16 KB page of
+            // ~30-byte rows with a third deleted this is a low single-digit
+            // percentage; the assertion is the ceiling, the message is the
+            // measurement.
+            let retained = dead * page::SLOT_SIZE;
+            let pct = retained * 100 / PAGE_SIZE;
+            assert!(
+                pct <= 5,
+                "slot-array retention is {retained} bytes of {PAGE_SIZE} ({pct}%) with \
+                 {dead} dead of {slots} slots — above the budget this trade was taken under"
+            );
+
+            // And it is a loan, not a loss: the next inserts reuse the dead
+            // slots instead of extending the array.
+            for i in 0..deleted {
+                engine
+                    .insert("t", simple_row(900_000 + i as i32, "refill"))
+                    .await
+                    .unwrap();
+            }
+            let slots_after = {
+                let pg = engine.pool.read_guard(page_id).unwrap();
+                page::slot_count(&pg)
+            };
+            assert_eq!(
+                slots_after, slots,
+                "refilling the page grew the slot array instead of reusing the dead slots"
+            );
+        })
+        .await;
     }
 
     // ── free list page reuse after DROP TABLE ─────────────────────
