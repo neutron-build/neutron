@@ -135,13 +135,26 @@ pub trait StorageEngine: Send + Sync {
     /// Update rows enforcing the given UNIQUE/PK column sets atomically on the new
     /// values (so concurrent updates can't move two rows to the same key).
     /// `updates` are `(position, new_row)`. Default: plain `update()`.
+    /// Update rows that change a PRIMARY KEY or UNIQUE column.
+    ///
+    /// Takes `(position, read row, new row)` for the same reason
+    /// [`update_if_unchanged`](Self::update_if_unchanged) does: the executor
+    /// resolves a position and then awaits before writing, and on the paged
+    /// engines a position is a physical address whose slot a concurrent
+    /// DELETE + INSERT can hand to a different row inside that window. The
+    /// default delegates to `update_if_unchanged`, so an engine that checks
+    /// identity there checks it here too.
+    ///
+    /// This used to take `(position, new row)` and call `update()` directly,
+    /// which left the identity re-check absent on exactly the updates where
+    /// writing the wrong row produces a duplicate primary key.
     async fn update_unique(
         &self,
         table: &str,
-        updates: &[(usize, Row)],
+        updates: &[(usize, Row, Row)],
         _unique_col_sets: &[Vec<usize>],
     ) -> Result<usize, StorageError> {
-        self.update(table, updates).await
+        self.update_if_unchanged(table, updates).await
     }
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError>;
     /// Scan all visible rows WITHOUT recording SIREAD locks. For INTERNAL

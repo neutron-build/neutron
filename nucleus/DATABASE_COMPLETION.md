@@ -937,7 +937,10 @@ correctness findings. All three were verified here before being recorded; none w
 any harness in this repository, and two are the same silent-trait-default shape as the
 savepoint and isolation-level defects already recorded under M8.
 
-- [ ] **`BEGIN; UPDATE (grows a row); DELETE; COMMIT;` silently loses the DELETE.**
+- [x] **`BEGIN; UPDATE (grows a row); DELETE; COMMIT;` silently loses the DELETE.** **FIXED
+      `073ba51`** — each real buffered position now gets exactly one write carrying its final
+      value; the last op naming it decides delete or update. Two regression tests, both failing
+      without the fix; wire repro now deletes and stays deleted across restart; lib 4042/0.
       **Confirmed by measurement**, on the shipped `BufferedDiskEngine`, from ordinary SQL with
       no concurrency. `update_if_unchanged`/`delete_if_unchanged`
       (`storage/buffered_engine.rs:400-428`) drop the caller's read row when in a transaction and
@@ -953,8 +956,12 @@ savepoint and isolation-level defects already recorded under M8.
       `buffered_engine.rs:406-408` claiming "the identity re-check happens when the buffer
       applies" is false in both directions: `apply_buffer` calls the unchecked methods, and
       `BufferedOp::Update` does not carry the read row for a check to use.
-      Note the review's paired claim that UPDATE-then-UPDATE loses the second update did **not**
-      reproduce; only the grow-then-DELETE sequence does.
+      The review's paired claim that UPDATE-then-UPDATE loses the second update was first
+      recorded here as not reproducing. **That was wrong** — a false negative from a wire-level
+      attempt whose page had no dead slot for the grown row to relocate into. At engine level it
+      reproduces reliably and is covered by
+      `buffered_update_after_growing_update_keeps_the_later_value`. Worth stating plainly: a
+      failed reproduction is evidence about the attempt, not about the claim.
 - [ ] **`update_unique` has no row-identity re-check on the paged engines.** The trait default
       (`storage/mod.rs:138-145`) is a plain `self.update()` with no expected row, and only
       `MvccStorageAdapter` overrides it (`mvcc.rs:2304`) — where it is unnecessary, because its

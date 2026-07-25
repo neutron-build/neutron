@@ -2239,6 +2239,22 @@ impl Executor {
         // concurrent txn's uncommitted row), so two concurrent updates can't move
         // two rows to the same key. Otherwise use the plain update path.
         let storage = self.storage_for(&table_name);
+        // Carry the row each position was resolved from. Statement execution
+        // awaits between resolving a position and writing it — triggers, RLS,
+        // constraints, derived-index maintenance — and on the paged engine a
+        // position is a physical address whose slot a concurrent DELETE +
+        // INSERT can hand to a different row inside that window. Writing on the
+        // address alone overwrote that row and left two rows with the same
+        // primary key. Both write paths below need this, and the unique path —
+        // where a wrong write lands on a PK column — went without it longest.
+        let verified: Vec<(usize, Row, Row)> = updates
+            .iter()
+            .filter_map(|(pos, new_row)| {
+                row_by_pos
+                    .get(pos)
+                    .map(|old| (*pos, (*old).clone(), new_row.clone()))
+            })
+            .collect();
         let count = if check_unique && !updates.is_empty() {
             let unique_col_sets: Vec<Vec<usize>> = {
                 use crate::catalog::TableConstraint;
@@ -2259,7 +2275,7 @@ impl Executor {
                     .collect()
             };
             storage
-                .update_unique(&table_name, &updates, &unique_col_sets)
+                .update_unique(&table_name, &verified, &unique_col_sets)
                 .await
                 .map_err(|e| match e {
                     crate::storage::StorageError::UniqueViolation(m) => {
@@ -2270,21 +2286,6 @@ impl Executor {
                     other => ExecError::Storage(other),
                 })?
         } else {
-            // Carry the row each position was resolved from. Statement
-            // execution awaits between resolving a position and writing it —
-            // triggers, RLS, constraints, derived-index maintenance — and on
-            // the paged engine a position is a physical address whose slot a
-            // concurrent DELETE + INSERT can hand to a different row inside
-            // that window. Writing on the address alone overwrote that row and
-            // left two rows with the same primary key.
-            let verified: Vec<(usize, Row, Row)> = updates
-                .iter()
-                .filter_map(|(pos, new_row)| {
-                    row_by_pos
-                        .get(pos)
-                        .map(|old| (*pos, (*old).clone(), new_row.clone()))
-                })
-                .collect();
             storage
                 .update_if_unchanged(&table_name, &verified)
                 .await?
