@@ -150,8 +150,51 @@ impl BufferedDiskEngine {
     /// Ops naming a synthetic position never reach the engine: a DELETE of a
     /// row this transaction inserted cancels that insert, and an UPDATE of one
     /// rewrites the row the insert will write. Everything else names a real
-    /// engine address and is replayed in order.
+    /// engine address.
+    ///
+    /// # Why real positions are collapsed to one write each
+    ///
+    /// A real position is a physical `(page_id, slot_idx)` address, and applying
+    /// a write can MOVE the row away from it: `DiskEngine::update_at` relocates
+    /// a row that no longer fits its slot, into an earlier dead slot on the page
+    /// or onto another page entirely. Replaying ops one by one therefore breaks
+    /// as soon as two of them name the same position — the first write moves the
+    /// row, and every later write lands on a slot that is now dead, where
+    /// `update_at`/`delete_at` skip it and return success.
+    ///
+    /// That is silent data loss from ordinary single-session SQL:
+    /// `BEGIN; UPDATE t SET c = repeat('q',2000) WHERE id=3; DELETE FROM t WHERE
+    /// id=3; COMMIT;` reported `DELETE 1` and left the row on disk, surviving a
+    /// reopen. The buffered view is what made it invisible until COMMIT — the
+    /// overlay rewrites a buffered row in place and keeps its position, so both
+    /// statements resolve the same address and the transaction looks coherent
+    /// right up to the point where it is replayed.
+    ///
+    /// So each real position gets exactly one write, carrying its final value:
+    /// the last op naming it decides whether that is a delete or an update, and
+    /// intermediate updates are dropped. This is also what the ops MEAN — a
+    /// transaction that updates then deletes a row has deleted it.
     async fn apply_buffer(&self, ops: Vec<BufferedOp>) -> Result<(), StorageError> {
+        // The last op naming each real position wins; `usize` is its index in
+        // `ops`, so replay can tell "this is the deciding write" from "this is
+        // an intermediate one that must not be applied".
+        let mut last_touch: HashMap<usize, usize> = HashMap::new();
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                BufferedOp::Delete { positions, .. } => {
+                    for pos in positions.iter().copied().filter(|p| !is_pending_pos(*p)) {
+                        last_touch.insert(pos, i);
+                    }
+                }
+                BufferedOp::Update { updates, .. } => {
+                    for (pos, _) in updates.iter().filter(|(p, _)| !is_pending_pos(*p)) {
+                        last_touch.insert(*pos, i);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Resolve the fate of each buffered insert before replaying anything.
         let mut cancelled: HashSet<usize> = HashSet::new();
         let mut rewritten: HashMap<usize, Row> = HashMap::new();
@@ -174,7 +217,7 @@ impl BufferedDiskEngine {
             }
         }
 
-        for op in ops {
+        for (i, op) in ops.into_iter().enumerate() {
             match op {
                 BufferedOp::Insert {
                     table,
@@ -188,9 +231,13 @@ impl BufferedDiskEngine {
                     self.inner.insert(&table, row).await?;
                 }
                 BufferedOp::Delete { table, positions } => {
+                    // Only the deciding op for each position writes; an earlier
+                    // op naming a position that is written again later would
+                    // move the row and strand every write after it.
                     let positions: Vec<usize> = positions
                         .into_iter()
                         .filter(|p| !is_pending_pos(*p))
+                        .filter(|p| last_touch.get(p) == Some(&i))
                         .collect();
                     if !positions.is_empty() {
                         self.inner.delete(&table, &positions).await?;
@@ -200,6 +247,7 @@ impl BufferedDiskEngine {
                     let updates: Vec<(usize, Row)> = updates
                         .into_iter()
                         .filter(|(p, _)| !is_pending_pos(*p))
+                        .filter(|(p, _)| last_touch.get(p) == Some(&i))
                         .collect();
                     if !updates.is_empty() {
                         self.inner.update(&table, &updates).await?;
