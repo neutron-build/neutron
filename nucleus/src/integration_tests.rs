@@ -4594,4 +4594,121 @@ mod tests {
         assert_eq!(r[1][0], Value::Text("Widget".into()));
         assert_eq!(r[1][1], Value::Int64(250));
     }
+
+    // ── KNOWN FAILING: concurrent writers on one page corrupt it ──────────
+    //
+    // IGNORED because it reproduces an OPEN defect, not a fixed one. Run it
+    // with `cargo test --lib --features server -- --ignored
+    // concurrent_same_page_writers`.
+    //
+    // `DiskEngine` never takes the buffer pool's frame latches: it mutates page
+    // bytes through `BufferPool::frame_data_mut`, whose own contract says the
+    // caller must hold the latch, and reads through `frame_data` with no read
+    // latch. Several sessions writing rows that live on the SAME page therefore
+    // race on the raw bytes, and `page::insert_tuple` is where it shows: two
+    // writers read the same `DATA_FREE_END` or claim the same dead slot, so one
+    // row is written over the other. `DiskEngine::index_delete` compounds it by
+    // mutating the B-tree while holding only `indexes.read()`, so two concurrent
+    // deletes mutate index pages at once.
+    //
+    // Observed on this workload: duplicate primary keys (only when updates
+    // change a row's width, which is what routes them through
+    // `delete_tuple` + `insert_tuple`), and a slice-out-of-bounds panic in
+    // `btree::extract_key` reading a corrupted leaf entry.
+    //
+    // This is a DIFFERENT defect from the row-identity one the
+    // `storage::disk_engine` position tests cover, and it is not fixed. Spread
+    // the same workload across many pages (as `probe_soak` does) and it does
+    // not fire. Un-ignore this once the paged engine latches its pages.
+    #[ignore = "reproduces an open defect: DiskEngine mutates pages without holding frame latches"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_page_writers_corrupt_rows_and_indexes() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("churn.db"), catalog.clone()).unwrap());
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, storage));
+
+        run(&ex, "CREATE TABLE churn (id BIGINT PRIMARY KEY, tag TEXT)").await;
+
+        // Low ids are the deleter's; each updater owns a 40-wide high range.
+        const UPDATERS: i64 = 3;
+        const PER_UPDATER: i64 = 40;
+        const DELETABLE: i64 = 120;
+        for id in 0..DELETABLE {
+            run(&ex, &format!("INSERT INTO churn VALUES ({id}, 'seed')")).await;
+        }
+        for w in 0..UPDATERS {
+            for k in 0..PER_UPDATER {
+                let id = 1_000 + w * 1_000 + k;
+                run(&ex, &format!("INSERT INTO churn VALUES ({id}, 'own')")).await;
+            }
+        }
+
+        let mut tasks = Vec::new();
+
+        // The deleter removes rows that sort BEFORE every updater's rows, so
+        // each delete renumbers the scan ordinal of every row they hold.
+        let deleter = ex.clone();
+        tasks.push(tokio::spawn(async move {
+            for id in 0..DELETABLE {
+                let _ = deleter
+                    .execute(&format!("DELETE FROM churn WHERE id = {id}"))
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        }));
+
+        for w in 0..UPDATERS {
+            let updater = ex.clone();
+            tasks.push(tokio::spawn(async move {
+                for round in 0..8 {
+                    for k in 0..PER_UPDATER {
+                        let id = 1_000 + w * 1_000 + k;
+                        // Alternate tag width so some updates fit in place and
+                        // some force the row to move to another slot.
+                        // Alternate tag width so some updates fit in place and
+                        // some force the row through delete_tuple + insert_tuple.
+                        let tag = if round % 2 == 0 {
+                            format!("r{round}")
+                        } else {
+                            "x".repeat(64)
+                        };
+                        let _ = updater
+                            .execute(&format!("UPDATE churn SET tag = '{tag}' WHERE id = {id}"))
+                            .await;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let dupes = run(
+            &ex,
+            "SELECT id FROM churn GROUP BY id HAVING COUNT(*) > 1 LIMIT 8",
+        )
+        .await;
+        assert!(
+            rows(&dupes[0]).is_empty(),
+            "concurrent churn produced duplicate primary keys: {:?}",
+            rows(&dupes[0])
+        );
+
+        // Every id an updater owns must still be there exactly once: a write at
+        // a renumbered position also destroys whichever row it landed on.
+        let survivors = run(&ex, "SELECT COUNT(*) FROM churn").await;
+        assert_eq!(
+            *scalar(&survivors[0]),
+            Value::Int64(UPDATERS * PER_UPDATER),
+            "rows were lost or duplicated by concurrent churn"
+        );
+    }
 }

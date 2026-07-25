@@ -3897,18 +3897,19 @@ impl Executor {
                         rows_affected: 0,
                     }));
                 }
-                let updates: Vec<(usize, Vec<Value>)> = matches
+                let updates: Vec<(usize, Vec<Value>, Vec<Value>)> = matches
                     .into_iter()
-                    .map(|(pos, mut row)| {
+                    .map(|(pos, row)| {
+                        let mut new_row = row.clone();
                         for (col_idx, val) in &col_updates {
-                            if *col_idx < row.len() {
-                                row[*col_idx] = val.clone();
+                            if *col_idx < new_row.len() {
+                                new_row[*col_idx] = val.clone();
                             }
                         }
-                        (pos, row)
+                        (pos, row, new_row)
                     })
                     .collect();
-                let count = match storage.update(table, &updates).await {
+                let count = match storage.update_if_unchanged(table, &updates).await {
                     Ok(n) => n,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
@@ -3963,8 +3964,7 @@ impl Executor {
                         rows_affected: 0,
                     }));
                 }
-                let positions: Vec<usize> = matches.into_iter().map(|(pos, _)| pos).collect();
-                let count = match storage.delete(table, &positions).await {
+                let count = match storage.delete_if_unchanged(table, &matches).await {
                     Ok(n) => n,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };

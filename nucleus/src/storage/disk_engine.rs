@@ -4,7 +4,7 @@
 //! tracked in a table directory (in-memory HashMap, persisted to the meta/catalog
 //! pages on flush). Rows are serialized to binary tuples and stored in slotted pages.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -215,6 +215,58 @@ fn get_next_page(pg: &PageBuf) -> u32 {
 fn set_next_page(pg: &mut PageBuf, next: u32) {
     page::write_u32(pg, NEXT_PAGE_OFFSET, next);
 }
+
+// ============================================================================
+// Stable row addressing
+// ============================================================================
+//
+// The `usize` "positions" this engine hands out through `scan_physical` /
+// `scan_where_eq_positions`, and accepts back in `update` / `delete`, are
+// physical tuple addresses — `(page_id, slot_idx)` packed together — and not
+// scan-order ordinals.
+//
+// Ordinals cannot serve as positions here. The executor resolves a row's
+// position, then awaits (triggers, RLS, CHECK/FK constraints, vector and
+// encrypted index maintenance) before feeding the position back to
+// `update()`/`delete()`. Any concurrent DELETE of an earlier row, or INSERT
+// into an earlier freed slot, renumbers every later live-row ordinal inside
+// that window — so the deferred write lands on a DIFFERENT row, overwriting it
+// with the updater's row. The result is two rows carrying the same primary key
+// and one row silently gone, and it persists across a reopen because it is a
+// genuine physical duplicate. `MvccStorageAdapter` never had the bug because it
+// hands out stable version indices; the paged engine now hands out stable
+// addresses.
+//
+// A physical address identifies a row for as long as that row occupies the
+// slot, but a slot is recycled by the next insert on the page once the row is
+// deleted (`page::insert_tuple` reuses the first dead slot). Callers that
+// resolved a position before awaiting therefore use `update_if_unchanged` /
+// `delete_if_unchanged`, which re-check the tuple's identity at write time.
+
+/// Bits of a packed position reserved for the slot index (`slot_idx: u16`).
+const POS_SLOT_BITS: u32 = 16;
+const POS_SLOT_MASK: usize = (1 << POS_SLOT_BITS) - 1;
+
+// A packed position needs 32 bits of page id plus 16 of slot index. Truncating
+// them into a narrower `usize` would silently alias unrelated rows, so refuse
+// to build rather than corrupt.
+const _: () = assert!(
+    usize::BITS >= 48,
+    "the paged engine packs (page_id, slot_idx) row addresses into a usize position"
+);
+
+#[inline]
+fn encode_row_pos(page_id: u32, slot_idx: u16) -> usize {
+    ((page_id as usize) << POS_SLOT_BITS) | slot_idx as usize
+}
+
+#[inline]
+fn decode_row_pos(pos: usize) -> (u32, u16) {
+    ((pos >> POS_SLOT_BITS) as u32, (pos & POS_SLOT_MASK) as u16)
+}
+
+/// Mutation targets grouped by the page holding them: `(page_id, [(slot, T)])`.
+type PageGrouped<T> = Vec<(u32, Vec<(u16, T)>)>;
 
 impl Drop for DiskEngine {
     /// Flush all dirty pages and save the table directory on drop (clean shutdown).
@@ -1225,6 +1277,293 @@ impl DiskEngine {
         }
     }
 
+    /// The pages this table owns, as a set, for validating caller-supplied
+    /// positions. A position is only ever minted by this engine's own scans,
+    /// so a page id outside the set means the caller mixed position spaces
+    /// (e.g. passed dense scan ordinals). Writing there would corrupt the meta
+    /// page or another table, so such positions are dropped instead.
+    fn owned_pages(&self, table: &str) -> Result<HashSet<u32>, StorageError> {
+        Ok(self.table_pages(table)?.into_iter().collect())
+    }
+
+    /// Column indices that identify a row when re-checking a deferred
+    /// mutation: the primary key when the table has one, `None` (compare every
+    /// column) when it does not.
+    fn identity_cols(&self, table: &str) -> Option<Vec<usize>> {
+        let def = self.catalog.get_table_cached(table)?;
+        for constraint in &def.constraints {
+            if let crate::catalog::TableConstraint::PrimaryKey { columns, .. } = constraint {
+                let idxs: Vec<usize> = columns
+                    .iter()
+                    .filter_map(|name| def.column_index(name))
+                    .collect();
+                if !idxs.is_empty() && idxs.len() == columns.len() {
+                    return Some(idxs);
+                }
+            }
+        }
+        None
+    }
+
+    /// Is the tuple now at a position still the row the caller read?
+    fn same_row_identity(expected: &Row, actual: &Row, identity: Option<&Vec<usize>>) -> bool {
+        match identity {
+            Some(cols) => cols.iter().all(|&i| expected.get(i) == actual.get(i)),
+            None => expected == actual,
+        }
+    }
+
+    /// Group caller-supplied positions by page, dropping any that do not
+    /// address a data page this table owns. Ordering within a page is by slot
+    /// index so a page is walked once, forwards.
+    fn group_by_page<T>(
+        &self,
+        table: &str,
+        items: impl IntoIterator<Item = (usize, T)>,
+    ) -> Result<PageGrouped<T>, StorageError> {
+        let owned = self.owned_pages(table)?;
+        let mut by_page: BTreeMap<u32, Vec<(u16, T)>> = BTreeMap::new();
+        for (pos, payload) in items {
+            let (page_id, slot_idx) = decode_row_pos(pos);
+            if !owned.contains(&page_id) {
+                tracing::error!(
+                    target: "nucleus::storage",
+                    table,
+                    pos,
+                    page_id,
+                    "mutation position does not address a page of this table; ignored"
+                );
+                continue;
+            }
+            by_page.entry(page_id).or_default().push((slot_idx, payload));
+        }
+        Ok(by_page
+            .into_iter()
+            .map(|(page_id, mut slots)| {
+                slots.sort_by_key(|(slot, _)| *slot);
+                (page_id, slots)
+            })
+            .collect())
+    }
+
+    /// Delete tuples at stable row addresses. `expected` is the row the caller
+    /// read; when present, the tuple is deleted only if it still holds that
+    /// row's identity, so a position whose slot was recycled by a later insert
+    /// cannot delete the row that took its place.
+    fn delete_at(
+        &self,
+        table: &str,
+        targets: Vec<(usize, Option<Row>)>,
+    ) -> Result<usize, StorageError> {
+        let col_types = self.col_types(table)?;
+        let has_indexes = {
+            let indexes = self.indexes.read();
+            indexes.values().any(|idx| idx.table == table)
+        };
+        let verifying = targets.iter().any(|(_, expected)| expected.is_some());
+        let identity = verifying.then(|| self.identity_cols(table)).flatten();
+        let mut count = 0usize;
+
+        for (page_id, slots) in self.group_by_page(table, targets)? {
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let mut dirty = false;
+            for (slot_idx, expected) in slots {
+                let pg = self.pool.frame_data(frame_id);
+                if page::read_u16(pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
+                    break;
+                }
+                if slot_idx >= page::read_u16(pg, page::DATA_SLOT_COUNT) {
+                    continue;
+                }
+                let entry = page::read_slot(pg, slot_idx);
+                // The row was deleted by someone else in the meantime.
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset() as usize;
+                let len = entry.length() as usize;
+                let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
+                if let Some(expected) = &expected {
+                    match &current {
+                        Some(row)
+                            if Self::same_row_identity(expected, row, identity.as_ref()) => {}
+                        // A different row occupies the address now — the slot
+                        // was freed and recycled while the caller was resolving
+                        // the rest of the statement. Leave it alone.
+                        _ => continue,
+                    }
+                }
+                if has_indexes && let Some(row) = &current {
+                    self.index_delete(table, page_id, slot_idx, row);
+                }
+                let pg_mut = self.pool.frame_data_mut(frame_id);
+                page::delete_tuple(pg_mut, slot_idx);
+                dirty = true;
+                count += 1;
+            }
+            if dirty {
+                self.pool.mark_dirty(frame_id);
+                self.record_dirty_page(page_id);
+            }
+            self.pool.unpin(frame_id);
+        }
+
+        Ok(count)
+    }
+
+    /// Update tuples at stable row addresses, with the same identity re-check
+    /// as [`Self::delete_at`].
+    fn update_at(
+        &self,
+        table: &str,
+        updates: Vec<(usize, Option<Row>, Row)>,
+    ) -> Result<usize, StorageError> {
+        let col_types = self.col_types(table)?;
+        let has_indexes = {
+            let indexes = self.indexes.read();
+            indexes.values().any(|idx| idx.table == table)
+        };
+        let verifying = updates.iter().any(|(_, expected, _)| expected.is_some());
+        let identity = verifying.then(|| self.identity_cols(table)).flatten();
+        let mut count = 0usize;
+
+        let grouped = self.group_by_page(
+            table,
+            updates
+                .into_iter()
+                .map(|(pos, expected, new_row)| (pos, (expected, new_row))),
+        )?;
+
+        for (page_id, slots) in grouped {
+            let mut frame_id = self
+                .pool
+                .fetch_page(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let mut dirty = false;
+            for (slot_idx, (expected, new_row)) in slots {
+                let pg = self.pool.frame_data(frame_id);
+                if page::read_u16(pg, page::HEADER_PAGE_TYPE) != page::PAGE_TYPE_DATA {
+                    break;
+                }
+                if slot_idx >= page::read_u16(pg, page::DATA_SLOT_COUNT) {
+                    continue;
+                }
+                let entry = page::read_slot(pg, slot_idx);
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset() as usize;
+                let len = entry.length() as usize;
+                let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
+                if let Some(expected) = &expected {
+                    match &current {
+                        Some(row)
+                            if Self::same_row_identity(expected, row, identity.as_ref()) => {}
+                        _ => continue,
+                    }
+                }
+                if has_indexes && let Some(row) = &current {
+                    self.index_delete(table, page_id, slot_idx, row);
+                }
+
+                let new_data = tuple::serialize_row(&new_row, &col_types);
+                let pg_mut = self.pool.frame_data_mut(frame_id);
+                if page::update_tuple_in_place(pg_mut, slot_idx, &new_data) {
+                    // Row keeps its address, so positions other sessions hold
+                    // for it stay valid.
+                    if has_indexes {
+                        self.index_insert(table, page_id, slot_idx, &new_row)?;
+                    }
+                    dirty = true;
+                    count += 1;
+                    continue;
+                }
+
+                // Grew past its slot — free it and place the row elsewhere. The
+                // row's address changes; anyone holding the old one now sees a
+                // dead slot and skips, which is a lost update rather than a
+                // write onto an unrelated row.
+                page::delete_tuple(pg_mut, slot_idx);
+                dirty = true;
+                if let Some(new_slot_idx) = page::insert_tuple(pg_mut, &new_data) {
+                    if has_indexes {
+                        self.index_insert(table, page_id, new_slot_idx, &new_row)?;
+                    }
+                    count += 1;
+                    continue;
+                }
+                // No room on this page: release the frame, place the row, then
+                // re-pin so the remaining slots on this page can be processed.
+                self.pool.mark_dirty(frame_id);
+                self.record_dirty_page(page_id);
+                self.pool.unpin(frame_id);
+                dirty = false;
+                let (new_page_id, new_slot_idx) = self.insert_sync(table, &new_data)?;
+                if has_indexes {
+                    self.index_insert(table, new_page_id, new_slot_idx, &new_row)?;
+                }
+                count += 1;
+                frame_id = self
+                    .pool
+                    .fetch_page(page_id)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+            }
+            if dirty {
+                self.pool.mark_dirty(frame_id);
+                self.record_dirty_page(page_id);
+            }
+            self.pool.unpin(frame_id);
+        }
+
+        Ok(count)
+    }
+
+    /// Every live tuple of a table paired with its stable row address, in scan
+    /// order. Backs `scan_physical` and `scan_where_eq_positions`.
+    fn scan_addressed(
+        &self,
+        table: &str,
+        filter: Option<(usize, &Value)>,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        let col_types = self.col_types(table)?;
+        let pages = self.table_pages(table)?;
+        let mut out = Vec::new();
+        for page_id in pages {
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let pg = self.pool.frame_data(frame_id);
+            let slot_count = page::read_u16(pg, page::DATA_SLOT_COUNT);
+            for slot_idx in 0..slot_count {
+                let entry = page::read_slot(pg, slot_idx);
+                if entry.is_dead() {
+                    continue;
+                }
+                let off = entry.offset() as usize;
+                let len = entry.length() as usize;
+                let Some(row) = tuple::deserialize_row(&pg[off..off + len], &col_types) else {
+                    tracing::error!(
+                        target: "nucleus::storage",
+                        "failed to deserialize tuple on page {page_id} (slot {slot_idx}); row omitted from scan"
+                    );
+                    continue;
+                };
+                if let Some((col_idx, value)) = filter
+                    && !row.get(col_idx).is_some_and(|v| v.loose_eq(value))
+                {
+                    continue;
+                }
+                out.push((encode_row_pos(page_id, slot_idx), row));
+            }
+            self.pool.unpin(frame_id);
+        }
+        Ok(out)
+    }
+
     /// Push a page onto the free list for later reuse.
     fn free_page(&self, page_id: u32) -> Result<(), StorageError> {
         let mut head = self.free_list_head.lock();
@@ -1963,158 +2302,62 @@ impl StorageEngine for DiskEngine {
         Some(count)
     }
 
+    /// Every physical row with its stable address. Overrides the trait default,
+    /// which would enumerate scan order — see the "Stable row addressing" note
+    /// at the top of this module for why ordinals cannot be used here.
+    async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        self.scan_addressed(table, None)
+    }
+
+    async fn scan_where_eq_positions(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &Value,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        self.scan_addressed(table, Some((col_idx, value)))
+    }
+
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
-        let col_types = self.col_types(table)?;
-        let pages = self.table_pages(table)?;
+        let targets: Vec<(usize, Option<Row>)> =
+            positions.iter().map(|&pos| (pos, None)).collect();
+        self.delete_at(table, targets)
+    }
 
-        // Check if any indexes exist for this table (avoid deserialization overhead if not)
-        let has_indexes = {
-            let indexes = self.indexes.read();
-            indexes.values().any(|idx| idx.table == table)
-        };
-
-        // Build a set of positions to delete
-        let mut to_delete: std::collections::HashSet<usize> = positions.iter().copied().collect();
-        let mut global_idx = 0usize;
-        let mut count = 0usize;
-
-        for &page_id in &pages {
-            if to_delete.is_empty() {
-                break;
-            }
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let slot_count = page::read_u16(pg, page::DATA_SLOT_COUNT);
-
-            let mut dirty = false;
-            for slot_idx in 0..slot_count {
-                let entry = page::read_slot(pg, slot_idx);
-                if entry.is_dead() {
-                    continue;
-                }
-                if to_delete.remove(&global_idx) {
-                    // Deserialize the row before deletion to remove index entries
-                    if has_indexes {
-                        let off = entry.offset() as usize;
-                        let len = entry.length() as usize;
-                        let tuple_data = &pg[off..off + len];
-                        if let Some(row) = tuple::deserialize_row(tuple_data, &col_types) {
-                            self.index_delete(table, page_id, slot_idx, &row);
-                        }
-                    }
-                    let pg_mut = self.pool.frame_data_mut(frame_id);
-                    page::delete_tuple(pg_mut, slot_idx);
-                    dirty = true;
-                    count += 1;
-                }
-                global_idx += 1;
-            }
-            if dirty {
-                self.pool.mark_dirty(frame_id);
-                self.record_dirty_page(page_id);
-            }
-            self.pool.unpin(frame_id);
-        }
-
-        Ok(count)
+    /// Delete rows the caller read earlier, applying each only if the tuple at
+    /// the address still holds that row. See [`StorageEngine::delete_if_unchanged`].
+    async fn delete_if_unchanged(
+        &self,
+        table: &str,
+        targets: &[(usize, Row)],
+    ) -> Result<usize, StorageError> {
+        let targets: Vec<(usize, Option<Row>)> = targets
+            .iter()
+            .map(|(pos, expected)| (*pos, Some(expected.clone())))
+            .collect();
+        self.delete_at(table, targets)
     }
 
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
-        let col_types = self.col_types(table)?;
-        let pages = self.table_pages(table)?;
+        let updates: Vec<(usize, Option<Row>, Row)> = updates
+            .iter()
+            .map(|(pos, new_row)| (*pos, None, new_row.clone()))
+            .collect();
+        self.update_at(table, updates)
+    }
 
-        // Check if any indexes exist for this table
-        let has_indexes = {
-            let indexes = self.indexes.read();
-            indexes.values().any(|idx| idx.table == table)
-        };
-
-        // Build a map of position → new row
-        let mut update_map: HashMap<usize, &Row> = updates.iter().map(|(p, r)| (*p, r)).collect();
-        let mut global_idx = 0usize;
-        let mut count = 0usize;
-
-        for &page_id in &pages {
-            if update_map.is_empty() {
-                break;
-            }
-            let frame_id = self
-                .pool
-                .fetch_page(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let pg = self.pool.frame_data(frame_id);
-            let slot_count = page::read_u16(pg, page::DATA_SLOT_COUNT);
-
-            let mut dirty = false;
-            for slot_idx in 0..slot_count {
-                let entry = page::read_slot(pg, slot_idx);
-                if entry.is_dead() {
-                    continue;
-                }
-                if let Some(new_row) = update_map.remove(&global_idx) {
-                    // Remove old index entries before modifying the row
-                    if has_indexes {
-                        let off = entry.offset() as usize;
-                        let len = entry.length() as usize;
-                        let tuple_data = &pg[off..off + len];
-                        if let Some(old_row) = tuple::deserialize_row(tuple_data, &col_types) {
-                            self.index_delete(table, page_id, slot_idx, &old_row);
-                        }
-                    }
-
-                    let new_data = tuple::serialize_row(new_row, &col_types);
-                    let pg_mut = self.pool.frame_data_mut(frame_id);
-                    if page::update_tuple_in_place(pg_mut, slot_idx, &new_data) {
-                        // In-place update: row stays at same (page_id, slot_idx)
-                        if has_indexes {
-                            self.index_insert(table, page_id, slot_idx, new_row)?;
-                        }
-                        dirty = true;
-                        count += 1;
-                    } else {
-                        // Doesn't fit in place — delete and re-insert
-                        page::delete_tuple(pg_mut, slot_idx);
-                        dirty = true;
-                        // Try inserting on this page first
-                        if let Some(new_slot_idx) = page::insert_tuple(pg_mut, &new_data) {
-                            if has_indexes {
-                                self.index_insert(table, page_id, new_slot_idx, new_row)?;
-                            }
-                            count += 1;
-                        } else {
-                            // Need to insert on another page; release this frame first
-                            self.pool.mark_dirty(frame_id);
-                            self.record_dirty_page(page_id);
-                            self.pool.unpin(frame_id);
-                            let (new_page_id, new_slot_idx) = self.insert_sync(table, &new_data)?;
-                            if has_indexes {
-                                self.index_insert(table, new_page_id, new_slot_idx, new_row)?;
-                            }
-                            count += 1;
-                            // Re-fetch this page to continue scanning
-                            let frame_id2 = self
-                                .pool
-                                .fetch_page(page_id)
-                                .map_err(|e| StorageError::Io(e.to_string()))?;
-                            self.pool.unpin(frame_id2);
-                            global_idx += 1;
-                            continue;
-                        }
-                    }
-                }
-                global_idx += 1;
-            }
-            if dirty {
-                self.pool.mark_dirty(frame_id);
-                self.record_dirty_page(page_id);
-            }
-            self.pool.unpin(frame_id);
-        }
-
-        Ok(count)
+    /// Update rows the caller read earlier, applying each only if the tuple at
+    /// the address still holds that row. See [`StorageEngine::update_if_unchanged`].
+    async fn update_if_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<usize, StorageError> {
+        let updates: Vec<(usize, Option<Row>, Row)> = updates
+            .iter()
+            .map(|(pos, expected, new_row)| (*pos, Some(expected.clone()), new_row.clone()))
+            .collect();
+        self.update_at(table, updates)
     }
 
     async fn sync_schema(&self, table: &str) -> Result<(), StorageError> {
@@ -2888,6 +3131,21 @@ mod tests {
         vec![Value::Int32(id), Value::Text(name.to_string())]
     }
 
+    /// Resolve scan-order ordinals to the engine's row positions. Positions are
+    /// stable physical addresses, not ordinals (see "Stable row addressing"),
+    /// so a caller that means "the n-th row in scan order" has to ask.
+    async fn at(engine: &DiskEngine, table: &str, ordinals: &[usize]) -> Vec<usize> {
+        let rows = engine.scan_physical(table).await.unwrap();
+        ordinals
+            .iter()
+            .map(|&i| {
+                rows.get(i)
+                    .unwrap_or_else(|| panic!("no row at scan ordinal {i} of {}", rows.len()))
+                    .0
+            })
+            .collect()
+    }
+
     // ── 1. create_and_scan_empty_table ─────────────────────────────
 
     #[tokio::test]
@@ -2965,8 +3223,9 @@ mod tests {
                 .unwrap();
         }
 
-        // Delete positions 1 and 3 (0-indexed scan order)
-        let deleted = engine.delete("data", &[1, 3]).await.unwrap();
+        // Delete the rows at scan ordinals 1 and 3
+        let targets = at(&engine, "data", &[1, 3]).await;
+        let deleted = engine.delete("data", &targets).await.unwrap();
         assert_eq!(deleted, 2);
 
         let rows = engine.scan("data").await.unwrap();
@@ -2994,9 +3253,10 @@ mod tests {
                 .unwrap();
         }
 
-        // Update position 1 with a new row
+        // Update the row at scan ordinal 1
+        let pos = at(&engine, "data", &[1]).await[0];
         let updated = engine
-            .update("data", &[(1, simple_row(99, "updated"))])
+            .update("data", &[(pos, simple_row(99, "updated"))])
             .await
             .unwrap();
         assert_eq!(updated, 1);
@@ -3209,10 +3469,11 @@ mod tests {
         engine.insert("grow", simple_row(1, "a")).await.unwrap();
         engine.insert("grow", simple_row(2, "b")).await.unwrap();
 
-        // Update position 0 with a much longer text value
+        // Update the first row with a much longer text value
         let long_name = "x".repeat(500);
+        let pos = at(&engine, "grow", &[0]).await[0];
         let updated = engine
-            .update("grow", &[(0, simple_row(1, &long_name))])
+            .update("grow", &[(pos, simple_row(1, &long_name))])
             .await
             .unwrap();
         assert_eq!(updated, 1);
@@ -3244,7 +3505,8 @@ mod tests {
                 .unwrap();
         }
 
-        let positions: Vec<usize> = (0..n as usize).collect();
+        let ordinals: Vec<usize> = (0..n as usize).collect();
+        let positions = at(&engine, "doomed", &ordinals).await;
         let deleted = engine.delete("doomed", &positions).await.unwrap();
         assert_eq!(deleted, n as usize);
 
@@ -3453,8 +3715,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete the middle row (position 1)
-        let deleted = engine.delete("del_tbl", &[1]).await.unwrap();
+        // Delete the middle row
+        let targets = at(&engine, "del_tbl", &[1]).await;
+        let deleted = engine.delete("del_tbl", &targets).await.unwrap();
         assert_eq!(deleted, 1);
 
         let rows = engine.scan("del_tbl").await.unwrap();
@@ -3480,9 +3743,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Update position 0 with new values
+        // Update the only row
+        let pos = at(&engine, "upd_tbl", &[0]).await[0];
         let updated = engine
-            .update("upd_tbl", &[(0, simple_row(1, "modified"))])
+            .update("upd_tbl", &[(pos, simple_row(1, "modified"))])
             .await
             .unwrap();
         assert_eq!(updated, 1);
@@ -3531,7 +3795,8 @@ mod tests {
         assert_eq!(rows_b[0], simple_row(100, "gamma"));
 
         // Deleting from one table should not affect the other
-        engine.delete("table_a", &[0]).await.unwrap();
+        let targets = at(&engine, "table_a", &[0]).await;
+        engine.delete("table_a", &targets).await.unwrap();
         let rows_a = engine.scan("table_a").await.unwrap();
         assert_eq!(rows_a.len(), 1);
         let rows_b = engine.scan("table_b").await.unwrap();
@@ -3696,8 +3961,9 @@ mod tests {
             engine.create_table("t").await.unwrap();
             engine.insert("t", simple_row(1, "old")).await.unwrap();
             engine.insert("t", simple_row(2, "keep")).await.unwrap();
+            let pos = at(&engine, "t", &[0]).await[0];
             engine
-                .update("t", &[(0, simple_row(1, "new"))])
+                .update("t", &[(pos, simple_row(1, "new"))])
                 .await
                 .unwrap();
             engine.flush().unwrap();
@@ -3730,7 +3996,8 @@ mod tests {
             engine.insert("t", simple_row(1, "a")).await.unwrap();
             engine.insert("t", simple_row(2, "b")).await.unwrap();
             engine.insert("t", simple_row(3, "c")).await.unwrap();
-            engine.delete("t", &[1]).await.unwrap(); // delete row at position 1 ("b")
+            let targets = at(&engine, "t", &[1]).await; // the row "b"
+            engine.delete("t", &targets).await.unwrap();
             engine.flush().unwrap();
         }
 
@@ -4404,8 +4671,9 @@ mod tests {
         }
         assert_eq!(engine.scan("t").await.unwrap().len(), 10);
 
-        // Delete rows at positions 2, 5, 7
-        let deleted = engine.delete("t", &[2, 5, 7]).await.unwrap();
+        // Delete the rows at scan ordinals 2, 5, 7
+        let targets = at(&engine, "t", &[2, 5, 7]).await;
+        let deleted = engine.delete("t", &targets).await.unwrap();
         assert_eq!(deleted, 3);
         assert_eq!(engine.scan("t").await.unwrap().len(), 7);
 
@@ -4444,7 +4712,8 @@ mod tests {
         );
 
         // Delete ALL rows — this should leave all pages empty
-        let positions: Vec<usize> = (0..1200).collect();
+        let ordinals: Vec<usize> = (0..1200).collect();
+        let positions = at(&engine, "t", &ordinals).await;
         let deleted = engine.delete("t", &positions).await.unwrap();
         assert_eq!(deleted, 1200);
 
@@ -4484,9 +4753,10 @@ mod tests {
                 .unwrap();
         }
 
-        // Delete even-numbered positions
+        // Delete the rows at even scan ordinals
         let evens: Vec<usize> = (0..20).filter(|x| x % 2 == 0).collect();
-        engine.delete("t", &evens).await.unwrap();
+        let targets = at(&engine, "t", &evens).await;
+        engine.delete("t", &targets).await.unwrap();
         assert_eq!(engine.scan("t").await.unwrap().len(), 10);
 
         // Vacuum
@@ -4522,8 +4792,10 @@ mod tests {
         }
 
         // Delete 2 from each
-        engine.delete("a", &[0, 1]).await.unwrap();
-        engine.delete("b", &[3, 4]).await.unwrap();
+        let a_targets = at(&engine, "a", &[0, 1]).await;
+        engine.delete("a", &a_targets).await.unwrap();
+        let b_targets = at(&engine, "b", &[3, 4]).await;
+        engine.delete("b", &b_targets).await.unwrap();
 
         // Use trait method
         use crate::storage::StorageEngine;
@@ -4546,7 +4818,8 @@ mod tests {
         for i in 0..10 {
             engine.insert("t", simple_row(i, "x")).await.unwrap();
         }
-        engine.delete("t", &[0, 1, 2]).await.unwrap();
+        let targets = at(&engine, "t", &[0, 1, 2]).await;
+        engine.delete("t", &targets).await.unwrap();
 
         // First vacuum reclaims dead tuples
         let (_, dead1, _, _) = engine.vacuum_table("t").unwrap();
@@ -4699,8 +4972,9 @@ mod tests {
         for i in 0..10 {
             engine.insert("t", simple_row(i, "x")).await.unwrap();
         }
-        // Delete first 5 rows (positions 0..5)
-        let positions: Vec<usize> = (0..5).collect();
+        // Delete the first 5 rows in scan order
+        let ordinals: Vec<usize> = (0..5).collect();
+        let positions = at(&engine, "t", &ordinals).await;
         let deleted = engine.delete("t", &positions).await.unwrap();
         assert_eq!(deleted, 5);
         assert_eq!(engine.fast_count_all("t"), Some(5));
@@ -4792,14 +5066,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Delete some
-        // Delete rows at positions where id % 3 == 0
-        let rows = engine.scan("t").await.unwrap();
+        // Delete the rows whose id % 3 == 0
+        let rows = engine.scan_physical("t").await.unwrap();
         let positions: Vec<usize> = rows
             .iter()
-            .enumerate()
             .filter(|(_, row)| matches!(row[0], Value::Int32(v) if v % 3 == 0))
-            .map(|(i, _)| i)
+            .map(|(pos, _)| *pos)
             .collect();
         engine.delete("t", &positions).await.unwrap();
 
@@ -5252,6 +5524,187 @@ mod tests {
             after < before,
             "a failed backup leaked its WAL retention pin: truncation reclaimed nothing \
              ({before} -> {after} segments)"
+        );
+    }
+
+    // ── row identity: a position must address exactly one physical row ──
+    //
+    // `scan_physical` / `scan_where_eq_positions` hand out positions that the
+    // executor feeds straight back to `update()` / `delete()` after an
+    // arbitrary number of await points. If those positions are live-row scan
+    // ordinals, a concurrent DELETE of an EARLIER row renumbers them and the
+    // deferred mutation lands on a DIFFERENT row — overwriting it with the
+    // updater's row, which leaves two rows carrying the same primary key.
+
+    /// Resolve the position the executor's PK fast path would use for `id`.
+    async fn pos_of(engine: &DiskEngine, table: &str, id: i32) -> usize {
+        let hits = engine
+            .scan_where_eq_positions(table, 0, &Value::Int32(id))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "expected exactly one row with id={id}");
+        hits[0].0
+    }
+
+    fn ids(rows: &[Row]) -> Vec<i32> {
+        rows.iter()
+            .map(|r| match r[0] {
+                Value::Int32(v) => v,
+                _ => panic!("non-Int32 id"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn update_position_survives_concurrent_delete_of_earlier_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+        for id in 1..=5 {
+            engine
+                .insert("t", simple_row(id, &format!("v{id}")))
+                .await
+                .unwrap();
+        }
+
+        // Session A resolves the position of id=3 and is then preempted.
+        let a_pos = pos_of(&engine, "t", 3).await;
+
+        // Session B deletes id=1, which precedes id=3 in scan order.
+        let b_pos = pos_of(&engine, "t", 1).await;
+        assert_eq!(engine.delete("t", &[b_pos]).await.unwrap(), 1);
+
+        // Session A resumes and writes its row at the position it resolved.
+        engine
+            .update("t", &[(a_pos, simple_row(3, "updated"))])
+            .await
+            .unwrap();
+
+        // The updated row may change address (it outgrew its slot), so compare
+        // the row SET, not scan order.
+        let rows = engine.scan("t").await.unwrap();
+        let mut got = ids(&rows);
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 3, 4, 5], "stale position aliased a different row");
+        assert!(
+            rows.contains(&simple_row(3, "updated")),
+            "update did not land on id=3: {rows:?}"
+        );
+        assert!(
+            rows.contains(&simple_row(4, "v4")),
+            "id=4 was overwritten by a stale position: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_position_survives_concurrent_delete_of_earlier_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+        for id in 1..=5 {
+            engine
+                .insert("t", simple_row(id, &format!("v{id}")))
+                .await
+                .unwrap();
+        }
+
+        let a_pos = pos_of(&engine, "t", 4).await;
+        let b_pos = pos_of(&engine, "t", 2).await;
+        assert_eq!(engine.delete("t", &[b_pos]).await.unwrap(), 1);
+        assert_eq!(engine.delete("t", &[a_pos]).await.unwrap(), 1);
+
+        let rows = engine.scan("t").await.unwrap();
+        assert_eq!(
+            ids(&rows),
+            vec![1, 3, 5],
+            "stale position deleted the wrong row"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_position_does_not_hit_a_row_that_recycled_the_slot() {
+        // Deleting a row frees its slot, and the next insert on that page
+        // reuses it. A position resolved before the delete must not address
+        // whatever moved in afterwards.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+        for id in 1..=3 {
+            engine
+                .insert("t", simple_row(id, &format!("v{id}")))
+                .await
+                .unwrap();
+        }
+
+        // Session A resolves id=2's position and reads the row there.
+        let a_pos = pos_of(&engine, "t", 2).await;
+        // Session B deletes id=2, and a later insert recycles the freed slot.
+        engine.delete("t", &[a_pos]).await.unwrap();
+        engine.insert("t", simple_row(9, "nine")).await.unwrap();
+
+        // Session A resumes. Its row is gone; the write must not land on id=9.
+        let applied = engine
+            .update_if_unchanged(
+                "t",
+                &[(a_pos, simple_row(2, "v2"), simple_row(2, "resurrected"))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, 0, "a write applied to a recycled address");
+
+        let got = ids(&engine.scan("t").await.unwrap());
+        assert!(
+            got.contains(&9),
+            "stale position overwrote the row that recycled the slot: {got:?}"
+        );
+        assert!(
+            !got.contains(&2),
+            "stale position resurrected a deleted row over its slot successor: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn positions_survive_concurrent_insert_into_a_recycled_earlier_slot() {
+        // An insert that fills a freed slot ahead of a resolved row renumbers
+        // every later live-row ordinal upward — the mirror of the delete case.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+        for id in 1..=6 {
+            engine
+                .insert("t", simple_row(id, &format!("v{id}")))
+                .await
+                .unwrap();
+        }
+        // Free an early slot, then resolve a later row's position.
+        let gone = pos_of(&engine, "t", 2).await;
+        engine.delete("t", &[gone]).await.unwrap();
+        let a_pos = pos_of(&engine, "t", 5).await;
+
+        // A concurrent insert reuses the freed slot ahead of id=5.
+        engine.insert("t", simple_row(7, "seven")).await.unwrap();
+
+        engine
+            .update("t", &[(a_pos, simple_row(5, "updated"))])
+            .await
+            .unwrap();
+
+        let rows = engine.scan("t").await.unwrap();
+        assert_eq!(
+            rows.iter().filter(|r| r[0] == Value::Int32(5)).count(),
+            1,
+            "duplicate id=5 after a concurrent insert renumbered positions: {:?}",
+            ids(&rows)
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r[0] == Value::Int32(6)).count(),
+            1,
+            "id=6 was overwritten by a stale position: {:?}",
+            ids(&rows)
         );
     }
 }
