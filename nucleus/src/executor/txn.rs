@@ -3,12 +3,18 @@
 //! Handles BEGIN, COMMIT, ROLLBACK, and savepoint operations.  When the
 //! storage engine supports MVCC the work is delegated to the engine's
 //! snapshot-isolation layer; otherwise a legacy clone-all-tables approach
-//! is used.  All specialty stores (KV, Graph, Doc, Datalog, FTS, TimeSeries,
-//! Blob, Vector) are snapshotted at BEGIN and restored on ROLLBACK.
+//! is used.
+//!
+//! Eight specialty stores (KV strings, graph, document, datalog, FTS, time
+//! series, blob, vector) are enlisted through the per-session write-set in
+//! `super::cross_model`: before-images are captured lazily at this session's
+//! first write to each store, and ROLLBACK reverts only the entities this
+//! session touched.  KV collections, the columnar analytics store, streams,
+//! and CDC are **not** enlisted and are never rolled back.
 
 use std::collections::HashMap;
 
-use super::session::CrossModelSnapshots;
+use super::cross_model::{CrossModelLevel, CrossModelTxn};
 use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
@@ -46,17 +52,11 @@ impl Executor {
             txn.snapshot = Some(snapshot);
         }
 
-        // Capture cross-model snapshots for rollback of all specialty stores.
-        txn.cross_model = Some(CrossModelSnapshots {
-            kv: Some(self.kv_store.txn_snapshot()),
-            graph: Some(self.graph_store.read().txn_snapshot()),
-            doc: Some(self.doc_store.read().txn_snapshot()),
-            datalog: Some(self.datalog_store.read().txn_snapshot()),
-            fts: Some(self.fts_index.read().begin_undo_log()),
-            ts: Some(self.ts_store.read().txn_snapshot()),
-            blob: Some(self.blob_store.read().txn_snapshot()),
-            vector: Some(self.vector_indexes.read().clone()),
-        });
+        // Arm per-session cross-model tracking. Before-images are captured
+        // lazily, at this session's first write to each store, so a SQL-only
+        // transaction no longer deep-clones every specialty store (including
+        // every HNSW graph) just to open.
+        *sess.cross_model.lock() = Some(CrossModelTxn::new());
         txn.security_snapshot = Some(self.security.read().clone_policy_state());
         txn.security_pending = None;
         txn.security_savepoints.clear();
@@ -159,13 +159,13 @@ impl Executor {
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
-        txn.cross_model = None; // Discard cross-model snapshots on commit
         txn.security_snapshot = None;
         txn.security_pending = None;
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        *sess.cross_model.lock() = None; // Discard the write-set on commit
         self.metrics.open_transactions.dec();
         drop(txn);
 
@@ -211,32 +211,14 @@ impl Executor {
             }
         }
 
-        // Restore cross-model snapshots (all specialty stores).
-        if let Some(cm) = txn.cross_model.take() {
-            if let Some(kv_snap) = cm.kv {
-                self.kv_store.txn_restore(kv_snap);
-            }
-            if let Some(graph_snap) = cm.graph {
-                self.graph_store.write().txn_restore(graph_snap);
-            }
-            if let Some(doc_snap) = cm.doc {
-                self.doc_store.write().txn_restore(doc_snap);
-            }
-            if let Some(datalog_snap) = cm.datalog {
-                self.datalog_store.write().txn_restore(datalog_snap);
-            }
-            if let Some(fts_log) = cm.fts {
-                self.fts_index.write().undo(fts_log);
-            }
-            if let Some(ts_snap) = cm.ts {
-                self.ts_store.write().txn_restore(ts_snap);
-            }
-            if let Some(blob_snap) = cm.blob {
-                self.blob_store.write().txn_restore(blob_snap);
-            }
-            if let Some(vector_snap) = cm.vector {
-                *self.vector_indexes.write() = vector_snap;
-            }
+        // Revert cross-model writes. Scoped to this session's write-set: an
+        // entity another session wrote since this BEGIN is left alone.
+        // The guard is dropped before the stores are touched so a concurrent
+        // specialty mutation (which takes a store lock, then this one) can
+        // never deadlock against the reverse order.
+        let cross_model = sess.cross_model.lock().take();
+        if let Some(cm) = cross_model {
+            self.cross_model_revert(cm.base, cm.fts_ops);
         }
 
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
@@ -296,6 +278,15 @@ impl Executor {
         txn.security_savepoints
             .push((name.to_string(), security_snapshot));
 
+        // Open a cross-model level for this savepoint. Its before-images are
+        // captured lazily at the first write after this point, so a savepoint
+        // in a SQL-only transaction costs nothing.
+        if let Some(cm) = sess.cross_model.lock().as_mut() {
+            let mark = cm.fts_ops.len();
+            cm.savepoints
+                .push((name.to_string(), CrossModelLevel::default(), mark));
+        }
+
         Ok(ExecResult::Command {
             tag: "SAVEPOINT".to_string(),
             rows_affected: 0,
@@ -318,6 +309,13 @@ impl Executor {
         }
         if let Some(pos) = txn.security_savepoints.iter().rposition(|(n, _)| n == name) {
             txn.security_savepoints.truncate(pos);
+        }
+        // Releasing keeps the writes; every level below already recorded them,
+        // so the level is simply discarded.
+        if let Some(cm) = sess.cross_model.lock().as_mut()
+            && let Some(pos) = cm.savepoints.iter().rposition(|(n, _, _)| n == name)
+        {
+            cm.savepoints.truncate(pos);
         }
         Ok(ExecResult::Command {
             tag: "RELEASE SAVEPOINT".into(),
@@ -368,6 +366,24 @@ impl Executor {
         txn.policy_dirty = true;
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
         drop(txn);
+
+        // Revert cross-model writes made after the savepoint. Taken out from
+        // under the mutex first so the stores are only locked afterwards.
+        let reverted = {
+            let mut guard = sess.cross_model.lock();
+            guard.as_mut().and_then(|cm| {
+                let pos = cm.savepoints.iter().rposition(|(n, _, _)| n == name)?;
+                let mark = cm.savepoints[pos].2;
+                let level = std::mem::take(&mut cm.savepoints[pos].1);
+                let fts_tail = cm.fts_ops.split_off(mark.min(cm.fts_ops.len()));
+                cm.savepoints.truncate(pos + 1);
+                Some((level, fts_tail))
+            })
+        };
+        if let Some((level, fts_tail)) = reverted {
+            self.cross_model_revert(level, fts_tail);
+        }
+
         for table in derived_dirty_tables {
             self.rebuild_table_derived_state(&table).await;
         }

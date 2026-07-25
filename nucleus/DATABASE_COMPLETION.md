@@ -24,11 +24,10 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 264508; Source Rust files: 235; Top-level modules: 51.
-- Declared unit tests: 3989; Declared integration tests: 327; Ignored tests: 45.
+- Source LOC: 265604; Source Rust files: 236; Top-level modules: 51.
+- Declared unit tests: 3989; Declared integration tests: 335; Ignored tests: 45.
   These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
-  passing tests with no ignores.
+- The most recent full library run executed 3,972 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
   state-machine/runtime scaffolding, trusted SCRAM identities, role assumption, and RLS enforcement
@@ -479,13 +478,64 @@ Exit gate:
 
 Goal: multi-model transactions remain atomic across process crash, not merely in-process rollback.
 
-- [ ] Inventory which models participate in the SQL transaction coordinator today.
-- [ ] Define transaction enlistment and isolation semantics for each public model.
+- [x] Inventory which models participate in the SQL transaction coordinator today.
+      Per-model matrix in `docs/MODEL_SEMANTICS.md`, measured against a live server.
+- [x] Define transaction enlistment and isolation semantics for each public model.
+      Enlistment is now one mechanism, `CrossModelTxn` (`src/executor/cross_model.rs`):
+      a per-session write-set with lazily captured before-images. Isolation is
+      documented as read-uncommitted for every non-SQL model and is **not** fixed —
+      see the open items below.
 - [ ] Add a shared commit record/coordinator or another proven atomic commit design.
 - [ ] Make prepare/commit/abort idempotent across every enlisted WAL.
 - [ ] Recover in-doubt transactions deterministically after crash.
 - [ ] Coordinate CDC emission, cache invalidation, specialty indexes, and policy metadata with commit.
 - [ ] Add crash injection at every cross-model commit boundary.
+
+Landed ahead of the commit-record work, because each was live data loss:
+
+- [x] **A ROLLBACK no longer destroys other sessions' committed non-SQL writes.**
+      `BEGIN` deep-cloned every specialty store and `ROLLBACK` assigned the clone
+      back wholesale, so session A's rollback erased session B's acknowledged,
+      fsynced KV/document/graph/time-series/blob/vector writes. Each session now
+      records the entities it wrote and reverts exactly those.
+- [x] **A ROLLBACK is durable for KV, document, graph, time series, and blob.**
+      The revert writes compensating records into each store's own WAL, so a crash
+      after a successful `ROLLBACK` no longer resurrects the rolled-back writes on
+      replay. Vector is **not** covered (in-memory revert only); datalog needs no
+      compensation because its WAL is never written at all.
+- [x] **A client disconnect no longer splits a transaction.** `drop_session`
+      discarded the uncommitted SQL rows and kept the non-SQL half permanently;
+      it now reverts both, matching what the idle-in-transaction sweep already did.
+      `reset_session` (pool return) too.
+- [x] **`ROLLBACK TO SAVEPOINT` reverts cross-model writes**, via a nested level in
+      the write-set. This also uncovered and fixed a relational bug:
+      `BufferedDiskEngine` — the engine every disk deployment runs — reported
+      `supports_mvcc() == true` while inheriting the silent `Ok(())` savepoint
+      defaults from `StorageEngine`, so on disk `ROLLBACK TO SAVEPOINT`
+      acknowledged success and discarded nothing. Only the in-memory
+      `MvccStorageAdapter` implemented savepoints, which is why the library suite
+      never saw it.
+- [x] The FTS undo hook no longer uses a non-blocking `try_write` on the async
+      transaction lock, which silently dropped the undo record under contention
+      and left a mutation that `ROLLBACK` could not undo.
+
+Evidence: `nucleus/tests/cross_model_txn_wire.rs` — eight end-to-end pgwire tests
+(two concurrent sessions, a real disconnect, and data-directory copies reopened as
+crash recovery). Each fix was reverted individually and the matching test observed
+to fail.
+
+Still open in this milestone:
+
+- No model is crash-atomic with the SQL commit. A COMMIT still fsyncs the SQL WAL
+  and the specialty logs as two ordered steps, and six specialty logs are not
+  fsynced at a commit boundary at all.
+- No isolation on specialty stores: one session reads another's uncommitted
+  non-SQL writes, and two sessions writing the same key still conflict
+  destructively.
+- KV collections, the columnar analytics store, streams, and CDC still do not
+  participate in transactions at all; their writes survive `ROLLBACK`, and CDC
+  publishes change events for transactions that never committed.
+- Vector rollback is not durable (no compensating record in `vector/vector.wal`).
 
 Exit gate:
 

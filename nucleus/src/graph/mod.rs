@@ -68,6 +68,31 @@ pub enum Direction {
     Both,
 }
 
+/// Entities a session mutated inside a transaction.
+///
+/// Recorded by the store itself (so Cypher writes, which go through the same
+/// mutating methods, are covered structurally) and drained by the executor
+/// under the same write guard that performed the mutation. ROLLBACK reverts
+/// exactly these ids, so it can never touch state another session committed.
+#[derive(Debug, Default, Clone)]
+pub struct GraphTouched {
+    pub nodes: HashSet<NodeId>,
+    pub edges: HashSet<EdgeId>,
+}
+
+impl GraphTouched {
+    /// Whether any entity was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.edges.is_empty()
+    }
+
+    /// Merge another set of touched entities into this one.
+    pub fn merge(&mut self, other: GraphTouched) {
+        self.nodes.extend(other.nodes);
+        self.edges.extend(other.edges);
+    }
+}
+
 /// Snapshot of graph state for transaction rollback.
 pub struct GraphTxnSnapshot {
     nodes: HashMap<NodeId, Node>,
@@ -111,6 +136,10 @@ pub struct GraphStore {
     hot_node_ids: HashSet<NodeId>,
     /// Maximum hot nodes before property eviction to cold tier.
     pub max_hot_nodes: usize,
+    /// Entities mutated since the last [`Self::take_touched`]. The executor
+    /// clears this before a mutating call and drains it afterwards, under the
+    /// same write guard, so the record is attributed to exactly one session.
+    txn_touched: GraphTouched,
 }
 
 impl Default for GraphStore {
@@ -134,7 +163,22 @@ impl GraphStore {
             cold_props: None,
             hot_node_ids: HashSet::new(),
             max_hot_nodes: usize::MAX,
+            txn_touched: GraphTouched::default(),
         }
+    }
+
+    // ---- Transaction write-set tracking ----
+
+    /// Forget any recorded mutations. Called immediately before a mutating
+    /// operation so the drained set names only that operation's entities.
+    pub fn clear_touched(&mut self) {
+        self.txn_touched.nodes.clear();
+        self.txn_touched.edges.clear();
+    }
+
+    /// Take the entities mutated since the last [`Self::clear_touched`].
+    pub fn take_touched(&mut self) -> GraphTouched {
+        std::mem::take(&mut self.txn_touched)
     }
 
     /// Open a durable graph store backed by a WAL in the given directory.
@@ -242,6 +286,7 @@ impl GraphStore {
             },
         );
         self.hot_node_ids.insert(id);
+        self.txn_touched.nodes.insert(id);
         if self.cold_props.is_some() {
             self.maybe_evict_props();
         }
@@ -296,6 +341,7 @@ impl GraphStore {
             Some(n) => n,
             None => return false,
         };
+        self.txn_touched.nodes.insert(id);
 
         // Remove from label index
         for label in &node.labels {
@@ -317,6 +363,7 @@ impl GraphStore {
 
         for eid in out_edges {
             if let Some(edge) = self.edges.remove(&eid) {
+                self.txn_touched.edges.insert(eid);
                 if let Some(inc) = self.incoming.get_mut(&edge.to) {
                     inc.retain(|e| *e != eid);
                 }
@@ -335,6 +382,7 @@ impl GraphStore {
         }
         for eid in in_edges {
             if let Some(edge) = self.edges.remove(&eid) {
+                self.txn_touched.edges.insert(eid);
                 if let Some(out) = self.outgoing.get_mut(&edge.from) {
                     out.retain(|e| *e != eid);
                 }
@@ -416,6 +464,7 @@ impl GraphStore {
         );
         self.outgoing.entry(from).or_default().push(id);
         self.incoming.entry(to).or_default().push(id);
+        self.txn_touched.edges.insert(id);
 
         Some(id)
     }
@@ -460,6 +509,7 @@ impl GraphStore {
             Some(e) => e,
             None => return false,
         };
+        self.txn_touched.edges.insert(id);
 
         if let Some(out) = self.outgoing.get_mut(&edge.from) {
             out.retain(|e| *e != id);
@@ -504,6 +554,7 @@ impl GraphStore {
         }
         if let Some(node) = self.nodes.get_mut(&id) {
             node.properties.insert(key, value);
+            self.txn_touched.nodes.insert(id);
             true
         } else {
             false
@@ -517,6 +568,7 @@ impl GraphStore {
         }
         if let Some(edge) = self.edges.get_mut(&id) {
             edge.properties.insert(key, value);
+            self.txn_touched.edges.insert(id);
             true
         } else {
             false
@@ -579,7 +631,130 @@ impl GraphStore {
         }
     }
 
+    /// Revert only the nodes and edges `touched` names, using `snap` as the
+    /// before-image. Entities this transaction never wrote are left exactly as
+    /// they are, so a ROLLBACK here cannot destroy another session's committed
+    /// graph writes.
+    ///
+    /// Durable: every reverted entity is written back to the graph WAL as a
+    /// compensating record, so a crash after ROLLBACK does not resurrect the
+    /// rolled-back writes on replay.
+    ///
+    /// The id counters are deliberately left where they are (never rewound):
+    /// rewinding them would hand out ids another session may already be using.
+    pub fn txn_restore_scoped(&mut self, snap: &GraphTxnSnapshot, touched: &GraphTouched) {
+        // Detach every touched edge from the live graph first so node
+        // restoration sees clean adjacency.
+        for eid in &touched.edges {
+            self.detach_edge(*eid);
+        }
+        // Detach touched nodes without cascading into untouched edges.
+        for nid in &touched.nodes {
+            self.detach_node(*nid);
+        }
+        // Reinstate the before-image for each touched entity.
+        for nid in &touched.nodes {
+            if let Some(node) = snap.nodes.get(nid) {
+                self.reattach_node(node.clone());
+            } else if let Some(ref w) = self.wal {
+                let _ = w.log_del_node(*nid);
+            }
+        }
+        for eid in &touched.edges {
+            if let Some(edge) = snap.edges.get(eid) {
+                self.reattach_edge(edge.clone());
+            } else if let Some(ref w) = self.wal {
+                let _ = w.log_del_edge(*eid);
+            }
+        }
+        // The restore itself is not a client mutation.
+        self.clear_touched();
+    }
+
+    /// Remove an edge from the live graph and every index that references it.
+    /// Unlike [`Self::delete_edge`] this writes no WAL record — the caller
+    /// (rollback) decides what the compensating record should be.
+    fn detach_edge(&mut self, id: EdgeId) {
+        let Some(edge) = self.edges.remove(&id) else {
+            return;
+        };
+        if let Some(out) = self.outgoing.get_mut(&edge.from) {
+            out.retain(|e| *e != id);
+        }
+        if let Some(inc) = self.incoming.get_mut(&edge.to) {
+            inc.retain(|e| *e != id);
+        }
+        if let Some(set) = self.type_index.get_mut(&edge.edge_type) {
+            set.remove(&id);
+            if set.is_empty() {
+                self.type_index.remove(&edge.edge_type);
+            }
+        }
+    }
+
+    /// Remove a node from the live graph without cascading into its edges.
+    /// Edges this transaction touched are handled separately; edges it did not
+    /// touch belong to other sessions and must not be collateral damage.
+    fn detach_node(&mut self, id: NodeId) {
+        let Some(node) = self.nodes.remove(&id) else {
+            return;
+        };
+        for label in &node.labels {
+            if let Some(set) = self.label_index.get_mut(label) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.label_index.remove(label);
+                }
+            }
+        }
+        self.hot_node_ids.remove(&id);
+    }
+
+    /// Put a node back exactly as the snapshot recorded it, logging a
+    /// compensating WAL record.
+    fn reattach_node(&mut self, node: Node) {
+        if let Some(ref w) = self.wal {
+            let _ = w.log_add_node(node.id, &node.labels, &node.properties);
+        }
+        for label in &node.labels {
+            self.label_index
+                .entry(label.clone())
+                .or_default()
+                .insert(node.id);
+        }
+        self.hot_node_ids.insert(node.id);
+        if node.id >= self.next_node_id {
+            self.next_node_id = node.id + 1;
+        }
+        self.nodes.insert(node.id, node);
+    }
+
+    /// Put an edge back exactly as the snapshot recorded it, logging a
+    /// compensating WAL record.
+    fn reattach_edge(&mut self, edge: Edge) {
+        if let Some(ref w) = self.wal {
+            let _ = w.log_add_edge(edge.id, edge.from, edge.to, &edge.edge_type, &edge.properties);
+        }
+        self.type_index
+            .entry(edge.edge_type.clone())
+            .or_default()
+            .insert(edge.id);
+        let out = self.outgoing.entry(edge.from).or_default();
+        if !out.contains(&edge.id) {
+            out.push(edge.id);
+        }
+        let inc = self.incoming.entry(edge.to).or_default();
+        if !inc.contains(&edge.id) {
+            inc.push(edge.id);
+        }
+        if edge.id >= self.next_edge_id {
+            self.next_edge_id = edge.id + 1;
+        }
+        self.edges.insert(edge.id, edge);
+    }
+
     /// Restore graph state from a transaction snapshot (for ROLLBACK).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn txn_restore(&mut self, snap: GraphTxnSnapshot) {
         self.nodes = snap.nodes;
         self.edges = snap.edges;

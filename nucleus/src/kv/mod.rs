@@ -9,7 +9,7 @@
 //!   - Accessible via SQL: SELECT kv_get('key'), SELECT kv_set('key', 'value', ttl_seconds)
 //!   - Or via dedicated KV commands on the wire protocol
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 #[cfg(feature = "server")]
 use std::path::Path;
@@ -1457,7 +1457,70 @@ impl KvStore {
         KvTxnSnapshot { entries }
     }
 
+    /// Revert only `keys`, using `snapshot` as the before-image.
+    ///
+    /// Keys this transaction never wrote are left untouched, so a ROLLBACK can
+    /// no longer destroy a value another session (or a RESP client, or the KV
+    /// fast path) set and had acknowledged since this transaction's BEGIN.
+    ///
+    /// Durable: each reverted key gets a compensating WAL record, so a crash
+    /// after a successful ROLLBACK cannot resurrect the rolled-back write on
+    /// replay.
+    pub fn txn_restore_scoped(&self, snapshot: &KvTxnSnapshot, keys: &HashSet<String>) {
+        for key in keys {
+            let shard = self.data.shard(key);
+            let previous = shard.data.write().remove(key);
+            if let Some(prev) = previous
+                && let Some(exp) = prev.expires_at
+                && let Some(bucket) = shard.expiry_index.write().get_mut(&exp)
+            {
+                bucket.retain(|k| k != key);
+            }
+            match snapshot.entries.get(key) {
+                Some(entry) => {
+                    if let Some(exp) = entry.expires_at {
+                        shard
+                            .expiry_index
+                            .write()
+                            .entry(exp)
+                            .or_default()
+                            .push(key.clone());
+                    }
+                    #[cfg(feature = "server")]
+                    if let Some(ref wal) = self.wal {
+                        if let Err(e) = wal.log_set(key, &entry.value) {
+                            tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
+                        }
+                        if let Some(exp) = entry.expires_at {
+                            let remaining = exp.saturating_duration_since(Instant::now());
+                            let abs_ms = epoch_ms_now() + remaining.as_millis() as u64;
+                            if let Err(e) = wal.log_expire(key, abs_ms) {
+                                tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
+                            }
+                        }
+                    }
+                    shard.data.write().insert(key.clone(), entry.clone());
+                }
+                None => {
+                    #[cfg(feature = "server")]
+                    if let Some(ref wal) = self.wal
+                        && let Err(e) = wal.log_delete(key)
+                    {
+                        tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every key present in a snapshot. Used to scope a `FLUSHDB` rollback,
+    /// which by definition touches the whole keyspace.
+    pub fn snapshot_keys(snapshot: &KvTxnSnapshot) -> Vec<String> {
+        snapshot.entries.keys().cloned().collect()
+    }
+
     /// Restore from a previously captured snapshot (for ROLLBACK).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn txn_restore(&self, snapshot: KvTxnSnapshot) {
         // Clear all shards (data + expiry index)
         for shard in &self.data.shards {
