@@ -3,6 +3,8 @@
 //! Provides a [`MetricsRegistry`] with thread-safe atomic instrumentation and a
 //! hand-rolled Prometheus exposition format renderer (no external dependencies).
 
+pub mod harness;
+pub mod latency;
 pub mod optimizations;
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
+use nucleus::metrics::latency::percentile_us;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
@@ -130,15 +131,13 @@ impl Stats {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Percentile in milliseconds. The index math lives in
+    /// `nucleus::metrics::latency` so every harness in the tree reports the same
+    /// number for the same samples.
     fn percentile(&self, p: f64) -> f64 {
         let mut lat = self.latencies_us.lock().clone();
-        if lat.is_empty() {
-            return 0.0;
-        }
         lat.sort_unstable();
-        let idx = ((p / 100.0) * (lat.len() as f64 - 1.0)).round() as usize;
-        let idx = idx.min(lat.len() - 1);
-        lat[idx] as f64 / 1000.0 // convert us to ms
+        percentile_us(&lat, p) / 1000.0 // us -> ms
     }
 }
 
