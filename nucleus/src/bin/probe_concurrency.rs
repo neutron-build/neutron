@@ -20,11 +20,22 @@
 //! MVCC transaction state). We compose a fixed step sequence, execute each step,
 //! and assert the expected value at each observation point.
 //!
+//! Engine coverage: this probe was written against `MvccStorageAdapter` and
+//! defaulted to it unconditionally, which left the paged engines with no
+//! isolation prober at all. That is the wrong place to have a blind spot —
+//! `MvccStorageAdapter` is the engine that PASSED the 8-way soak that both
+//! paged engines failed with duplicate primary keys, and every isolation defect
+//! found so far (scan-ordinal row addressing, missing buffer-pool frame
+//! latches) lived in `DiskEngine`. `--engine` now selects, so
+//! `--engine buffered-disk` points these invariants at what `nucleus serve`
+//! runs. The default is unchanged.
+//!
 //! Build:
 //!   cargo build --release --features server --bin probe_concurrency
 //! Run:
 //!   cargo run  --release --features server --bin probe_concurrency
 //!   cargo run  --release --features server --bin probe_concurrency -- --seed 42 --iterations 2000
+//!   cargo run  --release --features server --bin probe_concurrency -- --engine buffered-disk
 
 #![cfg(feature = "server")]
 #![allow(clippy::all)] // internal fuzz harness
@@ -34,6 +45,7 @@ use std::sync::Arc;
 
 use nucleus::catalog::Catalog;
 use nucleus::executor::{ExecResult, Executor};
+use nucleus::metrics::harness::{EngineConfig, EngineKind, HarnessDb};
 use nucleus::storage::{MvccStorageAdapter, StorageEngine};
 use nucleus::types::Value;
 
@@ -471,7 +483,52 @@ fn check_rollback_count(ctx: &Ctx, tbl: &str, rng: &mut Rng, v: &mut Violations)
 // ─── Scenario driver ──────────────────────────────────────────────────────────
 
 /// One complete scenario: fresh table, run all invariants with a mix of keys.
-fn run_scenario(ex: Arc<Executor>, seed: u64, iter: usize, v: &mut Violations) {
+/// Whether the engine gives a transaction a stable snapshot for its lifetime.
+///
+/// This is not cosmetic bookkeeping — invariant 5 is only meaningful where it
+/// holds. The MVCC family defaults to `IsolationLevel::Snapshot`
+/// (`src/storage/mvcc.rs:824`), but the paged engines behave as **read
+/// committed**, which `docs/MODEL_SEMANTICS.md:263-271` records as verified:
+/// an open transaction there legitimately sees rows another session committed
+/// after its `BEGIN`. Asserting stable re-reads against a read-committed engine
+/// reports the documented contract as a violation, so invariant 5 is skipped
+/// rather than failed. `MemoryEngine` provides no isolation at all.
+/// Whether the engine isolates uncommitted writes between sessions at all.
+///
+/// Invariants 1-4 and 6 all assume a transaction's writes are invisible to
+/// other sessions until COMMIT, which for paged storage is supplied by
+/// `BufferedDiskEngine` buffering writes per storage session and applying them
+/// at COMMIT (`docs/MODEL_SEMANTICS.md:255-257`). A bare `DiskEngine` is
+/// explicitly the un-buffered diagnostic engine and writes through to pages
+/// immediately, so it shows dirty reads by construction; `MemoryEngine`
+/// provides no isolation either. Neither is a configuration the server ships,
+/// and reporting their behaviour as violations would bury real findings under
+/// expected ones.
+fn provides_transaction_isolation(kind: Option<EngineKind>) -> bool {
+    match kind {
+        None => true,
+        Some(EngineKind::Mvcc) | Some(EngineKind::DurableMvcc) => true,
+        Some(EngineKind::BufferedDisk) => true,
+        Some(EngineKind::Disk) | Some(EngineKind::Memory) => false,
+    }
+}
+
+fn provides_snapshot_isolation(kind: Option<EngineKind>) -> bool {
+    match kind {
+        None => true, // historical in-process MvccStorageAdapter
+        Some(EngineKind::Mvcc) | Some(EngineKind::DurableMvcc) => true,
+        Some(EngineKind::Disk) | Some(EngineKind::BufferedDisk) => false,
+        Some(EngineKind::Memory) => false,
+    }
+}
+
+fn run_scenario(
+    ex: Arc<Executor>,
+    seed: u64,
+    iter: usize,
+    v: &mut Violations,
+    snapshot_iso: bool,
+) {
     let tbl = format!("cc_t_{iter}");
     let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
 
@@ -527,10 +584,13 @@ fn run_scenario(ex: Arc<Executor>, seed: u64, iter: usize, v: &mut Violations) {
 
     // Invariant 5: Repeatable read — use a key range that won't collide with
     // committed rows above (they used keys base+0..base+11; use base+20+).
-    for i in 0..3i64 {
-        let key = base + 20 + i;
-        let val = rng.int(1, 999);
-        check_repeatable_read(&ctx, &tbl, key, val, v);
+    // Only meaningful under snapshot isolation; see provides_snapshot_isolation.
+    if snapshot_iso {
+        for i in 0..3i64 {
+            let key = base + 20 + i;
+            let val = rng.int(1, 999);
+            check_repeatable_read(&ctx, &tbl, key, val, v);
+        }
     }
 
     // Invariant 6: Rollback count
@@ -543,6 +603,8 @@ fn main_impl() {
     let mut seed: u64 = 0xC0FFEE_BABE;
     let mut iterations = 500usize;
     let mut max_report = 20usize;
+    // None = the historical in-process MvccStorageAdapter (RAM, no WAL).
+    let mut engine: Option<EngineKind> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -560,6 +622,21 @@ fn main_impl() {
                 i += 1;
                 max_report = args[i].parse().unwrap();
             }
+            "--engine" => {
+                i += 1;
+                match EngineKind::parse(&args[i]) {
+                    Some(k) => engine = Some(k),
+                    None => {
+                        let names: Vec<&str> = EngineKind::ALL.iter().map(|k| k.name()).collect();
+                        println!(
+                            "unknown --engine {:?}; expected one of: {}",
+                            args[i],
+                            names.join(", ")
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -568,24 +645,80 @@ fn main_impl() {
     // Silence default panic hook (we catch_unwind everywhere).
     std::panic::set_hook(Box::new(|_| {}));
 
+    let engine_label = match engine {
+        Some(k) => k.name(),
+        None => "mvcc (in-process, no WAL)",
+    };
     println!("Nucleus MVCC isolation invariant prober");
-    println!("seed={seed} iterations={iterations}\n");
+    println!("seed={seed} iterations={iterations} engine={engine_label}");
+    if engine.is_none_or(|k| !k.has_buffer_pool()) {
+        println!(
+            "NOTE: this engine has no paged storage — nothing below covers \
+             DiskEngine isolation.\n      Pass --engine buffered-disk to probe \
+             what `nucleus serve` runs."
+        );
+    }
+    println!();
+    if !provides_transaction_isolation(engine) {
+        println!(
+            "SKIPPED: {engine_label} does not isolate uncommitted writes between \
+             sessions.\n         Every invariant here requires transaction \
+             buffering, which this engine\n         deliberately omits, and it is not a \
+             configuration `nucleus serve` runs.\n         Use --engine buffered-disk for \
+             the shipped paged configuration."
+        );
+        return;
+    }
     println!("Invariants checked:");
     println!("  1. NO_DIRTY_READ       — uncommitted writes invisible to other sessions");
     println!("  2. READ_OWN_WRITES     — txn sees its own uncommitted inserts");
     println!("  3. COMMIT_VISIBILITY   — committed writes visible to post-commit snapshots");
     println!("  4. ROLLBACK_DISCARD    — rolled-back writes invisible after ROLLBACK");
-    println!("  5. REPEATABLE_READ     — snapshot-isolated re-reads see stable count");
+    let snapshot_iso = provides_snapshot_isolation(engine);
+    if snapshot_iso {
+        println!("  5. REPEATABLE_READ     — snapshot-isolated re-reads see stable count");
+    } else {
+        println!(
+            "  5. REPEATABLE_READ     — SKIPPED: {engine_label} is read committed, where a \
+             re-read\n                            legitimately sees newly committed rows \
+             (MODEL_SEMANTICS.md:263)"
+        );
+    }
     println!("  6. ROLLBACK_COUNT      — count returns to baseline after ROLLBACK\n");
 
-    let catalog = Arc::new(Catalog::new());
-    let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
-    let ex = Arc::new(Executor::new(catalog, storage));
+    // Held for the whole run: a paged engine's executor borrows from its
+    // HarnessDb, and dropping it early would close the files under the probe.
+    let mut held: Option<HarnessDb> = None;
+    let mut work_dir: Option<std::path::PathBuf> = None;
+    let ex = match engine {
+        None => {
+            let catalog = Arc::new(Catalog::new());
+            let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+            Arc::new(Executor::new(catalog, storage))
+        }
+        Some(kind) => {
+            let dir = std::env::temp_dir()
+                .join(format!("nucleus-probe-concurrency-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let rt = tokio::runtime::Handle::current();
+            let db = tokio::task::block_in_place(|| {
+                rt.block_on(HarnessDb::open(kind, &dir, EngineConfig::default()))
+            })
+            .unwrap_or_else(|e| {
+                println!("FAIL: could not open engine {}: {e:?}", kind.name());
+                std::process::exit(1);
+            });
+            let ex = db.executor().clone();
+            held = Some(db);
+            work_dir = Some(dir);
+            ex
+        }
+    };
 
     let mut all_violations = Violations::new(max_report);
 
     for iter in 0..iterations {
-        run_scenario(ex.clone(), seed, iter, &mut all_violations);
+        run_scenario(ex.clone(), seed, iter, &mut all_violations, snapshot_iso);
 
         if all_violations.total() >= max_report {
             println!("Reached max-report={max_report}, stopping early.");
@@ -615,8 +748,16 @@ fn main_impl() {
         }
     }
 
+    // Close the engine before removing its directory — a paged engine holds WAL
+    // and data-file handles until its HarnessDb drops.
+    drop(ex);
+    drop(held);
+    if let Some(dir) = &work_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     if all_violations.total() == 0 && all_violations.panics == 0 {
-        println!("\nAll MVCC isolation invariants hold across {iterations} scenarios.");
+        println!("\nAll MVCC isolation invariants hold across {iterations} scenarios on {engine_label}.");
     } else {
         std::process::exit(1);
     }
