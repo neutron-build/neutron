@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 264403; Source Rust files: 235; Top-level modules: 51.
-- Declared unit tests: 3987; Declared integration tests: 327; Ignored tests: 44.
+- Source LOC: 264508; Source Rust files: 235; Top-level modules: 51.
+- Declared unit tests: 3989; Declared integration tests: 327; Ignored tests: 45.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
@@ -165,6 +165,20 @@ Evidence:
   `tests/copy_wire_constraints.rs` drives the pgwire path over the raw simple-query protocol (the
   one `psql \copy` uses) rather than `tokio_postgres::copy_in`, which prepares over the extended
   protocol and never reaches the COPY interception at all.
+  The oracle's default depth is 6 seeds, chosen so it can sit in the push gates; that is a speed
+  compromise and NOT a coverage claim. A 1500-seed sweep found a divergence at seed ~1140 that the
+  default depth cannot reach: zone-map granule statistics are shared process state, and an INSERT
+  inside a transaction merged its values into them immediately while only DELETE and UPDATE — and
+  only when they actually matched rows — marked the table for post-transaction repair. A transaction
+  that inserted and rolled back therefore left `min`/`max` describing a row that no longer existed,
+  and when the stale granule's `row_count` coincidentally matched the live table's, `can_skip_granule`
+  trusted it and pruned a granule holding live rows: `WHERE val > 13` returned nothing while
+  `WHERE val = 17` returned the same row. Inserts now mark the table dirty inside a transaction, so
+  COMMIT and ROLLBACK both rebuild the derived state.
+  `rolled_back_insert_does_not_poison_zone_map_pruning` pins the minimal case and fails if the mark
+  is removed. Because a green default-depth run says nothing about this class, the deep sweep
+  (`oracle_deep_run_catches_rare_divergences`, `#[ignore]`d) runs weekly in the
+  `cache-oracle-deep` job of `nucleus-long.yml`.
 
 Exit gate:
 
