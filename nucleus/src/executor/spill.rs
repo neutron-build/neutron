@@ -382,6 +382,21 @@ impl SpillWriter {
             None => std::mem::take(&mut self.scratch),
         };
 
+        // The reader rejects any block above MAX_BLOCK_LEN, and the writer had
+        // no matching cap — so a single skewed group large enough to fill the
+        // query budget produced a block this process could write and then
+        // refused to read back, surfacing as "corrupt spill file" on data it
+        // had just written. Reachable whenever max_memory_mb > 1024, which the
+        // cgroup auto-derivation reaches on its own in an 8 GB container. Above
+        // 4 GiB the `as u32` cast below would truncate and desynchronise the
+        // frame instead.
+        if stored.len() as u64 > MAX_BLOCK_LEN as u64 {
+            return Err(SpillError::Corrupt(format!(
+                "spill block of {} bytes exceeds the {MAX_BLOCK_LEN}-byte frame limit; \
+                 lower the query memory budget so batches flush more often",
+                stored.len()
+            )));
+        }
         let framed = 4u64 + stored.len() as u64;
         self.guard.reservation.grow(framed)?;
 
@@ -459,6 +474,18 @@ impl SpillReader {
             return Err(SpillError::Corrupt("missing row count".into()));
         }
         let nrows = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        // MAX_BLOCK_LEN guards the OUTER frame against a corrupt length prefix,
+        // but this inner count was unchecked: a block whose `nrows` field is
+        // corrupted to 0xFFFFFFFF asked for a ~103 GB allocation, which fails
+        // through `handle_alloc_error` and ABORTS the process rather than
+        // unwinding into `SpillError::Corrupt`. Every row needs at least one
+        // byte, so a count that cannot fit in what remains is corrupt.
+        if nrows > payload.len().saturating_sub(4) {
+            return Err(SpillError::Corrupt(format!(
+                "block claims {nrows} rows but holds only {} bytes",
+                payload.len() - 4
+            )));
+        }
         let mut pos = 4usize;
         let mut rows = Vec::with_capacity(nrows);
         for _ in 0..nrows {

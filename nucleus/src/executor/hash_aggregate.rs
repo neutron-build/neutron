@@ -730,11 +730,37 @@ impl Executor {
                             &spill,
                             0,
                         )?;
+                        // Take the schema from EVERY partition, not just one
+                        // that produced rows. `aggregate_partition` always
+                        // returns it (falling back to `agg_static_columns`), and
+                        // discarding it when the partition was empty left
+                        // `columns` empty for any query whose groups all
+                        // vanished — a HAVING that filtered everything, or an
+                        // empty table — which reaches the wire as a
+                        // RowDescription with zero fields. The materialized path
+                        // documents this exact defect as fixed
+                        // (`aggregate/mod.rs`): a derived table over such a
+                        // result has no columns, so an outer `alias.col`
+                        // reference fails, which is how SQLAlchemy's reflection
+                        // subquery hit it.
+                        if columns.is_empty() {
+                            columns = cols.clone().unwrap_or_default();
+                        }
                         if !part_rows.is_empty() {
                             columns = cols.unwrap_or_default();
                             pending = part_rows;
                             break;
                         }
+                    }
+                    // No partitions at all: nothing above ran, so neither did
+                    // `execute_aggregate` — and with it `validate_grouped_projection`,
+                    // which is what rejects `SELECT k, v FROM t GROUP BY k`. On an
+                    // empty table that made an illegal query silently succeed.
+                    if columns.is_empty()
+                        && let ExecResult::Select { columns: cols, .. } =
+                            self.execute_aggregate(select, &col_meta, Vec::new(), None)?
+                    {
+                        columns = cols;
                     }
                     let (session, sess_id) = capture_session();
                     let source: Box<dyn RowBatchIter> = Box::new(StreamingAggregateIter {
@@ -769,6 +795,17 @@ impl Executor {
                             columns = cols;
                         }
                         rows.extend(part_rows);
+                    }
+                    // Zero partitions means the loop never ran, so neither did
+                    // `execute_aggregate` — and an empty column list reaches the
+                    // wire as a RowDescription with no fields. It also skipped
+                    // `validate_grouped_projection`, letting an illegal
+                    // projection succeed on an empty table.
+                    if columns.is_none()
+                        && let ExecResult::Select { columns: cols, .. } =
+                            self.execute_aggregate(select, &col_meta, Vec::new(), None)?
+                    {
+                        columns = Some(cols);
                     }
                     (
                         columns.unwrap_or_default(),

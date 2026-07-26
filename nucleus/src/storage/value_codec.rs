@@ -230,6 +230,14 @@ pub(crate) fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         }
         VAL_ARRAY => {
             let count = read_u32_val(data, pos)? as usize;
+            // Every element costs at least a tag byte, so a count larger than
+            // the bytes remaining is corrupt. Reserving on the unchecked count
+            // let a torn record request gigabytes and ABORT the process through
+            // handle_alloc_error instead of returning None — and this codec also
+            // backs the MVCC WAL, so a torn WAL record could reach it.
+            if count > data.len().saturating_sub(*pos) {
+                return None;
+            }
             let mut arr = Vec::with_capacity(count);
             for _ in 0..count {
                 arr.push(read_value(data, pos)?);
@@ -251,6 +259,11 @@ pub(crate) fn write_row(buf: &mut Vec<u8>, row: &[Value]) {
 /// Decode one length-prefixed row starting at `*pos`, advancing past it.
 pub(crate) fn read_row(data: &[u8], pos: &mut usize) -> Option<Vec<Value>> {
     let count = read_u32_val(data, pos)? as usize;
+    // See `VAL_ARRAY`: an unchecked count aborts the process on corrupt input
+    // rather than failing this decode.
+    if count > data.len().saturating_sub(*pos) {
+        return None;
+    }
     let mut row = Vec::with_capacity(count);
     for _ in 0..count {
         row.push(read_value(data, pos)?);
