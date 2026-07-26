@@ -1030,6 +1030,16 @@ impl BufferPool {
         }
         // Clear the dirty set — all pages have been flushed
         self.dirty_set.lock().clear();
+        // Write-ahead: the loop above MINTED a record per page and stamped its
+        // LSN onto the page, so the pre-loop sync did not cover them. Without
+        // this, `disk.sync()` below makes pages durable at LSNs whose records
+        // are still in a process-local BufWriter, and a crash there leaves the
+        // data file ahead of the WAL. Recovery then reissues those LSNs (it
+        // takes its floor from the WAL) and the NEXT recovery discards the new
+        // records as stale — silently losing acknowledged commits.
+        if let Some(ref wal) = self.wal {
+            wal.sync().map_err(BufferError::Io)?;
+        }
         self.disk.sync()?;
         Ok(())
     }
@@ -1078,6 +1088,15 @@ impl BufferPool {
                 dirty.push((page_id, Box::new(*data)));
                 desc.is_dirty.store(false, Ordering::Release);
                 self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        // Write-ahead: the loop minted a record per collected page. The caller
+        // writes these bytes and fsyncs the data file, so the records must be
+        // durable before we hand them over. See `flush_all` for what a crash in
+        // that window costs.
+        if !dirty.is_empty() {
+            if let Some(ref wal) = self.wal {
+                wal.sync().map_err(BufferError::Io)?;
             }
         }
         Ok(dirty)
@@ -1149,6 +1168,16 @@ impl BufferPool {
                 }
             }
             flushed += 1;
+        }
+
+        // Write-ahead: records minted above must be durable before the pages
+        // stamped with their LSNs are. See `flush_all`.
+        if flushed > 0
+            && let Some(ref wal) = self.wal
+            && let Err(e) = wal.sync()
+        {
+            tracing::error!("WAL sync failed before flushing {flushed} pages: {e}");
+            return 0;
         }
 
         // Sync data pages to stable storage so they survive power failure.

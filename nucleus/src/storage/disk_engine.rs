@@ -565,6 +565,18 @@ impl DiskEngine {
                 tracing::info!("WAL recovery: replayed {recovered} page(s)");
             }
 
+            // The WAL is not a sufficient floor on its own. A page can carry an
+            // LSN whose record never reached stable storage — a crash between
+            // minting a flush record and fsyncing the WAL leaves exactly that.
+            // Minting from the WAL's last LSN would then REISSUE LSNs already
+            // stamped on pages, and the next recovery's `wal_lsn > disk_lsn`
+            // test would discard those new records as stale, silently dropping
+            // acknowledged commits. The data pages are ground truth, so take
+            // the floor from them too. This used to run only when a legacy
+            // single-file WAL was present, which is not the shipped
+            // configuration.
+            lsn_floor = lsn_floor.max(Self::max_page_lsn(&mut disk, initial_pages));
+
             if single_file_len > 0 {
                 // The single file's content is now applied (or unparseable —
                 // e.g. a pre-CRC-era legacy file, whose page-write records
@@ -572,11 +584,8 @@ impl DiskEngine {
                 // stored checksum). Either way it must not be re-parsed — and
                 // re-reported as corruption — on every subsequent boot.
                 //
-                // Its LSNs also vanish from the derivable history, so take
-                // the ground-truth floor from the data pages themselves.
-                // Full-file scan, but only at this rare hygiene moment (one
-                // time per legacy file / per single-file crash recovery).
-                lsn_floor = lsn_floor.max(Self::max_page_lsn(&mut disk, initial_pages));
+                // Its LSNs also vanish from the derivable history — the
+                // page-derived floor applied above already covers that.
                 if use_segmented_wal {
                     let aside = path.with_extension("wal.legacy");
                     match std::fs::rename(&wal_path, &aside) {
@@ -3336,6 +3345,71 @@ mod tests {
     /// Build a simple row for the (id Int32, name Text) schema.
     fn simple_row(id: i32, name: &str) -> Row {
         vec![Value::Int32(id), Value::Text(name.to_string())]
+    }
+
+    /// A reopened engine must never mint an LSN at or below one already stamped
+    /// on a data page.
+    ///
+    /// `flush` mints a record per dirty page and stamps its LSN onto the page.
+    /// If recovery takes its floor from the WAL alone, it reissues that range,
+    /// and the NEXT recovery's `wal_lsn > disk_lsn` test discards those records
+    /// as stale — dropping commits that were acknowledged as durable. The pages
+    /// are ground truth, so the floor has to come from them as well.
+    #[tokio::test]
+    async fn reopen_never_mints_an_lsn_a_page_already_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("lsnfloor.db");
+
+        let max_page_lsn_after_first_boot = {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
+            register_simple_table(&catalog, "t").await;
+            engine.create_table("t").await.unwrap();
+            for id in 0..400 {
+                engine
+                    .insert("t", simple_row(id, "seed"))
+                    .await
+                    .unwrap();
+            }
+            // Stamps fresh LSNs onto every dirty page.
+            engine.flush().unwrap();
+
+            let mut disk = DiskManager::open(&db_path).unwrap();
+            let pages = disk.slot_count().unwrap_or(0);
+            DiskEngine::max_page_lsn(&mut disk, pages)
+        };
+        assert!(
+            max_page_lsn_after_first_boot > 0,
+            "flush should have stamped page LSNs"
+        );
+
+        // Simulate the crash window this floor exists for: records minted for
+        // the flush never reached stable storage, so the WAL is BEHIND the data
+        // pages. Deleting the log is the strongest form of that. Recovery must
+        // still not resume minting below what the pages already carry.
+        let wal_dir = db_path.with_extension("wal.d");
+        if wal_dir.is_dir() {
+            for entry in std::fs::read_dir(&wal_dir).unwrap().flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let _ = std::fs::remove_file(db_path.with_extension("wal"));
+
+        // Reopen: recovery decides where minting resumes.
+        let catalog = Arc::new(Catalog::new());
+        let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
+        register_simple_table(&catalog, "t").await;
+        engine.insert("t", simple_row(9999, "after")).await.unwrap();
+        engine.flush().unwrap();
+
+        let mut disk = DiskManager::open(&db_path).unwrap();
+        let pages = disk.slot_count().unwrap_or(0);
+        let after = DiskEngine::max_page_lsn(&mut disk, pages);
+        assert!(
+            after > max_page_lsn_after_first_boot,
+            "second boot reissued LSNs already on disk: page max was {max_page_lsn_after_first_boot}, \
+             after another write it is {after} — a later recovery would discard the new records"
+        );
     }
 
     /// Resolve scan-order ordinals to the engine's row positions. Positions are
