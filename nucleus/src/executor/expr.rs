@@ -1555,8 +1555,18 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
-                // Cache key is the canonical text of the subquery before outer-ref substitution.
-                let cache_key = format!("{subquery}");
+                // Cache key is the canonical text of the subquery before
+                // outer-ref substitution, PLUS the principal it was evaluated
+                // for. The map is one process-wide table shared by every wire
+                // session, and this read happens before any RLS logic, so a
+                // text-only key served one principal's rows to another: a
+                // multi-tenant app issues the same prepared statement for every
+                // tenant, so tenant B primes the entry and tenant A's next
+                // execute matches against it. `rls_cache_principal` folds in
+                // the policy generation as well, so a policy change invalidates
+                // rather than lingering.
+                let subquery_text = format!("{subquery}");
+                let cache_key = format!("{}\u{1}{subquery_text}", self.rls_cache_principal());
                 // Check if we already have the result of this non-correlated subquery cached.
                 if let Some(cached) = self
                     .uncorrelated_subquery_cache
@@ -1579,7 +1589,9 @@ impl Executor {
                     _ => std::sync::Arc::new(vec![]),
                 };
                 // Only cache if non-correlated (resolved query text == original).
-                if cache_key == resolved_key {
+                // Compare the TEXT, not `cache_key`, which now carries a
+                // principal prefix that `resolved_key` does not.
+                if subquery_text == resolved_key {
                     self.uncorrelated_subquery_cache
                         .write()
                         .insert(cache_key, values.clone());

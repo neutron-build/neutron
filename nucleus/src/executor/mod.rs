@@ -2920,6 +2920,11 @@ impl Executor {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
     > {
+        // The other three entry points (`execute`, `execute_parsed`,
+        // `execute_prepared`) clear this; this one did not, and it is the
+        // extended-query AST fast path every real driver takes, so entries
+        // outlived the statement and the connection that made them.
+        self.uncorrelated_subquery_cache.write().clear();
         let session = self.get_session(session_id);
         let guard_sess = session.clone();
         Box::pin(CURRENT_SESSION.scope(
