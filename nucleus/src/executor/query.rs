@@ -7604,6 +7604,39 @@ impl Executor {
                     return Ok(result);
                 }
 
+                // SELECT privilege, checked once for every base-table read and
+                // before the index fast path below, which also returns rows.
+                //
+                // This was previously enforced nowhere on the read path:
+                // `check_privilege` was called for INSERT/UPDATE/DELETE and for
+                // `COPY ... TO`, so a role with no GRANT at all was refused by
+                // COPY and served the same rows by SELECT, while
+                // `has_table_privilege()` reported false. Every table without an
+                // RLS policy was world-readable to any authenticated role.
+                //
+                // Superusers and `bypass_rls` short-circuit inside
+                // `check_privilege`, so the default single-user session is
+                // unaffected; this engages once a session assumes a
+                // non-superuser identity.
+                //
+                // Tables with an active policy are exempt, because in this
+                // engine a policy IS the access mechanism — `CREATE POLICY ...
+                // TO PUBLIC USING (owner = CURRENT_USER)` is expected to admit
+                // the rows it selects without a separate GRANT, and
+                // `test_rls::table_rename_moves_policies_and_drop_removes_them`
+                // asserts that. PostgreSQL instead requires SELECT *and* passes
+                // RLS on top; matching that is a deliberate model change and a
+                // migration for every existing policy, not a bug fix, so it is
+                // recorded rather than smuggled in here. The hole this closes
+                // is the unpoliced one: a table with no policy at all.
+                if !self.rls_active(&table_name)
+                    && !self.check_privilege(&table_name, "SELECT").await
+                {
+                    return Err(ExecError::PermissionDenied(format!(
+                        "permission denied for table {table_name}"
+                    )));
+                }
+
                 // For JOIN-aware AST execution, attempt indexed lookup using relation-local
                 // pushdown predicates before falling back to full table scan.
                 if !self.rls_active(&table_name)
