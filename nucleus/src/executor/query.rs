@@ -4582,8 +4582,27 @@ impl Executor {
                                     .map(|e| {
                                         let asc = e.options.asc.unwrap_or(true);
                                         let nulls_first = e.options.nulls_first.unwrap_or(!asc);
+                                        // `col_pairs` here are the SOURCE
+                                        // columns — this sort runs before the
+                                        // projection is applied. A positional
+                                        // `ORDER BY 1` names the first OUTPUT
+                                        // column, so it has to be mapped
+                                        // through the SELECT list first:
+                                        // `SELECT b, a FROM w ORDER BY 1` sorted
+                                        // by `a` because ordinal 1 was used as a
+                                        // source index directly. The streaming
+                                        // aggregate path resolves output
+                                        // ordinals correctly, so this also made
+                                        // `SET stream_results = on` silently
+                                        // change row order.
+                                        let resolved_expr =
+                                            Self::order_by_ordinal_to_source_expr(
+                                                &e.expr,
+                                                &projection,
+                                            )
+                                            .unwrap_or_else(|| e.expr.clone());
                                         self.resolve_order_by_expr(
-                                            &e.expr,
+                                            &resolved_expr,
                                             &col_pairs,
                                             Some(&col_meta),
                                             Some(&projection),
@@ -8027,7 +8046,21 @@ impl Executor {
             let asc = ob_expr.options.asc.unwrap_or(true);
             // PostgreSQL default: NULLS LAST for ASC, NULLS FIRST for DESC
             let nulls_first = ob_expr.options.nulls_first.unwrap_or(!asc);
-            match self.resolve_order_by_expr(&ob_expr.expr, columns, col_meta, projection) {
+            // A positional `ORDER BY <n>` names the n-th OUTPUT column, but
+            // `columns` here are the SOURCE columns — this sort runs before the
+            // projection is applied. Using the ordinal as a source index made
+            // `SELECT b, a FROM w ORDER BY 1` sort by `a`. Map it through the
+            // SELECT list first; `order_by_ordinal_to_source_expr` declines
+            // (leaving the old path) whenever the mapping is not unambiguous,
+            // such as a wildcard projection.
+            //
+            // The streaming aggregate path resolves output ordinals correctly,
+            // so this mismatch also meant `SET stream_results = on` silently
+            // changed the row order of such queries.
+            let ordinal_mapped = projection
+                .and_then(|proj| Self::order_by_ordinal_to_source_expr(&ob_expr.expr, proj));
+            let effective_expr = ordinal_mapped.as_ref().unwrap_or(&ob_expr.expr);
+            match self.resolve_order_by_expr(effective_expr, columns, col_meta, projection) {
                 Ok(col_idx) => sort_keys.push((SortKey::Column(col_idx), asc, nulls_first)),
                 Err(_) => {
                     // ORDER BY <alias> where the alias names a COMPLEX
@@ -8201,6 +8234,34 @@ impl Executor {
         }
 
         Ok(())
+    }
+
+    /// Translate a positional `ORDER BY <n>` into the SELECT-list expression it
+    /// names, so a caller sorting PRE-projection rows resolves the ordinal
+    /// against output position rather than source position.
+    ///
+    /// Returns `None` when the ordinal cannot be mapped unambiguously — a
+    /// wildcard in the projection, an out-of-range position, or a non-ordinal
+    /// expression — leaving the caller's existing behaviour untouched.
+    pub(super) fn order_by_ordinal_to_source_expr(
+        expr: &Expr,
+        projection: &[SelectItem],
+    ) -> Option<Expr> {
+        let Expr::Value(v) = expr else { return None };
+        let ast::Value::Number(n, _) = &v.value else {
+            return None;
+        };
+        let pos: usize = n.parse().ok()?;
+        if pos == 0 || pos > projection.len() {
+            return None;
+        }
+        match &projection[pos - 1] {
+            SelectItem::UnnamedExpr(e) => Some(e.clone()),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
+            // Wildcards expand to an unknown arity, so position n in the
+            // projection is not position n in the output.
+            _ => None,
+        }
     }
 
     pub(super) fn resolve_order_by_expr(
