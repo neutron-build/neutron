@@ -1094,10 +1094,10 @@ impl BufferPool {
         // writes these bytes and fsyncs the data file, so the records must be
         // durable before we hand them over. See `flush_all` for what a crash in
         // that window costs.
-        if !dirty.is_empty() {
-            if let Some(ref wal) = self.wal {
-                wal.sync().map_err(BufferError::Io)?;
-            }
+        if !dirty.is_empty()
+            && let Some(ref wal) = self.wal
+        {
+            wal.sync().map_err(BufferError::Io)?;
         }
         Ok(dirty)
     }
