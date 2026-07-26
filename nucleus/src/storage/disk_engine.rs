@@ -2241,14 +2241,30 @@ impl StorageEngine for DiskEngine {
             return Err(StorageError::Io("row too large for inline storage".into()));
         }
 
-        // Fast path: try the last page first (O(1) instead of scanning all pages)
-        let last_page_id = {
-            let tables = self.tables.read();
-            tables
-                .get(table)
-                .map(|m| m.last_page)
-                .unwrap_or(INVALID_PAGE_ID)
-        };
+        // Fast path: try the last page first (O(1) instead of scanning all pages).
+        //
+        // The `tables` read guard is HELD across the page latch below, in that
+        // order (L1 before L6, per `FrameDescriptor::latch`). It is what makes
+        // "this page is still my table's last page" true for the duration of
+        // the write rather than merely true when it was sampled.
+        //
+        // Sampling it and dropping the lock was not enough. VACUUM or DROP
+        // TABLE can free the page in the gap — the `PAGE_TYPE_DATA` check below
+        // catches that — but another table's `alloc_data_page` can then pop it
+        // off the free list and `init_data_page` re-stamps `PAGE_TYPE_DATA`, so
+        // the check passes and the row lands in a page that now belongs to
+        // someone else, with an index entry pointing at it. "Still a data page"
+        // is weaker than "still mine", and there is no owner id in the page
+        // header to ask for the stronger property.
+        //
+        // Holding L1 shared also cannot deadlock against `alloc_data_page` /
+        // `vacuum_table`, which take L1 exclusively and only then reach for a
+        // page latch: same order, so no cycle.
+        let tables_guard = self.tables.read();
+        let last_page_id = tables_guard
+            .get(table)
+            .map(|m| m.last_page)
+            .unwrap_or(INVALID_PAGE_ID);
         if last_page_id != INVALID_PAGE_ID {
             // Write-latched: `page::insert_tuple` claims a slot by advancing
             // the page's free-space pointer and slot count. Two sessions
@@ -2262,10 +2278,22 @@ impl StorageEngine for DiskEngine {
                     .map_err(|e| StorageError::Io(e.to_string()))?;
                 // `last_page` was read outside the latch, and this is the one
                 // page access in the engine that does not walk the chain under
-                // `tables`. VACUUM can have freed the page in the gap, in which
-                // case it is now a free-list node and writing a tuple into it
-                // would put a live row on a page any table can claim. Fall
-                // through to allocating instead.
+                // `tables`. Two things can happen in that gap, and the page
+                // type only catches one of them:
+                //
+                //   - VACUUM (or DROP TABLE) frees the page, making it a
+                //     free-list node. `PAGE_TYPE_DATA` catches this.
+                //   - ...and then another table's `alloc_data_page` pops it off
+                //     the free list and calls `init_data_page`, which re-stamps
+                //     `PAGE_TYPE_DATA`. The type check PASSES and this session
+                //     writes its row into a page another table now owns, then
+                //     plants an index entry addressing a page it does not own.
+                //     VACUUM's index purge cannot help: the entry is created
+                //     after VACUUM released `tables`.
+                //
+                // Ownership is held by `tables_guard` above; the type check
+                // remains as a cheap assertion that the page was not freed
+                // while we were the only reader.
                 if page::get_page_type(&pg) == page::PAGE_TYPE_DATA {
                     let slot = page::insert_tuple(&mut pg, &data);
                     if slot.is_some() {
@@ -2278,13 +2306,18 @@ impl StorageEngine for DiskEngine {
             };
             if let Some(slot_idx) = placed {
                 self.record_dirty_page(last_page_id);
-                // Index maintenance takes `indexes` (L3) — outside the latch.
+                // Index maintenance takes `indexes` (L3) — outside the latch,
+                // still under L1, which is the documented order.
                 self.index_insert(table, last_page_id, slot_idx, &row)?;
                 return Ok(());
             }
         }
 
-        // Last page full or no pages yet — allocate a new one
+        // Last page full or no pages yet — allocate a new one. `alloc_data_page`
+        // takes `tables` exclusively, so the shared guard above must be gone
+        // first: `parking_lot`'s RwLock is not reentrant and read-then-write on
+        // one thread deadlocks.
+        drop(tables_guard);
         let page_id = self.alloc_data_page(table)?;
         let slot_idx = {
             let mut pg = self
