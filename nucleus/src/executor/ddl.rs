@@ -1059,6 +1059,10 @@ impl Executor {
         names: Vec<ast::ObjectName>,
         if_exists: bool,
     ) -> Result<ExecResult, ExecError> {
+        // Dropping an object is at least as privileged as truncating one, which
+        // already required superuser. A restricted principal could otherwise
+        // destroy a policy-protected table and its policies outright.
+        self.require_security_admin("drop an object")?;
         match object_type {
             ast::ObjectType::Table => {
                 for name in &names {
@@ -1692,6 +1696,20 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         let table_name = crate::sql::object_name_key(&alter_table.name);
         let table_def = self.get_table(&table_name).await?;
+
+        // Structural DDL is privileged, not just the RLS-specific operations
+        // below. Without this, a policy-restricted principal could rewrite the
+        // column its own policy reads:
+        //
+        //   ALTER TABLE docs RENAME COLUMN owner TO owner_real;
+        //   ALTER TABLE docs ADD COLUMN owner TEXT DEFAULT 'alice';
+        //
+        // The ADD backfills every existing row, hidden ones included, and
+        // policies are stored by column NAME, so the predicate then matches
+        // everything. DROP COLUMN is the shorter version of the same move.
+        // TRUNCATE already required superuser here while ALTER and DROP did
+        // not, which is the asymmetry that gave this away.
+        self.require_security_admin("alter a table")?;
 
         for op in &alter_table.operations {
             match op {
