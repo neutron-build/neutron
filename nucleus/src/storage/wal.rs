@@ -888,12 +888,29 @@ impl SegmentedWal {
                 break;
             }
             let path = segment_path(&self.dir, seg_num);
-            let max_seg_lsn = read_wal_records(&path)
-                .unwrap_or_default()
-                .iter()
-                .map(|r| r.lsn)
-                .max()
-                .unwrap_or(0);
+            // Fail CLOSED on an unreadable segment, matching the archive guard
+            // below ("keeping it rather than losing it").
+            //
+            // `unwrap_or_default()` collapsed an I/O error — EMFILE under fd
+            // pressure, a transient EIO — into an empty record list, hence
+            // max_seg_lsn = 0, which is below any `before_lsn`, so the segment
+            // was DELETED UNREAD. Segments numbered above the one holding the
+            // checkpoint record legitimately carry records past `cp_lsn`, and
+            // those cover pages dirtied after the checkpoint's flush: they are
+            // the only copy. Continuous archiving would preserve the bytes
+            // first, but it is opt-in and off by default.
+            let records = match read_wal_records(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        segment = seg_num,
+                        "WAL truncation: could not read segment, keeping it rather than \
+                         deleting it unread: {e}"
+                    );
+                    break;
+                }
+            };
+            let max_seg_lsn = records.iter().map(|r| r.lsn).max().unwrap_or(0);
 
             if max_seg_lsn < before_lsn {
                 // Last-resort archiving safety net: never delete an un-archived
