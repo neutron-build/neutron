@@ -2026,14 +2026,23 @@ impl ExtendedQueryHandler for NucleusHandler {
             if matches!(result, ExecResult::CopyOutStream { .. }) {
                 result = result.materialize().await.map_err(exec_error_to_pgwire)?;
             }
-            // Respect max_rows from the Execute message. When max_rows > 0,
-            // the client only wants that many rows. (Full cursor/PortalSuspended
-            // support would require pgwire to expose that response variant.)
-            if max_rows > 0
-                && let ExecResult::Select { ref mut rows, .. } = result
-            {
-                rows.truncate(max_rows);
-            }
+            // `max_rows` from the Execute message is deliberately NOT applied
+            // here.
+            //
+            // It used to truncate the row vector, and the comment claimed
+            // pgwire did not expose PortalSuspended. It does: `_on_execute`
+            // calls `send_partial_query_response`, which emits `max_rows` rows,
+            // sends PortalSuspended, and parks the REMAINDER in
+            // `PortalExecutionState::Suspended`. Truncating first meant the
+            // parked stream was already empty, so the next Execute on that
+            // portal drained nothing and the client got `SELECT 0` — silently
+            // losing every row past the first batch.
+            //
+            // That is the JDBC `setFetchSize(n)` path with autocommit off, plus
+            // node-postgres `pg-cursor` and Npgsql: the client concludes the
+            // result set has exactly n rows. Handing pgwire the full set lets it
+            // do the suspension it already implements correctly.
+            let _ = max_rows;
             let bytes_est = Self::estimate_result_bytes(&result);
             if bytes_est > 0 {
                 self.executor.metrics().bytes_sent.inc_by(bytes_est);
@@ -2157,7 +2166,15 @@ impl CopyHandler for NucleusHandler {
                 )))
             })?
         } else {
-            parse_copy_rows(&state.data, state.delimiter, state.is_csv, state.has_header)
+            parse_copy_rows(&state.data, state.delimiter, state.is_csv, state.has_header).map_err(
+                |msg| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22021".to_owned(), // character_not_in_repertoire
+                        msg,
+                    )))
+                },
+            )?
         };
         let row_count = rows.len();
 
@@ -4239,6 +4256,15 @@ fn parse_copy_binary_rows(
         }
         let nfields = i16::from_be_bytes(data[pos..pos + 2].try_into().unwrap());
         pos += 2;
+        // Only -1 is the trailer. Any other negative count sign-extended to a
+        // near-usize::MAX capacity request below and aborted the connection
+        // task with "capacity overflow" — the one malformed-stream case here
+        // that panicked instead of failing with 22P04.
+        if nfields < -1 {
+            return Err(format!(
+                "invalid field count in binary COPY tuple ({nfields})"
+            ));
+        }
         if nfields == -1 {
             break; // trailer
         }
@@ -4310,24 +4336,67 @@ fn parse_copy_rows(
     delimiter: u8,
     is_csv: bool,
     has_header: bool,
-) -> Vec<Vec<Option<String>>> {
+) -> Result<Vec<Vec<Option<String>>>, String> {
     let text = match std::str::from_utf8(data) {
         Ok(s) => s,
-        Err(_) => return vec![],
+        // Returning no rows here made `on_copy_done` skip the INSERT and report
+        // `COPY 0` — a clean success for a payload that was never stored, and
+        // valid rows later in the same stream vanished with it. PostgreSQL
+        // fails with 22021; the caller now surfaces an error too.
+        Err(e) => return Err(format!("invalid byte sequence for encoding \"UTF8\": {e}")),
     };
-    let mut rows = Vec::new();
-    let mut lines = text.lines().peekable();
-    if has_header {
-        lines.next();
+
+    // Split into RECORDS, not physical lines. A CSV field may legally contain a
+    // newline inside quotes — PostgreSQL round-trips those, and Nucleus's own
+    // `csv_quote` deliberately quotes any field containing \n or \r on COPY TO,
+    // so splitting on lines first meant `COPY TO` then `COPY FROM` corrupted
+    // data: one row became two and the newline was destroyed.
+    let mut records: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if is_csv && c == '"' {
+            // A doubled quote inside a quoted field is an escaped quote, not a
+            // terminator; consume both so the state stays correct.
+            if in_quotes && chars.peek() == Some(&'"') {
+                cur.push(c);
+                cur.push(chars.next().unwrap());
+                continue;
+            }
+            in_quotes = !in_quotes;
+            cur.push(c);
+            continue;
+        }
+        if c == '\n' && !in_quotes {
+            records.push(std::mem::take(&mut cur));
+            continue;
+        }
+        cur.push(c);
     }
-    for line in lines {
-        let trimmed = line.trim_end_matches('\r');
+    if !cur.is_empty() {
+        records.push(cur);
+    }
+
+    let mut rows = Vec::new();
+    let mut iter = records.into_iter();
+    if has_header {
+        iter.next();
+    }
+    for record in iter {
+        let trimmed = record.trim_end_matches('\r');
+        // `\.` terminates the data in text format. It was previously parsed as
+        // an ordinary line and stored as a row, so anything streaming raw
+        // pg_dump COPY blocks got one garbage row per block.
+        if !is_csv && trimmed == "\\." {
+            break;
+        }
         if trimmed.is_empty() {
             continue;
         }
         rows.push(split_copy_line(trimmed, delimiter, is_csv));
     }
-    rows
+    Ok(rows)
 }
 
 /// Split one data line into fields, respecting the chosen format.
@@ -5395,7 +5464,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_tab_delimited() {
         let data = b"1\thello\t3.14\n2\tworld\t2.71\n";
-        let rows = parse_copy_rows(data, b'\t', false, false);
+        let rows = parse_copy_rows(data, b'\t', false, false).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].as_deref(), Some("1"));
         assert_eq!(rows[0][1].as_deref(), Some("hello"));
@@ -5405,7 +5474,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_tab_null_value() {
         let data = b"1\t\\N\t3.14\n";
-        let rows = parse_copy_rows(data, b'\t', false, false);
+        let rows = parse_copy_rows(data, b'\t', false, false).unwrap();
         assert_eq!(rows[0][1], None);
         assert_eq!(rows[0][0].as_deref(), Some("1"));
     }
@@ -5413,7 +5482,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_csv() {
         let data = b"1,hello,3.14\n2,world,2.71\n";
-        let rows = parse_copy_rows(data, b',', true, false);
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].as_deref(), Some("1"));
         assert_eq!(rows[0][1].as_deref(), Some("hello"));
@@ -5422,7 +5491,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_csv_with_header() {
         let data = b"id,name,val\n1,alice,10\n2,bob,20\n";
-        let rows = parse_copy_rows(data, b',', true, true);
+        let rows = parse_copy_rows(data, b',', true, true).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1].as_deref(), Some("alice"));
     }
@@ -5430,8 +5499,71 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_csv_quoted() {
         let data = b"1,\"hello, world\",3.14\n";
-        let rows = parse_copy_rows(data, b',', true, false);
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
         assert_eq!(rows[0][1].as_deref(), Some("hello, world"));
+    }
+
+    /// A CSV field may contain a newline inside quotes. Splitting on physical
+    /// lines first tore one row into two and destroyed the newline — which also
+    /// broke Nucleus's own round trip, since `csv_quote` quotes any field
+    /// containing \n on COPY TO.
+    #[test]
+    fn parse_copy_rows_csv_field_may_contain_a_newline() {
+        let data = b"\"line1\nline2\"\n\"ok\"\n";
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
+        assert_eq!(rows.len(), 2, "quoted newline split the record");
+        assert_eq!(rows[0][0].as_deref(), Some("line1\nline2"));
+        assert_eq!(rows[1][0].as_deref(), Some("ok"));
+    }
+
+    /// A doubled quote inside a quoted field is an escaped quote, not a
+    /// terminator; getting that wrong flips the in-quotes state and the next
+    /// newline splits mid-record.
+    #[test]
+    fn parse_copy_rows_csv_escaped_quote_keeps_record_intact() {
+        let data = b"\"say \"\"hi\"\"\nthere\"\n";
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some("say \"hi\"\nthere"));
+    }
+
+    /// `\.` ends the data in text format. It used to be stored as a row, so
+    /// anything streaming raw pg_dump COPY blocks got a garbage row per block.
+    #[test]
+    fn parse_copy_rows_text_stops_at_end_of_data_marker() {
+        let data = b"a\nb\n\\.\n";
+        let rows = parse_copy_rows(data, b'\t', false, false).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some("a"));
+        assert_eq!(rows[1][0].as_deref(), Some("b"));
+    }
+
+    /// Non-UTF-8 input reported `COPY 0` — a clean success for a payload that
+    /// was never stored, taking the valid rows around it with it.
+    #[test]
+    fn parse_copy_rows_rejects_non_utf8_instead_of_reporting_success() {
+        let data = b"1\tcaf\xe9\n2\tok\n";
+        let err = parse_copy_rows(data, b'\t', false, false).unwrap_err();
+        assert!(
+            err.contains("UTF8"),
+            "expected an encoding error, got: {err}"
+        );
+    }
+
+    /// Only -1 is the trailer; any other negative count sign-extended into a
+    /// near-usize::MAX capacity request and aborted the connection task.
+    #[test]
+    fn parse_copy_binary_rows_rejects_negative_field_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PGCOPY\n\xff\r\n\0"); // 11-byte signature
+        data.extend_from_slice(&0i32.to_be_bytes()); // flags
+        data.extend_from_slice(&0i32.to_be_bytes()); // header extension length
+        data.extend_from_slice(&(-2i16).to_be_bytes()); // invalid field count
+        let err = parse_copy_binary_rows(&data, &[crate::types::DataType::Int32]).unwrap_err();
+        assert!(
+            err.contains("field count"),
+            "expected a clean field-count error, got: {err}"
+        );
     }
 
     #[test]
