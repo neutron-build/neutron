@@ -1810,6 +1810,19 @@ impl Executor {
                         security.rls.rename_table(&table_name, &new);
                         security.masking.rename_table(&table_name, &new);
                     }
+                    // GRANTs are keyed by table name too, and used to be left
+                    // behind here — the policies followed the table and the
+                    // privileges did not, so every grantee silently lost access
+                    // to the renamed table. It was invisible for as long as
+                    // privileges were not consulted on reads.
+                    {
+                        let mut roles = self.roles.write().await;
+                        for role in roles.values_mut() {
+                            if let Some(privs) = role.privileges.remove(&table_name) {
+                                role.privileges.insert(new.clone(), privs);
+                            }
+                        }
+                    }
                     self.bump_policy_gen();
                 }
                 ast::AlterTableOperation::AddColumn {
@@ -1850,6 +1863,11 @@ impl Executor {
                         data_type: dtype,
                         nullable,
                         default_expr: default_expr.clone(),
+                        // A fresh id, never a dropped column's. Reusing one
+                        // would let a stored reference to the dropped column
+                        // silently resolve to this new one — which is the
+                        // rename-then-re-add attack with extra steps.
+                        id: table_def.next_column_id(),
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col);
@@ -1910,8 +1928,50 @@ impl Executor {
                 ast::AlterTableOperation::DropColumn {
                     column_names,
                     if_exists,
+                    drop_behavior,
                     ..
                 } => {
+                    // A policy reading a column that is about to disappear must
+                    // not be left dangling. PostgreSQL raises a dependency error
+                    // and drops the dependent objects only under CASCADE; do the
+                    // same, because the alternative — silently keeping a policy
+                    // whose column is gone — is how a guard stops guarding
+                    // without anyone being told.
+                    let cascade = matches!(drop_behavior, Some(ast::DropBehavior::Cascade));
+                    for col_name in column_names {
+                        let col_str = col_name.to_string();
+                        let column_id = table_def.column_id(&col_str).unwrap_or(0);
+                        let dependents = {
+                            let security = self.security.read();
+                            security.rls.policies_depending_on_column(
+                                &table_name,
+                                column_id,
+                                &col_str,
+                            )
+                        };
+                        if dependents.is_empty() {
+                            continue;
+                        }
+                        if !cascade {
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "cannot drop column \"{col_str}\" because policy \"{}\" depends on it{}; \
+                                 use DROP COLUMN ... CASCADE to drop the {} as well",
+                                dependents[0],
+                                if dependents.len() > 1 {
+                                    format!(" (and {} more)", dependents.len() - 1)
+                                } else {
+                                    String::new()
+                                },
+                                if dependents.len() > 1 { "policies" } else { "policy" }
+                            )));
+                        }
+                        {
+                            let mut security = self.security.write();
+                            security.rls.drop_policies_named(&table_name, &dependents);
+                        }
+                        self.bump_policy_gen();
+                    }
+
                     let mut updated = (*table_def).clone();
                     let mut drop_indices = Vec::new();
                     for col_name in column_names {
@@ -2138,6 +2198,33 @@ impl Executor {
                     }
                     self.btree_indexes
                         .remove(&(table_name.clone(), old_column_name.value.clone()));
+
+                    // Refresh every policy predicate that names this column,
+                    // matched by the column's STABLE ID rather than by its old
+                    // name. The id did not change, so this is an exact rewrite
+                    // of a cached name — not a guess about which references
+                    // meant this column.
+                    //
+                    // Nothing did this before, so a rename left policies naming
+                    // a column that no longer existed. That failed closed on its
+                    // own (the predicate's name is absent from the row map, so
+                    // the row is denied), but `ADD COLUMN` could then recreate
+                    // the old name and the policy would silently start guarding
+                    // the new, attacker-chosen column instead.
+                    if let Some(column_id) = table_def.column_id(&old_column_name.value) {
+                        let mut security = self.security.write();
+                        let renamed = security.rls.rename_column(
+                            &table_name,
+                            column_id,
+                            &new_column_name.value,
+                        );
+                        drop(security);
+                        if renamed {
+                            // Cached plans and result caches keyed on the policy
+                            // generation must not serve pre-rename results.
+                            self.bump_policy_gen();
+                        }
+                    }
                 }
                 ast::AlterTableOperation::AlterColumn { column_name, op } => {
                     let mut updated = (*table_def).clone();

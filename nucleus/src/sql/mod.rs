@@ -327,7 +327,8 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
 pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, ParseError> {
     columns
         .iter()
-        .map(|col| {
+        .enumerate()
+        .map(|(idx, col)| {
             let data_type = convert_data_type(&col.data_type)?;
             let nullable = !col.options.iter().any(|opt| {
                 matches!(
@@ -344,6 +345,9 @@ pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, Par
                 data_type,
                 nullable,
                 default_expr,
+                // 1-based so `0` stays available as "no id recorded" for
+                // columns read from a pre-id snapshot.
+                id: idx as u32 + 1,
             })
         })
         .collect()

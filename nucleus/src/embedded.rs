@@ -176,6 +176,7 @@ impl DatabaseBuilder {
                     data_type: dt,
                     nullable: true,
                     default_expr: None,
+                    id: 0,
                 })
                 .collect();
             let epoch = recovered_epochs.get(&name).copied().unwrap_or(0);

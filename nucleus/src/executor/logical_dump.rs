@@ -361,11 +361,11 @@ fn render_grants(role: &RoleDef) -> Vec<String> {
 /// accepts, so a dumped policy recompiles to the identical predicate.
 fn render_rls_predicate(p: &RlsPredicate) -> String {
     match p {
-        RlsPredicate::ColumnEqStr { column, value } => format!("{column} = {}", quote_str(value)),
-        RlsPredicate::ColumnEqTenant { column } => {
+        RlsPredicate::ColumnEqStr { column, value, .. } => format!("{column} = {}", quote_str(value)),
+        RlsPredicate::ColumnEqTenant { column, .. } => {
             format!("{column} = current_setting('nucleus.tenant_id')")
         }
-        RlsPredicate::ColumnEqUser { column } => format!("{column} = CURRENT_USER"),
+        RlsPredicate::ColumnEqUser { column, .. } => format!("{column} = CURRENT_USER"),
         RlsPredicate::HasRole { role } => format!("has_role({})", quote_str(role)),
         RlsPredicate::And(a, b) => format!(
             "({} AND {})",
