@@ -44,6 +44,18 @@ function setupTestRoutes() {
     path.join(TEST_ROUTES_DIR, "sitemap[.]xml.ts"),
     "export async function loader() { return new Response(''); }"
   );
+  // A param as a mid-path DIRECTORY, not just a leaf filename.
+  fs.mkdirSync(path.join(TEST_ROUTES_DIR, "api", "runs", "[id]"), {
+    recursive: true,
+  });
+  fs.writeFileSync(
+    path.join(TEST_ROUTES_DIR, "api", "runs", "[id]", "decide.tsx"),
+    "export default function Decide() {}"
+  );
+  fs.writeFileSync(
+    path.join(TEST_ROUTES_DIR, "api", "runs", "[id]", "index.tsx"),
+    "export default function Run() {}"
+  );
   fs.mkdirSync(path.join(TEST_ROUTES_DIR, "docs"), { recursive: true });
   fs.writeFileSync(
     path.join(TEST_ROUTES_DIR, "docs", "[...slug].tsx"),
@@ -56,7 +68,18 @@ function setupTestRoutes() {
   );
 }
 
+const SCRATCH_ROUTES_DIR = path.join(__dirname, "__scratch_routes__");
+
+/** A throwaway routes dir, for tables that are meant to be rejected. */
+function makeScratchRoutes(name: string): string {
+  const dir = path.join(SCRATCH_ROUTES_DIR, name);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function cleanupTestRoutes() {
+  fs.rmSync(SCRATCH_ROUTES_DIR, { recursive: true, force: true });
   if (fs.existsSync(TEST_ROUTES_DIR)) {
     fs.rmSync(TEST_ROUTES_DIR, { recursive: true, force: true });
   }
@@ -113,6 +136,84 @@ describe("manifest", () => {
 
     expect(mdRoute).toBeDefined();
     expect(mdRoute?.params).toContain("slug");
+  });
+
+  it("treats a [param] directory as dynamic, not as a literal segment", () => {
+    const routes = discoverRoutes({ routesDir: TEST_ROUTES_DIR });
+    const paths = routes.map((r) => r.path);
+
+    expect(paths).toContain("/api/runs/:id/decide");
+    expect(paths).toContain("/api/runs/:id");
+    expect(paths).not.toContain("/api/runs/[id]/decide");
+  });
+
+  it("extracts params from a mid-path [param] directory", () => {
+    const routes = discoverRoutes({ routesDir: TEST_ROUTES_DIR });
+    const decide = routes.find((r) => r.path === "/api/runs/:id/decide");
+
+    expect(decide?.params).toEqual(["id"]);
+    expect(decide?.pattern.test("/api/runs/run_123/decide")).toBe(true);
+    expect(decide?.pattern.test("/api/runs/[id]/decide")).toBe(true);
+    expect(decide?.pattern.test("/api/runs/run_123/other")).toBe(false);
+  });
+
+  it("rejects a malformed dynamic segment instead of emitting it literally", () => {
+    const dir = makeScratchRoutes("malformed");
+    fs.mkdirSync(path.join(dir, "[id"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "[id", "show.tsx"),
+      "export default function Show() {}"
+    );
+
+    expect(() => discoverRoutes({ routesDir: dir })).toThrow(
+      /malformed dynamic segment/
+    );
+  });
+
+  it("rejects a catch-all directory, which nothing below it could ever match", () => {
+    const dir = makeScratchRoutes("catchall-dir");
+    fs.mkdirSync(path.join(dir, "docs", "[...slug]"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "docs", "[...slug]", "raw.tsx"),
+      "export default function Raw() {}"
+    );
+
+    expect(() => discoverRoutes({ routesDir: dir })).toThrow(
+      /catch-all segment .* is not last/
+    );
+  });
+
+  it("rejects two files that resolve to the same URL shape", () => {
+    const dir = makeScratchRoutes("collision");
+    fs.mkdirSync(path.join(dir, "users", "[id]"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "users", "[id]", "index.tsx"),
+      "export default function ById() {}"
+    );
+    fs.writeFileSync(
+      path.join(dir, "users", "[name].tsx"),
+      "export default function ByName() {}"
+    );
+
+    expect(() => discoverRoutes({ routesDir: dir })).toThrow(
+      /same URL shape/
+    );
+  });
+
+  it("does not mistake a literal suffix for a duplicate route", () => {
+    const dir = makeScratchRoutes("suffix");
+    fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "docs", "[...slug].tsx"),
+      "export default function Page() {}"
+    );
+    fs.writeFileSync(
+      path.join(dir, "docs", "[...slug][.]md.ts"),
+      "export async function loader() { return new Response(''); }"
+    );
+
+    const paths = discoverRoutes({ routesDir: dir }).map((r) => r.path).sort();
+    expect(paths).toEqual(["/docs/*slug", "/docs/*slug.md"]);
   });
 
   it("extracts route params", () => {
