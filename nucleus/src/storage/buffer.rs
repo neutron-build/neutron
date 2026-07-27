@@ -5,9 +5,10 @@
 
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::disk::DiskManager;
 use super::page::{self, INVALID_PAGE_ID, PAGE_SIZE, PageBuf};
@@ -95,7 +96,67 @@ pub struct FrameDescriptor {
     pub pin_count: AtomicU32,
     /// Dirty flag.
     pub is_dirty: AtomicBool,
-    /// Read-write latch protecting the page content.
+    /// Read-write latch protecting the page CONTENT — the 16 KB of bytes in the
+    /// frame, as opposed to `pin_count`, which protects the frame's *identity*
+    /// (which page lives here, and whether it may be evicted). A pin alone does
+    /// not make a page's bytes yours: two sessions inserting into the same page
+    /// both pin it, and without this latch both run `page::insert_tuple` over
+    /// the same slot array and free-space pointer, each overwriting the other's
+    /// bookkeeping. That is a byte-level data race, and it reproduces as
+    /// duplicate primary keys, lost rows, and out-of-bounds slot offsets read
+    /// back later as panics.
+    ///
+    /// # THE LOCK ORDER
+    ///
+    /// Every lock in the paged storage stack (`buffer.rs`, `disk_engine.rs`,
+    /// `btree.rs`) is assigned a level. A thread acquires locks in strictly
+    /// increasing level order, and never the reverse. Deadlock freedom follows
+    /// from the levels being a total order plus rule (B) below.
+    ///
+    /// ```text
+    ///   L0  DiskEngine::dir_save_lock
+    ///   L1  DiskEngine::tables
+    ///   L2  DiskEngine::txn_state
+    ///   L3  DiskEngine::indexes        (covers ALL B-tree page mutation)
+    ///   L4  DiskEngine::free_list_head, then free_page_count
+    ///   L5  BufferPool admission: eviction_lock, free_list, page_table
+    ///       partitions, replacer shards  -- i.e. everything fetch_page /
+    ///       new_page / unpin touch
+    ///   L6  FrameDescriptor::latch      <-- THIS LOCK
+    ///   L7  BufferPool bookkeeping: dirty_set, wal_pending
+    ///   L8  WalBackend / DiskManager internals
+    /// ```
+    ///
+    /// `tables` sits above `txn_state` because `alloc_data_page` links a new
+    /// page into the chain under `tables` and calls `record_dirty_page`
+    /// (`txn_state`) inside that section. The reverse never happens: both
+    /// `abort_txn` and `rollback_open_txn_in_memory` `take()` the txn state and
+    /// drop its guard before restoring `tables`.
+    ///
+    /// Two rules make L6 safe to retrofit onto code that never had it:
+    ///
+    /// **(A) A frame latch is acquired after every engine-level lock and before
+    /// nothing except pool bookkeeping and I/O.** In particular a thread
+    /// holding a latch must NOT call `fetch_page`, `new_page`, or `unpin` (L5),
+    /// and must not reach for `tables`, `indexes`, or the free list (L2-L4).
+    /// The concrete shape this forbids is the tempting one: latch a data page,
+    /// then do index maintenance, then allocate an overflow page. Sites that
+    /// want that sequence release the latch first and re-take it after, which
+    /// is why `DiskEngine::delete_at` / `update_at` collect their index work
+    /// into a list and drain it outside the latched region.
+    ///
+    /// **(B) At most ONE frame latch is held at a time.** No site anywhere
+    /// holds two. Splitting a B-tree node reads the source page into a local
+    /// `Vec`, drops the latch, and then writes the destination pages one latch
+    /// at a time. Because no thread ever waits for a latch while holding a
+    /// latch, latches cannot form a cycle among themselves regardless of the
+    /// order pages are visited in, so no page-ordering discipline is needed.
+    ///
+    /// Holding L6 across an `.await` would be both a correctness and a
+    /// liveness hazard. `parking_lot`'s guards are `!Send`, and every storage
+    /// future in this crate must be `Send`, so the compiler rejects it — which
+    /// is why [`PageReadGuard`] / [`PageWriteGuard`] deliberately wrap a
+    /// `parking_lot` guard instead of an owning handle.
     pub latch: RwLock<()>,
 }
 
@@ -107,6 +168,93 @@ impl FrameDescriptor {
             is_dirty: AtomicBool::new(false),
             latch: RwLock::new(()),
         }
+    }
+}
+
+// ============================================================================
+// Page guards
+// ============================================================================
+
+/// A pinned, read-latched page. Derefs to the page bytes.
+///
+/// Releasing the guard drops the latch and then the pin, in that order — the
+/// frame cannot be evicted out from under a latch holder.
+///
+/// See [`FrameDescriptor::latch`] for the lock order this participates in.
+/// The short version: hold at most one of these, and acquire no other lock
+/// while you do.
+pub struct PageReadGuard<'a> {
+    pool: &'a BufferPool,
+    frame_id: u32,
+    latch: Option<RwLockReadGuard<'a, ()>>,
+}
+
+impl PageReadGuard<'_> {
+    /// The frame this page is resident in.
+    pub fn frame_id(&self) -> u32 {
+        self.frame_id
+    }
+}
+
+impl Deref for PageReadGuard<'_> {
+    type Target = PageBuf;
+    fn deref(&self) -> &PageBuf {
+        self.pool.frame_data(self.frame_id)
+    }
+}
+
+impl Drop for PageReadGuard<'_> {
+    fn drop(&mut self) {
+        self.latch = None;
+        self.pool.unpin(self.frame_id);
+    }
+}
+
+/// A pinned, write-latched page. Derefs mutably to the page bytes.
+///
+/// Call [`PageWriteGuard::set_dirty`] after modifying the page; the buffer
+/// pool is told at release, after the latch is dropped but before the pin is,
+/// so a flusher can never observe a half-written page and can never miss the
+/// dirty mark.
+pub struct PageWriteGuard<'a> {
+    pool: &'a BufferPool,
+    frame_id: u32,
+    latch: Option<RwLockWriteGuard<'a, ()>>,
+    dirty: bool,
+}
+
+impl PageWriteGuard<'_> {
+    /// The frame this page is resident in.
+    pub fn frame_id(&self) -> u32 {
+        self.frame_id
+    }
+
+    /// Record that the page was modified. Marked dirty when the guard drops.
+    pub fn set_dirty(&mut self) {
+        self.dirty = true;
+    }
+}
+
+impl Deref for PageWriteGuard<'_> {
+    type Target = PageBuf;
+    fn deref(&self) -> &PageBuf {
+        self.pool.frame_data(self.frame_id)
+    }
+}
+
+impl DerefMut for PageWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut PageBuf {
+        self.pool.frame_data_mut(self.frame_id)
+    }
+}
+
+impl Drop for PageWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.latch = None;
+        if self.dirty {
+            self.pool.mark_dirty(self.frame_id);
+        }
+        self.pool.unpin(self.frame_id);
     }
 }
 
@@ -439,17 +587,23 @@ impl BufferPool {
                 return Ok(existing_frame);
             }
 
-            // Read from disk
-            self.disk
-                .read_page(page_id, self.frame_data_mut(frame_id))?;
-
-            // Verify checksum (skip for freshly allocated pages with all zeros)
-            let page_data = self.frame_data(frame_id);
-            if (page::get_page_type(page_data) != page::PAGE_TYPE_FREE
-                || page::read_u32(page_data, page::HEADER_CHECKSUM) != 0)
-                && !page::verify_checksum(page_data)
+            // Read from disk. The frame is exclusively ours — it is not in the
+            // page table and not in the replacer, so nobody can pin it — but a
+            // frame-index scan (`flush_all`, `flush_dirty_batch`) walks frames
+            // without consulting the page table, so hold the write latch while
+            // the bytes are in flux.
             {
-                return Err(BufferError::ChecksumMismatch(page_id));
+                let _latch = self.frame_latch(frame_id).write();
+                let buf = self.frame_data_mut(frame_id);
+                self.disk.read_page(page_id, buf)?;
+
+                // Verify checksum (skip for freshly allocated pages with all zeros)
+                if (page::get_page_type(buf) != page::PAGE_TYPE_FREE
+                    || page::read_u32(buf, page::HEADER_CHECKSUM) != 0)
+                    && !page::verify_checksum(buf)
+                {
+                    return Err(BufferError::ChecksumMismatch(page_id));
+                }
             }
 
             // Second race check: the earlier double-check only guarded the gap
@@ -556,9 +710,12 @@ impl BufferPool {
 
         let frame_id = self.get_free_frame()?;
 
-        // Initialize blank page
-        let data = self.frame_data_mut(frame_id);
-        data.fill(0);
+        // Initialize blank page. Latched for the same reason as the disk read
+        // in `fetch_page`: frame-index scans do not consult the page table.
+        {
+            let _latch = self.frame_latch(frame_id).write();
+            self.frame_data_mut(frame_id).fill(0);
+        }
 
         let desc = &self.descriptors[frame_id as usize];
         desc.page_id.store(page_id, Ordering::Release);
@@ -577,6 +734,11 @@ impl BufferPool {
     }
 
     /// Get a read reference to the page data in a frame.
+    ///
+    /// SAFETY CONTRACT: the caller must hold the frame's read or write latch.
+    /// Prefer [`BufferPool::read_guard`], which pins and latches together; this
+    /// raw accessor exists for the guards themselves, for the pool's own
+    /// internals, and for tests.
     pub fn frame_data(&self, frame_id: u32) -> &PageBuf {
         // SAFETY: Read access is safe because callers coordinate via pin_count
         // and frame latches (RwLock). The UnsafeCell provides interior mutability;
@@ -585,7 +747,11 @@ impl BufferPool {
     }
 
     /// Get a mutable reference to the page data in a frame.
-    /// SAFETY: Caller must hold appropriate latch or be the sole pinner.
+    ///
+    /// SAFETY CONTRACT: the caller must hold the frame's WRITE latch. Being
+    /// the sole pinner is not sufficient and never was — the flusher and the
+    /// evictor read frames they have not pinned. Prefer
+    /// [`BufferPool::write_guard`].
     #[allow(clippy::mut_from_ref)]
     pub fn frame_data_mut(&self, frame_id: u32) -> &mut PageBuf {
         // SAFETY: Mutable access is safe because callers coordinate via pin_count
@@ -598,6 +764,63 @@ impl BufferPool {
     /// Get the read-write latch for a frame.
     pub fn frame_latch(&self, frame_id: u32) -> &RwLock<()> {
         &self.descriptors[frame_id as usize].latch
+    }
+
+    /// Pin `page_id` and take its read latch. The page bytes cannot change
+    /// while the returned guard lives.
+    ///
+    /// Read [`FrameDescriptor::latch`] before adding a call site: no other
+    /// lock may be acquired, and no other page fetched, while the guard is
+    /// alive.
+    pub fn read_guard(&self, page_id: u32) -> Result<PageReadGuard<'_>, BufferError> {
+        let frame_id = self.fetch_page(page_id)?;
+        Ok(self.read_guard_for_frame(frame_id))
+    }
+
+    /// Pin `page_id` and take its write latch. Exclusive against every other
+    /// reader and writer of these bytes, including the flusher and the evictor.
+    pub fn write_guard(&self, page_id: u32) -> Result<PageWriteGuard<'_>, BufferError> {
+        let frame_id = self.fetch_page(page_id)?;
+        Ok(self.write_guard_for_frame(frame_id))
+    }
+
+    /// Take the read latch on a frame the caller has ALREADY pinned. The guard
+    /// takes over that pin and releases it on drop.
+    pub fn read_guard_for_frame(&self, frame_id: u32) -> PageReadGuard<'_> {
+        let latch = self.frame_latch(frame_id).read();
+        PageReadGuard {
+            pool: self,
+            frame_id,
+            latch: Some(latch),
+        }
+    }
+
+    /// Take the write latch on a frame the caller has ALREADY pinned. The guard
+    /// takes over that pin and releases it on drop.
+    pub fn write_guard_for_frame(&self, frame_id: u32) -> PageWriteGuard<'_> {
+        let latch = self.frame_latch(frame_id).write();
+        PageWriteGuard {
+            pool: self,
+            frame_id,
+            latch: Some(latch),
+            dirty: false,
+        }
+    }
+
+    /// Allocate a new page and return it write-latched. Already marked dirty
+    /// by `new_page`, so the guard does not need `set_dirty`.
+    pub fn new_page_guard(&self) -> Result<(u32, PageWriteGuard<'_>), BufferError> {
+        let (page_id, frame_id) = self.new_page()?;
+        Ok((page_id, self.write_guard_for_frame(frame_id)))
+    }
+
+    /// Allocate a new page, leaving it unlatched and unpinned. For callers that
+    /// need the page ID now and will write the page later under its own latch
+    /// (so they never hold a latch across an allocation — rule (A)).
+    pub fn new_page_id(&self) -> Result<u32, BufferError> {
+        let (page_id, frame_id) = self.new_page()?;
+        self.unpin(frame_id);
+        Ok(page_id)
     }
 
     /// Mark a frame as dirty (modified).
@@ -661,9 +884,12 @@ impl BufferPool {
             };
             let desc = &self.descriptors[frame_id as usize];
             if desc.is_dirty.load(Ordering::Acquire) {
-                // Read-latch the frame so a concurrent writer can't tear the
-                // image while it streams into the WAL record.
-                let _latch = self.frame_latch(frame_id).read();
+                // Write-latch the frame: this both stops a concurrent writer
+                // tearing the image as it streams into the WAL record AND
+                // covers `set_page_lsn` below, which mutates the page header.
+                // A read latch would have let two forces stamp the LSN
+                // concurrently.
+                let _latch = self.frame_latch(frame_id).write();
                 let data = self.frame_data_mut(frame_id);
                 match wal.log_page_write(0, page_id, data) {
                     Ok(lsn) => {
@@ -717,29 +943,55 @@ impl BufferPool {
     /// on a single fsync. The data page sync is skipped because the WAL already
     /// holds the full page image — crash recovery will replay it if needed.
     pub fn flush_page(&self, page_id: u32) -> Result<(), BufferError> {
-        if let Some(frame_id) = self.page_table.lookup(page_id) {
-            let desc = &self.descriptors[frame_id as usize];
-            if desc.is_dirty.load(Ordering::Acquire) {
-                let data = self.frame_data_mut(frame_id);
-                // WAL protocol: sync WAL before writing data pages
-                if let Some(ref wal) = self.wal {
-                    let lsn = wal
-                        .log_page_write(0, page_id, data)
-                        .map_err(BufferError::Io)?;
-                    page::set_page_lsn(data, lsn);
+        // Pin via the eviction-safe path: a bare page_table lookup can hand
+        // back a frame that is repurposed for a different page before the
+        // bytes are read, which would write one page's contents to another
+        // page's offset.
+        let Some(frame_id) = self.pin_if_present(page_id) else {
+            return Ok(());
+        };
+        let result = self.flush_pinned_frame(frame_id, page_id, true);
+        self.unpin(frame_id);
+        result
+    }
+
+    /// Write one already-pinned frame out, WAL record first. The frame is
+    /// write-latched for the whole sequence — `set_page_lsn` and
+    /// `write_checksum` mutate the page, and the disk write must see the same
+    /// bytes the WAL record captured.
+    fn flush_pinned_frame(
+        &self,
+        frame_id: u32,
+        page_id: u32,
+        group_sync: bool,
+    ) -> Result<(), BufferError> {
+        let desc = &self.descriptors[frame_id as usize];
+        {
+            let _latch = self.frame_latch(frame_id).write();
+            if !desc.is_dirty.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let data = self.frame_data_mut(frame_id);
+            // WAL protocol: sync WAL before writing data pages
+            if let Some(ref wal) = self.wal {
+                let lsn = wal
+                    .log_page_write(0, page_id, data)
+                    .map_err(BufferError::Io)?;
+                page::set_page_lsn(data, lsn);
+                if group_sync {
                     wal.group_sync();
                 }
-                // Checksum must be computed AFTER LSN is set so on-disk page is valid
-                page::write_checksum(data);
-                self.disk.write_page(page_id, data)?;
-                // Data page sync skipped — WAL guarantees durability.
-                // The background flusher's flush_dirty_batch() will do a
-                // coalesced disk.sync() covering this and other written pages.
-                desc.is_dirty.store(false, Ordering::Release);
-                self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
-                self.dirty_set.lock().remove(&{ frame_id });
             }
+            // Checksum must be computed AFTER LSN is set so on-disk page is valid
+            page::write_checksum(data);
+            self.disk.write_page(page_id, data)?;
+            // Data page sync skipped — WAL guarantees durability.
+            // The background flusher's flush_dirty_batch() will do a
+            // coalesced disk.sync() covering this and other written pages.
+            desc.is_dirty.store(false, Ordering::Release);
+            self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
         }
+        self.dirty_set.lock().remove(&frame_id);
         Ok(())
     }
 
@@ -753,6 +1005,15 @@ impl BufferPool {
             let desc = &self.descriptors[i];
             let page_id = desc.page_id.load(Ordering::Acquire);
             if page_id != INVALID_PAGE_ID && desc.is_dirty.load(Ordering::Acquire) {
+                // Write-latched: the page is mutated (LSN, checksum) and its
+                // bytes must not shift under the disk write. Re-checked inside
+                // the latch because a concurrent flusher may have won the race.
+                let _latch = self.frame_latch(i as u32).write();
+                if desc.page_id.load(Ordering::Acquire) != page_id
+                    || !desc.is_dirty.load(Ordering::Acquire)
+                {
+                    continue;
+                }
                 let data = self.frame_data_mut(i as u32);
                 if let Some(ref wal) = self.wal {
                     let lsn = wal
@@ -769,6 +1030,16 @@ impl BufferPool {
         }
         // Clear the dirty set — all pages have been flushed
         self.dirty_set.lock().clear();
+        // Write-ahead: the loop above MINTED a record per page and stamped its
+        // LSN onto the page, so the pre-loop sync did not cover them. Without
+        // this, `disk.sync()` below makes pages durable at LSNs whose records
+        // are still in a process-local BufWriter, and a crash there leaves the
+        // data file ahead of the WAL. Recovery then reissues those LSNs (it
+        // takes its floor from the WAL) and the NEXT recovery discards the new
+        // records as stale — silently losing acknowledged commits.
+        if let Some(ref wal) = self.wal {
+            wal.sync().map_err(BufferError::Io)?;
+        }
         self.disk.sync()?;
         Ok(())
     }
@@ -797,6 +1068,15 @@ impl BufferPool {
             let desc = &self.descriptors[idx];
             let page_id = desc.page_id.load(Ordering::Acquire);
             if page_id != INVALID_PAGE_ID && desc.is_dirty.load(Ordering::Acquire) {
+                // Write-latched: stamps the LSN and checksum, then copies the
+                // image out. Without the latch the copy tears against a
+                // concurrent writer and a torn page reaches the data file.
+                let _latch = self.frame_latch(frame_id).write();
+                if desc.page_id.load(Ordering::Acquire) != page_id
+                    || !desc.is_dirty.load(Ordering::Acquire)
+                {
+                    continue;
+                }
                 let data = self.frame_data_mut(frame_id);
                 if let Some(ref wal) = self.wal {
                     let lsn = wal
@@ -809,6 +1089,15 @@ impl BufferPool {
                 desc.is_dirty.store(false, Ordering::Release);
                 self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
             }
+        }
+        // Write-ahead: the loop minted a record per collected page. The caller
+        // writes these bytes and fsyncs the data file, so the records must be
+        // durable before we hand them over. See `flush_all` for what a crash in
+        // that window costs.
+        if !dirty.is_empty()
+            && let Some(ref wal) = self.wal
+        {
+            wal.sync().map_err(BufferError::Io)?;
         }
         Ok(dirty)
     }
@@ -860,19 +1149,35 @@ impl BufferPool {
             let desc = &self.descriptors[idx];
             let page_id = desc.page_id.load(Ordering::Acquire);
             if page_id != INVALID_PAGE_ID && desc.is_dirty.load(Ordering::Acquire) {
-                let data = self.frame_data_mut(*frame_id);
-                if let Some(ref wal) = self.wal
-                    && let Ok(lsn) = wal.log_page_write(0, page_id, data)
+                // Write-latched — see `flush_all` for why.
+                let _latch = self.frame_latch(*frame_id).write();
+                if desc.page_id.load(Ordering::Acquire) == page_id
+                    && desc.is_dirty.load(Ordering::Acquire)
                 {
-                    page::set_page_lsn(data, lsn);
-                }
-                page::write_checksum(data);
-                if self.disk.write_page(page_id, data).is_ok() {
-                    desc.is_dirty.store(false, Ordering::Release);
-                    self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
+                    let data = self.frame_data_mut(*frame_id);
+                    if let Some(ref wal) = self.wal
+                        && let Ok(lsn) = wal.log_page_write(0, page_id, data)
+                    {
+                        page::set_page_lsn(data, lsn);
+                    }
+                    page::write_checksum(data);
+                    if self.disk.write_page(page_id, data).is_ok() {
+                        desc.is_dirty.store(false, Ordering::Release);
+                        self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
             }
             flushed += 1;
+        }
+
+        // Write-ahead: records minted above must be durable before the pages
+        // stamped with their LSNs are. See `flush_all`.
+        if flushed > 0
+            && let Some(ref wal) = self.wal
+            && let Err(e) = wal.sync()
+        {
+            tracing::error!("WAL sync failed before flushing {flushed} pages: {e}");
+            return 0;
         }
 
         // Sync data pages to stable storage so they survive power failure.
@@ -922,9 +1227,13 @@ impl BufferPool {
                 if !desc.is_dirty.load(Ordering::Acquire) {
                     continue;
                 }
-                // Reload the page from disk, discarding the in-memory dirty state.
-                let data = self.frame_data_mut(frame_id);
-                self.disk.read_page(page_id, data)?;
+                // Reload the page from disk, discarding the in-memory dirty
+                // state. Write-latched: this replaces every byte of the frame.
+                {
+                    let _latch = self.frame_latch(frame_id).write();
+                    let data = self.frame_data_mut(frame_id);
+                    self.disk.read_page(page_id, data)?;
+                }
                 // Clear dirty tracking.
                 let was_dirty = desc.is_dirty.swap(false, Ordering::AcqRel);
                 if was_dirty {
@@ -941,6 +1250,48 @@ impl BufferPool {
         match self.wal.as_ref() {
             Some(wal) => wal.log_checkpoint().map_err(BufferError::Io),
             None => Ok(0),
+        }
+    }
+
+    /// The underlying disk manager (physical backup reads slots through it so
+    /// the copy honors the file's compression/encryption layout).
+    pub fn disk(&self) -> &DiskManager {
+        &self.disk
+    }
+
+    /// The next LSN the WAL will assign (`0` when no WAL is configured).
+    pub fn wal_current_lsn(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.current_lsn())
+    }
+
+    /// Force every WAL record up to and including `lsn` to stable storage.
+    pub fn wal_sync_up_to(&self, lsn: u64) -> Result<(), BufferError> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.sync_up_to(lsn).map_err(BufferError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Seal the active WAL segment so everything logged so far is in an
+    /// inactive, copyable segment.
+    pub fn wal_rotate(&self) -> Result<(), BufferError> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.rotate().map_err(BufferError::Io),
+            None => Ok(()),
+        }
+    }
+
+    /// Hold WAL segments carrying records at or after `lsn` against
+    /// checkpoint truncation (online backup). Returns `false` when the
+    /// backend does not support pinning.
+    pub fn wal_pin_retention(&self, lsn: u64) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.pin_retention(lsn))
+    }
+
+    /// Release a WAL retention pin.
+    pub fn wal_unpin_retention(&self) {
+        if let Some(wal) = self.wal.as_ref() {
+            wal.unpin_retention();
         }
     }
 
@@ -996,21 +1347,26 @@ impl BufferPool {
         let desc = &self.descriptors[frame_id as usize];
         let old_page_id = desc.page_id.load(Ordering::Acquire);
 
-        // Flush if dirty (WAL record first, then checksum — same order as flush_page)
+        // Flush if dirty (WAL record first, then checksum — same order as
+        // flush_page). Write-latched, and the latch is released before
+        // `page_table.remove` below so this never holds L6 while taking L5.
         if desc.is_dirty.load(Ordering::Acquire) {
-            let data = self.frame_data_mut(frame_id);
-            // WAL protocol: log before flush, set LSN first
-            if let Some(ref wal) = self.wal {
-                let lsn = wal
-                    .log_page_write(0, old_page_id, data)
-                    .map_err(BufferError::Io)?;
-                page::set_page_lsn(data, lsn);
+            {
+                let _latch = self.frame_latch(frame_id).write();
+                let data = self.frame_data_mut(frame_id);
+                // WAL protocol: log before flush, set LSN first
+                if let Some(ref wal) = self.wal {
+                    let lsn = wal
+                        .log_page_write(0, old_page_id, data)
+                        .map_err(BufferError::Io)?;
+                    page::set_page_lsn(data, lsn);
+                }
+                // Checksum must be computed AFTER LSN is set so on-disk page is valid
+                page::write_checksum(data);
+                self.disk.write_page(old_page_id, data)?;
+                desc.is_dirty.store(false, Ordering::Release);
+                self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
             }
-            // Checksum must be computed AFTER LSN is set so on-disk page is valid
-            page::write_checksum(data);
-            self.disk.write_page(old_page_id, data)?;
-            desc.is_dirty.store(false, Ordering::Release);
-            self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
             self.dirty_set.lock().remove(&frame_id);
         }
 

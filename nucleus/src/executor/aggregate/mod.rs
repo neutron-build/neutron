@@ -29,12 +29,182 @@ use super::{ExecError, ExecResult, Executor};
 /// `value_type`, but when the aggregate evaluates to NULL (e.g. `MAX` over
 /// an empty input) fall back to static AST inference so we still advertise
 /// the right pgwire OID instead of TEXT.
+/// Reject invalid aggregate/GROUP BY projections the way PostgreSQL does:
+/// (a) a nested aggregate — an aggregate whose argument contains another
+/// aggregate (`MAX(COUNT(*))`); (b) a column reference in the SELECT list that
+/// is neither inside an aggregate nor a GROUP BY key
+/// (`SELECT dept, sal FROM t GROUP BY dept`). Both were silently accepted and
+/// returned wrong/NULL results. Conservative: only bare and compound
+/// identifiers are checked for (b); anything more complex is left permissive
+/// so no currently-valid query regresses.
+/// All positional argument expressions of a window function call, in order —
+/// e.g. lag(v, 2, -1) → [v, 2, -1]. Named args are ignored.
+fn window_arg_exprs(func: &ast::Function) -> Vec<&Expr> {
+    match &func.args {
+        ast::FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub(super) fn validate_grouped_projection(
+    projection: &[SelectItem],
+    group_by: &[Expr],
+) -> Result<(), ExecError> {
+    use super::helpers::contains_aggregate;
+
+    // ROLLUP / CUBE / GROUPING SETS make columns conditionally grouped — the
+    // simple "must be a GROUP BY key" rule doesn't apply. Skip validation
+    // entirely when any such construct is present (permissive).
+    let has_grouping_set = group_by.iter().any(|e| {
+        matches!(
+            e,
+            Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)
+        )
+    });
+    if has_grouping_set {
+        return Ok(());
+    }
+
+    // GROUP BY key spellings, normalized (whitespace-insensitive, lowercased).
+    let norm = |e: &Expr| e.to_string().replace(char::is_whitespace, "").to_lowercase();
+    let keys: HashSet<String> = group_by.iter().map(norm).collect();
+    let has_group = !group_by.is_empty();
+
+    // Recursively check one projection expression.
+    fn check(
+        expr: &Expr,
+        keys: &HashSet<String>,
+        has_group: bool,
+        in_aggregate: bool,
+        norm: &dyn Fn(&Expr) -> String,
+    ) -> Result<(), ExecError> {
+        // A GROUP BY key covers this whole subtree.
+        if has_group && keys.contains(&norm(expr)) {
+            return Ok(());
+        }
+        match expr {
+            Expr::Function(func) if super::helpers::contains_aggregate(expr) && func.over.is_none() => {
+                let name = func.name.to_string().to_uppercase();
+                // Must match `contains_aggregate`'s function list exactly, or a
+                // recognized-elsewhere aggregate (argMax etc.) is treated as a
+                // scalar wrapper and its column args wrongly demand GROUP BY.
+                let is_agg = matches!(
+                    name.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
+                        | "JSON_AGG" | "BOOL_AND" | "BOOL_OR" | "EVERY" | "BIT_AND" | "BIT_OR"
+                        | "ARGMAX" | "ARG_MAX" | "ARGMIN" | "ARG_MIN"
+                        | "MEDIAN" | "QUANTILE" | "PERCENTILE_CONT" | "PERCENTILE_DISC"
+                );
+                if is_agg {
+                    if in_aggregate {
+                        return Err(ExecError::Unsupported(
+                            "aggregate function calls cannot be nested".into(),
+                        ));
+                    }
+                    if let ast::FunctionArguments::List(list) = &func.args {
+                        for a in &list.args {
+                            if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner))
+                            | ast::FunctionArg::Named {
+                                arg: ast::FunctionArgExpr::Expr(inner),
+                                ..
+                            } = a
+                            {
+                                check(inner, keys, has_group, true, norm)?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                // scalar fn wrapping an aggregate: recurse into args
+                if let ast::FunctionArguments::List(list) = &func.args {
+                    for a in &list.args {
+                        if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner))
+                        | ast::FunctionArg::Named {
+                            arg: ast::FunctionArgExpr::Expr(inner),
+                            ..
+                        } = a
+                        {
+                            check(inner, keys, has_group, in_aggregate, norm)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // Bare / qualified column reference not inside an aggregate and not
+            // a GROUP BY key → invalid in a grouped/aggregate query.
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                if has_group && !in_aggregate {
+                    Err(ExecError::Unsupported(format!(
+                        "column \"{expr}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                check(left, keys, has_group, in_aggregate, norm)?;
+                check(right, keys, has_group, in_aggregate, norm)
+            }
+            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+                check(expr, keys, has_group, in_aggregate, norm)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    for item in projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        // A projection with no aggregate and no GROUP BY is not our concern
+        // (that path never reaches execute_aggregate anyway).
+        if !has_group && !contains_aggregate(expr) {
+            continue;
+        }
+        check(expr, &keys, has_group, false, &norm)?;
+    }
+    Ok(())
+}
+
 fn agg_column_type(val: &Value, expr: &Expr, col_meta: &[ColMeta]) -> DataType {
     if matches!(val, Value::Null) {
         infer_expr_type(expr, col_meta)
     } else {
         value_type(val)
     }
+}
+
+/// Column descriptors derived statically from the projection — used when a
+/// GROUP BY produced ZERO groups, where the per-group loop never ran and the
+/// old code emitted an empty column list. A derived table over such a result
+/// then had no columns at all, so outer references like `alias.col` failed
+/// with "column does not exist" (SQLAlchemy's domain-reflection subquery over
+/// the empty pg_constraint hit exactly this).
+fn agg_static_columns(
+    projection: &[SelectItem],
+    col_meta: &[ColMeta],
+) -> Vec<(String, DataType)> {
+    let mut cols = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                cols.push((crate::executor::helpers::default_output_name(expr), infer_expr_type(expr, col_meta)));
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                cols.push((alias.value.clone(), infer_expr_type(expr, col_meta)));
+            }
+            _ => {}
+        }
+    }
+    cols
 }
 
 impl Executor {
@@ -58,6 +228,7 @@ impl Executor {
             ast::GroupByExpr::Expressions(exprs, _) => exprs,
             _ => &[],
         };
+        validate_grouped_projection(&select.projection, group_by_exprs)?;
 
         // Check for GROUPING SETS / CUBE / ROLLUP in GROUP BY expressions
         let grouping_sets = self.extract_grouping_sets(group_by_exprs);
@@ -148,7 +319,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -181,7 +352,8 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: result_rows,
         })
     }
@@ -243,7 +415,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -284,7 +456,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, &null_indices, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -309,7 +481,8 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: result_rows,
         })
     }
@@ -356,7 +529,7 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -388,14 +561,15 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: result_rows,
         })
     }
 
     /// Extract GROUPING SETS / CUBE / ROLLUP from GROUP BY expressions.
     /// Returns None if normal GROUP BY, Some(sets) if grouping sets are found.
-    fn extract_grouping_sets(&self, exprs: &[Expr]) -> Option<Vec<Vec<Expr>>> {
+    pub(super) fn extract_grouping_sets(&self, exprs: &[Expr]) -> Option<Vec<Vec<Expr>>> {
         for expr in exprs {
             match expr {
                 Expr::GroupingSets(sets) => {
@@ -478,7 +652,7 @@ impl Executor {
                         SelectItem::UnnamedExpr(expr) => {
                             let val =
                                 self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                            cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
+                            cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
                             row.push(val);
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
@@ -512,7 +686,8 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: all_result_rows,
         })
     }
@@ -1342,7 +1517,7 @@ impl Executor {
 
         for item in &select.projection {
             let (col_name, expr) = match item {
-                SelectItem::UnnamedExpr(e) => (format!("{e}"), e),
+                SelectItem::UnnamedExpr(e) => (crate::executor::helpers::default_output_name(e), e),
                 SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
                 SelectItem::Wildcard(_) => {
                     // Expand wildcard
@@ -1444,9 +1619,14 @@ impl Executor {
                         let vb = self
                             .eval_row_expr(&ob.expr, b, col_meta)
                             .unwrap_or(Value::Null);
-                        let ord = compare_values(&va, &vb).unwrap_or(std::cmp::Ordering::Equal);
                         let asc = ob.options.asc.unwrap_or(true);
-                        let ord = if asc { ord } else { ord.reverse() };
+                        // PostgreSQL window ORDER BY uses the same NULL default
+                        // as a top-level ORDER BY: NULLS LAST for ASC, NULLS
+                        // FIRST for DESC. The prior plain compare_values sorted
+                        // NULL first for ASC (NULL ranks as smallest), which
+                        // put NULL rows at rank 1.
+                        let nulls_first = ob.options.nulls_first.unwrap_or(!asc);
+                        let ord = super::helpers::cmp_with_nulls(&va, &vb, asc, nulls_first);
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
@@ -1473,8 +1653,12 @@ impl Executor {
             let partition_size = members.len();
             for (rank_in_partition, &(orig_idx, row)) in members.iter().enumerate() {
                 // Compute window frame bounds for aggregate window functions
-                let (frame_start, frame_end) =
-                    compute_window_frame_bounds(window_frame, rank_in_partition, partition_size)?;
+                let (frame_start, frame_end) = compute_window_frame_bounds(
+                    window_frame,
+                    rank_in_partition,
+                    partition_size,
+                    !order_by_exprs.is_empty(),
+                )?;
                 let val = match fname.as_str() {
                     "ROW_NUMBER" => Value::Int64(rank_in_partition as i64 + 1),
                     "RANK" => {
@@ -1556,28 +1740,38 @@ impl Executor {
                         };
                         Value::Int64(bucket)
                     }
-                    "LAG" => {
-                        let offset = 1usize;
-                        if rank_in_partition >= offset {
-                            let prev_row = members[rank_in_partition - offset].1;
-                            arg_expr
-                                .map(|e| self.eval_row_expr(e, prev_row, col_meta))
+                    // lag/lead(value [, offset [, default]]) — the offset and
+                    // default arguments were ignored (always offset 1, NULL
+                    // default). Read all three from the arg list.
+                    "LAG" | "LEAD" => {
+                        let win_args = window_arg_exprs(func);
+                        let offset = match win_args.get(1) {
+                            Some(e) => self.eval_row_expr(e, row, col_meta)?,
+                            None => Value::Int64(1),
+                        };
+                        let offset = match offset {
+                            Value::Int32(n) => n as isize,
+                            Value::Int64(n) => n as isize,
+                            _ => 1,
+                        };
+                        let target = if fname == "LAG" {
+                            rank_in_partition as isize - offset
+                        } else {
+                            rank_in_partition as isize + offset
+                        };
+                        if target >= 0 && (target as usize) < partition_size {
+                            let tgt_row = members[target as usize].1;
+                            win_args
+                                .first()
+                                .map(|e| self.eval_row_expr(e, tgt_row, col_meta))
                                 .transpose()?
                                 .unwrap_or(Value::Null)
                         } else {
-                            Value::Null
-                        }
-                    }
-                    "LEAD" => {
-                        let offset = 1usize;
-                        if rank_in_partition + offset < partition_size {
-                            let next_row = members[rank_in_partition + offset].1;
-                            arg_expr
-                                .map(|e| self.eval_row_expr(e, next_row, col_meta))
-                                .transpose()?
-                                .unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
+                            // Out of range → the default argument (or NULL).
+                            match win_args.get(2) {
+                                Some(e) => self.eval_row_expr(e, row, col_meta)?,
+                                None => Value::Null,
+                            }
                         }
                     }
                     "FIRST_VALUE" => {

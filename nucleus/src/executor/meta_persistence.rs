@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::schema_types::{
-    FunctionDef, FunctionKind, FunctionLanguage, MaterializedViewDef, Privilege, RoleDef,
-    SequenceDef, TriggerDef, TriggerEvent, TriggerTiming, ViewDef,
+    ExtensionDef, FunctionDef, FunctionKind, FunctionLanguage, MaterializedViewDef, Privilege,
+    RoleDef, SequenceDef, TriggerDef, TriggerEvent, TriggerTiming, ViewDef,
 };
 use crate::types::DataType;
 
@@ -138,6 +138,13 @@ struct FunctionSer {
     language: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExtensionSer {
+    name: String,
+    schema: String,
+    version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct MetaSnapshot {
     #[serde(default)]
@@ -152,6 +159,8 @@ struct MetaSnapshot {
     roles: Vec<RoleSer>,
     #[serde(default)]
     functions: Vec<FunctionSer>,
+    #[serde(default)]
+    extensions: Vec<ExtensionSer>,
     #[serde(default)]
     rls: crate::security::RlsEngine,
     #[serde(default)]
@@ -218,6 +227,7 @@ impl MetaPersistence {
         triggers: &[TriggerDef],
         roles: &HashMap<String, RoleDef>,
         functions: &HashMap<String, FunctionDef>,
+        extensions: &HashMap<String, ExtensionDef>,
         security: &crate::security::SecurityManager,
     ) -> Result<(), String> {
         let snapshot = MetaSnapshot {
@@ -333,6 +343,14 @@ impl MetaPersistence {
                     .into(),
                 })
                 .collect(),
+            extensions: extensions
+                .values()
+                .map(|e| ExtensionSer {
+                    name: e.name.clone(),
+                    schema: e.schema.clone(),
+                    version: e.version.clone(),
+                })
+                .collect(),
             rls: security.rls.clone(),
             masking: security.masking.clone(),
         };
@@ -340,6 +358,11 @@ impl MetaPersistence {
         let json =
             serde_json::to_string_pretty(&snapshot).map_err(|e| format!("meta serialize: {e}"))?;
 
+        // meta.json carries sequences, views, extensions, and the policy
+        // catalog: a write failure here must surface, never be swallowed.
+        if let Some(e) = crate::storage::crashpoint::io_fault("meta.write") {
+            return Err(format!("meta write: {e}"));
+        }
         let tmp = self.path.with_extension("json.tmp");
         {
             let mut f = std::fs::File::create(&tmp).map_err(|e| format!("meta write tmp: {e}"))?;
@@ -347,7 +370,9 @@ impl MetaPersistence {
                 .map_err(|e| format!("meta write: {e}"))?;
             f.sync_all().map_err(|e| format!("meta fsync: {e}"))?;
         }
+        crate::storage::crashpoint::reach("meta.before_rename");
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("meta rename: {e}"))?;
+        crate::storage::crashpoint::reach("meta.after_rename");
         Ok(())
     }
 
@@ -495,6 +520,17 @@ impl MetaPersistence {
             );
         }
 
+        for e in snap.extensions {
+            meta.extensions.insert(
+                e.name.clone(),
+                ExtensionDef {
+                    name: e.name,
+                    schema: e.schema,
+                    version: e.version,
+                },
+            );
+        }
+
         meta
     }
 }
@@ -508,6 +544,7 @@ pub struct LoadedMeta {
     pub triggers: Vec<TriggerDef>,
     pub roles: HashMap<String, RoleDef>,
     pub functions: HashMap<String, FunctionDef>,
+    pub extensions: HashMap<String, ExtensionDef>,
     pub rls: crate::security::RlsEngine,
     pub masking: crate::security::MaskingEngine,
 }

@@ -16,7 +16,11 @@ use super::helpers::*;
 use super::session::sync_block_on;
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
-use crate::types::{DataType, Row, Value};
+use crate::types::{DataType, Row, Value, parse_numeric};
+
+/// Seconds between the Unix epoch (1970-01-01) and Nucleus's internal temporal
+/// epoch (2000-01-01). EXTRACT(EPOCH ...) reports seconds since 1970 (PG).
+const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800;
 
 // ---------------------------------------------------------------------------
 // Lazy Materialization — Phase 2C
@@ -229,6 +233,11 @@ impl Executor {
             | Expr::Array(_)
             | Expr::AnyOp { .. }
             | Expr::AllOp { .. }
+            // CASE in constant context (`SELECT CASE ... END` with no FROM) —
+            // was missing from the delegation list and hit the catch-all error.
+            | Expr::Case { .. }
+            | Expr::Like { .. }
+            | Expr::ILike { .. }
             | Expr::CompoundFieldAccess { .. } => {
                 let empty_row: Row = Vec::new();
                 let empty_meta: Vec<ColMeta> = Vec::new();
@@ -236,9 +245,21 @@ impl Executor {
             }
             // Subqueries in constant context
             Expr::Subquery(subquery) => {
-                let sub_result = sync_block_on(self.execute_query(*subquery.clone()))?;
-                match sub_result {
+                self.check_subquery_depth()?;
+                let sub_result = sync_block_on(self.execute_query(*subquery.clone()));
+                self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+                match sub_result? {
                     ExecResult::Select { rows, .. } => {
+                        // Scalar subquery: 0 rows → NULL, 1 row → its value,
+                        // >1 row → error (PostgreSQL: "more than one row
+                        // returned by a subquery used as an expression").
+                        // Silently taking the first row was a wrong result.
+                        if rows.len() > 1 {
+                            return Err(ExecError::Runtime(
+                                "more than one row returned by a subquery used as an expression"
+                                    .into(),
+                            ));
+                        }
                         if rows.is_empty() || rows[0].is_empty() {
                             Ok(Value::Null)
                         } else {
@@ -274,6 +295,9 @@ impl Executor {
             ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
                 Ok(Value::Text(s.clone()))
             }
+            // E'...' escape-string literal (psql sends E'\n' in \l). The
+            // sqlparser tokenizer has already decoded the backslash escapes.
+            ast::Value::EscapedStringLiteral(s) => Ok(Value::Text(s.clone())),
             ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
             ast::Value::Null => Ok(Value::Null),
             _ => Err(ExecError::Unsupported(format!("value: {val}"))),
@@ -426,6 +450,42 @@ impl Executor {
     ///
     /// This is what makes `WHERE x NOT IN (..)` correctly exclude NULL-involved
     /// rows instead of including them.
+    /// Values for the right operand of `x op ANY/ALL (...)`: a subquery's whole
+    /// first column (correlated refs substituted), an array value, or a
+    /// Postgres array-literal text.
+    /// `None` means the array operand itself was NULL — the whole ANY/ALL
+    /// comparison is then NULL (PostgreSQL: `x = ANY(NULL::text[])` is NULL).
+    fn any_all_operand(
+        &self,
+        right: &Expr,
+        row: &Row,
+        col_meta: &[ColMeta],
+    ) -> Result<Option<Vec<Value>>, ExecError> {
+        let inner = match right {
+            Expr::Nested(e) => e.as_ref(),
+            other => other,
+        };
+        if let Expr::Subquery(subquery) = inner {
+            self.check_subquery_depth()?;
+            let resolved = substitute_outer_refs_in_query(subquery, row, col_meta);
+            let sub_result = sync_block_on(self.execute_query(resolved));
+            self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+            return match sub_result? {
+                ExecResult::Select { rows, .. } => Ok(Some(
+                    rows.into_iter().filter_map(|r| r.into_iter().next()).collect(),
+                )),
+                _ => Ok(Some(Vec::new())),
+            };
+        }
+        let r = self.eval_row_expr(right, row, col_meta)?;
+        if matches!(r, Value::Null) {
+            return Ok(None);
+        }
+        coerce_to_array(r)
+            .map(Some)
+            .ok_or_else(|| ExecError::Unsupported("ANY/ALL requires an array or subquery".into()))
+    }
+
     pub(super) fn in_three_valued(val: &Value, candidates: &[Value], negated: bool) -> Value {
         // Empty set is decisive regardless of `val` (including NULL): IN → FALSE,
         // NOT IN → TRUE. Must precede the NULL-val check below.
@@ -508,6 +568,38 @@ impl Executor {
                 return Ok(Value::Bool(matches!(
                     compare_values(left, right),
                     Some(Ordering::Greater | Ordering::Equal)
+                )));
+            }
+            // POSIX regex operators (~, !~, ~*, !~*) — psql meta-commands
+            // filter catalogs with these (`nspname !~ '^pg_'`), and psql also
+            // spells them as OPERATOR(pg_catalog.~), handled below.
+            ast::BinaryOperator::PGRegexMatch => {
+                return eval_regex_match(left, right, false, false);
+            }
+            ast::BinaryOperator::PGRegexNotMatch => {
+                return eval_regex_match(left, right, true, false);
+            }
+            ast::BinaryOperator::PGRegexIMatch => {
+                return eval_regex_match(left, right, false, true);
+            }
+            ast::BinaryOperator::PGRegexNotIMatch => {
+                return eval_regex_match(left, right, true, true);
+            }
+            ast::BinaryOperator::PGCustomBinaryOperator(parts) => {
+                // OPERATOR(pg_catalog.~) etc. — resolve the schema-qualified
+                // spelling to the same regex semantics.
+                if let Some(op_name) = parts.last() {
+                    match op_name.as_str() {
+                        "~" => return eval_regex_match(left, right, false, false),
+                        "!~" => return eval_regex_match(left, right, true, false),
+                        "~*" => return eval_regex_match(left, right, false, true),
+                        "!~*" => return eval_regex_match(left, right, true, true),
+                        _ => {}
+                    }
+                }
+                return Err(ExecError::Unsupported(format!(
+                    "custom operator OPERATOR({})",
+                    parts.join(".")
                 )));
             }
             // JSONB operators
@@ -656,6 +748,14 @@ impl Executor {
                 ast::BinaryOperator::StringConcat => Ok(Value::Text(format!("{l}{r}"))),
                 _ => Err(ExecError::Unsupported(format!("op on text: {op}"))),
             },
+            // `||` with one text operand coerces the other to text (PostgreSQL:
+            // `'a' || 1` = 'a1'). NULL was already handled above (yields NULL).
+            (Value::Text(l), r) if matches!(op, ast::BinaryOperator::StringConcat) => {
+                Ok(Value::Text(format!("{l}{r}")))
+            }
+            (l, Value::Text(r)) if matches!(op, ast::BinaryOperator::StringConcat) => {
+                Ok(Value::Text(format!("{l}{r}")))
+            }
             _ => Err(ExecError::Unsupported(format!(
                 "type mismatch for {op}: {left:?} vs {right:?}"
             ))),
@@ -680,12 +780,16 @@ impl Executor {
 
     /// Parallel WHERE filter for large result sets using Rayon.
     /// Falls back to serial for small sets (below `PARALLEL_THRESHOLD`).
-    pub(super) fn parallel_filter(
+    /// WHERE filter that PROPAGATES evaluation errors. An unresolvable column
+    /// or failing expression must surface as an error — treating it as
+    /// row-doesn't-match silently returned wrong (empty) results for typos
+    /// like `WHERE zzz > 3`.
+    pub(super) fn try_parallel_filter(
         &self,
         rows: Vec<Row>,
         where_expr: &Expr,
         col_meta: &[ColMeta],
-    ) -> Vec<Row> {
+    ) -> Result<Vec<Row>, ExecError> {
         /// Minimum row count before switching to parallel evaluation.
         const PARALLEL_THRESHOLD: usize = 10_000;
 
@@ -693,9 +797,42 @@ impl Executor {
             // Parallel path using Rayon (server builds only)
             #[cfg(feature = "server")]
             {
-                rows.into_par_iter()
-                    .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
-                    .collect()
+                // Rayon workers can't see the session task-local, so capture
+                // the cancel flag here and poll it per row.
+                let session = self.current_session_for_cancel();
+                let run = || {
+                    rows.into_par_iter()
+                        .map(|row| {
+                            if session
+                                .cancel_requested
+                                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                return Err(ExecError::Runtime(Self::CANCEL_MESSAGE.into()));
+                            }
+                            self.eval_where(where_expr, &row, col_meta)
+                                .map(|keep| (keep, row))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|pairs| {
+                            pairs
+                                .into_iter()
+                                .filter_map(|(keep, row)| keep.then_some(row))
+                                .collect()
+                        })
+                };
+                // A long rayon collect blocks this tokio worker; without
+                // block_in_place the runtime can stall its IO driver behind
+                // the compute, delaying even NEW connections (observed: a
+                // CancelRequest not read until the filter finished).
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        tokio::task::block_in_place(run)
+                    }
+                    _ => run(),
+                }
             }
             #[cfg(not(feature = "server"))]
             {
@@ -703,9 +840,13 @@ impl Executor {
             }
         } else {
             // Serial path for small result sets or non-server (WASM) builds
-            rows.into_iter()
-                .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
-                .collect()
+            let mut out = Vec::new();
+            for row in rows {
+                if self.eval_where(where_expr, &row, col_meta)? {
+                    out.push(row);
+                }
+            }
+            Ok(out)
         }
     }
 
@@ -813,6 +954,13 @@ impl Executor {
                 let idx = self.resolve_column(col_meta, Some(&parts[0].value), &parts[1].value)?;
                 Ok(row[idx].clone())
             }
+            // schema.table.column — Prisma qualifies RETURNING columns as
+            // "public"."users"."id". The schema part carries no information
+            // (single-schema engine); resolve on table.column.
+            Expr::CompoundIdentifier(parts) if parts.len() == 3 => {
+                let idx = self.resolve_column(col_meta, Some(&parts[1].value), &parts[2].value)?;
+                Ok(row[idx].clone())
+            }
             Expr::Value(val) => self.eval_value(&val.value),
             Expr::Interval(interval) => {
                 let value = self.eval_row_expr(&interval.value, row, col_meta)?;
@@ -883,6 +1031,17 @@ impl Executor {
                         .map(Value::Int64)
                         .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
+                    (ast::UnaryOperator::Minus, Value::Numeric(raw)) => Ok(Value::Numeric(
+                        parse_numeric(&raw)
+                            .map(|d| (-d).to_string())
+                            .unwrap_or_else(|_| {
+                                if let Some(stripped) = raw.strip_prefix('-') {
+                                    stripped.to_string()
+                                } else {
+                                    format!("-{raw}")
+                                }
+                            }),
+                    )),
                     (
                         ast::UnaryOperator::Minus,
                         Value::Interval {
@@ -1200,24 +1359,26 @@ impl Executor {
                             "year" => Ok(Value::Int32(y)),
                             "month" => Ok(Value::Int32(m as i32)),
                             "day" => Ok(Value::Int32(day as i32)),
-                            "dow" | "dayofweek" => {
-                                let jdn = d + 2451545;
-                                Ok(Value::Int32(jdn.rem_euclid(7)))
-                            }
+                            // PG DOW: Sunday=0..Saturday=6. 2000-01-01 (d=0) is
+                            // a Saturday, so DOW = (d + 6) mod 7 (the old
+                            // +2451545 offset was off by one).
+                            "dow" | "dayofweek" => Ok(Value::Int32((d + 6).rem_euclid(7))),
                             "doy" | "dayofyear" => {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
                                 Ok(Value::Int32(d - jan1 + 1))
                             }
-                            "epoch" => Ok(Value::Int64(d as i64 * 86400)),
+                            // PG epoch is seconds since 1970-01-01; Nucleus's
+                            // internal epoch is 2000-01-01 (offset 946684800s).
+                            "epoch" => Ok(Value::Int64(d as i64 * 86400 + PG_EPOCH_OFFSET_SECS)),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field_str}) from date"
                             ))),
                         }
                     }
-                    Value::Timestamp(ts) => {
-                        let total_secs = ts / 1_000_000;
-                        let days = (total_secs / 86400) as i32;
-                        let time_secs = total_secs % 86400;
+                    Value::Timestamp(ts) | Value::TimestampTz(ts) => {
+                        let total_secs = ts.div_euclid(1_000_000);
+                        let days = total_secs.div_euclid(86400) as i32;
+                        let time_secs = total_secs.rem_euclid(86400);
                         let (y, m, day) = crate::types::days_to_ymd(days);
                         match field_str.as_str() {
                             "year" => Ok(Value::Int32(y)),
@@ -1226,7 +1387,12 @@ impl Executor {
                             "hour" => Ok(Value::Int32((time_secs / 3600) as i32)),
                             "minute" => Ok(Value::Int32(((time_secs % 3600) / 60) as i32)),
                             "second" => Ok(Value::Int32((time_secs % 60) as i32)),
-                            "epoch" => Ok(Value::Int64(total_secs)),
+                            "dow" | "dayofweek" => Ok(Value::Int32((days + 6).rem_euclid(7))),
+                            "doy" | "dayofyear" => {
+                                let jan1 = crate::types::ymd_to_days(y, 1, 1);
+                                Ok(Value::Int32(days - jan1 + 1))
+                            }
+                            "epoch" => Ok(Value::Int64(total_secs + PG_EPOCH_OFFSET_SECS)),
                             _ => Err(ExecError::Unsupported(format!(
                                 "EXTRACT({field_str}) from timestamp"
                             ))),
@@ -1243,8 +1409,7 @@ impl Executor {
                                 "second" => Ok(Value::Int32(second as i32)),
                                 "dow" | "dayofweek" => {
                                     let d = crate::types::ymd_to_days(y, m, day);
-                                    let jdn = d + 2451545;
-                                    Ok(Value::Int32(jdn.rem_euclid(7)))
+                                    Ok(Value::Int32((d + 6).rem_euclid(7)))
                                 }
                                 "doy" | "dayofyear" => {
                                     let d = crate::types::ymd_to_days(y, m, day);
@@ -1256,7 +1421,7 @@ impl Executor {
                                     let day_secs = d as i64 * 86400;
                                     let time_secs =
                                         hour as i64 * 3600 + minute as i64 * 60 + second as i64;
-                                    Ok(Value::Int64(day_secs + time_secs))
+                                    Ok(Value::Int64(day_secs + time_secs + PG_EPOCH_OFFSET_SECS))
                                 }
                                 _ => Err(ExecError::Unsupported(format!(
                                     "EXTRACT({field_str}) from text"
@@ -1302,19 +1467,34 @@ impl Executor {
                 ..
             } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
-                // Right side should evaluate to an array or subquery
-                let r = self.eval_row_expr(right, row, col_meta)?;
-                match r {
-                    Value::Array(vals) => {
-                        let found = vals.iter().any(|v| {
-                            self.eval_binary_op(&l, compare_op, v).ok() == Some(Value::Bool(true))
-                        });
-                        Ok(Value::Bool(found))
+                // Right side: a subquery's whole first column, an array value,
+                // or a Postgres array-literal text ('{a,b}', how array params
+                // arrive). A subquery evaluated via eval_row_expr would collapse
+                // to its first cell, so gather the column explicitly.
+                let Some(vals) = self.any_all_operand(right, row, col_meta)? else {
+                    return Ok(Value::Null);
+                };
+                // `op ANY (empty)` = FALSE; NULL element makes an otherwise-FALSE
+                // result NULL (three-valued), matching PostgreSQL.
+                let mut any_true = false;
+                let mut any_null = matches!(l, Value::Null);
+                for v in &vals {
+                    match self.eval_binary_op(&l, compare_op, v)? {
+                        Value::Bool(true) => {
+                            any_true = true;
+                            break;
+                        }
+                        Value::Null => any_null = true,
+                        _ => {}
                     }
-                    _ => Err(ExecError::Unsupported(
-                        "ANY requires array or subquery".into(),
-                    )),
                 }
+                Ok(if any_true {
+                    Value::Bool(true)
+                } else if any_null {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                })
             }
             Expr::AllOp {
                 left,
@@ -1323,18 +1503,30 @@ impl Executor {
                 ..
             } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
-                let r = self.eval_row_expr(right, row, col_meta)?;
-                match r {
-                    Value::Array(vals) => {
-                        let all_match = vals.iter().all(|v| {
-                            self.eval_binary_op(&l, compare_op, v).ok() == Some(Value::Bool(true))
-                        });
-                        Ok(Value::Bool(all_match))
+                let Some(vals) = self.any_all_operand(right, row, col_meta)? else {
+                    return Ok(Value::Null);
+                };
+                // `op ALL (empty)` = TRUE; any FALSE makes it FALSE; otherwise a
+                // NULL element makes it NULL.
+                let mut all_true = true;
+                let mut any_null = matches!(l, Value::Null) && !vals.is_empty();
+                for v in &vals {
+                    match self.eval_binary_op(&l, compare_op, v)? {
+                        Value::Bool(false) => {
+                            all_true = false;
+                            break;
+                        }
+                        Value::Null => any_null = true,
+                        _ => {}
                     }
-                    _ => Err(ExecError::Unsupported(
-                        "ALL requires array or subquery".into(),
-                    )),
                 }
+                Ok(if !all_true {
+                    Value::Bool(false)
+                } else if any_null {
+                    Value::Null
+                } else {
+                    Value::Bool(true)
+                })
             }
             // -- Array constructor --
             Expr::Array(ast::Array { elem, .. }) => {
@@ -1363,8 +1555,18 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
-                // Cache key is the canonical text of the subquery before outer-ref substitution.
-                let cache_key = format!("{subquery}");
+                // Cache key is the canonical text of the subquery before
+                // outer-ref substitution, PLUS the principal it was evaluated
+                // for. The map is one process-wide table shared by every wire
+                // session, and this read happens before any RLS logic, so a
+                // text-only key served one principal's rows to another: a
+                // multi-tenant app issues the same prepared statement for every
+                // tenant, so tenant B primes the entry and tenant A's next
+                // execute matches against it. `rls_cache_principal` folds in
+                // the policy generation as well, so a policy change invalidates
+                // rather than lingering.
+                let subquery_text = format!("{subquery}");
+                let cache_key = format!("{}\u{1}{subquery_text}", self.rls_cache_principal());
                 // Check if we already have the result of this non-correlated subquery cached.
                 if let Some(cached) = self
                     .uncorrelated_subquery_cache
@@ -1387,7 +1589,9 @@ impl Executor {
                     _ => std::sync::Arc::new(vec![]),
                 };
                 // Only cache if non-correlated (resolved query text == original).
-                if cache_key == resolved_key {
+                // Compare the TEXT, not `cache_key`, which now carries a
+                // principal prefix that `resolved_key` does not.
+                if subquery_text == resolved_key {
                     self.uncorrelated_subquery_cache
                         .write()
                         .insert(cache_key, values.clone());
@@ -1430,6 +1634,32 @@ impl Executor {
                             let key = self.eval_row_expr(key_expr, row, col_meta)?;
                             self.eval_json_arrow(&base, &key)
                         }
+                        // Composite field access `(expr).field` — PostgreSQL
+                        // record syntax. Nucleus represents the only composite
+                        // producer (_pg_expandarray) as a JSON object, so
+                        // extract the field with a typed result (JDBC compares
+                        // `(keys).x` against integer attnum).
+                        AccessExpr::Dot(Expr::Identifier(field)) => match &base {
+                            Value::Jsonb(serde_json::Value::Object(map)) => {
+                                Ok(match map.get(&field.value) {
+                                    None | Some(serde_json::Value::Null) => Value::Null,
+                                    Some(serde_json::Value::Number(n)) => {
+                                        if let Some(i) = n.as_i64() {
+                                            Value::Int64(i)
+                                        } else {
+                                            Value::Float64(n.as_f64().unwrap_or(f64::NAN))
+                                        }
+                                    }
+                                    Some(serde_json::Value::String(s)) => Value::Text(s.clone()),
+                                    Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
+                                    Some(other) => Value::Jsonb(other.clone()),
+                                })
+                            }
+                            Value::Null => Ok(Value::Null),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "field access on non-composite value: {expr}"
+                            ))),
+                        },
                         _ => Err(ExecError::Unsupported(format!("expression: {expr}"))),
                     }
                 } else {
@@ -1444,8 +1674,89 @@ impl Executor {
     // Type casting
     // ========================================================================
 
+    /// Reverse regclass resolution: OID -> relation name. Synthetic user-table
+    /// OIDs (16384 + catalog position) resolve through the sync catalog
+    /// snapshot; fixed system-catalog OIDs resolve through the static map.
+    fn regclass_name(&self, oid: i32) -> Option<String> {
+        if oid >= 16384 {
+            let tables = self.catalog.list_tables_sync()?;
+            return tables.get((oid - 16384) as usize).map(|t| t.name.clone());
+        }
+        match oid {
+            1247 => Some("pg_type".into()),
+            1249 => Some("pg_attribute".into()),
+            1255 => Some("pg_proc".into()),
+            1259 => Some("pg_class".into()),
+            1260 => Some("pg_authid".into()),
+            1262 => Some("pg_database".into()),
+            2609 => Some("pg_description".into()),
+            2610 => Some("pg_index".into()),
+            2615 => Some("pg_namespace".into()),
+            3079 => Some("pg_extension".into()),
+            _ => None,
+        }
+    }
+
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
         match target {
+            // '<catalog name>'::regclass — psql meta-commands (\dx notably) use
+            // this to reference system catalogs by name. Resolve the fixed
+            // pg_catalog OIDs; unknown names (incl. user tables, which would
+            // need async catalog access) yield NULL rather than an error so a
+            // LEFT JOIN comparison degrades to no-match, matching what the
+            // meta-command needs.
+            ast::DataType::Regclass => Ok(match &val {
+                Value::Text(s) => regclass_oid(s).map(Value::Int32).unwrap_or_else(|| {
+                    // User table: resolve the synthetic OID (16384 + catalog
+                    // position — the same assignment the virtual pg_catalog
+                    // arms use). Quotes are stripped wholesale: real Nucleus
+                    // names never contain '"', but introspection SQL passes
+                    // spellings like '"public"."post_tags"'.
+                    let bare = s.replace('"', "");
+                    let bare = bare.strip_prefix("public.").unwrap_or(&bare);
+                    self.catalog
+                        .list_tables_sync()
+                        .and_then(|ts| ts.iter().position(|t| t.name == bare))
+                        .map(|i| Value::Int32(16384 + i as i32))
+                        .unwrap_or(Value::Null)
+                }),
+                // OID -> regclass renders as the relation NAME (Postgres
+                // displays regclass as text). A later ::text cast is then the
+                // identity, which is exactly what introspection queries like
+                // `attrelid::regclass::text` need. Unknown OIDs stay numeric.
+                Value::Int32(n) => self
+                    .regclass_name(*n)
+                    .map(Value::Text)
+                    .unwrap_or(val.clone()),
+                Value::Int64(n) => self
+                    .regclass_name(*n as i32)
+                    .map(Value::Text)
+                    .unwrap_or(Value::Int32(*n as i32)),
+                _ => Value::Null,
+            }),
+            // ::regproc — function-name pseudo-type. Nucleus renders regproc
+            // values as their text name already, so the cast is the identity
+            // on text (prisma casts pg_type.typinput::regproc::text).
+            ast::DataType::Custom(name, _)
+                if name.to_string().eq_ignore_ascii_case("regproc") =>
+            {
+                Ok(match &val {
+                    Value::Text(_) | Value::Int32(_) | Value::Int64(_) => val,
+                    _ => Value::Null,
+                })
+            }
+            // '<type name>'::regtype — sqlparser has no first-class REGTYPE, so
+            // it arrives as a custom type. Resolves to the type OID.
+            ast::DataType::Custom(name, _)
+                if name.to_string().eq_ignore_ascii_case("regtype") =>
+            {
+                Ok(match &val {
+                    Value::Text(s) => regtype_oid(s).map(Value::Int32).unwrap_or(Value::Null),
+                    Value::Int32(_) => val,
+                    Value::Int64(n) => Value::Int32(*n as i32),
+                    _ => Value::Null,
+                })
+            }
             ast::DataType::JSONB | ast::DataType::JSON => match val {
                 Value::Text(s) => {
                     let v: serde_json::Value = serde_json::from_str(&s)
@@ -1461,23 +1772,55 @@ impl Executor {
                 Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Text(val.to_string())),
             },
-            ast::DataType::Int(_) | ast::DataType::Integer(_) => match val {
+            ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => match val {
                 Value::Null => Ok(Value::Null),
                 Value::Int32(_) => Ok(val),
-                Value::Int64(n) => Ok(Value::Int32(n as i32)),
-                Value::Float64(n) => Ok(Value::Int32(n as i32)),
+                Value::Int64(n) => i32::try_from(n)
+                    .map(Value::Int32)
+                    .map_err(|_| ExecError::Runtime("integer out of range".into())),
+                // PostgreSQL rounds float8→int half-to-even (42.5→42, 43.5→44,
+                // 42.7→43); NUMERIC→int rounds half-AWAY-from-zero (42.5→43),
+                // matching PG's distinct numeric/float rounding rules.
+                Value::Float64(n) => f64_to_i32(n).map(Value::Int32),
+                Value::Numeric(s) => parse_numeric(&s)
+                    .ok()
+                    .and_then(|d| {
+                        d.round_dp_with_strategy(
+                            0,
+                            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                        )
+                        .to_string()
+                        .parse::<i32>()
+                        .ok()
+                    })
+                    .map(Value::Int32)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                 Value::Bool(b) => Ok(Value::Int32(if b { 1 } else { 0 })),
                 Value::Text(s) => s
+                    .trim()
                     .parse::<i32>()
                     .map(Value::Int32)
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to INT"))),
                 _ => Err(ExecError::Unsupported("cannot cast to INT".to_string())),
             },
-            ast::DataType::BigInt(_) => match val {
+            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => match val {
                 Value::Null => Ok(Value::Null),
                 Value::Int32(n) => Ok(Value::Int64(n as i64)),
                 Value::Int64(_) => Ok(val),
-                Value::Float64(n) => Ok(Value::Int64(n as i64)),
+                Value::Float64(n) => f64_to_i64(n).map(Value::Int64),
+                Value::Numeric(s) => parse_numeric(&s)
+                    .ok()
+                    .and_then(|d| {
+                        d.round_dp_with_strategy(
+                            0,
+                            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                        )
+                        .to_string()
+                        .parse::<i64>()
+                        .ok()
+                    })
+                    .map(Value::Int64)
+                    .ok_or_else(|| ExecError::Runtime("bigint out of range".into())),
                 Value::Bool(b) => Ok(Value::Int64(if b { 1 } else { 0 })),
                 Value::Text(s) => s
                     .parse::<i64>()
@@ -1485,20 +1828,32 @@ impl Executor {
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to BIGINT"))),
                 _ => Err(ExecError::Unsupported("cannot cast to BIGINT".to_string())),
             },
-            ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
-                match val {
-                    Value::Null => Ok(Value::Null),
-                    Value::Int32(n) => Ok(Value::Float64(n as f64)),
-                    Value::Int64(n) => Ok(Value::Float64(n as f64)),
-                    Value::Float64(_) => Ok(val),
-                    Value::Bool(b) => Ok(Value::Float64(if b { 1.0 } else { 0.0 })),
-                    Value::Text(s) => s
-                        .parse::<f64>()
-                        .map(Value::Float64)
-                        .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to FLOAT"))),
-                    _ => Err(ExecError::Unsupported("cannot cast to FLOAT".to_string())),
-                }
-            }
+            // float8/float4 are the PostgreSQL spellings of double/real; without
+            // these arms `x::float8` fell to the catch-all cast error, so every
+            // float-cast expression (incl. Infinity/NaN literals) errored.
+            ast::DataType::Float(_)
+            | ast::DataType::Double(_)
+            | ast::DataType::DoublePrecision
+            | ast::DataType::Float4
+            | ast::DataType::Float8 => match val {
+                Value::Null => Ok(Value::Null),
+                Value::Int32(n) => Ok(Value::Float64(n as f64)),
+                Value::Int64(n) => Ok(Value::Float64(n as f64)),
+                Value::Float64(_) => Ok(val),
+                Value::Numeric(s) => parse_numeric(&s)
+                    .ok()
+                    .and_then(|d| d.to_string().parse::<f64>().ok())
+                    .map(Value::Float64)
+                    .ok_or_else(|| ExecError::Runtime("invalid numeric".into())),
+                Value::Bool(b) => Ok(Value::Float64(if b { 1.0 } else { 0.0 })),
+                // f64::parse handles 'Infinity'/'-Infinity'/'NaN' (PG-compatible).
+                Value::Text(s) => s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::Float64)
+                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to FLOAT"))),
+                _ => Err(ExecError::Unsupported("cannot cast to FLOAT".to_string())),
+            },
             ast::DataType::Boolean => match val {
                 Value::Null => Ok(Value::Null),
                 Value::Bool(_) => Ok(val),
@@ -1574,7 +1929,11 @@ impl Executor {
             },
             ast::DataType::Bytea => match val {
                 Value::Bytea(_) => Ok(val),
-                Value::Text(s) => Ok(Value::Bytea(s.into_bytes())),
+                // Delegate to Value::cast so the '\x' hex text form decodes
+                // identically here and in the storage coercion path.
+                Value::Text(_) => val
+                    .cast(&crate::types::DataType::Bytea)
+                    .map_err(ExecError::Runtime),
                 _ => Err(ExecError::Unsupported("cannot cast to BYTEA".to_string())),
             },
             ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
@@ -1585,11 +1944,33 @@ impl Executor {
                 Value::Text(raw) => parse_interval_literal(&raw, None),
                 _ => Err(ExecError::Runtime("cannot cast to INTERVAL".into())),
             },
-            ast::DataType::Array(_) => {
-                // Pass through arrays
-                match val {
-                    Value::Array(_) => Ok(val),
-                    _ => Ok(Value::Array(vec![val])),
+            ast::DataType::Array(elem_def) => {
+                // A text literal in Postgres array syntax ('{a,b,c}') casts
+                // element-wise to the target element type. Anything else keeps
+                // the old pass-through behavior.
+                let elem_type = match elem_def {
+                    ast::ArrayElemTypeDef::AngleBracket(t)
+                    | ast::ArrayElemTypeDef::SquareBracket(t, _)
+                    | ast::ArrayElemTypeDef::Parenthesis(t) => Some(t.as_ref()),
+                    ast::ArrayElemTypeDef::None => None,
+                };
+                match (&val, elem_type) {
+                    (Value::Text(s), Some(et)) if s.trim().starts_with('{') => {
+                        let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
+                        let mut out = Vec::new();
+                        for part in inner.split(',') {
+                            let part = part.trim().trim_matches('"');
+                            if part.is_empty() {
+                                continue;
+                            }
+                            out.push(self.eval_cast(Value::Text(part.to_string()), et)?);
+                        }
+                        Ok(Value::Array(out))
+                    }
+                    _ => match val {
+                        Value::Array(_) => Ok(val),
+                        _ => Ok(Value::Array(vec![val])),
+                    },
                 }
             }
             ast::DataType::Char(_) | ast::DataType::Character(_) => {
@@ -1605,21 +1986,195 @@ impl Executor {
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to REAL"))),
                 _ => Err(ExecError::Unsupported("cannot cast to REAL".to_string())),
             },
-            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => match val {
-                Value::Int32(_) => Ok(val),
-                Value::Int64(n) => Ok(Value::Int32(n as i32)),
-                Value::Float64(n) => Ok(Value::Int32(n as i32)),
-                Value::Text(s) => s
-                    .parse::<i32>()
-                    .map(Value::Int32)
-                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))),
-                _ => Err(ExecError::Unsupported(
-                    "cannot cast to SMALLINT".to_string(),
-                )),
-            },
+            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => {
+                let n = match val {
+                    Value::Int32(n) => i64::from(n),
+                    Value::Int64(n) => n,
+                    Value::Float64(f) => i64::from(f64_to_i32(f)?),
+                    Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+                        ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))
+                    })?,
+                    _ => {
+                        return Err(ExecError::Unsupported("cannot cast to SMALLINT".to_string()));
+                    }
+                };
+                if (i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&n) {
+                    Ok(Value::Int32(n as i32))
+                } else {
+                    Err(ExecError::Runtime("smallint out of range".into()))
+                }
+            }
             _ => Err(ExecError::Unsupported(format!("cast to {target}"))),
         }
     }
+}
+
+/// PostgreSQL float8→int4 semantics: round half-to-even, error out of range.
+fn f64_to_i32(n: f64) -> Result<i32, ExecError> {
+    if n.is_nan() || n.is_infinite() {
+        return Err(ExecError::Runtime("cannot cast non-finite to integer".into()));
+    }
+    let r = n.round_ties_even();
+    if r >= i32::MIN as f64 && r <= i32::MAX as f64 {
+        Ok(r as i32)
+    } else {
+        Err(ExecError::Runtime("integer out of range".into()))
+    }
+}
+
+/// PostgreSQL float8→int8 semantics: round half-to-even, error out of range.
+fn f64_to_i64(n: f64) -> Result<i64, ExecError> {
+    if n.is_nan() || n.is_infinite() {
+        return Err(ExecError::Runtime("cannot cast non-finite to bigint".into()));
+    }
+    let r = n.round_ties_even();
+    if r >= i64::MIN as f64 && r < 9_223_372_036_854_775_808.0 {
+        Ok(r as i64)
+    } else {
+        Err(ExecError::Runtime("bigint out of range".into()))
+    }
+}
+
+/// POSIX regex match for the `~` / `!~` / `~*` / `!~*` operators. NULL operand
+/// yields NULL (SQL three-valued logic); a malformed pattern is a loud error,
+/// matching Postgres.
+pub(super) fn eval_regex_match(
+    left: &Value,
+    right: &Value,
+    negated: bool,
+    case_insensitive: bool,
+) -> Result<Value, ExecError> {
+    let (s, pat) = match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Text(s), Value::Text(p)) => (s.clone(), p.clone()),
+        (l, Value::Text(p)) => (l.to_string(), p.clone()),
+        _ => {
+            return Err(ExecError::Unsupported(
+                "regex match requires a text pattern".into(),
+            ));
+        }
+    };
+    let pattern = if case_insensitive {
+        format!("(?i){pat}")
+    } else {
+        pat
+    };
+    let re = regex::Regex::new(&pattern)
+        .map_err(|e| ExecError::Unsupported(format!("invalid regular expression: {e}")))?;
+    let matched = re.is_match(&s);
+    Ok(Value::Bool(matched != negated))
+}
+
+/// Resolve a `::regclass` cast of a system-catalog name to its fixed
+/// PostgreSQL OID. Accepts an optional `pg_catalog.` prefix and surrounding
+/// quotes. Returns `None` for anything else (user tables would need async
+/// catalog access; callers map that to NULL).
+pub(super) fn regclass_oid(name: &str) -> Option<i32> {
+    let n = name.trim().trim_matches('\'').trim_matches('"');
+    let n = n.strip_prefix("pg_catalog.").unwrap_or(n);
+    match n {
+        "pg_type" => Some(1247),
+        "pg_attribute" => Some(1249),
+        "pg_proc" => Some(1255),
+        "pg_class" => Some(1259),
+        "pg_authid" => Some(1260),
+        "pg_database" => Some(1262),
+        "pg_description" => Some(2609),
+        "pg_index" => Some(2610),
+        "pg_namespace" => Some(2615),
+        "pg_extension" => Some(3079),
+        _ => None,
+    }
+}
+
+/// Resolve a `::regtype` cast of a type name to its PostgreSQL type OID.
+/// Covers the names ORM introspection actually passes; unknown names map to
+/// None (callers yield NULL, so comparisons degrade to no-match).
+pub(super) fn regtype_oid(name: &str) -> Option<i32> {
+    let n = name.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+    let n = n.strip_prefix("pg_catalog.").unwrap_or(&n);
+    match n {
+        "bool" | "boolean" => Some(16),
+        "bytea" => Some(17),
+        "int8" | "bigint" => Some(20),
+        "int2" | "smallint" => Some(21),
+        "int" | "int4" | "integer" => Some(23),
+        "text" => Some(25),
+        "json" => Some(114),
+        "float4" | "real" => Some(700),
+        "float8" | "double precision" => Some(701),
+        "varchar" | "character varying" => Some(1043),
+        "date" => Some(1082),
+        "time" => Some(1083),
+        "timestamp" => Some(1114),
+        "timestamptz" | "timestamp with time zone" => Some(1184),
+        "interval" => Some(1186),
+        "numeric" | "decimal" => Some(1700),
+        "uuid" => Some(2950),
+        "jsonb" => Some(3802),
+        _ => None,
+    }
+}
+
+/// Treat a value as an array for ANY/ALL: real arrays pass through; a text
+/// value in Postgres array-literal form is parsed element-wise (quoted
+/// elements unescaped, unquoted NULL -> Null, numeric-looking elements
+/// coerced so int comparisons work). Everything else is None.
+fn coerce_to_array(v: Value) -> Option<Vec<Value>> {
+    match v {
+        Value::Array(vals) => Some(vals),
+        Value::Text(s) if s.trim().starts_with('{') && s.trim().ends_with('}') => {
+            Some(parse_pg_array_literal(s.trim()))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a one-dimensional Postgres array literal ('{a,"b,c",NULL}').
+pub(super) fn parse_pg_array_literal(s: &str) -> Vec<Value> {
+    let inner = &s[1..s.len() - 1];
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut was_quoted = false;
+    let mut chars = inner.chars().peekable();
+    let push = |cur: &mut String, was_quoted: bool, out: &mut Vec<Value>| {
+        let raw = std::mem::take(cur);
+        let trimmed = if was_quoted { raw } else { raw.trim().to_string() };
+        if trimmed.is_empty() && !was_quoted {
+            return;
+        }
+        if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
+            out.push(Value::Null);
+        } else if !was_quoted && let Ok(n) = trimmed.parse::<i64>() {
+            out.push(Value::Int64(n));
+        } else if !was_quoted && let Ok(f) = trimmed.parse::<f64>() {
+            out.push(Value::Float64(f));
+        } else {
+            out.push(Value::Text(trimmed));
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if !in_quotes => {
+                in_quotes = true;
+                was_quoted = true;
+            }
+            '"' if in_quotes => in_quotes = false,
+            '\\' if in_quotes => {
+                if let Some(esc) = chars.next() {
+                    cur.push(esc);
+                }
+            }
+            ',' if !in_quotes => {
+                push(&mut cur, was_quoted, &mut out);
+                was_quoted = false;
+            }
+            _ => cur.push(c),
+        }
+    }
+    push(&mut cur, was_quoted, &mut out);
+    out
 }
 
 #[cfg(test)]

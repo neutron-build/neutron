@@ -135,11 +135,6 @@ enum Commands {
         #[arg(long, default_value_t = 6379)]
         resp_port: u16,
 
-        /// Port for the binary wire protocol server.
-        /// Set to 0 to disable (default: 0). Use 9999 for standard binary protocol port.
-        #[arg(long, default_value_t = 0)]
-        binary_port: u16,
-
         /// Port for the S3-compatible gateway (default: 0 = disabled).
         /// Requires NUCLEUS_S3_ACCESS_KEY and NUCLEUS_S3_SECRET_KEY.
         #[arg(long, default_value_t = 0)]
@@ -196,10 +191,12 @@ enum Commands {
         json: bool,
     },
 
-    /// Back up a data directory to a portable snapshot (physical, v1).
+    /// Back up a data directory to a portable snapshot (physical).
     ///
-    /// Take it against a STOPPED instance for a consistent snapshot. Restore
-    /// requires the same Nucleus version (physical snapshots are version-locked).
+    /// Refuses to run against a data directory a live instance holds: a plain
+    /// copy of a database being written to is torn, and a torn snapshot that
+    /// reports success is worse than no snapshot. Restore requires a build on
+    /// the same on-disk format version.
     Backup {
         /// Data directory to back up.
         #[arg(short, long, default_value = "nucleus_data")]
@@ -212,6 +209,17 @@ enum Commands {
         /// Overwrite the destination if it already exists.
         #[arg(long)]
         force: bool,
+
+        /// Take a coordinated snapshot (checkpoint + WAL-pinned copy cut at a
+        /// named LSN) by opening the database. Plaintext, uncompressed data
+        /// files only — a plain copy needs no key, this does.
+        #[arg(long)]
+        online: bool,
+
+        /// Copy a data directory that a live instance holds. The result may be
+        /// TORN; it is recorded as inconsistent in the snapshot's manifest.
+        #[arg(long)]
+        allow_in_use: bool,
     },
 
     /// Restore a data directory from a snapshot created by `backup`.
@@ -330,7 +338,6 @@ struct StartConfig {
     encrypt: bool,
     compress: bool,
     resp_port: u16,
-    binary_port: u16,
     s3_port: u16,
     otlp_endpoint: Option<String>,
     max_memory: usize,
@@ -364,7 +371,6 @@ async fn main() {
             encrypt,
             compress,
             resp_port,
-            binary_port,
             s3_port,
             otlp_endpoint,
             max_memory,
@@ -388,7 +394,6 @@ async fn main() {
                 encrypt,
                 compress,
                 resp_port,
-                binary_port,
                 s3_port,
                 otlp_endpoint,
                 max_memory,
@@ -420,8 +425,10 @@ async fn main() {
             data,
             output,
             force,
+            online,
+            allow_in_use,
         }) => {
-            cmd_backup(data, output, force);
+            cmd_backup(data, output, force, online, allow_in_use);
         }
         Some(Commands::Restore { input, data, force }) => {
             cmd_restore(input, data, force);
@@ -464,7 +471,6 @@ async fn main() {
                 encrypt: false,
                 compress: false,
                 resp_port: 6379,
-                binary_port: 0,
                 s3_port: 0,
                 otlp_endpoint: None,
                 max_memory: 512,
@@ -498,7 +504,6 @@ async fn cmd_start(cfg: StartConfig) {
         encrypt,
         compress,
         resp_port,
-        binary_port,
         s3_port,
         otlp_endpoint,
         max_memory,
@@ -507,6 +512,7 @@ async fn cmd_start(cfg: StartConfig) {
     let config_path = data.join("nucleus.toml");
     let mut config = match NucleusConfig::load(&config_path) {
         Ok(cfg) => {
+            // `NucleusConfig::load` already overlays NUCLEUS_* env vars.
             eprintln!("Loaded config from {}", config_path.display());
             cfg
         }
@@ -557,6 +563,22 @@ async fn cmd_start(cfg: StartConfig) {
 
     // Derive subsystem budgets from the global memory limit
     config.apply_memory_budget();
+
+    // Refuse to start on a configuration that cannot do what it says. Doing
+    // this before the listener binds means an inverted watermark or a typo'd
+    // enum surfaces immediately, not the first time the safety net was
+    // supposed to catch something.
+    if let Err(problems) = config.validate() {
+        eprintln!("Refusing to start: invalid configuration");
+        for p in &problems {
+            eprintln!("  - {p}");
+        }
+        eprintln!(
+            "Fix {} (or the corresponding NUCLEUS_* environment variables) and retry.",
+            config_path.display()
+        );
+        std::process::exit(1);
+    }
 
     // Configure tracing with config-driven log level
     let log_directive = format!("nucleus={}", config.logging.level);
@@ -712,10 +734,13 @@ async fn cmd_start(cfg: StartConfig) {
 
     // Keep a separate Arc<DiskEngine> for shutdown flushing
     let disk_engine: Option<Arc<DiskEngine>>;
+    // At-rest key copy for the query spill manager (external sort), if encrypted.
+    let spill_encryptor: Option<nucleus::storage::encryption::PageEncryptor>;
 
     let storage: Arc<dyn StorageEngine> = if memory {
         tracing::info!("Storage: in-memory with MVCC snapshot isolation");
         disk_engine = None;
+        spill_encryptor = None;
         Arc::new(MvccStorageAdapter::new())
     } else {
         // Ensure data directory exists
@@ -723,6 +748,32 @@ async fn cmd_start(cfg: StartConfig) {
             std::fs::create_dir_all(&data).expect("failed to create data directory");
             tracing::info!("Created data directory: {}", data.display());
         }
+
+        // Announce that this directory is live. `nucleus backup` observes this
+        // lock and refuses to take a plain directory copy out from under a
+        // running writer — a copy that would look successful and restore into
+        // a torn database. Held for the process lifetime; released by the
+        // kernel on exit, so a crash never leaves a lock that blocks recovery.
+        match nucleus::backup::DataDirLock::acquire(&data) {
+            Ok(Some(lock)) => {
+                // Deliberately leaked: the lock must outlive every scope in
+                // this function and die only with the process.
+                std::mem::forget(lock);
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "{} is already locked by another Nucleus instance; continuing, but two \
+                     writers on one data directory will corrupt it",
+                    data.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("could not lock data directory {}: {e}", data.display());
+            }
+        }
+        // Give the database a stable identity so a restore can tell this
+        // database from a different one.
+        let _ = nucleus::backup::database_id(&data);
 
         // Load persisted catalog (table/index definitions) from previous session
         let catalog_path = data.join("catalog.json");
@@ -816,6 +867,9 @@ async fn cmd_start(cfg: StartConfig) {
             tracing::info!("Compression: LZ4 page-level compression enabled");
         }
 
+        // Keep a copy of the at-rest key for the query spill manager so blocking
+        // operators (external sort) spill ciphertext, not plaintext.
+        spill_encryptor = encryptor.clone();
         let engine = Arc::new(match (encryptor, compress, use_segmented_wal) {
             (Some(enc), true, _) => {
                 DiskEngine::open_compressed_encrypted(&db_path, catalog.clone(), enc)
@@ -968,15 +1022,24 @@ async fn cmd_start(cfg: StartConfig) {
     };
     let cache_bytes = config.cache.max_memory_mb * 1024 * 1024;
     let store_dir = if memory { None } else { Some(data.as_path()) };
-    let executor = Arc::new(
-        Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
-            .with_cache_size(cache_bytes)
-            .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
-            .with_metrics(metrics.clone())
-            .with_replication(replication.clone())
-            .with_conn_pool(conn_pool.clone())
-            .with_cluster(cluster.clone()),
-    );
+    let mut executor_build = Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
+        .with_cache_size(cache_bytes)
+        .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
+        .with_metrics(metrics.clone())
+        .with_replication(replication.clone())
+        .with_conn_pool(conn_pool.clone())
+        .with_cluster(cluster.clone());
+    if let Some(enc) = spill_encryptor {
+        // Encrypted deployment: spill runs must be ciphertext (fail-closed).
+        executor_build = executor_build.with_spill_encryptor(enc);
+    }
+    let executor = Arc::new(executor_build);
+    // Install the weak self-reference so streaming producers can hold an owned
+    // Arc<Executor> across the wire-drain boundary (streaming WHERE filter, etc.).
+    executor.install_self_ref();
+    // Seed the sync column cache for restored tables so size-keyed fast paths
+    // (O(1) COUNT most visibly) work from the first query after a restart.
+    executor.warm_table_caches_sync();
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
 
     // Query execution memory budget (T1.2): make the operator's configured
@@ -988,6 +1051,41 @@ async fn cmd_start(cfg: StartConfig) {
             "Query memory budget: {} MB (hash-join circuit-breaker)",
             config.server.max_memory_mb
         );
+    }
+
+    // Disk watermark monitor: sample free space on the data directory's
+    // filesystem and degrade the executor's write-admission gate to read-only
+    // *before* the filesystem fills, rather than discovering ENOSPC partway
+    // through a write. Writes resume automatically once free space climbs back
+    // above the (higher) resume watermark. In-memory mode has no data
+    // directory to watch.
+    if !memory && config.storage.disk_check_interval_secs > 0 {
+        let marks = config.storage.disk_watermarks();
+        let guard = Arc::new(nucleus::ops::DiskGuard::with_fs_probe(
+            data.clone(),
+            marks,
+            executor.service().clone(),
+        ));
+        // Evaluate once synchronously: starting up on an already-full disk
+        // must come up read-only, not accept writes until the first tick.
+        let first = guard.evaluate();
+        tracing::info!(
+            "Disk watermarks: warn<{:.1}% readonly<{:.1}% resume>{:.1}% min-free={} MB — {}",
+            marks.warn_free_pct,
+            marks.readonly_free_pct,
+            marks.resume_free_pct,
+            config.storage.disk_min_free_mb,
+            first.detail
+        );
+        let interval = std::time::Duration::from_secs(config.storage.disk_check_interval_secs);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // the first tick completes immediately
+            loop {
+                ticker.tick().await;
+                guard.evaluate();
+            }
+        });
     }
 
     // Commit-time durability default (config wal.synchronous_commit;
@@ -1070,7 +1168,6 @@ async fn cmd_start(cfg: StartConfig) {
         }
     }
     let resolved_password_for_resp = resolved_password.clone();
-    let resolved_password_for_binary = resolved_password.clone();
     let handler = if let Some(ref bootstrap_password) = resolved_password {
         executor.set_bootstrap_password(bootstrap_password).await;
         Arc::new(NucleusHandler::with_catalog_auth(executor.clone()))
@@ -1216,8 +1313,15 @@ async fn cmd_start(cfg: StartConfig) {
             })
             .collect()
     };
-    let (raft_replicator, apply_rx) =
-        nucleus::distributed::RaftReplicator::new(node_id, initial_peers, transport.clone());
+    // A server with a data directory gets durable Raft state; memory mode has
+    // nowhere to put it and is explicitly not restart-safe.
+    let raft_dir = if memory { None } else { Some(data.join("raft")) };
+    let (raft_replicator, apply_rx) = nucleus::distributed::RaftReplicator::with_storage(
+        node_id,
+        initial_peers,
+        transport.clone(),
+        raft_dir,
+    );
     let raft_replicator = Arc::new(raft_replicator);
 
     // Register initial peers with the transport.
@@ -1707,8 +1811,20 @@ async fn cmd_start(cfg: StartConfig) {
     //   3. Run synchronous work (disk flush) on a blocking thread so it
     //      cannot stall a tokio worker.
     const SHUTDOWN_DEADLINE_SECS: u64 = 5;
+    /// How long to wait for in-flight connections before flushing. Must stay
+    /// comfortably under `SHUTDOWN_DEADLINE_SECS` so the flush and the
+    /// watchdog both still have room.
+    const DRAIN_BUDGET_SECS: u64 = 2;
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let shutdown_for_handler = shutdown_notify.clone();
+    // Drain coordinator: makes "stop accepting → finish in-flight work →
+    // persist → exit" an enforced order. Before this, the signal handler
+    // flushed and called `process::exit(0)` immediately after notifying the
+    // accept loop, so the accept loop's own drain never got to run and a
+    // request could be executing while the flush ran and the process died.
+    let drain = nucleus::ops::ShutdownCoordinator::new();
+    let drain_for_handler = drain.clone();
+    let drain_for_accept = drain.clone();
     let disk_for_shutdown = disk_engine.clone();
     let workers_for_shutdown = workers.clone();
     let runtime_for_shutdown = runtime.clone();
@@ -1751,6 +1867,25 @@ async fn cmd_start(cfg: StartConfig) {
         // ports are released and no new work is admitted.
         shutdown_for_handler.notify_waiters();
 
+        // Wait (bounded) for in-flight connections to finish BEFORE tearing
+        // down the runtime and flushing. An idle client costs the full budget,
+        // which is the price of not cutting off a request mid-write.
+        match drain_for_handler
+            .await_drain(std::time::Duration::from_secs(DRAIN_BUDGET_SECS))
+            .await
+        {
+            nucleus::ops::DrainOutcome::Drained { started_with } => {
+                if started_with > 0 {
+                    tracing::info!("Drained {started_with} in-flight connection(s)");
+                }
+            }
+            nucleus::ops::DrainOutcome::TimedOut { remaining } => {
+                tracing::warn!(
+                    "Shutdown drain timed out after {DRAIN_BUDGET_SECS}s with {remaining} connection(s) still active; continuing to flush"
+                );
+            }
+        }
+
         // Log runtime stats before shutdown
         let stats = runtime_for_shutdown.stats();
         tracing::info!(
@@ -1785,6 +1920,7 @@ async fn cmd_start(cfg: StartConfig) {
                 Err(e) => tracing::error!("Flush task panicked: {e}"),
             }
         }
+        drain_for_handler.mark_persisted();
         tracing::info!("Nucleus stopped.");
         // Hard-exit immediately; do not wait for the runtime to drop
         // background tasks (some of which never check a shutdown flag).
@@ -1839,27 +1975,6 @@ async fn cmd_start(cfg: StartConfig) {
             });
             tracing::info!("S3 gateway on port {s3_port} (path-style, SigV4)");
         }
-    }
-
-    // Spawn binary wire protocol server
-    if binary_port > 0 {
-        let binary_addr = format!("{host}:{binary_port}");
-        let binary_exec = executor.clone();
-        let binary_pw = resolved_password_for_binary.clone();
-        let binary_shutdown = shutdown_notify.clone();
-        tokio::spawn(async move {
-            if let Err(e) = nucleus::binary_wire::server::start_binary_server(
-                binary_addr,
-                binary_exec,
-                binary_pw,
-                binary_shutdown,
-            )
-            .await
-            {
-                tracing::error!("Binary protocol server error: {e}");
-            }
-        });
-        tracing::info!("Binary protocol server on port {binary_port}");
     }
 
     // Spawn metrics HTTP endpoint
@@ -1961,9 +2076,6 @@ async fn cmd_start(cfg: StartConfig) {
     if resp_port > 0 {
         println!("  RESP port:    {resp_port}");
     }
-    if binary_port > 0 {
-        println!("  Binary port:  {binary_port}");
-    }
     if s3_port > 0 {
         println!("  S3 port:      {s3_port}");
     }
@@ -1991,15 +2103,39 @@ async fn cmd_start(cfg: StartConfig) {
             }
         };
 
-        // Acquire a connection slot from the pool
+        // Acquire a connection slot from the pool.
+        //
+        // `try_acquire`, not `acquire`: awaiting a slot here would block the
+        // accept loop for the whole acquire timeout (30 s by default) the
+        // moment the limit is reached, so a single over-limit client would
+        // stall every other connection — a limit that turns into an outage.
+        // And a refused client gets a real `FATAL 53300` frame instead of a
+        // silently dropped socket, which clients report as "server closed the
+        // connection unexpectedly".
         let pool_ref = conn_pool.clone();
-        let conn_id = match pool_ref.acquire(&peer_addr.to_string()).await {
+        let conn_id = match pool_ref.try_acquire(&peer_addr.to_string()).await {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!("Rejected connection from {peer_addr}: {e}");
-                drop(socket);
+                tracing::warn!(
+                    "Rejected connection from {peer_addr}: {e} (limit {})",
+                    config.server.max_connections
+                );
+                metrics.connections_rejected.inc();
+                let limit = config.server.max_connections;
+                tokio::spawn(async move {
+                    nucleus::wire::overload::refuse_too_many_connections(socket, limit).await;
+                });
                 continue;
             }
+        };
+
+        // Register the connection with the drain coordinator. `None` means
+        // shutdown already began between accept and here — refuse rather than
+        // start work the drain would then have to wait for.
+        let Some(inflight) = drain_for_accept.try_admit() else {
+            tracing::debug!("Refusing connection from {peer_addr}: server is shutting down");
+            pool_ref.release_with_metadata_cleanup(conn_id).await;
+            continue;
         };
 
         let core = router.route();
@@ -2025,39 +2161,36 @@ async fn cmd_start(cfg: StartConfig) {
             metrics_ref.active_connections.dec();
             router_ref.connection_ended(core);
             pool_ref.release_with_metadata_cleanup(conn_id).await;
+            // Dropped last so the drain coordinator only considers this
+            // connection finished after its cleanup has run. Dropping on a
+            // panic unwind too, so a blown-up connection cannot wedge
+            // shutdown.
+            drop(inflight);
         });
     }
 
-    // Drain in-flight connections with a tight timeout. Must be smaller than
-    // SHUTDOWN_DEADLINE_SECS in the signal handler so the watchdog has slack
-    // to actually fire if drain stalls.
-    if !connection_tasks.is_empty() {
-        let active = connection_tasks.len();
-        tracing::info!("Waiting for {active} in-flight connection(s) to finish (2s timeout)...");
-        let drain_deadline = tokio::time::sleep(std::time::Duration::from_secs(2));
-        tokio::pin!(drain_deadline);
-        loop {
-            tokio::select! {
-                result = connection_tasks.join_next() => {
-                    match result {
-                        Some(_) => {
-                            if connection_tasks.is_empty() {
-                                tracing::info!("All connections drained");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                _ = &mut drain_deadline => {
-                    let remaining = connection_tasks.len();
-                    tracing::warn!("Shutdown timeout: aborting {remaining} remaining connection(s)");
-                    connection_tasks.abort_all();
-                    break;
-                }
-            }
-        }
+    // The signal handler owns the ordered shutdown sequence (drain → flush →
+    // exit) and terminates the process itself. Returning from `main` here
+    // would end the process *before* that flush ran — which is what used to
+    // happen: this function's own 2 s drain finished first and dropped off the
+    // end of `main`, so "Data flushed to disk successfully" never appeared on
+    // a SIGTERM and durability rested entirely on the WAL.
+    //
+    // Wait for the handler to report persistence instead. The wait is bounded
+    // by the same deadline as the handler's hard-exit watchdog, so a wedged
+    // flush still cannot hang the process. Draining is *not* repeated here:
+    // two sequential 2 s drains would nearly exhaust the 5 s budget.
+    let persist_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_DEADLINE_SECS);
+    while !drain.is_persisted() && std::time::Instant::now() < persist_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    if !drain.is_persisted() {
+        tracing::warn!(
+            "Exiting without a confirmed flush: shutdown exceeded {SHUTDOWN_DEADLINE_SECS}s"
+        );
+    }
+    connection_tasks.abort_all();
 }
 
 /// Process an incoming cluster message (JoinCluster, Heartbeat, Raft RPCs, ForwardDml, etc.).
@@ -2251,8 +2384,14 @@ fn cmd_init(data: PathBuf) {
     println!("Start with: nucleus start --data {}", data.display());
 }
 
-fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
-    match nucleus::backup::backup_data_dir(&data, &output, force, env!("CARGO_PKG_VERSION")) {
+fn cmd_backup(data: PathBuf, output: PathBuf, force: bool, online: bool, allow_in_use: bool) {
+    let version = env!("CARGO_PKG_VERSION");
+    let result = if online {
+        backup_online_via_engine(&data, &output, force, version, allow_in_use)
+    } else {
+        nucleus::backup::backup_data_dir_opts(&data, &output, force, version, allow_in_use)
+    };
+    match result {
         Ok(manifest) => {
             println!(
                 "Backup complete: {} -> {}",
@@ -2260,6 +2399,25 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
                 output.display()
             );
             println!("  Nucleus version: {}", manifest.nucleus_version);
+            println!("  On-disk format:  v{}", manifest.format_version);
+            println!("  Database id:     {}", manifest.database_id);
+            println!("  Files:           {} (BLAKE3 checksummed)", manifest.files.len());
+            if manifest.online {
+                println!("  Consistency:     online, consistent through LSN {}", manifest.consistent_lsn);
+            } else if manifest.taken_while_in_use {
+                println!(
+                    "  Consistency:     NONE — copied while the database was in use. \
+                     This snapshot may be torn and is recorded as such in its manifest."
+                );
+            } else {
+                println!("  Consistency:     offline copy of a quiesced directory");
+            }
+            if manifest.encryption.encrypted {
+                println!(
+                    "  At rest:         encrypted ({}) — restoring needs the same key",
+                    manifest.encryption.algorithm.as_deref().unwrap_or("unknown")
+                );
+            }
             println!(
                 "  Restore with: nucleus restore --input {} --data <dir>",
                 output.display()
@@ -2270,6 +2428,84 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
             std::process::exit(1);
         }
     }
+}
+
+/// Take a coordinated online snapshot by opening the data directory's SQL
+/// engine ourselves: checkpoint, pin WAL retention, copy the data file with
+/// every page slot validated, then cut the WAL at a named LSN.
+///
+/// Opt-in rather than the default for one reason: this process must open the
+/// data file, and it has no way to know an encrypted or compressed database's
+/// settings from the outside. Guessing wrong is caught by page checksums (the
+/// open fails loudly rather than snapshotting garbage), but a plain directory
+/// copy needs no such guess, so it stays the default.
+fn backup_online_via_engine(
+    data: &std::path::Path,
+    output: &std::path::Path,
+    force: bool,
+    version: &str,
+    allow_in_use: bool,
+) -> std::io::Result<nucleus::backup::BackupManifest> {
+    use nucleus::backup::{DataDirLock, backup_data_dir_opts, backup_online};
+
+    if !data.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("data directory does not exist: {}", data.display()),
+        ));
+    }
+
+    // Take the directory lock for the duration of the backup. Failing to get
+    // it means a live instance owns the directory.
+    let _lock = match DataDirLock::acquire(data)? {
+        Some(lock) => lock,
+        None => {
+            if allow_in_use {
+                eprintln!(
+                    "warning: {} is open by a running instance; taking an INCONSISTENT copy \
+                     because the in-use override was given",
+                    data.display()
+                );
+                return backup_data_dir_opts(data, output, force, version, true);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                format!(
+                    "{} is open by a running Nucleus instance. A snapshot taken from outside \
+                     that instance would be TORN. Stop the server and re-run, or pass \
+                     --allow-in-use to accept an inconsistent copy (it is recorded as \
+                     inconsistent in the manifest).",
+                    data.display()
+                ),
+            ));
+        }
+    };
+
+    let db_path = data.join("nucleus.db");
+    if !db_path.is_file() {
+        // No SQL data file (fresh or non-SQL directory) — nothing to
+        // coordinate with; a plain copy is exactly right and is honest about
+        // having no LSN consistency point.
+        return backup_data_dir_opts(data, output, force, version, false);
+    }
+
+    let catalog = Arc::new(Catalog::new());
+    let engine = DiskEngine::open_segmented(
+        &db_path,
+        catalog,
+        nucleus::storage::buffer::DEFAULT_POOL_SIZE,
+        64,
+    )
+    .map_err(
+        |e| {
+            std::io::Error::other(format!(
+                "could not open {} for an online backup: {e}. If this database is encrypted or \
+                 compressed, take the backup without --online (the plain copy needs no key).",
+                db_path.display()
+            ))
+        },
+    )?;
+    backup_online(data, output, force, version, &engine)
 }
 
 #[allow(clippy::too_many_arguments)]

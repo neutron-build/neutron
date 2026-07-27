@@ -672,11 +672,6 @@ impl InvertedIndex {
     // Undo Log (transaction rollback without deep cloning)
     // ====================================================================
 
-    /// Create an empty undo log — O(1) memory. Replaces txn_snapshot().
-    pub(crate) fn begin_undo_log(&self) -> FtsUndoLog {
-        FtsUndoLog::default()
-    }
-
     /// Capture a document's state before removal for potential rollback.
     pub(crate) fn record_remove(&self, log: &mut FtsUndoLog, doc_id: u64) {
         if let Some(info) = self.docs.get(&doc_id) {

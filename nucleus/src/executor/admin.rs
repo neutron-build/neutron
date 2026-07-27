@@ -837,7 +837,7 @@ impl Executor {
                 match pwd {
                     ast::Password::Password(expr) => {
                         let raw = expr.to_string().trim_matches('\'').to_string();
-                        role.password_hash = Some(super::encode_scram_verifier(&raw));
+                        role.password_hash = Some(super::store_password_literal(&raw));
                     }
                     ast::Password::NullPassword => {}
                 }
@@ -871,7 +871,7 @@ impl Executor {
                         ast::RoleOption::Password(pwd) => match pwd {
                             ast::Password::Password(expr) => {
                                 let raw = expr.to_string().trim_matches('\'').to_string();
-                                role.password_hash = Some(super::encode_scram_verifier(&raw));
+                                role.password_hash = Some(super::store_password_literal(&raw));
                             }
                             ast::Password::NullPassword => {
                                 role.password_hash = None;

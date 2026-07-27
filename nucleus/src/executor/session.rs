@@ -81,6 +81,28 @@ pub(super) fn sync_block_on<F: std::future::Future + Send>(fut: F) -> F::Output
 where
     F::Output: Send,
 {
+    // SECURITY: `block_on` drives the future as a NEW task, and tokio
+    // task-locals are per-task — they are NOT inherited. Running the future
+    // bare therefore loses CURRENT_SESSION and STORAGE_SESSION_ID, so
+    // `current_session()` falls back to the bootstrap superuser session:
+    // every correlated subquery evaluated through this helper would execute
+    // with RLS bypassed and with the wrong storage-session visibility.
+    // Re-establish both scopes inside the new task.
+    let session = CURRENT_SESSION.try_with(|s| s.clone()).ok();
+    let storage_sid = crate::storage::STORAGE_SESSION_ID.try_with(|id| *id).ok();
+    let fut = async move {
+        match (session, storage_sid) {
+            (Some(sess), Some(sid)) => {
+                CURRENT_SESSION
+                    .scope(sess, crate::storage::STORAGE_SESSION_ID.scope(sid, fut))
+                    .await
+            }
+            (Some(sess), None) => CURRENT_SESSION.scope(sess, fut).await,
+            (None, Some(sid)) => crate::storage::STORAGE_SESSION_ID.scope(sid, fut).await,
+            (None, None) => fut.await,
+        }
+    };
+
     let handle = tokio::runtime::Handle::current();
     if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
         tokio::task::block_in_place(|| handle.block_on(fut))
@@ -130,19 +152,6 @@ pub(super) fn sync_block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// Cross-model snapshots captured at BEGIN for ROLLBACK support.
-pub(super) struct CrossModelSnapshots {
-    pub kv: Option<crate::kv::KvTxnSnapshot>,
-    pub graph: Option<crate::graph::GraphTxnSnapshot>,
-    pub doc: Option<crate::document::DocTxnSnapshot>,
-    pub datalog: Option<crate::datalog::DatalogTxnSnapshot>,
-    pub fts: Option<crate::fts::FtsUndoLog>,
-    pub ts: Option<crate::timeseries::TsTxnSnapshot>,
-    pub blob: Option<crate::blob::BlobTxnSnapshot>,
-    /// Clone of the full vector index map (keyed by index name).
-    pub vector: Option<std::collections::HashMap<String, crate::executor::types::VectorIndexEntry>>,
-}
-
 /// Transaction state for the current session.
 pub(super) struct TxnState {
     /// Whether a transaction is currently active.
@@ -151,8 +160,6 @@ pub(super) struct TxnState {
     pub snapshot: Option<HashMap<String, Vec<Row>>>,
     /// Savepoint stack: each entry is (name, snapshot of all tables at that point).
     pub savepoints: Vec<(String, HashMap<String, Vec<Row>>)>,
-    /// Cross-model snapshots for rolling back KV/Graph/Doc/Datalog mutations.
-    pub cross_model: Option<CrossModelSnapshots>,
     /// Security catalog at BEGIN, used to make policy DDL transactional.
     pub security_snapshot: Option<SecurityManager>,
     /// Session-local security catalog staged by policy DDL until COMMIT.
@@ -167,6 +174,11 @@ pub(super) struct TxnState {
     /// COMMIT or ROLLBACK.  Vector/encrypted indexes are shared across sessions,
     /// so an aborted transaction must repair them from committed base rows too.
     pub derived_dirty_tables: HashSet<String>,
+    /// PostgreSQL transaction-error state: once a statement errors inside an
+    /// explicit transaction, the whole transaction is aborted — every later
+    /// statement is rejected until ROLLBACK (or COMMIT, which becomes a
+    /// rollback). Reset at BEGIN.
+    pub aborted: bool,
 }
 
 impl TxnState {
@@ -175,13 +187,13 @@ impl TxnState {
             active: false,
             snapshot: None,
             savepoints: Vec::new(),
-            cross_model: None,
             security_snapshot: None,
             security_pending: None,
             security_savepoints: Vec::new(),
             policy_dirty: false,
             gin_dirty: false,
             derived_dirty_tables: HashSet::new(),
+            aborted: false,
         }
     }
 }
@@ -194,6 +206,11 @@ impl TxnState {
 /// the `Executor`.
 pub struct Session {
     pub(super) txn_state: RwLock<TxnState>,
+    /// Per-session cross-model write-set for the open transaction (`None`
+    /// outside a transaction). Deliberately a `parking_lot` mutex, not part of
+    /// the async `txn_state`: every specialty mutation site is synchronous, and
+    /// the old `try_write` hook silently dropped undo records under contention.
+    pub(super) cross_model: parking_lot::Mutex<Option<super::cross_model::CrossModelTxn>>,
     pub(super) prepared_stmts: RwLock<HashMap<String, Arc<PreparedStmt>>>,
     pub(super) cursors: RwLock<HashMap<String, CursorDef>>,
     pub(super) settings: parking_lot::RwLock<HashMap<String, String>>,
@@ -215,6 +232,17 @@ pub struct Session {
     /// executing sessions so a long-running query is never mistaken for idle.
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(super) executing: AtomicBool,
+    /// True when this session's consumer can lazily drain a streaming result
+    /// (the pgwire simple-query loop). COPY TO STDOUT then streams by default;
+    /// embedded/RESP/binary consumers leave it false and always materialize, so
+    /// the ExecResult contract they see is unchanged. SELECT streaming stays
+    /// separately gated on the explicit `stream_results` setting.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(super) stream_capable_consumer: AtomicBool,
+    /// Set by a wire CancelRequest while a query runs on this session; the
+    /// executor's long loops check it cooperatively and abort with SQLSTATE
+    /// 57014. Cleared at each statement start.
+    pub(super) cancel_requested: AtomicBool,
 }
 
 impl Default for Session {
@@ -238,6 +266,7 @@ impl Session {
 
         Self {
             txn_state: RwLock::new(TxnState::new()),
+            cross_model: parking_lot::Mutex::new(None),
             prepared_stmts: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
             settings: parking_lot::RwLock::new(default_settings),
@@ -254,6 +283,8 @@ impl Session {
             ),
             last_activity_ms: AtomicU64::new(now_millis()),
             executing: AtomicBool::new(false),
+            stream_capable_consumer: AtomicBool::new(false),
+            cancel_requested: AtomicBool::new(false),
         }
     }
 
@@ -288,6 +319,7 @@ impl Session {
             txn.gin_dirty = false;
             txn.derived_dirty_tables.clear();
         }
+        *self.cross_model.lock() = None;
         // Clear prepared statements
         self.prepared_stmts.write().await.clear();
         // Clear cursors

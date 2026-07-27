@@ -116,3 +116,44 @@ async fn small_query_under_tiny_budget_is_unaffected() {
     let r = ex.execute("SELECT * FROM big ORDER BY payload").await;
     assert!(r.is_ok(), "small ORDER BY should run under the budget, got {r:?}");
 }
+
+// P0.3 — the previously-ungated set-operation and plan-path join buffers.
+
+#[tokio::test]
+async fn union_over_budget_rejects_cleanly() {
+    // Set-operation output buffer (execute_set_expr) was ungated before P0.3.
+    let ex = test_executor();
+    seed(&ex, BIG_ROWS).await;
+    ex.set_query_memory_limit(TINY);
+    let r = ex
+        .execute("SELECT * FROM big UNION SELECT * FROM big")
+        .await;
+    assert!(is_mem_exceeded(&r), "expected MemoryExceeded, got {r:?}");
+}
+
+#[tokio::test]
+async fn cross_join_over_budget_rejects_cleanly() {
+    // Nested-loop/cross-join inputs are held live for the whole loop; the
+    // combined input footprint was ungated on the plan path before P0.3.
+    let ex = test_executor();
+    seed(&ex, BIG_ROWS).await;
+    ex.set_query_memory_limit(TINY);
+    let r = ex
+        .execute("SELECT a.id FROM big a CROSS JOIN big b")
+        .await;
+    assert!(is_mem_exceeded(&r), "expected MemoryExceeded, got {r:?}");
+}
+
+#[tokio::test]
+async fn union_and_cross_join_run_under_generous_budget() {
+    let ex = test_executor();
+    seed(&ex, 20).await; // small enough that the cross product stays cheap
+    ex.set_query_memory_limit(0); // 0 => unlimited
+    for sql in [
+        "SELECT * FROM big UNION SELECT * FROM big",
+        "SELECT a.id FROM big a CROSS JOIN big b",
+    ] {
+        let r = ex.execute(sql).await;
+        assert!(r.is_ok(), "expected success for `{sql}`, got {r:?}");
+    }
+}

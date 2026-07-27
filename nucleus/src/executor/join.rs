@@ -333,12 +333,15 @@ impl Executor {
                 let name = ident.value.to_lowercase();
                 meta.iter().position(|c| c.name.to_lowercase() == name)
             }
-            Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
-                let table = idents[0].value.to_lowercase();
-                let col = idents[1].value.to_lowercase();
+            Expr::CompoundIdentifier(idents) if idents.len() >= 2 => {
+                let table = idents[idents.len() - 2].value.to_lowercase();
+                let col = idents.last().unwrap().value.to_lowercase();
                 meta.iter().position(|c| {
                     c.name.to_lowercase() == col
-                        && c.table.as_ref().map(|t| t.to_lowercase()) == Some(table.clone())
+                        && c.table.as_deref().is_some_and(|t| {
+                            let tl = t.to_lowercase();
+                            tl == table || tl.rsplit('.').next() == Some(table.as_str())
+                        })
                 })
             }
             _ => None,
@@ -570,12 +573,30 @@ impl Executor {
         }
         let combined_meta: Vec<ColMeta> =
             left_meta.iter().chain(right_meta.iter()).cloned().collect();
-        let mut rows = Vec::with_capacity(product);
-        for lr in left_rows {
-            for rr in right_rows {
-                rows.push(lr.iter().chain(rr.iter()).cloned().collect());
+        let materialize = || {
+            let mut rows = Vec::with_capacity(product);
+            for lr in left_rows {
+                // Cartesian products are a long non-yielding loop — observe
+                // wire cancellation between outer rows.
+                self.check_cancelled()?;
+                for rr in right_rows {
+                    rows.push(lr.iter().chain(rr.iter()).cloned().collect());
+                }
             }
-        }
+            Ok::<_, ExecError>(rows)
+        };
+        // Long blocking materialization on a tokio worker stalls the IO
+        // driver (delays unrelated connections, including CancelRequests) —
+        // notify the runtime.
+        let rows = match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                    && product > 100_000 =>
+            {
+                tokio::task::block_in_place(materialize)?
+            }
+            _ => materialize()?,
+        };
         Ok((combined_meta, rows))
     }
 }

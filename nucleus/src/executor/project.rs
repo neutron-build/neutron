@@ -51,6 +51,15 @@ impl Executor {
                     col_indices.push(idx);
                     expr_items.push(None);
                 }
+                // schema.table.column (Prisma's RETURNING style) — the schema
+                // part carries no information; resolve on table.column.
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 3 => {
+                    let idx =
+                        self.resolve_column(col_meta, Some(&parts[1].value), &parts[2].value)?;
+                    columns.push((col_meta[idx].name.clone(), col_meta[idx].dtype.clone()));
+                    col_indices.push(idx);
+                    expr_items.push(None);
+                }
                 SelectItem::UnnamedExpr(expr) => {
                     // Expression projection — evaluate per row.  When the
                     // result set is empty (e.g. a `LIMIT 0` probe used by the
@@ -59,9 +68,12 @@ impl Executor {
                     // the correct column type instead of defaulting to TEXT.
                     if let Some(first) = rows.first() {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
-                        columns.push((format!("{expr}"), value_type(&val)));
+                        columns.push((super::helpers::default_output_name(expr), value_type(&val)));
                     } else {
-                        columns.push((format!("{expr}"), infer_expr_type(expr, col_meta)));
+                        columns.push((
+                            super::helpers::default_output_name(expr),
+                            infer_expr_type(expr, col_meta),
+                        ));
                     }
                     col_indices.push(usize::MAX); // sentinel
                     expr_items.push(Some(expr));

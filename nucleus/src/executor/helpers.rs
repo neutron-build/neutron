@@ -416,7 +416,16 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b)),
         (Value::Int32(a), Value::Int64(b)) => Some((*a as i64).cmp(b)),
         (Value::Int64(a), Value::Int32(b)) => Some(a.cmp(&(*b as i64))),
-        (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b),
+        // PostgreSQL orders NaN as GREATER than every other float and equal to
+        // itself (unlike IEEE): `'NaN' = 'NaN'` is true, `'NaN' > 'Infinity'`
+        // is true. `partial_cmp` alone returns None for any NaN → `= / >`
+        // wrongly false.
+        (Value::Float64(a), Value::Float64(b)) => Some(match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => a.partial_cmp(b)?,
+        }),
         // Cross-type: int ↔ float promotion
         (Value::Int32(a), Value::Float64(b)) => (*a as f64).partial_cmp(b),
         (Value::Float64(a), Value::Int32(b)) => a.partial_cmp(&(*b as f64)),
@@ -430,6 +439,15 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
             Some(sa.cmp(&sb))
         }
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
+        // Date ↔ Timestamp: a date compares as midnight of that day (PG:
+        // `TIMESTAMP '2024-01-01 00:00:00' = DATE '2024-01-01'` is true). Both
+        // use the 2000-01-01 epoch; a date is days, a timestamp is microseconds.
+        (Value::Date(d), Value::Timestamp(t)) | (Value::Date(d), Value::TimestampTz(t)) => {
+            Some((*d as i64 * 86_400_000_000).cmp(t))
+        }
+        (Value::Timestamp(t), Value::Date(d)) | (Value::TimestampTz(t), Value::Date(d)) => {
+            Some(t.cmp(&(*d as i64 * 86_400_000_000)))
+        }
         (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
         (Value::TimestampTz(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
         (Value::Timestamp(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
@@ -442,6 +460,29 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
         (Value::Null, _) => Some(std::cmp::Ordering::Less),
         (_, Value::Null) => Some(std::cmp::Ordering::Greater),
+        // Cross-type: NUMERIC ↔ integer / float. `2.0::numeric = 2::int` must
+        // be Equal; without these arms it fell through to `None` (predicate
+        // false), a silent wrong result for any mixed numeric/int comparison.
+        (Value::Numeric(n), Value::Int32(i)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| d.cmp(&rust_decimal::Decimal::from(*i))),
+        (Value::Numeric(n), Value::Int64(i)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| d.cmp(&rust_decimal::Decimal::from(*i))),
+        (Value::Int32(i), Value::Numeric(n)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| rust_decimal::Decimal::from(*i).cmp(&d)),
+        (Value::Int64(i), Value::Numeric(n)) => crate::types::parse_numeric(n)
+            .ok()
+            .map(|d| rust_decimal::Decimal::from(*i).cmp(&d)),
+        (Value::Numeric(n), Value::Float64(f)) => crate::types::parse_numeric(n)
+            .ok()
+            .and_then(|d| d.to_string().parse::<f64>().ok())
+            .and_then(|nf| nf.partial_cmp(f)),
+        (Value::Float64(f), Value::Numeric(n)) => crate::types::parse_numeric(n)
+            .ok()
+            .and_then(|d| d.to_string().parse::<f64>().ok())
+            .and_then(|nf| f.partial_cmp(&nf)),
         // Cross-type: text ↔ numeric / bool / date / timestamp coercion.
         //
         // Required because pgx's `QueryExecModeSimpleProtocol` interpolates
@@ -534,6 +575,86 @@ fn parse_uuid_text(s: &str) -> Option<[u8; 16]> {
 
 /// Compare two values for ORDER BY, respecting NULLS FIRST / NULLS LAST and ASC / DESC.
 /// PostgreSQL default: NULLS LAST for ASC, NULLS FIRST for DESC.
+/// Estimate the in-memory footprint of one row (mirrors the cost model the
+/// query-memory budget reserves against). Shared by `Executor::estimate_row_bytes`
+/// and the streaming external sort so their byte accounting can never drift.
+pub(super) fn estimate_row_bytes(row: &Row) -> u64 {
+    let mut bytes: u64 = 24; // Vec overhead
+    for v in row {
+        bytes += match v {
+            Value::Null | Value::Bool(_) => 1,
+            Value::Int32(_) | Value::Date(_) => 4,
+            Value::Int64(_)
+            | Value::Float64(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_) => 8,
+            Value::Text(s) => 24 + s.len() as u64,
+            Value::Numeric(s) => 24 + s.len() as u64,
+            Value::Uuid(_) => 16,
+            Value::Bytea(b) => 24 + b.len() as u64,
+            Value::Array(a) => 24 + a.len() as u64 * 16,
+            Value::Vector(v) => 24 + v.len() as u64 * 4,
+            Value::Jsonb(_) => 64,
+            Value::Interval { .. } => 16,
+        };
+    }
+    bytes
+}
+
+/// Compare two values for ORDER BY on one key. This is the single source of truth
+/// for sort-key ordering — byte-identical to the plan-path Sort arm's per-key
+/// comparison (NULLS placement first, then `Value::cmp` reversed for DESC) — so
+/// the materialized in-place sort and the streaming external sort produce
+/// identical row order. `desc`/`nulls_first` follow the SQL defaults resolved by
+/// the caller (ASC→NULLS LAST, DESC→NULLS FIRST).
+pub(super) fn cmp_sort_key(
+    a: &Value,
+    b: &Value,
+    desc: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_null = matches!(a, Value::Null);
+    let b_null = matches!(b, Value::Null);
+    match (a_null, b_null) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let cmp = a.cmp(b);
+            if desc { cmp.reverse() } else { cmp }
+        }
+    }
+}
+
+/// Multi-key row comparison for ORDER BY: compare `a` and `b` by each
+/// `(col_idx, desc, nulls_first)` key in order, first non-equal key decides.
+/// Combined with a stable sort/merge this reproduces the plan-path Sort arm's
+/// repeated per-key stable sort exactly.
+pub(super) fn cmp_row_sort_keys(a: &Row, b: &Row, keys: &[(usize, bool, bool)]) -> std::cmp::Ordering {
+    for &(idx, desc, nulls_first) in keys {
+        let va = a.get(idx).unwrap_or(&Value::Null);
+        let vb = b.get(idx).unwrap_or(&Value::Null);
+        let ord = cmp_sort_key(va, vb, desc, nulls_first);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 pub(super) fn cmp_with_nulls(
     va: &Value,
     vb: &Value,
@@ -1817,57 +1938,42 @@ pub(super) fn value_to_ast_expr(val: &Value) -> Expr {
 
 /// Substitute outer column references in an expression tree with literal values.
 /// Used for correlated subqueries where inner expressions reference outer table columns.
-pub(super) fn substitute_outer_refs(expr: &Expr, outer_row: &Row, outer_meta: &[ColMeta]) -> Expr {
-    match expr {
-        Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
-            let table = &idents[0].value;
-            let col = &idents[1].value;
-            // Look for a match in outer columns
-            for (i, meta) in outer_meta.iter().enumerate() {
-                if let Some(ref t) = meta.table
-                    && t.eq_ignore_ascii_case(table)
-                    && meta.name.eq_ignore_ascii_case(col)
-                    && let Some(val) = outer_row.get(i)
-                {
-                    return value_to_ast_expr(val);
-                }
-            }
-            expr.clone()
-        }
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(substitute_outer_refs(left, outer_row, outer_meta)),
-            op: op.clone(),
-            right: Box::new(substitute_outer_refs(right, outer_row, outer_meta)),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(substitute_outer_refs(inner, outer_row, outer_meta)),
-        },
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_outer_refs(
-            inner, outer_row, outer_meta,
-        ))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_outer_refs(
-            inner, outer_row, outer_meta,
-        ))),
-        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_outer_refs(
-            inner, outer_row, outer_meta,
-        ))),
-        _ => expr.clone(),
-    }
-}
-
-/// Substitute outer column references in a query's WHERE/selection clauses.
+/// Substitute outer column references throughout a correlated subquery —
+/// projection, WHERE, and any nested expressions.
 pub(super) fn substitute_outer_refs_in_query(
     query: &ast::Query,
     outer_row: &Row,
     outer_meta: &[ColMeta],
 ) -> ast::Query {
+    use core::ops::ControlFlow;
     let mut q = query.clone();
-    if let ast::SetExpr::Select(ref mut sel) = *q.body
-        && let Some(ref selection) = sel.selection
-    {
-        sel.selection = Some(substitute_outer_refs(selection, outer_row, outer_meta));
-    }
+    let _ = sqlparser::ast::visit_expressions_mut(&mut q, |node: &mut Expr| {
+        if let Expr::CompoundIdentifier(idents) = node
+            && idents.len() >= 2
+        {
+            let col = idents[idents.len() - 1].value.clone();
+            let qual: String = idents[..idents.len() - 1]
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let qual_last = idents[idents.len() - 2].value.clone();
+            for (i, meta) in outer_meta.iter().enumerate() {
+                if let Some(ref t) = meta.table
+                    && meta.name.eq_ignore_ascii_case(&col)
+                    && (t.eq_ignore_ascii_case(&qual)
+                        || t.rsplit('.')
+                            .next()
+                            .is_some_and(|last| last.eq_ignore_ascii_case(&qual_last)))
+                    && let Some(val) = outer_row.get(i)
+                {
+                    *node = value_to_ast_expr(val);
+                    break;
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
     q
 }
 
@@ -1880,12 +1986,23 @@ pub(super) fn compute_window_frame_bounds(
     frame: Option<&ast::WindowFrame>,
     current_row: usize,
     partition_size: usize,
+    has_order_by: bool,
 ) -> Result<(usize, usize), ExecError> {
     let frame = match frame {
         Some(f) => f,
         None => {
-            // Default: UNBOUNDED PRECEDING to CURRENT ROW
-            return Ok((0, current_row));
+            // SQL default frame depends on ORDER BY:
+            //  - with ORDER BY: RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+            //    (a running frame),
+            //  - WITHOUT ORDER BY: the WHOLE partition.
+            // Treating the no-ORDER-BY case as running made
+            // `SUM(v) OVER (PARTITION BY g)` and `COUNT(*) OVER ()` return
+            // running totals instead of the partition total.
+            if has_order_by {
+                return Ok((0, current_row));
+            } else {
+                return Ok((0, partition_size.saturating_sub(1)));
+            }
         }
     };
 
@@ -2152,15 +2269,46 @@ pub(super) fn json_to_sparse_vec(val: &Value) -> Result<crate::sparse::SparseVec
 /// SQL LIKE pattern matching (supports % and _) using O(n*m) DP to prevent ReDoS.
 pub(super) fn like_match(text: &str, pattern: &str) -> bool {
     let t: Vec<char> = text.chars().collect();
-    let p: Vec<char> = pattern.chars().collect();
+    // Pre-tokenize the pattern honoring the default backslash escape: `\%`,
+    // `\_`, `\\` become literal characters (Wildcard::Literal), so
+    // `LIKE 'a\%b'` matches the literal string "a%b" (the raw DP treated `\`
+    // as an ordinary char and never matched).
+    enum Tok {
+        Percent,
+        Underscore,
+        Literal(char),
+    }
+    let pc: Vec<char> = pattern.chars().collect();
+    let mut p: Vec<Tok> = Vec::with_capacity(pc.len());
+    let mut i = 0;
+    while i < pc.len() {
+        match pc[i] {
+            '\\' if i + 1 < pc.len() => {
+                p.push(Tok::Literal(pc[i + 1]));
+                i += 2;
+            }
+            '%' => {
+                p.push(Tok::Percent);
+                i += 1;
+            }
+            '_' => {
+                p.push(Tok::Underscore);
+                i += 1;
+            }
+            c => {
+                p.push(Tok::Literal(c));
+                i += 1;
+            }
+        }
+    }
     let m = p.len();
 
     // dp[j] = true means pattern[0..j] matches text[0..i] (updated per row)
     let mut dp = vec![false; m + 1];
     dp[0] = true;
-    // Initialize: leading '%' chars match empty text
+    // Initialize: leading '%' toks match empty text
     for j in 0..m {
-        if p[j] == '%' {
+        if matches!(p[j], Tok::Percent) {
             dp[j + 1] = dp[j];
         } else {
             break;
@@ -2173,12 +2321,9 @@ pub(super) fn like_match(text: &str, pattern: &str) -> bool {
         for j in 0..m {
             let old = dp[j + 1]; // save dp_prev[j+1] before overwrite
             dp[j + 1] = match p[j] {
-                '%' => {
-                    // dp_prev[j+1] (skip char in text) || dp[j] (skip % in pattern)
-                    old || dp[j]
-                }
-                '_' => prev, // dp_prev[j]: one char matched
-                c => prev && tc == c,
+                Tok::Percent => old || dp[j],
+                Tok::Underscore => prev,
+                Tok::Literal(c) => prev && tc == c,
             };
             prev = old;
         }
@@ -2383,5 +2528,29 @@ pub(super) fn json_contains(left: &serde_json::Value, right: &serde_json::Value)
             b.iter().all(|bv| a.iter().any(|av| json_contains(av, bv)))
         }
         (a, b) => a == b,
+    }
+}
+
+/// PostgreSQL's default output-column name for an unaliased projection:
+/// identifiers name after their last path component, function calls after the
+/// bare (lowercased) function name, parenthesized expressions after their
+/// inner expression. Everything else keeps its rendered form.
+pub(super) fn default_output_name(expr: &sqlparser::ast::Expr) -> String {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .unwrap_or_else(|| format!("{expr}")),
+        Expr::Function(f) => f
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|i| i.value.to_lowercase())
+            .unwrap_or_else(|| format!("{expr}")),
+        Expr::Nested(inner) => default_output_name(inner),
+        _ => format!("{expr}"),
     }
 }

@@ -84,11 +84,24 @@ pub enum PolicyCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RlsPredicate {
     /// Column must equal a constant string value.
-    ColumnEqStr { column: String, value: String },
+    ColumnEqStr {
+        column: String,
+        value: String,
+        #[serde(default)]
+        column_id: u32,
+    },
     /// Column must equal the session's tenant_id.
-    ColumnEqTenant { column: String },
+    ColumnEqTenant {
+        column: String,
+        #[serde(default)]
+        column_id: u32,
+    },
     /// Column must equal the session's user.
-    ColumnEqUser { column: String },
+    ColumnEqUser {
+        column: String,
+        #[serde(default)]
+        column_id: u32,
+    },
     /// The session must have a specific role.
     HasRole { role: String },
     /// AND of two predicates.
@@ -104,18 +117,145 @@ pub enum RlsPredicate {
 }
 
 impl RlsPredicate {
+    /// Rewrite the cached column NAME of every leaf whose stable id matches
+    /// `column_id`, and report whether anything changed.
+    ///
+    /// The id is the authority; the name is a cache, kept because evaluation
+    /// looks rows up by name and dumps have to render one. `ALTER TABLE ...
+    /// RENAME COLUMN` refreshes the cache through this, so the policy keeps
+    /// meaning the same COLUMN rather than following the old name to whatever
+    /// later answers to it. Predicates loaded from a pre-id snapshot carry
+    /// `column_id == 0` and are deliberately not matched — nothing can claim
+    /// them, so they keep their name-based behaviour instead of being captured
+    /// by an unrelated column that happens to hold id 0.
+    pub fn rename_column(&mut self, column_id: u32, new_name: &str) -> bool {
+        if column_id == 0 {
+            return false;
+        }
+        match self {
+            RlsPredicate::ColumnEqStr {
+                column,
+                column_id: id,
+                ..
+            }
+            | RlsPredicate::ColumnEqTenant {
+                column,
+                column_id: id,
+            }
+            | RlsPredicate::ColumnEqUser {
+                column,
+                column_id: id,
+            } => {
+                if *id == column_id && column != new_name {
+                    *column = new_name.to_string();
+                    true
+                } else {
+                    false
+                }
+            }
+            RlsPredicate::And(a, b) | RlsPredicate::Or(a, b) => {
+                // Both sides, not short-circuited: a rename must reach every leaf.
+                let left = a.rename_column(column_id, new_name);
+                let right = b.rename_column(column_id, new_name);
+                left || right
+            }
+            RlsPredicate::Not(inner) => inner.rename_column(column_id, new_name),
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse => false,
+        }
+    }
+
+    /// Bind each leaf's stable column id by resolving its name once, at
+    /// CREATE POLICY time, against the catalog.
+    ///
+    /// After this the name is only a cache: the id is what the policy means.
+    /// `resolve` returns `None` for a name that is not a column, which
+    /// `validate_rls_columns` rejects separately — leaving the id at 0 here
+    /// keeps that the single place the error is raised.
+    pub fn bind_column_ids(&mut self, resolve: &dyn Fn(&str) -> Option<u32>) {
+        match self {
+            RlsPredicate::ColumnEqStr {
+                column,
+                column_id: id,
+                ..
+            }
+            | RlsPredicate::ColumnEqTenant {
+                column,
+                column_id: id,
+            }
+            | RlsPredicate::ColumnEqUser {
+                column,
+                column_id: id,
+            } => {
+                if let Some(resolved) = resolve(column) {
+                    *id = resolved;
+                }
+            }
+            RlsPredicate::And(a, b) | RlsPredicate::Or(a, b) => {
+                a.bind_column_ids(resolve);
+                b.bind_column_ids(resolve);
+            }
+            RlsPredicate::Not(inner) => inner.bind_column_ids(resolve),
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse => {}
+        }
+    }
+
+    /// Stable ids of every column this predicate reads.
+    ///
+    /// Used to answer "does anything depend on this column" before a DROP.
+    pub fn referenced_column_ids(&self, out: &mut Vec<u32>) {
+        match self {
+            RlsPredicate::ColumnEqStr { column_id, .. }
+            | RlsPredicate::ColumnEqTenant { column_id, .. }
+            | RlsPredicate::ColumnEqUser { column_id, .. } => {
+                if *column_id != 0 {
+                    out.push(*column_id);
+                }
+            }
+            RlsPredicate::And(a, b) | RlsPredicate::Or(a, b) => {
+                a.referenced_column_ids(out);
+                b.referenced_column_ids(out);
+            }
+            RlsPredicate::Not(inner) => inner.referenced_column_ids(out),
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse => {}
+        }
+    }
+
+    /// Column NAMES this predicate reads — the fallback dependency check for
+    /// legacy predicates that carry no id.
+    pub fn referenced_column_names(&self, out: &mut Vec<String>) {
+        match self {
+            RlsPredicate::ColumnEqStr { column, .. }
+            | RlsPredicate::ColumnEqTenant { column, .. }
+            | RlsPredicate::ColumnEqUser { column, .. } => out.push(column.clone()),
+            RlsPredicate::And(a, b) | RlsPredicate::Or(a, b) => {
+                a.referenced_column_names(out);
+                b.referenced_column_names(out);
+            }
+            RlsPredicate::Not(inner) => inner.referenced_column_names(out),
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse => {}
+        }
+    }
+
     /// Evaluate the predicate against a row (column_name → value map) and session context.
     pub fn evaluate(&self, row: &HashMap<String, String>, ctx: &SessionContext) -> bool {
         match self {
-            RlsPredicate::ColumnEqStr { column, value } => row.get(column) == Some(value),
-            RlsPredicate::ColumnEqTenant { column } => {
+            RlsPredicate::ColumnEqStr { column, value, .. } => row.get(column) == Some(value),
+            RlsPredicate::ColumnEqTenant { column, .. } => {
                 if let Some(tenant) = &ctx.tenant_id {
                     row.get(column) == Some(tenant)
                 } else {
                     false
                 }
             }
-            RlsPredicate::ColumnEqUser { column } => row.get(column) == Some(&ctx.user),
+            RlsPredicate::ColumnEqUser { column, .. } => row.get(column) == Some(&ctx.user),
             RlsPredicate::HasRole { role } => ctx.has_role(role),
             RlsPredicate::And(a, b) => a.evaluate(row, ctx) && b.evaluate(row, ctx),
             RlsPredicate::Or(a, b) => a.evaluate(row, ctx) || b.evaluate(row, ctx),
@@ -180,6 +320,66 @@ impl RlsEngine {
                 policy.table = new.to_string();
             }
             self.policies.insert(new.to_string(), policies);
+        }
+    }
+
+    /// Point every predicate on `table` that reads column `column_id` at its
+    /// new name. Returns true if anything changed.
+    ///
+    /// Matching is by stable id, so this is an exact refresh of a cached name
+    /// rather than a guess at which references meant the renamed column.
+    pub fn rename_column(&mut self, table: &str, column_id: u32, new_name: &str) -> bool {
+        let Some(policies) = self.policies.get_mut(table) else {
+            return false;
+        };
+        let mut changed = false;
+        for policy in policies.iter_mut() {
+            changed |= policy.predicate.rename_column(column_id, new_name);
+            if let Some(check) = policy.check_predicate.as_mut() {
+                changed |= check.rename_column(column_id, new_name);
+            }
+        }
+        changed
+    }
+
+    /// Names of the policies on `table` whose predicates read `column_id`, or
+    /// — for predicates predating column ids — the column named `column_name`.
+    ///
+    /// The name fallback exists because a policy loaded from a pre-id snapshot
+    /// has nothing else to match on, and silently permitting a DROP that
+    /// orphans it would be the failure this whole change is closing.
+    pub fn policies_depending_on_column(
+        &self,
+        table: &str,
+        column_id: u32,
+        column_name: &str,
+    ) -> Vec<String> {
+        let Some(policies) = self.policies.get(table) else {
+            return Vec::new();
+        };
+        let mut dependents = Vec::new();
+        for policy in policies {
+            let mut ids = Vec::new();
+            let mut names = Vec::new();
+            policy.predicate.referenced_column_ids(&mut ids);
+            policy.predicate.referenced_column_names(&mut names);
+            if let Some(check) = policy.check_predicate.as_ref() {
+                check.referenced_column_ids(&mut ids);
+                check.referenced_column_names(&mut names);
+            }
+            let by_id = column_id != 0 && ids.contains(&column_id);
+            let by_legacy_name = names.iter().any(|n| n == column_name);
+            if by_id || by_legacy_name {
+                dependents.push(policy.name.clone());
+            }
+        }
+        dependents
+    }
+
+    /// Remove the named policies from `table` (CASCADE for a column drop).
+    pub fn drop_policies_named(&mut self, table: &str, names: &[String]) {
+        if let Some(policies) = self.policies.get_mut(table) {
+            policies.retain(|p| !names.contains(&p.name));
         }
     }
 
@@ -436,6 +636,18 @@ pub struct MaskingPolicy {
     pub column: String,
     pub role: String,
     pub rule: MaskingRule,
+    /// Stable id of the masked column — see [`crate::catalog::ColumnDef::id`].
+    ///
+    /// A mask stored against a NAME stops applying when the column is renamed,
+    /// and starts applying to an unrelated column if that name is later
+    /// recreated. That failure direction is OPEN: the value is returned
+    /// unmasked, unlike an RLS predicate losing its column, which denies.
+    ///
+    /// `0` means unbound. Masking has no `CREATE` DDL surface yet, so there is
+    /// no statement at which to resolve the id; it is stamped the first time a
+    /// rename matches the rule by name, and honoured from then on.
+    #[serde(default)]
+    pub column_id: u32,
 }
 
 /// Data masking engine.
@@ -474,6 +686,66 @@ impl MaskingEngine {
                 policy.table = new.to_string();
             }
         }
+    }
+
+    /// Point every mask on `table` for the renamed column at its new name.
+    ///
+    /// Matches by stable id once one is bound, else by the old name — which is
+    /// unambiguous AT a rename, because a table cannot hold two columns of the
+    /// same name. The id is stamped while we are here, so the later hazard is
+    /// closed too: if that old name is recreated by `ADD COLUMN`, the mask stays
+    /// on the column it was written for instead of jumping to the new one.
+    pub fn rename_column(
+        &mut self,
+        table: &str,
+        column_id: u32,
+        old_name: &str,
+        new_name: &str,
+    ) -> bool {
+        let mut changed = false;
+        for policy in &mut self.policies {
+            if policy.table != table {
+                continue;
+            }
+            let matches = if policy.column_id != 0 && column_id != 0 {
+                policy.column_id == column_id
+            } else {
+                policy.column == old_name
+            };
+            if matches {
+                policy.column = new_name.to_string();
+                if column_id != 0 {
+                    policy.column_id = column_id;
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Roles whose masks on `table` read the given column, by id or by name.
+    pub fn masks_depending_on_column(
+        &self,
+        table: &str,
+        column_id: u32,
+        column_name: &str,
+    ) -> Vec<String> {
+        self.policies
+            .iter()
+            .filter(|p| {
+                p.table == table
+                    && ((column_id != 0 && p.column_id == column_id) || p.column == column_name)
+            })
+            .map(|p| p.role.clone())
+            .collect()
+    }
+
+    /// Drop every mask on `table` for the given column (CASCADE on a drop).
+    pub fn drop_masks_for_column(&mut self, table: &str, column_id: u32, column_name: &str) {
+        self.policies.retain(|p| {
+            !(p.table == table
+                && ((column_id != 0 && p.column_id == column_id) || p.column == column_name))
+        });
     }
 
     pub fn drop_table(&mut self, table: &str) {
@@ -974,9 +1246,7 @@ mod tests {
             table: "orders".into(),
             command: PolicyCommand::All,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqTenant {
-                column: "org_id".into(),
-            },
+            predicate: RlsPredicate::ColumnEqTenant { column: "org_id".into(), column_id: 0 },
             check_predicate: None,
             permissive: true,
         });
@@ -1021,9 +1291,7 @@ mod tests {
             table: "docs".into(),
             command: PolicyCommand::Select,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqUser {
-                column: "owner".into(),
-            },
+            predicate: RlsPredicate::ColumnEqUser { column: "owner".into(), column_id: 0 },
             check_predicate: None,
             permissive: true,
         });
@@ -1034,10 +1302,8 @@ mod tests {
             table: "docs".into(),
             command: PolicyCommand::Select,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqStr {
-                column: "status".into(),
-                value: "published".into(),
-            },
+            predicate: RlsPredicate::ColumnEqStr { column: "status".into(),
+                value: "published".into(), column_id: 0 },
             check_predicate: None,
             permissive: false,
         });
@@ -1066,9 +1332,7 @@ mod tests {
             table: "items".into(),
             command: PolicyCommand::Select,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqTenant {
-                column: "tenant".into(),
-            },
+            predicate: RlsPredicate::ColumnEqTenant { column: "tenant".into(), column_id: 0 },
             check_predicate: None,
             permissive: true,
         });
@@ -1110,12 +1374,14 @@ mod tests {
             column: "email".into(),
             role: "analyst".into(),
             rule: MaskingRule::EmailMask,
+            column_id: 0,
         });
         masking.add_policy(MaskingPolicy {
             table: "users".into(),
             column: "ssn".into(),
             role: "analyst".into(),
             rule: MaskingRule::Redact("***-**-****".into()),
+            column_id: 0,
         });
 
         let analyst_ctx = SessionContext::new("bob").with_role("analyst");
@@ -1195,9 +1461,7 @@ mod tests {
             table: "orders".into(),
             command: PolicyCommand::All,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqTenant {
-                column: "org_id".into(),
-            },
+            predicate: RlsPredicate::ColumnEqTenant { column: "org_id".into(), column_id: 0 },
             check_predicate: None,
             permissive: true,
         });
@@ -1208,6 +1472,7 @@ mod tests {
             column: "customer_email".into(),
             role: "support".into(),
             rule: MaskingRule::EmailMask,
+            column_id: 0,
         });
 
         let ctx = SessionContext::new("agent")
@@ -1430,5 +1695,67 @@ mod tests {
         assert_eq!(mgr.key_count(), 3);
         let (_, _, mat) = mgr.active_key().unwrap();
         assert_eq!(mat, &[3]);
+    }
+}
+
+#[cfg(test)]
+mod masking_identity_tests {
+    use super::*;
+
+    fn mask(table: &str, column: &str) -> MaskingPolicy {
+        MaskingPolicy {
+            table: table.into(),
+            column: column.into(),
+            role: "analyst".into(),
+            rule: MaskingRule::Redact("***".into()),
+            column_id: 0,
+        }
+    }
+
+    /// A renamed column must keep its mask. Losing it fails OPEN — the value is
+    /// returned unmasked — which is the opposite direction from an RLS
+    /// predicate losing its column, and the reason this is worth closing even
+    /// while masking has no DDL surface yet.
+    #[test]
+    fn rename_column_keeps_the_mask_and_binds_the_id() {
+        let mut engine = MaskingEngine::new();
+        engine.add_policy(mask("people", "ssn"));
+
+        assert!(engine.rename_column("people", 7, "ssn", "national_id"));
+        let policy = &engine.all_policies()[0];
+        assert_eq!(policy.column, "national_id");
+        assert_eq!(policy.column_id, 7, "the id should be stamped while renaming");
+
+        // The escalation the id closes: recreate the old name. The mask must
+        // stay on the column it was written for.
+        assert!(!engine.rename_column("people", 9, "ssn", "decoy"));
+        assert_eq!(engine.all_policies()[0].column, "national_id");
+    }
+
+    #[test]
+    fn dropping_a_masked_column_removes_its_mask() {
+        let mut engine = MaskingEngine::new();
+        engine.add_policy(mask("people", "ssn"));
+        assert_eq!(
+            engine.masks_depending_on_column("people", 0, "ssn"),
+            vec!["analyst".to_string()]
+        );
+        engine.drop_masks_for_column("people", 0, "ssn");
+        assert!(engine.all_policies().is_empty());
+    }
+
+    /// A mask on another table must not be touched by this table's rename.
+    #[test]
+    fn rename_column_does_not_reach_other_tables() {
+        let mut engine = MaskingEngine::new();
+        engine.add_policy(mask("people", "ssn"));
+        engine.add_policy(mask("staff", "ssn"));
+        engine.rename_column("people", 7, "ssn", "national_id");
+        let staff = engine
+            .all_policies()
+            .iter()
+            .find(|p| p.table == "staff")
+            .unwrap();
+        assert_eq!(staff.column, "ssn");
     }
 }

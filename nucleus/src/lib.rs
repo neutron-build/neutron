@@ -2,6 +2,7 @@
 pub mod advisor;
 pub mod allocator;
 pub mod backup;
+pub mod bench_paired;
 pub mod blob;
 pub mod branching;
 pub mod cache;
@@ -22,6 +23,7 @@ pub mod inference;
 pub mod kv;
 pub mod memory;
 pub mod metrics;
+pub mod ops;
 pub mod pitr;
 pub mod planner;
 pub mod procedures;
@@ -43,7 +45,6 @@ pub mod versioning;
 #[cfg(feature = "server")]
 pub mod background;
 #[cfg(feature = "server")]
-pub mod binary_wire;
 #[cfg(feature = "server")]
 pub mod cli;
 #[cfg(feature = "server")]

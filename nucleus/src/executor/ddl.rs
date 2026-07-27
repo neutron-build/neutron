@@ -34,6 +34,31 @@ use super::types::{
 };
 use super::{ExecError, ExecResult, Executor};
 
+/// RAII bracket for a wholesale table rewrite (ALTER column add/drop): tells
+/// the storage engine unique-probe candidates are unreliable until the
+/// rewrite (including its index rebuild) finishes — released on drop so an
+/// error path cannot leave the engine in fallback mode forever.
+struct RewriteGuard {
+    engine: std::sync::Arc<dyn crate::storage::StorageEngine>,
+    table: String,
+}
+
+impl RewriteGuard {
+    fn new(engine: std::sync::Arc<dyn crate::storage::StorageEngine>, table: &str) -> Self {
+        engine.begin_table_rewrite(table);
+        Self {
+            engine,
+            table: table.to_string(),
+        }
+    }
+}
+
+impl Drop for RewriteGuard {
+    fn drop(&mut self) {
+        self.engine.end_table_rewrite(&self.table);
+    }
+}
+
 /// Sidecar metadata (`<data_dir>/engines.json`) describing per-table engine
 /// overrides so they can be re-registered at boot. Without this, a table
 /// created `WITH (engine='mergetree')` silently fell back to the default
@@ -83,6 +108,47 @@ impl Executor {
         let tmp = path.with_extension("json.tmp");
         if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
             tracing::warn!("failed to persist engines.json: {e}");
+        }
+    }
+
+    /// Rewrite a renamed column everywhere the durable engine sidecar names it.
+    ///
+    /// `TableEngineMeta` records ORDER BY, the version column, and the aggregate
+    /// column lists as NAMES, in `engines.json`. Nothing rewrote them on RENAME
+    /// COLUMN, so the stale name survived a restart and the MergeTree/columnar
+    /// engine kept ordering and de-duplicating against a column that no longer
+    /// existed. Table rename was already handled (`rename_override_engine`);
+    /// column rename was not.
+    pub(super) fn rename_engine_meta_column(&self, table: &str, old: &str, new: &str) {
+        if self.data_dir.is_none() {
+            return;
+        }
+        let mut metas = self.load_engines_meta();
+        let Some(meta) = metas.get_mut(table) else {
+            return;
+        };
+        let mut changed = false;
+        let swap = |slot: &mut String| {
+            if slot == old {
+                *slot = new.to_string();
+                return true;
+            }
+            false
+        };
+        for column in &mut meta.order_by {
+            changed |= swap(column);
+        }
+        for column in &mut meta.sum_columns {
+            changed |= swap(column);
+        }
+        for column in &mut meta.count_columns {
+            changed |= swap(column);
+        }
+        if let Some(version) = meta.version_column.as_mut() {
+            changed |= swap(version);
+        }
+        if changed {
+            self.save_engines_meta(&metas);
         }
     }
 
@@ -519,7 +585,7 @@ impl Executor {
         &self,
         create: ast::CreateTable,
     ) -> Result<ExecResult, ExecError> {
-        let table_name = create.name.to_string();
+        let table_name = crate::sql::object_name_key(&create.name);
         let mut columns = sql::extract_columns(&create.columns)?;
         let mut constraints = sql::extract_constraints(&create.columns, &create.constraints);
         let primary_key_declarations = create
@@ -1034,10 +1100,14 @@ impl Executor {
         names: Vec<ast::ObjectName>,
         if_exists: bool,
     ) -> Result<ExecResult, ExecError> {
+        // Dropping an object is at least as privileged as truncating one, which
+        // already required superuser. A restricted principal could otherwise
+        // destroy a policy-protected table and its policies outright.
+        self.require_security_admin("drop an object")?;
         match object_type {
             ast::ObjectType::Table => {
                 for name in &names {
-                    let table_name = name.to_string();
+                    let table_name = crate::sql::object_name_key(name);
                     // Check for dependent views before dropping.
                     {
                         let deps = self.view_deps.read();
@@ -1234,7 +1304,7 @@ impl Executor {
             .name
             .map(|n| n.to_string())
             .unwrap_or_else(|| "unnamed_idx".to_string());
-        let table_name = create_index.table_name.to_string();
+        let table_name = crate::sql::object_name_key(&create_index.table_name);
 
         // Verify table exists and reject duplicate names before constructing
         // any live index state. Otherwise `IF NOT EXISTS` could overwrite an
@@ -1262,7 +1332,7 @@ impl Executor {
         let columns: Vec<String> = create_index
             .columns
             .iter()
-            .map(|col| col.column.expr.to_string())
+            .map(crate::sql::index_column_name)
             .collect();
 
         // Determine index type from USING clause
@@ -1436,6 +1506,7 @@ impl Executor {
                         }
                     }
 
+                    self.cross_model_touch_vector(&index_name);
                     self.vector_indexes.write().insert(
                         index_name.clone(),
                         VectorIndexEntry {
@@ -1506,6 +1577,7 @@ impl Executor {
                         }
                     }
 
+                    self.cross_model_touch_vector(&index_name);
                     self.vector_indexes.write().insert(
                         index_name.clone(),
                         VectorIndexEntry {
@@ -1616,7 +1688,7 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         self.require_security_admin("truncate tables")?;
         for target in &truncate.table_names {
-            let table_name = target.name.to_string();
+            let table_name = crate::sql::object_name_key(&target.name);
             // Route to the table's actual engine (T0.3): a columnar/mergetree/lsm
             // table's rows live in its per-table override engine, not the base
             // heap. Truncating `self.storage` for such a table dropped/recreated
@@ -1663,8 +1735,22 @@ impl Executor {
         &self,
         alter_table: ast::AlterTable,
     ) -> Result<ExecResult, ExecError> {
-        let table_name = alter_table.name.to_string();
+        let table_name = crate::sql::object_name_key(&alter_table.name);
         let table_def = self.get_table(&table_name).await?;
+
+        // Structural DDL is privileged, not just the RLS-specific operations
+        // below. Without this, a policy-restricted principal could rewrite the
+        // column its own policy reads:
+        //
+        //   ALTER TABLE docs RENAME COLUMN owner TO owner_real;
+        //   ALTER TABLE docs ADD COLUMN owner TEXT DEFAULT 'alice';
+        //
+        // The ADD backfills every existing row, hidden ones included, and
+        // policies are stored by column NAME, so the predicate then matches
+        // everything. DROP COLUMN is the shorter version of the same move.
+        // TRUNCATE already required superuser here while ALTER and DROP did
+        // not, which is the asymmetry that gave this away.
+        self.require_security_admin("alter a table")?;
 
         for op in &alter_table.operations {
             match op {
@@ -1765,6 +1851,19 @@ impl Executor {
                         security.rls.rename_table(&table_name, &new);
                         security.masking.rename_table(&table_name, &new);
                     }
+                    // GRANTs are keyed by table name too, and used to be left
+                    // behind here — the policies followed the table and the
+                    // privileges did not, so every grantee silently lost access
+                    // to the renamed table. It was invisible for as long as
+                    // privileges were not consulted on reads.
+                    {
+                        let mut roles = self.roles.write().await;
+                        for role in roles.values_mut() {
+                            if let Some(privs) = role.privileges.remove(&table_name) {
+                                role.privileges.insert(new.clone(), privs);
+                            }
+                        }
+                    }
                     self.bump_policy_gen();
                 }
                 ast::AlterTableOperation::AddColumn {
@@ -1805,6 +1904,11 @@ impl Executor {
                         data_type: dtype,
                         nullable,
                         default_expr: default_expr.clone(),
+                        // A fresh id, never a dropped column's. Reusing one
+                        // would let a stored reference to the dropped column
+                        // silently resolve to this new one — which is the
+                        // rename-then-re-add attack with extra steps.
+                        id: table_def.next_column_id(),
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col);
@@ -1831,16 +1935,20 @@ impl Executor {
                     };
 
                     let engine = self.storage_for(&table_name);
+                    let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
                     // Read existing rows with the engine's pre-ALTER schema so
                     // old tuples deserialize at their original width, then widen
-                    // each with the new column's default value.
-                    let rows = engine.scan(&table_name).await?;
+                    // each with the new column's default value. scan_physical:
+                    // update() addresses VERSION indices — a plain scan's
+                    // enumeration positions drift from them under concurrent
+                    // churn, and the rewrite then lands on the WRONG rows
+                    // (duplicated PKs under the concurrency probe).
+                    let rows = engine.scan_physical(&table_name).await?;
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
-                        .enumerate()
-                        .map(|(i, mut r)| {
+                        .map(|(vidx, mut r)| {
                             r.push(default_val.clone());
-                            (i, r)
+                            (vidx, r)
                         })
                         .collect();
                     // Sync the engine's cached column schema to the new shape
@@ -1861,8 +1969,70 @@ impl Executor {
                 ast::AlterTableOperation::DropColumn {
                     column_names,
                     if_exists,
+                    drop_behavior,
                     ..
                 } => {
+                    // A policy reading a column that is about to disappear must
+                    // not be left dangling. PostgreSQL raises a dependency error
+                    // and drops the dependent objects only under CASCADE; do the
+                    // same, because the alternative — silently keeping a policy
+                    // whose column is gone — is how a guard stops guarding
+                    // without anyone being told.
+                    let cascade = matches!(drop_behavior, Some(ast::DropBehavior::Cascade));
+                    for col_name in column_names {
+                        let col_str = col_name.to_string();
+                        let column_id = table_def.column_id(&col_str).unwrap_or(0);
+                        let (dependents, masked_roles) = {
+                            let security = self.security.read();
+                            (
+                                security.rls.policies_depending_on_column(
+                                    &table_name,
+                                    column_id,
+                                    &col_str,
+                                ),
+                                security.masking.masks_depending_on_column(
+                                    &table_name,
+                                    column_id,
+                                    &col_str,
+                                ),
+                            )
+                        };
+                        // A mask on a dropped column is not a dangling guard the
+                        // way a policy is — the column it protected is gone, so
+                        // there is nothing left to leak. Drop the masks with it
+                        // rather than blocking on them, but do it explicitly so
+                        // they cannot resurface against a recreated name.
+                        if !masked_roles.is_empty() {
+                            let mut security = self.security.write();
+                            security.masking.drop_masks_for_column(
+                                &table_name,
+                                column_id,
+                                &col_str,
+                            );
+                        }
+                        if dependents.is_empty() {
+                            continue;
+                        }
+                        if !cascade {
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "cannot drop column \"{col_str}\" because policy \"{}\" depends on it{}; \
+                                 use DROP COLUMN ... CASCADE to drop the {} as well",
+                                dependents[0],
+                                if dependents.len() > 1 {
+                                    format!(" (and {} more)", dependents.len() - 1)
+                                } else {
+                                    String::new()
+                                },
+                                if dependents.len() > 1 { "policies" } else { "policy" }
+                            )));
+                        }
+                        {
+                            let mut security = self.security.write();
+                            security.rls.drop_policies_named(&table_name, &dependents);
+                        }
+                        self.bump_policy_gen();
+                    }
+
                     let mut updated = (*table_def).clone();
                     let mut drop_indices = Vec::new();
                     for col_name in column_names {
@@ -1967,20 +2137,21 @@ impl Executor {
                     }
                     self.catalog.update_table(updated).await?;
 
-                    // Remove column data from existing rows
+                    // Remove column data from existing rows (scan_physical:
+                    // version indices, not scan positions — see AddColumn).
                     let engine = self.storage_for(&table_name);
-                    let rows = engine.scan(&table_name).await?;
+                    let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
+                    let rows = engine.scan_physical(&table_name).await?;
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
-                        .enumerate()
-                        .map(|(i, r)| {
+                        .map(|(vidx, r)| {
                             let new_row: Vec<Value> = r
                                 .into_iter()
                                 .enumerate()
                                 .filter(|(j, _)| !drop_indices.contains(j))
                                 .map(|(_, v)| v)
                                 .collect();
-                            (i, new_row)
+                            (vidx, new_row)
                         })
                         .collect();
                     if !updates.is_empty() {
@@ -2088,6 +2259,86 @@ impl Executor {
                     }
                     self.btree_indexes
                         .remove(&(table_name.clone(), old_column_name.value.clone()));
+
+                    // Derived-index registries key their entries by column NAME.
+                    //
+                    // Measured, not assumed: entries backed by a catalog
+                    // IndexDef are ALREADY repaired, because the index rewrite
+                    // above drops and recreates them under the new name — a
+                    // regression test with this block disabled still passes.
+                    // This is therefore belt-and-braces, kept because it makes
+                    // the invariant explicit rather than incidental to the
+                    // drop/recreate path, and covers any entry that has no
+                    // catalog index behind it. It is not a fix for an observed
+                    // defect, and should not be described as one.
+                    for entry in self.vector_indexes.write().values_mut() {
+                        if entry.table_name == table_name
+                            && entry.column_name == old_column_name.value
+                        {
+                            entry.column_name = new_column_name.value.clone();
+                        }
+                    }
+                    for entry in self.encrypted_indexes.write().values_mut() {
+                        if entry.table_name == table_name
+                            && entry.column_name == old_column_name.value
+                        {
+                            entry.column_name = new_column_name.value.clone();
+                        }
+                    }
+                    for entry in self.gin_indexes.write().values_mut() {
+                        if entry.table_name == table_name
+                            && entry.column_name == old_column_name.value
+                        {
+                            entry.column_name = new_column_name.value.clone();
+                        }
+                    }
+
+                    // MergeTree/columnar engine metadata is DURABLE (engines.json)
+                    // and names its columns, so a stale entry survives restart —
+                    // ORDER BY, the version column, and the aggregate column
+                    // lists would all keep naming a column that no longer exists.
+                    self.rename_engine_meta_column(
+                        &table_name,
+                        &old_column_name.value,
+                        &new_column_name.value,
+                    );
+
+                    // Refresh every policy predicate that names this column,
+                    // matched by the column's STABLE ID rather than by its old
+                    // name. The id did not change, so this is an exact rewrite
+                    // of a cached name — not a guess about which references
+                    // meant this column.
+                    //
+                    // Nothing did this before, so a rename left policies naming
+                    // a column that no longer existed. That failed closed on its
+                    // own (the predicate's name is absent from the row map, so
+                    // the row is denied), but `ADD COLUMN` could then recreate
+                    // the old name and the policy would silently start guarding
+                    // the new, attacker-chosen column instead.
+                    if let Some(column_id) = table_def.column_id(&old_column_name.value) {
+                        let mut security = self.security.write();
+                        let renamed = security.rls.rename_column(
+                            &table_name,
+                            column_id,
+                            &new_column_name.value,
+                        );
+                        // Masks need the same treatment, and their failure
+                        // direction is worse: an RLS predicate that loses its
+                        // column denies, a mask that loses its column returns
+                        // the value UNMASKED.
+                        let remasked = security.masking.rename_column(
+                            &table_name,
+                            column_id,
+                            &old_column_name.value,
+                            &new_column_name.value,
+                        );
+                        drop(security);
+                        if renamed || remasked {
+                            // Cached plans and result caches keyed on the policy
+                            // generation must not serve pre-rename results.
+                            self.bump_policy_gen();
+                        }
+                    }
                 }
                 ast::AlterTableOperation::AlterColumn { column_name, op } => {
                     let mut updated = (*table_def).clone();
@@ -2219,7 +2470,7 @@ impl Executor {
                             let columns: Vec<String> = pk
                                 .columns
                                 .iter()
-                                .map(|c| c.column.expr.to_string())
+                                .map(crate::sql::index_column_name)
                                 .collect();
                             // Validate columns exist.
                             for col_name in &columns {
@@ -2269,7 +2520,7 @@ impl Executor {
                             let columns: Vec<String> = u
                                 .columns
                                 .iter()
-                                .map(|c| c.column.expr.to_string())
+                                .map(crate::sql::index_column_name)
                                 .collect();
                             // Validate columns exist.
                             for col_name in &columns {
@@ -2344,7 +2595,7 @@ impl Executor {
                             let constraint_name = fk.name.as_ref().map(|n| n.to_string());
                             let columns: Vec<String> =
                                 fk.columns.iter().map(|c| c.value.clone()).collect();
-                            let ref_table = fk.foreign_table.to_string();
+                            let ref_table = crate::sql::object_name_key(&fk.foreign_table);
                             let ref_columns: Vec<String> = fk
                                 .referred_columns
                                 .iter()
@@ -3154,7 +3405,7 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         let (pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed) =
             if let Some(ref table_name) = vacuum_stmt.table_name {
-                let table = table_name.to_string().to_lowercase();
+                let table = crate::sql::object_name_key(table_name).to_lowercase();
                 self.storage.vacuum(&table).await?
             } else {
                 self.storage.vacuum_all().await?

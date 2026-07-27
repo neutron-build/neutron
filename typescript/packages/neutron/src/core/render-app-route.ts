@@ -13,8 +13,13 @@ import type * as preact from "preact";
 import { escapeHtml } from "./escape.js";
 import { encodeSerializedPayloadAsJson, serializeForInlineScript } from "./serialization.js";
 import { assertRenderedFragment, decodeChunkStart } from "./fragment-guard.js";
-import { renderDocumentHead } from "./seo.js";
-import { resolveHeadHtml } from "./head.js";
+import {
+  renderDocumentHead,
+  buildHtmlOpenTag,
+  buildBodyOpenTag,
+  type SeoMetaInput,
+} from "./seo.js";
+import { resolveHeadDocument } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
 import { renderToString } from "preact-render-to-string";
 import type {
@@ -350,13 +355,17 @@ function renderErrorResponse(
   });
 }
 
-function buildHtmlPrefix(pathname: string, headHtml: string = ""): string {
+function buildHtmlPrefix(
+  pathname: string,
+  headHtml: string = "",
+  seo: SeoMetaInput | null = null
+): string {
   return `<!DOCTYPE html>
-<html lang="en">
+${buildHtmlOpenTag(seo?.htmlAttrs)}
 <head>
 ${headHtml || renderDocumentHead(pathname, null)}
 </head>
-<body>
+${buildBodyOpenTag(seo?.bodyAttrs)}
 <div id="app">`;
 }
 
@@ -405,9 +414,10 @@ function wrapHtml(
   actionData?: unknown,
   clientEntryScriptSrc: string | null = null,
   includeClientRuntime: boolean = true,
-  nonce?: string
+  nonce?: string,
+  seo: SeoMetaInput | null = null
 ): string {
-  return `${buildHtmlPrefix(pathname, headHtml)}${content}${buildHtmlSuffix(
+  return `${buildHtmlPrefix(pathname, headHtml, seo)}${content}${buildHtmlSuffix(
     loaderData,
     actionData,
     clientEntryScriptSrc,
@@ -468,6 +478,8 @@ interface RenderAppRouteHtmlResponseArgs {
   element: preact.VNode;
   pathname: string;
   headHtml: string;
+  /** Merged SeoMetaInput from the route chain — source of htmlAttrs/bodyAttrs. */
+  seo?: SeoMetaInput | null;
   loaderData: Record<string, unknown>;
   actionData?: unknown;
   clientEntryScriptSrc: string | null;
@@ -500,7 +512,8 @@ async function renderAppRouteHtmlResponse(
       args.actionData,
       args.clientEntryScriptSrc,
       args.includeClientRuntime,
-      args.nonce
+      args.nonce,
+      args.seo ?? null
     );
   };
 
@@ -509,7 +522,7 @@ async function renderAppRouteHtmlResponse(
     return new Response(composeFullDocument(), { headers });
   }
 
-  const shellPrefix = buildHtmlPrefix(args.pathname, args.headHtml);
+  const shellPrefix = buildHtmlPrefix(args.pathname, args.headHtml, args.seo ?? null);
   const shellSuffix = buildHtmlSuffix(
     args.loaderData,
     args.actionData,
@@ -869,7 +882,7 @@ export async function renderAppRoute(
       typeof (context as { cspNonce?: unknown }).cspNonce === "string"
         ? ((context as { cspNonce?: unknown }).cspNonce as string)
         : undefined;
-    const headHtml = await resolveHeadHtml(
+    const { headHtml, seo } = await resolveHeadDocument(
       allRoutes.map((route) => ({ route, module: routeModules.get(route.id) })),
       {
         request,
@@ -923,6 +936,7 @@ export async function renderAppRoute(
         loaderData,
         actionData,
         headHtml,
+        seo,
         clientEntryScriptSrc,
         includeClientRuntime,
         headers: routeHeaders,

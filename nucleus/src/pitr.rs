@@ -70,10 +70,34 @@ pub fn restore_pitr(
     force: bool,
 ) -> io::Result<PitrReport> {
     // 1. Lay down the physical base (format-locked, refuses a dirty target).
-    crate::backup::restore_data_dir(base_snapshot, out_data_dir, force, nucleus_version)?;
+    let manifest =
+        crate::backup::restore_data_dir(base_snapshot, out_data_dir, force, nucleus_version)?;
 
     // 2. Resolve the target LSN.
     let target_lsn = resolve_target_lsn(archive_dir, target)?;
+
+    // 3. Refuse a target older than the base.
+    //
+    // Replay can only move forward. If the base was taken at LSN 5000 and the
+    // operator asks for 4100 — say, to undo a destructive DELETE that ran at
+    // 4200 — the base pages already carry that delete, and every reconstructed
+    // record is older than the page LSNs, so recovery correctly applies none of
+    // them. The result is a database at 5000 with the delete intact, and the
+    // report used to say `target_lsn: 4100, restored_lsn: 4100` and success.
+    // The operator believes the rollback happened. Rolling BACK requires an
+    // older base, which is a different snapshot, so this cannot be repaired
+    // here — it can only be reported.
+    if manifest.consistent_lsn > 0 && target_lsn < manifest.consistent_lsn {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot restore to LSN {target_lsn}: the base snapshot is already consistent at \
+                 LSN {} and replay only moves forward, so the result would silently be the base. \
+                 Use a base snapshot taken at or before the target.",
+                manifest.consistent_lsn
+            ),
+        ));
+    }
 
     // 3. Locate the restored WAL locations for this db file.
     let db_path = Path::new(db_file);
@@ -191,8 +215,19 @@ fn resolve_target_lsn(archive_dir: &Path, target: PitrTarget) -> io::Result<u64>
                 }
             }
             if !matched {
-                // No segment archived by the target time → restore to base only.
-                Ok(0)
+                // No segment was archived at or before the target time. This
+                // used to return 0 — "restore to base only" — which quietly
+                // assumes the base is older than the target. It need not be:
+                // with a base newer than the requested time, that hands back a
+                // database FAR ahead of what was asked for and reports success.
+                // Nothing here can produce the requested state, so say so.
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "no WAL segment was archived at or before the requested time; \
+                     the archive cannot reconstruct that point, and restoring the base \
+                     alone would silently give a different (likely newer) state"
+                        .to_string(),
+                ))
             } else {
                 Ok(best)
             }

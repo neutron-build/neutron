@@ -113,6 +113,73 @@ impl DiskManager {
         }
     }
 
+    /// The on-disk byte size of one page slot, including any compression and
+    /// encryption overhead. Exposed so a physical backup can copy the file
+    /// slot-by-slot (see [`DiskManager::read_slot_raw`]) instead of streaming
+    /// bytes that may straddle a concurrent page write.
+    pub fn slot_size(&self) -> usize {
+        self.page_disk_size()
+    }
+
+    /// Number of whole page slots currently in the file.
+    pub fn slot_count(&self) -> std::io::Result<u32> {
+        let len = self.file.lock().unwrap().metadata()?.len();
+        Ok((len / self.page_disk_size() as u64) as u32)
+    }
+
+    /// Read one page slot's raw on-disk bytes (still compressed/encrypted).
+    ///
+    /// Paired with [`DiskManager::decode_slot`], this lets a caller copy the
+    /// exact bytes it validated: validating a separately-issued `read_page`
+    /// would prove nothing about the bytes actually written to the copy, since
+    /// a concurrent writer could land between the two reads.
+    pub fn read_slot_raw(&self, page_id: u32, raw: &mut Vec<u8>) -> std::io::Result<()> {
+        let disk_size = self.page_disk_size();
+        raw.resize(disk_size, 0);
+        let offset = page_id as u64 * disk_size as u64;
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(raw)
+    }
+
+    /// Decode raw slot bytes (as returned by [`DiskManager::read_slot_raw`])
+    /// into a plaintext page image.
+    pub fn decode_slot(&self, raw: &[u8], buf: &mut PageBuf) -> std::io::Result<()> {
+        if raw.len() != self.page_disk_size() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "slot is {} bytes, expected {}",
+                    raw.len(),
+                    self.page_disk_size()
+                ),
+            ));
+        }
+        if let Some(ref enc) = self.encryptor {
+            if self.compression_enabled {
+                let decrypted = enc.decrypt_bytes(raw).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                let page = PageCompressor::decompress_page(&decrypted).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                buf.copy_from_slice(&page);
+            } else {
+                let d = enc.decrypt_page(raw).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                buf.copy_from_slice(&d);
+            }
+        } else if self.compression_enabled {
+            let page = PageCompressor::decompress_page(raw)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            buf.copy_from_slice(&page);
+        } else {
+            buf.copy_from_slice(&raw[..PAGE_SIZE]);
+        }
+        Ok(())
+    }
+
     /// Read a page from disk into the buffer.
     /// Read path: disk → decrypt → decompress → page
     pub fn read_page(&self, page_id: u32, buf: &mut PageBuf) -> std::io::Result<()> {

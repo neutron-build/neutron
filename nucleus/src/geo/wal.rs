@@ -162,20 +162,34 @@ impl GeoWal {
             self.writer.lock().flush()?;
         }
 
-        // Truncate and rewrite as single SNAPSHOT entry
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(&[ENTRY_SNAPSHOT])?;
-        w.write_all(&payload)?;
-        w.flush()?;
-        drop(w);
-
+        // CRASH SAFETY: stage the snapshot, fsync it, then swap it in with an
+        // atomic rename. Truncating the live log first destroyed the only
+        // durable copy — a crash before the rewrite finished lost every point.
+        // (Same defect the crash matrix found in the MVCC WAL compaction; the
+        // graph and blob WALs already use this pattern.)
+        let tmp_path = self.path.with_extension("wal.compacting");
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut w = BufWriter::new(file);
+            w.write_all(&[ENTRY_SNAPSHOT])?;
+            w.write_all(&payload)?;
+            w.flush()?;
+            w.get_ref().sync_all()?;
+        }
+        let mut guard = self.writer.lock();
+        std::fs::rename(&tmp_path, &self.path)?;
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
         // Re-open in append mode for future writes
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *guard = BufWriter::new(file);
         Ok(())
     }
 }

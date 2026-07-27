@@ -17,6 +17,7 @@ pub mod compression;
 #[cfg(feature = "server")]
 pub mod disk;
 #[cfg(feature = "server")]
+pub mod crashpoint;
 pub mod disk_engine;
 pub mod encrypted_index;
 pub mod encryption;
@@ -37,6 +38,7 @@ pub mod page;
 pub mod persistence;
 pub mod tuple;
 pub mod txn;
+pub mod value_codec;
 pub mod wal;
 pub(crate) mod wal_util;
 
@@ -101,6 +103,19 @@ impl FilterOp {
 /// Principle 1: subsystems interact through clean abstractions.
 #[async_trait::async_trait]
 pub trait StorageEngine: Send + Sync {
+    /// The backup coordinator for this engine, when it has one.
+    ///
+    /// This is the route a RUNNING server uses to back itself up. An external
+    /// process cannot take a consistent snapshot of a live data directory —
+    /// it holds no locks and sees no LSNs — which is why PostgreSQL has
+    /// `pg_basebackup` talk to the server rather than read its files. The
+    /// executor holds an `Arc<dyn StorageEngine>` with no path to the concrete
+    /// engine underneath, so the trait must offer the handle explicitly.
+    /// Engines with no physical snapshot (memory, MVCC) correctly return None.
+    fn as_backup_coordinator(&self) -> Option<&dyn crate::backup::BackupCoordinator> {
+        None
+    }
+
     async fn create_table(&self, table: &str) -> Result<(), StorageError>;
     async fn drop_table(&self, table: &str) -> Result<(), StorageError>;
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError>;
@@ -120,13 +135,26 @@ pub trait StorageEngine: Send + Sync {
     /// Update rows enforcing the given UNIQUE/PK column sets atomically on the new
     /// values (so concurrent updates can't move two rows to the same key).
     /// `updates` are `(position, new_row)`. Default: plain `update()`.
+    /// Update rows that change a PRIMARY KEY or UNIQUE column.
+    ///
+    /// Takes `(position, read row, new row)` for the same reason
+    /// [`update_if_unchanged`](Self::update_if_unchanged) does: the executor
+    /// resolves a position and then awaits before writing, and on the paged
+    /// engines a position is a physical address whose slot a concurrent
+    /// DELETE + INSERT can hand to a different row inside that window. The
+    /// default delegates to `update_if_unchanged`, so an engine that checks
+    /// identity there checks it here too.
+    ///
+    /// This used to take `(position, new row)` and call `update()` directly,
+    /// which left the identity re-check absent on exactly the updates where
+    /// writing the wrong row produces a duplicate primary key.
     async fn update_unique(
         &self,
         table: &str,
-        updates: &[(usize, Row)],
+        updates: &[(usize, Row, Row)],
         _unique_col_sets: &[Vec<usize>],
     ) -> Result<usize, StorageError> {
-        self.update(table, updates).await
+        self.update_if_unchanged(table, updates).await
     }
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError>;
     /// Scan all visible rows WITHOUT recording SIREAD locks. For INTERNAL
@@ -167,6 +195,57 @@ pub trait StorageEngine: Send + Sync {
     /// Update rows at the given scan-order positions with new row values.
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError>;
 
+    /// Update rows the caller resolved earlier, carrying the row it read
+    /// (`(position, read, new)`), and apply each write only if the position
+    /// still addresses that row.
+    ///
+    /// A statement resolves positions, then awaits — triggers, RLS, CHECK/FK
+    /// constraints, derived-index maintenance — before writing. On an engine
+    /// whose positions are physical addresses, the row can be deleted and its
+    /// address handed to a different row inside that window, and a write that
+    /// trusted the address alone would overwrite an unrelated row (leaving two
+    /// rows with the same primary key). Engines whose positions are stable row
+    /// identities for the life of the row need no re-check.
+    ///
+    /// Default: ignore the read row and delegate to `update()`.
+    async fn update_if_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<usize, StorageError> {
+        let plain: Vec<(usize, Row)> = updates
+            .iter()
+            .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
+            .collect();
+        self.update(table, &plain).await
+    }
+
+    /// Delete counterpart of [`update_if_unchanged`](Self::update_if_unchanged):
+    /// `(position, row the caller read)`.
+    ///
+    /// Default: ignore the positions and re-resolve each target against a fresh
+    /// scan by matching the row. An engine whose positions are dense scan
+    /// ordinals (`MemoryEngine` removes from a `Vec`, so every later ordinal
+    /// shifts down) renumbers on every delete, including the ones a cascade
+    /// performs partway through this same statement, so an ordinal resolved
+    /// earlier means nothing by the time it is used. Each target consumes at
+    /// most one row, so a target list that is a subset of several identical
+    /// rows deletes only as many as were asked for.
+    async fn delete_if_unchanged(
+        &self,
+        table: &str,
+        targets: &[(usize, Row)],
+    ) -> Result<usize, StorageError> {
+        let mut current = self.scan_physical(table).await?;
+        let mut positions = Vec::with_capacity(targets.len());
+        for (_, wanted) in targets {
+            if let Some(i) = current.iter().position(|(_, row)| row == wanted) {
+                positions.push(current.remove(i).0);
+            }
+        }
+        self.delete(table, &positions).await
+    }
+
     /// Re-read a table's column schema from the catalog into any cache the
     /// engine keeps. Called after ALTER TABLE so an engine that caches its own
     /// column types (e.g. the disk engine's meta page) stays consistent with
@@ -181,6 +260,15 @@ pub trait StorageEngine: Send + Sync {
     /// backfill performs (the incremental index maintenance during that rewrite
     /// reads pre-widen tuples against the post-widen schema and can leave stale
     /// entries). Default: no-op, for engines that don't keep secondary indexes.
+    /// Bracket a wholesale table REWRITE (e.g. ALTER TABLE ADD COLUMN's
+    /// scan→update→rebuild). While at least one rewrite is active, engines
+    /// whose unique checks consult secondary structures must fall back to
+    /// authoritative row scans — mid-rewrite those structures are not a
+    /// reliable superset of live rows. Default: no-op.
+    fn begin_table_rewrite(&self, _table: &str) {}
+    /// See [`begin_table_rewrite`](Self::begin_table_rewrite). Default: no-op.
+    fn end_table_rewrite(&self, _table: &str) {}
+
     async fn rebuild_table_indexes(&self, _table: &str) -> Result<(), StorageError> {
         Ok(())
     }
@@ -732,6 +820,17 @@ impl StorageEngine for MemoryEngine {
             .get(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
         Ok(rows.clone())
+    }
+
+    async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        // Early-exit: clone only the first `limit` rows instead of the whole
+        // table. Same order as scan(), so equals scan()[..limit]. Safe here (the
+        // in-memory engine records no SIREAD).
+        let tables = self.tables.read().await;
+        let rows = tables
+            .get(table)
+            .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
+        Ok(rows.iter().take(limit).cloned().collect())
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {

@@ -8,8 +8,13 @@ import type {
 } from "./types.js";
 import { discoverRoutes } from "./manifest.js";
 import { assertRenderedFragment } from "./fragment-guard.js";
-import { renderDocumentHead } from "./seo.js";
-import { resolveHeadHtml } from "./head.js";
+import {
+  renderDocumentHead,
+  buildHtmlOpenTag,
+  buildBodyOpenTag,
+  type SeoMetaInput,
+} from "./seo.js";
+import { resolveHeadDocument } from "./head.js";
 import { resolvePreactSsr, importPreactSsr } from "./preact-ssr.js";
 
 export interface StaticRenderOptions {
@@ -168,7 +173,7 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
       // app-route renderer uses, so shared head resolution merges identically.
       const orderedRoutes = [...layoutChain].reverse();
       orderedRoutes.push(pageRoute);
-      const headHtml = await resolveHeadHtml(
+      const { headHtml, seo } = await resolveHeadDocument(
         orderedRoutes.map((route) => ({
           route,
           module: moduleCache.get(path.resolve(route.file)),
@@ -182,7 +187,7 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
           // No nonce at build time — SSG runs no CSP-nonce middleware.
         }
       );
-      const fullHtml = wrapHtml(html, pageRoute.path, headHtml);
+      const fullHtml = wrapHtml(html, pageRoute.path, headHtml, seo);
 
       const outPath = getOutputPath(outputDir, pageRoute.path);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
@@ -218,14 +223,15 @@ async function loadRouteModule(file: string, cache?: Map<string, RouteModule>): 
 function wrapHtml(
   content: string,
   routePath: string,
-  headHtml: string = renderDocumentHead(routePath, null)
+  headHtml: string = renderDocumentHead(routePath, null),
+  seo: SeoMetaInput | null = null
 ): string {
   return `<!DOCTYPE html>
-<html lang="en">
+${buildHtmlOpenTag(seo?.htmlAttrs)}
 <head>
 ${headHtml}
 </head>
-<body>
+${buildBodyOpenTag(seo?.bodyAttrs)}
 <div id="app">${content}</div>
 </body>
 </html>`;

@@ -31,6 +31,21 @@ pub struct ColumnDef {
     pub nullable: bool,
     /// Default value expression (stored as SQL text, e.g. "0", "'hello'", "now()").
     pub default_expr: Option<String>,
+    /// Stable per-table column identity, allocated at CREATE/ADD COLUMN and
+    /// never reused within a table — PostgreSQL's `attnum`.
+    ///
+    /// A column's NAME is not an identity: `ALTER TABLE ... RENAME COLUMN`
+    /// changes what a name refers to, and `ADD COLUMN` can then reintroduce the
+    /// old name pointing at different data. Anything that stores a column
+    /// reference to be resolved later — RLS predicates, masking rules — must
+    /// key off this instead, or it silently follows the name to whatever now
+    /// answers to it. The `Vec` position is not an identity either: DROP COLUMN
+    /// compacts it.
+    ///
+    /// `0` means "no id recorded", the legacy value for columns loaded from a
+    /// pre-id snapshot. Those are backfilled by position on load, so `0` should
+    /// not survive into a live catalog.
+    pub id: u32,
 }
 
 /// A table-level constraint.
@@ -80,6 +95,52 @@ pub struct TableDef {
 impl TableDef {
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
+    }
+
+    /// Stable id of the column currently answering to `name`.
+    pub fn column_id(&self, name: &str) -> Option<u32> {
+        self.columns.iter().find(|c| c.name == name).map(|c| c.id)
+    }
+
+    /// Current name of the column with stable id `id`, if it still exists.
+    ///
+    /// This is the direction that matters for anything holding a stored
+    /// reference: it answers "what is my column called now", which survives
+    /// renames, rather than "what does this name mean now", which does not.
+    pub fn column_name_by_id(&self, id: u32) -> Option<&str> {
+        self.columns
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.as_str())
+    }
+
+    /// Next unused column id for this table.
+    ///
+    /// Ids are never reused: a dropped column's id must not be handed to a
+    /// later `ADD COLUMN`, or a stored reference to the dropped column would
+    /// silently start resolving to the new one — the same defect this id
+    /// exists to prevent, one level down.
+    pub fn next_column_id(&self) -> u32 {
+        self.columns.iter().map(|c| c.id).max().unwrap_or(0) + 1
+    }
+
+    /// Assign ids to any column still carrying the legacy `0`.
+    ///
+    /// Pre-id snapshots have no ids at all, so they are backfilled by position
+    /// on load. This is safe exactly once, at load, before any rename can have
+    /// happened in this process; running it later would mint ids that disagree
+    /// with the ones already stored in policies.
+    pub fn backfill_column_ids(&mut self) {
+        if self.columns.iter().all(|c| c.id != 0) {
+            return;
+        }
+        let mut next = self.columns.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        for col in &mut self.columns {
+            if col.id == 0 {
+                col.id = next;
+                next += 1;
+            }
+        }
     }
 
     /// Return the primary key column names, if any.
@@ -355,6 +416,16 @@ impl Catalog {
         tables.values().cloned().collect()
     }
 
+    /// Non-blocking snapshot of every table, in the same iteration order as
+    /// `list_tables` for an unchanged map — the order the virtual pg_catalog
+    /// arms use to assign synthetic relation OIDs (16384 + index). Returns
+    /// `None` if the map is write-locked right now (callers degrade to NULL,
+    /// same contract as the other `_cached` accessors).
+    pub fn list_tables_sync(&self) -> Option<Vec<Arc<TableDef>>> {
+        let guard = self.tables.try_read().ok()?;
+        Some(guard.values().cloned().collect())
+    }
+
     // ── Sync metadata cache (session-level fast path) ──────────────────────
     //
     // These methods read from the `parking_lot::RwLock`-backed sync cache,
@@ -419,6 +490,33 @@ impl Catalog {
     ///
     /// Fails if an index with the same name already exists, or if the
     /// referenced table does not exist.
+    /// Synchronous index registration for startup/recovery, mirroring
+    /// `create_table_sync` — the catalog is exclusively ours then, so
+    /// try_write always succeeds.
+    pub fn create_index_sync(&self, def: IndexDef) -> Result<(), CatalogError> {
+        {
+            let tables = self
+                .tables
+                .try_read()
+                .map_err(|_| CatalogError::TableNotFound("catalog lock contention".into()))?;
+            if !tables.contains_key(&def.table_name) {
+                return Err(CatalogError::TableNotFound(def.table_name.clone()));
+            }
+        }
+        let table_name = def.table_name.clone();
+        let mut indexes = self
+            .indexes
+            .try_write()
+            .map_err(|_| CatalogError::TableNotFound("catalog lock contention".into()))?;
+        if indexes.contains_key(&def.name) {
+            return Err(CatalogError::IndexExists(def.name));
+        }
+        indexes.insert(def.name.clone(), Arc::new(def));
+        self.index_cache.write().remove(&table_name);
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub async fn create_index(&self, def: IndexDef) -> Result<(), CatalogError> {
         // Verify the target table exists.
         {
@@ -541,18 +639,21 @@ mod tests {
                     data_type: DataType::Int64,
                     nullable: false,
                     default_expr: None,
+                    id: 0,
                 },
                 ColumnDef {
                     name: "email".into(),
                     data_type: DataType::Text,
                     nullable: false,
                     default_expr: None,
+                    id: 0,
                 },
                 ColumnDef {
                     name: "active".into(),
                     data_type: DataType::Bool,
                     nullable: true,
                     default_expr: None,
+                    id: 0,
                 },
             ],
             constraints: vec![],
@@ -582,6 +683,7 @@ mod tests {
                 data_type: DataType::Int64,
                 nullable: false,
                 default_expr: None,
+                id: 0,
             }],
             constraints: vec![],
             append_only: false,
@@ -703,6 +805,7 @@ mod tests {
                 data_type: DataType::Int64,
                 nullable: false,
                 default_expr: None,
+                id: 0,
             }],
             constraints: vec![],
             append_only: false,

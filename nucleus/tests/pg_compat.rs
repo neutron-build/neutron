@@ -1130,3 +1130,200 @@ async fn text_literal_coercion_with_simple_protocol_via_pgx_shape() {
 
     server.abort();
 }
+
+// ============================================================================
+// Binary-format typed parameters (corruption-class regression)
+//
+// Before the decode_binary_param_typed fix, a BINARY-format timestamp/date/
+// uuid/bytea/numeric parameter fell into a catch-all that reinterpreted its
+// bytes as an integer — silent wrong data for every binary-mode driver
+// (tokio-postgres, pgx default, JDBC). This test drives the exact wire
+// encodings those drivers emit and asserts value-level round-trips.
+// ============================================================================
+
+mod binary_params {
+    use super::*;
+    use bytes::BytesMut;
+    use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
+
+    /// Sends exact raw bytes as a BINARY-format parameter for any declared
+    /// type — lets the test drive precise driver wire encodings without
+    /// pulling chrono/uuid/decimal client crates into the dev-dependencies.
+    #[derive(Debug)]
+    struct RawBinary(Vec<u8>);
+
+    impl ToSql for RawBinary {
+        fn to_sql(
+            &self,
+            _ty: &Type,
+            out: &mut BytesMut,
+        ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            out.extend_from_slice(&self.0);
+            Ok(IsNull::No)
+        }
+        fn accepts(_ty: &Type) -> bool {
+            true
+        }
+        to_sql_checked!();
+    }
+
+    #[tokio::test]
+    async fn binary_typed_params_round_trip() {
+        let (port, server) = start_nucleus_server().await;
+        let client = connect(port).await;
+
+        client
+            .simple_query(
+                "CREATE TABLE bin_params (id INT PRIMARY KEY, ts TIMESTAMP, d DATE, \
+                 u UUID, b BYTEA, n NUMERIC)",
+            )
+            .await
+            .expect("CREATE TABLE");
+
+        let stmt = client
+            .prepare_typed(
+                "INSERT INTO bin_params VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    Type::INT4,
+                    Type::TIMESTAMP,
+                    Type::DATE,
+                    Type::UUID,
+                    Type::BYTEA,
+                    Type::NUMERIC,
+                ],
+            )
+            .await
+            .expect("prepare_typed");
+
+        // day 8851 after 2000-01-01 = 2024-03-26, time 12:34:56.789012
+        let ts_us: i64 = 8851 * 86_400_000_000 + 45_296_789_012;
+        let date_days: i32 = 8851;
+        let uuid_bytes: [u8; 16] = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
+            0x44, 0x00, 0x00,
+        ];
+        let bytea_bytes: Vec<u8> = vec![0x00, 0xde, 0xad, 0xbe, 0xef];
+        // numeric 12345.6789: ndigits=3 weight=1 sign=+ dscale=4 [1,2345,6789]
+        let mut numeric = Vec::new();
+        numeric.extend_from_slice(&3u16.to_be_bytes());
+        numeric.extend_from_slice(&1i16.to_be_bytes());
+        numeric.extend_from_slice(&0u16.to_be_bytes());
+        numeric.extend_from_slice(&4u16.to_be_bytes());
+        for d in [1u16, 2345, 6789] {
+            numeric.extend_from_slice(&d.to_be_bytes());
+        }
+
+        client
+            .execute(
+                &stmt,
+                &[
+                    &1i32,
+                    &RawBinary(ts_us.to_be_bytes().to_vec()),
+                    &RawBinary(date_days.to_be_bytes().to_vec()),
+                    &RawBinary(uuid_bytes.to_vec()),
+                    &RawBinary(bytea_bytes.clone()),
+                    &RawBinary(numeric),
+                ],
+            )
+            .await
+            .expect("INSERT with binary-format typed params");
+
+        // Read back as text casts so the assertion is on the STORED VALUES,
+        // independent of result-side encoding.
+        let rows = client
+            .simple_query(
+                "SELECT ts::text, d::text, u::text, b::text, n::text \
+                 FROM bin_params WHERE id = 1",
+            )
+            .await
+            .expect("SELECT");
+        let row = rows
+            .iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .expect("one row");
+
+        assert_eq!(row.get(0), Some("2024-03-26 12:34:56.789012"), "timestamp");
+        assert_eq!(row.get(1), Some("2024-03-26"), "date");
+        assert_eq!(
+            row.get(2),
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+            "uuid"
+        );
+        assert_eq!(row.get(3), Some("\\x00deadbeef"), "bytea");
+        assert_eq!(row.get(4), Some("12345.6789"), "numeric");
+
+        server.abort();
+    }
+
+    /// Text params containing backslashes must round-trip literally
+    /// (standard-conforming strings — the old sanitizer doubled them).
+    #[tokio::test]
+    async fn text_param_backslash_round_trip() {
+        let (port, server) = start_nucleus_server().await;
+        let client = connect(port).await;
+
+        client
+            .simple_query("CREATE TABLE bs (id INT PRIMARY KEY, t TEXT)")
+            .await
+            .expect("CREATE TABLE");
+
+        let stmt = client
+            .prepare_typed("INSERT INTO bs VALUES ($1, $2)", &[Type::INT4, Type::TEXT])
+            .await
+            .expect("prepare");
+        let payload = r"C:\temp\new\x1";
+        client
+            .execute(&stmt, &[&1i32, &payload])
+            .await
+            .expect("INSERT");
+
+        let rows = client
+            .simple_query("SELECT t FROM bs WHERE id = 1")
+            .await
+            .expect("SELECT");
+        let row = rows
+            .iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .expect("one row");
+        assert_eq!(row.get(0), Some(payload), "backslashes must not double");
+
+        server.abort();
+    }
+}
+
+// ============================================================================
+// Prisma schema-engine describe shape: catalog query with a text[] parameter
+// ============================================================================
+
+/// Prisma's describe pipeline sends `... WHERE nspname = ANY ( $1 )` with a
+/// binary text[] parameter through tokio-postgres (quaint). The result must
+/// carry the selected column — an empty DataRow panics the schema engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn prisma_namespaces_query_shape() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    for (label, sql) in [
+        ("plain", "SELECT nspname FROM pg_namespace WHERE nspname = ANY ( $1 )"),
+        ("alias", "SELECT namespace.nspname as namespace_name FROM pg_namespace as namespace WHERE namespace.nspname = ANY ( $1 )"),
+        (
+            "orderby",
+            "SELECT namespace.nspname as namespace_name FROM pg_namespace as namespace WHERE namespace.nspname = ANY ( $1 ) ORDER BY namespace_name",
+        ),
+    ] {
+        let rows = client
+            .query(sql, &[&vec!["public".to_string()]])
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(rows.len(), 1, "{label}: one matching namespace");
+        assert_eq!(rows[0].len(), 1, "{label}: row must carry the column");
+    }
+
+    server.abort();
+}

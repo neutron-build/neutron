@@ -1,0 +1,51 @@
+{
+  "name": "@neutron-build/mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol for Neutron. Server and client over streamable HTTP, with pluggable auth and capability scoping.",
+  "author": "Tyler",
+  "license": "MIT",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "typescript/packages/neutron-mcp"
+  },
+  "keywords": [
+    "neutron",
+    "mcp",
+    "model-context-protocol",
+    "tools",
+    "agents"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm run build && node --test --experimental-test-isolation=none \"dist/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

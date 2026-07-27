@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+#
+# Nucleus release image — packages an ALREADY-BUILT binary.
+#
+# This is the multi-arch path. `Dockerfile` compiles from source, which under
+# QEMU emulation takes 45-90 minutes per foreign architecture; here the release
+# job has already produced a native binary per target, so a multi-platform
+# build is a file copy.
+#
+# Expected context layout (created by the release workflow from the release
+# tarballs — the directory names are Docker's `TARGETARCH` values):
+#
+#   dist/amd64/nucleus
+#   dist/arm64/nucleus
+#
+#   docker buildx build -f nucleus/Dockerfile.dist \
+#       --platform linux/amd64,linux/arm64 \
+#       -t ghcr.io/neutron-build/nucleus:<version> <context>
+#
+# Runtime behaviour is identical to `Dockerfile`; keep the two stanzas below in
+# sync with it.
+
+FROM debian:bookworm-slim
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 10001 nucleus \
+    && useradd --system --uid 10001 --gid nucleus \
+        --home-dir /data --shell /usr/sbin/nologin nucleus \
+    && mkdir -p /data \
+    && chown nucleus:nucleus /data
+
+COPY dist/${TARGETARCH}/nucleus /usr/local/bin/nucleus
+RUN chmod 0755 /usr/local/bin/nucleus
+
+USER 10001:10001
+WORKDIR /data
+VOLUME ["/data"]
+
+EXPOSE 5432 5433 5434 6379
+
+# LIVENESS ONLY — see the note in `Dockerfile`.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["nucleus", "status", "--host", "127.0.0.1:5432"]
+
+ENTRYPOINT ["nucleus"]
+CMD ["start", "--host", "0.0.0.0", "--port", "5432", "--data", "/data"]

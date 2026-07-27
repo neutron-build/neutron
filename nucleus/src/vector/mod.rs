@@ -502,12 +502,10 @@ impl HnswIndex {
             } else {
                 self.config.m
             };
-            let selected: Vec<u64> = candidates
-                .into_iter()
-                .filter(|c| c.id != id) // Don't connect to self
-                .take(m)
-                .map(|c| c.id)
-                .collect();
+            // Don't connect to self, then pick M diverse neighbours (Alg. 4)
+            // rather than the M closest — bridge edges keep the graph navigable.
+            let pool: Vec<Candidate> = candidates.into_iter().filter(|c| c.id != id).collect();
+            let selected: Vec<u64> = self.select_neighbors_heuristic(&pool, m);
 
             // Add bidirectional connections
             for &neighbor_id in &selected {
@@ -539,6 +537,58 @@ impl HnswIndex {
             self.entry_point = Some(id);
             self.max_layer = node_layer;
         }
+    }
+
+    /// Diversifying neighbour selection — HNSW paper Algorithm 4
+    /// (SELECT-NEIGHBORS-HEURISTIC). Given candidates sorted ascending by their
+    /// distance to `base` (each `Candidate.dist` is dist(candidate, base)),
+    /// keep a candidate only if it is closer to `base` than to every neighbour
+    /// already kept. This drops redundant same-direction links and preserves
+    /// long-range "bridge" edges, which is what keeps the graph navigable —
+    /// naive take-M-closest starves inter-cluster bridges and collapses recall
+    /// on structured (embedding-like) data.
+    ///
+    /// If the heuristic under-fills `m` slots (it can be aggressive), the
+    /// remaining slots are back-filled with the nearest not-yet-kept candidates
+    /// (the paper's `keepPrunedConnections`) so nodes stay well-connected.
+    /// `candidates[i].dist` must already be dist(candidate_i, base); the base
+    /// vector itself is not needed here because those distances are precomputed.
+    fn select_neighbors_heuristic(&self, candidates: &[Candidate], m: usize) -> Vec<u64> {
+        if m == 0 {
+            return Vec::new();
+        }
+        let mut kept: Vec<(u64, &Vector)> = Vec::with_capacity(m);
+        for c in candidates {
+            if kept.len() >= m {
+                break;
+            }
+            let cand_vec = match self.nodes.get(&c.id) {
+                Some(node) => &node.vector,
+                None => continue,
+            };
+            // Keep iff candidate is nearer to `base` than to any kept neighbour.
+            let diverse = kept
+                .iter()
+                .all(|(_, kv)| c.dist < distance(cand_vec, kv, self.config.metric));
+            if diverse {
+                kept.push((c.id, cand_vec));
+            }
+        }
+        // Back-fill toward `m` with the nearest candidates we skipped.
+        if kept.len() < m {
+            for c in candidates {
+                if kept.len() >= m {
+                    break;
+                }
+                if kept.iter().any(|(id, _)| *id == c.id) {
+                    continue;
+                }
+                if let Some(node) = self.nodes.get(&c.id) {
+                    kept.push((c.id, &node.vector));
+                }
+            }
+        }
+        kept.into_iter().map(|(id, _)| id).collect()
     }
 
     /// Greedy search at a single layer — find the closest node to query.
@@ -666,16 +716,19 @@ impl HnswIndex {
             return;
         };
 
-        // Score all neighbors
-        let mut scored: Vec<(u64, f32)> = neighbors
+        // Score all neighbours by distance to this node, sort ascending, then
+        // prune with the diversifying heuristic (not plain take-closest) so the
+        // surviving edges keep their spread of directions — otherwise repeated
+        // pruning strips every bridge and the node ends up locked to one cluster.
+        let mut scored: Vec<Candidate> = neighbors
             .into_iter()
-            .map(|nid| (nid, self.dist(nid, &vector)))
+            .map(|nid| Candidate { id: nid, dist: self.dist(nid, &vector) })
             .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        scored.truncate(max_conn);
+        scored.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+        let pruned = self.select_neighbors_heuristic(&scored, max_conn);
 
         if let Some(node) = self.nodes.get_mut(&node_id) {
-            node.neighbors[layer] = scored.into_iter().map(|(id, _)| id).collect();
+            node.neighbors[layer] = pruned;
         }
     }
 
@@ -690,7 +743,28 @@ impl HnswIndex {
 
     /// Search for the k nearest neighbors of a query vector.
     /// Returns (id, distance) pairs sorted by distance ascending.
+    ///
+    /// The DEFAULT beam width scales with index size: a fixed ef that is
+    /// ample at 10k–100k vectors starts fully trapping occasional queries in
+    /// the wrong cluster at a few hundred thousand (measured: clustered data,
+    /// ef=64 → min-recall 0.0 at 300k/1M while ef=128/256 recovers to ≥0.9
+    /// with recall ≥0.996). Postgres-style "document a fixed default" would
+    /// leave out-of-the-box zero-recall queries at scale — instead the
+    /// default follows n (n/2048, clamped to [configured ef, 512]) so recall
+    /// floors hold at every size, and an explicit `SET hnsw.ef_search` (the
+    /// `search_ef` path) still wins in BOTH directions for callers choosing
+    /// their own point on the recall/latency frontier.
     pub fn search(&self, query: &Vector, k: usize) -> Vec<(u64, f32)> {
+        let auto = self.config.ef_search.max((self.nodes.len() / 2048).min(512));
+        self.search_ef(query, k, auto)
+    }
+
+    /// Like [`search`] but with an explicit layer-0 beam width `ef` for this one
+    /// query, overriding the configured default. `ef` is the recall/latency
+    /// dial: a larger beam explores more of the graph before committing to the
+    /// top-k, so recall rises (toward exact) at the cost of more distance
+    /// evaluations. The effective beam is always at least `k`.
+    pub fn search_ef(&self, query: &Vector, k: usize, ef: usize) -> Vec<(u64, f32)> {
         if self.nodes.is_empty() || self.entry_point.is_none() {
             return vec![];
         }
@@ -707,7 +781,7 @@ impl HnswIndex {
         }
 
         // Phase 2: ef-bounded search at layer 0
-        let candidates = self.search_layer(current, query, self.config.ef_search.max(k), 0);
+        let candidates = self.search_layer(current, query, ef.max(k), 0);
 
         candidates
             .into_iter()
@@ -732,6 +806,24 @@ impl HnswIndex {
     where
         F: Fn(u64) -> bool,
     {
+        // Same size-scaled default beam as `search` (see its doc comment).
+        let auto = self.config.ef_search.max((self.nodes.len() / 2048).min(512));
+        self.search_filtered_ef(query, k, auto, filter)
+    }
+
+    /// Like [`search_filtered`] but with an explicit base beam width `ef` for
+    /// this one query (the oversampling multipliers and guaranteed-recall
+    /// fallbacks apply on top of it, exactly as with the configured default).
+    pub fn search_filtered_ef<F>(
+        &self,
+        query: &Vector,
+        k: usize,
+        ef: usize,
+        filter: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(u64) -> bool,
+    {
         if self.nodes.is_empty() || self.entry_point.is_none() || k == 0 {
             return vec![];
         }
@@ -749,7 +841,7 @@ impl HnswIndex {
 
         // Phase 2: Oversampling search at layer 0.
         // Start with 4x oversampling and increase if needed.
-        let base_ef = self.config.ef_search.max(k);
+        let base_ef = ef.max(k);
         for oversample in [4, 8, 16] {
             let ef = base_ef * oversample;
             let candidates = self.search_layer(current, query, ef, 0);

@@ -1000,3 +1000,238 @@ fn test_follower_read_stale_data() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("stale"));
 }
+
+// ======================================================================
+// CREATE / DROP EXTENSION (catalog-tracked no-ops)
+// ======================================================================
+
+fn command_tag(result: &ExecResult) -> &str {
+    match result {
+        ExecResult::Command { tag, .. } => tag,
+        _ => panic!("expected command result"),
+    }
+}
+
+#[tokio::test]
+async fn test_create_extension_noop() {
+    let ex = test_executor();
+    let results = exec(&ex, "CREATE EXTENSION \"uuid-ossp\"").await;
+    assert_eq!(command_tag(&results[0]), "CREATE EXTENSION");
+}
+
+#[tokio::test]
+async fn test_create_extension_with_schema_and_version() {
+    let ex = test_executor();
+    let results = exec(
+        &ex,
+        "CREATE EXTENSION pgcrypto WITH SCHEMA public VERSION '1.3'",
+    )
+    .await;
+    assert_eq!(command_tag(&results[0]), "CREATE EXTENSION");
+    // Version is tracked truthfully for introspection.
+    let sel = exec(
+        &ex,
+        "SELECT extversion FROM pg_extension WHERE extname = 'pgcrypto'",
+    )
+    .await;
+    assert_eq!(scalar(&sel[0]), &Value::Text("1.3".into()));
+}
+
+#[tokio::test]
+async fn test_create_extension_if_not_exists_idempotent() {
+    let ex = test_executor();
+    exec(&ex, "CREATE EXTENSION vector").await;
+    // Second create WITHOUT IF NOT EXISTS must error (extension already exists).
+    assert!(ex.execute("CREATE EXTENSION vector").await.is_err());
+    // With IF NOT EXISTS it is a silent no-op.
+    let results = exec(&ex, "CREATE EXTENSION IF NOT EXISTS vector").await;
+    assert_eq!(command_tag(&results[0]), "CREATE EXTENSION");
+    // Still exactly one row for it in the catalog (no duplicate).
+    let sel = exec(
+        &ex,
+        "SELECT count(*) FROM pg_extension WHERE extname = 'vector'",
+    )
+    .await;
+    assert_eq!(scalar(&sel[0]), &Value::Int64(1));
+}
+
+#[tokio::test]
+async fn test_pg_extension_introspection() {
+    let ex = test_executor();
+    // A fresh cluster ships plpgsql, matching Postgres.
+    let sel = exec(&ex, "SELECT extname FROM pg_extension WHERE extname = 'plpgsql'").await;
+    assert_eq!(rows(&sel[0]).len(), 1);
+
+    exec(&ex, "CREATE EXTENSION IF NOT EXISTS pg_trgm").await;
+    let sel = exec(&ex, "SELECT extname, extversion FROM pg_extension ORDER BY extname").await;
+    let names: Vec<String> = rows(&sel[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected text extname, got {other:?}"),
+        })
+        .collect();
+    assert!(names.contains(&"pg_trgm".to_string()));
+    assert!(names.contains(&"plpgsql".to_string()));
+}
+
+/// psql's \dx sends this exact query shape: pg_extension joined to
+/// pg_namespace (schema name) and LEFT JOINed to pg_description through a
+/// '::regclass' classoid comparison. All three pieces — pg_description, the
+/// regclass cast, and the joins — must work together for raw \dx to render.
+#[tokio::test]
+async fn test_psql_dx_query_shape() {
+    let ex = test_executor();
+    exec(&ex, "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"").await;
+
+    let sel = exec(
+        &ex,
+        "SELECT e.extname AS \"Name\", e.extversion AS \"Version\", \
+                n.nspname AS \"Schema\", c.description AS \"Description\" \
+         FROM pg_catalog.pg_extension e \
+         LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+         LEFT JOIN pg_catalog.pg_description c ON c.objoid = e.oid \
+              AND c.classoid = 'pg_catalog.pg_extension'::regclass \
+         ORDER BY 1",
+    )
+    .await;
+    let got = rows(&sel[0]);
+    // plpgsql (seed) + uuid-ossp, alphabetical.
+    assert_eq!(got.len(), 2, "both extensions must render: {got:?}");
+    assert_eq!(got[0][0], Value::Text("plpgsql".into()));
+    assert_eq!(got[1][0], Value::Text("uuid-ossp".into()));
+    // Schema resolves through the pg_namespace join.
+    assert_eq!(got[1][2], Value::Text("public".into()));
+    // No COMMENT ON support -> description is NULL, like uncommented PG objects.
+    assert_eq!(got[0][3], Value::Null);
+
+    // The regclass cast itself resolves the fixed catalog OID.
+    let cast = exec(&ex, "SELECT 'pg_catalog.pg_extension'::regclass").await;
+    assert_eq!(rows(&cast[0])[0][0], Value::Int32(3079));
+    // Unknown name degrades to NULL, not an error.
+    let unknown = exec(&ex, "SELECT 'no_such_catalog'::regclass").await;
+    assert_eq!(rows(&unknown[0])[0][0], Value::Null);
+}
+
+/// psql's \d <relation> pipeline, verified live against psql 17 (2026-07-20)
+/// and pinned here: the pg_class detail row, the pg_attribute column query
+/// (format_type + scalar subqueries over pg_attrdef/pg_collation), and the
+/// index listing (pg_index + pg_constraint LEFT JOIN + pg_get_indexdef).
+#[tokio::test]
+async fn test_psql_describe_table_pipeline() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE dsc (id INT PRIMARY KEY, name TEXT, v VECTOR(3))",
+    )
+    .await;
+
+    // Query 1: relation lookup by regex (OPERATOR(pg_catalog.~) + COLLATE).
+    let lookup = exec(
+        &ex,
+        "SELECT c.oid, n.nspname, c.relname \
+         FROM pg_catalog.pg_class c \
+         LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname OPERATOR(pg_catalog.~) '^(dsc)$' COLLATE pg_catalog.default \
+           AND pg_catalog.pg_table_is_visible(c.oid) \
+         ORDER BY 2, 3",
+    )
+    .await;
+    let found = rows(&lookup[0]);
+    assert_eq!(found.len(), 1, "regex relation lookup must find dsc: {found:?}");
+    let oid = match &found[0][0] {
+        Value::Int32(n) => *n,
+        other => panic!("expected int oid, got {other:?}"),
+    };
+
+    // Query 2: the detail row (subset of psql's column list).
+    let detail = exec(
+        &ex,
+        &format!(
+            "SELECT c.relchecks, c.relkind, c.relhasindex, c.relrowsecurity, \
+                    c.relpersistence, c.reltoastrelid \
+             FROM pg_catalog.pg_class c WHERE c.oid = '{oid}'"
+        ),
+    )
+    .await;
+    let d = rows(&detail[0]);
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0][1], Value::Text("r".into()));
+    assert_eq!(d[0][2], Value::Bool(true), "PK table must report relhasindex");
+
+    // Query 3: columns with format_type — vector renders with its dimension.
+    let cols = exec(
+        &ex,
+        &format!(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull \
+             FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = '{oid}' AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum"
+        ),
+    )
+    .await;
+    let c = rows(&cols[0]);
+    assert_eq!(c.len(), 3);
+    assert_eq!(c[0][1], Value::Text("integer".into()));
+    assert_eq!(c[0][2], Value::Bool(true), "PK column is NOT NULL");
+    assert_eq!(c[1][1], Value::Text("text".into()));
+    assert_eq!(c[2][1], Value::Text("vector(3)".into()), "vector typmod must render");
+
+    // Query 4: index listing — pg_get_indexdef synthesizes a real definition.
+    let idx = exec(
+        &ex,
+        &format!(
+            "SELECT c2.relname, i.indisprimary, i.indisunique, \
+                    pg_catalog.pg_get_indexdef(i.indexrelid, 0, true) \
+             FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i \
+             LEFT JOIN pg_catalog.pg_constraint con \
+               ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x')) \
+             WHERE c.oid = '{oid}' AND c.oid = i.indrelid AND i.indexrelid = c2.oid \
+             ORDER BY i.indisprimary DESC, c2.relname"
+        ),
+    )
+    .await;
+    let ix = rows(&idx[0]);
+    assert_eq!(ix.len(), 1, "PK index must list: {ix:?}");
+    assert_eq!(ix[0][1], Value::Bool(true), "index is primary");
+    match &ix[0][3] {
+        Value::Text(def) => assert!(
+            def.contains("USING btree (id)"),
+            "indexdef must synthesize USING clause: {def}"
+        ),
+        other => panic!("pg_get_indexdef must return text, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_drop_extension() {
+    let ex = test_executor();
+    exec(&ex, "CREATE EXTENSION IF NOT EXISTS hstore").await;
+    let results = exec(&ex, "DROP EXTENSION hstore").await;
+    assert_eq!(command_tag(&results[0]), "DROP EXTENSION");
+    let sel = exec(
+        &ex,
+        "SELECT count(*) FROM pg_extension WHERE extname = 'hstore'",
+    )
+    .await;
+    assert_eq!(scalar(&sel[0]), &Value::Int64(0));
+
+    // Dropping a missing extension errors unless IF EXISTS is given.
+    assert!(ex.execute("DROP EXTENSION hstore").await.is_err());
+    let results = exec(&ex, "DROP EXTENSION IF EXISTS hstore").await;
+    assert_eq!(command_tag(&results[0]), "DROP EXTENSION");
+}
+
+#[tokio::test]
+async fn test_create_extension_rejects_unsupported() {
+    let ex = test_executor();
+    // Procedural-language and FDW extensions imply behavior Nucleus cannot
+    // honestly provide, so they are rejected loudly rather than accepted.
+    let err = ex
+        .execute("CREATE EXTENSION plpython3u")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("procedural-language"), "got: {err}");
+    assert!(ex.execute("CREATE EXTENSION postgres_fdw").await.is_err());
+}

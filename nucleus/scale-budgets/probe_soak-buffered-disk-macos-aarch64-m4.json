@@ -1,0 +1,31 @@
+{
+  "_comment": "probe_soak regression budget, an envelope over `runs_recorded` runs. Valid only for the engine, machine, and config recorded here; a number without its hardware is not a datum. Each bound is the loosest seen across contributing runs, at recorded_slack for p50/throughput, 2x for p95, 3x for p99/checkpoint_ms/recovery_ms, because a time-bounded concurrent run does not replay deterministically even at a fixed seed. These bounds catch gross regressions, not small ones; runs_recorded=1 is provisional. Re-run --write-budget to widen, delete the file to start over.",
+  "engine": "buffered-disk",
+  "machine": "macos/aarch64/Apple M4/10cpu/release",
+  "config": "buffer_pool=32MB wal_segment=64MB sync=Fsync",
+  "recorded_slack": 1.5,
+  "runs_recorded": 3,
+  "all_source_runs_passed_invariants": "false",
+  "workload": "concurrency=8 duration_secs=90 rows_target=0",
+  "budgets": {
+    "mixed.ops_per_sec": {"min": 37.519},
+    "insert.p50_us": {"max": 22450.500},
+    "insert.p95_us": {"max": 182514.000},
+    "insert.p99_us": {"max": 471910.500},
+    "update.p50_us": {"max": 600867.000},
+    "update.p95_us": {"max": 1464492.000},
+    "update.p99_us": {"max": 2341093.500},
+    "select.p50_us": {"max": 124.500},
+    "select.p95_us": {"max": 12447.000},
+    "select.p99_us": {"max": 50319.000},
+    "kv_set.p50_us": {"max": 6009.000},
+    "kv_set.p95_us": {"max": 45042.000},
+    "kv_set.p99_us": {"max": 103653.000},
+    "delete.p50_us": {"max": 649522.500},
+    "delete.p95_us": {"max": 1487298.000},
+    "delete.p99_us": {"max": 2331963.000},
+    "recovery_ms": {"max": 293.555},
+    "checkpoint_ms": {"max": 2568.251},
+    "write_amplification": {"max": 18324.158}
+  }
+}

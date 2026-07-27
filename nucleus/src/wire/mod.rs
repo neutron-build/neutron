@@ -11,6 +11,7 @@
 pub mod compression;
 pub mod error_codec;
 pub mod kv_fast_path;
+pub mod overload;
 
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -48,7 +49,9 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::response::{CommandComplete, NotificationResponse};
-use pgwire::messages::startup::{Authentication, PasswordMessageFamily};
+use pgwire::api::cancel::CancelHandler;
+use pgwire::messages::cancel::CancelRequest;
+use pgwire::messages::startup::{Authentication, PasswordMessageFamily, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use compression::WireCompressor;
@@ -506,6 +509,7 @@ struct CopyInfo {
     columns: Option<Vec<String>>,
     delimiter: u8,
     is_csv: bool,
+    is_binary: bool,
     has_header: bool,
 }
 
@@ -514,6 +518,7 @@ struct CopyInProgress {
     columns: Option<Vec<String>>,
     delimiter: u8,
     is_csv: bool,
+    is_binary: bool,
     has_header: bool,
     data: Vec<u8>,
     session_id: u64,
@@ -565,6 +570,12 @@ pub struct NucleusHandler {
     // ── Large Objects ────────────────────────────────────────────────────
     /// Per-connection large object descriptors: peer addr → LargeObjectState.
     lo_state: parking_lot::Mutex<std::collections::HashMap<String, LargeObjectState>>,
+
+    // ── Query cancellation (wire CancelRequest) ──────────────────────────
+    /// Cancel keys handed out in BackendKeyData: pid → (secret, session_id).
+    cancel_keys: parking_lot::RwLock<std::collections::HashMap<i32, (SecretKey, u64)>>,
+    /// Per-session cancel signal, raced against query execution.
+    cancel_notifies: parking_lot::RwLock<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>,
 }
 
 impl NucleusHandler {
@@ -595,6 +606,8 @@ impl NucleusHandler {
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
             lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -662,6 +675,8 @@ impl NucleusHandler {
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
             lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -775,9 +790,10 @@ impl NucleusHandler {
                     for row in &rows {
                         let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
                         for (i, value) in row.iter().enumerate() {
+                            let fmt = schema.get(i).map_or(FieldFormat::Text, |f| f.format());
                             match col_types.get(i) {
-                                Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
-                                None => encode_value(&mut encoder, value)?,
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
+                                None => encode_value(&mut encoder, value, fmt)?,
                             }
                         }
                         encoded.push(encoder.finish()?);
@@ -790,9 +806,10 @@ impl NucleusHandler {
                     let data_row_stream = stream::iter(rows).map(move |row| {
                         let mut encoder = DataRowEncoder::new(Arc::clone(&schema_ref));
                         for (i, value) in row.iter().enumerate() {
+                            let fmt = schema_ref.get(i).map_or(FieldFormat::Text, |f| f.format());
                             match col_types_ref.get(i) {
-                                Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
-                                None => encode_value(&mut encoder, value)?,
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
+                                None => encode_value(&mut encoder, value, fmt)?,
                             }
                         }
                         encoder.finish()
@@ -808,13 +825,130 @@ impl NucleusHandler {
                 } else {
                     tag.as_str()
                 };
-                Ok(Response::Execution(
-                    Tag::new(wire_tag).with_rows(rows_affected),
-                ))
+                // Transaction boundaries must use the dedicated Response
+                // variants: pgwire derives the ReadyForQuery status byte
+                // ('I'/'T') from them. A plain Execution response left the
+                // status at Idle after BEGIN, so clients that track
+                // transaction state (psycopg, Prisma's quaint) believed no
+                // transaction was open, re-issued BEGIN, and their COMMIT
+                // never fired — buffered transactional writes were lost.
+                if tag.eq_ignore_ascii_case("BEGIN") {
+                    return Ok(Response::TransactionStart(Tag::new("BEGIN")));
+                }
+                if tag.eq_ignore_ascii_case("COMMIT") || tag.eq_ignore_ascii_case("ROLLBACK") {
+                    return Ok(Response::TransactionEnd(Tag::new(wire_tag)));
+                }
+                // PostgreSQL appends a row count only to row-affecting tags
+                // ("INSERT 0 2", "UPDATE 3"); DDL/utility tags are bare
+                // ("CREATE TABLE", "DISCARD ALL" — never "CREATE TABLE 0").
+                let counted = matches!(
+                    tag.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str(),
+                    "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "COPY" | "FETCH" | "MOVE" | "MERGE"
+                );
+                if counted {
+                    Ok(Response::Execution(
+                        Tag::new(wire_tag).with_rows(rows_affected),
+                    ))
+                } else {
+                    Ok(Response::Execution(Tag::new(wire_tag)))
+                }
             }
             ExecResult::CopyOut { row_count, .. } => {
                 Ok(Response::Execution(Tag::new("COPY").with_rows(row_count)))
             }
+            // Binary COPY TO is sent inline by the simple-query loop; the
+            // extended protocol has no inline path (same constraint as the
+            // streaming variant below).
+            ExecResult::CopyOutBinary { .. } => Err(PgWireError::ApiError(
+                "binary COPY TO STDOUT requires the simple query protocol".into(),
+            )),
+            // Streaming SELECT: pull batches lazily from the producer and encode
+            // rows as they arrive, so peak memory is O(batch) and the first row
+            // reaches the client without materializing the whole result. Reaches
+            // the wire only when the session opted in (SET stream_results = on);
+            // otherwise the dispatch boundary materialized it into `Select` above.
+            // The per-row encoding is identical to the `Select` arm.
+            ExecResult::SelectStream { columns, source } => {
+                let schema: Vec<FieldInfo> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, dt))| {
+                        FieldInfo::new(
+                            name.clone(),
+                            None,
+                            None,
+                            data_type_to_pg(dt),
+                            formats.map_or(FieldFormat::Text, |f| requested_format(f, i)),
+                        )
+                    })
+                    .collect();
+                let schema = Arc::new(schema);
+                let col_types: Arc<Vec<DataType>> =
+                    Arc::new(columns.iter().map(|(_, dt)| dt.clone()).collect());
+
+                struct StreamState {
+                    source: Box<dyn crate::executor::row_batch::RowBatchIter>,
+                    buf: std::vec::IntoIter<crate::types::Row>,
+                    done: bool,
+                }
+                let init = StreamState {
+                    source,
+                    buf: Vec::new().into_iter(),
+                    done: false,
+                };
+                let schema_ref = Arc::clone(&schema);
+                let data_row_stream = stream::unfold(init, move |mut st| {
+                    let schema = Arc::clone(&schema_ref);
+                    let col_types = Arc::clone(&col_types);
+                    async move {
+                        if st.done {
+                            return None;
+                        }
+                        loop {
+                            if let Some(row) = st.buf.next() {
+                                let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
+                                let encoded = (|| {
+                                    for (i, value) in row.iter().enumerate() {
+                                        let fmt =
+                                            schema.get(i).map_or(FieldFormat::Text, |f| f.format());
+                                        match col_types.get(i) {
+                                            Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
+                                            None => encode_value(&mut encoder, value, fmt)?,
+                                        }
+                                    }
+                                    encoder.finish()
+                                })();
+                                return Some((encoded, st));
+                            }
+                            // Buffer drained — pull the next batch.
+                            match st.source.next_batch().await {
+                                Ok(Some(batch)) => {
+                                    st.buf = batch.into_iter();
+                                    continue;
+                                }
+                                Ok(None) => {
+                                    // End of stream — unfold stops on None, so no
+                                    // need to flip `done` (st is dropped here).
+                                    return None;
+                                }
+                                Err(e) => {
+                                    // Surface the producer error as one stream error,
+                                    // then stop.
+                                    st.done = true;
+                                    return Some((Err(exec_error_to_pgwire(e)), st));
+                                }
+                            }
+                        }
+                    }
+                });
+                Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
+            }
+            // Streaming COPY is intercepted and sent inline in the simple-query
+            // loop (it needs the client sink); a non-wire caller materializes it
+            // to CopyOut first, so build_response never legitimately sees it.
+            ExecResult::CopyOutStream { .. } => Err(PgWireError::ApiError(
+                "streaming COPY must be sent inline, not via build_response".into(),
+            )),
         }
     }
 
@@ -826,6 +960,20 @@ impl NucleusHandler {
             .get(&addr)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Mirror the executor's per-session transaction state into the wire
+    /// client so ReadyForQuery reports 'T' inside BEGIN..COMMIT. Clients that
+    /// verify transaction state (Prisma's quaint) refuse to proceed when a
+    /// BEGIN is acknowledged with an idle status.
+    fn sync_transaction_status(&self, client: &mut impl ClientInfo, session_id: u64) {
+        use pgwire::messages::response::TransactionStatus;
+        let status = if self.executor.session_in_transaction(session_id) {
+            TransactionStatus::Transaction
+        } else {
+            TransactionStatus::Idle
+        };
+        client.set_transaction_status(status);
     }
 
     /// Execute a SQL query through the executor within the given session,
@@ -851,25 +999,51 @@ impl NucleusHandler {
 
         let fut = self.executor.execute_with_session(session_id, sql);
 
+        // Race execution against a wire CancelRequest for this session.
+        // `biased` checks the cancel signal first so a cancel that arrived
+        // while execution was inside a blocking (non-yielding) region still
+        // wins at the next poll. Granularity matches statement_timeout: the
+        // cancel takes effect at the executor's next await point.
+        let cancel = self.cancel_notifies.read().get(&session_id).cloned();
+        let fut = async move {
+            match cancel {
+                Some(notify) => {
+                    tokio::select! {
+                        biased;
+                        _ = notify.notified() => Err(PgWireError::UserError(Box::new(
+                            ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "57014".to_owned(), // query_canceled
+                                "canceling statement due to user request".to_owned(),
+                            ),
+                        ))),
+                        result = fut => result.map_err(exec_error_to_pgwire),
+                    }
+                }
+                None => fut.await.map_err(exec_error_to_pgwire),
+            }
+        };
+
         // Per-session statement_timeout overrides the global default.
-        // SET statement_timeout = N (seconds) to configure per-connection.
-        let timeout_secs = self
+        // Units follow PostgreSQL: a bare number is MILLISECONDS; "Ns"/"Nms"
+        // suffixes are accepted. The server-config default stays in seconds.
+        let timeout_ms = self
             .executor
             .get_session_setting(session_id, "statement_timeout")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(self.statement_timeout_secs);
+            .and_then(|v| parse_timeout_ms(&v))
+            .unwrap_or(self.statement_timeout_secs * 1000);
 
-        if timeout_secs > 0 {
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
-                Ok(result) => result.map_err(exec_error_to_pgwire),
+        if timeout_ms > 0 {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut).await {
+                Ok(result) => result,
                 Err(_elapsed) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
                     "57014".to_owned(), // query_canceled
-                    format!("canceling statement due to statement timeout ({timeout_secs}s)",),
+                    format!("canceling statement due to statement timeout ({timeout_ms}ms)",),
                 )))),
             }
         } else {
-            fut.await.map_err(exec_error_to_pgwire)
+            fut.await
         }
     }
 
@@ -1067,10 +1241,11 @@ impl NucleusHandler {
 }
 
 fn sanitize_sql_text_literal(value: &str) -> String {
-    value
-        .replace('\0', "")
-        .replace('\\', "\\\\")
-        .replace('\'', "''")
+    // Nucleus parses with PostgreSqlDialect, which is standard-conforming:
+    // backslashes inside '...' are LITERAL characters, so they must NOT be
+    // doubled here (doubling corrupted any text parameter containing '\',
+    // e.g. Windows paths). Only quote-doubling and NUL-stripping apply.
+    value.replace('\0', "").replace('\'', "''")
 }
 
 fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> String {
@@ -1219,8 +1394,24 @@ impl StartupHandler for NucleusHandler {
                 } else {
                     self.executor.create_session()
                 };
+                // The simple-query loop drains a streaming COPY inline (CopyData
+                // per batch), so this consumer can handle a lazy stream — let COPY
+                // TO STDOUT stream by default for it (bounded-memory export).
+                self.executor.mark_session_stream_capable(session_id);
                 let addr = client.socket_addr().to_string();
-                self.session_registry.write().insert(addr, session_id);
+                self.session_registry.write().insert(addr.clone(), session_id);
+
+                // Issue the cancellation key sent in BackendKeyData (during
+                // finish_authentication) and register it so a later
+                // CancelRequest on a fresh connection can interrupt this
+                // session's running query.
+                let pid = self.connection_pid(&addr);
+                let secret = SecretKey::I32(rand::random::<i32>());
+                client.set_pid_and_secret_key(pid, secret.clone());
+                self.cancel_keys.write().insert(pid, (secret, session_id));
+                self.cancel_notifies
+                    .write()
+                    .insert(session_id, Arc::new(tokio::sync::Notify::new()));
 
                 if !auth_required {
                     finish_authentication(client, &self.parameter_provider).await?;
@@ -1348,6 +1539,9 @@ impl SimpleQueryHandler for NucleusHandler {
     {
         let peer_addr_str = client.socket_addr().to_string();
         let session_id = self.session_id_from_client(client);
+        // New client command: a cancel for a previous command must not leak
+        // into this one.
+        self.executor.clear_session_cancel(session_id);
 
         // Inside an active transaction, all autocommit fast paths are disabled:
         // they bypass the session's MVCC snapshot and write straight to storage,
@@ -1400,6 +1594,14 @@ impl SimpleQueryHandler for NucleusHandler {
             && !rls_active
             && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query)
         {
+            // This path executes against the KV store directly, so it must
+            // consult the degraded-mode gate itself — otherwise a read-only
+            // server would still accept `SELECT kv_set(...)`.
+            if kv_cmd.is_write()
+                && let Err(e) = self.executor.service().admit_write("KV write")
+            {
+                return Err(exec_error_to_pgwire(e));
+            }
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             // A KV write must be durable before it is acked — this path bypasses
             // execute()'s commit-time force, so force here (no-op under
@@ -1431,6 +1633,19 @@ impl SimpleQueryHandler for NucleusHandler {
         // Detect COPY ... FROM STDIN and enter copy-in mode.
         if let Some(copy_info) = detect_copy_from_stdin(query) {
             let peer_addr = client.socket_addr();
+            let is_binary = copy_info.is_binary;
+            // Binary CopyInResponse advertises per-column binary format codes.
+            let ncols = if is_binary {
+                match &copy_info.columns {
+                    Some(cols) => cols.len(),
+                    None => self
+                        .executor
+                        .table_column_types(&copy_info.table)
+                        .map_or(0, |c| c.len()),
+                }
+            } else {
+                0
+            };
             self.copy_state.lock().insert(
                 peer_addr,
                 CopyInProgress {
@@ -1438,12 +1653,18 @@ impl SimpleQueryHandler for NucleusHandler {
                     columns: copy_info.columns,
                     delimiter: copy_info.delimiter,
                     is_csv: copy_info.is_csv,
+                    is_binary,
                     has_header: copy_info.has_header,
                     data: Vec::new(),
                     session_id,
                 },
             );
-            return Ok(vec![Response::CopyIn(CopyResponse::new(0, 0, vec![]))]);
+            let response = if is_binary {
+                CopyResponse::new(1, ncols, vec![1; ncols])
+            } else {
+                CopyResponse::new(0, 0, vec![])
+            };
+            return Ok(vec![Response::CopyIn(response)]);
         }
 
         let results = self.execute_sql_session(session_id, query).await?;
@@ -1451,6 +1672,39 @@ impl SimpleQueryHandler for NucleusHandler {
         let mut responses = Vec::new();
         let mut bytes_estimate: u64 = 0;
         for result in results {
+            // COPY TO STDOUT (FORMAT binary): one binary payload under a
+            // format=1 CopyOutResponse with per-column binary format codes.
+            if let crate::executor::ExecResult::CopyOutBinary {
+                data,
+                row_count,
+                columns,
+            } = result
+            {
+                use pgwire::api::copy::send_copy_out_response;
+                bytes_estimate += data.len() as u64;
+                send_copy_out_response(
+                    client,
+                    CopyResponse::new(1, columns, vec![1; columns]),
+                )
+                .await?;
+                const CHUNK_SIZE: usize = 65_536;
+                for chunk in data.chunks(CHUNK_SIZE) {
+                    client
+                        .send(PgWireBackendMessage::CopyData(CopyData::new(
+                            bytes::Bytes::copy_from_slice(chunk),
+                        )))
+                        .await?;
+                }
+                client
+                    .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                    .await?;
+                client
+                    .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                        format!("COPY {row_count}"),
+                    )))
+                    .await?;
+                continue;
+            }
             // COPY TO STDOUT: stream rows directly rather than returning a Response.
             if let crate::executor::ExecResult::CopyOut { data, row_count } = result {
                 use pgwire::api::copy::send_copy_out_response;
@@ -1482,6 +1736,67 @@ impl SimpleQueryHandler for NucleusHandler {
                 self.flush_pending_notifications(client).await?;
                 return Ok(vec![]);
             }
+            // Streaming COPY TO STDOUT: pull row batches and format+send each as
+            // CopyData, so a full-table export never buffers the whole table.
+            // Byte-identical to the materialized CopyOut path (shared formatters).
+            if let crate::executor::ExecResult::CopyOutStream {
+                mut source,
+                columns,
+                is_csv,
+                delimiter,
+                include_header,
+            } = result
+            {
+                use crate::executor::copy::{format_copy_body, format_copy_header};
+                use pgwire::api::copy::send_copy_out_response;
+                const CHUNK_SIZE: usize = 65_536;
+                send_copy_out_response(client, CopyResponse::new(0, 0, vec![])).await?;
+
+                // Emit the CSV header (if any) as the first CopyData payload.
+                if include_header {
+                    let header = format_copy_header(&columns, is_csv, delimiter);
+                    if !header.is_empty() {
+                        bytes_estimate += header.len() as u64;
+                        for chunk in header.into_bytes().chunks(CHUNK_SIZE) {
+                            client
+                                .send(PgWireBackendMessage::CopyData(CopyData::new(
+                                    bytes::Bytes::copy_from_slice(chunk),
+                                )))
+                                .await?;
+                        }
+                    }
+                }
+                let mut row_count = 0usize;
+                loop {
+                    match source.next_batch().await {
+                        Ok(Some(batch)) => {
+                            row_count += batch.len();
+                            let payload = format_copy_body(&batch, is_csv, delimiter);
+                            bytes_estimate += payload.len() as u64;
+                            for chunk in payload.into_bytes().chunks(CHUNK_SIZE) {
+                                client
+                                    .send(PgWireBackendMessage::CopyData(CopyData::new(
+                                        bytes::Bytes::copy_from_slice(chunk),
+                                    )))
+                                    .await?;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(exec_error_to_pgwire(e)),
+                    }
+                }
+                client
+                    .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                    .await?;
+                client
+                    .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                        format!("COPY {row_count}"),
+                    )))
+                    .await?;
+                self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
+                self.flush_pending_notifications(client).await?;
+                return Ok(vec![]);
+            }
             // Approximate wire bytes: count rows * avg 64 bytes per row + header
             bytes_estimate += Self::estimate_result_bytes(&result);
             responses.push(Self::build_response(result, None)?);
@@ -1492,6 +1807,10 @@ impl SimpleQueryHandler for NucleusHandler {
 
         // ── Flush pending notifications before ReadyForQuery ────────────
         self.flush_pending_notifications(client).await?;
+
+        // ReadyForQuery must report 'T' inside an open transaction — clients
+        // that verify BEGIN took effect (Prisma's quaint) abort otherwise.
+        self.sync_transaction_status(client, session_id);
 
         Ok(responses)
     }
@@ -1533,7 +1852,14 @@ impl ExtendedQueryHandler for NucleusHandler {
         // For SELECT statements, we can execute with dummy values to get the
         // schema. For non-SELECT statements, return no data.
         let fields = if is_select_query(sql) {
-            match self.describe_select_columns(sql, None).await {
+            // Statement-level Describe happens BEFORE Bind, so placeholders
+            // are unbound. Probe with NULL in their place — NULL comparisons
+            // yield no rows but the result SCHEMA is identical, which is all
+            // Describe needs. (Prisma describes statements, not portals; the
+            // old probe executed `$1` literally, errored, and advertised zero
+            // fields — its query engine then panicked on the arity mismatch.)
+            let probe_sql = replace_placeholders_with_null(sql);
+            match self.describe_select_columns(&probe_sql, None).await {
                 Ok(cols) => cols,
                 Err(e) => {
                     tracing::warn!("Failed to describe SELECT columns: {e}");
@@ -1541,7 +1867,7 @@ impl ExtendedQueryHandler for NucleusHandler {
                 }
             }
         } else {
-            Vec::new()
+            describe_returning_fields(stmt.statement.ast.as_deref(), &self.executor, None)
         };
 
         Ok(DescribeStatementResponse::new(param_types, fields))
@@ -1576,7 +1902,11 @@ impl ExtendedQueryHandler for NucleusHandler {
                 }
             }
         } else {
-            Vec::new()
+            describe_returning_fields(
+                portal.statement.statement.ast.as_deref(),
+                &self.executor,
+                Some(&portal.result_column_format),
+            )
         };
 
         Ok(DescribePortalResponse::new(fields))
@@ -1596,6 +1926,26 @@ impl ExtendedQueryHandler for NucleusHandler {
     {
         let parsed_stmt = &portal.statement.statement;
         let session_id = self.session_id_from_client(client);
+        // NOTE: no cancel-flag clear at entry. Extended-protocol clients
+        // pipeline Parse+Describe+Bind+Execute in one batch; a cancel that
+        // lands while the Describe probe runs targets this same client
+        // operation, and clearing at Execute entry would drop it. Instead the
+        // flag clears when this Execute finishes (drop guard), so a cancel
+        // that arrived too late to stop this command can't leak into the
+        // next one.
+        struct ClearCancelOnDrop {
+            executor: Arc<Executor>,
+            session_id: u64,
+        }
+        impl Drop for ClearCancelOnDrop {
+            fn drop(&mut self) {
+                self.executor.clear_session_cancel(self.session_id);
+            }
+        }
+        let _clear_cancel = ClearCancelOnDrop {
+            executor: self.executor.clone(),
+            session_id,
+        };
         let peer_addr_str = client.socket_addr().to_string();
         let rls_active = self.executor.session_has_active_rls(session_id);
 
@@ -1668,23 +2018,42 @@ impl ExtendedQueryHandler for NucleusHandler {
         // The extended protocol returns a single Response per Execute.
         // If there are multiple statements, take the last result.
         if let Some(mut result) = results.into_iter().last() {
-            // Respect max_rows from the Execute message. When max_rows > 0,
-            // the client only wants that many rows. (Full cursor/PortalSuspended
-            // support would require pgwire to expose that response variant.)
-            if max_rows > 0
-                && let ExecResult::Select { ref mut rows, .. } = result
-            {
-                rows.truncate(max_rows);
+            // The extended protocol returns a single Response via build_response,
+            // which has no inline COPY path and cannot serialize a streaming COPY
+            // (that is sent as CopyData in the simple-query loop). Collapse a
+            // streaming COPY to its materialized CopyOut here so extended-protocol
+            // COPY TO STDOUT keeps working when the session is stream-capable.
+            if matches!(result, ExecResult::CopyOutStream { .. }) {
+                result = result.materialize().await.map_err(exec_error_to_pgwire)?;
             }
+            // `max_rows` from the Execute message is deliberately NOT applied
+            // here.
+            //
+            // It used to truncate the row vector, and the comment claimed
+            // pgwire did not expose PortalSuspended. It does: `_on_execute`
+            // calls `send_partial_query_response`, which emits `max_rows` rows,
+            // sends PortalSuspended, and parks the REMAINDER in
+            // `PortalExecutionState::Suspended`. Truncating first meant the
+            // parked stream was already empty, so the next Execute on that
+            // portal drained nothing and the client got `SELECT 0` — silently
+            // losing every row past the first batch.
+            //
+            // That is the JDBC `setFetchSize(n)` path with autocommit off, plus
+            // node-postgres `pg-cursor` and Npgsql: the client concludes the
+            // result set has exactly n rows. Handing pgwire the full set lets it
+            // do the suspension it already implements correctly.
+            let _ = max_rows;
             let bytes_est = Self::estimate_result_bytes(&result);
             if bytes_est > 0 {
                 self.executor.metrics().bytes_sent.inc_by(bytes_est);
             }
             // Flush pending notifications before the response (before ReadyForQuery).
             self.flush_pending_notifications(client).await?;
+            self.sync_transaction_status(client, session_id);
             Self::build_response(result, Some(&portal.result_column_format))
         } else {
             self.flush_pending_notifications(client).await?;
+            self.sync_transaction_status(client, session_id);
             Ok(Response::EmptyQuery)
         }
     }
@@ -1761,50 +2130,69 @@ impl CopyHandler for NucleusHandler {
             return Ok(());
         };
 
-        let rows = parse_copy_rows(&state.data, state.delimiter, state.is_csv, state.has_header);
+        let rows = if state.is_binary {
+            // Resolve the target column types so each binary field can be
+            // decoded into the text-literal form the INSERT path expects.
+            let all = self.executor.table_column_types(&state.table).ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P01".to_owned(),
+                    format!("relation \"{}\" does not exist", state.table),
+                )))
+            })?;
+            let types: Vec<DataType> = match &state.columns {
+                Some(cols) => cols
+                    .iter()
+                    .map(|c| {
+                        all.iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(c))
+                            .map(|(_, t)| t.clone())
+                            .ok_or_else(|| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "42703".to_owned(),
+                                    format!("column \"{c}\" does not exist"),
+                                )))
+                            })
+                    })
+                    .collect::<PgWireResult<_>>()?,
+                None => all.into_iter().map(|(_, t)| t).collect(),
+            };
+            parse_copy_binary_rows(&state.data, &types).map_err(|msg| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P04".to_owned(), // bad_copy_file_format
+                    msg,
+                )))
+            })?
+        } else {
+            parse_copy_rows(&state.data, state.delimiter, state.is_csv, state.has_header).map_err(
+                |msg| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22021".to_owned(), // character_not_in_repertoire
+                        msg,
+                    )))
+                },
+            )?
+        };
         let row_count = rows.len();
 
-        // Insert in batches of 500 rows.
-        const BATCH: usize = 500;
-        for chunk in rows.chunks(BATCH) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let col_clause = match &state.columns {
-                Some(cols) => format!(
-                    " ({})",
-                    cols.iter()
-                        .map(|c| format!("\"{c}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                None => String::new(),
-            };
-            let mut sql = format!("INSERT INTO {}{} VALUES ", state.table, col_clause);
-            let mut first_row = true;
-            for row_fields in chunk {
-                if !first_row {
-                    sql.push_str(", ");
-                }
-                first_row = false;
-                sql.push('(');
-                for (i, val) in row_fields.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    match val {
-                        None => sql.push_str("NULL"),
-                        Some(s) => {
-                            sql.push('\'');
-                            sql.push_str(&sanitize_sql_text_literal(s));
-                            sql.push('\'');
-                        }
-                    }
-                }
-                sql.push(')');
-            }
+        // Run the whole payload as ONE INSERT statement.
+        //
+        // COPY is a bulk INSERT and PostgreSQL's is all-or-nothing within the
+        // statement. Splitting it into 500-row chunks made COPY the one write
+        // that could be half-applied: a constraint violation in chunk 2 left
+        // chunk 1 committed. Handing the executor a pre-built AST also drops
+        // the round-trip through SQL *text*, so no field has to survive literal
+        // escaping on its way into the table.
+        if row_count > 0 {
+            let statement = self
+                .executor
+                .copy_insert_statement(&state.table, state.columns.as_deref(), rows)
+                .map_err(exec_error_to_pgwire)?;
             self.executor
-                .execute_with_session(state.session_id, &sql)
+                .execute_statements_with_session(state.session_id, vec![statement])
                 .await
                 .map_err(exec_error_to_pgwire)?;
         }
@@ -1829,6 +2217,10 @@ impl NucleusHandler {
             }
             ExecResult::Command { tag, .. } => tag.len() as u64 + 16,
             ExecResult::CopyOut { data, .. } => data.len() as u64,
+            ExecResult::CopyOutBinary { data, .. } => data.len() as u64,
+            // Row count unknown until drained; estimate from the header only.
+            ExecResult::SelectStream { columns, .. } => columns.len() as u64 * 32,
+            ExecResult::CopyOutStream { columns, .. } => columns.len() as u64 * 32,
         }
     }
 
@@ -1855,7 +2247,11 @@ impl NucleusHandler {
                 self.notification_registry.remove_channel_if_empty(ch);
             }
         }
-        self.connection_pids.write().remove(peer_addr);
+        if let Some(pid) = self.connection_pids.write().remove(peer_addr)
+            && let Some((_, session_id)) = self.cancel_keys.write().remove(&pid)
+        {
+            self.cancel_notifies.write().remove(&session_id);
+        }
         // Clean up large object descriptors.
         self.lo_state.lock().remove(peer_addr);
     }
@@ -2317,6 +2713,74 @@ impl PgWireServerHandlers for NucleusServer {
     fn copy_handler(&self) -> Arc<impl CopyHandler> {
         self.handler.clone()
     }
+
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
+        self.handler.clone()
+    }
+}
+
+#[async_trait]
+impl CancelHandler for NucleusHandler {
+    /// Handle a wire CancelRequest (arrives on its own short-lived
+    /// connection). The (pid, secret) pair must match what BackendKeyData
+    /// advertised; on mismatch the request is silently ignored, per protocol.
+    async fn on_cancel_request(&self, request: CancelRequest) {
+        // Protocol 3.0 carries the secret as i32, 3.2 as bytes — a client may
+        // echo the key in either form, so compare canonical byte values.
+        fn secret_matches(a: &SecretKey, b: &SecretKey) -> bool {
+            let as_bytes = |k: &SecretKey| -> Vec<u8> {
+                match k {
+                    SecretKey::I32(v) => v.to_be_bytes().to_vec(),
+                    SecretKey::Bytes(b) => b.to_vec(),
+                }
+            };
+            constant_time_eq(&as_bytes(a), &as_bytes(b))
+        }
+        let session = {
+            let keys = self.cancel_keys.read();
+            match keys.get(&request.pid) {
+                Some((secret, session_id)) if secret_matches(secret, &request.secret_key) => {
+                    Some(*session_id)
+                }
+                _ => None,
+            }
+        };
+        match session {
+            Some(session_id) => {
+                tracing::info!(pid = request.pid, session_id, "query cancel request accepted");
+                // Cooperative flag: long compute loops poll it (rayon filters,
+                // cartesian products) — this is what interrupts CPU-bound work.
+                self.executor.request_session_cancel(session_id);
+                // Notify: wakes the wire-level race for executions parked at
+                // an await point.
+                if let Some(notify) = self.cancel_notifies.read().get(&session_id) {
+                    notify.notify_one();
+                }
+            }
+            None => {
+                tracing::debug!(pid = request.pid, "query cancel request ignored (key mismatch)");
+            }
+        }
+    }
+}
+
+/// Parse a statement_timeout setting into milliseconds, following
+/// PostgreSQL's convention: bare integers are milliseconds; "s"/"ms"/"min"
+/// suffixes are honoured. Returns None for unparseable values.
+fn parse_timeout_ms(v: &str) -> Option<u64> {
+    let v = v.trim().trim_matches('\'');
+    if let Ok(n) = v.parse::<u64>() {
+        return Some(n);
+    }
+    let (num, unit) = v.split_at(v.find(|c: char| c.is_ascii_alphabetic())?);
+    let n = num.trim().parse::<u64>().ok()?;
+    match unit.trim() {
+        "ms" => Some(n),
+        "s" => Some(n * 1000),
+        "min" => Some(n * 60_000),
+        "h" => Some(n * 3_600_000),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -2445,6 +2909,221 @@ enum DecodedParam {
 /// Decode a portal parameter into a `DecodedParam` regardless of whether the
 /// client sent it in text or binary format.  Returns `None` only when the
 /// portal index is out of bounds.
+/// Decode a BINARY-format parameter for the typed OIDs whose wire encoding is
+/// NOT a fixed-width integer: temporal, uuid, bytea, numeric, interval. Returns
+/// the text-literal form the SQL substitution path expects (the same form a
+/// text-mode driver would send), so both formats flow through one path.
+///
+/// Pure so unit tests can hit it with raw byte patterns. Returns `None` when
+/// the OID isn't one of these types (caller falls through to its other arms)
+/// and a loud `Some(Err)`-style corrupt-length rejection is expressed by the
+/// caller mapping `None` from a matched-but-malformed payload — here malformed
+/// lengths return `None` too, which the caller treats as NULL (matching the
+/// pre-existing convention for undecodable params).
+fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
+    match oid {
+        // timestamp / timestamptz: i64 BE microseconds since 2000-01-01.
+        // Value::Timestamp's Display renders "YYYY-MM-DD HH:MM:SS[.ffffff]",
+        // which parse_timestamp accepts for both ts and tstz columns.
+        1114 | 1184 => {
+            if bytes.len() != 8 {
+                return None;
+            }
+            let us = i64::from_be_bytes(bytes.try_into().ok()?);
+            Some(DecodedParam::Text(Value::Timestamp(us).to_string()))
+        }
+        // date: i32 BE days since 2000-01-01 → "YYYY-MM-DD".
+        1082 => {
+            if bytes.len() != 4 {
+                return None;
+            }
+            let days = i32::from_be_bytes(bytes.try_into().ok()?);
+            Some(DecodedParam::Text(Value::Date(days).to_string()))
+        }
+        // uuid: 16 raw bytes → canonical hyphenated lowercase hex.
+        2950 => {
+            if bytes.len() != 16 {
+                return None;
+            }
+            let h: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let s = format!(
+                "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12],
+                h[13], h[14], h[15]
+            );
+            Some(DecodedParam::Text(s))
+        }
+        // bytea: raw bytes → Postgres hex text form. The '\' is literal under
+        // the standard-conforming dialect; Value's Text→Bytea cast hex-decodes
+        // the "\x" prefix, so this round-trips exactly.
+        17 => {
+            let mut s = String::with_capacity(2 + bytes.len() * 2);
+            s.push_str("\\x");
+            for b in bytes {
+                s.push_str(&format!("{b:02x}"));
+            }
+            Some(DecodedParam::Text(s))
+        }
+        // numeric: NBASE-10000 (ndigits, weight, sign, dscale, digit words).
+        // Decoded exactly to a decimal string — no float round-trip.
+        1700 => decode_binary_numeric(bytes).map(DecodedParam::Numeric),
+        // interval: i64 μs, i32 days, i32 months → unit literal the interval
+        // parser accepts.
+        1186 => {
+            if bytes.len() != 16 {
+                return None;
+            }
+            let us = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
+            let days = i32::from_be_bytes(bytes[8..12].try_into().ok()?);
+            let months = i32::from_be_bytes(bytes[12..16].try_into().ok()?);
+            let secs = us / 1_000_000;
+            let frac = (us % 1_000_000).unsigned_abs();
+            let mut s = format!("{months} months {days} days {secs}");
+            if frac != 0 {
+                s.push_str(&format!(".{frac:06}"));
+            }
+            s.push_str(" seconds");
+            Some(DecodedParam::Text(s))
+        }
+        // Arrays of the common element types (text[]/varchar[], int2/4/8[],
+        // bool[], uuid[], float4/8[]) — decoded to the Postgres array-literal
+        // text form ('{a,b}') that the executor's ANY/ALL and array casts
+        // accept. Layout: i32 ndim, i32 dataoffset, u32 elemtype, then per
+        // dim (i32 len, i32 lower bound), then per element i32 len + payload.
+        1009 | 1015 | 1005 | 1007 | 1016 | 1000 | 2951 | 1021 | 1022 => {
+            decode_binary_array(bytes).map(DecodedParam::Text)
+        }
+        _ => None,
+    }
+}
+
+/// Decode a binary one-dimensional array parameter into `{...}` literal text.
+/// Elements are rendered by element OID; embedded quotes/backslashes in text
+/// elements are escaped per the array-literal grammar. NULL elements render
+/// as unquoted NULL. Multi-dimensional arrays are refused (None → fail-loud).
+fn decode_binary_array(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let ndim = i32::from_be_bytes(bytes[0..4].try_into().ok()?);
+    let elem_oid = u32::from_be_bytes(bytes[8..12].try_into().ok()?);
+    if ndim == 0 {
+        return Some("{}".into());
+    }
+    if ndim != 1 || bytes.len() < 20 {
+        return None;
+    }
+    let count = i32::from_be_bytes(bytes[12..16].try_into().ok()?);
+    let mut off = 20;
+    let mut parts: Vec<String> = Vec::with_capacity(count.max(0) as usize);
+    for _ in 0..count {
+        if bytes.len() < off + 4 {
+            return None;
+        }
+        let len = i32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+        off += 4;
+        if len < 0 {
+            parts.push("NULL".into());
+            continue;
+        }
+        let len = len as usize;
+        if bytes.len() < off + len {
+            return None;
+        }
+        let payload = &bytes[off..off + len];
+        off += len;
+        let rendered = match elem_oid {
+            16 => (payload == [1u8]).then(|| "t".to_string()).or(Some("f".to_string()))?,
+            21 => i16::from_be_bytes(payload.try_into().ok()?).to_string(),
+            23 => i32::from_be_bytes(payload.try_into().ok()?).to_string(),
+            20 => i64::from_be_bytes(payload.try_into().ok()?).to_string(),
+            700 => f32::from_be_bytes(payload.try_into().ok()?).to_string(),
+            701 => f64::from_be_bytes(payload.try_into().ok()?).to_string(),
+            2950 => {
+                if payload.len() != 16 {
+                    return None;
+                }
+                let h: Vec<String> = payload.iter().map(|b| format!("{b:02x}")).collect();
+                format!(
+                    "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11],
+                    h[12], h[13], h[14], h[15]
+                )
+            }
+            // text / varchar
+            25 | 1043 => {
+                let s = std::str::from_utf8(payload).ok()?;
+                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            }
+            _ => return None,
+        };
+        parts.push(rendered);
+    }
+    Some(format!("{{{}}}", parts.join(",")))
+}
+
+/// Decode PostgreSQL's binary NUMERIC wire format into an exact decimal
+/// string. Layout: u16 ndigits, i16 weight (in NBASE-10000 words), u16 sign
+/// (0x0000 +, 0x4000 -, 0xC000 NaN), u16 dscale, then ndigits u16 words.
+fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let ndigits = u16::from_be_bytes(bytes[0..2].try_into().ok()?) as usize;
+    let weight = i16::from_be_bytes(bytes[2..4].try_into().ok()?) as i32;
+    let sign = u16::from_be_bytes(bytes[4..6].try_into().ok()?);
+    let dscale = u16::from_be_bytes(bytes[6..8].try_into().ok()?) as usize;
+    if bytes.len() != 8 + ndigits * 2 {
+        return None;
+    }
+    if sign == 0xC000 {
+        return None; // NaN has no SQL literal Nucleus accepts; treat as undecodable
+    }
+    let digits: Vec<u16> = (0..ndigits)
+        .map(|i| u16::from_be_bytes([bytes[8 + i * 2], bytes[9 + i * 2]]))
+        .collect();
+
+    // Integer part: words with index <= weight (each word = 4 decimal digits).
+    let mut int_part = String::new();
+    for w in 0..=weight.max(-1) {
+        let d = digits.get(w as usize).copied().unwrap_or(0);
+        if int_part.is_empty() {
+            int_part.push_str(&d.to_string());
+        } else {
+            int_part.push_str(&format!("{d:04}"));
+        }
+    }
+    if int_part.is_empty() {
+        int_part.push('0');
+    }
+    // Fraction part: words after the weight position, 4 digits each.
+    let mut frac_part = String::new();
+    let mut idx = (weight + 1).max(0) as usize;
+    // Leading zero-words for numbers like 0.0001 (weight < -1).
+    let mut lead = -1 - weight;
+    while lead > 0 {
+        frac_part.push_str("0000");
+        lead -= 1;
+    }
+    while idx < ndigits {
+        frac_part.push_str(&format!("{:04}", digits[idx]));
+        idx += 1;
+    }
+    // Scale the fraction to dscale exactly (pad or trim trailing digits).
+    if frac_part.len() < dscale {
+        frac_part.push_str(&"0".repeat(dscale - frac_part.len()));
+    } else {
+        frac_part.truncate(dscale);
+    }
+    let sign_str = if sign == 0x4000 { "-" } else { "" };
+    Some(if frac_part.is_empty() {
+        format!("{sign_str}{int_part}")
+    } else {
+        format!("{sign_str}{int_part}.{frac_part}")
+    })
+}
+
 fn decode_pg_param(
     portal: &Portal<ParsedStatement>,
     idx: usize,
@@ -2455,6 +3134,19 @@ fn decode_pg_param(
         return Some(DecodedParam::Null);
     };
     let is_binary = portal.parameter_format.is_binary(idx);
+
+    // Typed non-integer binary encodings (temporal/uuid/bytea/numeric/interval)
+    // — previously these fell through to the fixed-width-integer catch-all and
+    // were silently reinterpreted as integers (data corruption for binary-mode
+    // drivers: tokio-postgres, pgx default, JDBC).
+    if is_binary
+        && let Some(decoded) = decode_binary_param_typed(type_hint.oid(), bytes)
+    {
+        return Some(decoded);
+    }
+    // Text-format bytea arrives as the '\x...' literal already; other text
+    // formats for these OIDs are likewise the literal forms — the existing
+    // text handling below passes them through correctly.
 
     match type_hint.oid() {
         23 => {
@@ -2597,6 +3289,145 @@ fn decode_pg_param(
 /// clauses), or another `Cast`.  Anything we cannot resolve stays `None`,
 /// which the caller turns into `Type::TEXT` — preserving the pre-fix
 /// behavior so we do not regress queries we could not infer before.
+/// FieldInfos for the RETURNING list of an INSERT/UPDATE/DELETE statement —
+/// Describe used to advertise ZERO fields for these, which crashes clients
+/// that build their row decoder from the describe response (Prisma's query
+/// engine panics with "index out of bounds: the len is 0").
+/// Replace `$N` placeholders with NULL for schema-probe execution. Skips
+/// dollar signs inside single-quoted literals and dollar-quoted strings are
+/// not handled (a describe probe of such SQL degrades to the error path, the
+/// same behavior as before).
+fn replace_placeholders_with_null(sql: &str) -> String {
+    let mut out = Vec::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            out.push(c);
+            if c == b'\'' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_str = true;
+                out.push(c);
+                i += 1;
+            }
+            b'$' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                out.extend_from_slice(b"NULL");
+                i = j;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // Byte-level edits only touched ASCII, so this cannot fail for valid input.
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+}
+
+fn describe_returning_fields(
+    ast: Option<&[sqlparser::ast::Statement]>,
+    executor: &Arc<Executor>,
+    formats: Option<&Format>,
+) -> Vec<FieldInfo> {
+    use sqlparser::ast::{Expr, FromTable, SelectItem, Statement, TableFactor, TableObject};
+    let Some(stmt) = ast.and_then(|stmts| stmts.first()) else {
+        return Vec::new();
+    };
+    let (table_name, returning): (String, &Vec<SelectItem>) = match stmt {
+        Statement::Insert(i) => {
+            let Some(r) = &i.returning else {
+                return Vec::new();
+            };
+            let TableObject::TableName(n) = &i.table else {
+                return Vec::new();
+            };
+            (crate::sql::object_name_key(n), r)
+        }
+        Statement::Update(u) => {
+            let Some(r) = &u.returning else {
+                return Vec::new();
+            };
+            let TableFactor::Table { name, .. } = &u.table.relation else {
+                return Vec::new();
+            };
+            (crate::sql::object_name_key(name), r)
+        }
+        Statement::Delete(d) => {
+            let Some(r) = &d.returning else {
+                return Vec::new();
+            };
+            let (FromTable::WithFromKeyword(twjs) | FromTable::WithoutKeyword(twjs)) = &d.from;
+            let Some(TableFactor::Table { name, .. }) = twjs.first().map(|t| &t.relation) else {
+                return Vec::new();
+            };
+            (crate::sql::object_name_key(name), r)
+        }
+        _ => return Vec::new(),
+    };
+    let Some(def) = executor.catalog().get_table_cached(&table_name) else {
+        return Vec::new();
+    };
+    let col_type = |col: &str| {
+        def.columns
+            .iter()
+            .find(|c| c.name == col)
+            .map(|c| data_type_to_pg(&c.data_type))
+            .unwrap_or(Type::TEXT)
+    };
+    let mut out = Vec::new();
+    for item in returning {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for c in &def.columns {
+                    out.push((c.name.clone(), data_type_to_pg(&c.data_type)));
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let alias = if let SelectItem::ExprWithAlias { alias, .. } = item {
+                    Some(alias.value.clone())
+                } else {
+                    None
+                };
+                let (name, ty) = match expr {
+                    Expr::Identifier(id) => (id.value.clone(), col_type(&id.value)),
+                    Expr::CompoundIdentifier(parts) => {
+                        let col = parts.last().map(|p| p.value.clone()).unwrap_or_default();
+                        let ty = col_type(&col);
+                        (col, ty)
+                    }
+                    other => (other.to_string(), Type::TEXT),
+                };
+                out.push((alias.unwrap_or(name), ty));
+            }
+            _ => {}
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, (name, ty))| {
+            FieldInfo::new(
+                name,
+                None,
+                None,
+                ty,
+                formats.map_or(FieldFormat::Text, |f| requested_format(f, i)),
+            )
+        })
+        .collect()
+}
+
 fn infer_param_types_from_ast(
     stmts: &[sqlparser::ast::Statement],
     executor: &Arc<Executor>,
@@ -2611,32 +3442,7 @@ fn infer_param_types_from_ast(
 
         match stmt {
             Statement::Query(q) => {
-                if let SetExpr::Select(select) = q.body.as_ref() {
-                    for item in &select.projection {
-                        if let sqlparser::ast::SelectItem::UnnamedExpr(e)
-                        | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } = item
-                        {
-                            walk_expr_for_params(e, &tables, &mut result);
-                        }
-                    }
-                    if let Some(ref w) = select.selection {
-                        walk_expr_for_params(w, &tables, &mut result);
-                    }
-                    if let Some(ref h) = select.having {
-                        walk_expr_for_params(h, &tables, &mut result);
-                    }
-                }
-                if let Some(ref limit_clause) = q.limit_clause {
-                    use sqlparser::ast::LimitClause;
-                    if let LimitClause::LimitOffset { limit, offset, .. } = limit_clause {
-                        if let Some(e) = limit {
-                            mark_param(e, Type::INT8, &mut result);
-                        }
-                        if let Some(off) = offset {
-                            mark_param(&off.value, Type::INT8, &mut result);
-                        }
-                    }
-                }
+                walk_query_for_params(q, &tables, &mut result);
             }
             Statement::Insert(insert) => {
                 if let Some(source) = &insert.source
@@ -2787,6 +3593,72 @@ fn column_type_in_tables(
 
 /// Recursively walk an expression looking for `$N` placeholders and infer
 /// each one\'s pgwire `Type` from the surrounding AST.
+/// Recursive Query walker: projection/WHERE/HAVING exprs, LIMIT/OFFSET, and —
+/// crucially for ORM introspection SQL — derived tables in FROM and join ON
+/// constraints, which the old top-level-only walk never reached (Prisma binds
+/// `= ANY($1)` inside a FROM (SELECT ...) subquery).
+fn walk_query_for_params(
+    q: &sqlparser::ast::Query,
+    tables: &[Arc<crate::catalog::TableDef>],
+    result: &mut [Option<Type>],
+) {
+    use sqlparser::ast::{JoinConstraint, JoinOperator, SetExpr, TableFactor};
+    fn walk_factor(
+        f: &TableFactor,
+        tables: &[Arc<crate::catalog::TableDef>],
+        result: &mut [Option<Type>],
+    ) {
+        if let TableFactor::Derived { subquery, .. } = f {
+            walk_query_for_params(subquery, tables, result);
+        }
+    }
+    if let SetExpr::Select(select) = q.body.as_ref() {
+        for item in &select.projection {
+            if let sqlparser::ast::SelectItem::UnnamedExpr(e)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } = item
+            {
+                walk_expr_for_params(e, tables, result);
+            }
+        }
+        if let Some(ref w) = select.selection {
+            walk_expr_for_params(w, tables, result);
+        }
+        if let Some(ref h) = select.having {
+            walk_expr_for_params(h, tables, result);
+        }
+        for twj in &select.from {
+            walk_factor(&twj.relation, tables, result);
+            for j in &twj.joins {
+                walk_factor(&j.relation, tables, result);
+                let constraint = match &j.join_operator {
+                    JoinOperator::Inner(c)
+                    | JoinOperator::Join(c)
+                    | JoinOperator::Left(c)
+                    | JoinOperator::LeftOuter(c)
+                    | JoinOperator::Right(c)
+                    | JoinOperator::RightOuter(c)
+                    | JoinOperator::FullOuter(c) => Some(c),
+                    _ => None,
+                };
+                if let Some(JoinConstraint::On(e)) = constraint {
+                    walk_expr_for_params(e, tables, result);
+                }
+            }
+        }
+    }
+    if let Some(ref limit_clause) = q.limit_clause {
+        use sqlparser::ast::LimitClause;
+        if let LimitClause::LimitOffset { limit, offset, .. } = limit_clause {
+            if let Some(e) = limit {
+                mark_param(e, Type::INT8, result);
+            }
+            if let Some(off) = offset {
+                mark_param(&off.value, Type::INT8, result);
+            }
+        }
+    }
+}
+
 fn walk_expr_for_params(
     expr: &sqlparser::ast::Expr,
     tables: &[Arc<crate::catalog::TableDef>],
@@ -2856,6 +3728,27 @@ fn walk_expr_for_params(
                 walk_expr_for_params(item, tables, out);
             }
         }
+        // `x = ANY($1)` / `x = ALL($1)` — the parameter is an ARRAY of x's
+        // element type. Without this, ParameterDescription said TEXT and
+        // array-binding drivers (Prisma's quaint) refused to serialize.
+        Expr::AnyOp {
+            left,
+            right,
+            ..
+        }
+        | Expr::AllOp {
+            left,
+            right,
+            ..
+        } => {
+            // The right side of ANY/ALL is definitionally an array, so even
+            // when the element type can't be resolved (virtual catalogs are
+            // not in the TableDef list) default to text[] rather than text.
+            let elem = expr_pg_type(left, tables).unwrap_or(Type::TEXT);
+            mark_param(right, scalar_to_array_type(&elem), out);
+            walk_expr_for_params(left, tables, out);
+            walk_expr_for_params(right, tables, out);
+        }
         Expr::Function(func) => {
             // Known Nucleus scalar extensions: advertise proper types for
             // their placeholder args instead of the blanket TEXT default.
@@ -2901,8 +3794,11 @@ fn expr_pg_type(
         Expr::Identifier(ident) => {
             column_type_in_tables(tables, &ident.value).map(|dt| data_type_to_pg(&dt))
         }
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            column_type_in_tables(tables, &parts[1].value).map(|dt| data_type_to_pg(&dt))
+        // table.column or schema.table.column (Prisma qualifies all columns
+        // three-part) — the column is always the last segment.
+        Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+            column_type_in_tables(tables, &parts.last().unwrap().value)
+                .map(|dt| data_type_to_pg(&dt))
         }
         Expr::Cast { data_type, .. } => crate::sql::convert_data_type(data_type)
             .ok()
@@ -2939,6 +3835,27 @@ fn is_select_query(sql: &str) -> bool {
 }
 
 /// Map Nucleus DataType to Postgres wire type.
+/// Array pg type whose element type is `t` — for `= ANY($n)` parameter
+/// inference. Unknown element types degrade to text[].
+fn scalar_to_array_type(t: &Type) -> Type {
+    match *t {
+        Type::BOOL => Type::BOOL_ARRAY,
+        Type::INT2 => Type::INT2_ARRAY,
+        Type::INT4 => Type::INT4_ARRAY,
+        Type::INT8 => Type::INT8_ARRAY,
+        Type::FLOAT4 => Type::FLOAT4_ARRAY,
+        Type::FLOAT8 => Type::FLOAT8_ARRAY,
+        Type::NUMERIC => Type::NUMERIC_ARRAY,
+        Type::VARCHAR => Type::VARCHAR_ARRAY,
+        Type::UUID => Type::UUID_ARRAY,
+        Type::DATE => Type::DATE_ARRAY,
+        Type::TIMESTAMP => Type::TIMESTAMP_ARRAY,
+        Type::TIMESTAMPTZ => Type::TIMESTAMPTZ_ARRAY,
+        Type::BYTEA => Type::BYTEA_ARRAY,
+        _ => Type::TEXT_ARRAY,
+    }
+}
+
 fn data_type_to_pg(dt: &DataType) -> Type {
     match dt {
         DataType::Bool => Type::BOOL,
@@ -2988,6 +3905,7 @@ fn encode_value_typed(
     encoder: &mut DataRowEncoder,
     value: &Value,
     target: &DataType,
+    fmt: FieldFormat,
 ) -> PgWireResult<()> {
     match (value, target) {
         (Value::Int32(n), DataType::Int64) => return encoder.encode_field(&Some(*n as i64)),
@@ -3000,30 +3918,104 @@ fn encode_value_typed(
         (Value::Int64(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
         _ => {}
     }
-    encode_value(encoder, value)
+    encode_value(encoder, value, fmt)
 }
 
-/// Encode a Nucleus Value into a pgwire DataRowEncoder field.
-fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()> {
+/// Encode a Nucleus Value into a pgwire DataRowEncoder field. `fmt` is the
+/// column's wire format (Text/Binary) — temporal values render differently in
+/// text (see below).
+fn encode_value(encoder: &mut DataRowEncoder, value: &Value, fmt: FieldFormat) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<&str>),
         Value::Bool(b) => encoder.encode_field(&Some(*b)),
         Value::Int32(n) => encoder.encode_field(&Some(*n)),
         Value::Int64(n) => encoder.encode_field(&Some(*n)),
+        // Non-finite floats: PostgreSQL's text wire form is
+        // "Infinity"/"-Infinity"/"NaN"; f64's ToSqlText emits "inf"/"NaN".
+        // Encode the PG spelling as text so clients (and psql) display it
+        // correctly under the float8 RowDescription.
+        Value::Float64(n) if !n.is_finite() => {
+            let s = if n.is_nan() {
+                "NaN"
+            } else if *n < 0.0 {
+                "-Infinity"
+            } else {
+                "Infinity"
+            };
+            encoder.encode_field(&Some(s))
+        }
+        // TEXT-format floats render via Value's Display, which spells the
+        // exponent PostgreSQL-style ("1e+100", not Rust's "1e100").
+        Value::Float64(_) if matches!(fmt, FieldFormat::Text) => {
+            encoder.encode_field(&Some(value.to_string().as_str()))
+        }
         Value::Float64(n) => encoder.encode_field(&Some(*n)),
         Value::Text(s) => encoder.encode_field(&Some(s.as_str())),
         Value::Jsonb(v) => encoder.encode_field(&Some(v.to_string().as_str())),
-        // New types: encode as text representation for wire protocol
-        Value::Date(_)
-        | Value::Timestamp(_)
-        | Value::TimestampTz(_)
-        | Value::Numeric(_)
+        // In TEXT format, temporal values render via Nucleus's Display, which
+        // matches PostgreSQL's text form — most importantly it OMITS a
+        // `.000000` fractional part when microseconds are zero (chrono's
+        // ToSqlText always writes it). Binary format still uses the native
+        // chrono impls below so binary clients decode correctly.
+        Value::Timestamp(_) | Value::TimestampTz(_) | Value::Date(_)
+            if matches!(fmt, FieldFormat::Text) =>
+        {
+            encoder.encode_field(&Some(value.to_string().as_str()))
+        }
+        // Temporal/decimal/bytea values encode through their native
+        // postgres-types impls so BINARY-format result columns carry real
+        // binary payloads (a text string under a binary RowDescription made
+        // Prisma/pgx misdecode timestamps). Text-format columns still render
+        // through ToSqlText, so text clients are unchanged.
+        Value::Timestamp(us) => {
+            let ts = pg_epoch_naive() + chrono::Duration::microseconds(*us);
+            encoder.encode_field(&Some(ts))
+        }
+        Value::TimestampTz(us) => {
+            let ts = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                pg_epoch_naive() + chrono::Duration::microseconds(*us),
+                chrono::Utc,
+            );
+            encoder.encode_field(&Some(ts))
+        }
+        Value::Date(days) => {
+            let d = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()
+                + chrono::Duration::days(i64::from(*days));
+            encoder.encode_field(&Some(d))
+        }
+        Value::Bytea(b) => encoder.encode_field(&Some(b.as_slice())),
+        // BINARY-format NUMERIC must carry the NBASE-10000 wire encoding —
+        // pgjdbc switches result transfer to binary once a statement is
+        // server-prepared and rejects text bytes under a binary column.
+        Value::Numeric(s) if matches!(fmt, FieldFormat::Binary) => {
+            match rust_decimal::Decimal::from_str_exact(s) {
+                Ok(d) => encoder.encode_field(&Some(d)),
+                Err(_) => Err(PgWireError::ApiError(
+                    format!("numeric value not binary-encodable: {s}").into(),
+                )),
+            }
+        }
+        // BINARY-format UUID is the 16 raw bytes (the &[u8] impl writes raw).
+        Value::Uuid(b) if matches!(fmt, FieldFormat::Binary) => {
+            encoder.encode_field(&Some(b.as_slice()))
+        }
+        // Text-rendered forms are exact for the remaining types; array/vector/
+        // interval have no enabled native binary impl.
+        Value::Numeric(_)
         | Value::Uuid(_)
-        | Value::Bytea(_)
         | Value::Array(_)
         | Value::Vector(_)
         | Value::Interval { .. } => encoder.encode_field(&Some(value.to_string().as_str())),
     }
+}
+
+/// 2000-01-01T00:00:00 — the PostgreSQL timestamp epoch Nucleus stores
+/// microsecond offsets against.
+fn pg_epoch_naive() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
 }
 
 /// Map a Postgres wire type OID to Nucleus DataType (best effort).
@@ -3216,6 +4208,7 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
 
     let mut delimiter = b'\t';
     let mut is_csv = false;
+    let mut is_binary = false;
     let mut has_header = false;
 
     for opt in options {
@@ -3223,6 +4216,9 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
             CopyOption::Format(f) if f.value.to_uppercase() == "CSV" => {
                 is_csv = true;
                 delimiter = b',';
+            }
+            CopyOption::Format(f) if f.value.to_uppercase() == "BINARY" => {
+                is_binary = true;
             }
             CopyOption::Delimiter(d) => delimiter = d as u8,
             CopyOption::Header(h) => has_header = h,
@@ -3235,8 +4231,103 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
         columns: col_names,
         delimiter,
         is_csv,
+        is_binary,
         has_header,
     })
+}
+
+/// Parse a PostgreSQL binary-COPY payload into rows of optional text-literal
+/// fields (the same form the text path produces, so both feed one INSERT
+/// builder). Fails loudly on a malformed stream or an undecodable type.
+fn parse_copy_binary_rows(
+    data: &[u8],
+    types: &[DataType],
+) -> Result<Vec<Vec<Option<String>>>, String> {
+    const SIG: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
+    if data.len() < 19 || &data[..11] != SIG {
+        return Err("invalid binary COPY signature".into());
+    }
+    let ext_len = u32::from_be_bytes(data[15..19].try_into().unwrap()) as usize;
+    let mut pos = 19 + ext_len;
+    let mut rows = Vec::new();
+    loop {
+        if pos + 2 > data.len() {
+            return Err("unexpected end of binary COPY data".into());
+        }
+        let nfields = i16::from_be_bytes(data[pos..pos + 2].try_into().unwrap());
+        pos += 2;
+        // Only -1 is the trailer. Any other negative count sign-extended to a
+        // near-usize::MAX capacity request below and aborted the connection
+        // task with "capacity overflow" — the one malformed-stream case here
+        // that panicked instead of failing with 22P04.
+        if nfields < -1 {
+            return Err(format!(
+                "invalid field count in binary COPY tuple ({nfields})"
+            ));
+        }
+        if nfields == -1 {
+            break; // trailer
+        }
+        let mut row = Vec::with_capacity(nfields as usize);
+        for i in 0..nfields as usize {
+            if pos + 4 > data.len() {
+                return Err("unexpected end of binary COPY tuple".into());
+            }
+            let len = i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            if len == -1 {
+                row.push(None);
+                continue;
+            }
+            let len = len as usize;
+            if pos + len > data.len() {
+                return Err("binary COPY field extends past end of data".into());
+            }
+            let ty = types.get(i).ok_or_else(|| {
+                format!("binary COPY row has more fields than target columns ({nfields})")
+            })?;
+            let oid = data_type_to_pg(ty).oid();
+            let text = decode_copy_binary_field(oid, &data[pos..pos + len]).ok_or_else(|| {
+                format!("cannot decode binary COPY field of type {ty}")
+            })?;
+            row.push(Some(text));
+            pos += len;
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Decode one binary COPY field into its text-literal form.
+fn decode_copy_binary_field(oid: u32, b: &[u8]) -> Option<String> {
+    match oid {
+        16 if b.len() == 1 => Some(if b[0] != 0 { "true" } else { "false" }.into()),
+        21 if b.len() == 2 => Some(i16::from_be_bytes(b.try_into().ok()?).to_string()),
+        23 if b.len() == 4 => Some(i32::from_be_bytes(b.try_into().ok()?).to_string()),
+        20 if b.len() == 8 => Some(i64::from_be_bytes(b.try_into().ok()?).to_string()),
+        700 if b.len() == 4 => Some(float_literal(f32::from_be_bytes(b.try_into().ok()?) as f64)),
+        701 if b.len() == 8 => Some(float_literal(f64::from_be_bytes(b.try_into().ok()?))),
+        // Text family: the binary encoding IS the UTF-8 text.
+        18 | 19 | 25 | 114 | 1042 | 1043 => Some(String::from_utf8(b.to_vec()).ok()?),
+        // jsonb: version byte then JSON text.
+        3802 if !b.is_empty() && b[0] == 1 => Some(String::from_utf8(b[1..].to_vec()).ok()?),
+        _ => match decode_binary_param_typed(oid, b)? {
+            DecodedParam::Null => None,
+            DecodedParam::Numeric(s) | DecodedParam::Bool(s) | DecodedParam::Text(s) => Some(s),
+        },
+    }
+}
+
+/// Float text form the SQL parser accepts (PostgreSQL spellings for the
+/// non-finite values).
+fn float_literal(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".into()
+    } else if f.is_infinite() {
+        if f < 0.0 { "-Infinity".into() } else { "Infinity".into() }
+    } else {
+        f.to_string()
+    }
 }
 
 /// Parse accumulated COPY data bytes into rows of optional string fields.
@@ -3245,45 +4336,89 @@ fn parse_copy_rows(
     delimiter: u8,
     is_csv: bool,
     has_header: bool,
-) -> Vec<Vec<Option<String>>> {
+) -> Result<Vec<Vec<Option<String>>>, String> {
     let text = match std::str::from_utf8(data) {
         Ok(s) => s,
-        Err(_) => return vec![],
+        // Returning no rows here made `on_copy_done` skip the INSERT and report
+        // `COPY 0` — a clean success for a payload that was never stored, and
+        // valid rows later in the same stream vanished with it. PostgreSQL
+        // fails with 22021; the caller now surfaces an error too.
+        Err(e) => return Err(format!("invalid byte sequence for encoding \"UTF8\": {e}")),
     };
-    let mut rows = Vec::new();
-    let mut lines = text.lines().peekable();
-    if has_header {
-        lines.next();
+
+    // Split into RECORDS, not physical lines. A CSV field may legally contain a
+    // newline inside quotes — PostgreSQL round-trips those, and Nucleus's own
+    // `csv_quote` deliberately quotes any field containing \n or \r on COPY TO,
+    // so splitting on lines first meant `COPY TO` then `COPY FROM` corrupted
+    // data: one row became two and the newline was destroyed.
+    let mut records: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if is_csv && c == '"' {
+            // A doubled quote inside a quoted field is an escaped quote, not a
+            // terminator; consume both so the state stays correct.
+            if in_quotes && chars.peek() == Some(&'"') {
+                cur.push(c);
+                cur.push(chars.next().unwrap());
+                continue;
+            }
+            in_quotes = !in_quotes;
+            cur.push(c);
+            continue;
+        }
+        if c == '\n' && !in_quotes {
+            records.push(std::mem::take(&mut cur));
+            continue;
+        }
+        cur.push(c);
     }
-    for line in lines {
-        let trimmed = line.trim_end_matches('\r');
+    if !cur.is_empty() {
+        records.push(cur);
+    }
+
+    let mut rows = Vec::new();
+    let mut iter = records.into_iter();
+    if has_header {
+        iter.next();
+    }
+    for record in iter {
+        let trimmed = record.trim_end_matches('\r');
+        // `\.` terminates the data in text format. It was previously parsed as
+        // an ordinary line and stored as a row, so anything streaming raw
+        // pg_dump COPY blocks got one garbage row per block.
+        if !is_csv && trimmed == "\\." {
+            break;
+        }
         if trimmed.is_empty() {
             continue;
         }
         rows.push(split_copy_line(trimmed, delimiter, is_csv));
     }
-    rows
+    Ok(rows)
 }
 
 /// Split one data line into fields, respecting the chosen format.
 fn split_copy_line(line: &str, delimiter: u8, is_csv: bool) -> Vec<Option<String>> {
     let delim = delimiter as char;
     if is_csv {
+        // An *unquoted* empty field is NULL (PostgreSQL's default CSV NULL
+        // string is the empty string); a *quoted* empty field (`""`) is the
+        // empty string. Tracking `was_quoted` is what keeps the two apart.
         let mut result = Vec::new();
         let mut chars = line.chars().peekable();
         let mut current = String::new();
-        loop {
-            match chars.next() {
-                None => {
-                    result.push(if current.is_empty() {
-                        None
-                    } else {
-                        Some(current)
-                    });
-                    break;
-                }
-                Some('"') => {
-                    // Quoted field.
+        let mut was_quoted = false;
+        let finish = |current: &mut String, was_quoted: bool| -> Option<String> {
+            let text = std::mem::take(current);
+            (was_quoted || !text.is_empty()).then_some(text)
+        };
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    was_quoted = true;
+                    // Quoted section.
                     loop {
                         match chars.next() {
                             None => break,
@@ -3292,34 +4427,21 @@ fn split_copy_line(line: &str, delimiter: u8, is_csv: bool) -> Vec<Option<String
                                     chars.next();
                                     current.push('"');
                                 } else {
-                                    break; // end of quoted field
+                                    break; // end of quoted section
                                 }
                             }
                             Some(ch) => current.push(ch),
                         }
                     }
-                    // Skip optional delimiter after closing quote.
-                    if chars.peek() == Some(&delim) {
-                        chars.next();
-                        result.push(if current.is_empty() {
-                            None
-                        } else {
-                            Some(current.clone())
-                        });
-                        current.clear();
-                    }
                 }
-                Some(c) if c == delim => {
-                    result.push(if current.is_empty() {
-                        None
-                    } else {
-                        Some(current.clone())
-                    });
-                    current.clear();
+                c if c == delim => {
+                    result.push(finish(&mut current, was_quoted));
+                    was_quoted = false;
                 }
-                Some(c) => current.push(c),
+                c => current.push(c),
             }
         }
+        result.push(finish(&mut current, was_quoted));
         result
     } else {
         // PostgreSQL text format: tab (or custom) delimiter, `\N` = NULL.
@@ -3368,6 +4490,133 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    // ── Binary-parameter typed decoding (corruption-class regression) ──
+
+    #[test]
+    fn binary_param_timestamp_decodes_to_literal() {
+        // day 8851 after 2000-01-01 = 2024-03-26, 12:34:56.789012
+        let us: i64 = 8851 * 86_400_000_000 + 45_296_789_012;
+        let got = decode_binary_param_typed(1114, &us.to_be_bytes()).unwrap();
+        match got {
+            DecodedParam::Text(s) => {
+                assert_eq!(s, Value::Timestamp(us).to_string());
+                assert_eq!(s, "2024-03-26 12:34:56.789012");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // timestamptz shares the encoding
+        assert!(decode_binary_param_typed(1184, &us.to_be_bytes()).is_some());
+        // wrong length → undecodable, NOT reinterpreted
+        assert!(decode_binary_param_typed(1114, &[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn binary_param_date_decodes_to_literal() {
+        let days: i32 = 8845; // 2024-03-19
+        match decode_binary_param_typed(1082, &days.to_be_bytes()).unwrap() {
+            DecodedParam::Text(s) => assert_eq!(s, Value::Date(days).to_string()),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_uuid_decodes_canonical() {
+        let bytes: [u8; 16] = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        match decode_binary_param_typed(2950, &bytes).unwrap() {
+            DecodedParam::Text(s) => {
+                assert_eq!(s, "550e8400-e29b-41d4-a716-446655440000");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_bytea_decodes_hex_form() {
+        match decode_binary_param_typed(17, &[0x00, 0xde, 0xad, 0xbe, 0xef]).unwrap() {
+            DecodedParam::Text(s) => assert_eq!(s, "\\x00deadbeef"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_numeric_decodes_exact() {
+        // 12345.6789: ndigits=3 weight=1 sign=0 dscale=4 digits=[1,2345,6789]
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(&1i16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        for d in [1u16, 2345, 6789] {
+            b.extend_from_slice(&d.to_be_bytes());
+        }
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "12345.6789"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+
+        // -0.0001: ndigits=1 weight=-1 sign=0x4000 dscale=4 digits=[1]
+        // (NBASE word at weight -1 covers the first 4 fraction digits)
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(-1i16).to_be_bytes());
+        b.extend_from_slice(&0x4000u16.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "-0.0001"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+
+        // 0.00001: weight=-2 (one leading zero word), digits=[1000], dscale=5
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(-2i16).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&5u16.to_be_bytes());
+        b.extend_from_slice(&1000u16.to_be_bytes());
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "0.00001"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+
+        // 42 integer: ndigits=1 weight=0 sign=0 dscale=0
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0i16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&42u16.to_be_bytes());
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "42"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_interval_decodes_to_unit_literal() {
+        // 1 month, 2 days, 3.5 seconds
+        let mut b = Vec::new();
+        b.extend_from_slice(&3_500_000i64.to_be_bytes());
+        b.extend_from_slice(&2i32.to_be_bytes());
+        b.extend_from_slice(&1i32.to_be_bytes());
+        match decode_binary_param_typed(1186, &b).unwrap() {
+            DecodedParam::Text(s) => assert_eq!(s, "1 months 2 days 3.500000 seconds"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_preserves_backslashes_literally() {
+        // Standard-conforming dialect: '\' is literal inside '...'. Doubling
+        // it (the old behavior) corrupted any text param containing '\'.
+        assert_eq!(sanitize_sql_text_literal(r"C:\temp\x"), r"C:\temp\x");
+        assert_eq!(sanitize_sql_text_literal("it's"), "it''s");
+        assert_eq!(sanitize_sql_text_literal("nul\0byte"), "nulbyte");
+    }
 
     // ── UserAuthenticator unit tests ───────────────────────────────────
 
@@ -3484,7 +4733,9 @@ mod tests {
         let catalog = Arc::new(crate::catalog::Catalog::new());
         let storage: Arc<dyn crate::storage::StorageEngine> =
             Arc::new(crate::storage::MemoryEngine::new());
-        Arc::new(Executor::new(catalog, storage))
+        let ex = Arc::new(Executor::new(catalog, storage));
+        ex.install_self_ref();
+        ex
     }
 
     #[test]
@@ -3866,6 +5117,32 @@ mod tests {
         }
     }
 
+    /// Phase 1.1: a SelectStream must build a streaming Query response (the arm
+    /// that previously `unreachable!`d). Rows/columns correctness is covered by
+    /// the executor-level streaming-vs-materialized equivalence tests; the
+    /// encoder here is byte-identical to the Select arm.
+    #[tokio::test]
+    async fn build_response_streams_select_stream() {
+        let columns = vec![
+            ("id".to_string(), DataType::Int32),
+            ("name".to_string(), DataType::Text),
+        ];
+        let rows = vec![
+            vec![Value::Int32(1), Value::Text("alice".into())],
+            vec![Value::Int32(2), Value::Text("bob".into())],
+        ];
+        let source = Box::new(
+            crate::executor::row_batch::MaterializedBatchIter::with_batch_size(rows, 1),
+        );
+        let result = ExecResult::SelectStream { columns, source };
+        let response = NucleusHandler::build_response(result, None);
+        assert!(response.is_ok());
+        match response.unwrap() {
+            Response::Query(_) => {}
+            _ => panic!("Expected streaming Query response"),
+        }
+    }
+
     /// Result formats belong to the CLIENT (Bind): text-mode clients must
     /// get text even for numeric columns — the server unilaterally sending
     /// binary made node-postgres read Float64(1.0) back as ~0.992 garbage.
@@ -4073,7 +5350,9 @@ mod security_tests {
         let catalog = Arc::new(crate::catalog::Catalog::new());
         let storage: Arc<dyn crate::storage::StorageEngine> =
             Arc::new(crate::storage::MemoryEngine::new());
-        Arc::new(Executor::new(catalog, storage))
+        let ex = Arc::new(Executor::new(catalog, storage));
+        ex.install_self_ref();
+        ex
     }
 
     #[test]
@@ -4128,12 +5407,21 @@ mod security_tests {
     }
 
     #[test]
-    fn parameter_substitution_escapes_backslashes() {
+    fn parameter_substitution_preserves_backslashes() {
+        // PostgreSqlDialect is standard-conforming: '\' is a LITERAL character
+        // inside '...', so doubling it (the old behavior this test used to
+        // assert) corrupted stored values. Injection safety comes from
+        // quote-doubling — a param ending in '\' followed by a quote still
+        // cannot escape the literal because the quote itself is doubled.
         let result = NucleusHandler::substitute_parameters_raw("SELECT $1", &["back\\slash"]);
         assert_eq!(
-            result, "SELECT 'back\\\\slash'",
-            "Backslashes in parameter values must be doubled"
+            result, "SELECT 'back\\slash'",
+            "Backslashes in parameter values must be preserved literally"
         );
+        // Attempted escape-out: backslash + quote → quote is doubled, string
+        // stays closed exactly where the substitution closes it.
+        let tricky = NucleusHandler::substitute_parameters_raw("SELECT $1", &["a\\', 1); --"]);
+        assert_eq!(tricky, "SELECT 'a\\'', 1); --'");
     }
 
     // ── COPY helper tests ──────────────────────────────────────────────
@@ -4176,7 +5464,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_tab_delimited() {
         let data = b"1\thello\t3.14\n2\tworld\t2.71\n";
-        let rows = parse_copy_rows(data, b'\t', false, false);
+        let rows = parse_copy_rows(data, b'\t', false, false).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].as_deref(), Some("1"));
         assert_eq!(rows[0][1].as_deref(), Some("hello"));
@@ -4186,7 +5474,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_tab_null_value() {
         let data = b"1\t\\N\t3.14\n";
-        let rows = parse_copy_rows(data, b'\t', false, false);
+        let rows = parse_copy_rows(data, b'\t', false, false).unwrap();
         assert_eq!(rows[0][1], None);
         assert_eq!(rows[0][0].as_deref(), Some("1"));
     }
@@ -4194,7 +5482,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_csv() {
         let data = b"1,hello,3.14\n2,world,2.71\n";
-        let rows = parse_copy_rows(data, b',', true, false);
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].as_deref(), Some("1"));
         assert_eq!(rows[0][1].as_deref(), Some("hello"));
@@ -4203,7 +5491,7 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_csv_with_header() {
         let data = b"id,name,val\n1,alice,10\n2,bob,20\n";
-        let rows = parse_copy_rows(data, b',', true, true);
+        let rows = parse_copy_rows(data, b',', true, true).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1].as_deref(), Some("alice"));
     }
@@ -4211,8 +5499,71 @@ mod security_tests {
     #[test]
     fn parse_copy_rows_csv_quoted() {
         let data = b"1,\"hello, world\",3.14\n";
-        let rows = parse_copy_rows(data, b',', true, false);
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
         assert_eq!(rows[0][1].as_deref(), Some("hello, world"));
+    }
+
+    /// A CSV field may contain a newline inside quotes. Splitting on physical
+    /// lines first tore one row into two and destroyed the newline — which also
+    /// broke Nucleus's own round trip, since `csv_quote` quotes any field
+    /// containing \n on COPY TO.
+    #[test]
+    fn parse_copy_rows_csv_field_may_contain_a_newline() {
+        let data = b"\"line1\nline2\"\n\"ok\"\n";
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
+        assert_eq!(rows.len(), 2, "quoted newline split the record");
+        assert_eq!(rows[0][0].as_deref(), Some("line1\nline2"));
+        assert_eq!(rows[1][0].as_deref(), Some("ok"));
+    }
+
+    /// A doubled quote inside a quoted field is an escaped quote, not a
+    /// terminator; getting that wrong flips the in-quotes state and the next
+    /// newline splits mid-record.
+    #[test]
+    fn parse_copy_rows_csv_escaped_quote_keeps_record_intact() {
+        let data = b"\"say \"\"hi\"\"\nthere\"\n";
+        let rows = parse_copy_rows(data, b',', true, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some("say \"hi\"\nthere"));
+    }
+
+    /// `\.` ends the data in text format. It used to be stored as a row, so
+    /// anything streaming raw pg_dump COPY blocks got a garbage row per block.
+    #[test]
+    fn parse_copy_rows_text_stops_at_end_of_data_marker() {
+        let data = b"a\nb\n\\.\n";
+        let rows = parse_copy_rows(data, b'\t', false, false).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some("a"));
+        assert_eq!(rows[1][0].as_deref(), Some("b"));
+    }
+
+    /// Non-UTF-8 input reported `COPY 0` — a clean success for a payload that
+    /// was never stored, taking the valid rows around it with it.
+    #[test]
+    fn parse_copy_rows_rejects_non_utf8_instead_of_reporting_success() {
+        let data = b"1\tcaf\xe9\n2\tok\n";
+        let err = parse_copy_rows(data, b'\t', false, false).unwrap_err();
+        assert!(
+            err.contains("UTF8"),
+            "expected an encoding error, got: {err}"
+        );
+    }
+
+    /// Only -1 is the trailer; any other negative count sign-extended into a
+    /// near-usize::MAX capacity request and aborted the connection task.
+    #[test]
+    fn parse_copy_binary_rows_rejects_negative_field_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PGCOPY\n\xff\r\n\0"); // 11-byte signature
+        data.extend_from_slice(&0i32.to_be_bytes()); // flags
+        data.extend_from_slice(&0i32.to_be_bytes()); // header extension length
+        data.extend_from_slice(&(-2i16).to_be_bytes()); // invalid field count
+        let err = parse_copy_binary_rows(&data, &[crate::types::DataType::Int32]).unwrap_err();
+        assert!(
+            err.contains("field count"),
+            "expected a clean field-count error, got: {err}"
+        );
     }
 
     #[test]

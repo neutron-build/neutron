@@ -33,9 +33,12 @@ pub(super) fn scalar(result: &ExecResult) -> &Value {
 }
 
 mod test_admin;
+mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_collections;
+mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
 mod test_ddl;
+mod test_durability_format; // M3: format rejection + full-state recovery
 mod test_dml;
 mod test_e2e_smoke; // End-to-end smoke tests exercising all Nucleus capabilities
 mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filtering
@@ -49,7 +52,17 @@ mod test_module_wiring;
 mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_query;
+mod test_read_only_mode; // M10: degraded read-only write admission
 mod test_rls;
+mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
 mod test_scalar_fns;
 mod test_specialty_persistence;
+mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
+mod test_ssi_census; // B1: end-to-end SSI anomaly census (gate for MVCC scan changes)
+mod test_streaming_aggregate; // Grace hash aggregation: bounded-memory GROUP BY with spill
+mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN with spill
+mod test_streaming_filter; // Phase 1.2 read-side: streaming WHERE filter (SIREAD-safe full scan)
+mod test_streaming_lazy; // Lazy per-partition/pair output emitters for the Grace operators
+mod test_streaming_metamorphic; // streaming ≡ materialized over random queries (transitive SQLite oracle)
+mod test_streaming_scan; // Phase 1.1: opt-in streaming scan (SET stream_results = on)
 mod test_txn; // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

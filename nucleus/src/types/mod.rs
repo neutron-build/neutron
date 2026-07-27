@@ -2,19 +2,63 @@
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::str::FromStr;
 
 use rust_decimal::Decimal;
 
 /// Parse the bounded exact NUMERIC representation used by Nucleus. The current
 /// physical type is rust_decimal (96-bit coefficient, scale <= 28); values
 /// outside that range reject explicitly instead of degrading to f64.
+///
+/// This uses `from_str_exact` rather than `from_str` so that a value with more
+/// fractional digits than the 28-place scale ceiling FAILS LOUDLY instead of
+/// being silently rounded (a silent-wrong-result): `from_str` rounds excess
+/// precision away, whereas `from_str_exact` returns `Underflow`. Magnitude that
+/// overflows the 96-bit coefficient is rejected by both.
 pub(crate) fn parse_numeric(value: &str) -> Result<Decimal, String> {
-    Decimal::from_str(value.trim()).map_err(|error| format!("invalid numeric value: {error}"))
+    let trimmed = value.trim();
+    // Accept scientific notation ('1e3', '1.5E-2') the way PostgreSQL does —
+    // `from_str_exact` rejects it, so fall back to the scientific parser.
+    if trimmed.contains(['e', 'E'])
+        && let Ok(d) = Decimal::from_scientific(trimmed)
+    {
+        return Ok(d);
+    }
+    Decimal::from_str_exact(trimmed).map_err(|error| match error {
+        rust_decimal::Error::Underflow => format!(
+            "numeric value '{trimmed}' exceeds NUMERIC precision ceiling: Nucleus stores \
+             NUMERIC as a 96-bit coefficient with scale <= 28 (max 28 fractional digits)"
+        ),
+        other => format!("invalid numeric value: {other}"),
+    })
 }
 
 pub(crate) fn canonical_numeric(value: &str) -> Result<String, String> {
     parse_numeric(value).map(|decimal| decimal.normalize().to_string())
+}
+
+/// Parse the text form of a BYTEA value. The PostgreSQL standard text/wire
+/// form is hex: `\x` followed by an even number of hex digits (this is also
+/// exactly what `Value::Bytea`'s Display emits, so casts round-trip). Malformed
+/// hex fails loudly instead of storing garbage. A string without the `\x`
+/// prefix keeps the legacy raw-bytes behavior.
+pub(crate) fn parse_bytea_text(s: &str) -> Result<Vec<u8>, String> {
+    let Some(hex) = s.strip_prefix("\\x") else {
+        return Ok(s.as_bytes().to_vec());
+    };
+    if hex.len() % 2 != 0 {
+        return Err("invalid bytea hex literal: odd number of hex digits".into());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let b = hex.as_bytes();
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char).to_digit(16);
+        let lo = (b[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => out.push(((h << 4) | l) as u8),
+            _ => return Err(format!("invalid bytea hex literal at byte {i}")),
+        }
+    }
+    Ok(out)
 }
 
 /// A value in Nucleus. All data flows through this enum.
@@ -64,7 +108,12 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int32(n) => write!(f, "{n}"),
             Value::Int64(n) => write!(f, "{n}"),
-            Value::Float64(n) => write!(f, "{n}"),
+            // PostgreSQL spells float specials "Infinity"/"-Infinity"/"NaN";
+            // Rust's default is "inf"/"-inf"/"NaN".
+            Value::Float64(n) if n.is_infinite() => {
+                write!(f, "{}Infinity", if *n < 0.0 { "-" } else { "" })
+            }
+            Value::Float64(n) => write!(f, "{}", pg_float_text(*n)),
             Value::Text(s) => write!(f, "{s}"),
             Value::Jsonb(v) => write!(f, "{v}"),
             Value::Date(days) => {
@@ -258,8 +307,47 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
     jdn - 2451545 // subtract J2000 epoch
 }
 
+/// PostgreSQL float8 text form: shortest round-trip digits, positional
+/// notation while the exponent is in [-4, 15), otherwise scientific with a
+/// signed, two-digit-minimum exponent ("1e+100", "1e-05") — matching
+/// PostgreSQL 12+ shortest-Ryu output.
+pub fn pg_float_text(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".into();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity" } else { "Infinity" }.into();
+    }
+    let sci = format!("{n:e}");
+    let (_, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    if (-4..15).contains(&exp) {
+        n.to_string()
+    } else {
+        let (mant, _) = sci.split_once('e').unwrap();
+        if exp < 0 {
+            format!("{mant}e-{:02}", -exp)
+        } else {
+            format!("{mant}e+{exp:02}")
+        }
+    }
+}
+
 /// Strict ISO date parser used by casts and write coercion.
+///
+/// Tolerates a trailing UTC-offset token ("1999-12-31 -08") — JDBC sends
+/// dates that way; PostgreSQL parses and ignores the offset for `date`.
 pub fn parse_date(value: &str) -> Result<i32, String> {
+    let value = value.trim();
+    let value = match value.split_once(char::is_whitespace) {
+        Some((date, zone))
+            if zone.starts_with(['+', '-']) && split_zone_suffix(zone).is_ok() =>
+        {
+            date
+        }
+        Some(_) => return Err(format!("invalid date value: {value}")),
+        None => value,
+    };
     let parts: Vec<&str> = value.trim().split('-').collect();
     if parts.len() != 3 {
         return Err(format!("invalid date value: {value}"));
@@ -280,11 +368,61 @@ pub fn parse_date(value: &str) -> Result<i32, String> {
 }
 
 /// Strict ISO timestamp-without-time-zone parser with microsecond precision.
+///
+/// A trailing UTC offset (`Z`, `+HH`, `-HH:MM`, …) is accepted and ignored,
+/// matching PostgreSQL's `timestamp` input rule (keep the wall-clock time).
 pub fn parse_timestamp(value: &str) -> Result<i64, String> {
+    parse_timestamp_with_zone(value).map(|(us, _)| us)
+}
+
+/// ISO timestamp parser for `timestamptz`: a trailing UTC offset shifts the
+/// wall-clock time to UTC (PostgreSQL stores timestamptz normalized to UTC).
+/// Without an offset the value is taken as already-UTC (server runs in UTC).
+pub fn parse_timestamptz(value: &str) -> Result<i64, String> {
+    parse_timestamp_with_zone(value).map(|(us, offset)| us - offset.unwrap_or(0) * 1_000_000)
+}
+
+/// Split a trailing UTC-offset suffix (`Z`, `±HH`, `±HH:MM`, `±HHMM`,
+/// `±HH:MM:SS`) off an ISO time string. Returns (time, offset_seconds).
+fn split_zone_suffix(time: &str) -> Result<(&str, Option<i64>), String> {
+    if let Some(stripped) = time.strip_suffix(['Z', 'z']) {
+        return Ok((stripped, Some(0)));
+    }
+    // The time-of-day portion never contains '+'/'-', so any sign marks the
+    // start of an offset.
+    let Some(pos) = time.find(['+', '-']) else {
+        return Ok((time, None));
+    };
+    let (time, zone) = time.split_at(pos);
+    let sign: i64 = if zone.starts_with('-') { -1 } else { 1 };
+    let digits = &zone[1..];
+    let fields: Vec<&str> = digits.split(':').collect();
+    let parse_field = |s: &str| -> Result<i64, String> {
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("invalid time zone offset: {zone}"));
+        }
+        s.parse::<i64>().map_err(|_| format!("invalid time zone offset: {zone}"))
+    };
+    let (hours, minutes, seconds) = match fields.as_slice() {
+        [hhmm] if hhmm.len() == 4 => (parse_field(&hhmm[..2])?, parse_field(&hhmm[2..])?, 0),
+        [hh] => (parse_field(hh)?, 0, 0),
+        [hh, mm] => (parse_field(hh)?, parse_field(mm)?, 0),
+        [hh, mm, ss] => (parse_field(hh)?, parse_field(mm)?, parse_field(ss)?),
+        _ => return Err(format!("invalid time zone offset: {zone}")),
+    };
+    if hours > 15 || minutes > 59 || seconds > 59 {
+        return Err(format!("time zone displacement out of range: {zone}"));
+    }
+    Ok((time, Some(sign * (hours * 3600 + minutes * 60 + seconds))))
+}
+
+fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<i64>), String> {
     let value = value.trim();
     let (date, time) = value
         .split_once([' ', 'T'])
         .map_or((value, "00:00:00"), |parts| parts);
+    let (time, zone_offset) = split_zone_suffix(time)?;
+    let time = time.trim_end();
     let days = parse_date(date)? as i64;
     let pieces: Vec<&str> = time.split(':').collect();
     if pieces.len() != 3 {
@@ -322,6 +460,7 @@ pub fn parse_timestamp(value: &str) -> Result<i64, String> {
         .and_then(|base| base.checked_add(minute as i64 * 60_000_000))
         .and_then(|base| base.checked_add(second as i64 * 1_000_000))
         .and_then(|base| base.checked_add(fraction as i64))
+        .map(|us| (us, zone_offset))
         .ok_or_else(|| "timestamp value out of range".to_string())
 }
 
@@ -357,6 +496,27 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
             .map_err(|_| format!("invalid UUID hex: {s}"))?;
     }
     Ok(bytes)
+}
+
+/// Parse pgvector's text form, `[1,2.5,3]`, into f32 components.
+pub fn parse_vector_text(s: &str) -> Result<Vec<f32>, String> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .ok_or_else(|| format!("invalid vector literal (expected [...]): {s}"))?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|component| {
+            component
+                .trim()
+                .parse::<f32>()
+                .map_err(|error| format!("invalid vector component '{component}': {error}"))
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -489,13 +649,20 @@ impl Value {
             (Value::Text(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
             (Value::Text(s), DataType::Date) => parse_date(s).map(Value::Date),
             (Value::Text(s), DataType::Timestamp) => parse_timestamp(s).map(Value::Timestamp),
-            (Value::Text(s), DataType::TimestampTz) => parse_timestamp(s).map(Value::TimestampTz),
+            (Value::Text(s), DataType::TimestampTz) => {
+                parse_timestamptz(s).map(Value::TimestampTz)
+            }
             (Value::Text(s), DataType::Uuid) => parse_uuid(s).map(Value::Uuid),
-            (Value::Text(s), DataType::Bytea) => Ok(Value::Bytea(s.as_bytes().to_vec())),
+            (Value::Text(s), DataType::Bytea) => parse_bytea_text(s).map(Value::Bytea),
             (Value::Text(s), DataType::Jsonb) => serde_json::from_str(s)
                 .map(Value::Jsonb)
                 .map_err(|error| format!("invalid JSON: {error}")),
             (Value::Text(_), DataType::UserDefined(_)) => Ok(self.clone()),
+            // pgvector's text input form. A VECTOR column fed a bare `[1,2,3]`
+            // (COPY text format, or a plain string literal) must become a real
+            // Vector; storing the Text would leave the column physically mixed
+            // and invisible to every vector index.
+            (Value::Text(s), DataType::Vector(_)) => parse_vector_text(s).map(Value::Vector),
             // Numeric conversions
             (Value::Numeric(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -784,9 +951,41 @@ impl Ord for Value {
                     _ => a.partial_cmp(&bf).unwrap_or(Ordering::Equal),
                 }
             }
+            // Numeric vs integer: exact decimal comparison (2.0::numeric = 2
+            // must be Equal). Falling through to type_rank made every
+            // numeric/int comparison unequal — a silent wrong result in any
+            // WHERE/JOIN/ORDER mixing the two.
+            (Value::Numeric(a), Value::Int32(b)) => cmp_numeric_int(a, i64::from(*b)),
+            (Value::Numeric(a), Value::Int64(b)) => cmp_numeric_int(a, *b),
+            (Value::Int32(a), Value::Numeric(b)) => {
+                cmp_numeric_int(b, i64::from(*a)).reverse()
+            }
+            (Value::Int64(a), Value::Numeric(b)) => cmp_numeric_int(b, *a).reverse(),
+            // Numeric vs float: compare in f64 (float is already inexact, so
+            // this matches PostgreSQL's numeric→float8 promotion for mixed
+            // comparisons).
+            (Value::Numeric(a), Value::Float64(b)) => parse_numeric(a)
+                .ok()
+                .and_then(|d| d.to_string().parse::<f64>().ok())
+                .and_then(|af| af.partial_cmp(b))
+                .unwrap_or(Ordering::Equal),
+            (Value::Float64(a), Value::Numeric(b)) => parse_numeric(b)
+                .ok()
+                .and_then(|d| d.to_string().parse::<f64>().ok())
+                .and_then(|bf| a.partial_cmp(&bf))
+                .unwrap_or(Ordering::Equal),
             // Fallback: compare by type rank for truly incompatible types
             _ => self.type_rank().cmp(&other.type_rank()),
         }
+    }
+}
+
+/// Compare a NUMERIC (decimal string) against an integer exactly.
+fn cmp_numeric_int(num: &str, int: i64) -> std::cmp::Ordering {
+    match parse_numeric(num) {
+        Ok(d) => d.cmp(&rust_decimal::Decimal::from(int)),
+        // Undecodable numeric: fall back to string compare (deterministic).
+        _ => num.cmp(&int.to_string()),
     }
 }
 
@@ -911,6 +1110,22 @@ pub fn numeric_abs(a: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytea_text_hex_form_decodes() {
+        // Postgres standard hex form — also what Value::Bytea Display emits.
+        assert_eq!(parse_bytea_text("\\x00deadbeef").unwrap(), vec![0x00, 0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(parse_bytea_text("\\x").unwrap(), Vec::<u8>::new());
+        // Display → cast round-trip is exact.
+        let original = Value::Bytea(vec![1, 2, 250, 255]);
+        let text = Value::Text(original.to_string());
+        assert_eq!(text.cast(&DataType::Bytea).unwrap(), original);
+        // Malformed hex fails loudly instead of storing garbage.
+        assert!(parse_bytea_text("\\x0").is_err());
+        assert!(parse_bytea_text("\\xzz").is_err());
+        // Non-hex strings keep the legacy raw-bytes behavior.
+        assert_eq!(parse_bytea_text("plain").unwrap(), b"plain".to_vec());
+    }
 
     #[test]
     fn test_date_roundtrip() {
@@ -1155,6 +1370,43 @@ mod tests {
     fn test_numeric_large_numbers() {
         assert_eq!(numeric_add("999999999999", "1").unwrap(), "1000000000000");
         assert_eq!(numeric_mul("1000000", "1000000").unwrap(), "1000000000000");
+    }
+
+    #[test]
+    fn test_numeric_within_ceiling_is_exact() {
+        // Exactly 28 fractional digits is the ceiling and must round-trip exactly.
+        let v = "0.1234567890123456789012345678";
+        assert_eq!(canonical_numeric(v).unwrap(), v);
+    }
+
+    #[test]
+    fn test_numeric_excess_precision_fails_loudly() {
+        // 35 fractional digits exceeds the scale<=28 ceiling. Previously this was
+        // silently ROUNDED by Decimal::from_str; it must now reject with a clear
+        // error rather than return a truncated (wrong) value.
+        let v = "0.12345678901234567890123456789012345";
+        let err = parse_numeric(v).unwrap_err();
+        assert!(
+            err.contains("precision ceiling"),
+            "expected precision-ceiling error, got: {err}"
+        );
+        assert!(canonical_numeric(v).is_err());
+    }
+
+    #[test]
+    fn test_numeric_magnitude_overflow_fails_loudly() {
+        // A coefficient beyond the 96-bit range must also reject, not wrap.
+        let v = "179769313486231590000000000000000000000000000";
+        assert!(parse_numeric(v).is_err());
+    }
+
+    #[test]
+    fn test_numeric_within_ceiling_negative_and_trailing() {
+        // Negative high-scale value at the ceiling round-trips exactly.
+        assert_eq!(
+            canonical_numeric("-0.1234567890123456789012345678").unwrap(),
+            "-0.1234567890123456789012345678"
+        );
     }
 
     // ========================================================================
