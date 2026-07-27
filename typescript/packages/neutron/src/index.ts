@@ -18,6 +18,7 @@ export {
   defineCollection,
   getCollection,
   getEntry,
+  renderEntry,
   prepareContentCollections,
   setActiveMarkdownConfig,
   getActiveMarkdownConfig,
