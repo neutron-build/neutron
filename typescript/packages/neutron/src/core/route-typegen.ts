@@ -64,7 +64,8 @@ function toPathType(routePath: string): string {
 
   for (const segment of segments) {
     pattern += "/";
-    if (segment.startsWith(":") || segment === "*") {
+    // Catch-alls are named (`*slug`), so match on the prefix, not on a bare "*".
+    if (segment.startsWith(":") || segment.startsWith("*")) {
       pattern += "${string}";
       hasDynamicSegment = true;
       continue;
