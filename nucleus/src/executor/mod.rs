@@ -1019,6 +1019,75 @@ impl Executor {
 
         // Override sequences with dedicated sequences.json if it exists (more up-to-date).
         self.load_sequences_sync();
+
+        self.report_policies_without_grants().await;
+    }
+
+    /// Warn about policies whose target roles hold no GRANT on the table.
+    ///
+    /// GRANT and RLS are independent gates: a policy filters within what a
+    /// grant already allows, and cannot admit rows on its own. A database
+    /// written under the older policy-as-access model can therefore contain
+    /// policies that used to confer read access and no longer do, and the
+    /// symptom — a role that silently sees nothing — is indistinguishable from
+    /// a correctly-restrictive policy.
+    ///
+    /// This reports; it deliberately does not grant. Auto-granting would
+    /// reintroduce exactly the property the layering removed, and it would do
+    /// so invisibly, which is worse than the state it was repairing.
+    async fn report_policies_without_grants(&self) {
+        // Snapshot the policies FIRST and drop the (sync) security guard before
+        // taking the async roles lock — holding a parking_lot guard across an
+        // await can deadlock the runtime.
+        let targets: Vec<(String, String, Vec<String>)> = {
+            let security = self.security.read();
+            security
+                .rls
+                .all_policies()
+                .into_iter()
+                .map(|p| (p.table.clone(), p.name.clone(), p.target_roles.clone()))
+                .collect()
+        };
+        let affected: Vec<(String, String, String)> = {
+            let roles = self.roles.read().await;
+            targets
+                .iter()
+                .flat_map(|(table, policy, target_roles)| {
+                    let roles = &roles;
+                    target_roles.iter().filter_map(move |role_name| {
+                        // PUBLIC-targeted policies name no role, so there is no
+                        // grant to look for.
+                        if role_name.eq_ignore_ascii_case("public") {
+                            return None;
+                        }
+                        let granted = roles.get(role_name).is_some_and(|role| {
+                            role.is_superuser
+                                || role.privileges.contains_key(table)
+                                || role.privileges.contains_key("*")
+                        });
+                        (!granted).then(|| (table.clone(), policy.clone(), role_name.clone()))
+                    })
+                })
+                .collect()
+        };
+
+        for (table, policy, role) in &affected {
+            tracing::warn!(
+                table = %table,
+                policy = %policy,
+                role = %role,
+                "policy targets a role with no GRANT on the table; SELECT is required \
+                 in addition to a matching policy, so this role will see no rows. \
+                 Grant it explicitly if that is not intended."
+            );
+        }
+        if !affected.is_empty() {
+            tracing::warn!(
+                count = affected.len(),
+                "{} policy/role pair(s) confer no access without a GRANT",
+                affected.len()
+            );
+        }
     }
 
     /// Restore sequence state from `sequences.json` (sync — callable from the

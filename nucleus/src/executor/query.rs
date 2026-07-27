@@ -7638,16 +7638,21 @@ impl Executor {
                 // unaffected; this engages once a session assumes a
                 // non-superuser identity.
                 //
-                // Tables with an active policy are exempt, because in this
-                // engine a policy IS the access mechanism — `CREATE POLICY ...
-                // TO PUBLIC USING (owner = CURRENT_USER)` is expected to admit
-                // the rows it selects without a separate GRANT, and
-                // `test_rls::table_rename_moves_policies_and_drop_removes_them`
-                // asserts that. PostgreSQL instead requires SELECT *and* passes
-                // RLS on top; matching that is a deliberate model change and a
-                // migration for every existing policy, not a bug fix, so it is
-                // recorded rather than smuggled in here. The hole this closes
-                // is the unpoliced one: a table with no policy at all.
+                // GRANT and RLS are two INDEPENDENT gates, as in PostgreSQL:
+                // SELECT is required to touch the table at all, and policies
+                // then filter within what the grant already allows. A policy can
+                // only ever subtract, so `ENABLE ROW LEVEL SECURITY` with no
+                // policy denies rather than opens.
+                //
+                // Policy-as-access — where a matching policy admitted rows with
+                // no GRANT — was the earlier model. It was abandoned because it
+                // makes the catalog lie: `has_table_privilege()` answers from
+                // GRANT, so it and the engine disagreed, and one over-broad
+                // predicate (a `USING (true)` left from debugging) became global
+                // read where PostgreSQL would still have required a grant. It
+                // cost exactly one test to change, and that test turned out to
+                // be failing on a real bug — RENAME TABLE orphaning grants —
+                // rather than on the semantics.
                 if !self.check_privilege(&table_name, "SELECT").await {
                     return Err(ExecError::PermissionDenied(format!(
                         "permission denied for table {table_name}"
