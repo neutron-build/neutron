@@ -5205,6 +5205,51 @@ impl Executor {
         })
     }
 
+    /// Whether the NAMED role holds `privilege` on `table_name`.
+    ///
+    /// `check_privilege` answers for the current session, which is the right
+    /// question on an execution path and the wrong one for
+    /// `has_table_privilege(user, table, privilege)`: that form names the
+    /// principal to test, and answering about the caller instead made it report
+    /// `true` for every table whenever a superuser asked. An introspection
+    /// function that reports on someone other than the subject it was given is
+    /// worse than absent — it is the function an audit would trust.
+    async fn check_privilege_for_role(
+        &self,
+        role_name: &str,
+        table_name: &str,
+        privilege: &str,
+    ) -> bool {
+        let required_priv = match privilege.to_uppercase().as_str() {
+            "SELECT" => Privilege::Select,
+            "INSERT" => Privilege::Insert,
+            "UPDATE" => Privilege::Update,
+            "DELETE" => Privilege::Delete,
+            _ => return false,
+        };
+
+        let roles = self.roles.read().await;
+        let Some(subject) = roles.get(role_name) else {
+            return false;
+        };
+        if subject.is_superuser {
+            return true;
+        }
+
+        // The role itself plus the roles it is a member of — the same set a
+        // session for this principal would carry.
+        let holds = |name: &str| {
+            roles.get(name).is_some_and(|role| {
+                let grants = |privs: &Vec<Privilege>| {
+                    privs.contains(&Privilege::All) || privs.contains(&required_priv)
+                };
+                role.privileges.get(table_name).is_some_and(grants)
+                    || role.privileges.get("*").is_some_and(grants)
+            })
+        };
+        holds(role_name) || subject.member_of.iter().any(|parent| holds(parent))
+    }
+
     fn table_col_meta(&self, table_def: &TableDef) -> Vec<ColMeta> {
         table_def
             .columns

@@ -424,3 +424,38 @@ async fn dropping_a_policy_column_requires_cascade() {
         "with its only policy CASCADE-dropped, an RLS-enabled table must deny, not open"
     );
 }
+
+/// `has_table_privilege(user, table, privilege)` must answer about the NAMED
+/// user, not the caller.
+///
+/// It previously ignored its first argument and reported on the current
+/// session, so a superuser asking about anyone got `true` for everything — and
+/// this is the function an audit query trusts. It also made an earlier version
+/// of the rename test above pass vacuously.
+#[tokio::test]
+async fn has_table_privilege_reports_on_the_named_user() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+    exec(&ex, "CREATE TABLE secrets (id INT PRIMARY KEY, v TEXT)").await;
+    exec(&ex, "CREATE ROLE mallory LOGIN PASSWORD 'x'").await;
+
+    // Asked as superuser, about someone else, on a table they were never granted.
+    let denied = exec(
+        &ex,
+        "SELECT has_table_privilege('mallory', 'secrets', 'SELECT')",
+    )
+    .await;
+    assert_eq!(
+        *scalar(&denied[0]),
+        Value::Bool(false),
+        "mallory has no GRANT on secrets, so this must be false even when a superuser asks"
+    );
+
+    // And true where the grant genuinely exists.
+    let allowed = exec(&ex, "SELECT has_table_privilege('alice', 'docs', 'SELECT')").await;
+    assert_eq!(
+        *scalar(&allowed[0]),
+        Value::Bool(true),
+        "alice was granted SELECT on docs in setup"
+    );
+}

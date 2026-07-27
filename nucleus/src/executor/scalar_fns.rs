@@ -2168,8 +2168,22 @@ impl Executor {
             }
             "HAS_TABLE_PRIVILEGE" => {
                 // has_table_privilege(table, privilege) or has_table_privilege(user, table, privilege)
+                // 3-arg form names the principal to test. Answering about the
+                // CALLER instead reported `true` for every table whenever a
+                // superuser asked, so the catalog and the engine disagreed about
+                // who could read what — and this is the function an audit query
+                // would trust.
+                if args.len() >= 3
+                    && let (Value::Text(user), Value::Text(t), Value::Text(p)) =
+                        (&args[0], &args[1], &args[2])
+                {
+                    let priv_upper = p.to_uppercase();
+                    let priv_key = priv_upper.split_whitespace().next().unwrap_or(&priv_upper);
+                    let result =
+                        sync_block_on(self.check_privilege_for_role(user, t, priv_key));
+                    return Ok(Value::Bool(result));
+                }
                 let (table_name, privilege) = if args.len() >= 3 {
-                    // 3-arg form: (user, table, privilege) — ignore user, check current session
                     match (&args[1], &args[2]) {
                         (Value::Text(t), Value::Text(p)) => (t.clone(), p.clone()),
                         _ => return Ok(Value::Bool(true)),

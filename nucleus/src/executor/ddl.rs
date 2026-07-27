@@ -1941,14 +1941,34 @@ impl Executor {
                     for col_name in column_names {
                         let col_str = col_name.to_string();
                         let column_id = table_def.column_id(&col_str).unwrap_or(0);
-                        let dependents = {
+                        let (dependents, masked_roles) = {
                             let security = self.security.read();
-                            security.rls.policies_depending_on_column(
+                            (
+                                security.rls.policies_depending_on_column(
+                                    &table_name,
+                                    column_id,
+                                    &col_str,
+                                ),
+                                security.masking.masks_depending_on_column(
+                                    &table_name,
+                                    column_id,
+                                    &col_str,
+                                ),
+                            )
+                        };
+                        // A mask on a dropped column is not a dangling guard the
+                        // way a policy is — the column it protected is gone, so
+                        // there is nothing left to leak. Drop the masks with it
+                        // rather than blocking on them, but do it explicitly so
+                        // they cannot resurface against a recreated name.
+                        if !masked_roles.is_empty() {
+                            let mut security = self.security.write();
+                            security.masking.drop_masks_for_column(
                                 &table_name,
                                 column_id,
                                 &col_str,
-                            )
-                        };
+                            );
+                        }
                         if dependents.is_empty() {
                             continue;
                         }
@@ -2218,8 +2238,18 @@ impl Executor {
                             column_id,
                             &new_column_name.value,
                         );
+                        // Masks need the same treatment, and their failure
+                        // direction is worse: an RLS predicate that loses its
+                        // column denies, a mask that loses its column returns
+                        // the value UNMASKED.
+                        let remasked = security.masking.rename_column(
+                            &table_name,
+                            column_id,
+                            &old_column_name.value,
+                            &new_column_name.value,
+                        );
                         drop(security);
-                        if renamed {
+                        if renamed || remasked {
                             // Cached plans and result caches keyed on the policy
                             // generation must not serve pre-rename results.
                             self.bump_policy_gen();
