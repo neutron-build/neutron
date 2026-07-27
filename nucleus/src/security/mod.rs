@@ -636,6 +636,18 @@ pub struct MaskingPolicy {
     pub column: String,
     pub role: String,
     pub rule: MaskingRule,
+    /// Stable id of the masked column — see [`crate::catalog::ColumnDef::id`].
+    ///
+    /// A mask stored against a NAME stops applying when the column is renamed,
+    /// and starts applying to an unrelated column if that name is later
+    /// recreated. That failure direction is OPEN: the value is returned
+    /// unmasked, unlike an RLS predicate losing its column, which denies.
+    ///
+    /// `0` means unbound. Masking has no `CREATE` DDL surface yet, so there is
+    /// no statement at which to resolve the id; it is stamped the first time a
+    /// rename matches the rule by name, and honoured from then on.
+    #[serde(default)]
+    pub column_id: u32,
 }
 
 /// Data masking engine.
@@ -674,6 +686,66 @@ impl MaskingEngine {
                 policy.table = new.to_string();
             }
         }
+    }
+
+    /// Point every mask on `table` for the renamed column at its new name.
+    ///
+    /// Matches by stable id once one is bound, else by the old name — which is
+    /// unambiguous AT a rename, because a table cannot hold two columns of the
+    /// same name. The id is stamped while we are here, so the later hazard is
+    /// closed too: if that old name is recreated by `ADD COLUMN`, the mask stays
+    /// on the column it was written for instead of jumping to the new one.
+    pub fn rename_column(
+        &mut self,
+        table: &str,
+        column_id: u32,
+        old_name: &str,
+        new_name: &str,
+    ) -> bool {
+        let mut changed = false;
+        for policy in &mut self.policies {
+            if policy.table != table {
+                continue;
+            }
+            let matches = if policy.column_id != 0 && column_id != 0 {
+                policy.column_id == column_id
+            } else {
+                policy.column == old_name
+            };
+            if matches {
+                policy.column = new_name.to_string();
+                if column_id != 0 {
+                    policy.column_id = column_id;
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Roles whose masks on `table` read the given column, by id or by name.
+    pub fn masks_depending_on_column(
+        &self,
+        table: &str,
+        column_id: u32,
+        column_name: &str,
+    ) -> Vec<String> {
+        self.policies
+            .iter()
+            .filter(|p| {
+                p.table == table
+                    && ((column_id != 0 && p.column_id == column_id) || p.column == column_name)
+            })
+            .map(|p| p.role.clone())
+            .collect()
+    }
+
+    /// Drop every mask on `table` for the given column (CASCADE on a drop).
+    pub fn drop_masks_for_column(&mut self, table: &str, column_id: u32, column_name: &str) {
+        self.policies.retain(|p| {
+            !(p.table == table
+                && ((column_id != 0 && p.column_id == column_id) || p.column == column_name))
+        });
     }
 
     pub fn drop_table(&mut self, table: &str) {
@@ -1302,12 +1374,14 @@ mod tests {
             column: "email".into(),
             role: "analyst".into(),
             rule: MaskingRule::EmailMask,
+            column_id: 0,
         });
         masking.add_policy(MaskingPolicy {
             table: "users".into(),
             column: "ssn".into(),
             role: "analyst".into(),
             rule: MaskingRule::Redact("***-**-****".into()),
+            column_id: 0,
         });
 
         let analyst_ctx = SessionContext::new("bob").with_role("analyst");
@@ -1398,6 +1472,7 @@ mod tests {
             column: "customer_email".into(),
             role: "support".into(),
             rule: MaskingRule::EmailMask,
+            column_id: 0,
         });
 
         let ctx = SessionContext::new("agent")
@@ -1620,5 +1695,67 @@ mod tests {
         assert_eq!(mgr.key_count(), 3);
         let (_, _, mat) = mgr.active_key().unwrap();
         assert_eq!(mat, &[3]);
+    }
+}
+
+#[cfg(test)]
+mod masking_identity_tests {
+    use super::*;
+
+    fn mask(table: &str, column: &str) -> MaskingPolicy {
+        MaskingPolicy {
+            table: table.into(),
+            column: column.into(),
+            role: "analyst".into(),
+            rule: MaskingRule::Redact("***".into()),
+            column_id: 0,
+        }
+    }
+
+    /// A renamed column must keep its mask. Losing it fails OPEN — the value is
+    /// returned unmasked — which is the opposite direction from an RLS
+    /// predicate losing its column, and the reason this is worth closing even
+    /// while masking has no DDL surface yet.
+    #[test]
+    fn rename_column_keeps_the_mask_and_binds_the_id() {
+        let mut engine = MaskingEngine::new();
+        engine.add_policy(mask("people", "ssn"));
+
+        assert!(engine.rename_column("people", 7, "ssn", "national_id"));
+        let policy = &engine.all_policies()[0];
+        assert_eq!(policy.column, "national_id");
+        assert_eq!(policy.column_id, 7, "the id should be stamped while renaming");
+
+        // The escalation the id closes: recreate the old name. The mask must
+        // stay on the column it was written for.
+        assert!(!engine.rename_column("people", 9, "ssn", "decoy"));
+        assert_eq!(engine.all_policies()[0].column, "national_id");
+    }
+
+    #[test]
+    fn dropping_a_masked_column_removes_its_mask() {
+        let mut engine = MaskingEngine::new();
+        engine.add_policy(mask("people", "ssn"));
+        assert_eq!(
+            engine.masks_depending_on_column("people", 0, "ssn"),
+            vec!["analyst".to_string()]
+        );
+        engine.drop_masks_for_column("people", 0, "ssn");
+        assert!(engine.all_policies().is_empty());
+    }
+
+    /// A mask on another table must not be touched by this table's rename.
+    #[test]
+    fn rename_column_does_not_reach_other_tables() {
+        let mut engine = MaskingEngine::new();
+        engine.add_policy(mask("people", "ssn"));
+        engine.add_policy(mask("staff", "ssn"));
+        engine.rename_column("people", 7, "ssn", "national_id");
+        let staff = engine
+            .all_policies()
+            .iter()
+            .find(|p| p.table == "staff")
+            .unwrap();
+        assert_eq!(staff.column, "ssn");
     }
 }

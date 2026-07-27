@@ -446,6 +446,7 @@ async fn logical_dump_reports_what_it_cannot_express() {
             column: "ssn".into(),
             role: "alice".into(),
             rule: crate::security::MaskingRule::Redact("***".into()),
+            column_id: 0,
         });
     })
     .expect("install mask");
