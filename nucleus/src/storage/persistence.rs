@@ -61,6 +61,12 @@ struct ColumnDefSer {
     nullable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_expr: Option<String>,
+    /// Stable column identity. Absent in snapshots written before column ids
+    /// existed; `0` then means "unknown" and is backfilled by position on load.
+    /// Defaulted rather than versioned because this file has no format version
+    /// and a deserialize failure degrades to an empty catalog.
+    #[serde(default)]
+    id: u32,
 }
 
 /// Serializable representation of a table constraint.
@@ -316,6 +322,7 @@ impl CatalogPersistence {
                             data_type: data_type_to_string(&c.data_type),
                             nullable: c.nullable,
                             default_expr: c.default_expr.clone(),
+                            id: c.id,
                         })
                         .collect(),
                     constraints: t.constraints.iter().map(constraint_to_ser).collect(),
@@ -381,18 +388,24 @@ impl CatalogPersistence {
                         data_type: string_to_data_type(&c.data_type)?,
                         nullable: c.nullable,
                         default_expr: c.default_expr.clone(),
+                        id: c.id,
                     })
                 })
                 .collect();
             let constraints: Vec<TableConstraint> =
                 t.constraints.iter().map(ser_to_constraint).collect();
-            let table_def = TableDef {
+            let mut table_def = TableDef {
                 name: t.name.clone(),
                 columns: columns?,
                 constraints,
                 append_only: t.append_only,
                 epoch: t.epoch,
             };
+            // Pre-id snapshots carry no column ids. Assign them by position
+            // exactly once, here on load, before anything in this process can
+            // have renamed a column — later would mint ids that disagree with
+            // the ones already recorded in policies.
+            table_def.backfill_column_ids();
             // Another recovery source may have registered this table already
             // (DiskEngine::open populates the catalog from its on-disk
             // directory before this loader runs). Existing entries win — this
@@ -445,6 +458,7 @@ impl CatalogPersistence {
                         data_type: string_to_data_type(&c.data_type)?,
                         nullable: c.nullable,
                         default_expr: c.default_expr.clone(),
+                        id: c.id,
                     })
                 })
                 .collect();
@@ -452,13 +466,18 @@ impl CatalogPersistence {
             let constraints: Vec<TableConstraint> =
                 t.constraints.iter().map(ser_to_constraint).collect();
 
-            let table_def = TableDef {
+            let mut table_def = TableDef {
                 name: t.name.clone(),
                 columns: columns?,
                 constraints,
                 append_only: t.append_only,
                 epoch: t.epoch,
             };
+            // Pre-id snapshots carry no column ids. Assign them by position
+            // exactly once, here on load, before anything in this process can
+            // have renamed a column — later would mint ids that disagree with
+            // the ones already recorded in policies.
+            table_def.backfill_column_ids();
 
             catalog
                 .create_table(table_def)
@@ -912,18 +931,21 @@ mod tests {
                         data_type: DataType::Int64,
                         nullable: false,
                         default_expr: None,
+                        id: 0,
                     },
                     ColumnDef {
                         name: "email".into(),
                         data_type: DataType::Text,
                         nullable: false,
                         default_expr: None,
+                        id: 0,
                     },
                     ColumnDef {
                         name: "active".into(),
                         data_type: DataType::Bool,
                         nullable: true,
                         default_expr: Some("true".into()),
+                        id: 0,
                     },
                 ],
                 constraints: vec![TableConstraint::PrimaryKey {
@@ -945,18 +967,21 @@ mod tests {
                         data_type: DataType::Int64,
                         nullable: false,
                         default_expr: None,
+                        id: 0,
                     },
                     ColumnDef {
                         name: "amount".into(),
                         data_type: DataType::Float64,
                         nullable: false,
                         default_expr: None,
+                        id: 0,
                     },
                     ColumnDef {
                         name: "tags".into(),
                         data_type: DataType::Array(Box::new(DataType::Text)),
                         nullable: true,
                         default_expr: None,
+                        id: 0,
                     },
                 ],
                 constraints: vec![],
@@ -1425,6 +1450,7 @@ mod tests {
                         data_type: DataType::Int64,
                         nullable: false,
                         default_expr: None,
+                        id: 0,
                     }],
                     constraints: vec![],
                     append_only: false,

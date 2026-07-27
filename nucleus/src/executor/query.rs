@@ -7648,9 +7648,7 @@ impl Executor {
                 // migration for every existing policy, not a bug fix, so it is
                 // recorded rather than smuggled in here. The hole this closes
                 // is the unpoliced one: a table with no policy at all.
-                if !self.rls_active(&table_name)
-                    && !self.check_privilege(&table_name, "SELECT").await
-                {
+                if !self.check_privilege(&table_name, "SELECT").await {
                     return Err(ExecError::PermissionDenied(format!(
                         "permission denied for table {table_name}"
                     )));

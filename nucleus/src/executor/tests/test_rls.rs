@@ -330,3 +330,97 @@ async fn principal_less_protocol_and_cluster_forwarding_fail_closed() {
             .is_err()
     );
 }
+
+/// `ALTER TABLE ... RENAME TO` must carry the GRANTs with the table.
+///
+/// Privileges are keyed by table name in `RoleDef::privileges`, and the rename
+/// path moved the RLS policies and masking rules but left the grants behind
+/// under the old name — so every grantee silently lost access to the table they
+/// had been granted. It stayed invisible for as long as privileges were not
+/// consulted on the read path.
+///
+/// Asserted through a real bound session rather than `has_table_privilege`,
+/// which ignores its user argument and reports on the *current* session — in a
+/// test that runs as superuser it answers `true` for everything, so it cannot
+/// witness this.
+#[tokio::test]
+async fn rename_table_carries_grants_with_it() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+    exec(&ex, "ALTER TABLE docs RENAME TO renamed_docs").await;
+
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "alice").await.unwrap();
+    let result = exec_session(&ex, sid, "SELECT id FROM renamed_docs ORDER BY id")
+        .await
+        .expect("alice's GRANT did not follow the table across RENAME");
+    assert_eq!(rows(&result[0]).len(), 2, "alice should still see her 2 rows");
+}
+
+/// Renaming the column a policy reads must keep the policy on that COLUMN.
+///
+/// Predicates used to store only the column NAME. A rename left the policy
+/// naming a column that no longer existed, which failed closed on its own —
+/// but `ADD COLUMN` could then recreate the old name and the policy would
+/// silently begin guarding the new, attacker-chosen column instead. Predicates
+/// now carry the column's stable id and the name is refreshed through it.
+#[tokio::test]
+async fn renaming_a_policy_column_keeps_the_policy_on_that_column() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+    exec(&ex, "ALTER TABLE docs RENAME COLUMN owner TO owner_real").await;
+
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "alice").await.unwrap();
+    let result = exec_session(&ex, sid, "SELECT id FROM docs ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&result[0]).len(),
+        2,
+        "policy should still filter on the renamed column, showing alice her 2 rows"
+    );
+
+    // The escalation this closes: reintroduce the old name and make it match
+    // every row. The policy must keep reading `owner_real`, not this decoy.
+    exec(
+        &ex,
+        "ALTER TABLE docs ADD COLUMN owner TEXT DEFAULT 'alice'",
+    )
+    .await;
+    let after = exec_session(&ex, sid, "SELECT id FROM docs ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&after[0]).len(),
+        2,
+        "a re-added column with the old name captured the policy: alice saw {} rows",
+        rows(&after[0]).len()
+    );
+}
+
+/// Dropping a column a policy reads must fail, and CASCADE must drop the policy.
+#[tokio::test]
+async fn dropping_a_policy_column_requires_cascade() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+
+    let blocked = ex.execute("ALTER TABLE docs DROP COLUMN owner").await;
+    let err = blocked.expect_err("dropping a column a policy depends on must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("owner_isolation"),
+        "the error should name the dependent policy, got: {msg}"
+    );
+
+    exec(&ex, "ALTER TABLE docs DROP COLUMN owner CASCADE").await;
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "alice").await.unwrap();
+    // The policy is gone with the column; RLS is still enabled, so with no
+    // policy admitting anything the table denies rather than opens.
+    let result = exec_session(&ex, sid, "SELECT id FROM docs").await.unwrap();
+    assert!(
+        rows(&result[0]).is_empty(),
+        "with its only policy CASCADE-dropped, an RLS-enabled table must deny, not open"
+    );
+}
