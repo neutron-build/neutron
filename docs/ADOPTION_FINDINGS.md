@@ -150,18 +150,117 @@ largest inflow, and this taxes all of it.
 **Suggested:** a sync `TestClient` facade using an anyio portal, as Starlette
 does. Small, and it removes the single largest obstacle to FastAPI migration.
 
-## N-002 — job queue worker-claim semantics unverified
-**Python · MEDIUM · `needs verification`**
+## N-002 — the job queue is in-process only, and its persistence does nothing
+**Python · HIGH · `REAL-BUG`**
 
-`neutron/jobs/queue.py` (342 lines) has persistence, cron scheduling, retry with
-backoff and handler registration. A grep found no `SKIP LOCKED`, no
-`LISTEN`/`NOTIFY` and no visibility timeout, so multi-worker claim semantics are
-unproven. Persistence is also optional (`db: Any = None`), defaulting to
-in-memory.
+Upgraded from MEDIUM/`needs verification` on 2026-07-27 after a full read of
+`neutron/jobs/queue.py` (342 lines). The original entry was a grep; every
+suspicion it raised is confirmed, and the durability problem is worse than
+suspected.
 
-**Flagged, not asserted** — this was a grep, not a full read of the file. It
-matters because a background-agent architecture makes this queue load-bearing
-and horizontal scale-out would be a hard requirement.
+| Line | Finding |
+|---|---|
+| 81 | `self._queue: asyncio.Queue[str]` — the work queue is **in-process**. Two workers in two processes hold two independent queues. No `SKIP LOCKED`, no claim, no lease, no visibility timeout. |
+| 105–133 | `_persist_job` writes `_neutron_jobs`, but **nothing ever reads the table back**. There is no recovery path. |
+| 58–62 | The class docstring says passing a `db` makes jobs "persist across restarts". Given the above this is false: after a restart `self._jobs` and `self._queue` are empty and every pending row is orphaned permanently. |
+| 100–103, 132–133 | `_ensure_db` and `_persist_job` both end in `except Exception: pass`. A persistence outage is silent — the queue reports healthy while writing nothing. |
+| 250–258 | `_scheduler_loop` fires on a `time.localtime()` match then `sleep(60)`, with no leader election. Two instances double-fire every cron entry, and a slow iteration can skip a minute entirely. |
+| 213–216 | A job whose `scheduled_at` is in the future is re-`put` on the queue followed by `sleep(0.1)`. A backlog of delayed jobs busy-spins every worker. |
+
+`tests/test_jobs.py` (188 lines) has no test for restart recovery, multi-worker
+claiming, or durability, so none of this is guarded.
+
+**Why it matters.** This is the one finding that blocks the Omni Analyst v2
+rebuild. That system's scheduler dispatches agents against a ranked queue of
+coverage gaps — it *is* a distributed work queue, and it is replacing a
+Celery + Redis deployment. Adopting Neutron's queue as it stands is a
+durability regression, and the docstring means an adopter will not know until
+they lose a restart's worth of work.
+
+**Fix sketch.** Postgres claim via `UPDATE … WHERE id IN (SELECT … FOR UPDATE
+SKIP LOCKED)`, a lease column with heartbeat and reclaim-on-expiry, read-back
+of pending rows on boot, an advisory lock so exactly one scheduler fires cron,
+and surfacing persistence errors instead of swallowing them. Until then the
+docstring should say in-memory-only.
+
+---
+
+## N-008 — `/health` reports `nucleus: "disconnected"` for a healthy Postgres connection
+**Python · MEDIUM · `REAL-BUG`**
+
+`neutron/app.py:145-162` computes the health payload's `nucleus` field:
+
+```python
+if db is None:                                  nucleus = "unconfigured"
+elif getattr(getattr(db, "features", None), "is_nucleus", False):
+                                                nucleus = "connected"
+else:                                           nucleus = "disconnected"
+```
+
+Running against plain PostgreSQL — an explicitly supported mode, since the
+pitch is that Nucleus speaks the Postgres wire protocol so "any Postgres client
+connects" — a fully healthy connection reports `"disconnected"`.
+
+Reproduction: point `NucleusClient.connect()` at stock Postgres, boot, and
+`GET /health` returns `{"status":"ok","nucleus":"disconnected","version":…}`.
+Observed on `timescale/timescaledb:2.17.2-pg17`.
+
+The field conflates "this backend is not Nucleus" with "the database is
+unreachable". Any monitor keyed on it pages for a healthy system, and the one
+genuine outage case is indistinguishable from the normal case. Three states
+are being squeezed into a field that needs four — suggest `"postgres"` (or
+`"connected (non-nucleus)"`) for a healthy non-Nucleus backend, leaving
+`"disconnected"` to mean unreachable.
+
+---
+
+## N-009 — the editable install exposes a top-level `tests` package
+**Python · LOW · `REAL-BUG`**
+
+Installing the Python tier from a path checkout —
+
+```toml
+[tool.uv.sources]
+neutron-py = { path = "../Neutron/python", editable = true }
+```
+
+— puts Neutron's own `python/tests/` on `sys.path` as a top-level `tests`
+module. A consuming application with the conventional `tests/` directory then
+finds Neutron's:
+
+```
+tests/test_skeleton.py:7: in <module>
+    from tests.conftest import TEST_DATABASE_URL
+E   ImportError: cannot import name 'TEST_DATABASE_URL' from 'tests.conftest'
+    (/…/Neutron/python/tests/conftest.py)
+```
+
+The app's own `tests/conftest.py` is shadowed. Editable path installs are the
+normal setup for anyone dogfooding or contributing, so this is hit early.
+
+Cause — and it is *not* the wheel's package set, which is correctly scoped to
+`packages = ["neutron"]`. Hatchling's default editable mode writes a `.pth`
+containing the **project root**:
+
+```
+$ cat .venv/lib/python3.12/site-packages/_editable_impl_neutron_py.pth
+/Users/…/Neutron/python
+
+$ python -c "import tests; print(tests.__file__)"
+/Users/…/Neutron/python/tests/__init__.py
+```
+
+So every top-level directory next to `neutron/` — currently `tests/`, and
+anything added later — becomes importable in the consuming app. `packages`
+governs the built wheel; it does not constrain the editable path entry.
+
+Fix: set `dev-mode-exact = true` under `[tool.hatch.build.targets.wheel]` so the
+editable install maps the package directly instead of exposing the source root.
+Dropping `tests/__init__.py` would not be sufficient on its own — `tests/` would
+remain importable as a namespace package.
+
+Workaround for adopters: don't import across your own `tests` package; use
+fixtures instead.
 
 ---
 
