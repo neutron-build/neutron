@@ -295,6 +295,33 @@ export async function getEntry(
   return entries.find((entry) => entry.slug === slug);
 }
 
+// Public string-returning counterpart to entry.render(). render() returns a
+// Preact component, which is not serializable — a static route's loader cannot
+// pass it through to its component. This helper runs the same lazy markup step
+// as render() and returns the HTML string directly, so consumers no longer need
+// a preact-render-to-string round-trip to recover markup the renderer already
+// produced.
+//
+// Like render(), this does NOT memoize the result onto the (long-lived, cached)
+// entry — doing so would re-accumulate the whole collection's HTML in memory
+// across a static build, the exact regression lazy rendering exists to avoid.
+// The content-addressed render cache (a bounded LRU, separate from the entry)
+// still applies, so repeated renders of identical bodies reuse one compile.
+export async function renderEntry<TData = unknown>(
+  entry: CollectionEntry<TData>
+): Promise<{ html: string }> {
+  const lazyMarkup = (entry as { __lazyMarkup?: () => Promise<{ html: string }> }).__lazyMarkup;
+  if (typeof lazyMarkup === "function") {
+    const rendered = await lazyMarkup();
+    const html = entry.sanitize ? await sanitizeHtml(rendered.html) : rendered.html;
+    return { html };
+  }
+  // HTML-passthrough entries carry their content in `html` directly; data
+  // entries have no body to render. Sanitize untrusted HTML in either case.
+  const html = entry.sanitize ? await sanitizeHtml(entry.html) : entry.html;
+  return { html };
+}
+
 export async function prepareContentCollections(
   options: PrepareContentCollectionsOptions = {}
 ): Promise<void> {
