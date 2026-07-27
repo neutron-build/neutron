@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented in this file.
 
+## [core 0.1.8] - 2026-07-27
+
+### Fixed
+
+- **A `[param]` directory was emitted as a literal path segment
+  (`@neutron-build/core`).** Only the last segment of a route was run through
+  the param rule, so `api/runs/[id]/decide.tsx` registered as the literal path
+  `/api/runs/[id]/decide` with no params — the route existed, but only the URL
+  containing the brackets could reach it, and every real request 404'd. There
+  was no build error and no warning; the only visible symptom was the generated
+  route type, which showed `"/api/runs/[id]/decide"` as a plain string while a
+  leaf `runs/[id].tsx` correctly produced `` `/runs/${string}` ``. Directory
+  names now go through the same rule as filenames, including `[...name]`
+  catch-alls and the `[.]` literal-dot escape.
+- **A named catch-all got a literal string route type.** The type generator
+  tested for a bare `"*"`, but catch-all segments carry their param name
+  (`*slug`), so `/docs/*slug` was typed as the literal `"/docs/*slug"` instead
+  of a template with a `${string}` hole.
+
+### Changed
+
+- **A route table that cannot work is now a build error, not a 404 at
+  runtime.** `discoverRoutes` rejects three cases that all used to register
+  silently: a malformed dynamic segment (a leftover `[` or `]` after
+  conversion), a catch-all that is not the last segment (nothing below it can
+  ever match), and two files that resolve to the same URL shape (only one can
+  ever be matched, and which one was an accident of discovery order — this
+  includes `/users/:id` vs `/users/:name`, since the router keeps one param
+  name per position). A literal suffix still distinguishes a route, so
+  `/docs/*slug` and `/docs/*slug.md` remain separate.
+
 ## [0.1.x hardening wave] - 2026-06-04
 
 > DX + ecosystem-hygiene pass. Scaffolded projects now typecheck clean, build
