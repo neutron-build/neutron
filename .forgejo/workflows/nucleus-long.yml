@@ -1,0 +1,125 @@
+name: Nucleus long-running
+
+# The reason a Forgejo runner is worth standing up at all.
+#
+# GitHub-hosted jobs are capped at 6 hours, which makes a multi-hour soak, a
+# 10M+ row scale load, and a full-scale probe sweep impossible there. A
+# self-hosted runner has no such cap, so those gates live here and only here.
+#
+# Nothing in this workflow runs on push — it is scheduled and manual. It is
+# also the workflow that must NOT share a machine with a benchmark: timings
+# recorded here are latency-sensitive.
+
+on:
+  schedule:
+    # 01:00 Sunday. A full sweep plus a soak is hours, not minutes.
+    - cron: "0 1 * * 0"
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "probe_soak duration in seconds"
+        required: false
+        default: "10800"
+      rows_target:
+        description: "probe_soak --rows-target (0 = leave at harness default)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: nucleus-long
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CARGO_HOME: /var/cache/forgejo-runner/cargo
+  CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-long
+
+jobs:
+  soak:
+    name: Soak
+    runs-on: nucleus-lab
+    # 24h. This value is the whole point of the runner; do not lower it to
+    # match GitHub's cap.
+    timeout-minutes: 1440
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm this is Linux
+        # The leak gate no longer depends on /proc — it reads RSS via ps where
+        # /proc is absent, and treats unreadable RSS as a failure rather than a
+        # silent pass (that silent pass was a permanent green on macOS until it
+        # was fixed). This job still pins Linux because the soak is the
+        # reference measurement: its numbers are only comparable run to run if
+        # the OS, allocator, and page-cache behavior stay fixed.
+        run: |
+          test "$(uname -s)" = "Linux" || {
+            echo "the soak is the reference measurement and is pinned to Linux; this runner is $(uname -s)" >&2
+            exit 1
+          }
+
+      - name: Build soak harness
+        run: cargo build --release --locked --features server --bin probe_soak
+
+      - name: Soak
+        run: |
+          SECS="${{ github.event.inputs.soak_seconds }}"
+          ROWS="${{ github.event.inputs.rows_target }}"
+          [ -n "$SECS" ] || SECS=10800
+          ARGS="--duration-secs $SECS --concurrency 8 --leak-limit-mb 256"
+          if [ -n "$ROWS" ] && [ "$ROWS" != "0" ]; then
+            ARGS="$ARGS --rows-target $ROWS"
+          fi
+          echo "probe_soak $ARGS"
+          "$CARGO_TARGET_DIR/release/probe_soak" $ARGS
+
+  probe-full:
+    name: Probe suite (full scale)
+    runs-on: nucleus-lab
+    timeout-minutes: 1440
+    env:
+      CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-long-probe
+      PROBE_SCALE: full
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Full-scale probe sweep
+        run: bash scripts/probe.sh
+
+      - name: Dump probe artifacts on failure
+        if: failure()
+        run: |
+          for f in probe-artifacts/*.log; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            cat "$f"
+          done
+
+  cache-oracle-deep:
+    name: Cache-coherence oracle (deep sweep)
+    runs-on: nucleus-lab
+    # Minutes, not hours — but it lives here rather than in the push gates
+    # because it is far too slow to sit in front of every commit.
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-long-oracle
+    defaults:
+      run:
+        working-directory: nucleus
+    steps:
+      - uses: actions/checkout@v4
+
+      # The push gates run this oracle at its default of 6 seeds, which is a
+      # speed compromise and NOT a coverage claim: the zone-map/rollback
+      # divergence fixed in this file's regression test first appeared at seed
+      # ~1140. A green default-depth run means nothing about the rare classes,
+      # so the deep sweep has to run somewhere. It runs here.
+      - name: Deep oracle sweep
+        run: cargo test --lib --features server oracle_deep_run_catches_rare_divergences -- --ignored --nocapture

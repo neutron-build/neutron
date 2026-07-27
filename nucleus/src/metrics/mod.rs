@@ -3,6 +3,8 @@
 //! Provides a [`MetricsRegistry`] with thread-safe atomic instrumentation and a
 //! hand-rolled Prometheus exposition format renderer (no external dependencies).
 
+pub mod harness;
+pub mod latency;
 pub mod optimizations;
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -230,6 +232,10 @@ pub struct MetricsRegistry {
     pub cache_misses: Counter,
     pub bytes_sent: Counter,
     pub bytes_received: Counter,
+    /// Connections refused because the server was at `max_connections`.
+    /// Without this, a connection limit is invisible in monitoring: clients
+    /// just see failures and nothing on the server side counts them.
+    pub connections_rejected: Counter,
 
     // Gauges
     pub active_connections: Gauge,
@@ -282,6 +288,10 @@ impl MetricsRegistry {
             cache_misses: Counter::new("nucleus_cache_misses_total", "Cache misses"),
             bytes_sent: Counter::new("nucleus_bytes_sent_total", "Network bytes sent"),
             bytes_received: Counter::new("nucleus_bytes_received_total", "Network bytes received"),
+            connections_rejected: Counter::new(
+                "nucleus_connections_rejected_total",
+                "Connections refused because the server was at max_connections",
+            ),
 
             active_connections: Gauge::new("nucleus_active_connections", "Active connections"),
             idle_connections: Gauge::new("nucleus_idle_connections", "Idle connections"),
@@ -365,6 +375,7 @@ impl MetricsRegistry {
         render_counter(&mut out, &self.cache_misses);
         render_counter(&mut out, &self.bytes_sent);
         render_counter(&mut out, &self.bytes_received);
+        render_counter(&mut out, &self.connections_rejected);
 
         // Gauges
         render_gauge(&mut out, &self.active_connections);
@@ -435,6 +446,7 @@ impl MetricsRegistry {
         add_counter(&mut rows, &self.cache_misses);
         add_counter(&mut rows, &self.bytes_sent);
         add_counter(&mut rows, &self.bytes_received);
+        add_counter(&mut rows, &self.connections_rejected);
 
         add_gauge(&mut rows, &self.active_connections);
         add_gauge(&mut rows, &self.idle_connections);
@@ -660,8 +672,8 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 16 counters + 7 gauges + 1 uptime + 1 histogram = 25
-        assert_eq!(rows.len(), 25);
+        // 17 counters + 7 gauges + 1 uptime + 1 histogram = 26
+        assert_eq!(rows.len(), 26);
 
         // Check a counter row
         let qt = rows

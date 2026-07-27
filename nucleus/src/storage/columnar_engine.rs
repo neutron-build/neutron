@@ -394,6 +394,32 @@ fn batches_to_rows(batches: &[ColumnBatch]) -> Vec<Row> {
     rows
 }
 
+/// Reconstruct at most `limit` rows, stopping as soon as the limit is reached so
+/// the tail rows are never assembled (no `Value` allocation for them). Batches
+/// are already dedup-resolved by `batches_all_for_select`, so the first `limit`
+/// rows equal `batches_to_rows(..)` truncated to `limit`.
+fn batches_to_rows_limit(batches: &[ColumnBatch], limit: usize) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(limit.min(1024));
+    if limit == 0 {
+        return rows;
+    }
+    for batch in batches {
+        for row_i in 0..batch.row_count {
+            let row: Row = (0..batch.columns.len())
+                .map(|col_i| {
+                    let (_, col) = &batch.columns[col_i];
+                    coldata_get(col, row_i)
+                })
+                .collect();
+            rows.push(row);
+            if rows.len() >= limit {
+                return rows;
+            }
+        }
+    }
+    rows
+}
+
 /// Reconstruct only rows where `batches[*][filter_col] == filter_val`.
 /// Avoids allocating Value objects for non-matching rows.
 /// Returns `(matched_rows, rows_examined)`. `rows_examined` is the total number of
@@ -816,6 +842,19 @@ impl StorageEngine for ColumnarStorageEngine {
         // tables pass through unchanged.
         let batches = store.batches_all_for_select(table);
         Ok(batches_to_rows(&batches))
+    }
+
+    async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        // Early-exit: assemble only the first `limit` rows from the (already
+        // dedup-resolved) batches. Same order as scan(), so equals
+        // scan()[..limit]. Safe here (the columnar engine records no SIREAD).
+        self.flush_write_buffer(table);
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        }
+        let batches = store.batches_all_for_select(table);
+        Ok(batches_to_rows_limit(&batches, limit))
     }
 
     async fn scan_where_eq_positions(
@@ -1506,6 +1545,20 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Int64(1));
         assert_eq!(rows[1][1], Value::Text("bob".into()));
+    }
+
+    #[tokio::test]
+    async fn scan_limit_early_exit_matches_prefix() {
+        let eng = ColumnarStorageEngine::new();
+        eng.create_table("t").await.unwrap();
+        for i in 1..=50 {
+            eng.insert("t", row(i, "x", i as f64)).await.unwrap();
+        }
+        let full = eng.scan("t").await.unwrap();
+        for n in [0usize, 1, 7, 50, 100] {
+            let lim = eng.scan_limit("t", n).await.unwrap();
+            assert_eq!(lim, full[..n.min(full.len())], "n={n}");
+        }
     }
 
     #[tokio::test]

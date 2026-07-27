@@ -327,7 +327,8 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
 pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, ParseError> {
     columns
         .iter()
-        .map(|col| {
+        .enumerate()
+        .map(|(idx, col)| {
             let data_type = convert_data_type(&col.data_type)?;
             let nullable = !col.options.iter().any(|opt| {
                 matches!(
@@ -344,6 +345,9 @@ pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, Par
                 data_type,
                 nullable,
                 default_expr,
+                // 1-based so `0` stays available as "no id recorded" for
+                // columns read from a pre-id snapshot.
+                id: idx as u32 + 1,
             })
         })
         .collect()
@@ -406,6 +410,51 @@ pub fn extract_serial_columns(columns: &[ast::ColumnDef]) -> Vec<(String, bool)>
     serials
 }
 
+/// Catalog key for a (possibly quoted, possibly schema-qualified) object name.
+/// Each part contributes its bare identifier value — `"users"` and `users` are
+/// the same relation, matching Postgres, where quoting affects case folding
+/// but not identity for names that need no folding. A leading `public.`
+/// qualifier is dropped because unqualified DDL stores bare names;
+/// `pg_catalog.` / `information_schema.` prefixes are preserved for
+/// virtual-table dispatch.
+pub fn object_name_key(name: &ast::ObjectName) -> String {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .map(|p| match p.as_ident() {
+            Some(id) => id.value.clone(),
+            None => p.to_string(),
+        })
+        .collect();
+    let skip = usize::from(parts.len() > 1 && parts[0] == "public");
+    parts[skip..].join(".")
+}
+
+/// Bare column name for a single- or compound-identifier target (e.g. an
+/// UPDATE assignment `"users"."age"` or `"age"`): the last part's value.
+pub fn object_name_last(name: &ast::ObjectName) -> String {
+    name.0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|id| id.value.clone())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Column name of an index/constraint column entry. Quoted identifiers
+/// (`PRIMARY KEY("post_id")`) must resolve to the bare column name —
+/// `expr.to_string()` would keep the quote characters and never match the
+/// catalog.
+pub fn index_column_name(col: &ast::IndexColumn) -> String {
+    match &col.column.expr {
+        ast::Expr::Identifier(ident) => ident.value.clone(),
+        ast::Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .unwrap_or_else(|| col.column.expr.to_string()),
+        other => other.to_string(),
+    }
+}
+
 /// Extract table-level constraints and inline column constraints from a CREATE TABLE.
 pub fn extract_constraints(
     columns: &[ast::ColumnDef],
@@ -445,7 +494,7 @@ pub fn extract_constraints(
                     constraints.push(TableConstraint::ForeignKey {
                         name: opt.name.as_ref().map(|name| name.to_string()),
                         columns: vec![col.name.value.clone()],
-                        ref_table: fk.foreign_table.to_string(),
+                        ref_table: object_name_key(&fk.foreign_table),
                         ref_columns: fk
                             .referred_columns
                             .iter()
@@ -467,21 +516,13 @@ pub fn extract_constraints(
                 constraints.retain(|c| !matches!(c, TableConstraint::PrimaryKey { .. }));
                 constraints.push(TableConstraint::PrimaryKey {
                     name: pk.name.as_ref().map(|name| name.to_string()),
-                    columns: pk
-                        .columns
-                        .iter()
-                        .map(|c| c.column.expr.to_string())
-                        .collect(),
+                    columns: pk.columns.iter().map(index_column_name).collect(),
                 });
             }
             ast::TableConstraint::Unique(u) => {
                 constraints.push(TableConstraint::Unique {
                     name: u.name.as_ref().map(|n| n.to_string()),
-                    columns: u
-                        .columns
-                        .iter()
-                        .map(|c| c.column.expr.to_string())
-                        .collect(),
+                    columns: u.columns.iter().map(index_column_name).collect(),
                 });
             }
             ast::TableConstraint::Check(ck) => {
@@ -494,7 +535,7 @@ pub fn extract_constraints(
                 constraints.push(TableConstraint::ForeignKey {
                     name: fk.name.as_ref().map(|n| n.to_string()),
                     columns: fk.columns.iter().map(|c| c.value.clone()).collect(),
-                    ref_table: fk.foreign_table.to_string(),
+                    ref_table: object_name_key(&fk.foreign_table),
                     ref_columns: fk
                         .referred_columns
                         .iter()

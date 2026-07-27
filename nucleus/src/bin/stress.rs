@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, BytesMut};
 use clap::Parser;
+use nucleus::metrics::latency::percentile_us;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
@@ -24,9 +24,6 @@ struct Args {
 
     #[arg(long, default_value_t = 6379)]
     resp_port: u16,
-
-    #[arg(long, default_value_t = 9999)]
-    binary_port: u16,
 
     #[arg(long, default_value_t = 10)]
     concurrency: usize,
@@ -52,7 +49,6 @@ struct Args {
 enum Protocol {
     Pgwire,
     Resp,
-    Binary,
     Embedded,
 }
 
@@ -61,7 +57,6 @@ impl std::fmt::Display for Protocol {
         match self {
             Protocol::Pgwire => write!(f, "pgwire"),
             Protocol::Resp => write!(f, "resp"),
-            Protocol::Binary => write!(f, "binary"),
             Protocol::Embedded => write!(f, "embedded"),
         }
     }
@@ -130,15 +125,13 @@ impl Stats {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Percentile in milliseconds. The index math lives in
+    /// `nucleus::metrics::latency` so every harness in the tree reports the same
+    /// number for the same samples.
     fn percentile(&self, p: f64) -> f64 {
         let mut lat = self.latencies_us.lock().clone();
-        if lat.is_empty() {
-            return 0.0;
-        }
         lat.sort_unstable();
-        let idx = ((p / 100.0) * (lat.len() as f64 - 1.0)).round() as usize;
-        let idx = idx.min(lat.len() - 1);
-        lat[idx] as f64 / 1000.0 // convert us to ms
+        percentile_us(&lat, p) / 1000.0 // us -> ms
     }
 }
 
@@ -239,218 +232,6 @@ impl RespReply {
     fn is_error(&self) -> bool {
         matches!(self, RespReply::Error(_))
     }
-}
-
-// ============================================================================
-// Binary wire helpers (TLV framing)
-// ============================================================================
-
-#[allow(dead_code)]
-mod binary_msg {
-    pub const QUERY: u8 = 1;
-    pub const PREPARED_STMT: u8 = 2;
-    pub const BIND: u8 = 3;
-    pub const EXECUTE: u8 = 4;
-    pub const COMMAND_COMPLETE: u8 = 5;
-    pub const DATA_ROW: u8 = 6;
-    pub const ERROR: u8 = 7;
-    pub const HANDSHAKE: u8 = 8;
-    pub const AUTHENTICATION: u8 = 9;
-    pub const READY: u8 = 10;
-    pub const RESULT_END: u8 = 12;
-    pub const BEGIN_TXN: u8 = 13;
-    pub const COMMIT_TXN: u8 = 14;
-    pub const ROLLBACK_TXN: u8 = 15;
-    pub const PARAMETER_STATUS: u8 = 16;
-}
-
-fn binary_encode_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.push(msg_type);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-    buf
-}
-
-fn binary_encode_query(query_id: u32, sql: &str) -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    payload.put_u8(0); // flags
-    payload.put_u32(query_id);
-    payload.put_slice(sql.as_bytes());
-    binary_encode_frame(binary_msg::QUERY, &payload)
-}
-
-fn binary_encode_handshake(version: u32, client_id: u32) -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    payload.put_u32(version);
-    payload.put_u32(client_id);
-    payload.put_u8(0); // flags
-    binary_encode_frame(binary_msg::HANDSHAKE, &payload)
-}
-
-fn binary_encode_prepared_stmt(stmt_id: u32, sql: &str) -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    payload.put_u32(stmt_id);
-    payload.put_slice(sql.as_bytes());
-    binary_encode_frame(binary_msg::PREPARED_STMT, &payload)
-}
-
-fn binary_encode_execute(stmt_id: u32) -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    payload.put_u32(stmt_id);
-    payload.put_u8(0); // flags
-    binary_encode_frame(binary_msg::EXECUTE, &payload)
-}
-
-fn binary_encode_begin_txn(isolation: u8) -> Vec<u8> {
-    binary_encode_frame(binary_msg::BEGIN_TXN, &[isolation])
-}
-
-fn binary_encode_commit_txn() -> Vec<u8> {
-    binary_encode_frame(binary_msg::COMMIT_TXN, &[])
-}
-
-fn binary_encode_rollback_txn() -> Vec<u8> {
-    binary_encode_frame(binary_msg::ROLLBACK_TXN, &[])
-}
-
-struct BinaryFrame {
-    msg_type: u8,
-    payload: Vec<u8>,
-}
-
-async fn binary_read_frame(
-    stream: &mut tokio::io::ReadHalf<TcpStream>,
-) -> Result<BinaryFrame, String> {
-    let mut header = [0u8; 5];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(|e| e.to_string())?;
-    let msg_type = header[0];
-    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(BinaryFrame { msg_type, payload })
-}
-
-/// Read frames until we get a READY, COMMAND_COMPLETE, RESULT_END, or ERROR.
-async fn binary_read_response(
-    stream: &mut tokio::io::ReadHalf<TcpStream>,
-) -> Result<Vec<BinaryFrame>, String> {
-    let mut frames = Vec::new();
-    loop {
-        let frame = binary_read_frame(stream).await?;
-        let done = matches!(
-            frame.msg_type,
-            binary_msg::READY
-                | binary_msg::COMMAND_COMPLETE
-                | binary_msg::RESULT_END
-                | binary_msg::ERROR
-        );
-        let is_error = frame.msg_type == binary_msg::ERROR;
-        frames.push(frame);
-        if done {
-            // After COMMAND_COMPLETE or RESULT_END, server typically sends READY.
-            // After ERROR, server typically sends READY.
-            // Keep reading until we see READY.
-            if !is_error && frames.last().map(|f| f.msg_type) != Some(binary_msg::READY) {
-                // Try to read one more for READY
-                if let Ok(Ok(f)) =
-                    tokio::time::timeout(Duration::from_millis(100), binary_read_frame(stream))
-                        .await
-                {
-                    frames.push(f);
-                }
-            }
-            break;
-        }
-    }
-    Ok(frames)
-}
-
-// ============================================================================
-// Binary wire handshake client
-// ============================================================================
-
-const PROTOCOL_VERSION: u32 = 0x00010000;
-
-async fn binary_handshake(
-    read: &mut tokio::io::ReadHalf<TcpStream>,
-    write: &mut tokio::io::WriteHalf<TcpStream>,
-) -> Result<(), String> {
-    // Step 1: Send client handshake
-    let hs = binary_encode_handshake(PROTOCOL_VERSION, 1);
-    write.write_all(&hs).await.map_err(|e| e.to_string())?;
-
-    // Step 2: Read server handshake
-    let frame = binary_read_frame(read).await?;
-    if frame.msg_type != binary_msg::HANDSHAKE {
-        return Err(format!("expected HANDSHAKE, got type {}", frame.msg_type));
-    }
-
-    // Step 3: Read authentication challenge
-    let auth_frame = binary_read_frame(read).await?;
-    if auth_frame.msg_type != binary_msg::AUTHENTICATION {
-        return Err(format!(
-            "expected AUTHENTICATION, got type {}",
-            auth_frame.msg_type
-        ));
-    }
-
-    // Step 4: Parse challenge and send response
-    // Challenge payload: [challenge_id:4][nonce_len:2][nonce:variable]
-    if auth_frame.payload.len() < 6 {
-        return Err("auth challenge too short".into());
-    }
-    let challenge_id = u32::from_be_bytes([
-        auth_frame.payload[0],
-        auth_frame.payload[1],
-        auth_frame.payload[2],
-        auth_frame.payload[3],
-    ]);
-    let nonce_len = u16::from_be_bytes([auth_frame.payload[4], auth_frame.payload[5]]) as usize;
-    let server_nonce = &auth_frame.payload[6..6 + nonce_len];
-
-    // Build auth response: [challenge_id:4][nonce_len:2][nonce:var][proof_len:2][proof:var]
-    let proof = b"Auth:";
-    let mut resp_payload = Vec::new();
-    resp_payload.extend_from_slice(&challenge_id.to_be_bytes());
-    resp_payload.extend_from_slice(&(server_nonce.len() as u16).to_be_bytes());
-    resp_payload.extend_from_slice(server_nonce);
-    resp_payload.extend_from_slice(&(proof.len() as u16).to_be_bytes());
-    resp_payload.extend_from_slice(proof);
-
-    let auth_resp = binary_encode_frame(binary_msg::AUTHENTICATION, &resp_payload);
-    write
-        .write_all(&auth_resp)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Step 5: Read ParameterStatus messages and final READY
-    loop {
-        let frame = binary_read_frame(read).await?;
-        match frame.msg_type {
-            binary_msg::PARAMETER_STATUS => continue,
-            binary_msg::READY => break,
-            binary_msg::ERROR => {
-                return Err("auth failed".into());
-            }
-            other => {
-                // Might get additional messages; keep reading until READY
-                if other == binary_msg::READY {
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 // ============================================================================
@@ -796,206 +577,6 @@ async fn resp_stress(stats: StatsMap, port: u16, concurrency: usize, duration: D
         let _ = h.await;
     }
     println!("[resp] Done.");
-}
-
-// ============================================================================
-// Binary wire stress tests
-// ============================================================================
-
-async fn binary_stress(stats: StatsMap, port: u16, concurrency: usize, duration: Duration) {
-    println!(
-        "[binary] Starting {} concurrent connections on port {}...",
-        concurrency, port
-    );
-
-    let barrier = Arc::new(Barrier::new(concurrency));
-    let mut handles = Vec::new();
-
-    for task_id in 0..concurrency {
-        let stats = stats.clone();
-        let barrier = barrier.clone();
-        let handle = tokio::spawn(async move {
-            barrier.wait().await;
-            let deadline = Instant::now() + duration;
-
-            let stream = match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[binary] task {} connect error: {}", task_id, e);
-                    return;
-                }
-            };
-
-            let (mut read_half, mut write_half) = tokio::io::split(stream);
-
-            // Handshake
-            if let Err(e) = binary_handshake(&mut read_half, &mut write_half).await {
-                eprintln!("[binary] task {} handshake error: {}", task_id, e);
-                return;
-            }
-
-            let tbl = format!("stress_bin_{}", task_id);
-            // Create table
-            let create_q = binary_encode_query(
-                0,
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS {} (id INT NOT NULL, val TEXT)",
-                    tbl
-                ),
-            );
-            let _ = write_half.write_all(&create_q).await;
-            let _ = binary_read_response(&mut read_half).await;
-
-            let mut counter = 0u64;
-            let mut query_id = 1u32;
-            while Instant::now() < deadline {
-                counter += 1;
-                query_id += 1;
-                let op_type = counter % 5;
-
-                let s = get_stats(&stats, Protocol::Binary, Model::Sql);
-                let start = Instant::now();
-
-                let result: Result<(), String> = async {
-                    match op_type {
-                        // Simple query
-                        0 => {
-                            let q = binary_encode_query(
-                                query_id,
-                                &format!(
-                                    "INSERT INTO {} VALUES ({}, 'bin_{}')",
-                                    tbl, counter, counter
-                                ),
-                            );
-                            write_half.write_all(&q).await.map_err(|e| e.to_string())?;
-                            let frames = binary_read_response(&mut read_half).await?;
-                            if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
-                                Err("query error".into())
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        // SELECT
-                        1 => {
-                            let q = binary_encode_query(
-                                query_id,
-                                &format!("SELECT * FROM {} LIMIT 5", tbl),
-                            );
-                            write_half.write_all(&q).await.map_err(|e| e.to_string())?;
-                            let frames = binary_read_response(&mut read_half).await?;
-                            if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
-                                Err("query error".into())
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        // Prepared statement
-                        2 => {
-                            let stmt = binary_encode_prepared_stmt(
-                                query_id,
-                                &format!("SELECT * FROM {} WHERE id = 1", tbl),
-                            );
-                            write_half
-                                .write_all(&stmt)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let _ = binary_read_response(&mut read_half).await;
-
-                            let exec = binary_encode_execute(query_id);
-                            write_half
-                                .write_all(&exec)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let frames = binary_read_response(&mut read_half).await?;
-                            if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
-                                Err("execute error".into())
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        // Transaction commit
-                        3 => {
-                            let begin = binary_encode_begin_txn(0);
-                            write_half
-                                .write_all(&begin)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let _ = binary_read_response(&mut read_half).await;
-
-                            let q = binary_encode_query(
-                                query_id,
-                                &format!(
-                                    "INSERT INTO {} VALUES ({}, 'txn_{}')",
-                                    tbl,
-                                    counter + 100000,
-                                    counter
-                                ),
-                            );
-                            write_half.write_all(&q).await.map_err(|e| e.to_string())?;
-                            let _ = binary_read_response(&mut read_half).await;
-
-                            let commit = binary_encode_commit_txn();
-                            write_half
-                                .write_all(&commit)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let frames = binary_read_response(&mut read_half).await?;
-                            if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
-                                Err("commit error".into())
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        // Transaction rollback
-                        4 => {
-                            let begin = binary_encode_begin_txn(0);
-                            write_half
-                                .write_all(&begin)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let _ = binary_read_response(&mut read_half).await;
-
-                            let q = binary_encode_query(
-                                query_id,
-                                &format!("INSERT INTO {} VALUES (999999, 'rollback')", tbl),
-                            );
-                            write_half.write_all(&q).await.map_err(|e| e.to_string())?;
-                            let _ = binary_read_response(&mut read_half).await;
-
-                            let rollback = binary_encode_rollback_txn();
-                            write_half
-                                .write_all(&rollback)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let frames = binary_read_response(&mut read_half).await?;
-                            if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
-                                Err("rollback error".into())
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        _ => Ok(()),
-                    }
-                }
-                .await;
-
-                let elapsed = start.elapsed();
-                match result {
-                    Ok(_) => s.record_op(elapsed),
-                    Err(_) => {
-                        s.record_error();
-                        s.record_op(elapsed);
-                    }
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    for h in handles {
-        let _ = h.await;
-    }
-    println!("[binary] Done.");
 }
 
 // ============================================================================
@@ -1774,8 +1355,7 @@ fn print_report(stats: &StatsMap, cross_passed: u64, cross_total: u64) {
         let proto_ord = |p: &Protocol| match p {
             Protocol::Pgwire => 0,
             Protocol::Resp => 1,
-            Protocol::Binary => 2,
-            Protocol::Embedded => 3,
+            Protocol::Embedded => 2,
         };
         let model_ord = |m: &Model| match m {
             Model::Sql => 0,
@@ -1894,7 +1474,6 @@ async fn main() {
     println!("  mode:         network");
     println!("  pgwire port:  {}", args.pg_port);
     println!("  resp port:    {}", args.resp_port);
-    println!("  binary port:  {}", args.binary_port);
     println!("  concurrency:  {}", args.concurrency);
     println!("  duration:     {}s", args.duration_secs);
     println!("  embedded:     {}", args.embedded);
@@ -1907,12 +1486,10 @@ async fn main() {
 
     let stats_pg = stats.clone();
     let stats_resp = stats.clone();
-    let stats_bin = stats.clone();
     let stats_emb = stats.clone();
 
     let pg_port = args.pg_port;
     let resp_port = args.resp_port;
-    let binary_port = args.binary_port;
     let concurrency = args.concurrency;
     let run_embedded = args.embedded;
 
@@ -1923,10 +1500,6 @@ async fn main() {
 
     let resp_handle = tokio::spawn(async move {
         resp_stress(stats_resp, resp_port, concurrency, duration).await;
-    });
-
-    let bin_handle = tokio::spawn(async move {
-        binary_stress(stats_bin, binary_port, concurrency, duration).await;
     });
 
     let emb_handle = if run_embedded {
@@ -1940,7 +1513,6 @@ async fn main() {
     // Wait for all protocol tests
     let _ = pg_handle.await;
     let _ = resp_handle.await;
-    let _ = bin_handle.await;
     if let Some(h) = emb_handle {
         let _ = h.await;
     }

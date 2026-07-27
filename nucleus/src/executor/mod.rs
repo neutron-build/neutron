@@ -80,10 +80,32 @@ pub(crate) fn decode_scram_verifier(encoded: &str) -> Option<(Vec<u8>, Vec<u8>)>
     (parts.next().is_none()).then_some((salt, salted))
 }
 
+/// Turn the literal supplied to `PASSWORD '…'` into the stored credential.
+///
+/// A literal that is ALREADY a well-formed stored verifier is kept verbatim
+/// instead of being hashed a second time — the same rule PostgreSQL applies to
+/// `PASSWORD 'SCRAM-SHA-256$…'`. Without it a logical dump could not carry role
+/// credentials at all (the plaintext is never retained), so restoring a dump
+/// would leave every role unable to log in. Anything that is not a valid
+/// verifier is treated as a plaintext password and hashed.
+pub(crate) fn store_password_literal(literal: &str) -> String {
+    #[cfg(feature = "server")]
+    if decode_scram_verifier(literal).is_some() {
+        return literal.to_string();
+    }
+    #[cfg(not(feature = "server"))]
+    if literal.starts_with("EMBEDDED-BLAKE3$") {
+        return literal.to_string();
+    }
+    encode_scram_verifier(literal)
+}
+
 mod admin;
+mod admission;
 mod aggregate;
 mod cache;
-mod copy;
+pub(crate) mod copy;
+mod cross_model;
 mod ddl;
 mod dml;
 mod expr;
@@ -97,9 +119,14 @@ mod meta_persistence;
 pub mod param_subst;
 mod policy;
 mod project;
+mod external_sort;
+mod hash_aggregate;
 mod query;
+pub(crate) mod row_batch;
 mod scalar_fns;
+mod scan_stream;
 mod schema_types;
+mod spill;
 mod session;
 mod txn;
 mod types;
@@ -128,17 +155,139 @@ impl Drop for CommandGuard {
 }
 
 /// The result of executing a statement.
-#[derive(Debug)]
 pub enum ExecResult {
-    /// SELECT result with column names, types, and rows.
+    /// SELECT result with column names, types, and materialized rows.
     Select {
         columns: Vec<(String, DataType)>,
         rows: Vec<Row>,
+    },
+    /// A SELECT result whose rows are pulled lazily in batches instead of being
+    /// materialized up front (the streaming-execution seam, P0.2). Producers
+    /// (streaming scans/operators) hand back one of these; consumers that are not
+    /// yet streaming-aware call [`ExecResult::materialize`] to collapse it to a
+    /// `Select`. The public [`Executor::execute`] boundary materializes so every
+    /// existing consumer is unchanged; only a future streaming wire path consumes
+    /// the batches directly.
+    SelectStream {
+        columns: Vec<(String, DataType)>,
+        source: Box<dyn row_batch::RowBatchIter>,
     },
     /// DDL/DML result with a command tag and affected row count.
     Command { tag: String, rows_affected: usize },
     /// Result of COPY ... TO STDOUT: pre-formatted copy data ready to stream.
     CopyOut { data: String, row_count: usize },
+    /// Result of COPY ... TO STDOUT WITH (FORMAT binary): the complete
+    /// PostgreSQL binary-copy payload (signature + tuples + trailer). The
+    /// wire layer sends it under a format=1 CopyOutResponse with one column
+    /// format code per column.
+    CopyOutBinary {
+        data: Vec<u8>,
+        row_count: usize,
+        columns: usize,
+    },
+    /// Streaming COPY ... TO STDOUT: rows are pulled in batches and formatted on
+    /// the fly, so a full-table export never buffers the whole table. The pgwire
+    /// path formats + sends CopyData per batch; non-wire consumers collapse it to
+    /// a `CopyOut` via [`ExecResult::materialize`]. Byte-identical to `CopyOut`.
+    CopyOutStream {
+        source: Box<dyn row_batch::RowBatchIter>,
+        columns: Vec<String>,
+        is_csv: bool,
+        delimiter: char,
+        include_header: bool,
+    },
+}
+
+impl std::fmt::Debug for ExecResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecResult::Select { columns, rows } => f
+                .debug_struct("Select")
+                .field("columns", columns)
+                .field("rows", rows)
+                .finish(),
+            // The source is an opaque lazy iterator — don't (and can't) drain it
+            // to format; show its shape instead.
+            ExecResult::SelectStream { columns, .. } => f
+                .debug_struct("SelectStream")
+                .field("columns", columns)
+                .field("source", &"<lazy row stream>")
+                .finish(),
+            ExecResult::Command { tag, rows_affected } => f
+                .debug_struct("Command")
+                .field("tag", tag)
+                .field("rows_affected", rows_affected)
+                .finish(),
+            ExecResult::CopyOut { data, row_count } => f
+                .debug_struct("CopyOut")
+                .field("data", data)
+                .field("row_count", row_count)
+                .finish(),
+            ExecResult::CopyOutBinary {
+                row_count, columns, ..
+            } => f
+                .debug_struct("CopyOutBinary")
+                .field("row_count", row_count)
+                .field("columns", columns)
+                .finish(),
+            ExecResult::CopyOutStream {
+                columns, is_csv, ..
+            } => f
+                .debug_struct("CopyOutStream")
+                .field("columns", columns)
+                .field("is_csv", is_csv)
+                .field("source", &"<lazy row stream>")
+                .finish(),
+        }
+    }
+}
+
+impl ExecResult {
+    /// Collapse a [`ExecResult::SelectStream`] into a materialized
+    /// [`ExecResult::Select`] by draining its batch iterator; all other variants
+    /// pass through unchanged. This is the adapter every not-yet-streaming
+    /// consumer uses, and what the [`Executor::execute`] boundary applies so the
+    /// default result path is always materialized.
+    pub async fn materialize(self) -> Result<ExecResult, ExecError> {
+        match self {
+            ExecResult::SelectStream {
+                columns,
+                mut source,
+            } => {
+                let rows = source.collect().await?;
+                Ok(ExecResult::Select { columns, rows })
+            }
+            ExecResult::CopyOutStream {
+                mut source,
+                columns,
+                is_csv,
+                delimiter,
+                include_header,
+            } => {
+                let rows = source.collect().await?;
+                let mut data = String::new();
+                if include_header {
+                    data.push_str(&copy::format_copy_header(&columns, is_csv, delimiter));
+                }
+                data.push_str(&copy::format_copy_body(&rows, is_csv, delimiter));
+                Ok(ExecResult::CopyOut {
+                    data,
+                    row_count: rows.len(),
+                })
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Whether this result is a lazy stream (SELECT or COPY) not yet materialized.
+    /// The dispatch boundary passes these through to the wire for a single-
+    /// statement batch; every other consumer materializes them.
+    pub fn is_stream(&self) -> bool {
+        matches!(
+            self,
+            ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. }
+        )
+    }
 }
 
 /// The executor holds shared catalog/storage state and per-session state.
@@ -148,6 +297,15 @@ pub enum ExecResult {
 /// connection should call [`create_session`] on connect and [`drop_session`] on
 /// disconnect. The wire handler does this automatically.
 pub struct Executor {
+    /// A weak self-reference, installed once the executor is wrapped in an `Arc`
+    /// (see [`Executor::install_self_ref`]). Streaming iterators are drained by the
+    /// wire layer *after* `execute` returns, so a lazy producer that must call back
+    /// into the executor (e.g. a streaming WHERE filter evaluating `eval_where`, or
+    /// a per-partition emitter) needs an owned `Arc<Executor>` to hold across that
+    /// boundary. `&self` methods reach it through [`Executor::arc_self`]. Left unset
+    /// for by-value/embedded constructions, where those producers simply decline
+    /// and fall back to the materialized path.
+    self_ref: std::sync::OnceLock<std::sync::Weak<Executor>>,
     catalog: Arc<Catalog>,
     views: RwLock<HashMap<String, ViewDef>>,
     sequences: parking_lot::RwLock<HashMap<String, parking_lot::Mutex<SequenceDef>>>,
@@ -169,6 +327,9 @@ pub struct Executor {
     materialized_views: RwLock<HashMap<String, MaterializedViewDef>>,
     /// Schemas (namespaces).
     schemas: RwLock<HashSet<String>>,
+    /// Installed extensions tracked as catalog no-ops (name → definition).
+    /// Seeded with `plpgsql`, matching a fresh Postgres cluster.
+    extensions: parking_lot::RwLock<HashMap<String, ExtensionDef>>,
     /// Path to the catalog JSON file for persistence (None = no persistence).
     catalog_path: Option<std::path::PathBuf>,
     /// Live vector indexes keyed by index name.
@@ -182,6 +343,16 @@ pub struct Executor {
     cdc_wal: Option<crate::reactive::cdc_wal::CdcWal>,
     /// Optional geo WAL for durable R-tree persistence.
     geo_wal: Option<crate::geo::wal::GeoWal>,
+    /// Live spill manager for bounded-memory blocking operators (external sort,
+    /// Phase 3). `Some` once a data dir is configured; the spill directory is
+    /// swept of crash orphans at construction. Holds the at-rest encryptor when
+    /// the deployment is encrypted so sensitive runs spill ciphertext.
+    #[cfg(feature = "server")]
+    spill_manager: Option<Arc<spill::SpillManager>>,
+    /// True when the storage is encrypted at rest — streamed sort runs are then
+    /// marked `Sensitive` so they spill encrypted (fail-closed without a key).
+    #[cfg(feature = "server")]
+    at_rest_encrypted: bool,
     /// Fault isolation health registry (Principle 6).
     health_registry: Arc<parking_lot::RwLock<HealthRegistry>>,
     /// Live encrypted indexes keyed by index name.
@@ -293,6 +464,10 @@ pub struct Executor {
     /// Memory budget for query execution — prevents OOM from giant JOINs / sorts.
     /// Shared across all concurrent queries; default 256 MB.
     query_memory: Arc<crate::allocator::MemoryBudget>,
+    /// Write-admission gate. Read on every statement that could mutate state;
+    /// flipped to read-only by the disk watermark guard or by an operator so
+    /// the database degrades safely instead of failing mid-write.
+    service: Arc<crate::ops::ServiceState>,
     /// Current subquery nesting depth (safety limit against stack overflow).
     query_depth: AtomicU32,
     /// Global prepared statement cache: SQL text → Arc<PreparedStmt>.
@@ -376,6 +551,7 @@ impl Executor {
         health.register("memory");
 
         Self {
+            self_ref: std::sync::OnceLock::new(),
             catalog,
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
@@ -393,6 +569,18 @@ impl Executor {
                 s.insert("public".to_string());
                 s
             }),
+            extensions: parking_lot::RwLock::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    "plpgsql".to_string(),
+                    ExtensionDef {
+                        name: "plpgsql".to_string(),
+                        schema: "pg_catalog".to_string(),
+                        version: "1.0".to_string(),
+                    },
+                );
+                m
+            }),
             catalog_path: None,
             vector_indexes: parking_lot::RwLock::new(HashMap::new()),
             vector_wal: None,
@@ -400,6 +588,10 @@ impl Executor {
             #[cfg(feature = "server")]
             cdc_wal: None,
             geo_wal: None,
+            #[cfg(feature = "server")]
+            spill_manager: None,
+            #[cfg(feature = "server")]
+            at_rest_encrypted: false,
             health_registry: Arc::new(parking_lot::RwLock::new(health)),
             encrypted_indexes: parking_lot::RwLock::new(HashMap::new()),
             graph_store: parking_lot::RwLock::new(GraphStore::new()),
@@ -475,6 +667,7 @@ impl Executor {
                 "query_executor",
                 256 * 1024 * 1024, // 256 MB default
             )),
+            service: Arc::new(crate::ops::ServiceState::new()),
             query_depth: AtomicU32::new(0),
             global_prepared_cache: parking_lot::RwLock::new(GlobalPreparedCache::new(4096)),
             uncorrelated_subquery_cache: parking_lot::RwLock::new(HashMap::new()),
@@ -645,6 +838,24 @@ impl Executor {
                 // when a GeoIndex is added to the executor. For now, store the WAL handle.
                 exec.geo_wal = Some(wal);
             }
+
+            // Query spill directory: reclaim any files a crashed process left
+            // behind (spill files never survive a clean shutdown — their guards
+            // unlink on drop — so anything here at startup is an orphan, the same
+            // crash-cleanup contract as the WAL temp sweep), then keep the manager
+            // live on the executor so blocking operators (external sort, Phase 3)
+            // can spill. Created without an encryptor; an encrypted deployment
+            // upgrades it via `with_spill_encryptor` so sensitive runs spill
+            // ciphertext. u64::MAX ceiling for now (a configurable disk budget is
+            // a follow-up); the budget still tracks usage, it just never denies.
+            #[cfg(feature = "server")]
+            {
+                let spill_dir = dir.join("spill");
+                if let Ok(mgr) = spill::SpillManager::new(&spill_dir, u64::MAX, None) {
+                    let _ = mgr.sweep_orphans();
+                    exec.spill_manager = Some(std::sync::Arc::new(mgr));
+                }
+            }
         }
 
         // Set up stats persistence path and load any saved ANALYZE stats.
@@ -796,6 +1007,10 @@ impl Executor {
         if !loaded.functions.is_empty() {
             *self.functions.write() = loaded.functions;
         }
+        if !loaded.extensions.is_empty() {
+            // Snapshot includes the plpgsql seed, so overwrite is lossless.
+            *self.extensions.write() = loaded.extensions;
+        }
         {
             let mut security = self.security.write();
             security.rls = loaded.rls;
@@ -803,6 +1018,84 @@ impl Executor {
         }
 
         // Override sequences with dedicated sequences.json if it exists (more up-to-date).
+        self.load_sequences_sync();
+
+        self.report_policies_without_grants().await;
+    }
+
+    /// Warn about policies whose target roles hold no GRANT on the table.
+    ///
+    /// GRANT and RLS are independent gates: a policy filters within what a
+    /// grant already allows, and cannot admit rows on its own. A database
+    /// written under the older policy-as-access model can therefore contain
+    /// policies that used to confer read access and no longer do, and the
+    /// symptom — a role that silently sees nothing — is indistinguishable from
+    /// a correctly-restrictive policy.
+    ///
+    /// This reports; it deliberately does not grant. Auto-granting would
+    /// reintroduce exactly the property the layering removed, and it would do
+    /// so invisibly, which is worse than the state it was repairing.
+    async fn report_policies_without_grants(&self) {
+        // Snapshot the policies FIRST and drop the (sync) security guard before
+        // taking the async roles lock — holding a parking_lot guard across an
+        // await can deadlock the runtime.
+        let targets: Vec<(String, String, Vec<String>)> = {
+            let security = self.security.read();
+            security
+                .rls
+                .all_policies()
+                .into_iter()
+                .map(|p| (p.table.clone(), p.name.clone(), p.target_roles.clone()))
+                .collect()
+        };
+        let affected: Vec<(String, String, String)> = {
+            let roles = self.roles.read().await;
+            targets
+                .iter()
+                .flat_map(|(table, policy, target_roles)| {
+                    let roles = &roles;
+                    target_roles.iter().filter_map(move |role_name| {
+                        // PUBLIC-targeted policies name no role, so there is no
+                        // grant to look for.
+                        if role_name.eq_ignore_ascii_case("public") {
+                            return None;
+                        }
+                        let granted = roles.get(role_name).is_some_and(|role| {
+                            role.is_superuser
+                                || role.privileges.contains_key(table)
+                                || role.privileges.contains_key("*")
+                        });
+                        (!granted).then(|| (table.clone(), policy.clone(), role_name.clone()))
+                    })
+                })
+                .collect()
+        };
+
+        for (table, policy, role) in &affected {
+            tracing::warn!(
+                table = %table,
+                policy = %policy,
+                role = %role,
+                "policy targets a role with no GRANT on the table; SELECT is required \
+                 in addition to a matching policy, so this role will see no rows. \
+                 Grant it explicitly if that is not intended."
+            );
+        }
+        if !affected.is_empty() {
+            tracing::warn!(
+                count = affected.len(),
+                "{} policy/role pair(s) confer no access without a GRANT",
+                affected.len()
+            );
+        }
+    }
+
+    /// Restore sequence state from `sequences.json` (sync — callable from the
+    /// embedded builder, which has no runtime). Without this, an embedded
+    /// durable database reset every SERIAL to 1 on reopen; with PK
+    /// enforcement now also restored across reopen, that would turn every
+    /// post-restart SERIAL insert into a loud duplicate-key error.
+    pub fn load_sequences_sync(&self) {
         if let Some(ref cp) = self.catalog_path
             && let Some(dir) = cp.parent()
         {
@@ -1344,6 +1637,48 @@ impl Executor {
         self
     }
 
+    /// Equip the spill manager with the at-rest encryptor (builder form). Called
+    /// by the server bootstrap when `--encrypt` is on, so blocking operators that
+    /// spill rows from encrypted storage write ciphertext, and mark the deployment
+    /// encrypted so streamed sort runs are treated as `Sensitive`. No-op if no
+    /// spill directory was configured.
+    #[cfg(feature = "server")]
+    pub fn with_spill_encryptor(
+        mut self,
+        encryptor: crate::storage::encryption::PageEncryptor,
+    ) -> Self {
+        self.at_rest_encrypted = true;
+        if let Some(old) = self.spill_manager.take() {
+            // Rebuild the manager over the same directory, now with the key. The
+            // orphan sweep already ran at construction; the dir path is stable.
+            if let Ok(mgr) = spill::SpillManager::new(old.dir(), u64::MAX, Some(encryptor)) {
+                self.spill_manager = Some(std::sync::Arc::new(mgr));
+            } else {
+                self.spill_manager = Some(old);
+            }
+        }
+        self
+    }
+
+    /// Build the spill context for a streamed blocking operator, or `None` when no
+    /// spill directory is configured (spill disabled → operator stays in memory,
+    /// bounded by the run budget, or returns MemoryExceeded). Runs are marked
+    /// `Sensitive` iff the deployment is encrypted at rest.
+    #[cfg(feature = "server")]
+    fn sort_spill_ctx(&self, owner: &str) -> Option<external_sort::SpillCtx> {
+        let manager = std::sync::Arc::clone(self.spill_manager.as_ref()?);
+        let sensitivity = if self.at_rest_encrypted {
+            spill::Sensitivity::Sensitive
+        } else {
+            spill::Sensitivity::Plain
+        };
+        Some(external_sort::SpillCtx {
+            manager,
+            sensitivity,
+            owner: owner.to_string(),
+        })
+    }
+
     /// Set the query execution memory budget after construction (T1.2). The
     /// executor is shared behind an `Arc` by the time config is applied, so the
     /// consuming builder above can't be used; this drives the same budget the
@@ -1360,6 +1695,62 @@ impl Executor {
     /// Current query execution memory budget in bytes.
     pub fn query_memory_limit(&self) -> u64 {
         self.query_memory.limit()
+    }
+
+    /// Record a weak self-reference so `&self` methods can recover an owned
+    /// `Arc<Executor>` (see [`Executor::arc_self`]). Call this once, right after the
+    /// executor is wrapped in an `Arc` at a server/embedded entry point. Idempotent;
+    /// a second call is ignored (the `OnceLock` keeps the first).
+    pub fn install_self_ref(self: &Arc<Self>) {
+        let _ = self.self_ref.set(Arc::downgrade(self));
+    }
+
+    /// Seed the sync per-table column cache from the catalog. Call once at
+    /// startup after recovery has registered tables: `table_columns` is
+    /// otherwise only populated by CREATE TABLE, so every fast path keyed on
+    /// it (the O(1) COUNT/aggregate arm most visibly) silently degraded to a
+    /// full materializing scan for RECOVERED tables — at 5M rows that scan
+    /// tripped the query-memory ceiling and a plain `SELECT COUNT(*)` errored
+    /// after reopen while working before it.
+    /// True when some table has a FOREIGN KEY referencing `table` — used by the
+    /// point-DELETE fast path to decline (the full path enforces referential
+    /// integrity). Best-effort: if the sync catalog snapshot is unavailable,
+    /// returns true so the safe full path runs.
+    fn table_is_fk_referenced(&self, table: &str) -> bool {
+        let Some(tables) = self.catalog.list_tables_sync() else {
+            return true;
+        };
+        tables.iter().any(|t| {
+            t.constraints.iter().any(|c| {
+                matches!(c, crate::catalog::TableConstraint::ForeignKey { ref_table, .. }
+                    if ref_table.eq_ignore_ascii_case(table))
+            })
+        })
+    }
+
+    pub fn warm_table_caches_sync(&self) {
+        let Some(tables) = self.catalog.list_tables_sync() else {
+            return;
+        };
+        let mut cache = self.table_columns.write();
+        for t in tables {
+            cache.entry(t.name.clone()).or_insert_with(|| {
+                t.columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect()
+            });
+        }
+    }
+
+    /// Recover the owning `Arc<Executor>` if one was installed via
+    /// [`install_self_ref`](Self::install_self_ref). Returns `None` for a by-value
+    /// or not-yet-installed executor, in which case callers that need an owned
+    /// handle (streaming producers that outlive the `execute` call) decline and let
+    /// the materialized path run. `Weak::upgrade` also yields `None` if the executor
+    /// is mid-drop, so a stream can never resurrect a dying executor.
+    pub(super) fn arc_self(&self) -> Option<Arc<Self>> {
+        self.self_ref.get().and_then(std::sync::Weak::upgrade)
     }
 
     // =========================================================================
@@ -1624,26 +2015,9 @@ impl Executor {
 
     /// Estimate memory consumption of a row (rough, fast).
     fn estimate_row_bytes(row: &Row) -> u64 {
-        let mut bytes: u64 = 24; // Vec overhead
-        for v in row {
-            bytes += match v {
-                Value::Null | Value::Bool(_) => 1,
-                Value::Int32(_) | Value::Date(_) => 4,
-                Value::Int64(_)
-                | Value::Float64(_)
-                | Value::Timestamp(_)
-                | Value::TimestampTz(_) => 8,
-                Value::Text(s) => 24 + s.len() as u64,
-                Value::Numeric(s) => 24 + s.len() as u64,
-                Value::Uuid(_) => 16,
-                Value::Bytea(b) => 24 + b.len() as u64,
-                Value::Array(a) => 24 + a.len() as u64 * 16,
-                Value::Vector(v) => 24 + v.len() as u64 * 4,
-                Value::Jsonb(_) => 64,
-                Value::Interval { .. } => 16,
-            };
-        }
-        bytes
+        // Single source of truth in helpers so the streaming external sort's run
+        // sizing accounts bytes identically to the query-memory budget.
+        helpers::estimate_row_bytes(row)
     }
 
     /// Estimate the combined in-memory footprint of a slice of rows.
@@ -1945,8 +2319,27 @@ impl Executor {
     }
 
     /// Drop a session when a connection closes, freeing its state.
+    ///
+    /// A client that disconnects mid-transaction must not leave half of it
+    /// behind. `drop_storage_session` discards the uncommitted SQL rows, so the
+    /// cross-model half has to be reverted here too — otherwise a plain TCP
+    /// close splits the transaction (SQL rolled back, KV/graph/doc writes
+    /// permanent) with no crash and no timing window involved. The idle-in-
+    /// transaction sweep already does this via `rollback_transaction`; before
+    /// M8 the two abandonment paths disagreed.
+    ///
+    /// Synchronous on purpose: every disconnect path (pgwire cleanup, the
+    /// binary protocol handler, embedded callers) is sync, and the revert needs
+    /// no async work.
     pub fn drop_session(&self, id: u64) {
-        self.sessions.write().remove(&id);
+        let session = self.sessions.write().remove(&id);
+        if let Some(session) = session {
+            let cross_model = session.cross_model.lock().take();
+            if let Some(cm) = cross_model {
+                self.cross_model_revert(cm.base, cm.fts_ops);
+                self.metrics.open_transactions.dec();
+            }
+        }
         self.storage.drop_storage_session(id);
     }
 
@@ -1978,6 +2371,13 @@ impl Executor {
             }
             actions.push("ROLLBACK active transaction".into());
             self.metrics.open_transactions.dec();
+        }
+
+        // Pool return abandons the transaction the same way a disconnect does,
+        // so the cross-model half must be reverted with it.
+        let cross_model = session.cross_model.lock().take();
+        if let Some(cm) = cross_model {
+            self.cross_model_revert(cm.base, cm.fts_ops);
         }
 
         // Collect info about what will be cleared
@@ -2070,6 +2470,12 @@ impl Executor {
     }
 
     /// Get the session for the given ID, falling back to the default session.
+    /// Column (name, type) pairs for a table from the sync schema cache —
+    /// used by the wire layer to decode binary COPY payloads.
+    pub fn table_column_types(&self, table: &str) -> Option<Vec<(String, DataType)>> {
+        self.table_columns.read().get(table).cloned()
+    }
+
     fn get_session(&self, id: u64) -> Arc<Session> {
         self.sessions
             .read()
@@ -2140,6 +2546,47 @@ impl Executor {
         self.security.read().rls.any_enabled()
     }
 
+    /// Whether the current session opted into streaming results via
+    /// `SET stream_results = on`. Default OFF. Gates the streaming scan/COPY
+    /// producers so existing sessions are byte-for-byte unchanged.
+    #[cfg(feature = "server")]
+    pub(super) fn stream_results_enabled(&self) -> bool {
+        self.current_session()
+            .settings
+            .read()
+            .get("stream_results")
+            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether COPY TO STDOUT should stream (vs materialize the whole table).
+    /// Unlike SELECT streaming this is ON by default — but only for a wire
+    /// consumer that can lazily drain the result (pgwire, which marks the session
+    /// stream-capable). Embedded/RESP/binary callers leave the flag false and so
+    /// keep receiving a materialized `CopyOut`, preserving their result contract.
+    /// An explicit `SET stream_results = on|off` overrides in either direction, so
+    /// the setting remains a per-session escape hatch on the wire.
+    #[cfg(feature = "server")]
+    pub(super) fn copy_streaming_enabled(&self) -> bool {
+        let session = self.current_session();
+        if let Some(v) = session.settings.read().get("stream_results") {
+            return v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        session
+            .stream_capable_consumer
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mark a session's consumer as able to lazily drain a streaming result, so
+    /// COPY TO STDOUT streams by default for it. Called by the pgwire layer at
+    /// connection setup; never by embedded/RESP/binary paths.
+    #[cfg(feature = "server")]
+    pub fn mark_session_stream_capable(&self, session_id: u64) {
+        self.get_session(session_id)
+            .stream_capable_consumer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[cfg(feature = "server")]
     pub async fn execute_principal_less_forward(
         &self,
@@ -2152,6 +2599,49 @@ impl Executor {
             ));
         }
         self.execute(sql).await
+    }
+
+    /// Message used for wire-initiated query cancellation; the pg error codec
+    /// maps it to SQLSTATE 57014 (query_canceled).
+    pub(super) const CANCEL_MESSAGE: &'static str = "canceling statement due to user request";
+
+    /// Flag the session's currently-executing statement for cooperative
+    /// cancellation (wire CancelRequest). Long compute loops observe the flag
+    /// and abort with SQLSTATE 57014; the flag clears at the next statement.
+    pub fn request_session_cancel(&self, session_id: u64) {
+        self.get_session(session_id)
+            .cancel_requested
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Drop any pending cancel on the session. The wire layer calls this at
+    /// each CLIENT command boundary (simple query / Execute / Describe) — NOT
+    /// per internal executor entry, because one client command may run
+    /// several internal statements (e.g. the Describe probe) and a cancel
+    /// arriving during any of them targets the same client command.
+    pub fn clear_session_cancel(&self, session_id: u64) {
+        self.get_session(session_id)
+            .cancel_requested
+            .store(false, Ordering::Relaxed);
+    }
+
+    /// Error out if the current session's statement has been cancelled.
+    /// Cheap (one relaxed atomic load) — called from the executor's long
+    /// loops (filters, joins, aggregates) to bound cancellation latency.
+    /// Consumes the flag when it fires so the cancel affects one command.
+    #[inline]
+    pub(super) fn check_cancelled(&self) -> Result<(), ExecError> {
+        let session = self.current_session();
+        if session.cancel_requested.swap(false, Ordering::Relaxed) {
+            return Err(ExecError::Runtime(Self::CANCEL_MESSAGE.into()));
+        }
+        Ok(())
+    }
+
+    /// Current session handle for capturing the cancel flag before entering
+    /// rayon (worker threads can't read the task-local).
+    pub(super) fn current_session_for_cancel(&self) -> Arc<Session> {
+        self.current_session()
     }
 
     /// Get the current session from the task-local, or the default session
@@ -2434,6 +2924,23 @@ impl Executor {
         }
     }
 
+    /// Drop every derived in-memory query cache: result cache, plan cache, AST
+    /// cache, global prepared cache, and the uncorrelated-subquery cache.
+    ///
+    /// This is the "cache-free reference" switch used by the cache-coherence
+    /// oracle: clearing these must never change a query's result, so any
+    /// divergence between a warm executor and one cleared through this call is
+    /// a stale-cache bug. Specialty indexes are deliberately NOT touched — the
+    /// oracle isolates them with a separate index-free reference side.
+    pub fn clear_all_query_caches(&self) {
+        self.query_cache_invalidate_all();
+        self.plan_cache.write().clear();
+        self.ast_cache.write().clear();
+        self.global_prepared_cache.write().clear();
+        self.uncorrelated_subquery_cache.write().clear();
+        *self.plan_cache_key_hint.lock() = None;
+    }
+
     /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.
     /// Returns `Some(key)` if a hint was stored, `None` otherwise.
     /// Used by the wire protocol handler to carry the normalized SQL key
@@ -2482,6 +2989,11 @@ impl Executor {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
     > {
+        // The other three entry points (`execute`, `execute_parsed`,
+        // `execute_prepared`) clear this; this one did not, and it is the
+        // extended-query AST fast path every real driver takes, so entries
+        // outlived the statement and the connection that made them.
+        self.uncorrelated_subquery_cache.write().clear();
         let session = self.get_session(session_id);
         let guard_sess = session.clone();
         Box::pin(CURRENT_SESSION.scope(
@@ -2491,7 +3003,9 @@ impl Executor {
                 let _guard = CommandGuard(guard_sess);
                 let mut results = Vec::new();
                 for stmt in statements {
-                    results.push(self.execute_statement(stmt).await?);
+                    // Materialization boundary (see execute_statements_dispatch).
+                    let r = self.execute_statement(stmt).await?.materialize().await?;
+                    results.push(r);
                 }
                 Ok(results)
             }),
@@ -2534,6 +3048,7 @@ impl Executor {
                 .collect()
         };
         let functions_snap: HashMap<String, FunctionDef> = self.functions.read().clone();
+        let extensions_snap: HashMap<String, ExtensionDef> = self.extensions.read().clone();
         let security_snap = self.security.read().clone_policy_state();
         // Now take async locks.
         let meta_pers = meta_persistence::MetaPersistence::alongside_catalog(path);
@@ -2549,6 +3064,7 @@ impl Executor {
                 &triggers,
                 &roles,
                 &functions_snap,
+                &extensions_snap,
                 &security_snap,
             )
             .map_err(|e| ExecError::Runtime(format!("metadata persistence failed: {e}")))?;
@@ -2771,7 +3287,13 @@ impl Executor {
 
     /// Convenience: put data into the blob store.
     pub fn blob_store_put(&self, key: &str, data: &[u8], content_type: Option<&str>) {
-        self.blob_store.write().put(key, data, content_type);
+        let mut store = self.blob_store.write();
+        self.cross_model_before_blob(&store);
+        store.clear_touched();
+        store.put(key, data, content_type);
+        let touched = store.take_touched();
+        drop(store);
+        self.cross_model_after_blob(touched);
     }
 
     /// Convenience: check if a blob exists.
@@ -2791,7 +3313,14 @@ impl Executor {
 
     /// Convenience: delete a blob.
     pub fn blob_store_delete(&self, key: &str) -> bool {
-        self.blob_store.write().delete(key)
+        let mut store = self.blob_store.write();
+        self.cross_model_before_blob(&store);
+        store.clear_touched();
+        let removed = store.delete(key);
+        let touched = store.take_touched();
+        drop(store);
+        self.cross_model_after_blob(touched);
+        removed
     }
 
     /// Get a reference to the datalog store.
@@ -3100,8 +3629,14 @@ impl Executor {
             .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
         let result = {
             let mut gs = self.graph_store.write();
-            execute_cypher(&mut gs, &parsed)
-                .map_err(|e| ExecError::Unsupported(format!("Cypher execution error: {e:?}")))?
+            self.cross_model_before_graph(&gs);
+            gs.clear_touched();
+            let outcome = execute_cypher(&mut gs, &parsed)
+                .map_err(|e| ExecError::Unsupported(format!("Cypher execution error: {e:?}")));
+            let touched = gs.take_touched();
+            drop(gs);
+            self.cross_model_after_graph(touched);
+            outcome?
         };
         // Convert CypherResult columns/rows to SQL types.
         let columns: Vec<(String, DataType)> = result
@@ -3240,6 +3775,21 @@ impl Executor {
     ) -> Option<Result<ExecResult, ExecError>> {
         use crate::wire::kv_fast_path::SqlFastPathCommand;
 
+        // The OLTP fast path bypasses `execute_statement`, so it needs its own
+        // degraded-mode gate; otherwise a read-only server would still accept
+        // single-row INSERT/UPDATE/DELETE.
+        if self.service.is_read_only()
+            && !matches!(cmd, SqlFastPathCommand::PointSelect { .. })
+        {
+            let label = match cmd {
+                SqlFastPathCommand::SimpleInsert { .. } => "INSERT",
+                SqlFastPathCommand::PointUpdate { .. } => "UPDATE",
+                SqlFastPathCommand::PointDelete { .. } => "DELETE",
+                SqlFastPathCommand::PointSelect { .. } => unreachable!(),
+            };
+            return Some(Err(self.service.admit_write(label).unwrap_err()));
+        }
+
         match cmd {
             SqlFastPathCommand::PointSelect {
                 table,
@@ -3365,6 +3915,27 @@ impl Executor {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // The fast path writes new column values WITHOUT constraint
+                // enforcement. Decline (fall back to the full UPDATE path,
+                // which enforces) whenever an assigned column participates in a
+                // PRIMARY KEY / UNIQUE / FOREIGN KEY, or the table has any CHECK
+                // constraint — otherwise UPDATE silently bypassed CHECK and PK
+                // uniqueness (a duplicate PK could be produced by UPDATE).
+                {
+                    let assigned: std::collections::HashSet<&str> =
+                        assignments.iter().map(|(c, _)| c.as_str()).collect();
+                    let touches_keyed = table_def.constraints.iter().any(|c| match c {
+                        crate::catalog::TableConstraint::Check { .. } => true,
+                        crate::catalog::TableConstraint::PrimaryKey { columns, .. }
+                        | crate::catalog::TableConstraint::Unique { columns, .. }
+                        | crate::catalog::TableConstraint::ForeignKey { columns, .. } => {
+                            columns.iter().any(|col| assigned.contains(col.as_str()))
+                        }
+                    });
+                    if touches_keyed {
+                        return None;
+                    }
+                }
                 let pk_idx = table_def.column_index(where_col)?;
                 // Resolve all assignment column indexes upfront. If any column
                 // is not found, fall through to normal path. Each assignment
@@ -3400,18 +3971,19 @@ impl Executor {
                         rows_affected: 0,
                     }));
                 }
-                let updates: Vec<(usize, Vec<Value>)> = matches
+                let updates: Vec<(usize, Vec<Value>, Vec<Value>)> = matches
                     .into_iter()
-                    .map(|(pos, mut row)| {
+                    .map(|(pos, row)| {
+                        let mut new_row = row.clone();
                         for (col_idx, val) in &col_updates {
-                            if *col_idx < row.len() {
-                                row[*col_idx] = val.clone();
+                            if *col_idx < new_row.len() {
+                                new_row[*col_idx] = val.clone();
                             }
                         }
-                        (pos, row)
+                        (pos, row, new_row)
                     })
                     .collect();
-                let count = match storage.update(table, &updates).await {
+                let count = match storage.update_if_unchanged(table, &updates).await {
                     Ok(n) => n,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
@@ -3436,6 +4008,14 @@ impl Executor {
                 if self.rls_active(table) {
                     return None;
                 }
+                // The fast path deletes without enforcing referential
+                // integrity. Decline (fall back to the full DELETE, which runs
+                // enforce_fk_on_parent_mutation) whenever ANOTHER table has a
+                // FOREIGN KEY referencing this one — otherwise a fast-path
+                // DELETE could orphan child rows / bypass ON DELETE actions.
+                if self.table_is_fk_referenced(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce text literal to the column's declared type — see
@@ -3458,8 +4038,7 @@ impl Executor {
                         rows_affected: 0,
                     }));
                 }
-                let positions: Vec<usize> = matches.into_iter().map(|(pos, _)| pos).collect();
-                let count = match storage.delete(table, &positions).await {
+                let count = match storage.delete_if_unchanged(table, &matches).await {
                     Ok(n) => n,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
@@ -3539,7 +4118,9 @@ impl Executor {
                 // 'I' = INSERT, 'W' = WITH, 'B' = BEGIN, 'E' = EXPLAIN/EXECUTE,
                 // 'G' = GRANT, 'T' = TRUNCATE/TABLE, 'L' = LOCK/LISTEN,
                 // 'N' = NOTIFY, 'V' = VALUES/VACUUM, 'P' = PREPARE
-                b'I' | b'W' | b'B' | b'E' | b'G' | b'T' | b'L' | b'N' | b'V' | b'P' => true,
+                b'I' | b'W' | b'E' | b'G' | b'T' | b'L' | b'N' | b'V' | b'P' => true,
+                // 'B' could be BACKUP (extension) or BEGIN (standard)
+                b'B' => !Self::starts_with_ci(trimmed, "BACKUP"),
                 // 'U' could be UNSUBSCRIBE or UPDATE/UNLISTEN — check
                 b'U' => {
                     let second = trimmed
@@ -3624,6 +4205,44 @@ impl Executor {
                 return Ok(vec![self.execute_cache_stats()?]);
             }
             // REFRESH MATERIALIZED VIEW <name> — re-execute the query and update cached rows.
+            // BACKUP DATABASE TO '<path>' [FORCE]
+            //
+            // The pg_basebackup shape: a RUNNING server snapshots itself. The
+            // `nucleus backup` CLI deliberately refuses a live data directory
+            // (an outside process cannot pin WAL retention or observe LSNs, so
+            // it can only produce a torn copy), which left no way to back up a
+            // serving database. This is that way.
+            #[cfg(feature = "server")]
+            if upper.starts_with("BACKUP DATABASE TO ") {
+                let rest = trimmed["BACKUP DATABASE TO ".len()..].trim().trim_end_matches(';');
+                let force = rest.to_uppercase().ends_with(" FORCE");
+                let path_part = if force {
+                    rest[..rest.len() - " FORCE".len()].trim()
+                } else {
+                    rest
+                };
+                let path = path_part.trim_matches('\'').trim_matches('"');
+                if path.is_empty() {
+                    return Err(ExecError::Unsupported(
+                        "BACKUP DATABASE TO requires a destination path".into(),
+                    ));
+                }
+                let manifest = self
+                    .backup_online_to(std::path::Path::new(path), force)
+                    .await?;
+                return Ok(vec![ExecResult::Select {
+                    columns: vec![
+                        ("destination".into(), DataType::Text),
+                        ("consistent_lsn".into(), DataType::Int64),
+                        ("database_id".into(), DataType::Text),
+                    ],
+                    rows: vec![vec![
+                        Value::Text(path.to_string()),
+                        Value::Int64(manifest.consistent_lsn as i64),
+                        Value::Text(manifest.database_id.clone()),
+                    ]],
+                }]);
+            }
             if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
                 self.require_security_admin("refresh materialized views")?;
                 let view_name = trimmed[26..].trim().trim_end_matches(';').to_string();
@@ -3776,7 +4395,7 @@ impl Executor {
     async fn execute_statements_dispatch(
         &self,
         sql: &str,
-        statements: Vec<Statement>,
+        #[cfg_attr(not(feature = "server"), allow(unused_mut))] mut statements: Vec<Statement>,
     ) -> Result<Vec<ExecResult>, ExecError> {
         #[cfg(not(feature = "server"))]
         let _ = sql;
@@ -3842,13 +4461,31 @@ impl Executor {
                     } else {
                         let repl = self.raft_replicator.read().clone();
                         if let Some(replicator) = repl {
-                            if let Err(e) = replicator.propose_and_await(sql).await {
-                                if has_security_ddl {
-                                    return Err(ExecError::Runtime(format!(
-                                        "security catalog replication failed: {e}"
-                                    )));
+                            match replicator.propose_and_await(sql).await {
+                                Ok(replicated) => {
+                                    // Execute exactly what was replicated. The
+                                    // determinism gate may have folded volatile
+                                    // functions into leader-evaluated literals;
+                                    // running the original text here would make
+                                    // the leader disagree with its own followers.
+                                    if replicated != sql {
+                                        statements = self.parse_with_ast_cache(&replicated)?;
+                                    }
                                 }
-                                tracing::warn!("Raft propose failed: {e}");
+                                // A refusal must never fall through to a local
+                                // write: a leader-only write IS the divergence
+                                // the refusal exists to prevent.
+                                Err(crate::distributed::ProposeError::Nondeterministic(e)) => {
+                                    return Err(ExecError::Runtime(e.to_string()));
+                                }
+                                Err(e) => {
+                                    if has_security_ddl {
+                                        return Err(ExecError::Runtime(format!(
+                                            "security catalog replication failed: {e}"
+                                        )));
+                                    }
+                                    tracing::warn!("Raft propose failed: {e}");
+                                }
                             }
                         } else {
                             if has_security_ddl {
@@ -3876,9 +4513,22 @@ impl Executor {
             }
         }
 
+        // A SelectStream may pass through to the wire only for a single-statement
+        // simple-query batch (the pgwire simple protocol streams it row-by-row).
+        // Multi-statement batches materialize each result so two concurrent
+        // producers never race on the session, and every non-wire consumer
+        // (tests, embedded, RESP, binary wire) still materializes because the
+        // producer only emits a stream when the session opted in (stream_results).
+        let single = statements.len() == 1;
         let mut results = Vec::new();
         for stmt in statements {
-            results.push(self.execute_statement(stmt).await?);
+            let r = self.execute_statement(stmt).await?;
+            let r = if single && r.is_stream() {
+                r
+            } else {
+                r.materialize().await?
+            };
+            results.push(r);
         }
         Ok(results)
     }
@@ -3892,7 +4542,10 @@ impl Executor {
         let statements = self.parse_with_ast_cache(sql)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
-            results.push(self.execute_statement(statement).await?);
+            // Materialization boundary (see execute_statements_dispatch): a
+            // replicated result must be materialized, never a lazy stream.
+            let r = self.execute_statement(statement).await?.materialize().await?;
+            results.push(r);
         }
         Ok(results)
     }
@@ -3928,7 +4581,13 @@ impl Executor {
         let statements = self.parse_with_ast_cache(sql)?;
         let mut results = Vec::new();
         for stmt in statements {
-            results.push(self.execute_statement(stmt).await?);
+            // Materialization boundary: the default result path (tests, embedded,
+            // RESP, binary wire, and today's pgwire) receives fully materialized
+            // rows. A streaming producer's SelectStream is collapsed here; only a
+            // future streaming wire path (Phase 4) bypasses this to stream a huge
+            // result to the client without materializing it.
+            let r = self.execute_statement(stmt).await?.materialize().await?;
+            results.push(r);
         }
         Ok(results)
     }
@@ -3938,6 +4597,43 @@ impl Executor {
     // ========================================================================
 
     async fn execute_statement(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
+        // PostgreSQL transaction-error state: once a statement errors inside an
+        // explicit transaction, every subsequent statement is rejected until
+        // the transaction ends (ROLLBACK, or COMMIT which becomes a rollback).
+        // This runs FIRST so an aborted transaction reports 25P02 for every
+        // statement, exactly as PostgreSQL does, rather than being masked by a
+        // read-only refusal that would tell the client the wrong thing.
+        let is_txn_end = matches!(
+            &stmt,
+            Statement::Commit { .. } | Statement::Rollback { .. }
+        );
+        {
+            let session = self.current_session();
+            let tx = session.txn_state.read().await;
+            if tx.active && tx.aborted && !is_txn_end {
+                return Err(ExecError::Runtime(
+                    "current transaction is aborted, commands ignored until end of transaction block"
+                        .into(),
+                ));
+            }
+        }
+        let result = self.execute_statement_inner(stmt).await;
+        if result.is_err() {
+            let session = self.current_session();
+            let mut tx = session.txn_state.write().await;
+            if tx.active {
+                tx.aborted = true;
+            }
+        }
+        result
+    }
+
+    async fn execute_statement_inner(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
+        // Write-admission gate: when the server has degraded to read-only
+        // (disk watermark or operator request), refuse anything that could add
+        // durable state before it touches storage. One relaxed atomic load on
+        // the healthy path.
+        self.admit_statement(&stmt)?;
         self.recompute_session_context(&self.current_session());
         // Track whether this is a DDL statement that modifies the catalog or metadata.
         let is_ddl = matches!(
@@ -3958,6 +4654,8 @@ impl Executor {
                 | Statement::CreateTrigger(_)
                 | Statement::CreatePolicy(_)
                 | Statement::DropPolicy(_)
+                | Statement::CreateExtension(_)
+                | Statement::DropExtension(_)
         );
         let is_policy_ddl = match &stmt {
             Statement::CreatePolicy(_) | Statement::DropPolicy(_) => true,
@@ -4037,6 +4735,47 @@ impl Executor {
 
         let result = match stmt {
             Statement::Query(query) => {
+                // Streaming scan (Phase 1.1, opt-in via SET stream_results = on):
+                // for a bare `SELECT * FROM <base table>` hand back a lazy
+                // SelectStream the pgwire path streams row-by-row. Decided HERE at
+                // the top-level dispatch (never the reentrant execute_query) and
+                // BEFORE the result cache, so nested subqueries never stream and a
+                // streamed query bypasses the materialized cache. Non-wire
+                // consumers collapse it at the materialization boundary.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_scan(&query).await? {
+                    return Ok(stream);
+                }
+
+                // Streaming GROUP BY (opt-in + memory limit + spill): bounded-
+                // memory hash aggregation that partitions the input so a large
+                // GROUP BY completes under a budget where the materialized path
+                // would return MemoryExceeded. Falls through (None) for every
+                // shape it does not handle, and never engages without a limit.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_aggregate(&query).await? {
+                    return Ok(stream);
+                }
+
+                // Streaming DISTINCT (opt-in + memory limit + spill): bounded-
+                // memory dedup that partitions projected rows by strict row hash,
+                // so a large SELECT DISTINCT completes under a budget. Falls
+                // through (None) for every shape it does not handle.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_distinct(&query).await? {
+                    return Ok(stream);
+                }
+
+                // Streaming JOIN (opt-in + memory limit + spill): a bounded-memory
+                // Grace hash join that partitions both sides on the join key so a
+                // large two-table equi-join completes under a budget where the
+                // materialized hash-join build would return MemoryExceeded. Falls
+                // through (None) for every shape it does not handle.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_join(&query).await? {
+                    return Ok(stream);
+                }
+
                 // Query result cache: check for a cached result before executing.
                 // Only cache deterministic SELECT queries (no RANDOM(), NOW(), etc.)
                 // and only outside of transactions.
@@ -4243,6 +4982,8 @@ impl Executor {
                     rows_affected: 0,
                 })
             }
+            Statement::CreateExtension(ext) => self.execute_create_extension(&ext),
+            Statement::DropExtension(ext) => self.execute_drop_extension(&ext),
             Statement::Call(func) => self.execute_call(func).await,
             Statement::Vacuum(ref vacuum_stmt) => self.execute_vacuum(vacuum_stmt).await,
             Statement::Discard { object_type } => self.execute_discard(object_type).await,
@@ -4281,8 +5022,8 @@ impl Executor {
                     String::new()
                 };
                 self.execute_create_trigger(
-                    &ct.name.to_string(),
-                    &ct.table_name.to_string(),
+                    &crate::sql::object_name_key(&ct.name),
+                    &crate::sql::object_name_key(&ct.table_name),
                     timing,
                     events,
                     for_each_row,
@@ -4326,9 +5067,13 @@ impl Executor {
                 ExecResult::Command { rows_affected, .. } => {
                     self.metrics.rows_returned.inc_by(*rows_affected as u64);
                 }
-                ExecResult::CopyOut { row_count, .. } => {
+                ExecResult::CopyOut { row_count, .. }
+                | ExecResult::CopyOutBinary { row_count, .. } => {
                     self.metrics.rows_returned.inc_by(*row_count as u64);
                 }
+                // A streaming result's row count is not known until it drains at
+                // the consumer; it is counted there, not here.
+                ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => {}
             }
         }
 
@@ -4460,6 +5205,51 @@ impl Executor {
         })
     }
 
+    /// Whether the NAMED role holds `privilege` on `table_name`.
+    ///
+    /// `check_privilege` answers for the current session, which is the right
+    /// question on an execution path and the wrong one for
+    /// `has_table_privilege(user, table, privilege)`: that form names the
+    /// principal to test, and answering about the caller instead made it report
+    /// `true` for every table whenever a superuser asked. An introspection
+    /// function that reports on someone other than the subject it was given is
+    /// worse than absent — it is the function an audit would trust.
+    async fn check_privilege_for_role(
+        &self,
+        role_name: &str,
+        table_name: &str,
+        privilege: &str,
+    ) -> bool {
+        let required_priv = match privilege.to_uppercase().as_str() {
+            "SELECT" => Privilege::Select,
+            "INSERT" => Privilege::Insert,
+            "UPDATE" => Privilege::Update,
+            "DELETE" => Privilege::Delete,
+            _ => return false,
+        };
+
+        let roles = self.roles.read().await;
+        let Some(subject) = roles.get(role_name) else {
+            return false;
+        };
+        if subject.is_superuser {
+            return true;
+        }
+
+        // The role itself plus the roles it is a member of — the same set a
+        // session for this principal would carry.
+        let holds = |name: &str| {
+            roles.get(name).is_some_and(|role| {
+                let grants = |privs: &Vec<Privilege>| {
+                    privs.contains(&Privilege::All) || privs.contains(&required_priv)
+                };
+                role.privileges.get(table_name).is_some_and(grants)
+                    || role.privileges.get("*").is_some_and(grants)
+            })
+        };
+        holds(role_name) || subject.member_of.iter().any(|parent| holds(parent))
+    }
+
     fn table_col_meta(&self, table_def: &TableDef) -> Vec<ColMeta> {
         table_def
             .columns
@@ -4480,14 +5270,20 @@ impl Executor {
     ) -> Result<usize, ExecError> {
         if let Some(tbl) = table {
             // Qualified: table.column (case-insensitive table match for
-            // pseudo-tables like EXCLUDED and regular table references)
+            // pseudo-tables like EXCLUDED and regular table references).
+            // A schema-qualified relation keeps its dotted label (e.g. the
+            // virtual "pg_catalog.pg_class"), so the qualifier also matches
+            // the label's final segment — SQLAlchemy writes
+            // pg_catalog.pg_class.relname against exactly that shape.
             col_meta
                 .iter()
                 .position(|c| {
-                    c.table
-                        .as_deref()
-                        .is_some_and(|t| t.eq_ignore_ascii_case(tbl))
-                        && c.name == name
+                    c.table.as_deref().is_some_and(|t| {
+                        t.eq_ignore_ascii_case(tbl)
+                            || t.rsplit('.')
+                                .next()
+                                .is_some_and(|last| last.eq_ignore_ascii_case(tbl))
+                    }) && c.name == name
                 })
                 .ok_or_else(|| ExecError::ColumnNotFound(format!("{tbl}.{name}")))
         } else {
@@ -4620,6 +5416,20 @@ impl Executor {
 
         let query = vector::Vector::new(query_vec.clone());
 
+        // Per-session recall/latency dial, pgvector-compatible spelling:
+        //   SET hnsw.ef_search = 100;   (also accepted: SET hnsw_ef_search = 100)
+        // When set, it overrides the index's configured ef_search for this
+        // query's layer-0 beam width. Clamped so a typo can't wedge a scan.
+        let ef_override: Option<usize> = {
+            let session = self.current_session();
+            let settings = session.settings.read();
+            settings
+                .get("hnsw.ef_search")
+                .or_else(|| settings.get("hnsw_ef_search"))
+                .and_then(|v| v.trim().trim_matches('\'').trim_matches('"').parse::<usize>().ok())
+                .map(|v| v.clamp(1, 65_536))
+        };
+
         let result_ids: Vec<u64> = if let Some(pc) = pk_col {
             // Valid set = PK ids present in the pre-filtered (post-WHERE) rows.
             // The HNSW search returns NODE ids; filter and resolve via the registry.
@@ -4629,15 +5439,20 @@ impl Executor {
                 .collect();
             let reg = &entry.registry;
             match &entry.kind {
-                VectorIndexKind::Hnsw(hnsw) => hnsw
-                    .search_filtered(&query, k, |node| {
+                VectorIndexKind::Hnsw(hnsw) => {
+                    let flt = |node: u64| {
                         reg.node_to_pk
                             .get(&node)
                             .is_some_and(|pk| valid_pks.contains(pk))
-                    })
+                    };
+                    match ef_override {
+                        Some(ef) => hnsw.search_filtered_ef(&query, k, ef, flt),
+                        None => hnsw.search_filtered(&query, k, flt),
+                    }
                     .into_iter()
                     .map(|(node, _)| node)
-                    .collect(),
+                    .collect()
+                }
                 VectorIndexKind::IvfFlat(_) => return None,
             }
         } else {
@@ -4646,15 +5461,22 @@ impl Executor {
             match &entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => {
                     if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
-                        hnsw.search_filtered(&query, k, |id| valid_row_ids.contains(&id))
-                            .into_iter()
-                            .map(|(id, _)| id)
-                            .collect()
+                        let flt = |id: u64| valid_row_ids.contains(&id);
+                        match ef_override {
+                            Some(ef) => hnsw.search_filtered_ef(&query, k, ef, flt),
+                            None => hnsw.search_filtered(&query, k, flt),
+                        }
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
                     } else {
-                        hnsw.search(&query, k)
-                            .into_iter()
-                            .map(|(id, _)| id)
-                            .collect()
+                        match ef_override {
+                            Some(ef) => hnsw.search_ef(&query, k, ef),
+                            None => hnsw.search(&query, k),
+                        }
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
                     }
                 }
                 VectorIndexKind::IvfFlat(ivf) => {
@@ -5359,6 +6181,92 @@ impl Executor {
     }
 
     // ========================================================================
+    // Extensions (CREATE/DROP EXTENSION as catalog-tracked no-ops)
+    // ========================================================================
+
+    /// Extensions whose behavior Nucleus genuinely cannot honor. Accepting these
+    /// silently would be a lie that leads to later runtime failures, so they are
+    /// rejected with a clear message. Everything else is accepted as a no-op:
+    /// Nucleus already provides vector/FTS/crypto/uuid/trigram/etc. natively, and
+    /// unblocking real ORMs/migration tools is the goal.
+    fn extension_is_unsupported(name: &str) -> Option<&'static str> {
+        match name.to_ascii_lowercase().as_str() {
+            // Procedural-language handlers execute foreign code we do not run.
+            "plpython3u" | "plpythonu" | "plperl" | "plperlu" | "plv8" | "plr" | "pltcl"
+            | "pltclu" => Some("procedural-language extensions are not supported: Nucleus does \
+                 not execute PL/Python, PL/Perl, PL/v8, PL/R, or PL/Tcl code"),
+            // Foreign-data / cross-database links reach systems we cannot proxy.
+            "postgres_fdw" | "dblink" | "file_fdw" | "mysql_fdw" | "oracle_fdw" | "tds_fdw" => {
+                Some("foreign-data-wrapper extensions are not supported: Nucleus cannot proxy \
+                 external data sources")
+            }
+            _ => None,
+        }
+    }
+
+    fn execute_create_extension(
+        &self,
+        ext: &ast::CreateExtension,
+    ) -> Result<ExecResult, ExecError> {
+        let name = ext.name.value.clone();
+        if let Some(reason) = Self::extension_is_unsupported(&name) {
+            return Err(ExecError::Unsupported(format!(
+                "CREATE EXTENSION \"{name}\": {reason}"
+            )));
+        }
+        let mut extensions = self.extensions.write();
+        if extensions.contains_key(&name) {
+            if ext.if_not_exists {
+                return Ok(ExecResult::Command {
+                    tag: "CREATE EXTENSION".into(),
+                    rows_affected: 0,
+                });
+            }
+            return Err(ExecError::Unsupported(format!(
+                "extension \"{name}\" already exists"
+            )));
+        }
+        let schema = ext
+            .schema
+            .as_ref()
+            .map(|s| s.value.clone())
+            .unwrap_or_else(|| "public".to_string());
+        let version = ext
+            .version
+            .as_ref()
+            .map(|v| v.value.clone())
+            .unwrap_or_else(|| "1.0".to_string());
+        extensions.insert(
+            name.clone(),
+            ExtensionDef {
+                name,
+                schema,
+                version,
+            },
+        );
+        Ok(ExecResult::Command {
+            tag: "CREATE EXTENSION".into(),
+            rows_affected: 0,
+        })
+    }
+
+    fn execute_drop_extension(&self, ext: &ast::DropExtension) -> Result<ExecResult, ExecError> {
+        let mut extensions = self.extensions.write();
+        for ident in &ext.names {
+            let name = &ident.value;
+            if extensions.remove(name).is_none() && !ext.if_exists {
+                return Err(ExecError::Unsupported(format!(
+                    "extension \"{name}\" does not exist"
+                )));
+            }
+        }
+        Ok(ExecResult::Command {
+            tag: "DROP EXTENSION".into(),
+            rows_affected: 0,
+        })
+    }
+
+    // ========================================================================
     // Virtual tables (information_schema, pg_catalog)
     // ========================================================================
 
@@ -5453,6 +6361,84 @@ impl Executor {
                         name: "udt_name".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "udt_schema".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "character_maximum_length".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "numeric_precision".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "numeric_scale".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "numeric_precision_radix".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datetime_precision".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // Identity/generated-column facets (ORM introspection reads
+                    // them). Nucleus has neither feature: is_generated=NEVER,
+                    // is_identity=NO, every identity_* facet NULL.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "is_generated".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "generation_expression".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "is_identity".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_generation".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_start".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_increment".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_maximum".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_minimum".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_cycle".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for t in &tables {
@@ -5469,6 +6455,40 @@ impl Executor {
                             Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
                             Value::Text(c.data_type.to_string()),
                             Value::Text(datatype_to_udt_name(&c.data_type).into()),
+                            Value::Text("pg_catalog".into()),
+                            Value::Null,
+                            match &c.data_type {
+                                DataType::Int32 => Value::Int32(32),
+                                DataType::Int64 => Value::Int32(64),
+                                DataType::Float64 => Value::Int32(53),
+                                DataType::Numeric => Value::Null,
+                                _ => Value::Null,
+                            },
+                            match &c.data_type {
+                                DataType::Int32 | DataType::Int64 => Value::Int32(0),
+                                _ => Value::Null,
+                            },
+                            match &c.data_type {
+                                DataType::Int32 | DataType::Int64 | DataType::Float64 => {
+                                    Value::Int32(2)
+                                }
+                                DataType::Numeric => Value::Int32(10),
+                                _ => Value::Null,
+                            },
+                            match &c.data_type {
+                                DataType::Timestamp | DataType::TimestampTz => Value::Int32(6),
+                                DataType::Date => Value::Int32(0),
+                                _ => Value::Null,
+                            },
+                            Value::Text("NEVER".into()),
+                            Value::Null,
+                            Value::Text("NO".into()),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Text("NO".into()),
                         ]);
                     }
                 }
@@ -5618,6 +6638,31 @@ impl Executor {
                         name: "datcollate".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datctype".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datlocprovider".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "daticulocale".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "daticurules".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datacl".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let rows = vec![vec![
                     Value::Int32(1),
@@ -5625,6 +6670,11 @@ impl Executor {
                     Value::Int32(10),
                     Value::Int32(6), // UTF8 encoding id
                     Value::Text("en_US.UTF-8".into()),
+                    Value::Text("en_US.UTF-8".into()),
+                    Value::Text("c".into()), // libc locale provider
+                    Value::Null,
+                    Value::Null,
+                    Value::Null, // no ACLs — renders as default privileges
                 ]];
                 Ok(Some((cols, rows)))
             }
@@ -5661,7 +6711,76 @@ impl Executor {
                         name: "typcategory".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typcollation".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // JDBC's getColumns query joins on these: no domain types,
+                    // so typnotnull=false, typbasetype=0, typtypmod=-1.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typnotnull".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typbasetype".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typtypmod".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typelem".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // psycopg's TypeInfo query selects these: no array types
+                    // exposed (typarray=0), default delimiter ','.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typarray".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typdelim".into(),
+                        dtype: DataType::Text,
+                    },
+                    // Input-function name (prisma's describe checks it to
+                    // detect array types via 'array_in'); scalar spelling.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typinput".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
+                let domain_cols = |rows: &mut Vec<Vec<Value>>| {
+                    for row in rows.iter_mut() {
+                        let typname = match &row[1] {
+                            Value::Text(n) => n.clone(),
+                            _ => String::new(),
+                        };
+                        row.extend([
+                            Value::Bool(false),
+                            Value::Int32(0),
+                            Value::Int32(-1),
+                            Value::Int32(0),
+                            Value::Int32(0),
+                            Value::Int32(0),
+                            Value::Text(",".into()),
+                            Value::Text(format!("{typname}in")),
+                        ]);
+                    }
+                };
                 let mut seen = std::collections::HashSet::new();
                 let mut rows = Vec::new();
                 for t in &tables {
@@ -5676,6 +6795,8 @@ impl Executor {
                                 Value::Int32(typlen),
                                 Value::Text(typtype.into()),
                                 Value::Text(typcategory.into()),
+                                // No collation support: 0 = not collatable.
+                                Value::Int32(0),
                             ]);
                         }
                     }
@@ -5689,9 +6810,11 @@ impl Executor {
                             Value::Int32(*len),
                             Value::Text((*tt).into()),
                             Value::Text((*cat).into()),
+                            Value::Int32(0),
                         ]);
                     }
                 }
+                domain_cols(&mut rows);
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_class" | "pg_class" => {
@@ -5723,16 +6846,124 @@ impl Executor {
                         name: "reltuples".into(),
                         dtype: DataType::Float64,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relowner".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relam".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // Detail columns psql's \d <relation> selects. Constant for
+                    // Nucleus (no TOAST/rules/partitions/tablespaces) except
+                    // relhasindex/relrowsecurity, which are computed truthfully.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relchecks".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhasindex".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhasrules".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhastriggers".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relrowsecurity".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relforcerowsecurity".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relispartition".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reltablespace".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reloftype".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relpersistence".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relreplident".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reltoastrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // Prisma's schema engine selects these two: no table
+                    // inheritance and no storage options exist, so false/NULL.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhassubclass".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reloptions".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
+                let rls_tables: std::collections::HashSet<String> = {
+                    let sec = self.security.read();
+                    sec.rls.enabled_tables().into_iter().collect()
+                };
                 let mut rows = Vec::new();
                 for (i, t) in tables.iter().enumerate() {
                     let oid = 16384 + i as i32;
+                    let has_index = indexes.iter().any(|ix| ix.table_name == t.name);
+                    let rls_on = rls_tables.contains(&t.name);
                     rows.push(vec![
                         Value::Int32(oid),
                         Value::Text(t.name.clone()),
                         Value::Int32(2200),
                         Value::Text("r".into()),
                         Value::Float64(-1.0),
+                        Value::Int32(10),
+                        // Tables use the default (heap) access method.
+                        Value::Int32(2),
+                        Value::Int32(0),
+                        Value::Bool(has_index),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(rls_on),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Int32(0),
+                        Value::Int32(0),
+                        Value::Text("p".into()),
+                        Value::Text("d".into()),
+                        Value::Int32(0),
+                        Value::Bool(false),
+                        Value::Null,
                     ]);
                 }
                 for (i, idx) in indexes.iter().enumerate() {
@@ -5743,8 +6974,53 @@ impl Executor {
                         Value::Int32(2200),
                         Value::Text("i".into()),
                         Value::Float64(0.0),
+                        Value::Int32(10),
+                        Value::Int32(403),
+                        Value::Int32(0),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Int32(0),
+                        Value::Int32(0),
+                        Value::Text("p".into()),
+                        Value::Text("n".into()),
+                        Value::Int32(0),
+                        Value::Bool(false),
+                        Value::Null,
                     ]);
                 }
+                Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_am" | "pg_am" => {
+                // Access methods — psql's \dt joins this (c.relam = am.oid).
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "amname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "amtype".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                let rows = vec![
+                    vec![Value::Int32(2), Value::Text("heap".into()), Value::Text("t".into())],
+                    vec![Value::Int32(403), Value::Text("btree".into()), Value::Text("i".into())],
+                    vec![Value::Int32(405), Value::Text("hash".into()), Value::Text("i".into())],
+                    vec![Value::Int32(783), Value::Text("gist".into()), Value::Text("i".into())],
+                    vec![Value::Int32(2742), Value::Text("gin".into()), Value::Text("i".into())],
+                    vec![Value::Int32(3580), Value::Text("brin".into()), Value::Text("i".into())],
+                ];
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_namespace" | "pg_namespace" => {
@@ -5759,16 +7035,116 @@ impl Executor {
                         name: "nspname".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "nspowner".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let rows = vec![
-                    vec![Value::Int32(11), Value::Text("pg_catalog".into())],
-                    vec![Value::Int32(2200), Value::Text("public".into())],
+                    vec![
+                        Value::Int32(11),
+                        Value::Text("pg_catalog".into()),
+                        Value::Int32(10),
+                    ],
+                    vec![
+                        Value::Int32(2200),
+                        Value::Text("public".into()),
+                        Value::Int32(10),
+                    ],
                     vec![
                         Value::Int32(13100),
                         Value::Text("information_schema".into()),
+                        Value::Int32(10),
                     ],
                 ];
                 Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_extension" | "pg_extension" => {
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extowner".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extnamespace".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extrelocatable".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extversion".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                let mut entries: Vec<(String, String)> = {
+                    let exts = self.extensions.read();
+                    exts.values()
+                        .map(|e| (e.name.clone(), e.version.clone()))
+                        .collect()
+                };
+                entries.sort();
+                let rows: Vec<Row> = entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (name, version))| {
+                        // Deterministic synthetic OID above the reserved range.
+                        vec![
+                            Value::Int32(16384 + i as i32),
+                            Value::Text(name),
+                            Value::Int32(10),
+                            Value::Int32(2200),
+                            Value::Bool(true),
+                            Value::Text(version),
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_description" | "pg_description" => {
+                // Object comments. Nucleus has no COMMENT ON yet, so the
+                // catalog exists (psql's \dx, \d+ etc. LEFT JOIN it) but is
+                // empty — every description renders as NULL, which is exactly
+                // how an uncommented object renders in Postgres.
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "objoid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "classoid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "objsubid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "description".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                Ok(Some((cols, Vec::new())))
             }
             "pg_catalog.pg_proc" | "pg_proc" => {
                 let functions = self.functions.read();
@@ -5808,6 +7184,11 @@ impl Executor {
                         name: "prosrc".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "prolang".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (i, (fname, fdef)) in functions.iter().enumerate() {
@@ -5837,8 +7218,28 @@ impl Executor {
                         Value::Int32(pronargs),
                         Value::Text(proargtypes),
                         Value::Text(fdef.body.clone()),
+                        // All user functions are SQL-language (OID 14).
+                        Value::Int32(14),
                     ]);
                 }
+                Ok(Some((cols, rows)))
+            }
+            // pg_language: the three built-in languages. User functions are
+            // SQL-language, so prolang joins resolve to 'sql'.
+            "pg_catalog.pg_language" | "pg_language" => {
+                let cols = [("oid", DataType::Int32), ("lanname", DataType::Text)]
+                    .into_iter()
+                    .map(|(n, dt)| ColMeta {
+                        table: Some(label.into()),
+                        name: n.into(),
+                        dtype: dt,
+                    })
+                    .collect();
+                let rows = vec![
+                    vec![Value::Int32(12), Value::Text("internal".into())],
+                    vec![Value::Int32(13), Value::Text("c".into())],
+                    vec![Value::Int32(14), Value::Text("sql".into())],
+                ];
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_roles" | "pg_roles" => {
@@ -5879,6 +7280,26 @@ impl Executor {
                         name: "rolcanlogin".into(),
                         dtype: DataType::Bool,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolconnlimit".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolvaliduntil".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolreplication".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolbypassrls".into(),
+                        dtype: DataType::Bool,
+                    },
                 ];
                 let rows: Vec<Row> = roles
                     .values()
@@ -5892,6 +7313,386 @@ impl Executor {
                             Value::Bool(r.is_superuser),
                             Value::Bool(r.is_superuser),
                             Value::Bool(r.can_login),
+                            // No per-role connection limits: -1 = unlimited.
+                            Value::Int32(-1),
+                            Value::Null,
+                            Value::Bool(false),
+                            Value::Bool(r.is_superuser),
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            // pg_sequence (raw catalog, singular): SQLAlchemy's reflection
+            // joins it for identity/serial detection. Sequences back SERIAL
+            // columns internally but aren't exposed as catalog objects — empty.
+            "pg_catalog.pg_sequence" | "pg_sequence" => {
+                let names = [
+                    ("seqrelid", DataType::Int32),
+                    ("seqtypid", DataType::Int32),
+                    ("seqstart", DataType::Int64),
+                    ("seqincrement", DataType::Int64),
+                    ("seqmax", DataType::Int64),
+                    ("seqmin", DataType::Int64),
+                    ("seqcache", DataType::Int64),
+                    ("seqcycle", DataType::Bool),
+                ];
+                let cols = names
+                    .iter()
+                    .map(|(n, t)| ColMeta {
+                        table: Some(label.into()),
+                        name: (*n).into(),
+                        dtype: t.clone(),
+                    })
+                    .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_sequences: sequence inventory view (drizzle-kit/SQLAlchemy pull
+            // it during introspection). Nucleus has no sequence objects, so the
+            // truthful answer is the empty set — NOT an error.
+            "pg_catalog.pg_sequences" | "pg_sequences" => {
+                let names = [
+                    ("schemaname", DataType::Text),
+                    ("sequencename", DataType::Text),
+                    ("sequenceowner", DataType::Text),
+                    ("data_type", DataType::Text),
+                    ("start_value", DataType::Int64),
+                    ("min_value", DataType::Int64),
+                    ("max_value", DataType::Int64),
+                    ("increment_by", DataType::Int64),
+                    ("cycle", DataType::Bool),
+                    ("cache_size", DataType::Int64),
+                    ("last_value", DataType::Int64),
+                ];
+                let cols = names
+                    .iter()
+                    .map(|(n, t)| ColMeta {
+                        table: Some(label.into()),
+                        name: (*n).into(),
+                        dtype: t.clone(),
+                    })
+                    .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_enum: enum-label catalog. CREATE TYPE ... AS ENUM values live in
+            // the type catalog, not a pg_enum-shaped store; ORM introspection
+            // (drizzle-kit) only needs the relation to resolve on a fresh DB.
+            "pg_catalog.pg_enum" | "pg_enum" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("enumtypid", DataType::Int32),
+                    ("enumsortorder", DataType::Float64),
+                    ("enumlabel", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_opclass: operator classes — Nucleus indexes have no opclass
+            // concept; empty so index-introspection joins resolve.
+            "pg_catalog.pg_opclass" | "pg_opclass" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("opcmethod", DataType::Int32),
+                    ("opcname", DataType::Text),
+                    ("opcnamespace", DataType::Int32),
+                    ("opcdefault", DataType::Bool),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_views: view inventory. Nucleus views live in the view
+            // registry; surface names so introspection sees them (definition
+            // SQL is not stored in catalog form — NULL).
+            "pg_catalog.pg_views" | "pg_views" => {
+                let cols = [
+                    ("schemaname", DataType::Text),
+                    ("viewname", DataType::Text),
+                    ("viewowner", DataType::Text),
+                    ("definition", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let views = self.views.read().await;
+                let rows: Vec<Row> = views
+                    .keys()
+                    .map(|name| {
+                        vec![
+                            Value::Text("public".into()),
+                            Value::Text(name.clone()),
+                            Value::Text("nucleus".into()),
+                            Value::Null,
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            // pg_matviews: materialized-view inventory — Nucleus has none.
+            "pg_catalog.pg_matviews" | "pg_matviews" => {
+                let cols = [
+                    ("schemaname", DataType::Text),
+                    ("matviewname", DataType::Text),
+                    ("matviewowner", DataType::Text),
+                    ("hasindexes", DataType::Bool),
+                    ("ispopulated", DataType::Bool),
+                    ("definition", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_policies: human-readable RLS view (pg_policy is the raw
+            // catalog). Populated from the live RLS engine like pg_policy;
+            // qual/with_check render NULL for the same reason as polqual.
+            "pg_catalog.pg_policies" | "pg_policies" => {
+                let cols = [
+                    ("schemaname", DataType::Text),
+                    ("tablename", DataType::Text),
+                    ("policyname", DataType::Text),
+                    ("permissive", DataType::Text),
+                    ("roles", DataType::Text),
+                    ("cmd", DataType::Text),
+                    ("qual", DataType::Text),
+                    ("with_check", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let sec = self.security.read();
+                let rows: Vec<Row> = sec
+                    .rls
+                    .all_policies()
+                    .iter()
+                    .map(|p| {
+                        let cmd = match p.command {
+                            crate::security::PolicyCommand::Select => "SELECT",
+                            crate::security::PolicyCommand::Insert => "INSERT",
+                            crate::security::PolicyCommand::Update => "UPDATE",
+                            crate::security::PolicyCommand::Delete => "DELETE",
+                            crate::security::PolicyCommand::All => "ALL",
+                        };
+                        vec![
+                            Value::Text("public".into()),
+                            Value::Text(p.table.clone()),
+                            Value::Text(p.name.clone()),
+                            Value::Text("PERMISSIVE".into()),
+                            Value::Text("{public}".into()),
+                            Value::Text(cmd.into()),
+                            Value::Null,
+                            Value::Null,
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            // information_schema constraint views: synthesized from table
+            // metadata. PRIMARY KEY only — Nucleus's FK/unique enforcement
+            // lives in table metadata without named constraint objects, and a
+            // fresh-DB ORM pull only needs PKs to round-trip.
+            "information_schema.table_constraints" => {
+                let tables = self.catalog.list_tables().await;
+                let cols = [
+                    ("constraint_catalog", DataType::Text),
+                    ("constraint_schema", DataType::Text),
+                    ("constraint_name", DataType::Text),
+                    ("table_catalog", DataType::Text),
+                    ("table_schema", DataType::Text),
+                    ("table_name", DataType::Text),
+                    ("constraint_type", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let rows: Vec<Row> = tables
+                    .iter()
+                    .filter(|t| t.primary_key_columns().is_some_and(|pk| !pk.is_empty()))
+                    .map(|t| {
+                        vec![
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(format!("{}_pkey", t.name)),
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(t.name.clone()),
+                            Value::Text("PRIMARY KEY".into()),
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            "information_schema.key_column_usage" | "information_schema.constraint_column_usage" => {
+                let tables = self.catalog.list_tables().await;
+                let cols = [
+                    ("constraint_catalog", DataType::Text),
+                    ("constraint_schema", DataType::Text),
+                    ("constraint_name", DataType::Text),
+                    ("table_catalog", DataType::Text),
+                    ("table_schema", DataType::Text),
+                    ("table_name", DataType::Text),
+                    ("column_name", DataType::Text),
+                    ("ordinal_position", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let mut rows = Vec::new();
+                for t in &tables {
+                    let Some(pk_cols) = t.primary_key_columns() else {
+                        continue;
+                    };
+                    for (i, pk_col) in pk_cols.iter().enumerate() {
+                        rows.push(vec![
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(format!("{}_pkey", t.name)),
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(t.name.clone()),
+                            Value::Text(pk_col.clone()),
+                            Value::Int32((i + 1) as i32),
+                        ]);
+                    }
+                }
+                Ok(Some((cols, rows)))
+            }
+            "information_schema.sequences" => {
+                // No sequence objects — empty, mirroring pg_sequences.
+                let cols = [
+                    ("sequence_catalog", DataType::Text),
+                    ("sequence_schema", DataType::Text),
+                    ("sequence_name", DataType::Text),
+                    ("data_type", DataType::Text),
+                    ("start_value", DataType::Text),
+                    ("minimum_value", DataType::Text),
+                    ("maximum_value", DataType::Text),
+                    ("increment", DataType::Text),
+                    ("cycle_option", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "information_schema.views" => {
+                let cols = [
+                    ("table_catalog", DataType::Text),
+                    ("table_schema", DataType::Text),
+                    ("table_name", DataType::Text),
+                    ("view_definition", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_user is the legacy login-role view (drizzle-kit joins it on
+            // usesysid = nspowner during schema pull). Same source as pg_roles;
+            // usesysid mirrors pg_roles.oid so cross-catalog joins line up.
+            "pg_catalog.pg_user" | "pg_user" => {
+                let roles = self.roles.read().await;
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usename".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usesysid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usecreatedb".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usesuper".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "userepl".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usebypassrls".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "passwd".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "valuntil".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "useconfig".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                let rows: Vec<Row> = roles
+                    .values()
+                    .enumerate()
+                    .filter(|(_, r)| r.can_login)
+                    .map(|(i, r)| {
+                        vec![
+                            Value::Text(r.name.clone()),
+                            Value::Int32(10 + i as i32),
+                            Value::Bool(r.is_superuser),
+                            Value::Bool(r.is_superuser),
+                            Value::Bool(false),
+                            Value::Bool(r.is_superuser),
+                            Value::Text("********".into()),
+                            Value::Null,
+                            Value::Null,
                         ]
                     })
                     .collect();
@@ -5925,22 +7726,322 @@ impl Executor {
                         name: "attnotnull".into(),
                         dtype: DataType::Bool,
                     },
+                    // Columns psql's \d <relation> selects. Nucleus has no
+                    // typmods, defaults-in-catalog, per-column collations,
+                    // identity/generated columns, or dropped-column slots.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "atttypmod".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "atthasdef".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attcollation".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attidentity".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attgenerated".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attisdropped".into(),
+                        dtype: DataType::Bool,
+                    },
+                    // Array dimensionality (drizzle-kit selects it) — Nucleus
+                    // arrays don't track declared dims; 0 matches "not an
+                    // array" for every scalar column.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attndims".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // Fixed byte width of the column's type (JDBC getColumns).
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attlen".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (ti, t) in tables.iter().enumerate() {
                     let rel_oid = 16384 + ti as i32;
                     for (ci, c) in t.columns.iter().enumerate() {
-                        let (type_oid, _, _, _) = pg_type_info(&c.data_type);
+                        let (type_oid, typlen, _, _) = pg_type_info(&c.data_type);
                         rows.push(vec![
                             Value::Int32(rel_oid),
                             Value::Text(c.name.clone()),
                             Value::Int32(type_oid),
                             Value::Int32((ci + 1) as i32),
                             Value::Bool(!c.nullable),
+                            Value::Int32(match &c.data_type {
+                                // Encode vector dimension the way pgvector does
+                                // (typmod = dim), so format_type can render it.
+                                DataType::Vector(d) => *d as i32,
+                                _ => -1,
+                            }),
+                            Value::Bool(false),
+                            Value::Int32(0),
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                            Value::Bool(false),
+                            Value::Int32(0),
+                            Value::Int32(typlen),
                         ]);
                     }
                 }
                 Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_depend" | "pg_depend" => {
+                // Object dependencies. Nucleus tracks none of the dependency
+                // classes clients inspect (extension membership etc.) — an
+                // empty relation lets pgcli's completion query run.
+                let cols = [
+                    ("classid", DataType::Int32),
+                    ("objid", DataType::Int32),
+                    ("objsubid", DataType::Int32),
+                    ("refclassid", DataType::Int32),
+                    ("refobjid", DataType::Int32),
+                    ("refobjsubid", DataType::Int32),
+                    ("deptype", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_attrdef" | "pg_attrdef" => {
+                // Column defaults. Nucleus stores defaults in table metadata,
+                // not a separate catalog — empty relation so \d's scalar
+                // subquery resolves (atthasdef=false keeps it unreached).
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "adrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "adnum".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "adbin".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_policy" | "pg_policy" => {
+                // Row-level-security policies, populated from the live RLS
+                // engine so \d on a policied table lists its policies. polqual
+                // renders NULL (predicates aren't stored as node trees) and
+                // polroles is always "{0}" (= all roles) — psql's role-name
+                // resolution path uses array machinery Nucleus doesn't have.
+                let tables = self.catalog.list_tables().await;
+                let table_oid: HashMap<String, i32> = tables
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (t.name.clone(), 16384 + i as i32))
+                    .collect();
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("polname", DataType::Text),
+                    ("polrelid", DataType::Int32),
+                    ("polcmd", DataType::Text),
+                    ("polpermissive", DataType::Bool),
+                    ("polroles", DataType::Text),
+                    ("polqual", DataType::Text),
+                    ("polwithcheck", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let sec = self.security.read();
+                let rows: Vec<Row> = sec
+                    .rls
+                    .all_policies()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let cmd = match p.command {
+                            crate::security::PolicyCommand::Select => "r",
+                            crate::security::PolicyCommand::Insert => "a",
+                            crate::security::PolicyCommand::Update => "w",
+                            crate::security::PolicyCommand::Delete => "d",
+                            crate::security::PolicyCommand::All => "*",
+                        };
+                        vec![
+                            Value::Int32(16000 + i as i32),
+                            Value::Text(p.name.clone()),
+                            Value::Int32(table_oid.get(&p.table).copied().unwrap_or(0)),
+                            Value::Text(cmd.into()),
+                            Value::Bool(true),
+                            Value::Text("{0}".into()),
+                            Value::Null,
+                            Value::Null,
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_statistic_ext" | "pg_statistic_ext" => {
+                // Extended statistics — Nucleus has none; empty relation so
+                // \d's stats query resolves and returns nothing.
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("stxrelid", DataType::Int32),
+                    ("stxname", DataType::Text),
+                    ("stxnamespace", DataType::Int32),
+                    ("stxkeys", DataType::Text),
+                    ("stxkind", DataType::Text),
+                    ("stxstattarget", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_publication" | "pg_publication" => {
+                // Logical-replication publications — none; empty so \d's
+                // publication listing resolves.
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("pubname", DataType::Text),
+                    ("puballtables", DataType::Bool),
+                    ("pubinsert", DataType::Bool),
+                    ("pubupdate", DataType::Bool),
+                    ("pubdelete", DataType::Bool),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_publication_rel" | "pg_publication_rel" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("prpubid", DataType::Int32),
+                    ("prrelid", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_publication_namespace" | "pg_publication_namespace" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("pnpubid", DataType::Int32),
+                    ("pnnspid", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_inherits" | "pg_inherits" => {
+                // Table inheritance / partition parentage — none; empty so
+                // \d's child/parent listing resolves.
+                let cols = [
+                    ("inhrelid", DataType::Int32),
+                    ("inhparent", DataType::Int32),
+                    ("inhseqno", DataType::Int32),
+                    ("inhdetachpending", DataType::Bool),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_constraint" | "pg_constraint" => {
+                // Constraints. Nucleus enforces PK/NOT NULL through table
+                // metadata, not a constraint catalog — empty relation so \d's
+                // LEFT JOIN resolves (index lines render without con* rows).
+                let names = [
+                    ("oid", DataType::Int32),
+                    ("conname", DataType::Text),
+                    ("connamespace", DataType::Int32),
+                    ("conrelid", DataType::Int32),
+                    ("contypid", DataType::Int32),
+                    ("conindid", DataType::Int32),
+                    ("confrelid", DataType::Int32),
+                    ("contype", DataType::Text),
+                    ("condeferrable", DataType::Bool),
+                    ("condeferred", DataType::Bool),
+                    ("convalidated", DataType::Bool),
+                    ("conkey", DataType::Text),
+                    ("confkey", DataType::Text),
+                    ("confupdtype", DataType::Text),
+                    ("confdeltype", DataType::Text),
+                    ("confmatchtype", DataType::Text),
+                ];
+                let cols = names
+                    .into_iter()
+                    .map(|(n, dt)| ColMeta {
+                        table: Some(label.into()),
+                        name: n.into(),
+                        dtype: dt,
+                    })
+                    .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_collation" | "pg_collation" => {
+                // Collations. Nucleus compares text bytewise; no per-column
+                // collations exist, so the catalog is empty.
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "collname".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                Ok(Some((cols, Vec::new())))
             }
             "pg_catalog.pg_index" | "pg_index" => {
                 let tables = self.catalog.list_tables().await;
@@ -5970,6 +8071,49 @@ impl Executor {
                         table: Some(label.into()),
                         name: "indkey".into(),
                         dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisclustered".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisvalid".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisreplident".into(),
+                        dtype: DataType::Bool,
+                    },
+                    // Index-reflection columns (SQLAlchemy autoload): per-key
+                    // option flags (all 0 — ASC NULLS LAST), key-column count,
+                    // no expression indexes, no partial-index predicates.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indoption".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indnkeyatts".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indexprs".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indpred".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indnullsnotdistinct".into(),
+                        dtype: DataType::Bool,
                     },
                 ];
                 let table_oid_map: HashMap<String, i32> = tables
@@ -6002,12 +8146,21 @@ impl Executor {
                         .find(|t| t.name == idx.table_name)
                         .and_then(|t| t.primary_key_columns())
                         .is_some_and(|pk_cols| pk_cols == idx.columns.as_slice());
+                    let ncols = idx.columns.len();
                     rows.push(vec![
                         Value::Int32(index_oid),
                         Value::Int32(table_oid),
                         Value::Bool(idx.unique),
                         Value::Bool(is_primary),
                         Value::Text(indkey),
+                        Value::Bool(false),
+                        Value::Bool(true),
+                        Value::Bool(false),
+                        Value::Text(vec!["0"; ncols].join(" ")),
+                        Value::Int32(ncols as i32),
+                        Value::Null,
+                        Value::Null,
+                        Value::Bool(false),
                     ]);
                 }
                 Ok(Some((cols, rows)))
@@ -6384,6 +8537,16 @@ pub enum ExecError {
     Runtime(String),
     #[error("memory limit exceeded: {0}")]
     MemoryExceeded(String),
+    /// The server refused a write because a disk watermark was crossed
+    /// (SQLSTATE `53100`). Distinct from [`ExecError::ReadOnly`] so operators
+    /// and clients can tell "free space and retry" apart from "someone put
+    /// this server in read-only mode".
+    #[error("disk space exhausted: {0}")]
+    DiskFull(String),
+    /// The server refused a write because it is in read-only mode for a
+    /// non-disk reason (SQLSTATE `25006`).
+    #[error("read-only mode: {0}")]
+    ReadOnly(String),
 }
 
 #[cfg(all(test, feature = "server"))]

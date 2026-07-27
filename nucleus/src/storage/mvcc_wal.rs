@@ -98,6 +98,16 @@ pub struct MvccWal {
     writer: Mutex<BufWriter<File>>,
 }
 
+/// Write one length-prefixed, CRC-suffixed record onto any writer. Shares the
+/// exact framing `MvccWal::log` uses so a staged file replays identically.
+fn write_framed<W: Write>(w: &mut W, record: &MvccWalRecord) -> io::Result<()> {
+    let payload = encode_record(record);
+    let crc = crc32c(&payload);
+    w.write_all(&(payload.len() as u32).to_le_bytes())?;
+    w.write_all(&payload)?;
+    w.write_all(&crc.to_le_bytes())
+}
+
 impl MvccWal {
     /// Open or create the WAL file.  Returns (wal, recovered_state).
     pub fn open(dir: &Path) -> io::Result<(Self, MvccWalState)> {
@@ -110,6 +120,10 @@ impl MvccWal {
         } else {
             MvccWalState::default()
         };
+        // A `.wal.compacting` file is a staged baseline from a compaction that
+        // crashed before its atomic rename. It was never authoritative, so
+        // discard it rather than leaving it to confuse a later compaction.
+        let _ = std::fs::remove_file(path.with_extension("wal.compacting"));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
@@ -126,23 +140,34 @@ impl MvccWal {
         let crc = crc32c(&payload);
         let len = payload.len() as u32;
         let mut w = self.writer.lock();
+        crate::storage::crashpoint::io_fault_check!("wal.append");
+        crate::storage::crashpoint::reach("wal.before_append");
         w.write_all(&len.to_le_bytes())?;
         w.write_all(&payload)?;
         w.write_all(&crc.to_le_bytes())?;
-        w.flush()
+        let r = w.flush();
+        crate::storage::crashpoint::reach("wal.after_append");
+        r
     }
 
     /// Fsync the WAL file to ensure durability.
     pub fn sync(&self) -> io::Result<()> {
         let mut w = self.writer.lock();
         w.flush()?;
-        w.get_ref().sync_all()
+        crate::storage::crashpoint::io_fault_check!("wal.fsync");
+        crate::storage::crashpoint::reach("wal.before_fsync");
+        let r = w.get_ref().sync_all();
+        crate::storage::crashpoint::reach("wal.after_fsync");
+        r
     }
 
     /// Log a COMMIT and immediately fsync.
     pub fn log_commit(&self, txn_id: u64) -> io::Result<()> {
+        crate::storage::crashpoint::reach("wal.before_commit_record");
         self.log(&MvccWalRecord::Commit { txn_id })?;
-        self.sync()
+        let r = self.sync();
+        crate::storage::crashpoint::reach("wal.after_commit_record");
+        r
     }
 
     /// Truncate the WAL (after a full snapshot has been written).
@@ -173,22 +198,72 @@ impl MvccWal {
     /// engine from the SAME `state` in the same per-table row order, so the
     /// engine's assigned version indices match these baseline records exactly.
     pub fn compact(&self, state: &MvccWalState) -> io::Result<()> {
-        self.truncate()?;
-        for (name, tbl) in &state.tables {
-            self.log(&MvccWalRecord::CreateTable {
-                name: name.clone(),
-                columns: tbl.columns.clone(),
-            })?;
-            for (i, row) in tbl.rows.iter().enumerate() {
-                self.log(&MvccWalRecord::Insert {
-                    table: name.clone(),
-                    txn_id: 0,
-                    version_idx: i as u32,
-                    row: row.clone(),
-                })?;
+        // CRASH SAFETY: stage the new baseline in a temp file, fsync it, then
+        // swap it in with an atomic rename.
+        //
+        // The previous implementation truncated the LIVE WAL in place and then
+        // rewrote it. A crash in that window destroyed the only durable copy:
+        // the deterministic crash matrix caught it losing all 40 fsynced rows
+        // at `checkpoint.mid_rewrite`. Because compaction runs on EVERY reopen
+        // of a populated database, that made a power loss during startup a
+        // total-data-loss event for a database that had been fully fsynced.
+        //
+        // With stage-and-rename, a crash at any instant leaves either the old
+        // complete WAL or the new complete one, never a truncated file.
+        crate::storage::crashpoint::reach("checkpoint.before");
+        let tmp_path = self.path.with_extension("wal.compacting");
+        {
+            let tmp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut w = BufWriter::new(tmp);
+            for (name, tbl) in &state.tables {
+                write_framed(
+                    &mut w,
+                    &MvccWalRecord::CreateTable {
+                        name: name.clone(),
+                        columns: tbl.columns.clone(),
+                    },
+                )?;
+                for (i, row) in tbl.rows.iter().enumerate() {
+                    write_framed(
+                        &mut w,
+                        &MvccWalRecord::Insert {
+                            table: name.clone(),
+                            txn_id: 0,
+                            version_idx: i as u32,
+                            row: row.clone(),
+                        },
+                    )?;
+                }
             }
+            w.flush()?;
+            // Dying here must be survivable: the live WAL is still intact and
+            // the temp file is garbage that open() discards.
+            crate::storage::crashpoint::reach("checkpoint.mid_rewrite");
+            w.get_ref().sync_all()?;
         }
-        self.sync()
+
+        let mut guard = self.writer.lock();
+        guard.flush()?;
+        std::fs::rename(&tmp_path, &self.path)?;
+        // Fsync the directory so the rename itself survives a crash; without
+        // this the swap can be lost even though both files were fsynced.
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        *guard = BufWriter::new(file);
+        drop(guard);
+        crate::storage::crashpoint::reach("checkpoint.after");
+        Ok(())
     }
 }
 
@@ -220,7 +295,7 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
             write_u32(&mut buf, *version_idx);
-            write_row(&mut buf, row);
+            crate::storage::value_codec::write_row(&mut buf, row);
         }
         MvccWalRecord::Delete {
             table,
@@ -244,7 +319,7 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             write_u64(&mut buf, *txn_id);
             write_u32(&mut buf, *old_version_idx);
             write_u32(&mut buf, *new_version_idx);
-            write_row(&mut buf, new_row);
+            crate::storage::value_codec::write_row(&mut buf, new_row);
         }
         MvccWalRecord::Begin { txn_id } => {
             buf.push(TAG_BEGIN);
@@ -263,243 +338,6 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
         }
     }
     buf
-}
-
-// ── Value encoding ───────────────────────────────────────────────────────────
-
-const VAL_NULL: u8 = 0;
-const VAL_BOOL: u8 = 1;
-const VAL_INT32: u8 = 2;
-const VAL_INT64: u8 = 3;
-const VAL_FLOAT64: u8 = 4;
-const VAL_TEXT: u8 = 5;
-const VAL_BYTEA: u8 = 6;
-const VAL_DATE: u8 = 7;
-const VAL_TIMESTAMP: u8 = 8;
-const VAL_TIMESTAMPTZ: u8 = 9;
-const VAL_NUMERIC: u8 = 10;
-const VAL_UUID: u8 = 11;
-const VAL_JSONB: u8 = 12;
-const VAL_VECTOR: u8 = 13;
-const VAL_INTERVAL: u8 = 14;
-const VAL_ARRAY: u8 = 15;
-
-fn write_value(buf: &mut Vec<u8>, val: &Value) {
-    match val {
-        Value::Null => buf.push(VAL_NULL),
-        Value::Bool(b) => {
-            buf.push(VAL_BOOL);
-            buf.push(if *b { 1 } else { 0 });
-        }
-        Value::Int32(n) => {
-            buf.push(VAL_INT32);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        Value::Int64(n) => {
-            buf.push(VAL_INT64);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        Value::Float64(f) => {
-            buf.push(VAL_FLOAT64);
-            buf.extend_from_slice(&f.to_le_bytes());
-        }
-        Value::Text(s) => {
-            buf.push(VAL_TEXT);
-            write_str(buf, s);
-        }
-        Value::Bytea(b) => {
-            buf.push(VAL_BYTEA);
-            write_u32(buf, b.len() as u32);
-            buf.extend_from_slice(b);
-        }
-        Value::Date(d) => {
-            buf.push(VAL_DATE);
-            buf.extend_from_slice(&d.to_le_bytes());
-        }
-        Value::Timestamp(t) => {
-            buf.push(VAL_TIMESTAMP);
-            buf.extend_from_slice(&t.to_le_bytes());
-        }
-        Value::TimestampTz(t) => {
-            buf.push(VAL_TIMESTAMPTZ);
-            buf.extend_from_slice(&t.to_le_bytes());
-        }
-        Value::Numeric(s) => {
-            buf.push(VAL_NUMERIC);
-            write_str(buf, s);
-        }
-        Value::Uuid(bytes) => {
-            buf.push(VAL_UUID);
-            buf.extend_from_slice(bytes);
-        }
-        Value::Jsonb(j) => {
-            buf.push(VAL_JSONB);
-            write_str(buf, &j.to_string());
-        }
-        Value::Vector(v) => {
-            buf.push(VAL_VECTOR);
-            write_u32(buf, v.len() as u32);
-            for f in v {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        Value::Interval {
-            months,
-            days,
-            microseconds,
-        } => {
-            buf.push(VAL_INTERVAL);
-            buf.extend_from_slice(&months.to_le_bytes());
-            buf.extend_from_slice(&days.to_le_bytes());
-            buf.extend_from_slice(&microseconds.to_le_bytes());
-        }
-        Value::Array(arr) => {
-            buf.push(VAL_ARRAY);
-            write_u32(buf, arr.len() as u32);
-            for v in arr {
-                write_value(buf, v);
-            }
-        }
-    }
-}
-
-fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
-    let tag = *data.get(*pos)?;
-    *pos += 1;
-    match tag {
-        VAL_NULL => Some(Value::Null),
-        VAL_BOOL => {
-            let b = *data.get(*pos)?;
-            *pos += 1;
-            Some(Value::Bool(b != 0))
-        }
-        VAL_INT32 => {
-            let b = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            Some(Value::Int32(i32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-        }
-        VAL_INT64 => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::Int64(i64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_FLOAT64 => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::Float64(f64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_TEXT => {
-            let s = read_str(data, pos)?;
-            Some(Value::Text(s))
-        }
-        VAL_BYTEA => {
-            let len = read_u32_val(data, pos)? as usize;
-            if *pos + len > data.len() {
-                return None;
-            }
-            let b = data[*pos..*pos + len].to_vec();
-            *pos += len;
-            Some(Value::Bytea(b))
-        }
-        VAL_DATE => {
-            let b = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            Some(Value::Date(i32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-        }
-        VAL_TIMESTAMP => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::Timestamp(i64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_TIMESTAMPTZ => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::TimestampTz(i64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_NUMERIC => {
-            let s = read_str(data, pos)?;
-            Some(Value::Numeric(s))
-        }
-        VAL_UUID => {
-            let b = data.get(*pos..*pos + 16)?;
-            *pos += 16;
-            let mut arr = [0u8; 16];
-            arr.copy_from_slice(b);
-            Some(Value::Uuid(arr))
-        }
-        VAL_JSONB => {
-            let s = read_str(data, pos)?;
-            // A malformed stored JSONB value must not drop the whole row
-            // (data loss). Fall back to JSON null; the insert path now rejects
-            // invalid JSON up front, so this only guards legacy/foreign rows.
-            let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
-            Some(Value::Jsonb(v))
-        }
-        VAL_VECTOR => {
-            let count = read_u32_val(data, pos)? as usize;
-            let byte_len = count * 4;
-            if *pos + byte_len > data.len() {
-                return None;
-            }
-            let mut v = Vec::with_capacity(count);
-            for _ in 0..count {
-                let b = data.get(*pos..*pos + 4)?;
-                *pos += 4;
-                v.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-            }
-            Some(Value::Vector(v))
-        }
-        VAL_INTERVAL => {
-            let mb = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            let months = i32::from_le_bytes([mb[0], mb[1], mb[2], mb[3]]);
-            let db = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            let days = i32::from_le_bytes([db[0], db[1], db[2], db[3]]);
-            let ub = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            let microseconds =
-                i64::from_le_bytes([ub[0], ub[1], ub[2], ub[3], ub[4], ub[5], ub[6], ub[7]]);
-            Some(Value::Interval {
-                months,
-                days,
-                microseconds,
-            })
-        }
-        VAL_ARRAY => {
-            let count = read_u32_val(data, pos)? as usize;
-            let mut arr = Vec::with_capacity(count);
-            for _ in 0..count {
-                arr.push(read_value(data, pos)?);
-            }
-            Some(Value::Array(arr))
-        }
-        _ => None,
-    }
-}
-
-fn write_row(buf: &mut Vec<u8>, row: &[Value]) {
-    write_u32(buf, row.len() as u32);
-    for val in row {
-        write_value(buf, val);
-    }
-}
-
-fn read_row(data: &[u8], pos: &mut usize) -> Option<Vec<Value>> {
-    let count = read_u32_val(data, pos)? as usize;
-    let mut row = Vec::with_capacity(count);
-    for _ in 0..count {
-        row.push(read_value(data, pos)?);
-    }
-    Some(row)
 }
 
 // ── Primitive helpers ────────────────────────────────────────────────────────
@@ -765,7 +603,7 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
             let version_idx = read_u32_val(data, &mut pos)?;
-            let row = read_row(data, &mut pos)?;
+            let row = crate::storage::value_codec::read_row(data, &mut pos)?;
             Some(MvccWalRecord::Insert {
                 table,
                 txn_id,
@@ -788,7 +626,7 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let txn_id = read_u64_val(data, &mut pos)?;
             let old_version_idx = read_u32_val(data, &mut pos)?;
             let new_version_idx = read_u32_val(data, &mut pos)?;
-            let new_row = read_row(data, &mut pos)?;
+            let new_row = crate::storage::value_codec::read_row(data, &mut pos)?;
             Some(MvccWalRecord::Update {
                 table,
                 txn_id,
@@ -987,5 +825,95 @@ mod tests {
 
         let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
         assert!(!state.tables.contains_key("temp"));
+    }
+}
+
+#[cfg(test)]
+mod crash_safety_tests {
+    use super::*;
+
+    /// Compaction must never leave the live WAL truncated.
+    ///
+    /// Regression pin for a total-data-loss defect: `compact` used to
+    /// `truncate()` the live WAL and then rewrite it, so a crash in that window
+    /// destroyed the only durable copy. Compaction runs on every reopen of a
+    /// populated database, which made a power loss during startup lose a
+    /// database whose every commit had been fsynced.
+    ///
+    /// This simulates the crash without a subprocess: it stages the compaction
+    /// exactly as `compact` does, then abandons it before the rename — the
+    /// worst instant — and asserts the live WAL still replays every record.
+    #[test]
+    fn abandoned_compaction_leaves_the_live_wal_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = MvccWal::open(dir.path()).unwrap();
+
+        wal.log(&MvccWalRecord::CreateTable {
+            name: "t".into(),
+            columns: vec![("id".into(), DataType::Int64)],
+        })
+        .unwrap();
+        for i in 0..5u32 {
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_idx: i,
+                row: vec![Value::Int64(i as i64)],
+            })
+            .unwrap();
+        }
+        wal.sync().unwrap();
+
+        // Simulate a compaction that died after staging but before the swap.
+        let staged = dir.path().join("mvcc.wal.compacting");
+        std::fs::write(&staged, b"partial garbage").unwrap();
+
+        // Reopen: the live WAL must still hold all 5 rows, and the abandoned
+        // staging file must be discarded rather than trusted.
+        drop(wal);
+        let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
+        let tbl = state.tables.get("t").expect("table survived");
+        assert_eq!(tbl.rows.len(), 5, "abandoned compaction lost committed rows");
+        assert!(
+            !staged.exists(),
+            "stale staging file was left behind for a later compaction to trip over"
+        );
+    }
+
+    /// A completed compaction must be durable and replay to the same state.
+    #[test]
+    fn completed_compaction_preserves_state_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = MvccWal::open(dir.path()).unwrap();
+        wal.log(&MvccWalRecord::CreateTable {
+            name: "t".into(),
+            columns: vec![("id".into(), DataType::Int64)],
+        })
+        .unwrap();
+        for i in 0..3u32 {
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 0,
+                version_idx: i,
+                row: vec![Value::Int64(i as i64)],
+            })
+            .unwrap();
+        }
+        wal.sync().unwrap();
+        let (_, state) = MvccWal::open(dir.path()).unwrap();
+
+        wal.compact(&state).unwrap();
+        assert!(
+            !dir.path().join("mvcc.wal.compacting").exists(),
+            "compaction left its staging file in place"
+        );
+
+        drop(wal);
+        let (_wal2, after) = MvccWal::open(dir.path()).unwrap();
+        assert_eq!(
+            after.tables.get("t").map(|t| t.rows.len()),
+            Some(3),
+            "compaction changed the recovered row set"
+        );
     }
 }

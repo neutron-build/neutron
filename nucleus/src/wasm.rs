@@ -41,6 +41,7 @@ impl NucleusWasm {
         let catalog = Arc::new(Catalog::new());
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new());
         let executor = Arc::new(Executor::new(catalog.clone(), storage.clone()));
+        executor.install_self_ref();
         Self {
             executor,
             _catalog: catalog,
@@ -54,6 +55,7 @@ impl NucleusWasm {
         let catalog = Arc::new(Catalog::new());
         let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
         let executor = Arc::new(Executor::new(catalog.clone(), storage.clone()));
+        executor.install_self_ref();
         Self {
             executor,
             _catalog: catalog,
@@ -173,6 +175,17 @@ fn exec_result_to_js(r: ExecResult) -> JsResultRepr {
             affected: Some(row_count),
             message: Some(data),
         },
+        ExecResult::CopyOutBinary { row_count, .. } => JsResultRepr {
+            kind: "copy_out_binary".into(),
+            columns: None,
+            rows: None,
+            affected: Some(row_count),
+            message: None,
+        },
+        // The executor materializes results before they reach the WASM boundary.
+        ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => unreachable!(
+            "streams must be materialized before the WASM result adapter"
+        ),
     }
 }
 

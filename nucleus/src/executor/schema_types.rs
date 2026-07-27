@@ -60,6 +60,18 @@ pub(crate) enum TriggerEvent {
     Delete,
 }
 
+/// A Postgres extension tracked as a catalog no-op. Nucleus provides the
+/// functionality most bootstrap extensions ask for (uuid, crypto, trigram,
+/// vector, etc.) natively, so `CREATE EXTENSION` records the name/schema/version
+/// for truthful `pg_extension` introspection without loading any real .so.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ExtensionDef {
+    pub name: String,
+    pub schema: String,
+    pub version: String,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct RoleDef {

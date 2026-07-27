@@ -512,12 +512,32 @@ pub struct DatalogStore {
 
     /// Derived facts (computed by evaluator, not stored in WAL).
     derived: HashMap<String, HashSet<Vec<String>>>,
+
+    /// Predicates mutated since the last `clear_touched` — the transaction
+    /// write-set the executor drains under the same write guard.
+    txn_touched: HashSet<String>,
+    /// Rules appended since the last `clear_touched`.
+    txn_added_rules: Vec<Rule>,
 }
 
 impl DatalogStore {
     /// Create an empty Datalog store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Forget any recorded mutations (called before a mutating operation).
+    pub fn clear_touched(&mut self) {
+        self.txn_touched.clear();
+        self.txn_added_rules.clear();
+    }
+
+    /// Take the predicates and rules mutated since the last `clear_touched`.
+    pub fn take_touched(&mut self) -> (HashSet<String>, Vec<Rule>) {
+        (
+            std::mem::take(&mut self.txn_touched),
+            std::mem::take(&mut self.txn_added_rules),
+        )
     }
 
     /// Assert a ground fact into the store and update indexes.
@@ -532,6 +552,7 @@ impl DatalogStore {
                 .push(args.clone());
         }
         self.facts.entry(pred.to_string()).or_default().insert(args);
+        self.txn_touched.insert(pred.to_string());
         // Invalidate derived facts (rules may produce different results)
         self.derived.clear();
     }
@@ -559,12 +580,14 @@ impl DatalogStore {
                 }
             }
         }
+        self.txn_touched.insert(pred.to_string());
         // Invalidate derived facts
         self.derived.clear();
     }
 
     /// Add a rule to the store.
     pub fn add_rule(&mut self, rule: Rule) {
+        self.txn_added_rules.push(rule.clone());
         self.rules.push(rule);
         // Invalidate derived facts
         self.derived.clear();
@@ -583,6 +606,7 @@ impl DatalogStore {
         for key in keys_to_remove {
             self.indexes.remove(&key);
         }
+        self.txn_touched.insert(pred.to_string());
         // Invalidate derived facts
         self.derived.clear();
     }
@@ -1488,7 +1512,57 @@ impl DatalogStore {
         }
     }
 
+    /// Revert only the predicates in `touched` (and the rules in `added_rules`)
+    /// using `snap` as the before-image. Predicates this transaction never
+    /// wrote are left alone, so a ROLLBACK cannot destroy facts another session
+    /// asserted since BEGIN.
+    ///
+    /// No compensating WAL records: `datalog_wal` is opened by the executor but
+    /// never appended to, so datalog holds no durable state to resurrect.
+    pub fn txn_restore_scoped(
+        &mut self,
+        snap: &DatalogTxnSnapshot,
+        touched: &HashSet<String>,
+        added_rules: &[Rule],
+    ) {
+        for pred in touched {
+            match snap.facts.get(pred) {
+                Some(facts) => {
+                    self.facts.insert(pred.clone(), facts.clone());
+                }
+                None => {
+                    self.facts.remove(pred);
+                }
+            }
+            let index_keys: Vec<(String, usize)> = self
+                .indexes
+                .keys()
+                .filter(|(p, _)| p == pred)
+                .cloned()
+                .collect();
+            for key in index_keys {
+                self.indexes.remove(&key);
+            }
+            for (key, value) in &snap.indexes {
+                if &key.0 == pred {
+                    self.indexes.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        // `add_rule` only ever appends, so undo is removal by value — position
+        // is not stable when another session appended concurrently.
+        for rule in added_rules {
+            if let Some(pos) = self.rules.iter().rposition(|r| r == rule) {
+                self.rules.remove(pos);
+            }
+        }
+        // `derived` is a memoized evaluation cache, invalidated by every
+        // mutation; clearing it is always safe and never loses committed state.
+        self.derived.clear();
+    }
+
     /// Restore state from a transaction snapshot (for ROLLBACK).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn txn_restore(&mut self, snap: DatalogTxnSnapshot) {
         self.facts = snap.facts;
         self.indexes = snap.indexes;
@@ -1614,11 +1688,6 @@ impl DatalogWal {
             self.writer.lock().flush()?;
         }
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
         // Guard the length prefix: a payload over 4 GiB would silently truncate
         // when cast to u32 and corrupt the snapshot on replay. Fail loudly instead.
         let plen = u32::try_from(payload.len()).map_err(|_| {
@@ -1627,15 +1696,34 @@ impl DatalogWal {
                 "datalog checkpoint payload exceeds 4 GiB",
             )
         })?;
-        w.write_all(&[WAL_SNAPSHOT])?;
-        w.write_all(&plen.to_le_bytes())?;
-        w.write_all(&payload)?;
-        w.flush()?;
-        drop(w);
 
+        // CRASH SAFETY: stage + fsync + atomic rename, rather than truncating
+        // the live log and rewriting it in place (a crash in that window lost
+        // every fact and rule).
+        let tmp_path = self.path.with_extension("wal.compacting");
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut w = BufWriter::new(file);
+            w.write_all(&[WAL_SNAPSHOT])?;
+            w.write_all(&plen.to_le_bytes())?;
+            w.write_all(&payload)?;
+            w.flush()?;
+            w.get_ref().sync_all()?;
+        }
+        let mut guard = self.writer.lock();
+        std::fs::rename(&tmp_path, &self.path)?;
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
         // Re-open in append mode for future writes
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *guard = BufWriter::new(file);
         Ok(())
     }
 

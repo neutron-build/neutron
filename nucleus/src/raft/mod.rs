@@ -8,8 +8,26 @@
 //!   - Automatic failover
 //!
 //! Replaces CockroachDB's consensus layer for Nucleus cluster mode.
+//!
+//! # Durability
+//!
+//! Raft's safety proof assumes `current_term`, `voted_for` and the replicated
+//! log survive a crash. A node built with [`RaftNode::new`] keeps them in memory
+//! only and is therefore **not** restart-safe — it is for tests and simulation.
+//! A node built with [`RaftNode::open`] fsyncs those three (plus the commit
+//! index and snapshot metadata) through [`storage::RaftStorage`] *before*
+//! returning any RPC response that depends on them.
+//!
+//! When a durable write fails, the node does not pretend: it rolls the in-memory
+//! change back, refuses the operation (`vote_granted: false` / `success: false`)
+//! and latches [`RaftNode::durability_failed`]. Refusing is always safe in Raft;
+//! acknowledging something that is not on disk is not.
 
 use std::collections::HashMap;
+use std::path::Path;
+
+pub mod determinism;
+pub mod storage;
 
 // ============================================================================
 // Raft types
@@ -165,9 +183,19 @@ pub struct RaftNode {
     pub lease_acks: usize,
     /// Whether the leader's lease is currently valid (majority responded recently).
     pub lease_valid: bool,
+
+    // Durability
+    /// Durable backing store. `None` means volatile mode (tests/simulation).
+    storage: Option<storage::RaftStorage>,
+    /// Latched once a durable write fails. A node that cannot persist its hard
+    /// state must stop participating rather than acknowledge phantom state.
+    durability_failed: bool,
 }
 
 impl RaftNode {
+    /// Create a **volatile** node: nothing is persisted, so it is not
+    /// restart-safe. Use [`RaftNode::open`] for any node that can outlive a
+    /// process.
     pub fn new(id: NodeId, peers: Vec<NodeId>) -> Self {
         Self {
             id,
@@ -191,6 +219,149 @@ impl RaftNode {
             snapshot: None,
             lease_acks: 0,
             lease_valid: false,
+            storage: None,
+            durability_failed: false,
+        }
+    }
+
+    /// Open a **durable** node, restoring term, vote, log, commit index and
+    /// snapshot from `dir` (created if absent).
+    ///
+    /// The restored term/vote are what make a restart safe: a node that already
+    /// voted in term T comes back still knowing it voted, so it cannot be talked
+    /// into a second vote in T and cannot help elect a second leader.
+    pub fn open(id: NodeId, peers: Vec<NodeId>, dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let (store, persisted) = storage::RaftStorage::open(dir)?;
+
+        // The in-memory log always starts with a sentinel. Without a snapshot it
+        // is the index-0 origin; with one it stands in for the compacted prefix
+        // and carries the snapshot's index/term so log-matching still works.
+        let sentinel = match &persisted.snapshot {
+            Some(s) => LogEntry {
+                index: s.last_included_index,
+                term: s.last_included_term,
+                command: Command::Noop,
+            },
+            None => LogEntry {
+                index: 0,
+                term: 0,
+                command: Command::Noop,
+            },
+        };
+        let mut log = Vec::with_capacity(persisted.entries.len() + 1);
+        log.push(sentinel);
+        log.extend(persisted.entries);
+
+        let snapshot_index = persisted
+            .snapshot
+            .as_ref()
+            .map(|s| s.last_included_index)
+            .unwrap_or(0);
+        // Everything the snapshot covers is by definition already applied.
+        let last_applied = snapshot_index;
+        let commit_index = persisted.commit_index.max(snapshot_index);
+
+        let mut node = Self::new(id, peers);
+        node.current_term = persisted.current_term;
+        node.voted_for = persisted.voted_for;
+        node.commit_index = commit_index;
+        node.last_applied = last_applied;
+        node.log = log;
+        node.snapshot = persisted.snapshot;
+        node.storage = Some(store);
+        Ok(node)
+    }
+
+    /// Whether a durable write has failed. Such a node refuses to vote or to
+    /// acknowledge appends, because it can no longer honour Raft's persistence
+    /// preconditions.
+    pub fn durability_failed(&self) -> bool {
+        self.durability_failed
+    }
+
+    /// Whether this node persists its state at all.
+    pub fn is_durable(&self) -> bool {
+        self.storage.is_some()
+    }
+
+    // ── Durability helpers ───────────────────────────────────────────────────
+
+    /// fsync term / vote / commit index. Returns `false` on failure, which the
+    /// caller must translate into a refusal.
+    fn persist_hard_state(&mut self) -> bool {
+        let (term, vote, commit) = (self.current_term, self.voted_for, self.commit_index);
+        let Some(store) = self.storage.as_mut() else {
+            return true;
+        };
+        match store.save_hard_state(term, vote, commit) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("raft: hard-state fsync failed, refusing operation: {e}");
+                self.durability_failed = true;
+                false
+            }
+        }
+    }
+
+    /// Record a commit-index advance. Best-effort by design: a persisted commit
+    /// index is allowed to lag (it is relearned from the leader) but never to
+    /// run ahead, so a failure here is not a safety problem.
+    fn note_commit_index(&mut self) {
+        let (term, vote, commit) = (self.current_term, self.voted_for, self.commit_index);
+        if let Some(store) = self.storage.as_mut()
+            && let Err(e) = store.note_commit_index(term, vote, commit)
+        {
+            tracing::warn!("raft: commit-index checkpoint failed (recoverable): {e}");
+        }
+    }
+
+    /// fsync freshly appended log entries. Returns `false` on failure.
+    fn persist_entries(&mut self, entries: &[LogEntry]) -> bool {
+        let Some(store) = self.storage.as_mut() else {
+            return true;
+        };
+        match store.append_entries(entries) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("raft: log append fsync failed, refusing operation: {e}");
+                self.durability_failed = true;
+                false
+            }
+        }
+    }
+
+    /// Atomically rewrite the durable log to match the in-memory log. Used after
+    /// a conflicting suffix is truncated or a snapshot compacts a prefix.
+    fn persist_log_rewrite(&mut self) -> bool {
+        let entries: Vec<LogEntry> = self.log.iter().skip(1).cloned().collect();
+        let Some(store) = self.storage.as_mut() else {
+            return true;
+        };
+        match store.rewrite_log(&entries) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("raft: log rewrite failed, refusing operation: {e}");
+                self.durability_failed = true;
+                false
+            }
+        }
+    }
+
+    /// fsync snapshot metadata and data.
+    fn persist_snapshot(&mut self) -> bool {
+        let Some(snap) = self.snapshot.clone() else {
+            return true;
+        };
+        let Some(store) = self.storage.as_mut() else {
+            return true;
+        };
+        match store.save_snapshot(&snap) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("raft: snapshot fsync failed: {e}");
+                self.durability_failed = true;
+                false
+            }
         }
     }
 
@@ -204,18 +375,57 @@ impl RaftNode {
         self.log.last().map(|e| e.term).unwrap_or(0)
     }
 
+    /// The lowest log index still held in memory (the sentinel's index). Zero
+    /// on a fresh node; the snapshot's last-included index after compaction.
+    fn log_base(&self) -> LogIndex {
+        self.log.first().map(|e| e.index).unwrap_or(0)
+    }
+
+    /// Position of `index` within `self.log`, accounting for a compacted prefix.
+    ///
+    /// Before any snapshot the base is 0 and position == index; after compaction
+    /// they diverge, so every lookup must go through here rather than indexing
+    /// the vector with a log index directly.
+    fn log_pos(&self, index: LogIndex) -> Option<usize> {
+        let base = self.log_base();
+        if index < base {
+            return None;
+        }
+        let pos = (index - base) as usize;
+        (pos < self.log.len()).then_some(pos)
+    }
+
     /// Get the log entry at a specific index.
     pub fn log_at(&self, index: LogIndex) -> Option<&LogEntry> {
-        self.log.get(index as usize)
+        self.log_pos(index).and_then(|p| self.log.get(p))
     }
 
     /// Start an election: become candidate, vote for self, increment term.
+    ///
+    /// The new term and the self-vote are fsync'd before any `RequestVote` is
+    /// handed to the caller — otherwise a crash could leave the node able to
+    /// vote again in the same term it already campaigned in.
     pub fn start_election(&mut self) -> Vec<(NodeId, RequestVoteRequest)> {
+        if self.durability_failed {
+            return Vec::new();
+        }
+        let prev = (self.current_term, self.voted_for, self.role, self.leader_id);
+
         self.current_term += 1;
         self.role = Role::Candidate;
         self.voted_for = Some(self.id);
         self.votes_received = vec![self.id];
         self.leader_id = None;
+
+        if !self.persist_hard_state() {
+            // Could not durably claim the term — unwind and stay put.
+            self.current_term = prev.0;
+            self.voted_for = prev.1;
+            self.role = prev.2;
+            self.leader_id = prev.3;
+            self.votes_received.clear();
+            return Vec::new();
+        }
 
         let request = RequestVoteRequest {
             term: self.current_term,
@@ -231,7 +441,20 @@ impl RaftNode {
     }
 
     /// Handle a RequestVote RPC.
+    ///
+    /// The response is not produced until the resulting term and vote are on
+    /// stable storage. That ordering *is* the anti-double-vote guarantee: a
+    /// response that outran its own fsync would let a crashed-and-restarted node
+    /// grant a second vote in the same term and elect a second leader.
     pub fn handle_request_vote(&mut self, req: &RequestVoteRequest) -> RequestVoteResponse {
+        if self.durability_failed {
+            return RequestVoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+            };
+        }
+        let prev = (self.current_term, self.voted_for, self.role, self.leader_id);
+
         // If the request has a higher term, update and become follower
         if req.term > self.current_term {
             self.current_term = req.term;
@@ -257,6 +480,19 @@ impl RaftNode {
             }
         };
 
+        // Persist BEFORE replying. Both the term bump and the vote are visible
+        // to the peer through this response, so both must already be durable.
+        if (self.current_term, self.voted_for) != (prev.0, prev.1) && !self.persist_hard_state() {
+            self.current_term = prev.0;
+            self.voted_for = prev.1;
+            self.role = prev.2;
+            self.leader_id = prev.3;
+            return RequestVoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+            };
+        }
+
         RequestVoteResponse {
             term: self.current_term,
             vote_granted,
@@ -269,6 +505,7 @@ impl RaftNode {
             self.current_term = resp.term;
             self.role = Role::Follower;
             self.voted_for = None;
+            self.persist_hard_state();
             return false;
         }
 
@@ -308,17 +545,27 @@ impl RaftNode {
     }
 
     /// Append an entry to the log (leader only). Returns the log index.
+    ///
+    /// The entry is fsync'd before the index is returned: the leader counts
+    /// itself toward the commit quorum, so an entry it has not durably stored
+    /// must not be allowed to influence a commit decision.
     pub fn append_entry(&mut self, command: Command) -> Option<LogIndex> {
-        if self.role != Role::Leader {
+        if self.role != Role::Leader || self.durability_failed {
             return None;
         }
 
         let index = self.last_log_index() + 1;
-        self.log.push(LogEntry {
+        let entry = LogEntry {
             index,
             term: self.current_term,
             command,
-        });
+        };
+        self.log.push(entry.clone());
+
+        if !self.persist_entries(&[entry]) {
+            self.log.pop();
+            return None;
+        }
 
         Some(index)
     }
@@ -359,6 +606,11 @@ impl RaftNode {
     }
 
     /// Handle AppendEntries RPC (as follower).
+    ///
+    /// `success: true` is a promise the leader is entitled to count toward a
+    /// commit quorum — and therefore to report to a client as durable. So the
+    /// entries and any term change are fsync'd before this returns; if that
+    /// fails the node answers `success: false` instead of lying.
     pub fn handle_append_entries(&mut self, req: &AppendEntriesRequest) -> AppendEntriesResponse {
         // Stale term
         if req.term < self.current_term {
@@ -368,9 +620,17 @@ impl RaftNode {
                 match_index: 0,
             };
         }
+        if self.durability_failed {
+            return AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: 0,
+            };
+        }
 
         // Update term if needed
-        if req.term > self.current_term {
+        let term_changed = req.term > self.current_term;
+        if term_changed {
             self.current_term = req.term;
             self.voted_for = None;
         }
@@ -378,7 +638,19 @@ impl RaftNode {
         self.role = Role::Follower;
         self.leader_id = Some(req.leader_id);
 
-        // Check if we have the prev_log entry
+        // A term bump must be durable before it is echoed back in the response.
+        if term_changed && !self.persist_hard_state() {
+            return AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: 0,
+            };
+        }
+
+        // Check if we have the prev_log entry. After compaction the sentinel
+        // carries the snapshot's index/term, so this check still works at the
+        // snapshot boundary; anything below it makes us answer false, which is
+        // the leader's cue to send a snapshot instead.
         if req.prev_log_index > 0 {
             match self.log_at(req.prev_log_index) {
                 None => {
@@ -391,7 +663,10 @@ impl RaftNode {
                 Some(entry) => {
                     if entry.term != req.prev_log_term {
                         // Conflict: truncate log from this point
-                        self.log.truncate(req.prev_log_index as usize);
+                        if let Some(pos) = self.log_pos(req.prev_log_index) {
+                            self.log.truncate(pos);
+                        }
+                        self.persist_log_rewrite();
                         return AppendEntriesResponse {
                             term: self.current_term,
                             success: false,
@@ -402,24 +677,50 @@ impl RaftNode {
             }
         }
 
-        // Append new entries (handle conflicts)
+        // Append new entries (handle conflicts). Track whether a suffix was
+        // discarded: an append-only log file cannot express that, so a conflict
+        // forces a full atomic rewrite rather than an append.
+        let mut appended: Vec<LogEntry> = Vec::new();
+        let mut rewrote = false;
         for entry in &req.entries {
-            if (entry.index as usize) < self.log.len() {
-                // Existing entry — check for conflict
-                if let Some(existing) = self.log_at(entry.index)
-                    && existing.term != entry.term
-                {
-                    self.log.truncate(entry.index as usize);
-                    self.log.push(entry.clone());
+            match self.log_at(entry.index) {
+                Some(existing) => {
+                    if existing.term != entry.term {
+                        if let Some(pos) = self.log_pos(entry.index) {
+                            self.log.truncate(pos);
+                        }
+                        self.log.push(entry.clone());
+                        rewrote = true;
+                    }
                 }
-            } else {
-                self.log.push(entry.clone());
+                None => {
+                    // Only extend contiguously; a gap would corrupt the log.
+                    if entry.index == self.last_log_index() + 1 {
+                        self.log.push(entry.clone());
+                        appended.push(entry.clone());
+                    }
+                }
             }
+        }
+
+        // Persist the log BEFORE acknowledging.
+        let persisted = if rewrote {
+            self.persist_log_rewrite()
+        } else {
+            self.persist_entries(&appended)
+        };
+        if !persisted {
+            return AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: 0,
+            };
         }
 
         // Update commit index
         if req.leader_commit > self.commit_index {
             self.commit_index = req.leader_commit.min(self.last_log_index());
+            self.note_commit_index();
         }
 
         AppendEntriesResponse {
@@ -436,6 +737,7 @@ impl RaftNode {
             self.role = Role::Follower;
             self.voted_for = None;
             self.leader_id = None;
+            self.persist_hard_state();
             return;
         }
 
@@ -465,6 +767,7 @@ impl RaftNode {
     fn try_advance_commit(&mut self) {
         let total_nodes = self.peers.len() + 1;
         let majority = total_nodes / 2 + 1;
+        let mut advanced = false;
 
         for n in (self.commit_index + 1)..=self.last_log_index() {
             // Only commit entries from current term
@@ -484,7 +787,12 @@ impl RaftNode {
 
             if count >= majority {
                 self.commit_index = n;
+                advanced = true;
             }
+        }
+
+        if advanced {
+            self.note_commit_index();
         }
     }
 
@@ -494,8 +802,9 @@ impl RaftNode {
 
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            if let Some(entry) = self.log.get(self.last_applied as usize) {
-                self.applied_commands.push(entry.command.clone());
+            if let Some(entry) = self.log_at(self.last_applied) {
+                let command = entry.command.clone();
+                self.applied_commands.push(command);
             }
             applied.push(self.last_applied);
         }
@@ -530,8 +839,7 @@ impl RaftNode {
 
         // Compact the log: keep only entries after the snapshot index.
         // Replace the prefix with a new sentinel at the snapshot point.
-        let keep_from = snap_index as usize;
-        if keep_from < self.log.len() {
+        if let Some(keep_from) = self.log_pos(snap_index) {
             self.log = std::iter::once(LogEntry {
                 index: snap_index,
                 term: snap_term,
@@ -540,6 +848,13 @@ impl RaftNode {
             .chain(self.log.drain((keep_from + 1)..))
             .collect();
         }
+
+        // Snapshot first, then the compacted log: if the crash lands between
+        // them we still hold a superset of the state (an uncompacted log plus a
+        // valid snapshot), never a hole.
+        self.persist_snapshot();
+        self.persist_log_rewrite();
+        self.persist_hard_state();
 
         self.snapshot.as_ref()
     }
@@ -596,6 +911,11 @@ impl RaftNode {
         if req.last_included_index > self.last_applied {
             self.last_applied = req.last_included_index;
         }
+
+        // All three are durable before the follower acknowledges the install.
+        self.persist_snapshot();
+        self.persist_log_rewrite();
+        self.persist_hard_state();
 
         InstallSnapshotResponse {
             term: self.current_term,
@@ -1082,5 +1402,433 @@ mod tests {
         let applied3 = node.apply_committed();
         assert_eq!(applied3, vec![3]);
         assert_eq!(node.last_applied, 3);
+    }
+
+    // ================================================================
+    // Restart safety
+    //
+    // These exercise the property Raft actually depends on: state that
+    // an RPC response already promised must still be there after the
+    // process dies. "Crash" here is dropping the node and reopening the
+    // same directory — the on-disk bytes are all a restarted process
+    // gets, so anything not fsync'd is gone by construction.
+    // ================================================================
+
+    fn raft_tmpdir(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nucleus_raftnode_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// THE safety test. A node votes for candidate 2 in term 5, crashes, and
+    /// restarts. Candidate 3 then asks for a vote in the same term 5.
+    ///
+    /// Granting it would give term 5 two majorities and therefore two leaders,
+    /// which lets committed entries be overwritten — unbounded, silent data
+    /// loss. The restarted node must refuse.
+    ///
+    /// Without persistence the restarted node comes back at term 0 with no
+    /// recorded vote and cheerfully votes again, which is exactly the bug.
+    #[test]
+    fn restarted_node_will_not_vote_twice_in_the_same_term() {
+        let dir = raft_tmpdir("double_vote");
+
+        let granted_to_2 = {
+            let mut node = RaftNode::open(1, vec![2, 3], &dir).unwrap();
+            let resp = node.handle_request_vote(&RequestVoteRequest {
+                term: 5,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            });
+            assert!(resp.vote_granted, "first vote in term 5 should be granted");
+            assert_eq!(resp.term, 5);
+            resp.vote_granted
+            // node dropped here == the process dies
+        };
+        assert!(granted_to_2);
+
+        // Restart: everything not on disk is gone.
+        let mut restarted = RaftNode::open(1, vec![2, 3], &dir).unwrap();
+        assert_eq!(
+            restarted.current_term, 5,
+            "term must survive the crash, else the node moves backwards in time"
+        );
+        assert_eq!(
+            restarted.voted_for,
+            Some(2),
+            "the recorded vote must survive the crash"
+        );
+
+        let second = restarted.handle_request_vote(&RequestVoteRequest {
+            term: 5,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+        assert!(
+            !second.vote_granted,
+            "restarted node granted a SECOND vote in term 5 — two leaders can now be \
+             elected in one term and committed entries can be overwritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A candidate that crashes mid-election must not campaign again in the
+    /// same term with a fresh vote budget: its own self-vote has to survive.
+    #[test]
+    fn candidates_own_self_vote_survives_a_crash() {
+        let dir = raft_tmpdir("self_vote");
+        {
+            let mut node = RaftNode::open(7, vec![8, 9], &dir).unwrap();
+            let reqs = node.start_election();
+            assert_eq!(reqs.len(), 2);
+            assert_eq!(node.current_term, 1);
+            assert_eq!(node.voted_for, Some(7));
+        }
+        let mut restarted = RaftNode::open(7, vec![8, 9], &dir).unwrap();
+        assert_eq!(restarted.current_term, 1);
+        assert_eq!(restarted.voted_for, Some(7));
+
+        // Another candidate in the same term must be refused.
+        let resp = restarted.handle_request_vote(&RequestVoteRequest {
+            term: 1,
+            candidate_id: 8,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+        assert!(
+            !resp.vote_granted,
+            "restarted candidate forgot its own self-vote and voted for a rival in term 1"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A follower answering `success: true` is telling the leader "this entry is
+    /// mine now". The leader may count that toward a commit quorum and report
+    /// the write durable to a client. So those entries must survive a crash.
+    #[test]
+    fn acknowledged_entries_survive_a_crash() {
+        let dir = raft_tmpdir("acked_entries");
+        {
+            let mut follower = RaftNode::open(2, vec![1, 3], &dir).unwrap();
+            let resp = follower.handle_append_entries(&AppendEntriesRequest {
+                term: 3,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        index: 1,
+                        term: 3,
+                        command: Command::Noop,
+                    },
+                    LogEntry {
+                        index: 2,
+                        term: 3,
+                        command: Command::Sql("INSERT INTO t VALUES (1)".into()),
+                    },
+                    LogEntry {
+                        index: 3,
+                        term: 3,
+                        command: Command::Sql("INSERT INTO t VALUES (2)".into()),
+                    },
+                ],
+                leader_commit: 3,
+            });
+            assert!(resp.success, "follower must accept a clean append");
+            assert_eq!(resp.match_index, 3);
+        }
+
+        let restarted = RaftNode::open(2, vec![1, 3], &dir).unwrap();
+        assert_eq!(
+            restarted.last_log_index(),
+            3,
+            "the follower acknowledged 3 entries and then lost them across a restart; \
+             the leader may already have told a client those writes were committed"
+        );
+        assert_eq!(restarted.current_term, 3);
+        match &restarted.log_at(2).expect("entry 2 must exist").command {
+            Command::Sql(sql) => assert_eq!(sql, "INSERT INTO t VALUES (1)"),
+            other => panic!("entry 2 came back as {other:?}"),
+        }
+        match &restarted.log_at(3).expect("entry 3 must exist").command {
+            Command::Sql(sql) => assert_eq!(sql, "INSERT INTO t VALUES (2)"),
+            other => panic!("entry 3 came back as {other:?}"),
+        }
+        // The commit index is allowed to come back LOW (it is relearned from the
+        // leader's next AppendEntries). What it must never do is come back HIGH,
+        // which would mark uncommitted entries as committed.
+        assert!(
+            restarted.commit_index <= 3,
+            "restart reported commit index {} but only 3 entries were ever committed",
+            restarted.commit_index
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Commit-index persistence is checkpointed, not written on every advance.
+    /// Pin both halves of that contract: a large advance does get written, and a
+    /// restart never reports more than was actually committed.
+    #[test]
+    fn commit_index_is_checkpointed_and_never_restored_too_high() {
+        let dir = raft_tmpdir("commit_checkpoint");
+        let committed;
+        {
+            let mut follower = RaftNode::open(2, vec![1, 3], &dir).unwrap();
+            let entries: Vec<LogEntry> = (1..=200)
+                .map(|i| LogEntry {
+                    index: i,
+                    term: 1,
+                    command: Command::Sql(format!("INSERT INTO t VALUES ({i})")),
+                })
+                .collect();
+            let resp = follower.handle_append_entries(&AppendEntriesRequest {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 200,
+            });
+            assert!(resp.success);
+            committed = follower.commit_index;
+            assert_eq!(committed, 200);
+        }
+        let restarted = RaftNode::open(2, vec![1, 3], &dir).unwrap();
+        assert!(
+            restarted.commit_index > 0,
+            "a 200-entry commit advance was never checkpointed at all"
+        );
+        assert!(
+            restarted.commit_index <= committed,
+            "restart claimed commit index {} but only {} was committed — uncommitted \
+             entries would be treated as committed",
+            restarted.commit_index,
+            committed
+        );
+        assert_eq!(restarted.last_log_index(), 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The leader counts itself toward the commit quorum, so an entry it has
+    /// appended must be durable before that self-count can matter.
+    #[test]
+    fn leader_appended_entries_survive_a_crash() {
+        let dir = raft_tmpdir("leader_append");
+        {
+            let mut leader = RaftNode::open(1, vec![2, 3], &dir).unwrap();
+            leader.role = Role::Leader;
+            leader.current_term = 2;
+            assert_eq!(
+                leader.append_entry(Command::Sql("UPDATE t SET x = 1".into())),
+                Some(1)
+            );
+            assert_eq!(leader.append_entry(Command::Noop), Some(2));
+        }
+        let restarted = RaftNode::open(1, vec![2, 3], &dir).unwrap();
+        assert_eq!(restarted.last_log_index(), 2);
+        assert!(
+            matches!(&restarted.log_at(1).unwrap().command, Command::Sql(s) if s == "UPDATE t SET x = 1")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Durability must happen BEFORE the response is returned, not merely at
+    /// some point afterwards. A response that outran its own fsync is exactly as
+    /// unsafe as no persistence, because the crash window is the interesting
+    /// case. Reading the files through a second, independent handle while the
+    /// node is still alive is the observable form of that ordering.
+    #[test]
+    fn vote_is_on_disk_before_the_response_is_returned() {
+        let dir = raft_tmpdir("fsync_order");
+        let mut node = RaftNode::open(1, vec![2, 3], &dir).unwrap();
+
+        let resp = node.handle_request_vote(&RequestVoteRequest {
+            term: 9,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+        assert!(resp.vote_granted);
+
+        // Node still alive; read what a restarting process would see right now.
+        let (_s, on_disk) = storage::RaftStorage::open(&dir).unwrap();
+        assert_eq!(
+            (on_disk.current_term, on_disk.voted_for),
+            (9, Some(2)),
+            "the vote response was returned before the vote reached stable storage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same ordering requirement for the log: the entries must be readable from
+    /// disk at the instant `success: true` is produced.
+    #[test]
+    fn entries_are_on_disk_before_success_is_returned() {
+        let dir = raft_tmpdir("append_fsync_order");
+        let mut node = RaftNode::open(2, vec![1, 3], &dir).unwrap();
+
+        let resp = node.handle_append_entries(&AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                index: 1,
+                term: 1,
+                command: Command::Sql("INSERT INTO t VALUES (42)".into()),
+            }],
+            leader_commit: 0,
+        });
+        assert!(resp.success);
+
+        let (_s, on_disk) = storage::RaftStorage::open(&dir).unwrap();
+        assert_eq!(
+            on_disk.entries.len(),
+            1,
+            "the follower acknowledged an entry that was not yet on stable storage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Raft repairs a divergent follower by truncating the conflicting suffix.
+    /// An append-only file cannot express a truncation, so the durable log must
+    /// be rewritten — otherwise a restart resurrects entries the leader already
+    /// overruled.
+    #[test]
+    fn truncated_conflicting_suffix_does_not_come_back_after_restart() {
+        let dir = raft_tmpdir("truncate");
+        {
+            let mut follower = RaftNode::open(2, vec![1, 3], &dir).unwrap();
+            // Stale leader's entries.
+            follower.handle_append_entries(&AppendEntriesRequest {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        index: 1,
+                        term: 1,
+                        command: Command::Sql("STALE-1".into()),
+                    },
+                    LogEntry {
+                        index: 2,
+                        term: 1,
+                        command: Command::Sql("STALE-2".into()),
+                    },
+                ],
+                leader_commit: 0,
+            });
+            assert_eq!(follower.last_log_index(), 2);
+
+            // New leader in term 2 overwrites index 2.
+            let resp = follower.handle_append_entries(&AppendEntriesRequest {
+                term: 2,
+                leader_id: 3,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    index: 2,
+                    term: 2,
+                    command: Command::Sql("AUTHORITATIVE-2".into()),
+                }],
+                leader_commit: 0,
+            });
+            assert!(resp.success);
+            assert!(
+                matches!(&follower.log_at(2).unwrap().command, Command::Sql(s) if s == "AUTHORITATIVE-2")
+            );
+        }
+
+        let restarted = RaftNode::open(2, vec![1, 3], &dir).unwrap();
+        assert_eq!(restarted.last_log_index(), 2);
+        assert_eq!(restarted.current_term, 2);
+        match &restarted.log_at(2).unwrap().command {
+            Command::Sql(sql) => assert_eq!(
+                sql, "AUTHORITATIVE-2",
+                "the overruled entry came back after restart; the durable log still \
+                 holds a suffix the leader truncated"
+            ),
+            other => panic!("entry 2 came back as {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Snapshot metadata and the compacted log must both survive, and the
+    /// restored node must index its log correctly across the compaction
+    /// boundary (positions no longer equal log indices after compaction).
+    #[test]
+    fn snapshot_and_compacted_log_survive_a_crash() {
+        let dir = raft_tmpdir("snapshot");
+        {
+            let mut node = RaftNode::open(1, vec![2, 3], &dir).unwrap();
+            node.handle_append_entries(&AppendEntriesRequest {
+                term: 4,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: (1..=5)
+                    .map(|i| LogEntry {
+                        index: i,
+                        term: 4,
+                        command: Command::Sql(format!("STMT-{i}")),
+                    })
+                    .collect(),
+                leader_commit: 3,
+            });
+            node.apply_committed();
+            assert_eq!(node.last_applied, 3);
+            node.take_snapshot(b"machine-state".to_vec())
+                .expect("snapshot should be taken at last_applied");
+        }
+
+        let restarted = RaftNode::open(1, vec![2, 3], &dir).unwrap();
+        let snap = restarted
+            .snapshot
+            .as_ref()
+            .expect("snapshot metadata must survive restart");
+        assert_eq!(snap.last_included_index, 3);
+        assert_eq!(snap.last_included_term, 4);
+        assert_eq!(snap.data, b"machine-state");
+
+        assert_eq!(
+            restarted.last_log_index(),
+            5,
+            "entries after the snapshot must survive compaction + restart"
+        );
+        assert!(
+            restarted.log_at(3).is_some(),
+            "the snapshot boundary must be addressable so log matching still works"
+        );
+        // Positions and indices diverge after compaction; lookups must respect that.
+        match &restarted.log_at(5).expect("entry 5 must exist").command {
+            Command::Sql(sql) => assert_eq!(sql, "STMT-5"),
+            other => panic!("entry 5 came back as {other:?}"),
+        }
+        assert!(restarted.last_applied >= 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node built with `new()` is explicitly volatile. Say so in a test so the
+    /// distinction is not folded away by accident: production paths must use
+    /// `open()`.
+    #[test]
+    fn volatile_nodes_advertise_that_they_are_not_durable() {
+        let node = RaftNode::new(1, vec![2]);
+        assert!(!node.is_durable());
+        let dir = raft_tmpdir("durable_flag");
+        let durable = RaftNode::open(1, vec![2], &dir).unwrap();
+        assert!(durable.is_durable());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

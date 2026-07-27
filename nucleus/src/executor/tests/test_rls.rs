@@ -330,3 +330,169 @@ async fn principal_less_protocol_and_cluster_forwarding_fail_closed() {
             .is_err()
     );
 }
+
+/// `ALTER TABLE ... RENAME TO` must carry the GRANTs with the table.
+///
+/// Privileges are keyed by table name in `RoleDef::privileges`, and the rename
+/// path moved the RLS policies and masking rules but left the grants behind
+/// under the old name — so every grantee silently lost access to the table they
+/// had been granted. It stayed invisible for as long as privileges were not
+/// consulted on the read path.
+///
+/// Asserted through a real bound session rather than `has_table_privilege`,
+/// which ignores its user argument and reports on the *current* session — in a
+/// test that runs as superuser it answers `true` for everything, so it cannot
+/// witness this.
+#[tokio::test]
+async fn rename_table_carries_grants_with_it() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+    exec(&ex, "ALTER TABLE docs RENAME TO renamed_docs").await;
+
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "alice").await.unwrap();
+    let result = exec_session(&ex, sid, "SELECT id FROM renamed_docs ORDER BY id")
+        .await
+        .expect("alice's GRANT did not follow the table across RENAME");
+    assert_eq!(rows(&result[0]).len(), 2, "alice should still see her 2 rows");
+}
+
+/// Renaming the column a policy reads must keep the policy on that COLUMN.
+///
+/// Predicates used to store only the column NAME. A rename left the policy
+/// naming a column that no longer existed, which failed closed on its own —
+/// but `ADD COLUMN` could then recreate the old name and the policy would
+/// silently begin guarding the new, attacker-chosen column instead. Predicates
+/// now carry the column's stable id and the name is refreshed through it.
+#[tokio::test]
+async fn renaming_a_policy_column_keeps_the_policy_on_that_column() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+    exec(&ex, "ALTER TABLE docs RENAME COLUMN owner TO owner_real").await;
+
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "alice").await.unwrap();
+    let result = exec_session(&ex, sid, "SELECT id FROM docs ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&result[0]).len(),
+        2,
+        "policy should still filter on the renamed column, showing alice her 2 rows"
+    );
+
+    // The escalation this closes: reintroduce the old name and make it match
+    // every row. The policy must keep reading `owner_real`, not this decoy.
+    exec(
+        &ex,
+        "ALTER TABLE docs ADD COLUMN owner TEXT DEFAULT 'alice'",
+    )
+    .await;
+    let after = exec_session(&ex, sid, "SELECT id FROM docs ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&after[0]).len(),
+        2,
+        "a re-added column with the old name captured the policy: alice saw {} rows",
+        rows(&after[0]).len()
+    );
+}
+
+/// Dropping a column a policy reads must fail, and CASCADE must drop the policy.
+#[tokio::test]
+async fn dropping_a_policy_column_requires_cascade() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+
+    let blocked = ex.execute("ALTER TABLE docs DROP COLUMN owner").await;
+    let err = blocked.expect_err("dropping a column a policy depends on must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("owner_isolation"),
+        "the error should name the dependent policy, got: {msg}"
+    );
+
+    exec(&ex, "ALTER TABLE docs DROP COLUMN owner CASCADE").await;
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "alice").await.unwrap();
+    // The policy is gone with the column; RLS is still enabled, so with no
+    // policy admitting anything the table denies rather than opens.
+    let result = exec_session(&ex, sid, "SELECT id FROM docs").await.unwrap();
+    assert!(
+        rows(&result[0]).is_empty(),
+        "with its only policy CASCADE-dropped, an RLS-enabled table must deny, not open"
+    );
+}
+
+/// `has_table_privilege(user, table, privilege)` must answer about the NAMED
+/// user, not the caller.
+///
+/// It previously ignored its first argument and reported on the current
+/// session, so a superuser asking about anyone got `true` for everything — and
+/// this is the function an audit query trusts. It also made an earlier version
+/// of the rename test above pass vacuously.
+#[tokio::test]
+async fn has_table_privilege_reports_on_the_named_user() {
+    let ex = test_executor();
+    setup_owner_policy(&ex).await;
+    exec(&ex, "CREATE TABLE secrets (id INT PRIMARY KEY, v TEXT)").await;
+    exec(&ex, "CREATE ROLE mallory LOGIN PASSWORD 'x'").await;
+
+    // Asked as superuser, about someone else, on a table they were never granted.
+    let denied = exec(
+        &ex,
+        "SELECT has_table_privilege('mallory', 'secrets', 'SELECT')",
+    )
+    .await;
+    assert_eq!(
+        *scalar(&denied[0]),
+        Value::Bool(false),
+        "mallory has no GRANT on secrets, so this must be false even when a superuser asks"
+    );
+
+    // And true where the grant genuinely exists.
+    let allowed = exec(&ex, "SELECT has_table_privilege('alice', 'docs', 'SELECT')").await;
+    assert_eq!(
+        *scalar(&allowed[0]),
+        Value::Bool(true),
+        "alice was granted SELECT on docs in setup"
+    );
+}
+
+/// A renamed column must not strand the derived-index registries or the durable
+/// engine sidecar.
+///
+/// `TableEngineMeta` records ORDER BY / version / aggregate columns by NAME in
+/// engines.json and nothing rewrote them on RENAME COLUMN, so a stale name
+/// survived restart. The derived-index registries also key on the column name,
+/// but those turn out to be repaired already by the catalog index drop/recreate
+/// on rename — this asserts the end-to-end behaviour rather than registry
+/// internals, which is what actually has to hold.
+#[tokio::test]
+async fn rename_column_rewrites_derived_index_registries() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE emb (id INT PRIMARY KEY, body TEXT, v VECTOR(3))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO emb VALUES (1,'a',VECTOR('[1,0,0]')),(2,'b',VECTOR('[0,1,0]'))",
+    )
+    .await;
+    exec(&ex, "CREATE INDEX ix_v ON emb USING IVFFLAT (v)").await;
+
+    exec(&ex, "ALTER TABLE emb RENAME COLUMN v TO embedding").await;
+
+    // End-to-end is the meaningful assertion here. A registry-contents check
+    // passes even with the rewrite disabled, because the catalog index is
+    // dropped and recreated under the new name by the rewrite above.
+    let knn = exec(
+        &ex,
+        "SELECT id FROM emb ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]')) LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&knn[0]).len(), 1);
+}

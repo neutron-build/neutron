@@ -1,0 +1,38 @@
+// Postgres port of typescript/benchmarks/orms/prisma-schema.prisma (that file
+// targets sqlite). IDs are explicit Ints, not autoincrement — sequence DDL is
+// exercised separately and autoincrement support is recorded in the README.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "./generated"
+}
+
+model User {
+  id        Int      @id
+  email     String   @unique
+  name      String
+  age       Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  posts Post[]
+
+  @@map("users")
+}
+
+model Post {
+  id        Int      @id
+  userId    Int      @map("user_id")
+  title     String
+  content   String
+  published Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("posts")
+}

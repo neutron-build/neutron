@@ -17,7 +17,7 @@ crc32c = "0.6"
 dashmap = "6"
 futures = "0.3"
 parking_lot = "0.12"
-pgwire = { version = "0.36", features = ["server-api-aws-lc-rs"], optional = true }
+pgwire = { version = "0.36", features = ["server-api-aws-lc-rs", "pg-type-rust-decimal"], optional = true }
 rcgen = { version = "0.13", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rand = "0.8"
@@ -32,6 +32,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 clap = { version = "4.5.58", features = ["derive"], optional = true }
 base64 = "0.22.1"
 blake3 = "1"
+md5 = "0.8"
 sha2 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
 toml = "0.8"
@@ -71,6 +72,11 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 getrandom = { version = "0.2", optional = true }
+
+# Free-space probing for the disk watermark guard (`src/ops/disk.rs`) needs
+# `statvfs`; on non-Unix targets the probe reports Unsupported instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["server"]
@@ -165,11 +171,6 @@ path = "src/bin/probe_recover_engines.rs"
 required-features = ["server", "rusqlite"]
 
 [[bin]]
-name = "probe_pgwire"
-path = "src/bin/probe_pgwire.rs"
-required-features = ["server", "rusqlite"]
-
-[[bin]]
 name = "probe_concurrency_threads"
 path = "src/bin/probe_concurrency_threads.rs"
 required-features = ["server", "rusqlite"]
@@ -178,6 +179,21 @@ required-features = ["server", "rusqlite"]
 name = "probe_crash_subprocess"
 path = "src/bin/probe_crash_subprocess.rs"
 required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_crash_points"
+path = "src/bin/probe_crash_points.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_raft_crash"
+path = "src/bin/probe_raft_crash.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_io_faults"
+path = "src/bin/probe_io_faults.rs"
+required-features = ["server"]
 
 [[bin]]
 name = "probe_distributed"
@@ -305,6 +321,14 @@ required-features = ["server"]
 [[bin]]
 name = "probe_vector_recall"
 path = "src/bin/probe_vector_recall.rs"
+required-features = ["server"]
+
+# Correctness-paired benchmark harness (vector recall / FTS set-equality /
+# graph BFS+Dijkstra) — every latency number ships with a correctness number
+# measured on the same run against an inline reference. No external DB needed.
+[[bin]]
+name = "bench_paired"
+path = "src/bin/bench_paired.rs"
 required-features = ["server"]
 
 [[bench]]

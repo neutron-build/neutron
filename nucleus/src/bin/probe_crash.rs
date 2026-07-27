@@ -6,11 +6,9 @@
 #![cfg(feature = "server")]
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 
-use nucleus::catalog::Catalog;
 use nucleus::executor::Executor;
-use nucleus::storage::{MvccStorageAdapter, StorageEngine};
+use nucleus::metrics::harness::{engine_from_args, open_probe_db};
 
 struct Rng(u64);
 impl Rng {
@@ -479,14 +477,29 @@ fn main_impl() {
     }
     std::panic::set_hook(Box::new(|_| {}));
 
-    println!("Nucleus crash/panic fuzzer ({} functions)", FUNCS.len());
-    println!("seed={seed} iterations={iterations}\n");
-
     // One executor with a small table + some seeded model state, so functions
     // exercise both empty and populated paths.
-    let catalog = Arc::new(Catalog::new());
-    let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
-    let ex = Arc::new(Executor::new(catalog, storage));
+    let probe = match open_probe_db(engine_from_args(), "probe-crash") {
+        Ok(p) => p,
+        Err(e) => {
+            println!("FAIL: could not open engine: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    let ex = probe.executor().clone();
+
+    println!("Nucleus crash/panic fuzzer ({} functions)", FUNCS.len());
+    println!("seed={seed} iterations={iterations} engine={}", probe.label());
+    if !probe.covers_paged_storage() {
+        println!(
+            "NOTE: no paged storage under test — a panic reachable only through \
+             DiskEngine\n      (the frame-latch defect surfaced as a slice \
+             out-of-bounds in btree::extract_key)\n      cannot be found here. \
+             Pass --engine buffered-disk."
+        );
+    }
+    println!();
+
     let rt = tokio::runtime::Handle::current();
     for setup in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, txt TEXT)",

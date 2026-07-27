@@ -759,8 +759,10 @@ mod tests {
 
         let res = run(
             &ex,
-            "SELECT m.label, g.generate_series, g.generate_series * m.factor AS result
-             FROM generate_series(1, 3) g
+            // PostgreSQL rule: a table alias on a base-type SRF names its
+            // single output column, and a column alias list wins outright.
+            "SELECT m.label, g.n, g.n * m.factor AS result
+             FROM generate_series(1, 3) g(n)
              JOIN multipliers m ON 1=1
              ORDER BY 1, 2",
         )
@@ -4591,5 +4593,212 @@ mod tests {
         assert_eq!(r[0][1], Value::Int64(250));
         assert_eq!(r[1][0], Value::Text("Widget".into()));
         assert_eq!(r[1][1], Value::Int64(250));
+    }
+
+    // ── REGRESSION: concurrent writers on one page used to corrupt it ─────
+    //
+    // `DiskEngine` used to mutate page bytes through
+    // `BufferPool::frame_data_mut` — whose own contract says the caller must
+    // hold the latch — and read through `frame_data` with no read latch. It
+    // never took a frame latch anywhere. Several sessions writing rows that
+    // live on the SAME page therefore raced on the raw bytes, and
+    // `page::insert_tuple` was where it showed: two writers read the same
+    // `DATA_FREE_END` or claimed the same dead slot, so one row was written
+    // over the other. `DiskEngine::index_delete` compounded it by mutating the
+    // B-tree while holding only `indexes.read()`, so two concurrent deletes
+    // rewrote index leaf entries at once.
+    //
+    // Observed on this workload before the fix (6 runs, 6 failures): duplicate
+    // primary keys — only when updates change a row's width, which is what
+    // routes them through `delete_tuple` + `insert_tuple` — and a
+    // slice-out-of-bounds panic in `btree::extract_key` reading a corrupted
+    // leaf entry.
+    //
+    // This is a DIFFERENT defect from the row-identity one the
+    // `storage::disk_engine` position tests cover. Spread the same workload
+    // across many pages (as `probe_soak` does) and it does not fire, which is
+    // why the soak stayed green throughout.
+    //
+    // Bounded so a lock-order regression fails instead of hanging CI: the
+    // whole body runs under a timeout, because the fix introduces real
+    // blocking locks on the write path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_page_writers_corrupt_rows_and_indexes() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            concurrent_same_page_writers_body(),
+        )
+        .await
+        .expect("timed out: concurrent same-page writers deadlocked");
+    }
+
+    async fn concurrent_same_page_writers_body() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("churn.db"), catalog.clone()).unwrap());
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, storage));
+
+        run(&ex, "CREATE TABLE churn (id BIGINT PRIMARY KEY, tag TEXT)").await;
+
+        // Low ids are the deleter's; each updater owns a 40-wide high range.
+        const UPDATERS: i64 = 3;
+        const PER_UPDATER: i64 = 40;
+        const DELETABLE: i64 = 120;
+        for id in 0..DELETABLE {
+            run(&ex, &format!("INSERT INTO churn VALUES ({id}, 'seed')")).await;
+        }
+        for w in 0..UPDATERS {
+            for k in 0..PER_UPDATER {
+                let id = 1_000 + w * 1_000 + k;
+                run(&ex, &format!("INSERT INTO churn VALUES ({id}, 'own')")).await;
+            }
+        }
+
+        let mut tasks = Vec::new();
+
+        // The deleter removes rows that sort BEFORE every updater's rows, so
+        // each delete renumbers the scan ordinal of every row they hold.
+        let deleter = ex.clone();
+        tasks.push(tokio::spawn(async move {
+            for id in 0..DELETABLE {
+                let _ = deleter
+                    .execute(&format!("DELETE FROM churn WHERE id = {id}"))
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        }));
+
+        for w in 0..UPDATERS {
+            let updater = ex.clone();
+            tasks.push(tokio::spawn(async move {
+                for round in 0..8 {
+                    for k in 0..PER_UPDATER {
+                        let id = 1_000 + w * 1_000 + k;
+                        // Alternate tag width so some updates fit in place and
+                        // some force the row to move to another slot.
+                        // Alternate tag width so some updates fit in place and
+                        // some force the row through delete_tuple + insert_tuple.
+                        let tag = if round % 2 == 0 {
+                            format!("r{round}")
+                        } else {
+                            "x".repeat(64)
+                        };
+                        let _ = updater
+                            .execute(&format!("UPDATE churn SET tag = '{tag}' WHERE id = {id}"))
+                            .await;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let dupes = run(
+            &ex,
+            "SELECT id FROM churn GROUP BY id HAVING COUNT(*) > 1 LIMIT 8",
+        )
+        .await;
+        assert!(
+            rows(&dupes[0]).is_empty(),
+            "concurrent churn produced duplicate primary keys: {:?}",
+            rows(&dupes[0])
+        );
+
+        // Every id an updater owns must still be there exactly once: a write at
+        // a renumbered position also destroys whichever row it landed on.
+        let survivors = run(&ex, "SELECT COUNT(*) FROM churn").await;
+        assert_eq!(
+            *scalar(&survivors[0]),
+            Value::Int64(UPDATERS * PER_UPDATER),
+            "rows were lost or duplicated by concurrent churn"
+        );
+    }
+
+    /// A DELETE that follows a row-growing UPDATE in the same transaction must
+    /// still delete the row.
+    ///
+    /// `BufferedDiskEngine` replays its buffer op-by-op at COMMIT. The UPDATE
+    /// grows the row past its slot, so `update_at` relocates it — into an
+    /// earlier dead slot if one exists, which is why the prior DELETE below is
+    /// load-bearing. The buffered DELETE still names the original position,
+    /// where `delete_at` finds a dead slot and silently continues. The client
+    /// is told `DELETE 1`, the row survives, and it survives a reopen: on-disk
+    /// data loss from ordinary single-session SQL.
+    #[tokio::test]
+    async fn buffered_delete_after_growing_update_is_not_lost() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("relocate.db"), catalog.clone()).unwrap());
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, storage));
+
+        run(&ex, "CREATE TABLE t (id BIGINT PRIMARY KEY, c TEXT)").await;
+        run(&ex, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").await;
+        // Leaves a dead slot ahead of id=3 for the grown row to relocate into.
+        run(&ex, "DELETE FROM t WHERE id = 2").await;
+
+        run(&ex, "BEGIN").await;
+        run(&ex, "UPDATE t SET c = repeat('q', 2000) WHERE id = 3").await;
+        run(&ex, "DELETE FROM t WHERE id = 3").await;
+        run(&ex, "COMMIT").await;
+
+        let remaining = run(&ex, "SELECT COUNT(*) FROM t WHERE id = 3").await;
+        assert_eq!(
+            *scalar(&remaining[0]),
+            Value::Int64(0),
+            "COMMIT reported the DELETE succeeded but the row is still present"
+        );
+
+        let total = run(&ex, "SELECT COUNT(*) FROM t").await;
+        assert_eq!(
+            *scalar(&total[0]),
+            Value::Int64(1),
+            "only id=1 should remain"
+        );
+    }
+
+    /// The same shape with a second UPDATE instead of a DELETE: the later write
+    /// must win. If the first UPDATE relocates the row, a second UPDATE aimed at
+    /// the original position lands on a dead slot and is silently dropped,
+    /// leaving the *earlier* value behind.
+    #[tokio::test]
+    async fn buffered_update_after_growing_update_keeps_the_later_value() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("relocate2.db"), catalog.clone()).unwrap());
+        let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, storage));
+
+        run(&ex, "CREATE TABLE t (id BIGINT PRIMARY KEY, c TEXT)").await;
+        run(&ex, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").await;
+        run(&ex, "DELETE FROM t WHERE id = 2").await;
+
+        run(&ex, "BEGIN").await;
+        run(&ex, "UPDATE t SET c = repeat('q', 2000) WHERE id = 3").await;
+        run(&ex, "UPDATE t SET c = 'final' WHERE id = 3").await;
+        run(&ex, "COMMIT").await;
+
+        let v = run(&ex, "SELECT c FROM t WHERE id = 3").await;
+        assert_eq!(
+            *scalar(&v[0]),
+            Value::Text("final".into()),
+            "the later UPDATE in the transaction was dropped"
+        );
     }
 }

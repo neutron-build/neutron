@@ -56,14 +56,21 @@ impl Executor {
             if analyze {
                 // EXPLAIN ANALYZE: actually execute the query and report actual rows + time.
                 let start = std::time::Instant::now();
-                let exec_result = self.execute_statement(stmt).await?;
+                // Materialize any streaming result so ANALYZE can report an
+                // actual row count (draining is the honest cost to measure).
+                let exec_result = self.execute_statement(stmt).await?.materialize().await?;
                 let elapsed = start.elapsed();
                 let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
                 let actual_rows = match &exec_result {
                     ExecResult::Select { rows, .. } => rows.len(),
                     ExecResult::Command { rows_affected, .. } => *rows_affected,
-                    ExecResult::CopyOut { row_count, .. } => *row_count,
+                    ExecResult::CopyOut { row_count, .. }
+                    | ExecResult::CopyOutBinary { row_count, .. } => *row_count,
+                    // Materialized just above, so a stream can't reach here.
+                    ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => {
+                        unreachable!("stream materialized before EXPLAIN ANALYZE row count")
+                    }
                 };
 
                 // Build annotated plan text with actual execution stats
@@ -254,6 +261,11 @@ impl Executor {
         // GROUP BY
         let has_group_by = if let ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
             if !exprs.is_empty() {
+                // Reject ungrouped columns / nested aggregates here too — the
+                // plan path (HashAggregate) does not go through
+                // execute_aggregate, so its validator alone would miss grouped
+                // queries.
+                super::aggregate::validate_grouped_projection(&select.projection, exprs)?;
                 let input_rows = plan.estimated_rows();
                 let group_keys: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
                 let distinct_groups = (input_rows / 10).max(1);
@@ -498,7 +510,7 @@ impl Executor {
         where_clause: &Option<Expr>,
     ) -> Result<planner::PlanNode, ExecError> {
         let table_name = match table_factor {
-            TableFactor::Table { name, .. } => name.to_string(),
+            TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
             _ => {
                 return Err(ExecError::Unsupported(
                     "subqueries in FROM not planned yet".into(),
@@ -696,6 +708,418 @@ impl Executor {
     // Plan-driven execution
     // ========================================================================
 
+    /// Streaming producer for the safe scan shape (Phase 1.1 + Phase 2 project/limit).
+    ///
+    /// Returns `Some(SelectStream)` for `SELECT <*|bare columns> FROM <base table>
+    /// [ORDER BY <source cols>] [LIMIT n] [OFFSET m]` — no WHERE / join / GROUP BY
+    /// / HAVING / DISTINCT / FETCH / CTE, and only when the session opted in via
+    /// `SET stream_results = on`. Projection and OFFSET/LIMIT are applied by
+    /// streaming adapters over the scan; a bare-column ORDER BY (without LIMIT) is
+    /// applied by the streaming external sort (spilling under a memory limit).
+    /// Every other shape returns `None` and falls through to the materialized path.
+    ///
+    /// Correctness: this streams `scan_chunked`, which bottoms out in the engine
+    /// `scan()` — recording SIREAD on all visible rows, exactly the read set the
+    /// materialized path records for this (predicate-free) shape. No matched-only
+    /// fast scan is involved, so the read set can only be ≥ conservative, never
+    /// under-recorded. It uses `storage_for(table)` so multi-engine routing and
+    /// per-table column schema match the normal path byte-for-byte.
+    ///
+    /// Called ONLY from the top-level `Statement::Query` dispatch (never the
+    /// reentrant `execute_query`), so a nested subquery/CTE body is never turned
+    /// into a stream — nested consumers require materialized rows.
+    /// Parse a query's `LIMIT`/`OFFSET` for a streaming path: `Ok(Some((skip,
+    /// limit)))` for static integer bounds, `Ok(None)` when a parameter /
+    /// expression / ClickHouse `LIMIT ... BY` bound means the caller must fall
+    /// back to the materialized path. Shared by the streaming scan and streaming
+    /// aggregate producers.
+    #[cfg(feature = "server")]
+    pub(super) fn streaming_limit_offset(
+        &self,
+        query: &ast::Query,
+    ) -> Result<Option<(usize, Option<usize>)>, ExecError> {
+        let parsed = match &query.limit_clause {
+            None => (0, None),
+            Some(ast::LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            }) => {
+                if !limit_by.is_empty() {
+                    return Ok(None); // LIMIT ... BY (ClickHouse) not handled here
+                }
+                let off = match offset {
+                    Some(o) => match self.expr_to_usize(&o.value) {
+                        Ok(n) => n.unwrap_or(0),
+                        Err(_) => return Ok(None),
+                    },
+                    None => 0,
+                };
+                let lim = match limit {
+                    Some(e) => match self.expr_to_usize(e) {
+                        Ok(n) => n,
+                        Err(_) => return Ok(None),
+                    },
+                    None => None,
+                };
+                (off, lim)
+            }
+            Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+                let off = match self.expr_to_usize(offset) {
+                    Ok(n) => n.unwrap_or(0),
+                    Err(_) => return Ok(None),
+                };
+                let lim = match self.expr_to_usize(limit) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(None),
+                };
+                (off, lim)
+            }
+        };
+        Ok(Some(parsed))
+    }
+
+    /// Resolve a SELECT projection for a streaming path over `table_def`: either a
+    /// plain `*` (returns `(all columns, None)` — no narrowing) or a list of bare
+    /// column identifiers / `col AS alias` (returns `(output columns, Some(source
+    /// indices))`). Returns `None` for anything computed (expressions, functions,
+    /// qualified refs, `* EXCEPT/REPLACE/…`, or an unresolved column) so the caller
+    /// falls back to the materialized path. Shared by the streaming scan and
+    /// streaming DISTINCT producers.
+    #[cfg(feature = "server")]
+    pub(super) fn resolve_bare_projection(
+        &self,
+        select: &ast::Select,
+        table_def: &crate::catalog::TableDef,
+    ) -> Option<super::types::StreamProjection> {
+        let is_plain_star = select.projection.len() == 1
+            && matches!(&select.projection[0], SelectItem::Wildcard(opts)
+                if opts.opt_ilike.is_none()
+                    && opts.opt_exclude.is_none()
+                    && opts.opt_except.is_none()
+                    && opts.opt_replace.is_none()
+                    && opts.opt_rename.is_none());
+        if is_plain_star {
+            return Some((
+                table_def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect(),
+                None,
+            ));
+        }
+        let mut cols = Vec::with_capacity(select.projection.len());
+        let mut indices = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            // Accept `col` and `col AS alias`; reject everything else.
+            let (ident, out_alias) = match item {
+                SelectItem::UnnamedExpr(Expr::Identifier(id)) => (id, None),
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Identifier(id),
+                    alias,
+                } => (id, Some(alias.value.clone())),
+                _ => return None,
+            };
+            let idx = table_def
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&ident.value))?;
+            let col = &table_def.columns[idx];
+            // Unaliased output name is the catalog column name (as the materialized
+            // path emits it); an explicit alias overrides it.
+            cols.push((
+                out_alias.unwrap_or_else(|| col.name.clone()),
+                col.data_type.clone(),
+            ));
+            indices.push(idx);
+        }
+        Some((cols, Some(indices)))
+    }
+
+    /// Whether a WHERE predicate is safe to evaluate in the streaming filter.
+    /// Returns `false` if a subquery (`(SELECT …)`, `EXISTS`, `IN (SELECT …)`) is
+    /// reachable through the boolean/comparison structure — its `sync_block_on`
+    /// should not run inside the async wire-drain, and per-row correlated
+    /// evaluation is better left to the materialized path. Recurses through the
+    /// operators a WHERE clause is built from; a subquery buried inside a function
+    /// argument is not reached here and simply isn't declined (still correct — the
+    /// filter would evaluate it, `sync_block_on` being drain-safe — just not the
+    /// clean fall-back). Everything else `eval_where` handles as pure evaluation.
+    #[cfg(feature = "server")]
+    fn where_predicate_streamable(expr: &Expr) -> bool {
+        match expr {
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => false,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::where_predicate_streamable(left) && Self::where_predicate_streamable(right)
+            }
+            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr) | Expr::IsTrue(expr) | Expr::IsFalse(expr)
+            | Expr::IsNotTrue(expr) | Expr::IsNotFalse(expr) => {
+                Self::where_predicate_streamable(expr)
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                Self::where_predicate_streamable(expr)
+                    && Self::where_predicate_streamable(low)
+                    && Self::where_predicate_streamable(high)
+            }
+            Expr::InList { expr, list, .. } => {
+                Self::where_predicate_streamable(expr)
+                    && list.iter().all(Self::where_predicate_streamable)
+            }
+            Expr::Like { expr, pattern, .. }
+            | Expr::ILike { expr, pattern, .. }
+            | Expr::SimilarTo { expr, pattern, .. } => {
+                Self::where_predicate_streamable(expr) && Self::where_predicate_streamable(pattern)
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_none_or(|e| Self::where_predicate_streamable(e))
+                    && conditions.iter().all(|cw| {
+                        Self::where_predicate_streamable(&cw.condition)
+                            && Self::where_predicate_streamable(&cw.result)
+                    })
+                    && else_result
+                        .as_ref()
+                        .is_none_or(|e| Self::where_predicate_streamable(e))
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether an ordered/equality index could serve `pred` on `table` — i.e. the
+    /// predicate references the leading column of some BTree/Hash index. When it
+    /// can, the streaming full-scan filter declines so the materialized path's
+    /// (bounded, faster) index scan runs instead. Best-effort: `collect_column_refs`
+    /// only reaches columns in comparison/boolean positions, which is exactly where
+    /// an index-eligible predicate puts them.
+    #[cfg(feature = "server")]
+    async fn predicate_could_use_index(&self, table: &str, pred: &Expr) -> bool {
+        let mut cols = Vec::new();
+        self.collect_column_refs(pred, &mut cols);
+        if cols.is_empty() {
+            return false;
+        }
+        let referenced: std::collections::HashSet<String> = cols.into_iter().collect();
+        for idx in self.catalog.get_indexes(table).await {
+            if matches!(
+                idx.index_type,
+                crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+            ) && idx
+                .columns
+                .first()
+                .is_some_and(|c| referenced.contains(&c.to_lowercase()))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(feature = "server")]
+    pub(super) async fn try_streaming_scan(
+        &self,
+        query: &ast::Query,
+    ) -> Result<Option<ExecResult>, ExecError> {
+        // RLS queries stay on the fail-closed materialized path.
+        if self.any_rls_active() {
+            return Ok(None);
+        }
+        // Opt-in only — default OFF keeps every existing session materialized.
+        if !self.stream_results_enabled() {
+            return Ok(None);
+        }
+
+        // No CTEs / FETCH. LIMIT/OFFSET are allowed (applied by a streaming
+        // adapter). ORDER BY is allowed ONLY when it has no LIMIT/OFFSET (a full
+        // sort, handled by the streaming external sort below) — ORDER BY + LIMIT
+        // is left to the materialized top-K fast path, which is already bounded
+        // and cheaper than a full sort. The sort keys are validated further down.
+        if query.with.is_some() || query.fetch.is_some() {
+            return Ok(None);
+        }
+        let has_order_by = query.order_by.is_some();
+        if has_order_by && query.limit_clause.is_some() {
+            return Ok(None);
+        }
+
+        let SetExpr::Select(select) = &*query.body else {
+            return Ok(None);
+        };
+
+        // Single base table, no joins, and none of the row-shaping clauses that
+        // this streaming path does not handle (grouping/distinct). A WHERE
+        // predicate IS handled — by a post-scan streaming filter (below) that keeps
+        // the conservative full-relation SIREAD.
+        if select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.having.is_some()
+            || select.distinct.is_some()
+            || !matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let table_name = match &select.from[0].relation {
+            TableFactor::Table {
+                name, alias, args, ..
+            } if alias.is_none() && args.is_none() => crate::sql::object_name_key(name),
+            _ => return Ok(None),
+        };
+        if table_name.is_empty() {
+            return Ok(None);
+        }
+        // A name shadowed by a DML-context CTE (WITH ... INSERT/UPDATE/DELETE)
+        // is not a base table — let the normal path resolve it.
+        if self
+            .current_session()
+            .active_ctes
+            .read()
+            .contains_key(&table_name)
+        {
+            return Ok(None);
+        }
+        // Views/MVs are not base tables — the normal path expands them.
+        if self.views.read().await.contains_key(&table_name)
+            || self
+                .materialized_views
+                .read()
+                .await
+                .contains_key(&table_name)
+        {
+            return Ok(None);
+        }
+        // Unknown table: let the normal path raise the proper error.
+        let Ok(table_def) = self.get_table(&table_name).await else {
+            return Ok(None);
+        };
+
+        // Projection: either a plain `*` (all columns) or a list of bare column
+        // identifiers. Anything computed falls back to the materialized path.
+        let Some((columns, proj_indices)) = self.resolve_bare_projection(select, &table_def) else {
+            return Ok(None);
+        };
+
+        // WHERE: a predicate is streamed by a post-scan filter over the FULL scan
+        // (conservative SIREAD preserved). Decline — leaving it to the materialized
+        // path — when (a) no owning Arc is installed (the filter must hold one to
+        // call eval_where across the wire-drain boundary), (b) the predicate has a
+        // subquery (its sync_block_on should not run inside the async drain), or
+        // (c) an index could serve the predicate (the materialized index scan is
+        // bounded and faster — don't preempt it with a full scan).
+        let where_filter: Option<(std::sync::Arc<Executor>, Expr, Vec<ColMeta>)> =
+            match &select.selection {
+                None => None,
+                Some(pred) => {
+                    let Some(arc) = self.arc_self() else {
+                        return Ok(None);
+                    };
+                    if !Self::where_predicate_streamable(pred) {
+                        return Ok(None);
+                    }
+                    if self.predicate_could_use_index(&table_name, pred).await {
+                        return Ok(None);
+                    }
+                    let col_meta: Vec<ColMeta> = table_def
+                        .columns
+                        .iter()
+                        .map(|c| ColMeta {
+                            table: Some(table_name.clone()),
+                            name: c.name.clone(),
+                            dtype: c.data_type.clone(),
+                        })
+                        .collect();
+                    Some((arc, pred.clone(), col_meta))
+                }
+            };
+
+        // LIMIT / OFFSET: only static integer bounds stream; a parameter or
+        // expression bound falls back to the materialized path.
+        let (skip, limit): (usize, Option<usize>) = match self.streaming_limit_offset(query)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // ORDER BY keys: stream only when every key is a bare column identifier
+        // resolving to a SOURCE column (the sort runs on full source rows, before
+        // projection). Positional / aliased / computed keys and ORDER BY ALL fall
+        // back to the materialized path (which resolves those against the output).
+        let sort_cols: Vec<(usize, bool, bool)> = match &query.order_by {
+            None => Vec::new(),
+            Some(ob) => {
+                let exprs = match &ob.kind {
+                    ast::OrderByKind::Expressions(exprs) => exprs,
+                    ast::OrderByKind::All(_) => return Ok(None),
+                };
+                let mut cols = Vec::with_capacity(exprs.len());
+                for obe in exprs {
+                    if obe.with_fill.is_some() {
+                        return Ok(None); // WITH FILL (ClickHouse) unsupported here
+                    }
+                    let Expr::Identifier(id) = &obe.expr else {
+                        return Ok(None);
+                    };
+                    let Some(idx) = table_def
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&id.value))
+                    else {
+                        return Ok(None);
+                    };
+                    let asc = obe.options.asc.unwrap_or(true);
+                    // SQL default NULLS placement: ASC→LAST, DESC→FIRST.
+                    let nulls_first = obe.options.nulls_first.unwrap_or(!asc);
+                    cols.push((idx, !asc, nulls_first));
+                }
+                cols
+            }
+        };
+
+        // Compose the pipeline: scan -> [WHERE filter] -> [external sort] ->
+        // [OFFSET/LIMIT] -> [projection]. WHERE runs first, on full source rows
+        // (before the sort and before projection narrows columns), matching SQL
+        // evaluation order; ORDER BY excludes LIMIT/OFFSET here (guarded above) so
+        // those adapters never combine with the sort.
+        let storage = self.storage_for(&table_name);
+        let mut source: Box<dyn super::row_batch::RowBatchIter> =
+            Box::new(super::scan_stream::ChunkedScanIter::new(
+                storage,
+                table_name,
+                super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
+            ));
+        if let Some((arc, pred, col_meta)) = where_filter {
+            source = Box::new(super::scan_stream::FilterBatchIter::new(
+                source, arc, pred, col_meta,
+            ));
+        }
+        if !sort_cols.is_empty() {
+            // Per-run byte budget from the session memory limit (u64::MAX =
+            // unlimited → 0 = never spill, a single in-memory run). Spill context
+            // is None when no spill dir is configured (operator stays in memory).
+            let mem_limit = self.query_memory_limit();
+            let run_budget = if mem_limit == u64::MAX { 0 } else { mem_limit };
+            let spill = self.sort_spill_ctx("order_by");
+            source = Box::new(super::external_sort::ExternalSortIter::new(
+                source, sort_cols, run_budget, spill,
+            ));
+        }
+        if skip > 0 || limit.is_some() {
+            source = Box::new(super::scan_stream::LimitBatchIter::new(source, skip, limit));
+        }
+        if let Some(indices) = proj_indices {
+            source = Box::new(super::scan_stream::ProjectBatchIter::new(source, indices));
+        }
+        Ok(Some(ExecResult::SelectStream { columns, source }))
+    }
+
     /// Check if a SELECT query is safe enough for plan-driven execution.
     /// Returns false for subqueries and expression features we still cannot
     /// evaluate correctly in the plan path.
@@ -709,6 +1133,15 @@ impl Executor {
         }
         // No DISTINCT ON (plain DISTINCT is ok)
         if let Some(ast::Distinct::On(_)) = &select.distinct {
+            return false;
+        }
+        // DISTINCT + LIMIT: the plan path executes the plan (which already applies
+        // the Limit — and, with ORDER BY, the Sort) and only THEN dedups the result,
+        // i.e. LIMIT-before-DISTINCT. SQL requires DISTINCT before ORDER BY/LIMIT, so
+        // this would return too few rows (e.g. `SELECT DISTINCT k ... ORDER BY k
+        // LIMIT 6` collapsing 6 equal leading rows to 1). Route to the AST path,
+        // which dedups before ordering/limiting.
+        if select.distinct.is_some() && query.limit_clause.is_some() {
             return false;
         }
         // Projection expressions must be evaluable by the plan path.
@@ -772,7 +1205,7 @@ impl Executor {
                 let base_alias = if let TableFactor::Table { alias, name, .. } = &from.relation {
                     alias
                         .as_ref()
-                        .map(|a| a.name.value.as_str() != name.to_string().as_str())
+                        .map(|a| a.name.value != crate::sql::object_name_key(name))
                         .unwrap_or(false)
                 } else {
                     false
@@ -781,7 +1214,7 @@ impl Executor {
                     if let TableFactor::Table { alias, name, .. } = &j.relation {
                         alias
                             .as_ref()
-                            .map(|a| a.name.value.as_str() != name.to_string().as_str())
+                            .map(|a| a.name.value != crate::sql::object_name_key(name))
                             .unwrap_or(false)
                     } else {
                         false
@@ -978,7 +1411,7 @@ impl Executor {
     pub(super) fn table_factor_names(factor: &TableFactor) -> HashSet<String> {
         let mut names = HashSet::new();
         if let TableFactor::Table { name, alias, .. } = factor {
-            names.insert(name.to_string().to_lowercase());
+            names.insert(crate::sql::object_name_key(name).to_lowercase());
             if let Some(a) = alias {
                 names.insert(a.name.value.to_lowercase());
             }
@@ -997,14 +1430,14 @@ impl Executor {
             } = &twj.relation
                 && a.name.value.to_lowercase() == lower
             {
-                return name.to_string();
+                return crate::sql::object_name_key(name);
             }
             if let TableFactor::Table {
                 name, alias: None, ..
             } = &twj.relation
-                && name.to_string().to_lowercase() == lower
+                && crate::sql::object_name_key(name).to_lowercase() == lower
             {
-                return name.to_string();
+                return crate::sql::object_name_key(name);
             }
             for join in &twj.joins {
                 if let TableFactor::Table {
@@ -1014,7 +1447,7 @@ impl Executor {
                 } = &join.relation
                     && a.name.value.to_lowercase() == lower
                 {
-                    return name.to_string();
+                    return crate::sql::object_name_key(name);
                 }
             }
         }
@@ -1256,13 +1689,13 @@ impl Executor {
         rows: Vec<Row>,
         col_meta: &[ColMeta],
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
-    ) -> Vec<Row> {
+    ) -> Result<Vec<Row>, ExecError> {
         let Some(pushdown_map) = pushdown else {
-            return rows;
+            return Ok(rows);
         };
         let factor_names = Self::table_factor_names(factor);
         if factor_names.is_empty() {
-            return rows;
+            return Ok(rows);
         }
         let mut preds = Vec::new();
         for name in &factor_names {
@@ -1271,10 +1704,10 @@ impl Executor {
             }
         }
         let Some(expr) = Self::combine_predicates(preds) else {
-            return rows;
+            return Ok(rows);
         };
         // Parallel Rayon filter for large sets, serial for small
-        self.parallel_filter(rows, &expr, col_meta)
+        self.try_parallel_filter(rows, &expr, col_meta)
     }
 
     pub(super) async fn try_execute_index_join_for_factor(
@@ -1306,7 +1739,7 @@ impl Executor {
                 args: None,
                 ..
             } => {
-                let table_name = name.to_string();
+                let table_name = crate::sql::object_name_key(name);
                 let label = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -1764,6 +2197,21 @@ impl Executor {
                     range_predicate_expr,
                     ..
                 } => {
+                    // Committed indexes cannot see this transaction's own
+                    // uncommitted writes — bail to the AST/seq-scan path,
+                    // which reads through the session's MVCC snapshot (same
+                    // contract as try_index_scan_sync / try_gin_index_scan).
+                    if self
+                        .current_session()
+                        .txn_state
+                        .try_read()
+                        .map(|t| t.active)
+                        .unwrap_or(true)
+                    {
+                        return Err(ExecError::Unsupported(
+                            "index scan bypassed inside transaction".into(),
+                        ));
+                    }
                     let table_def = self.get_table(table).await?;
                     let meta: Vec<ColMeta> = table_def
                         .columns
@@ -1960,6 +2408,11 @@ impl Executor {
 
                 planner::PlanNode::Sort { input, keys, .. } => {
                     let (meta, mut rows) = self.execute_plan_node(input, cte_tables).await?;
+                    // Bound the in-place sort buffer against the query memory budget
+                    // (held for the duration of the sort). Clean MemoryExceeded
+                    // instead of an OOM when a limit is configured; no-op when
+                    // unlimited (the T1.2 default).
+                    let _sort_mem = self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?;
                     // Parse sort keys: "col_name ASC|DESC [NULLS FIRST|LAST]"
                     for key_str in keys.iter().rev() {
                         // Strip optional NULLS FIRST/LAST suffix
@@ -1988,30 +2441,11 @@ impl Executor {
                         // Default NULLS placement: ASC→NULLS LAST, DESC→NULLS FIRST (SQL standard)
                         let nulls_first = nulls_first.unwrap_or(desc);
                         if let Some(idx) = Self::resolve_plan_col_idx(&meta, col_name) {
+                            // Shared per-key comparison (see helpers::cmp_sort_key)
+                            // so this in-place sort and the streaming external sort
+                            // order rows identically.
                             rows.sort_by(|a, b| {
-                                let a_null = a[idx] == Value::Null;
-                                let b_null = b[idx] == Value::Null;
-                                match (a_null, b_null) {
-                                    (true, true) => std::cmp::Ordering::Equal,
-                                    (true, false) => {
-                                        if nulls_first {
-                                            std::cmp::Ordering::Less
-                                        } else {
-                                            std::cmp::Ordering::Greater
-                                        }
-                                    }
-                                    (false, true) => {
-                                        if nulls_first {
-                                            std::cmp::Ordering::Greater
-                                        } else {
-                                            std::cmp::Ordering::Less
-                                        }
-                                    }
-                                    (false, false) => {
-                                        let cmp = a[idx].cmp(&b[idx]);
-                                        if desc { cmp.reverse() } else { cmp }
-                                    }
-                                }
+                                super::helpers::cmp_sort_key(&a[idx], &b[idx], desc, nulls_first)
                             });
                         }
                     }
@@ -2326,9 +2760,19 @@ impl Executor {
                                 (col_spec.as_str(), None)
                             };
                         if let Some(idx) = Self::resolve_plan_col_idx(&meta, col_name) {
+                            // Output name: alias, else the PostgreSQL default
+                            // for the spec expression ("COUNT(*)" -> "count",
+                            // "t.k" -> "k"); internal plan names keep the full
+                            // expression text so specs resolve unambiguously.
+                            let display = match alias {
+                                Some(a) => a.to_string(),
+                                None => Self::parse_expr_string(col_name)
+                                    .map(|e| super::helpers::default_output_name(&e))
+                                    .unwrap_or_else(|_| meta[idx].name.clone()),
+                            };
                             proj_meta.push(ColMeta {
                                 table: meta[idx].table.clone(),
-                                name: alias.unwrap_or(&meta[idx].name).to_string(),
+                                name: display,
                                 dtype: meta[idx].dtype.clone(),
                             });
                             proj_items.push(ProjItem::ColIdx(idx));
@@ -2355,7 +2799,9 @@ impl Executor {
                                 upstream_dt.unwrap_or_else(|| infer_expr_type(&expr, &meta));
                             proj_meta.push(ColMeta {
                                 table: None,
-                                name: alias.unwrap_or(col_name).to_string(),
+                                name: alias.map(str::to_string).unwrap_or_else(|| {
+                                    super::helpers::default_output_name(&expr)
+                                }),
                                 dtype,
                             });
                             proj_items.push(ProjItem::Expr(Box::new(expr)));
@@ -2398,6 +2844,14 @@ impl Executor {
                     let (right_meta, right_rows) =
                         self.execute_plan_node(right, cte_tables).await?;
 
+                    // Both input sides are held live for the whole nested loop; the
+                    // per-side scan checks are transient, so account the combined
+                    // footprint here.
+                    let _inputs_mem = self.reserve_query_memory(
+                        Self::estimate_rows_bytes(&left_rows)
+                            .saturating_add(Self::estimate_rows_bytes(&right_rows)),
+                    )?;
+
                     // Guard against cartesian explosion.
                     let product = left_rows.len().saturating_mul(right_rows.len());
                     if product > Self::MAX_CROSS_JOIN_ROWS {
@@ -2435,6 +2889,8 @@ impl Executor {
                             }
                         }
                     }
+                    // Peak-check the materialized join output.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&result_rows))?);
                     Ok((combined_meta, result_rows))
                 }
 
@@ -2447,6 +2903,13 @@ impl Executor {
                     let (left_meta, left_rows) = self.execute_plan_node(left, cte_tables).await?;
                     let (right_meta, right_rows) =
                         self.execute_plan_node(right, cte_tables).await?;
+
+                    // Both sides (plus the right-side hash table) are held live for
+                    // the whole join; account the combined input footprint here.
+                    let _inputs_mem = self.reserve_query_memory(
+                        Self::estimate_rows_bytes(&left_rows)
+                            .saturating_add(Self::estimate_rows_bytes(&right_rows)),
+                    )?;
 
                     let mut combined_meta = left_meta.clone();
                     combined_meta.extend(right_meta.clone());
@@ -2497,6 +2960,10 @@ impl Executor {
                                         }
                                     }
                                 }
+                                // Peak-check the materialized join output.
+                                drop(self.reserve_query_memory(Self::estimate_rows_bytes(
+                                    &result_rows,
+                                ))?);
                                 return Ok((combined_meta, result_rows));
                             }
                         }
@@ -2518,6 +2985,8 @@ impl Executor {
                             result_rows.push(combined);
                         }
                     }
+                    // Peak-check the materialized join output.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&result_rows))?);
                     Ok((combined_meta, result_rows))
                 }
 
@@ -3083,14 +3552,49 @@ impl Executor {
             return Some(idx);
         }
 
-        let unqualified = col_spec
-            .trim()
+        // Qualified reference: honour the table part first. Dropping it and
+        // matching by bare column name (the old behavior) silently bound
+        // `users.name` to the first `name` column of a join — a wrong-RESULT
+        // bug whenever two joined tables share a column name.
+        let trimmed = col_spec.trim();
+        if let Some(dot) = trimmed.rfind('.') {
+            let table = trimmed[..dot].trim().trim_matches('"');
+            let col = trimmed[dot + 1..].trim().trim_matches('"');
+            if let Some(idx) = meta.iter().position(|c| {
+                c.name.eq_ignore_ascii_case(col)
+                    && c.table
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(table))
+            }) {
+                return Some(idx);
+            }
+        }
+
+        let unqualified = trimmed
             .split('.')
             .next_back()
             .unwrap_or(col_spec)
             .trim_matches('"');
-        meta.iter()
+        if let Some(idx) = meta
+            .iter()
             .position(|c| c.name.eq_ignore_ascii_case(unqualified))
+        {
+            return Some(idx);
+        }
+
+        // Expression spec vs default-named output column: plan nodes name
+        // aggregate outputs PostgreSQL-style ("count"), while sort/projection
+        // specs carry the stringified expression ("COUNT(*)"). Bridge by
+        // deriving the default output name from the parsed spec.
+        if let Ok(expr) = Self::parse_expr_string(trimmed) {
+            let derived = super::helpers::default_output_name(&expr);
+            if !derived.eq_ignore_ascii_case(trimmed) {
+                return meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&derived));
+            }
+        }
+        None
     }
 
     pub(super) fn resolve_plan_col_idx_for_join_side(
@@ -3151,13 +3655,16 @@ impl Executor {
                 let col_name = parts.last().map(|i| i.value.as_str()).unwrap_or("");
                 if parts.len() >= 2 {
                     let table_qual = parts[parts.len() - 2].value.as_str();
-                    // First try exact table+column match
+                    // First try exact table+column match (a dotted label like
+                    // "pg_catalog.pg_class" also matches its final segment).
                     if let Some(idx) = meta.iter().position(|c| {
                         c.name.eq_ignore_ascii_case(col_name)
-                            && c.table
-                                .as_deref()
-                                .map(|t| t.eq_ignore_ascii_case(table_qual))
-                                .unwrap_or(false)
+                            && c.table.as_deref().is_some_and(|t| {
+                                t.eq_ignore_ascii_case(table_qual)
+                                    || t.rsplit('.')
+                                        .next()
+                                        .is_some_and(|l| l.eq_ignore_ascii_case(table_qual))
+                            })
                     }) {
                         return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
                     }
@@ -3182,7 +3689,8 @@ impl Executor {
                         Ok(Value::Text(n.clone()))
                     }
                 }
-                ast::Value::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
+                ast::Value::SingleQuotedString(s)
+                | ast::Value::EscapedStringLiteral(s) => Ok(Value::Text(s.clone())),
                 ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
                 ast::Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
@@ -3246,6 +3754,31 @@ impl Executor {
                     return result;
                 }
                 match op {
+                    // POSIX regex operators (see expr::eval_regex_match).
+                    ast::BinaryOperator::PGRegexMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, false, false)
+                    }
+                    ast::BinaryOperator::PGRegexNotMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, true, false)
+                    }
+                    ast::BinaryOperator::PGRegexIMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, false, true)
+                    }
+                    ast::BinaryOperator::PGRegexNotIMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, true, true)
+                    }
+                    ast::BinaryOperator::PGCustomBinaryOperator(parts) => {
+                        match parts.last().map(String::as_str) {
+                            Some("~") => super::expr::eval_regex_match(&lv, &rv, false, false),
+                            Some("!~") => super::expr::eval_regex_match(&lv, &rv, true, false),
+                            Some("~*") => super::expr::eval_regex_match(&lv, &rv, false, true),
+                            Some("!~*") => super::expr::eval_regex_match(&lv, &rv, true, true),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "custom operator OPERATOR({})",
+                                parts.join(".")
+                            ))),
+                        }
+                    }
                     ast::BinaryOperator::Eq => {
                         Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Equal)))
                     }
@@ -3431,13 +3964,13 @@ impl Executor {
                 }
                 let val_str = val.to_string();
                 let pat_str = pat.to_string();
-                let esc = escape_char.as_ref().and_then(|v| {
-                    if let ast::Value::SingleQuotedString(s) = v {
-                        s.chars().next()
-                    } else {
-                        None
-                    }
-                });
+                // PostgreSQL's DEFAULT LIKE escape is backslash even with no
+                // explicit ESCAPE clause, so `LIKE 'a\\%b'` matches literal
+                // "a%b". Only `ESCAPE ''` disables escaping.
+                let esc = match escape_char.as_ref() {
+                    Some(ast::Value::SingleQuotedString(s)) => s.chars().next(),
+                    _ => Some('\\'),
+                };
                 let matched = Self::sql_like_match(&val_str, &pat_str, esc, false);
                 Ok(Value::Bool(if *negated { !matched } else { matched }))
             }
@@ -3455,13 +3988,13 @@ impl Executor {
                 }
                 let val_str = val.to_string();
                 let pat_str = pat.to_string();
-                let esc = escape_char.as_ref().and_then(|v| {
-                    if let ast::Value::SingleQuotedString(s) = v {
-                        s.chars().next()
-                    } else {
-                        None
-                    }
-                });
+                // PostgreSQL's DEFAULT LIKE escape is backslash even with no
+                // explicit ESCAPE clause, so `LIKE 'a\\%b'` matches literal
+                // "a%b". Only `ESCAPE ''` disables escaping.
+                let esc = match escape_char.as_ref() {
+                    Some(ast::Value::SingleQuotedString(s)) => s.chars().next(),
+                    _ => Some('\\'),
+                };
                 let matched = Self::sql_like_match(&val_str, &pat_str, esc, true);
                 Ok(Value::Bool(if *negated { !matched } else { matched }))
             }
@@ -3510,18 +4043,15 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_expr_plan(expr, row, meta)?;
-                if matches!(val, Value::Null) {
-                    return Ok(Value::Null);
-                }
-                let mut found = false;
+                let mut items = Vec::with_capacity(list.len());
                 for item in list {
-                    let item_val = self.eval_expr_plan(item, row, meta)?;
-                    if Self::plan_values_cmp(&val, &item_val) == std::cmp::Ordering::Equal {
-                        found = true;
-                        break;
-                    }
+                    items.push(self.eval_expr_plan(item, row, meta)?);
                 }
-                Ok(Value::Bool(if *negated { !found } else { found }))
+                // Full three-valued IN/NOT IN (a NULL in the list makes an
+                // otherwise-false result NULL). The old plan-path loop ignored
+                // NULLs entirely, so `x NOT IN (10, NULL)` wrongly returned
+                // true for non-matching x.
+                Ok(Self::in_three_valued(&val, &items, *negated))
             }
             _ => Ok(Value::Null),
         }
@@ -3643,6 +4173,15 @@ impl Executor {
     /// Cast a Value to the specified SQL data type (best effort for plan path).
     pub(super) fn plan_cast_value(&self, v: Value, target: &ast::DataType) -> Value {
         match target {
+            // See eval_cast: system-catalog name → fixed OID, else NULL.
+            ast::DataType::Regclass => match &v {
+                Value::Text(s) => super::expr::regclass_oid(s)
+                    .map(Value::Int32)
+                    .unwrap_or(Value::Null),
+                Value::Int32(_) => v,
+                Value::Int64(n) => Value::Int32(*n as i32),
+                _ => Value::Null,
+            },
             ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => {
                 match &v {
                     Value::Int32(_) => v,
@@ -3786,7 +4325,7 @@ impl Executor {
                     && let Some((col, _)) = planner::is_equality_predicate(preds[0])
                 {
                     let table_name = match &select.from[0].relation {
-                        TableFactor::Table { name, .. } => name.to_string(),
+                        TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
                         _ => String::new(),
                     };
                     if !table_name.is_empty()
@@ -3897,6 +4436,9 @@ impl Executor {
                             if let Some(ast::Distinct::Distinct) = &select.distinct
                                 && let ExecResult::Select { ref mut rows, .. } = exec_result
                             {
+                                // The dedup set clones every distinct row; bound it.
+                                let _distinct_mem =
+                                    self.reserve_query_memory(Self::estimate_rows_bytes(rows))?;
                                 let mut seen: HashSet<Vec<Value>> = HashSet::new();
                                 rows.retain(|row| seen.insert(row.clone()));
                             }
@@ -3907,8 +4449,8 @@ impl Executor {
             }
 
             // --- AST-based execution fallback ---
-            let order_by = query.order_by;
-            let limit_clause = query.limit_clause;
+            let mut order_by = query.order_by;
+            let mut limit_clause = query.limit_clause;
 
             // Extract DISTINCT info from select body before consuming it
             let distinct_mode = if let SetExpr::Select(ref select) = *query.body {
@@ -3939,6 +4481,33 @@ impl Executor {
                 None => Vec::new(),
             };
 
+            // Plain DISTINCT + LIMIT ordering fix. SQL evaluates SELECT → DISTINCT →
+            // ORDER BY → LIMIT, but the branches below apply ORDER BY/LIMIT before the
+            // DISTINCT dedup pass — so a plain `DISTINCT … LIMIT n` would truncate to n
+            // rows and only then dedup, returning too few (e.g. `DISTINCT k ORDER BY k
+            // LIMIT 6` collapsing six equal leading rows to one). When both are present
+            // for a plain DISTINCT, defer ORDER BY/LIMIT until after dedup (resolving
+            // ORDER BY against the OUTPUT columns, as SQL requires for DISTINCT). Note
+            // `order_by_cols` above is intentionally still derived from the original
+            // ORDER BY so column-dropping fast paths keep the keys they need.
+            // DISTINCT ON is unaffected: its first-row-per-key semantics require the
+            // ORDER BY to run first, which the un-deferred path preserves.
+            let defer_distinct = matches!(&distinct_mode, Some(ast::Distinct::Distinct))
+                && limit_clause.is_some();
+            let (deferred_order, deferred_limit) = if defer_distinct {
+                (order_by.take(), limit_clause.take())
+            } else {
+                (None, None)
+            };
+
+            // Keep the projection for ORDER BY resolution over aggregate
+            // output: columns carry PostgreSQL default names ("upper"), so an
+            // `ORDER BY upper(dept)` key resolves by matching the projection
+            // item's expression text (the source column is gone post-agg).
+            let projection_for_sort: Option<Vec<SelectItem>> = match &*query.body {
+                SetExpr::Select(sel) => Some(sel.projection.clone()),
+                _ => None,
+            };
             let result = self
                 .execute_set_expr(*query.body, &cte_tables, &order_by_cols)
                 .await?;
@@ -3953,7 +4522,14 @@ impl Executor {
                             ref mut rows,
                         } = exec_result
                     {
-                        self.apply_order_by(rows, columns, &ob, None, None, top_k)?;
+                        self.apply_order_by(
+                            rows,
+                            columns,
+                            &ob,
+                            None,
+                            projection_for_sort.as_deref(),
+                            top_k,
+                        )?;
                     }
                     if let Some(lc) = limit_clause
                         && let ExecResult::Select { ref mut rows, .. } = exec_result
@@ -4006,8 +4582,27 @@ impl Executor {
                                     .map(|e| {
                                         let asc = e.options.asc.unwrap_or(true);
                                         let nulls_first = e.options.nulls_first.unwrap_or(!asc);
+                                        // `col_pairs` here are the SOURCE
+                                        // columns — this sort runs before the
+                                        // projection is applied. A positional
+                                        // `ORDER BY 1` names the first OUTPUT
+                                        // column, so it has to be mapped
+                                        // through the SELECT list first:
+                                        // `SELECT b, a FROM w ORDER BY 1` sorted
+                                        // by `a` because ordinal 1 was used as a
+                                        // source index directly. The streaming
+                                        // aggregate path resolves output
+                                        // ordinals correctly, so this also made
+                                        // `SET stream_results = on` silently
+                                        // change row order.
+                                        let resolved_expr =
+                                            Self::order_by_ordinal_to_source_expr(
+                                                &e.expr,
+                                                &projection,
+                                            )
+                                            .unwrap_or_else(|| e.expr.clone());
                                         self.resolve_order_by_expr(
-                                            &e.expr,
+                                            &resolved_expr,
                                             &col_pairs,
                                             Some(&col_meta),
                                             Some(&projection),
@@ -4103,6 +4698,31 @@ impl Executor {
                 }
             }
 
+            // Deferred ORDER BY + LIMIT for plain DISTINCT (applied AFTER dedup, over
+            // the output columns) — see `defer_distinct`. This is the tail of the
+            // SELECT → DISTINCT → ORDER BY → LIMIT pipeline.
+            if defer_distinct
+                && let ExecResult::Select {
+                    ref columns,
+                    ref mut rows,
+                } = exec_result
+            {
+                if let Some(ob) = deferred_order {
+                    let top_k = self.extract_top_k(deferred_limit.as_ref());
+                    self.apply_order_by(
+                        rows,
+                        columns,
+                        &ob,
+                        None,
+                        projection_for_sort.as_deref(),
+                        top_k,
+                    )?;
+                }
+                if let Some(lc) = deferred_limit {
+                    self.apply_limit_offset(rows, &lc)?;
+                }
+            }
+
             Ok(exec_result)
         }) // end Box::pin
     }
@@ -4137,7 +4757,27 @@ impl Executor {
                     let right_result = self.execute_set_expr(*right, cte_tables, &[]).await?;
 
                     let (left_cols, left_rows) = self.select_result_to_rows(left_result)?;
-                    let (_right_cols, right_rows) = self.select_result_to_rows(right_result)?;
+                    let (right_cols, right_rows) = self.select_result_to_rows(right_result)?;
+
+                    // Column-count agreement is required (PostgreSQL: "each
+                    // UNION/INTERSECT/EXCEPT query must have the same number of
+                    // columns"). Without this check, mismatched branches
+                    // produced malformed DataRows and a wire-protocol error
+                    // ("unexpected field count in D message") instead of a
+                    // clean SQL error.
+                    if left_cols.len() != right_cols.len() {
+                        return Err(ExecError::Unsupported(format!(
+                            "each {} query must have the same number of columns ({} vs {})",
+                            match op {
+                                ast::SetOperator::Union => "UNION",
+                                ast::SetOperator::Intersect => "INTERSECT",
+                                ast::SetOperator::Except => "EXCEPT",
+                                _ => "set-operation",
+                            },
+                            left_cols.len(),
+                            right_cols.len()
+                        )));
+                    }
 
                     let all = matches!(
                         set_quantifier,
@@ -4188,6 +4828,8 @@ impl Executor {
                         }
                     };
 
+                    // Peak-check the materialized set-operation output.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&combined_rows))?);
                     Ok(SelectResult::Projected(ExecResult::Select {
                         columns: left_cols,
                         rows: combined_rows,
@@ -4742,7 +5384,7 @@ impl Executor {
         let table_name = match &select.from[0].relation {
             TableFactor::Table {
                 name, args: None, ..
-            } => name.to_string(),
+            } => crate::sql::object_name_key(name),
             _ => return Ok(None),
         };
         // Guard 3: not a CTE
@@ -4843,7 +5485,7 @@ impl Executor {
             };
             let col_label = alias
                 .map(|a| a.value.clone())
-                .unwrap_or_else(|| format!("{expr}"));
+                .unwrap_or_else(|| super::helpers::default_output_name(expr));
 
             match expr {
                 Expr::Function(func) if func.over.is_none() => {
@@ -5629,7 +6271,7 @@ impl Executor {
                 args: None,
                 ..
             } => {
-                let t = name.to_string();
+                let t = crate::sql::object_name_key(name);
                 let l = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -5724,6 +6366,18 @@ impl Executor {
         if col1 != col2 {
             return None;
         }
+        // The coarse `[lo, hi]` range this produces is scanned INCLUSIVELY and
+        // relies on a post-scan recheck to enforce strict (`<` / `>`) bounds. That
+        // recheck is not reliably applied on this two-sided path — it silently
+        // leaked the excluded boundary row (e.g. `a > 0 AND a <= 3` returned rows
+        // with `a = 0`), most visibly under ORDER BY on the (unprojected) range
+        // column. So only take this fast path when BOTH bounds are inclusive
+        // (`>=` / `<=`), which makes the coarse range exactly equal the predicate;
+        // a strict bound falls through to the general per-row filter, which applies
+        // the exact predicate.
+        if Self::is_strict_inequality(left) || Self::is_strict_inequality(right) {
+            return None;
+        }
         // One must be a lower bound and one an upper bound
         if is_lower1 && !is_lower2 {
             Some((col1, val1, val2))
@@ -5732,6 +6386,18 @@ impl Executor {
         } else {
             None
         }
+    }
+
+    /// Whether `expr` is a strict inequality comparison (`<` or `>`) — used to keep
+    /// the inclusive coarse-range fast path off strict bounds it can't represent.
+    fn is_strict_inequality(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::BinaryOp {
+                op: ast::BinaryOperator::Lt | ast::BinaryOperator::Gt,
+                ..
+            }
+        )
     }
 
     /// Extract a single bound from `col >= val`, `col > val`, `col <= val`, `col < val`.
@@ -5882,6 +6548,17 @@ impl Executor {
         order_by_cols: &[String],
     ) -> Option<ExecResult> {
         if self.rls_active(table_name) {
+            return None;
+        }
+        // Committed indexes cannot see this transaction's own uncommitted
+        // writes — same contract as try_index_scan_sync/try_gin_index_scan.
+        if self
+            .current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(true)
+        {
             return None;
         }
         // Only single-table, no-join queries
@@ -6095,6 +6772,20 @@ impl Executor {
         if self.rls_active(table_name) {
             return None;
         }
+        // Inside an explicit transaction the committed index cannot see the
+        // txn's own uncommitted writes — an indexed point lookup right after
+        // an INSERT in the same BEGIN..COMMIT returned nothing (Prisma's
+        // nested-create reload hit exactly this). Fall back to the seq scan,
+        // which reads through the session's MVCC snapshot.
+        if self
+            .current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(true)
+        {
+            return None;
+        }
         let (eq_preds, range_preds, _remaining) = self.extract_index_predicates(where_expr);
         if eq_preds.is_empty() && range_preds.is_empty() {
             return None;
@@ -6227,6 +6918,23 @@ impl Executor {
         cte_tables: &CteTableMap,
         order_by_cols: &[String],
     ) -> Result<SelectResult, ExecError> {
+        // Window functions are not allowed in WHERE / HAVING (PostgreSQL):
+        // they are computed after the row set is chosen, so they cannot filter
+        // it. Reject rather than silently mis-evaluate.
+        if let Some(w) = &select.selection
+            && super::helpers::contains_window_function(w)
+        {
+            return Err(ExecError::Unsupported(
+                "window functions are not allowed in WHERE".into(),
+            ));
+        }
+        if let Some(h) = &select.having
+            && super::helpers::contains_window_function(h)
+        {
+            return Err(ExecError::Unsupported(
+                "window functions are not allowed in HAVING".into(),
+            ));
+        }
         // Expression-only query: SELECT 1, SELECT 'hello', SELECT 1+1
         if select.from.is_empty() {
             return Ok(SelectResult::Projected(
@@ -6257,7 +6965,7 @@ impl Executor {
                 ..
             } = &select.from[0].relation
         {
-            let table_name = name.to_string();
+            let table_name = crate::sql::object_name_key(name);
             let label = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -6286,7 +6994,7 @@ impl Executor {
                 },
             ) = (&select.selection, &select.from[0].relation)
             {
-                let table_name = name.to_string();
+                let table_name = crate::sql::object_name_key(name);
                 let label = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -6321,7 +7029,7 @@ impl Executor {
                         indices.into_iter().map(|i| rows[i].clone()).collect()
                     } else {
                         // Parallel Rayon filter for large sets, serial for small
-                        self.parallel_filter(rows, expr, &col_meta)
+                        self.try_parallel_filter(rows, expr, &col_meta)?
                     }
                 } else {
                     rows
@@ -6359,7 +7067,7 @@ impl Executor {
                             .collect()
                     } else {
                         // Parallel Rayon filter for large sets, serial for small
-                        self.parallel_filter(combined_rows, expr, &col_meta)
+                        self.try_parallel_filter(combined_rows, expr, &col_meta)?
                     }
                 } else {
                     combined_rows
@@ -6373,6 +7081,38 @@ impl Executor {
         // choke point — the plan executor is gated at its own scan sites — so a
         // large GROUP BY/ORDER BY here can't OOM the box.
         drop(self.reserve_query_memory(Self::estimate_rows_bytes(&filtered))?);
+
+        // Set-returning `information_schema._pg_expandarray(arr)` in the
+        // projection (JDBC's getPrimaryKeys/getIndexInfo shape): expand each
+        // input row into one row per array element, materialize the composite
+        // {x: element, n: ordinal} as a synthetic JSON column, and rewrite
+        // every call in the projection to reference it. All calls in one
+        // projection expand in lockstep, matching PostgreSQL for the
+        // identical-argument form these queries use.
+        let mut srf_select_storage;
+        let (select, col_meta, filtered) =
+            if let Some(arg) = find_pg_expandarray_arg(&select.projection) {
+                let mut expanded = Vec::new();
+                for row in &filtered {
+                    let arr = self.eval_row_expr(&arg, row, &col_meta)?;
+                    for (i, elem) in srf_array_elements(&arr).into_iter().enumerate() {
+                        let mut r = row.clone();
+                        r.push(Value::Jsonb(serde_json::json!({"x": elem, "n": i as i64 + 1})));
+                        expanded.push(r);
+                    }
+                }
+                let mut meta = col_meta.clone();
+                meta.push(ColMeta {
+                    table: None,
+                    name: "__pg_expandarray".into(),
+                    dtype: DataType::Jsonb,
+                });
+                srf_select_storage = select.clone();
+                rewrite_pg_expandarray(&mut srf_select_storage.projection);
+                (&srf_select_storage, meta, expanded)
+            } else {
+                (select, col_meta, filtered)
+            };
 
         // Check for window functions
         let has_window = select.projection.iter().any(|item| match item {
@@ -6448,14 +7188,14 @@ impl Executor {
         {
             // Build col_meta for left (from[0]) without loading rows
             let left_table_name = if let TableFactor::Table { name, .. } = &from[0].relation {
-                Some(name.to_string())
+                Some(crate::sql::object_name_key(name))
             } else {
                 None
             };
             let left_label = if let TableFactor::Table { alias: Some(a), .. } = &from[0].relation {
                 a.name.value.clone()
             } else if let TableFactor::Table { name, .. } = &from[0].relation {
-                name.to_string()
+                crate::sql::object_name_key(name)
             } else {
                 String::new()
             };
@@ -6484,7 +7224,7 @@ impl Executor {
                     right_rows0,
                     &right_meta,
                     pushdown,
-                );
+                )?;
 
                 if let Some(join_expr) = Self::combine_predicates(remaining_preds.clone())
                     && let Some((left_keys, right_keys, residual)) =
@@ -6549,7 +7289,7 @@ impl Executor {
         let (mut col_meta, rows0) = self
             .load_table_factor_with_ctes(&first.relation, cte_tables, first_pushdown.as_ref())
             .await?;
-        let mut rows = self.apply_pushdown_for_factor(&first.relation, rows0, &col_meta, pushdown);
+        let mut rows = self.apply_pushdown_for_factor(&first.relation, rows0, &col_meta, pushdown)?;
 
         for join in &first.joins {
             // Check for LATERAL derived table
@@ -6580,7 +7320,7 @@ impl Executor {
                 .load_table_factor_with_ctes(&join.relation, cte_tables, right_pushdown.as_ref())
                 .await?;
             let right_rows =
-                self.apply_pushdown_for_factor(&join.relation, right_rows0, &right_meta, pushdown);
+                self.apply_pushdown_for_factor(&join.relation, right_rows0, &right_meta, pushdown)?;
             let (new_meta, new_rows) = self.execute_join(
                 &col_meta,
                 &rows,
@@ -6598,7 +7338,7 @@ impl Executor {
                 .load_table_factor_with_ctes(&twj.relation, cte_tables, twj_pushdown.as_ref())
                 .await?;
             let right_rows =
-                self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown);
+                self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown)?;
 
             // Optimization: implicit hash join for comma-separated FROM
             // Instead of O(N*M) cross join + filter, try to extract equi-join
@@ -6736,7 +7476,7 @@ impl Executor {
                             join_pushdown.as_ref(),
                         )
                         .await?;
-                    let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown);
+                    let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown)?;
                     let (nm, nr) =
                         self.execute_join(&col_meta, &rows, &jm, &jr, &join.join_operator)?;
                     col_meta = nm;
@@ -6764,7 +7504,7 @@ impl Executor {
                 let (jm, jr0) = self
                     .load_table_factor_with_ctes(&join.relation, cte_tables, join_pushdown.as_ref())
                     .await?;
-                let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown);
+                let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown)?;
                 let (nm, nr) =
                     self.execute_join(&col_meta, &rows, &jm, &jr, &join.join_operator)?;
                 col_meta = nm;
@@ -6787,7 +7527,7 @@ impl Executor {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
-                let table_name = name.to_string();
+                let table_name = crate::sql::object_name_key(name);
                 let alias_str = alias.as_ref().map(|a| a.name.value.clone());
                 let label = alias_str.unwrap_or_else(|| table_name.clone());
 
@@ -6805,7 +7545,16 @@ impl Executor {
                             }
                         })
                         .collect();
-                    return self.execute_table_function(&func_name, &arg_values, &label);
+                    let col_alias = alias
+                        .as_ref()
+                        .and_then(|a| a.columns.first())
+                        .map(|c| c.name.value.clone());
+                    return self.execute_table_function(
+                        &func_name,
+                        &arg_values,
+                        &label,
+                        col_alias.as_deref(),
+                    );
                 }
 
                 // Check CTE first
@@ -6874,6 +7623,42 @@ impl Executor {
                     return Ok(result);
                 }
 
+                // SELECT privilege, checked once for every base-table read and
+                // before the index fast path below, which also returns rows.
+                //
+                // This was previously enforced nowhere on the read path:
+                // `check_privilege` was called for INSERT/UPDATE/DELETE and for
+                // `COPY ... TO`, so a role with no GRANT at all was refused by
+                // COPY and served the same rows by SELECT, while
+                // `has_table_privilege()` reported false. Every table without an
+                // RLS policy was world-readable to any authenticated role.
+                //
+                // Superusers and `bypass_rls` short-circuit inside
+                // `check_privilege`, so the default single-user session is
+                // unaffected; this engages once a session assumes a
+                // non-superuser identity.
+                //
+                // GRANT and RLS are two INDEPENDENT gates, as in PostgreSQL:
+                // SELECT is required to touch the table at all, and policies
+                // then filter within what the grant already allows. A policy can
+                // only ever subtract, so `ENABLE ROW LEVEL SECURITY` with no
+                // policy denies rather than opens.
+                //
+                // Policy-as-access — where a matching policy admitted rows with
+                // no GRANT — was the earlier model. It was abandoned because it
+                // makes the catalog lie: `has_table_privilege()` answers from
+                // GRANT, so it and the engine disagreed, and one over-broad
+                // predicate (a `USING (true)` left from debugging) became global
+                // read where PostgreSQL would still have required a grant. It
+                // cost exactly one test to change, and that test turned out to
+                // be failing on a real bug — RENAME TABLE orphaning grants —
+                // rather than on the semantics.
+                if !self.check_privilege(&table_name, "SELECT").await {
+                    return Err(ExecError::PermissionDenied(format!(
+                        "permission denied for table {table_name}"
+                    )));
+                }
+
                 // For JOIN-aware AST execution, attempt indexed lookup using relation-local
                 // pushdown predicates before falling back to full table scan.
                 if !self.rls_active(&table_name)
@@ -6882,7 +7667,7 @@ impl Executor {
                         self.try_index_scan_sync(&table_name, &label, where_expr)
                 {
                     let filtered_rows = if let Some(ref expr) = remaining_where {
-                        self.parallel_filter(rows, expr, &col_meta)
+                        self.try_parallel_filter(rows, expr, &col_meta)?
                     } else {
                         rows
                     };
@@ -6975,7 +7760,11 @@ impl Executor {
                     })
                     .collect();
 
-                self.execute_table_function(&func_name, &fn_args, &alias_name)
+                let col_alias = alias
+                    .as_ref()
+                    .and_then(|a| a.columns.first())
+                    .map(|c| c.name.value.clone());
+                self.execute_table_function(&func_name, &fn_args, &alias_name, col_alias.as_deref())
             }
             TableFactor::UNNEST {
                 alias, array_exprs, ..
@@ -7081,6 +7870,7 @@ impl Executor {
         name: &str,
         args: &[Value],
         alias: &str,
+        column_alias: Option<&str>,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
         match name {
             "generate_series" => {
@@ -7119,9 +7909,12 @@ impl Executor {
                     ));
                 }
 
+                // PostgreSQL: for a function returning a base type, a column
+                // alias (`g(x)`) or plain table alias (`g`) names the single
+                // output column; bare calls keep the function name.
                 let col_meta = vec![ColMeta {
                     table: Some(alias.into()),
-                    name: "generate_series".into(),
+                    name: column_alias.unwrap_or(alias).into(),
                     dtype: DataType::Int64,
                 }];
 
@@ -7256,7 +8049,21 @@ impl Executor {
             let asc = ob_expr.options.asc.unwrap_or(true);
             // PostgreSQL default: NULLS LAST for ASC, NULLS FIRST for DESC
             let nulls_first = ob_expr.options.nulls_first.unwrap_or(!asc);
-            match self.resolve_order_by_expr(&ob_expr.expr, columns, col_meta, projection) {
+            // A positional `ORDER BY <n>` names the n-th OUTPUT column, but
+            // `columns` here are the SOURCE columns — this sort runs before the
+            // projection is applied. Using the ordinal as a source index made
+            // `SELECT b, a FROM w ORDER BY 1` sort by `a`. Map it through the
+            // SELECT list first; `order_by_ordinal_to_source_expr` declines
+            // (leaving the old path) whenever the mapping is not unambiguous,
+            // such as a wildcard projection.
+            //
+            // The streaming aggregate path resolves output ordinals correctly,
+            // so this mismatch also meant `SET stream_results = on` silently
+            // changed the row order of such queries.
+            let ordinal_mapped = projection
+                .and_then(|proj| Self::order_by_ordinal_to_source_expr(&ob_expr.expr, proj));
+            let effective_expr = ordinal_mapped.as_ref().unwrap_or(&ob_expr.expr);
+            match self.resolve_order_by_expr(effective_expr, columns, col_meta, projection) {
                 Ok(col_idx) => sort_keys.push((SortKey::Column(col_idx), asc, nulls_first)),
                 Err(_) => {
                     // ORDER BY <alias> where the alias names a COMPLEX
@@ -7432,6 +8239,34 @@ impl Executor {
         Ok(())
     }
 
+    /// Translate a positional `ORDER BY <n>` into the SELECT-list expression it
+    /// names, so a caller sorting PRE-projection rows resolves the ordinal
+    /// against output position rather than source position.
+    ///
+    /// Returns `None` when the ordinal cannot be mapped unambiguously — a
+    /// wildcard in the projection, an out-of-range position, or a non-ordinal
+    /// expression — leaving the caller's existing behaviour untouched.
+    pub(super) fn order_by_ordinal_to_source_expr(
+        expr: &Expr,
+        projection: &[SelectItem],
+    ) -> Option<Expr> {
+        let Expr::Value(v) = expr else { return None };
+        let ast::Value::Number(n, _) = &v.value else {
+            return None;
+        };
+        let pos: usize = n.parse().ok()?;
+        if pos == 0 || pos > projection.len() {
+            return None;
+        }
+        match &projection[pos - 1] {
+            SelectItem::UnnamedExpr(e) => Some(e.clone()),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
+            // Wildcards expand to an unknown arity, so position n in the
+            // projection is not position n in the output.
+            _ => None,
+        }
+    }
+
     pub(super) fn resolve_order_by_expr(
         &self,
         expr: &Expr,
@@ -7439,6 +8274,32 @@ impl Executor {
         col_meta: Option<&[ColMeta]>,
         projection: Option<&[SelectItem]>,
     ) -> Result<usize, ExecError> {
+        // A non-column ORDER BY expression that equals an OUTPUT column by its
+        // canonical text — e.g. `ORDER BY upper(dept)` over
+        // `SELECT upper(dept), count(*) ... GROUP BY upper(dept)`. The output
+        // column is named after the expression, but the underlying `dept`
+        // column is gone post-aggregation, so per-row re-evaluation fails and
+        // the sort silently no-ops. Match by canonical text instead.
+        if !matches!(expr, Expr::Identifier(_) | Expr::Value(_)) {
+            let canon = |s: &str| s.replace(char::is_whitespace, "").to_lowercase();
+            let want = canon(&expr.to_string());
+            if let Some(pos) = columns.iter().position(|(name, _)| canon(name) == want) {
+                return Ok(pos);
+            }
+            // Output columns carry PostgreSQL default names ("upper", not
+            // "upper(dept)"), so also match the ORDER BY expression against
+            // the projection items' expression text — position i of the
+            // projection IS output column i (when no wildcard expands).
+            if let Some(proj) = projection
+                && proj.len() == columns.len()
+                && let Some(pos) = proj.iter().position(|item| {
+                    matches!(item, SelectItem::UnnamedExpr(e)
+                        if canon(&e.to_string()) == want)
+                })
+            {
+                return Ok(pos);
+            }
+        }
         match expr {
             Expr::Identifier(ident) => {
                 // First, try direct column name match
@@ -7546,7 +8407,7 @@ impl Executor {
         };
 
         let offset = match offset_expr {
-            Some(expr) => self.expr_to_usize(expr)?,
+            Some(expr) => self.expr_to_usize(expr)?.unwrap_or(0),
             None => 0,
         };
 
@@ -7558,19 +8419,24 @@ impl Executor {
             }
         }
 
-        if let Some(expr) = limit_expr {
-            let limit = self.expr_to_usize(expr)?;
+        if let Some(expr) = limit_expr
+            && let Some(limit) = self.expr_to_usize(expr)?
+        {
             rows.truncate(limit);
         }
 
         Ok(())
     }
 
-    pub(super) fn expr_to_usize(&self, expr: &Expr) -> Result<usize, ExecError> {
+    /// LIMIT/OFFSET operand evaluation. `None` = no bound: Postgres treats
+    /// `LIMIT NULL` as LIMIT ALL and `OFFSET NULL` as OFFSET 0 (Prisma's
+    /// findUnique emits exactly that shape).
+    pub(super) fn expr_to_usize(&self, expr: &Expr) -> Result<Option<usize>, ExecError> {
         let val = self.eval_const_expr(expr)?;
         match val {
-            Value::Int32(n) if n >= 0 => Ok(n as usize),
-            Value::Int64(n) if n >= 0 => Ok(n as usize),
+            Value::Int32(n) if n >= 0 => Ok(Some(n as usize)),
+            Value::Int64(n) if n >= 0 => Ok(Some(n as usize)),
+            Value::Null => Ok(None),
             _ => Err(ExecError::Unsupported(
                 "LIMIT/OFFSET must be non-negative integer".into(),
             )),
@@ -7588,9 +8454,10 @@ impl Executor {
             }
             ast::LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
         };
-        let limit = self.expr_to_usize(limit_expr?).ok()?;
+        let limit = self.expr_to_usize(limit_expr?).ok()??;
         let offset = offset_expr
             .and_then(|e| self.expr_to_usize(e).ok())
+            .flatten()
             .unwrap_or(0);
         // checked_add: a wrapped limit+offset could pass the later `k < rows.len()`
         // check and corrupt the top-K optimization. On overflow, skip top-K.
@@ -8713,7 +9580,9 @@ impl Executor {
                         None
                     }
                 }
-                ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
+                ast::Value::SingleQuotedString(s)
+                | ast::Value::DoubleQuotedString(s)
+                | ast::Value::EscapedStringLiteral(s) => {
                     Some(Value::Text(s.clone()))
                 }
                 ast::Value::Boolean(b) => Some(Value::Bool(*b)),
@@ -9142,5 +10011,77 @@ mod ast_cache_tests {
 
         // The substituted template should produce the same SQL as parsing sql2 directly
         assert_eq!(template[0].to_string(), stmts2[0].to_string());
+    }
+}
+
+// ============================================================================
+// information_schema._pg_expandarray SRF support (JDBC metadata queries)
+// ============================================================================
+
+fn is_pg_expandarray(name: &ast::ObjectName) -> bool {
+    name.0
+        .last()
+        .and_then(|p| p.as_ident())
+        .is_some_and(|i| i.value.eq_ignore_ascii_case("_pg_expandarray"))
+}
+
+/// Find the argument of the first `_pg_expandarray(...)` call anywhere in the
+/// projection (bare, aliased, or inside composite access like `(call).n`).
+pub(super) fn find_pg_expandarray_arg(projection: &[SelectItem]) -> Option<Expr> {
+    use core::ops::ControlFlow;
+    let mut found: Option<Expr> = None;
+    let items = projection.to_vec();
+    let _ = sqlparser::ast::visit_expressions(&items, |e: &Expr| {
+        if found.is_none()
+            && let Expr::Function(f) = e
+            && is_pg_expandarray(&f.name)
+            && let ast::FunctionArguments::List(arg_list) = &f.args
+            && let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg))) =
+                arg_list.args.first()
+        {
+            found = Some(arg.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+/// Replace every `_pg_expandarray(...)` call in the projection with a
+/// reference to the synthetic expansion column.
+pub(super) fn rewrite_pg_expandarray(projection: &mut Vec<SelectItem>) {
+    use core::ops::ControlFlow;
+    let _ = sqlparser::ast::visit_expressions_mut(projection, |e: &mut Expr| {
+        if let Expr::Function(f) = e
+            && is_pg_expandarray(&f.name)
+        {
+            *e = Expr::Identifier(ast::Ident::new("__pg_expandarray"));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Elements of an array value for SRF expansion. pg_index.indkey is an
+/// int2vector rendered as space-separated text; real arrays expand directly.
+pub(super) fn srf_array_elements(v: &Value) -> Vec<serde_json::Value> {
+    match v {
+        Value::Text(s) => s
+            .split_whitespace()
+            .map(|tok| match tok.parse::<i64>() {
+                Ok(n) => serde_json::json!(n),
+                Err(_) => serde_json::json!(tok),
+            })
+            .collect(),
+        Value::Array(items) => items
+            .iter()
+            .map(|it| match it {
+                Value::Int32(n) => serde_json::json!(*n as i64),
+                Value::Int64(n) => serde_json::json!(*n),
+                Value::Float64(f) => serde_json::json!(*f),
+                Value::Bool(b) => serde_json::json!(*b),
+                other => serde_json::json!(other.to_string()),
+            })
+            .collect(),
+        Value::Null => Vec::new(),
+        other => vec![serde_json::json!(other.to_string())],
     }
 }

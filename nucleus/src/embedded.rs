@@ -138,7 +138,35 @@ impl DatabaseBuilder {
             }
         };
 
-        // Register WAL-recovered table schemas in the catalog (synchronous — safe during startup).
+        // Durable modes: restore the persisted catalog FIRST — it carries the
+        // full TableDefs including CONSTRAINTS. The WAL schema records below
+        // only know column names/types, so recovering from them alone
+        // silently dropped PK/UNIQUE/FK enforcement after a reopen.
+        // Catalog sidecar: DurableMvcc ONLY. Its data directory is exclusive
+        // to one database, so catalog.json/sequences.json live inside it and
+        // vanish with it. Disk mode gets NO sidecar: the .ndb file already
+        // persists schemas WITH constraints through the engine's own
+        // directory (verified by the disk recovery suites), and a sidecar
+        // next to the file would be shared by every .ndb in that directory —
+        // one database's tables would leak into another's recovery.
+        #[cfg(feature = "server")]
+        let catalog_path = match self.mode {
+            StorageMode::DurableMvcc(ref d) => Some(d.join("catalog.json")),
+            _ => None,
+        };
+        #[cfg(not(feature = "server"))]
+        let catalog_path: Option<std::path::PathBuf> = None;
+        if let Some(ref cp) = catalog_path {
+            let persistence = crate::storage::persistence::CatalogPersistence::new(cp);
+            if let Err(e) = persistence.load_catalog_sync(&catalog) {
+                return Err(DatabaseError::Storage(format!("catalog load: {e}")));
+            }
+        }
+
+        // Register WAL-recovered table schemas in the catalog (synchronous —
+        // safe during startup). Tables already restored from catalog.json win
+        // (create_table_sync rejects duplicates; the error is ignored) — this
+        // path only fills in tables missing from an absent/older catalog file.
         for (name, columns) in recovered_schemas {
             use crate::catalog::{ColumnDef, TableDef};
             let cols: Vec<ColumnDef> = columns
@@ -148,6 +176,7 @@ impl DatabaseBuilder {
                     data_type: dt,
                     nullable: true,
                     default_expr: None,
+                    id: 0,
                 })
                 .collect();
             let epoch = recovered_epochs.get(&name).copied().unwrap_or(0);
@@ -165,12 +194,16 @@ impl DatabaseBuilder {
             Arc::new(Executor::new_with_persistence(
                 catalog.clone(),
                 storage.clone(),
-                None,
+                catalog_path.clone(),
                 Some(dir.as_path()),
             ))
         } else {
             Arc::new(Executor::new(catalog.clone(), storage.clone()))
         };
+        // Let streaming producers recover an owned Arc across the drain boundary.
+        executor.install_self_ref();
+        executor.warm_table_caches_sync();
+        executor.load_sequences_sync();
         Ok(Database {
             executor,
             _catalog: catalog,
@@ -310,6 +343,13 @@ impl Database {
     /// Cleanly shut down the database, releasing all resources.
     pub fn close(self) {
         drop(self);
+    }
+
+    /// The underlying executor — for administrative flows the SQL surface
+    /// doesn't cover (logical dump/restore, metrics). Most callers should
+    /// stay on `execute`/`query`.
+    pub fn executor(&self) -> &Arc<Executor> {
+        &self.executor
     }
 
     // ========================================================================

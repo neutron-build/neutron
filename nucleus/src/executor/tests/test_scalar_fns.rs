@@ -265,7 +265,8 @@ async fn test_md5() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT MD5('hello')").await;
     match scalar(&results[0]) {
-        Value::Text(s) => assert_eq!(s.len(), 16), // 16 hex chars for u64
+        // Real MD5: 32 lowercase hex chars, matching PostgreSQL's md5().
+        Value::Text(s) => assert_eq!(s, "5d41402abc4b2a76b9719d911017c592"),
         other => panic!("expected Text, got {other:?}"),
     }
 }

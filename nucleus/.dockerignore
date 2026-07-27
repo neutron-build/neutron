@@ -5,3 +5,11 @@ proptest-regressions/
 *.md
 *.json
 *.txt
+# Nested build/dependency trees. `target/` above is root-anchored only, and the
+# ORM compatibility harnesses install npm/pip trees in place.
+**/target/
+**/node_modules/
+**/.venv/
+**/__pycache__/
+compat/orm/*/package-lock.json
+compat/jdbc/*.class

@@ -30,6 +30,16 @@ impl Executor {
     ) -> Result<Value, ExecError> {
         let args = self.extract_fn_args(func, row, col_meta)?;
 
+        // SECURITY ORDERING: strip the schema qualifier BEFORE any policy check
+        // reads the name. psql and ORMs schema-qualify builtin calls
+        // (pg_catalog.array_length, …) and the prefix never changes semantics.
+        // This strip used to sit AFTER the specialty fail-closed guard below,
+        // which made the guard trivially defeatable: `pg_catalog.kv_set(...)`
+        // did not match the "KV_" prefix, sailed past the check, and only THEN
+        // had its prefix removed — so it executed. Every policy decision in this
+        // function must see the same canonical name the dispatcher executes.
+        let fname = fname.strip_prefix("PG_CATALOG.").unwrap_or(fname);
+
         // Specialty stores do not yet carry table-policy metadata. When any
         // RLS policy is active for this principal, allowing their direct SQL
         // functions would create an alternate read/write channel around the
@@ -73,6 +83,14 @@ impl Executor {
             )));
         }
 
+        // Specialty-store writes reach the engine as ordinary `SELECT kv_set(…)`
+        // queries, so the statement-level admission gate cannot see them. Check
+        // the degraded-mode gate here too, or a read-only server would still
+        // accept KV/document/graph/vector writes.
+        if self.service.is_read_only() && super::admission::scalar_fn_mutates(fname) {
+            self.service.admit_write(fname)?;
+        }
+
         match fname {
             // -- String functions --
             "UPPER" => {
@@ -93,10 +111,12 @@ impl Executor {
             }
             "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
                 require_args(fname, &args, 1)?;
+                // Character count, not byte count (PostgreSQL): length('héllo')
+                // is 5, not 6.
                 match &args[0] {
-                    Value::Text(s) => Ok(Value::Int32(s.len() as i32)),
+                    Value::Text(s) => Ok(Value::Int32(s.chars().count() as i32)),
                     Value::Null => Ok(Value::Null),
-                    _ => Ok(Value::Int32(args[0].to_string().len() as i32)),
+                    _ => Ok(Value::Int32(args[0].to_string().chars().count() as i32)),
                 }
             }
             "TRIM" => {
@@ -196,13 +216,28 @@ impl Executor {
                     _ => Err(ExecError::Unsupported("REPLACE requires text args".into())),
                 }
             }
-            "POSITION" | "STRPOS" => {
+            // POSITION(substr IN string) — sqlparser yields args [substr, string].
+            "POSITION" => {
                 require_args(fname, &args, 2)?;
                 match (&args[0], &args[1]) {
                     (Value::Text(substr), Value::Text(s)) => {
-                        let pos = s.find(substr.as_str()).map(|i| i + 1).unwrap_or(0);
-                        Ok(Value::Int32(pos as i32))
+                        let pos = char_index_of(s, substr);
+                        Ok(Value::Int32(pos))
                     }
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    _ => Ok(Value::Int32(0)),
+                }
+            }
+            // strpos(string, substr) — arguments in the OPPOSITE order to
+            // POSITION; sharing the binding returned 0 for every found substr.
+            "STRPOS" => {
+                require_args(fname, &args, 2)?;
+                match (&args[0], &args[1]) {
+                    (Value::Text(s), Value::Text(substr)) => {
+                        let pos = char_index_of(s, substr);
+                        Ok(Value::Int32(pos))
+                    }
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     _ => Ok(Value::Int32(0)),
                 }
             }
@@ -210,8 +245,15 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 match &args[0] {
                     Value::Text(s) => {
-                        let n = value_to_i64(&args[1])? as usize;
-                        Ok(Value::Text(s.chars().take(n).collect()))
+                        let n = value_to_i64(&args[1])?;
+                        let chars: Vec<char> = s.chars().collect();
+                        // Negative n: all but the last |n| characters (PG).
+                        let take = if n >= 0 {
+                            (n as usize).min(chars.len())
+                        } else {
+                            chars.len().saturating_sub((-n) as usize)
+                        };
+                        Ok(Value::Text(chars[..take].iter().collect()))
                     }
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("LEFT requires text".into())),
@@ -221,9 +263,14 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 match &args[0] {
                     Value::Text(s) => {
-                        let n = value_to_i64(&args[1])? as usize;
+                        let n = value_to_i64(&args[1])?;
                         let chars: Vec<char> = s.chars().collect();
-                        let start = chars.len().saturating_sub(n);
+                        // Negative n: all but the first |n| characters (PG).
+                        let start = if n >= 0 {
+                            chars.len().saturating_sub(n as usize)
+                        } else {
+                            ((-n) as usize).min(chars.len())
+                        };
                         Ok(Value::Text(chars[start..].iter().collect()))
                     }
                     Value::Null => Ok(Value::Null),
@@ -580,6 +627,19 @@ impl Executor {
                         let factor = 10f64.powi(decimals);
                         Ok(Value::Float64((n * factor).round() / factor))
                     }
+                    // NUMERIC round is EXACT and half-away-from-zero (PG),
+                    // supporting an optional scale. round(2.5)=3, round(-2.5)=-3.
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| {
+                            Value::Numeric(
+                                d.round_dp_with_strategy(
+                                    decimals.max(0) as u32,
+                                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                                )
+                                .to_string(),
+                            )
+                        })
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("ROUND requires numeric".into())),
@@ -589,6 +649,9 @@ impl Executor {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
                     Value::Float64(n) => Ok(Value::Float64(n.ceil())),
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| Value::Numeric(d.ceil().to_string()))
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("CEIL requires numeric".into())),
@@ -598,6 +661,9 @@ impl Executor {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
                     Value::Float64(n) => Ok(Value::Float64(n.floor())),
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| Value::Numeric(d.floor().to_string()))
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("FLOOR requires numeric".into())),
@@ -697,6 +763,13 @@ impl Executor {
                         let factor = 10f64.powi(decimals);
                         Ok(Value::Float64((n * factor).trunc() / factor))
                     }
+                    Value::Numeric(t) => crate::types::parse_numeric(t)
+                        .map(|d| {
+                            Value::Numeric(
+                                d.trunc_with_scale(decimals.max(0) as u32).to_string(),
+                            )
+                        })
+                        .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("TRUNC requires numeric".into())),
@@ -851,11 +924,13 @@ impl Executor {
                     Ok(args[0].clone())
                 }
             }
+            // GREATEST/LEAST IGNORE NULL arguments (PostgreSQL); only an
+            // all-NULL argument list yields NULL. Propagating NULL was wrong.
             "GREATEST" => {
                 let mut best: Option<Value> = None;
                 for arg in &args {
                     if matches!(arg, Value::Null) {
-                        return Ok(Value::Null);
+                        continue;
                     }
                     best = Some(match best {
                         None => arg.clone(),
@@ -874,7 +949,7 @@ impl Executor {
                 let mut best: Option<Value> = None;
                 for arg in &args {
                     if matches!(arg, Value::Null) {
-                        return Ok(Value::Null);
+                        continue;
                     }
                     best = Some(match best {
                         None => arg.clone(),
@@ -919,10 +994,38 @@ impl Executor {
                 "PostgreSQL 16.0 (Nucleus {} — The Definitive Database)",
                 env!("CARGO_PKG_VERSION")
             ))),
-            "CURRENT_DATABASE" => Ok(Value::Text("nucleus".to_string())),
+            "CURRENT_DATABASE" | "CURRENT_CATALOG" => Ok(Value::Text("nucleus".to_string())),
+            // to_regtype('name') resolves a type name to its OID, NULL when
+            // unknown (psycopg's TypeInfo.fetch probes extension types this
+            // way and treats an empty result as "type not installed").
+            "TO_REGTYPE" => Ok(match args.first() {
+                Some(Value::Text(s)) => super::expr::regtype_oid(s)
+                    .map(Value::Int32)
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            }),
             "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
-            "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER" => {
-                Ok(Value::Text("nucleus".to_string()))
+            // Identity functions report the SESSION's principal, not a fixed
+            // name. PostgreSQL semantics: SESSION_USER is the authenticated
+            // login role and is unaffected by SET ROLE; CURRENT_USER (and its
+            // synonym CURRENT_ROLE) is the effective role. An unauthenticated
+            // embedded session has no login role and keeps the bootstrap
+            // identity.
+            "SESSION_USER" => {
+                let session = self.current_session();
+                let login = session.authenticated_user.read().clone();
+                Ok(Value::Text(login.unwrap_or_else(|| "nucleus".to_string())))
+            }
+            "CURRENT_USER" | "CURRENT_ROLE" => {
+                let session = self.current_session();
+                let effective = session
+                    .current_role
+                    .read()
+                    .clone()
+                    .or_else(|| session.authenticated_user.read().clone());
+                Ok(Value::Text(
+                    effective.unwrap_or_else(|| "nucleus".to_string()),
+                ))
             }
 
             // -- Date/time functions --
@@ -1782,9 +1885,11 @@ impl Executor {
                     Value::Null => return Ok(Value::Null),
                     other => other.to_string(),
                 };
-                // Use FNV-1a hash (fast, non-crypto) formatted as hex
-                let hash = crate::blob::content_hash(text.as_bytes());
-                Ok(Value::Text(format!("{hash:016x}")))
+                // Real MD5 (PostgreSQL's md5() is the cryptographic digest as
+                // 32 lowercase hex chars). The prior FNV-1a stand-in produced
+                // a wrong 16-char value that no client would accept.
+                let digest = md5::compute(text.as_bytes());
+                Ok(Value::Text(format!("{digest:x}")))
             }
             "ENCODE" => {
                 require_args(fname, &args, 2)?;
@@ -1935,6 +2040,60 @@ impl Executor {
 
             // -- PostgreSQL system/catalog functions --
             "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),
+            "CURRENT_SETTING" => {
+                // current_setting(name [, missing_ok]) — session overrides
+                // first, then the same static defaults SHOW reports. Prisma's
+                // schema engine calls this during connection setup.
+                let Some(Value::Text(name)) = args.first() else {
+                    return Err(ExecError::Unsupported(
+                        "current_setting requires a setting name".into(),
+                    ));
+                };
+                let missing_ok = matches!(args.get(1), Some(Value::Bool(true)));
+                let key = name.to_lowercase();
+                let sess = self.current_session();
+                let user_val = sess.settings.read().get(&key).cloned();
+                let value = user_val.or_else(|| {
+                    Some(match key.as_str() {
+                        "server_version" => "16.0 (Nucleus)".into(),
+                        "server_version_num" => "160000".into(),
+                        "server_encoding" | "client_encoding" => "UTF8".into(),
+                        "standard_conforming_strings" => "on".into(),
+                        "timezone" => "UTC".into(),
+                        "datestyle" => "ISO, MDY".into(),
+                        "integer_datetimes" => "on".into(),
+                        "intervalstyle" => "postgres".into(),
+                        "search_path" => "\"$user\", public".into(),
+                        "max_connections" => "100".into(),
+                        "transaction_isolation" | "default_transaction_isolation" => {
+                            "read committed".into()
+                        }
+                        "max_index_keys" => "32".into(),
+                        "lc_collate" => "C".into(),
+                        "lc_ctype" => "en_US.UTF-8".into(),
+                        _ => return None,
+                    })
+                });
+                match value {
+                    Some(v) => Ok(Value::Text(v)),
+                    None if missing_ok => Ok(Value::Null),
+                    None => Err(ExecError::Unsupported(format!(
+                        "unrecognized configuration parameter \"{name}\""
+                    ))),
+                }
+            }
+            "PG_GET_FUNCTIONDEF" => {
+                // Function-definition SQL isn't reconstructable from the
+                // registry's stored body alone; NULL keeps introspection
+                // queries running (they fall back to prosrc).
+                Ok(Value::Null)
+            }
+            "PG_GET_SERIAL_SEQUENCE" => {
+                // No sequence objects exist; NULL matches Postgres for a
+                // column with no owned sequence. ORM introspection (drizzle)
+                // calls this per column to detect serial columns.
+                Ok(Value::Null)
+            }
             "TXID_CURRENT" => Ok(Value::Int64(1)),
             "OBJ_DESCRIPTION" => {
                 // Stub: always returns NULL
@@ -1945,37 +2104,52 @@ impl Executor {
                 Ok(Value::Null)
             }
             "FORMAT_TYPE" => {
-                // Map common PostgreSQL type OIDs to type names
+                // format_type(type_oid[, typmod]) -> SQL display name; psql's
+                // \d uses this for the Type column. Typmod is honoured where
+                // it matters: vector dimension (pgvector encoding) and varchar
+                // length. NULL oid -> NULL.
                 if args.is_empty() {
                     return Err(ExecError::Unsupported(
                         "FORMAT_TYPE requires at least 1 arg".into(),
                     ));
                 }
+                if matches!(args[0], Value::Null) {
+                    return Ok(Value::Null);
+                }
                 let oid = value_to_i64(&args[0])?;
-                let type_name = match oid {
-                    16 => "boolean",
-                    20 => "bigint",
-                    21 => "smallint",
-                    23 => "integer",
-                    25 => "text",
-                    700 => "real",
-                    701 => "double precision",
-                    1043 => "character varying",
-                    1082 => "date",
-                    1114 => "timestamp without time zone",
-                    1184 => "timestamp with time zone",
-                    1700 => "numeric",
-                    2950 => "uuid",
-                    3802 => "jsonb",
-                    17 => "bytea",
-                    1042 => "character",
-                    1005 => "smallint[]",
-                    1007 => "integer[]",
-                    1009 => "text[]",
-                    1016 => "bigint[]",
-                    _ => "unknown",
+                let typmod = match args.get(1) {
+                    Some(Value::Int32(n)) => *n,
+                    Some(Value::Int64(n)) => *n as i32,
+                    _ => -1,
                 };
-                Ok(Value::Text(type_name.to_string()))
+                let type_name = match oid {
+                    16 => "boolean".to_string(),
+                    20 => "bigint".to_string(),
+                    21 => "smallint".to_string(),
+                    23 => "integer".to_string(),
+                    25 => "text".to_string(),
+                    700 => "real".to_string(),
+                    701 => "double precision".to_string(),
+                    1043 if typmod > 4 => format!("character varying({})", typmod - 4),
+                    1043 => "character varying".to_string(),
+                    1082 => "date".to_string(),
+                    1114 => "timestamp without time zone".to_string(),
+                    1184 => "timestamp with time zone".to_string(),
+                    1186 => "interval".to_string(),
+                    1700 => "numeric".to_string(),
+                    2950 => "uuid".to_string(),
+                    3802 => "jsonb".to_string(),
+                    17 => "bytea".to_string(),
+                    1042 => "character".to_string(),
+                    1005 => "smallint[]".to_string(),
+                    1007 => "integer[]".to_string(),
+                    1009 => "text[]".to_string(),
+                    1016 => "bigint[]".to_string(),
+                    16385 if typmod > 0 => format!("vector({typmod})"),
+                    16385 => "vector".to_string(),
+                    _ => "unknown".to_string(),
+                };
+                Ok(Value::Text(type_name))
             }
             "PG_GET_EXPR" => {
                 // Return first arg as text
@@ -1994,8 +2168,22 @@ impl Executor {
             }
             "HAS_TABLE_PRIVILEGE" => {
                 // has_table_privilege(table, privilege) or has_table_privilege(user, table, privilege)
+                // 3-arg form names the principal to test. Answering about the
+                // CALLER instead reported `true` for every table whenever a
+                // superuser asked, so the catalog and the engine disagreed about
+                // who could read what — and this is the function an audit query
+                // would trust.
+                if args.len() >= 3
+                    && let (Value::Text(user), Value::Text(t), Value::Text(p)) =
+                        (&args[0], &args[1], &args[2])
+                {
+                    let priv_upper = p.to_uppercase();
+                    let priv_key = priv_upper.split_whitespace().next().unwrap_or(&priv_upper);
+                    let result =
+                        sync_block_on(self.check_privilege_for_role(user, t, priv_key));
+                    return Ok(Value::Bool(result));
+                }
                 let (table_name, privilege) = if args.len() >= 3 {
-                    // 3-arg form: (user, table, privilege) — ignore user, check current session
                     match (&args[1], &args[2]) {
                         (Value::Text(t), Value::Text(p)) => (t.clone(), p.clone()),
                         _ => return Ok(Value::Bool(true)),
@@ -2078,13 +2266,65 @@ impl Executor {
                 // Always return "nucleus" regardless of OID
                 Ok(Value::Text("nucleus".to_string()))
             }
-            "PG_CATALOG.PG_GET_CONSTRAINTDEF" | "PG_GET_CONSTRAINTDEF" => {
+            "PG_GET_CONSTRAINTDEF" => {
                 // Stub: returns NULL
                 Ok(Value::Null)
             }
-            "PG_CATALOG.PG_GET_INDEXDEF" | "PG_GET_INDEXDEF" => {
-                // Stub: returns NULL
-                Ok(Value::Null)
+            "PG_GET_INDEXDEF" => {
+                // pg_get_indexdef(index_oid[, colno, pretty]) — synthesize the
+                // definition from the catalog (psql's \d parses the part after
+                // "USING" for its Indexes section). Unknown OID -> NULL.
+                let oid = match args.first() {
+                    Some(Value::Int32(n)) => *n as i64,
+                    Some(Value::Int64(n)) => *n,
+                    _ => return Ok(Value::Null),
+                };
+                let tables = sync_block_on(self.catalog.list_tables());
+                let indexes = sync_block_on(self.catalog.get_all_indexes());
+                // Index OIDs are assigned positionally after table OIDs
+                // (16384 + tables.len() + i) — must match pg_class/pg_index.
+                let pos = oid - 16384 - tables.len() as i64;
+                if pos < 0 || pos as usize >= indexes.len() {
+                    return Ok(Value::Null);
+                }
+                let idx = &indexes[pos as usize];
+                let unique = if idx.unique { "UNIQUE " } else { "" };
+                Ok(Value::Text(format!(
+                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
+                    unique,
+                    idx.name,
+                    idx.table_name,
+                    idx.columns.join(", ")
+                )))
+            }
+            "ARRAY_TO_STRING" => {
+                // array_to_string(array, sep [, null_string]) — used by \l on
+                // datacl. NULL array → NULL, matching Postgres.
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(ExecError::Unsupported(
+                        "ARRAY_TO_STRING requires 2 or 3 arguments".into(),
+                    ));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::Null, _) => Ok(Value::Null),
+                    (Value::Array(vals), Value::Text(sep)) => {
+                        let null_str = match args.get(2) {
+                            Some(Value::Text(s)) => Some(s.clone()),
+                            _ => None,
+                        };
+                        let parts: Vec<String> = vals
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Null => null_str.clone(),
+                                other => Some(other.to_string()),
+                            })
+                            .collect();
+                        Ok(Value::Text(parts.join(sep)))
+                    }
+                    _ => Err(ExecError::Unsupported(
+                        "ARRAY_TO_STRING requires (array, text) arguments".into(),
+                    )),
+                }
             }
 
             // -- Array functions --
@@ -2602,9 +2842,15 @@ impl Executor {
                     .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
                 let result = {
                     let mut gs = self.graph_store.write();
-                    execute_cypher(&mut gs, &parsed).map_err(|e| {
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let outcome = execute_cypher(&mut gs, &parsed).map_err(|e| {
                         ExecError::Unsupported(format!("Cypher execution error: {e:?}"))
-                    })?
+                    });
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    outcome?
                 };
                 // Convert CypherResult to a JSON-like text representation.
                 // Format: columns as header, rows as JSON arrays.
@@ -2696,6 +2942,7 @@ impl Executor {
                         estimated, key
                     )));
                 }
+                self.cross_model_touch_kv(&key);
                 self.kv_store.set(&key, value, ttl);
                 Ok(Value::Text("OK".into()))
             }
@@ -2707,6 +2954,7 @@ impl Executor {
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
                 };
+                self.cross_model_touch_kv(&key);
                 let deleted = self.kv_store.del(&key);
                 if deleted {
                     self.memory_allocator.lock().release("kv", key.len() + 96);
@@ -2747,6 +2995,7 @@ impl Executor {
                 } else {
                     1
                 };
+                self.cross_model_touch_kv(&key);
                 match self.kv_store.incr_by(&key, amount) {
                     Ok(v) => Ok(Value::Int64(v)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
@@ -2769,6 +3018,7 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let ttl = val_to_u64(&args[1], "KV_EXPIRE ttl")?;
+                self.cross_model_touch_kv(&key);
                 Ok(Value::Bool(self.kv_store.expire(&key, ttl)))
             }
             "KV_SETNX" => {
@@ -2800,6 +3050,7 @@ impl Executor {
                         estimated
                     )));
                 }
+                self.cross_model_touch_kv(&key);
                 let was_set = self.kv_store.setnx_ttl(&key, args[1].clone(), ttl);
                 if !was_set {
                     // Key already existed, release the reservation
@@ -2816,6 +3067,7 @@ impl Executor {
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
                 };
+                self.cross_model_touch_kv(&key);
                 let deleted = self.kv_store.cdel(&key, &args[1]);
                 if deleted {
                     self.memory_allocator.lock().release("kv", key.len() + 96);
@@ -2833,6 +3085,7 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let ttl = val_to_u64(&args[2], "KV_CEXPIRE ttl")?;
+                self.cross_model_touch_kv(&key);
                 Ok(Value::Bool(self.kv_store.cexpire(&key, &args[1], ttl)))
             }
             "KV_DBSIZE" => {
@@ -2841,6 +3094,7 @@ impl Executor {
             }
             "KV_FLUSHDB" => {
                 // kv_flushdb() → 'OK'
+                self.cross_model_touch_kv_all();
                 self.kv_store.flushdb();
                 Ok(Value::Text("OK".into()))
             }
@@ -3751,14 +4005,22 @@ impl Executor {
                         ));
                     }
                 };
-                self.ts_store.write().insert(
-                    &series,
-                    crate::timeseries::DataPoint {
-                        timestamp: ts,
-                        tags: vec![],
-                        value: val,
-                    },
-                );
+                {
+                    let mut store = self.ts_store.write();
+                    self.cross_model_before_ts(&store);
+                    store.clear_touched();
+                    store.insert(
+                        &series,
+                        crate::timeseries::DataPoint {
+                            timestamp: ts,
+                            tags: vec![],
+                            value: val,
+                        },
+                    );
+                    let touched = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_ts(touched);
+                }
                 Ok(Value::Text("OK".into()))
             }
             "TS_COUNT" => {
@@ -3841,7 +4103,16 @@ impl Executor {
                 };
                 let jv = parse_json_to_doc(&json_text)
                     .map_err(|e| ExecError::Unsupported(format!("DOC_INSERT invalid JSON: {e}")))?;
-                let id = self.doc_store.write().insert(jv);
+                let id = {
+                    let mut store = self.doc_store.write();
+                    self.cross_model_before_doc(&store);
+                    store.clear_touched();
+                    let id = store.insert(jv);
+                    let touched = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_doc(touched);
+                    id
+                };
                 Ok(Value::Int64(id as i64))
             }
             "DOC_UPDATE" => {
@@ -3863,14 +4134,25 @@ impl Executor {
                 if store.get(id).is_none() {
                     return Ok(Value::Bool(false));
                 }
+                self.cross_model_before_doc(&store);
+                store.clear_touched();
                 store.insert_with_id(id, jv);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_doc(touched);
                 Ok(Value::Bool(true))
             }
             "DOC_DELETE" => {
                 // doc_delete(id) → bool (true if the document existed).
                 require_args(fname, &args, 1)?;
                 let id = val_to_u64(&args[0], "DOC_DELETE id")?;
-                let removed = self.doc_store.write().delete(id);
+                let mut store = self.doc_store.write();
+                self.cross_model_before_doc(&store);
+                store.clear_touched();
+                let removed = store.delete(id);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_doc(touched);
                 Ok(Value::Bool(removed))
             }
             "DOC_GET" => {
@@ -3959,13 +4241,7 @@ impl Executor {
                 self.fts_index.write().add_document(doc_id, &text);
                 self.save_fts_index();
                 // Record mutation for potential rollback
-                if let Ok(mut txn) = self.current_session().txn_state.try_write()
-                    && txn.active
-                    && let Some(ref mut cm) = txn.cross_model
-                    && let Some(ref mut fts_log) = cm.fts
-                {
-                    fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
-                }
+                self.cross_model_fts_added(doc_id);
                 Ok(Value::Bool(true))
             }
             "FTS_INDEX_FACETED" => {
@@ -4008,13 +4284,7 @@ impl Executor {
                     .write()
                     .add_document_with_facets(doc_id, &text, facets);
                 self.save_fts_index();
-                if let Ok(mut txn) = self.current_session().txn_state.try_write()
-                    && txn.active
-                    && let Some(ref mut cm) = txn.cross_model
-                    && let Some(ref mut fts_log) = cm.fts
-                {
-                    fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
-                }
+                self.cross_model_fts_added(doc_id);
                 Ok(Value::Bool(true))
             }
             "FTS_REMOVE" => {
@@ -4027,13 +4297,7 @@ impl Executor {
                 }
                 let doc_id = val_to_u64(&args[0], "FTS_REMOVE doc_id")?;
                 // Capture state before removal for potential rollback
-                if let Ok(mut txn) = self.current_session().txn_state.try_write()
-                    && txn.active
-                    && let Some(ref mut cm) = txn.cross_model
-                    && let Some(ref mut fts_log) = cm.fts
-                {
-                    self.fts_index.read().record_remove(fts_log, doc_id);
-                }
+                self.cross_model_fts_removing(doc_id);
                 self.fts_index.write().remove_document(doc_id);
                 self.save_fts_index();
                 self.memory_allocator.lock().release("fts", 64);
@@ -4233,9 +4497,15 @@ impl Executor {
                 } else {
                     None
                 };
-                self.blob_store
-                    .write()
-                    .put(&key, &data, content_type.as_deref());
+                {
+                    let mut store = self.blob_store.write();
+                    self.cross_model_before_blob(&store);
+                    store.clear_touched();
+                    store.put(&key, &data, content_type.as_deref());
+                    let touched = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_blob(touched);
+                }
                 Ok(Value::Bool(true))
             }
             "BLOB_GET" => {
@@ -4271,7 +4541,13 @@ impl Executor {
                         ));
                     }
                 };
-                let removed = self.blob_store.write().delete(&key);
+                let mut store = self.blob_store.write();
+                self.cross_model_before_blob(&store);
+                store.clear_touched();
+                let removed = store.delete(&key);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_blob(touched);
                 Ok(Value::Bool(removed))
             }
             "BLOB_META" => {
@@ -4335,7 +4611,13 @@ impl Executor {
                         ));
                     }
                 };
-                let ok = self.blob_store.write().set_tag(&key, &tag_key, &tag_val);
+                let mut store = self.blob_store.write();
+                self.cross_model_before_blob(&store);
+                store.clear_touched();
+                let ok = store.set_tag(&key, &tag_key, &tag_val);
+                let touched = store.take_touched();
+                drop(store);
+                self.cross_model_after_blob(touched);
                 Ok(Value::Bool(ok))
             }
             "BLOB_LIST" => {
@@ -4391,9 +4673,18 @@ impl Executor {
                 let stmt = parse_cypher(&cypher).map_err(|e| {
                     ExecError::Unsupported(format!("GRAPH_QUERY parse error: {e:?}"))
                 })?;
-                let result = execute_cypher(&mut self.graph_store.write(), &stmt).map_err(|e| {
-                    ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}"))
-                })?;
+                let result = {
+                    let mut gs = self.graph_store.write();
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let outcome = execute_cypher(&mut gs, &stmt).map_err(|e| {
+                        ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}"))
+                    });
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    outcome?
+                };
                 // Serialize result to JSON
                 let cols_json = result
                     .columns
@@ -4442,7 +4733,16 @@ impl Executor {
                 } else {
                     std::collections::BTreeMap::new()
                 };
-                let id = self.graph_store.write().create_node(vec![label], props);
+                let id = {
+                    let mut gs = self.graph_store.write();
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let id = gs.create_node(vec![label], props);
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    id
+                };
                 Ok(Value::Int64(id as i64))
             }
             "GRAPH_ADD_EDGE" => {
@@ -4472,11 +4772,17 @@ impl Executor {
                 } else {
                     std::collections::BTreeMap::new()
                 };
-                match self
-                    .graph_store
-                    .write()
-                    .create_edge(from, to, edge_type, props)
-                {
+                let created = {
+                    let mut gs = self.graph_store.write();
+                    self.cross_model_before_graph(&gs);
+                    gs.clear_touched();
+                    let created = gs.create_edge(from, to, edge_type, props);
+                    let touched = gs.take_touched();
+                    drop(gs);
+                    self.cross_model_after_graph(touched);
+                    created
+                };
+                match created {
                     Some(eid) => Ok(Value::Int64(eid as i64)),
                     None => Ok(Value::Null),
                 }
@@ -4490,7 +4796,14 @@ impl Executor {
                     ));
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_NODE")?;
-                Ok(Value::Bool(self.graph_store.write().delete_node(id)))
+                let mut gs = self.graph_store.write();
+                self.cross_model_before_graph(&gs);
+                gs.clear_touched();
+                let removed = gs.delete_node(id);
+                let touched = gs.take_touched();
+                drop(gs);
+                self.cross_model_after_graph(touched);
+                Ok(Value::Bool(removed))
             }
             "GRAPH_DELETE_EDGE" => {
                 // graph_delete_edge(edge_id) → true/false
@@ -4501,7 +4814,14 @@ impl Executor {
                     ));
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_EDGE")?;
-                Ok(Value::Bool(self.graph_store.write().delete_edge(id)))
+                let mut gs = self.graph_store.write();
+                self.cross_model_before_graph(&gs);
+                gs.clear_touched();
+                let removed = gs.delete_edge(id);
+                let touched = gs.take_touched();
+                drop(gs);
+                self.cross_model_after_graph(touched);
+                Ok(Value::Bool(removed))
             }
             "GRAPH_NEIGHBORS" => {
                 // graph_neighbors(node_id, direction?) → JSON array of {neighbor_id, edge_id, edge_type}
@@ -4701,7 +5021,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_assert(&input) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_assert(&input);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
@@ -4713,7 +5043,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_rule(&input) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_rule(&input);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
@@ -4737,7 +5077,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_retract(&input) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_retract(&input);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
@@ -4749,7 +5099,17 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.datalog_store.write().sql_clear(&pred) {
+                let result = {
+                    let mut store = self.datalog_store.write();
+                    self.cross_model_before_datalog(&store);
+                    store.clear_touched();
+                    let result = store.sql_clear(&pred);
+                    let (touched, rules) = store.take_touched();
+                    drop(store);
+                    self.cross_model_after_datalog(touched, rules);
+                    result
+                };
+                match result {
                     Ok(msg) => Ok(Value::Text(msg)),
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
@@ -5672,4 +6032,17 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         _ => return None,
     };
     Some(dt)
+}
+
+/// 1-based character index of `needle` in `haystack`, or 0 if absent — the
+/// POSITION/strpos return contract. Byte `find` then converted to a char
+/// index so multibyte text reports character positions like PostgreSQL.
+fn char_index_of(haystack: &str, needle: &str) -> i32 {
+    if needle.is_empty() {
+        return 1;
+    }
+    match haystack.find(needle) {
+        Some(byte_idx) => (haystack[..byte_idx].chars().count() + 1) as i32,
+        None => 0,
+    }
 }

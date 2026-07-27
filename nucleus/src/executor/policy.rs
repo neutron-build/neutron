@@ -34,19 +34,31 @@ impl Executor {
                 "USING is not valid for INSERT policies".into(),
             ));
         }
-        let using_predicate = policy
+        let mut using_predicate = policy
             .using
             .as_ref()
             .map(Self::compile_rls_predicate)
             .transpose()?
             .unwrap_or(RlsPredicate::AlwaysTrue);
-        let check_predicate = policy
+        let mut check_predicate = policy
             .with_check
             .as_ref()
             .map(Self::compile_rls_predicate)
             .transpose()?;
         for predicate in std::iter::once(&using_predicate).chain(check_predicate.iter()) {
             Self::validate_rls_columns(predicate, &table_def)?;
+        }
+        // Resolve each referenced column to its stable id, once, here. From now
+        // on the id is what the policy means and the name is a cache: a later
+        // RENAME COLUMN refreshes the name through the id, so the policy keeps
+        // guarding the same column instead of following the old name to
+        // whatever is subsequently created under it.
+        {
+            let resolve = |name: &str| table_def.column_id(name);
+            using_predicate.bind_column_ids(&resolve);
+            if let Some(check) = check_predicate.as_mut() {
+                check.bind_column_ids(&resolve);
+            }
         }
         let target_roles = policy
             .to
@@ -187,10 +199,10 @@ impl Executor {
             normalized.as_str(),
             "current_user" | "session_user" | "current_user()"
         ) {
-            return Ok(RlsPredicate::ColumnEqUser { column });
+            return Ok(RlsPredicate::ColumnEqUser { column, column_id: 0 });
         }
         if normalized.starts_with("current_setting(") && normalized.contains("nucleus.tenant_id") {
-            return Ok(RlsPredicate::ColumnEqTenant { column });
+            return Ok(RlsPredicate::ColumnEqTenant { column, column_id: 0 });
         }
         if let Expr::Value(v) = value_expr {
             let value = match &v.value {
@@ -202,7 +214,7 @@ impl Executor {
                 ast::Value::Boolean(v) => v.to_string(),
                 _ => return Err(Self::unsupported_policy_expr(value_expr)),
             };
-            return Ok(RlsPredicate::ColumnEqStr { column, value });
+            return Ok(RlsPredicate::ColumnEqStr { column, value, column_id: 0 });
         }
         Err(Self::unsupported_policy_expr(value_expr))
     }
@@ -225,8 +237,8 @@ impl Executor {
     ) -> Result<(), ExecError> {
         match predicate {
             RlsPredicate::ColumnEqStr { column, .. }
-            | RlsPredicate::ColumnEqTenant { column }
-            | RlsPredicate::ColumnEqUser { column } => {
+            | RlsPredicate::ColumnEqTenant { column, .. }
+            | RlsPredicate::ColumnEqUser { column, .. } => {
                 if table.column_index(column).is_none() {
                     return Err(ExecError::ColumnNotFound(column.clone()));
                 }

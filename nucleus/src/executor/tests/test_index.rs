@@ -49,6 +49,48 @@ async fn test_hnsw_incremental_update_moves_row() {
     );
 }
 
+/// `SET hnsw.ef_search` (pgvector-compatible) and `SET hnsw_ef_search` are the
+/// per-session recall/latency dial for HNSW KNN scans. On small data every ef
+/// returns the exact top-k, so this asserts the setting path parses, threads
+/// through the index scan without error, and never changes correctness —
+/// including an absurd value (clamped) and a non-numeric one (ignored).
+#[tokio::test]
+async fn test_hnsw_ef_search_session_setting() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE efs (id INT PRIMARY KEY, v VECTOR(3))").await;
+    exec(
+        &ex,
+        "INSERT INTO efs VALUES (1, VECTOR('[1,0,0]')), (2, VECTOR('[0,1,0]')), \
+         (3, VECTOR('[0,0,1]')), (4, VECTOR('[0.9,0.1,0]')), (5, VECTOR('[0.8,0.2,0]'))",
+    )
+    .await;
+    exec(&ex, "CREATE INDEX efs_v ON efs USING hnsw (v)").await;
+
+    let top = |r: &[ExecResult]| -> Option<i32> {
+        rows(&r[0]).first().and_then(|row| match row.first() {
+            Some(Value::Int32(n)) => Some(*n),
+            _ => None,
+        })
+    };
+    let knn = "SELECT id FROM efs ORDER BY VECTOR_DISTANCE(v, VECTOR('[1,0,0]'), 'l2') ASC LIMIT 2";
+
+    // pgvector spelling, small-but-valid ef.
+    exec(&ex, "SET hnsw.ef_search = 4").await;
+    assert_eq!(top(&exec(&ex, knn).await), Some(1), "ef=4 must still find the exact NN");
+
+    // Underscore spelling, generous ef.
+    exec(&ex, "SET hnsw_ef_search = 256").await;
+    assert_eq!(top(&exec(&ex, knn).await), Some(1), "ef=256 must find the exact NN");
+
+    // Absurd value is clamped, not an error.
+    exec(&ex, "SET hnsw.ef_search = 999999999").await;
+    assert_eq!(top(&exec(&ex, knn).await), Some(1), "huge ef must clamp and still work");
+
+    // Non-numeric value is ignored (falls back to the configured default).
+    exec(&ex, "SET hnsw.ef_search = 'not_a_number'").await;
+    assert_eq!(top(&exec(&ex, knn).await), Some(1), "bad ef must fall back, not break KNN");
+}
+
 // ================================================================
 // B-tree range index scan tests
 // ================================================================

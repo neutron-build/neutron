@@ -40,6 +40,11 @@ pub(crate) type CteTableMap = HashMap<String, (Vec<ColMeta>, Vec<Row>)>;
 /// Result of column projection: column names+types paired with rows.
 pub(crate) type ProjectedResult = Result<(Vec<(String, DataType)>, Vec<Row>), ExecError>;
 
+/// A resolved streaming projection: the output columns (name + type) and, for a
+/// bare-column list, the source column indices to narrow each row to (`None` for
+/// a plain `*`, which needs no narrowing). Produced by `resolve_bare_projection`.
+pub(crate) type StreamProjection = (Vec<(String, DataType)>, Option<Vec<usize>>);
+
 /// Index predicate extraction: (equalities, range predicates, remaining expr).
 pub(crate) type IndexPredicates = (
     Vec<(String, Value)>,
@@ -299,6 +304,11 @@ impl GlobalPreparedCache {
         } else {
             None
         }
+    }
+
+    /// Clear every cached prepared statement.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 
     /// Insert a prepared statement. Evicts the least-accessed entry if full.
