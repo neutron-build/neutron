@@ -1,4 +1,4 @@
-import { getCollection, getEntry } from "@neutron-build/core/content";
+import { getCollection, getEntry, renderEntry } from "@neutron-build/core/content";
 
 export const config = { mode: "static" };
 
@@ -21,9 +21,13 @@ export async function loader({
     throw new Response("Not found", { status: 404 });
   }
 
+  // Markdown bodies render lazily, so entry.html is "" — the markup has to
+  // come from renderEntry().
+  const { html } = await renderEntry(entry);
+
   return {
     title: entry.data.title as string,
-    html: entry.html,
+    html,
   };
 }
 

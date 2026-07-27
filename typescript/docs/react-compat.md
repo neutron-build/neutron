@@ -17,7 +17,7 @@ Recommended default:
 Set runtime mode in `neutron.config.ts`:
 
 ```ts
-import { defineConfig } from "neutron";
+import { defineConfig } from "@neutron-build/core";
 
 export default defineConfig({
   runtime: "react-compat",

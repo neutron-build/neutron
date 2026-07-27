@@ -1,4 +1,4 @@
-import { getCollection, getEntry } from "@neutron-build/core/content";
+import { getCollection, getEntry, renderEntry } from "@neutron-build/core/content";
 import { extractToc } from "@neutron-build/core";
 import { calculateReadingTime } from "@neutron-build/core";
 import { Toc } from "../../components/Toc";
@@ -22,7 +22,11 @@ export async function loader({ params }: { params: Record<string, string> }) {
   const entry = await getEntry("docs", slug);
   if (!entry) throw new Response("Not found", { status: 404 });
 
-  const toc = extractToc(entry.html);
+  // Markdown/MDX bodies render lazily — `entry.html` is always "" for markdown,
+  // so the markup must be produced via renderEntry() before extracting the TOC
+  // or returning it to the component. See docs/content-collections.md.
+  const { html } = await renderEntry(entry);
+  const toc = extractToc(html);
   const readingTime = calculateReadingTime(entry.body);
 
   const docs = await getCollection("docs");
@@ -34,7 +38,7 @@ export async function loader({ params }: { params: Record<string, string> }) {
   return {
     title: entry.data.title,
     description: entry.data.description,
-    html: entry.html,
+    html,
     slug,
     toc,
     readingTime,

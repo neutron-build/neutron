@@ -1,4 +1,4 @@
-import { getCollection, getEntry } from "@neutron-build/core";
+import { getCollection, getEntry, renderEntry } from "@neutron-build/core";
 
 // Read from the loader data (already computed at build time) rather than
 // calling getEntry here — an async head() that imports the content runtime
@@ -20,7 +20,9 @@ export async function getStaticPaths() {
 
 export async function loader({ params }: { params: { slug: string } }) {
   const post = await getEntry('blog', params.slug);
-  const { html } = await post.render();
+  // render() resolves to { Content } only — destructuring html here left
+  // every post body undefined. renderEntry() returns the markup itself.
+  const { html } = await renderEntry(post);
   const { title, description, pubDate, author, tags } = post.data;
 
   const formattedDate = pubDate.toLocaleDateString('en-US', {

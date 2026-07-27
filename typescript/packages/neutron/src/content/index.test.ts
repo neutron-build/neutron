@@ -8,6 +8,7 @@ import {
   getCollection,
   getEntry,
   prepareContentCollections,
+  renderEntry,
   setActiveMarkdownConfig,
   __renderCacheStatsForTest,
   __resetRenderCacheForTest,
@@ -227,6 +228,73 @@ describe("content collections", () => {
     expect(third.length).toBe(first.length);
 
     setActiveMarkdownConfig(undefined);
+  });
+
+  it("renderEntry returns rendered HTML for a markdown entry without memoizing onto the entry", async () => {
+    const root = await makeFixtureProject();
+    process.chdir(root);
+
+    const nested = await getEntry("blog", "guides/intro");
+    expect(nested).toBeTruthy();
+
+    // Sanity: the entry starts with an empty html field (lazy rendering).
+    expect(nested!.html).toBe("");
+
+    const { html } = await renderEntry(nested!);
+    // Real markup — the body's heading and its slugified id are present.
+    expect(html).toContain("Nested guide");
+    expect(html).toContain('id="nested-guide"');
+
+    // The contract from N-006: renderEntry does NOT memoize onto the entry.
+    // A static build relies on this so the whole collection's HTML does not
+    // re-accumulate in memory. The eager `html` field stays empty.
+    expect(nested!.html).toBe("");
+
+    // Re-rendering still works and returns identical markup — the bounded
+    // content-addressed render cache serves it, not the entry.
+    const again = await renderEntry(nested!);
+    expect(again.html).toBe(html);
+  });
+
+  it("renderEntry returns rendered HTML for an MDX entry", async () => {
+    const root = await makeFixtureProject();
+    process.chdir(root);
+
+    const hello = await getEntry("blog", "hello-world");
+    expect(hello).toBeTruthy();
+    expect(hello!.html).toBe("");
+
+    const { html } = await renderEntry(hello!);
+    // MDX expression output ({2}) is evaluated, and slugified heading ids
+    // match the plain-markdown path.
+    expect(html).toContain("Hello world");
+    expect(html).toContain("2");
+    expect(html).toContain('id="hello-world"');
+
+    // Same no-memoization contract.
+    expect(hello!.html).toBe("");
+  });
+
+  it("renderEntry output matches the docs template's loader data shape", async () => {
+    // Type-level check that the data shape produced by switching the docs
+    // template's loader to renderEntry() — `const { html } = await renderEntry(entry)`
+    // — is assignable to the `html: string` field the template's component
+    // declares on its `data` prop. This is the regression guard for N-003:
+    // the template's data shape must still type-check after the switch.
+    const root = await makeFixtureProject();
+    process.chdir(root);
+    const entry = await getEntry("blog", "guides/intro");
+    const { html } = await renderEntry(entry!);
+
+    // Mirrors the relevant slice of DocPage's `data` prop type.
+    type DocPageData = { title: string; html: string; slug: string };
+    const data: DocPageData = {
+      title: (entry!.data as { title: string }).title,
+      html,
+      slug: entry!.slug,
+    };
+    expect(data.html).toBe(html);
+    expect(typeof data.html).toBe("string");
   });
 });
 
