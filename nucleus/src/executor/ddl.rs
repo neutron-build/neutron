@@ -111,6 +111,47 @@ impl Executor {
         }
     }
 
+    /// Rewrite a renamed column everywhere the durable engine sidecar names it.
+    ///
+    /// `TableEngineMeta` records ORDER BY, the version column, and the aggregate
+    /// column lists as NAMES, in `engines.json`. Nothing rewrote them on RENAME
+    /// COLUMN, so the stale name survived a restart and the MergeTree/columnar
+    /// engine kept ordering and de-duplicating against a column that no longer
+    /// existed. Table rename was already handled (`rename_override_engine`);
+    /// column rename was not.
+    pub(super) fn rename_engine_meta_column(&self, table: &str, old: &str, new: &str) {
+        if self.data_dir.is_none() {
+            return;
+        }
+        let mut metas = self.load_engines_meta();
+        let Some(meta) = metas.get_mut(table) else {
+            return;
+        };
+        let mut changed = false;
+        let swap = |slot: &mut String| {
+            if slot == old {
+                *slot = new.to_string();
+                return true;
+            }
+            false
+        };
+        for column in &mut meta.order_by {
+            changed |= swap(column);
+        }
+        for column in &mut meta.sum_columns {
+            changed |= swap(column);
+        }
+        for column in &mut meta.count_columns {
+            changed |= swap(column);
+        }
+        if let Some(version) = meta.version_column.as_mut() {
+            changed |= swap(version);
+        }
+        if changed {
+            self.save_engines_meta(&metas);
+        }
+    }
+
     pub(super) fn record_table_engine(&self, table: &str, meta: TableEngineMeta) {
         if self.data_dir.is_none() {
             return;
@@ -2218,6 +2259,49 @@ impl Executor {
                     }
                     self.btree_indexes
                         .remove(&(table_name.clone(), old_column_name.value.clone()));
+
+                    // Derived-index registries key their entries by column NAME.
+                    //
+                    // Measured, not assumed: entries backed by a catalog
+                    // IndexDef are ALREADY repaired, because the index rewrite
+                    // above drops and recreates them under the new name — a
+                    // regression test with this block disabled still passes.
+                    // This is therefore belt-and-braces, kept because it makes
+                    // the invariant explicit rather than incidental to the
+                    // drop/recreate path, and covers any entry that has no
+                    // catalog index behind it. It is not a fix for an observed
+                    // defect, and should not be described as one.
+                    for entry in self.vector_indexes.write().values_mut() {
+                        if entry.table_name == table_name
+                            && entry.column_name == old_column_name.value
+                        {
+                            entry.column_name = new_column_name.value.clone();
+                        }
+                    }
+                    for entry in self.encrypted_indexes.write().values_mut() {
+                        if entry.table_name == table_name
+                            && entry.column_name == old_column_name.value
+                        {
+                            entry.column_name = new_column_name.value.clone();
+                        }
+                    }
+                    for entry in self.gin_indexes.write().values_mut() {
+                        if entry.table_name == table_name
+                            && entry.column_name == old_column_name.value
+                        {
+                            entry.column_name = new_column_name.value.clone();
+                        }
+                    }
+
+                    // MergeTree/columnar engine metadata is DURABLE (engines.json)
+                    // and names its columns, so a stale entry survives restart —
+                    // ORDER BY, the version column, and the aggregate column
+                    // lists would all keep naming a column that no longer exists.
+                    self.rename_engine_meta_column(
+                        &table_name,
+                        &old_column_name.value,
+                        &new_column_name.value,
+                    );
 
                     // Refresh every policy predicate that names this column,
                     // matched by the column's STABLE ID rather than by its old

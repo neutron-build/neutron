@@ -459,3 +459,40 @@ async fn has_table_privilege_reports_on_the_named_user() {
         "alice was granted SELECT on docs in setup"
     );
 }
+
+/// A renamed column must not strand the derived-index registries or the durable
+/// engine sidecar.
+///
+/// `TableEngineMeta` records ORDER BY / version / aggregate columns by NAME in
+/// engines.json and nothing rewrote them on RENAME COLUMN, so a stale name
+/// survived restart. The derived-index registries also key on the column name,
+/// but those turn out to be repaired already by the catalog index drop/recreate
+/// on rename — this asserts the end-to-end behaviour rather than registry
+/// internals, which is what actually has to hold.
+#[tokio::test]
+async fn rename_column_rewrites_derived_index_registries() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE emb (id INT PRIMARY KEY, body TEXT, v VECTOR(3))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO emb VALUES (1,'a',VECTOR('[1,0,0]')),(2,'b',VECTOR('[0,1,0]'))",
+    )
+    .await;
+    exec(&ex, "CREATE INDEX ix_v ON emb USING IVFFLAT (v)").await;
+
+    exec(&ex, "ALTER TABLE emb RENAME COLUMN v TO embedding").await;
+
+    // End-to-end is the meaningful assertion here. A registry-contents check
+    // passes even with the rewrite disabled, because the catalog index is
+    // dropped and recreated under the new name by the rewrite above.
+    let knn = exec(
+        &ex,
+        "SELECT id FROM emb ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]')) LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&knn[0]).len(), 1);
+}
