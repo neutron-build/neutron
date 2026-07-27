@@ -428,6 +428,15 @@ importers:
         specifier: ^5.7.2
         version: 5.9.3
 
+  packages/neutron-mcp:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.7
+        version: 22.19.11
+      typescript:
+        specifier: ^5.7.2
+        version: 5.7.2
+
   packages/neutron-nucleus:
     optionalDependencies:
       pg:
