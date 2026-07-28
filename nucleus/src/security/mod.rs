@@ -80,6 +80,71 @@ pub enum PolicyCommand {
     All,
 }
 
+/// Ordering comparison available to a row-security predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CmpOp {
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    NotEq,
+}
+
+impl CmpOp {
+    /// The SQL spelling, used when rendering a policy back to DDL.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            CmpOp::Lt => "<",
+            CmpOp::LtEq => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::GtEq => ">=",
+            CmpOp::NotEq => "<>",
+        }
+    }
+
+    /// The same test with the operands swapped, so `100 < amount` compiles to
+    /// the same predicate as `amount > 100`.
+    pub fn flipped(self) -> Self {
+        match self {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::LtEq => CmpOp::GtEq,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::GtEq => CmpOp::LtEq,
+            CmpOp::NotEq => CmpOp::NotEq,
+        }
+    }
+
+    fn admits(self, ordering: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering;
+        match self {
+            CmpOp::Lt => ordering == Ordering::Less,
+            CmpOp::LtEq => ordering != Ordering::Greater,
+            CmpOp::Gt => ordering == Ordering::Greater,
+            CmpOp::GtEq => ordering != Ordering::Less,
+            CmpOp::NotEq => ordering != Ordering::Equal,
+        }
+    }
+}
+
+/// Compare two rendered cell values the way the policy author meant.
+///
+/// The RLS row map is stringly-typed, so `"10" < "9"` would hold under a plain
+/// lexical compare and a policy like `amount > 100` would admit rows it must
+/// not. Both sides are therefore parsed as numbers first and compared
+/// numerically when both parse; anything else (text, dates, uuids) falls back to
+/// a lexical compare, which is the right order for those. Dates and timestamps
+/// render ISO-8601, so lexical order is chronological order for them too.
+fn compare_cells(left: &str, right: &str) -> std::cmp::Ordering {
+    if let (Ok(l), Ok(r)) = (left.parse::<f64>(), right.parse::<f64>()) {
+        // Both numeric: NaN cannot appear from a parsed literal, so a total
+        // order over the parsed values is safe.
+        if let Some(ordering) = l.partial_cmp(&r) {
+            return ordering;
+        }
+    }
+    left.cmp(right)
+}
+
 /// A predicate that can be evaluated against a row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RlsPredicate {
@@ -99,6 +164,28 @@ pub enum RlsPredicate {
     /// Column must equal the session's user.
     ColumnEqUser {
         column: String,
+        #[serde(default)]
+        column_id: u32,
+    },
+    /// Column ordered against a constant (`<`, `<=`, `>`, `>=`, `<>`).
+    ColumnCmp {
+        column: String,
+        op: CmpOp,
+        value: String,
+        #[serde(default)]
+        column_id: u32,
+    },
+    /// Column must be one of a constant list (`IN`).
+    ColumnInList {
+        column: String,
+        values: Vec<String>,
+        #[serde(default)]
+        column_id: u32,
+    },
+    /// Column `IS NULL`, or `IS NOT NULL` when `negated`.
+    ColumnIsNull {
+        column: String,
+        negated: bool,
         #[serde(default)]
         column_id: u32,
     },
@@ -145,6 +232,21 @@ impl RlsPredicate {
             | RlsPredicate::ColumnEqUser {
                 column,
                 column_id: id,
+            }
+            | RlsPredicate::ColumnCmp {
+                column,
+                column_id: id,
+                ..
+            }
+            | RlsPredicate::ColumnInList {
+                column,
+                column_id: id,
+                ..
+            }
+            | RlsPredicate::ColumnIsNull {
+                column,
+                column_id: id,
+                ..
             } => {
                 if *id == column_id && column != new_name {
                     *column = new_name.to_string();
@@ -187,6 +289,21 @@ impl RlsPredicate {
             | RlsPredicate::ColumnEqUser {
                 column,
                 column_id: id,
+            }
+            | RlsPredicate::ColumnCmp {
+                column,
+                column_id: id,
+                ..
+            }
+            | RlsPredicate::ColumnInList {
+                column,
+                column_id: id,
+                ..
+            }
+            | RlsPredicate::ColumnIsNull {
+                column,
+                column_id: id,
+                ..
             } => {
                 if let Some(resolved) = resolve(column) {
                     *id = resolved;
@@ -210,7 +327,10 @@ impl RlsPredicate {
         match self {
             RlsPredicate::ColumnEqStr { column_id, .. }
             | RlsPredicate::ColumnEqTenant { column_id, .. }
-            | RlsPredicate::ColumnEqUser { column_id, .. } => {
+            | RlsPredicate::ColumnEqUser { column_id, .. }
+            | RlsPredicate::ColumnCmp { column_id, .. }
+            | RlsPredicate::ColumnInList { column_id, .. }
+            | RlsPredicate::ColumnIsNull { column_id, .. } => {
                 if *column_id != 0 {
                     out.push(*column_id);
                 }
@@ -232,7 +352,10 @@ impl RlsPredicate {
         match self {
             RlsPredicate::ColumnEqStr { column, .. }
             | RlsPredicate::ColumnEqTenant { column, .. }
-            | RlsPredicate::ColumnEqUser { column, .. } => out.push(column.clone()),
+            | RlsPredicate::ColumnEqUser { column, .. }
+            | RlsPredicate::ColumnCmp { column, .. }
+            | RlsPredicate::ColumnInList { column, .. }
+            | RlsPredicate::ColumnIsNull { column, .. } => out.push(column.clone()),
             RlsPredicate::And(a, b) | RlsPredicate::Or(a, b) => {
                 a.referenced_column_names(out);
                 b.referenced_column_names(out);
@@ -256,6 +379,22 @@ impl RlsPredicate {
                 }
             }
             RlsPredicate::ColumnEqUser { column, .. } => row.get(column) == Some(&ctx.user),
+            // A NULL column is ABSENT from the map, so `get` yields None and
+            // every comparison below denies. That is SQL's rule — a comparison
+            // with NULL is unknown, and unknown never grants — and it is the
+            // fail-closed direction, so a row whose guarded column is NULL is
+            // withheld rather than leaked.
+            RlsPredicate::ColumnCmp {
+                column, op, value, ..
+            } => row
+                .get(column)
+                .is_some_and(|cell| op.admits(compare_cells(cell, value))),
+            RlsPredicate::ColumnInList { column, values, .. } => row
+                .get(column)
+                .is_some_and(|cell| values.iter().any(|candidate| candidate == cell)),
+            RlsPredicate::ColumnIsNull {
+                column, negated, ..
+            } => row.contains_key(column) == *negated,
             RlsPredicate::HasRole { role } => ctx.has_role(role),
             RlsPredicate::And(a, b) => a.evaluate(row, ctx) && b.evaluate(row, ctx),
             RlsPredicate::Or(a, b) => a.evaluate(row, ctx) || b.evaluate(row, ctx),
@@ -1278,6 +1417,96 @@ mod tests {
         let row = make_row(&[("id", "1")]);
         // Superuser bypasses RLS
         assert!(engine.check_row("orders", PolicyCommand::Select, &row, &ctx));
+    }
+
+    #[test]
+    fn comparison_predicate_orders_numerically_not_lexically() {
+        // The trap this exists to avoid: "9" > "100" holds lexically, but
+        // 9 > 100 does not. A lexical compare would ADMIT a row the policy
+        // excludes, so the numeric path is a security property, not a nicety.
+        let predicate = RlsPredicate::ColumnCmp {
+            column: "amount".into(),
+            op: CmpOp::Gt,
+            value: "100".into(),
+            column_id: 0,
+        };
+        let ctx = SessionContext::new("u");
+        assert!(predicate.evaluate(&make_row(&[("amount", "200")]), &ctx));
+        assert!(!predicate.evaluate(&make_row(&[("amount", "9")]), &ctx));
+        assert!(!predicate.evaluate(&make_row(&[("amount", "100")]), &ctx));
+    }
+
+    #[test]
+    fn comparison_and_in_list_deny_a_null_column() {
+        // A NULL cell is ABSENT from the row map. SQL says a comparison with
+        // NULL is unknown, and unknown never grants — so every form denies.
+        let ctx = SessionContext::new("u");
+        let null_row = make_row(&[("id", "1")]);
+
+        for op in [CmpOp::Lt, CmpOp::LtEq, CmpOp::Gt, CmpOp::GtEq, CmpOp::NotEq] {
+            let predicate = RlsPredicate::ColumnCmp {
+                column: "amount".into(),
+                op,
+                value: "100".into(),
+                column_id: 0,
+            };
+            assert!(
+                !predicate.evaluate(&null_row, &ctx),
+                "{op:?} must not admit a row whose column is NULL"
+            );
+        }
+
+        let in_list = RlsPredicate::ColumnInList {
+            column: "amount".into(),
+            values: vec!["1".into(), "2".into()],
+            column_id: 0,
+        };
+        assert!(!in_list.evaluate(&null_row, &ctx));
+    }
+
+    #[test]
+    fn is_null_predicate_reads_absence() {
+        let ctx = SessionContext::new("u");
+        let present = make_row(&[("region", "eu")]);
+        let missing = make_row(&[("id", "1")]);
+
+        let is_null = RlsPredicate::ColumnIsNull {
+            column: "region".into(),
+            negated: false,
+            column_id: 0,
+        };
+        assert!(is_null.evaluate(&missing, &ctx));
+        assert!(!is_null.evaluate(&present, &ctx));
+
+        let is_not_null = RlsPredicate::ColumnIsNull {
+            column: "region".into(),
+            negated: true,
+            column_id: 0,
+        };
+        assert!(is_not_null.evaluate(&present, &ctx));
+        assert!(!is_not_null.evaluate(&missing, &ctx));
+    }
+
+    #[test]
+    fn in_list_and_text_comparison_use_the_right_order() {
+        let ctx = SessionContext::new("u");
+        let in_list = RlsPredicate::ColumnInList {
+            column: "region".into(),
+            values: vec!["eu".into(), "us".into()],
+            column_id: 0,
+        };
+        assert!(in_list.evaluate(&make_row(&[("region", "eu")]), &ctx));
+        assert!(!in_list.evaluate(&make_row(&[("region", "apac")]), &ctx));
+
+        // Non-numeric operands keep lexical order, which is what text wants.
+        let text_cmp = RlsPredicate::ColumnCmp {
+            column: "region".into(),
+            op: CmpOp::Lt,
+            value: "m".into(),
+            column_id: 0,
+        };
+        assert!(text_cmp.evaluate(&make_row(&[("region", "eu")]), &ctx));
+        assert!(!text_cmp.evaluate(&make_row(&[("region", "us")]), &ctx));
     }
 
     #[test]
