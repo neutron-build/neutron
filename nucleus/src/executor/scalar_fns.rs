@@ -77,6 +77,16 @@ impl Executor {
                     | "SUBSCRIBE"
                     | "UNSUBSCRIBE"
             );
+        // The text-search functions collide with the time-series `TS_` prefix
+        // without belonging to any specialty store: they are pure computations
+        // over the arguments they are handed, reaching no keyspace the secured
+        // relational path does not already cover. Gating them denied the
+        // PostgreSQL-compatible spelling of a plain expression under RLS.
+        let specialty_surface = specialty_surface
+            && !matches!(
+                fname,
+                "TS_MATCH" | "TS_RANK" | "TS_HEADLINE" | "FTS_RANK"
+            );
         if specialty_surface && self.any_rls_active() {
             return Err(ExecError::PermissionDenied(format!(
                 "{fname} is unavailable while row-level security is active because this specialty-store surface has no policy-aware access path"
@@ -1683,6 +1693,49 @@ impl Executor {
                     }
                 }
                 Ok(Value::Float64(score))
+            }
+            "BM25" => {
+                // BM25(column, query) → relevance of this row's text under the
+                // corpus statistics of the FTS index on `column`.
+                //
+                // Scoring is row-local: every input except N, avgdl, and one
+                // document frequency per query term comes from the row itself,
+                // so the index supplies a handful of numbers and the score needs
+                // no plumbing through the executor. The per-row cost is
+                // dominated by tokenizing the row's text, not by the lookup.
+                require_args(fname, &args, 2)?;
+                let (Value::Text(text), Value::Text(query)) = (&args[0], &args[1]) else {
+                    if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    return Err(ExecError::Unsupported(
+                        "BM25 requires (text column, query text)".into(),
+                    ));
+                };
+                let (qualifier, column) = Self::fn_arg_column_ref(func, 0).ok_or_else(|| {
+                    ExecError::Unsupported(
+                        "BM25's first argument must be a column reference, because the \
+                         corpus statistics are read from that column's FTS index"
+                            .into(),
+                    )
+                })?;
+                // An unqualified column resolves through the row's own metadata,
+                // so `BM25(body, …)` works without spelling out the table.
+                let table = qualifier.or_else(|| {
+                    col_meta
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(&column))
+                        .and_then(|c| c.table.clone())
+                });
+                let stats = self
+                    .fts_stats_for_column(table.as_deref(), &column, query)
+                    .ok_or_else(|| {
+                        ExecError::Unsupported(format!(
+                            "BM25 requires a full-text index on '{column}': \
+                             CREATE INDEX ON <table> USING FTS ({column})"
+                        ))
+                    })?;
+                Ok(Value::Float64(crate::fts::bm25_score(text, &stats)))
             }
             "TO_TSVECTOR" => {
                 require_args(fname, &args, 1)?;
@@ -5885,6 +5938,29 @@ impl Executor {
     }
 
     /// Extract function arguments as evaluated Values.
+    /// The `(qualifier, column)` a function argument names, when that argument
+    /// is a plain column reference. Used by functions whose meaning depends on
+    /// *which* column was passed, not only on the value it evaluated to.
+    pub(super) fn fn_arg_column_ref(
+        func: &ast::Function,
+        idx: usize,
+    ) -> Option<(Option<String>, String)> {
+        let ast::FunctionArguments::List(list) = &func.args else {
+            return None;
+        };
+        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = list.args.get(idx)? else {
+            return None;
+        };
+        match expr {
+            ast::Expr::Identifier(id) => Some((None, id.value.clone())),
+            ast::Expr::CompoundIdentifier(parts) if parts.len() >= 2 => Some((
+                Some(parts[parts.len() - 2].value.clone()),
+                parts[parts.len() - 1].value.clone(),
+            )),
+            _ => None,
+        }
+    }
+
     pub(super) fn extract_fn_args(
         &self,
         func: &ast::Function,
@@ -6029,6 +6105,7 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         "FTS_SEARCH" | "FTS_FUZZY_SEARCH" | "FTS_SEARCH_FILTER" => DataType::Text,
         "FTS_DOC_COUNT" | "FTS_TERM_COUNT" => DataType::Int64,
         "FTS_MATCH" => DataType::Bool,
+        "BM25" => DataType::Float64,
         _ => return None,
     };
     Some(dt)

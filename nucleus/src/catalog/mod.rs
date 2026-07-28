@@ -180,6 +180,9 @@ pub enum IndexType {
     Gist,
     /// R-tree index (spatial data).
     Rtree,
+    /// Full-text index over a TEXT column: BM25 corpus statistics plus a
+    /// postings map, maintained by DML like any other index on the table.
+    Fts,
 }
 
 impl fmt::Display for IndexType {
@@ -192,6 +195,7 @@ impl fmt::Display for IndexType {
             IndexType::Gin => write!(f, "GIN"),
             IndexType::Gist => write!(f, "GIST"),
             IndexType::Rtree => write!(f, "RTREE"),
+            IndexType::Fts => write!(f, "FTS"),
         }
     }
 }

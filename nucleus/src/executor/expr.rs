@@ -532,12 +532,25 @@ impl Executor {
                 | ast::BinaryOperator::Multiply
                 | ast::BinaryOperator::Divide
                 | ast::BinaryOperator::Modulo
-                | ast::BinaryOperator::StringConcat => return Ok(Value::Null),
+                | ast::BinaryOperator::StringConcat
+                | ast::BinaryOperator::AtAt => return Ok(Value::Null),
                 _ => {}
             }
         }
         // Comparison operators work across all comparable types
         match op {
+            // Full-text match: `text @@ 'query'` is true when the text contains
+            // every query term, matching PostgreSQL's
+            // `to_tsvector(text) @@ plainto_tsquery(query)`. Defined row-locally
+            // so it is correct with or without an FTS index on the column.
+            ast::BinaryOperator::AtAt => {
+                let (Value::Text(text), Value::Text(query)) = (left, right) else {
+                    return Err(ExecError::Unsupported(
+                        "@@ requires text operands: `column @@ 'query'`".into(),
+                    ));
+                };
+                return Ok(Value::Bool(crate::fts::text_matches(text, query)));
+            }
             ast::BinaryOperator::Eq => {
                 return Ok(Value::Bool(
                     compare_values(left, right) == Some(Ordering::Equal),
