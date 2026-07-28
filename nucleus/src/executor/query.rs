@@ -1359,6 +1359,15 @@ impl Executor {
             Expr::IsNull(inner) | Expr::IsNotNull(inner) => Self::expr_has_unsupported(inner),
             // Simple identifiers and values are fine
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => false,
+            // Typed literals (`TIMESTAMP '…'`, `DATE '…'`, `UUID '…'`) are
+            // constants, not features. Excluding them sent every query with a
+            // temporal literal in its WHERE down the AST path, which silently
+            // gave up the plan path's index range scan: a bounded time window
+            // over an indexed TIMESTAMP column full-scanned the table while the
+            // identical query over a BIGINT epoch column used the index. Only
+            // safe because `eval_expr_plan` now evaluates them — a supported
+            // marker without an evaluator arm returns NULL and drops every row.
+            Expr::TypedString(_) => false,
             // Anything else we don't recognize — skip plan execution
             _ => true,
         }
@@ -3642,6 +3651,12 @@ impl Executor {
         meta: &[ColMeta],
     ) -> Result<Value, ExecError> {
         match expr {
+            // Typed literals carry no row dependency, so the general evaluator
+            // is reused rather than reimplemented here. Two evaluators over the
+            // same expressions is how `TIMESTAMP '…'` came to mean one thing in
+            // a projection and another in a WHERE clause; the shared call is the
+            // point, not a shortcut.
+            Expr::TypedString(_) => self.eval_row_expr(expr, row, meta),
             Expr::Identifier(ident) => {
                 let name = ident.value.as_str();
                 if let Some(idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
