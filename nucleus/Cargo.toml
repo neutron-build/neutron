@@ -131,6 +131,11 @@ path = "src/bin/compete.rs"
 required-features = ["bench-tools"]
 
 [[bin]]
+name = "compete_vector"
+path = "src/bin/compete_vector.rs"
+required-features = ["bench-tools"]
+
+[[bin]]
 name = "stress"
 path = "src/bin/stress.rs"
 required-features = ["server"]

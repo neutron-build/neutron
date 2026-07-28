@@ -106,7 +106,7 @@ pub enum VectorDist {
 /// Generate `n` vectors under `dist`. For `Clustered`, points are drawn around
 /// `n/50`-ish centres with Gaussian jitter (sd 0.10) so within-cluster nearest
 /// neighbours are unambiguous — the structure real embeddings have.
-fn gen_vectors(rng: &mut Rng, n: usize, dim: usize, dist: VectorDist) -> Vec<Vector> {
+pub fn gen_vectors(rng: &mut Rng, n: usize, dim: usize, dist: VectorDist) -> Vec<Vector> {
     match dist {
         VectorDist::Uniform => (0..n).map(|_| rand_vector(rng, dim)).collect(),
         VectorDist::Clustered => {
@@ -126,7 +126,7 @@ fn gen_vectors(rng: &mut Rng, n: usize, dim: usize, dist: VectorDist) -> Vec<Vec
 
 /// Draw a query from the same distribution as the corpus, so recall is measured
 /// in-distribution (an out-of-distribution query is a different, easier check).
-fn gen_query(rng: &mut Rng, dim: usize, dist: VectorDist, corpus: &[Vector]) -> Vector {
+pub fn gen_query(rng: &mut Rng, dim: usize, dist: VectorDist, corpus: &[Vector]) -> Vector {
     match dist {
         VectorDist::Uniform => rand_vector(rng, dim),
         VectorDist::Clustered => {
