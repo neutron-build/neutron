@@ -2336,11 +2336,29 @@ impl Executor {
                             Self::extract_equality_value(key_expr)
                         });
                         if let Some(val) = key_val {
-                            // For non-PK equality scans with many expected rows, prefer
-                            // fast_scan_where_eq which has better cache locality than
-                            // cloning from the index BTreeMap. For PK/unique lookups
-                            // (estimated_rows ≤ 10), use O(log N) index lookup instead.
-                            if *estimated_rows > 10
+                            // For an unselective equality, a sequential scan can beat
+                            // cloning scattered rows out of the index BTreeMap. The
+                            // crossover is a FRACTION of the table, though, not an
+                            // absolute row count — and `estimated_rows` is
+                            // `row_count * selectivity`, where selectivity defaults to
+                            // 10% for any column ANALYZE has not measured
+                            // (`TableStats::equality_selectivity`). So the old
+                            // `> 10` test really read "this table has more than ~100
+                            // rows", and every indexed equality lookup above that size
+                            // silently degraded to an O(n) scan. The only columns that
+                            // kept using their index were the ones whose engine
+                            // `fast_scan_where_eq` is unimplemented and returns None.
+                            //
+                            // Requiring the estimate to be a third of the table keeps
+                            // the sequential path for genuinely low-cardinality columns
+                            // (measured by ANALYZE) while the 10% default never trips
+                            // it. When the row count is unavailable, prefer the index:
+                            // O(log n + k) is the safe choice under uncertainty.
+                            let unselective = self
+                                .storage_for(table)
+                                .fast_count_all(table)
+                                .is_some_and(|total| total > 0 && estimated_rows * 3 >= total);
+                            if unselective
                                 && let Some((col_name, _)) =
                                     planner::is_equality_predicate(key_expr)
                                 && let Some(col_idx) = table_def
