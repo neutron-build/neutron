@@ -1368,6 +1368,14 @@ impl Executor {
             // safe because `eval_expr_plan` now evaluates them — a supported
             // marker without an evaluator arm returns NULL and drops every row.
             Expr::TypedString(_) => false,
+            // `INTERVAL '5 minutes'` is likewise a constant, and `eval_expr_plan`
+            // has evaluated it all along — only this list disagreed. Omitting it
+            // excluded the canonical dashboard predicate
+            // (`ts >= <bound> - INTERVAL '1 hour'`) from plan execution, so a
+            // bounded time window full-scanned purely because of how its upper
+            // bound was spelled. Recurse so an unsupported inner expression is
+            // still caught.
+            Expr::Interval(interval) => Self::expr_has_unsupported(&interval.value),
             // Anything else we don't recognize — skip plan execution
             _ => true,
         }
