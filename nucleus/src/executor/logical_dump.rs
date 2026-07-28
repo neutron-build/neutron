@@ -366,6 +366,26 @@ fn render_rls_predicate(p: &RlsPredicate) -> String {
             format!("{column} = current_setting('nucleus.tenant_id')")
         }
         RlsPredicate::ColumnEqUser { column, .. } => format!("{column} = CURRENT_USER"),
+        // Every constant is re-emitted quoted. The compiler reads a quoted
+        // number back as its digits, which is exactly what the row map holds,
+        // so `amount > 100` round-trips to the same comparison — while a value
+        // that merely looks numeric stays intact instead of being mangled.
+        RlsPredicate::ColumnCmp {
+            column, op, value, ..
+        } => format!("{column} {} {}", op.as_sql(), quote_str(value)),
+        RlsPredicate::ColumnInList { column, values, .. } => {
+            let rendered: Vec<String> = values.iter().map(|v| quote_str(v)).collect();
+            format!("{column} IN ({})", rendered.join(", "))
+        }
+        RlsPredicate::ColumnIsNull {
+            column, negated, ..
+        } => {
+            if *negated {
+                format!("{column} IS NOT NULL")
+            } else {
+                format!("{column} IS NULL")
+            }
+        }
         RlsPredicate::HasRole { role } => format!("has_role({})", quote_str(role)),
         RlsPredicate::And(a, b) => format!(
             "({} AND {})",

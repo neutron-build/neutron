@@ -45,8 +45,23 @@ through Raft before they are applied.
 
 Supported policy expressions deliberately compile to a small auditable predicate representation:
 boolean constants, `NOT`, `AND`, `OR`, equality between a column and a string/number/boolean,
-`CURRENT_USER`/`SESSION_USER`, `current_setting('nucleus.tenant_id')`, and `has_role('role')`.
+`CURRENT_USER`/`SESSION_USER`, `current_setting('nucleus.tenant_id')`, `has_role('role')`,
+ordering comparison between a column and a literal (`<`, `<=`, `>`, `>=`, `<>`),
+`column IN (literal, …)`, and `column IS [NOT] NULL`.
 Unsupported expressions are rejected instead of being accepted without enforcement.
+
+Two properties of the comparison forms are load-bearing rather than incidental:
+
+- **Comparison is numeric when both sides are numeric.** The predicate row map is
+  stringly-typed, so a lexical compare would make `"9" > "100"` hold and admit a
+  row that `amount > 100` excludes. Non-numeric operands keep lexical order,
+  which is also chronological order for the ISO-8601 date and timestamp forms.
+- **A NULL column denies every comparison.** NULL is represented by absence from
+  the predicate row map, never by the string `"NULL"` — which is what the text
+  value `'NULL'` also renders to, and which would compare greater than most
+  numbers lexically. `IS NULL` reads that absence; every other form denies,
+  matching SQL's rule that a comparison with NULL is unknown and unknown never
+  grants.
 
 ## Enforcement semantics
 

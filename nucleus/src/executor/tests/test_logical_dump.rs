@@ -455,3 +455,52 @@ async fn logical_dump_reports_what_it_cannot_express() {
     assert_eq!(gaps.len(), 1, "the column mask must be reported, got {gaps:?}");
     assert_eq!(gaps[0].kind, "masking_policy");
 }
+
+/// A policy using the ordering / IN / IS NULL predicate forms must survive a
+/// dump and restore with its meaning intact. The renderer and the compiler are
+/// separate code paths, so a mismatch here would silently widen a policy on
+/// restore rather than fail — the dump would replay, just guarding less.
+#[tokio::test]
+async fn dump_round_trips_comparison_in_list_and_null_predicates() {
+    let src = test_executor();
+    exec(
+        &src,
+        "CREATE TABLE ledger (id INT PRIMARY KEY, amount INT, region TEXT)",
+    )
+    .await;
+    exec(
+        &src,
+        "INSERT INTO ledger VALUES (1, 9, 'eu'), (2, 200, 'us'), (3, 100, NULL)",
+    )
+    .await;
+    exec(&src, "CREATE ROLE auditor LOGIN PASSWORD 'auditor-secret'").await;
+    exec(&src, "GRANT SELECT ON ledger TO auditor").await;
+    exec(
+        &src,
+        "CREATE POLICY tight ON ledger FOR SELECT TO PUBLIC \
+         USING (amount > 100 AND region IN ('eu', 'us') AND region IS NOT NULL)",
+    )
+    .await;
+    exec(&src, "ALTER TABLE ledger ENABLE ROW LEVEL SECURITY").await;
+
+    let script = src.dump_logical().await.expect("dump");
+    let dst = test_executor();
+    dst.restore_logical(&script).await.expect("restore");
+
+    let sid = dst.create_session();
+    dst.bind_authenticated_session(sid, "auditor")
+        .await
+        .expect("auditor must survive the restore");
+    let visible = dst
+        .execute_with_session(sid, "SELECT id FROM ledger ORDER BY id")
+        .await
+        .expect("select as auditor");
+    // Only id=2 qualifies. id=1 fails the numeric compare (and would leak under
+    // a lexical one), id=3 is not strictly greater and has a NULL region.
+    assert_eq!(
+        rows(&visible[0]).len(),
+        1,
+        "restored policy must admit exactly the row the source policy admits"
+    );
+    assert_eq!(rows(&visible[0])[0][0], Value::Int32(2));
+}

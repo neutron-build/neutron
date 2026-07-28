@@ -496,3 +496,64 @@ async fn rename_column_rewrites_derived_index_registries() {
     .await;
     assert_eq!(rows(&knn[0]).len(), 1);
 }
+
+#[tokio::test]
+async fn rls_comparison_in_list_and_null_predicates_enforce() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE ledger (id INT PRIMARY KEY, amount INT, region TEXT)",
+    )
+    .await;
+    // Row 4 carries a NULL amount and a NULL region — the fail-closed case.
+    exec(
+        &ex,
+        "INSERT INTO ledger VALUES (1, 9, 'eu'), (2, 200, 'us'), (3, 100, 'apac'), (4, NULL, NULL)",
+    )
+    .await;
+    exec(&ex, "CREATE ROLE auditor LOGIN PASSWORD 'auditor-secret'").await;
+    exec(&ex, "GRANT SELECT ON ledger TO auditor").await;
+    exec(
+        &ex,
+        "CREATE POLICY big_only ON ledger FOR SELECT TO PUBLIC USING (amount > 100)",
+    )
+    .await;
+    exec(&ex, "ALTER TABLE ledger ENABLE ROW LEVEL SECURITY").await;
+
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "auditor").await.unwrap();
+
+    // Only id=2 (200). id=1 is 9 — which would pass a LEXICAL "9" > "100"
+    // compare, so this asserts the numeric path. id=3 is not strictly greater,
+    // id=4 is NULL and must be withheld.
+    let result = exec_session(&ex, sid, "SELECT id FROM ledger ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result[0]).len(), 1);
+    assert_eq!(rows(&result[0])[0][0], Value::Int32(2));
+
+    // IN over a literal list.
+    exec(&ex, "DROP POLICY big_only ON ledger").await;
+    exec(
+        &ex,
+        "CREATE POLICY known_regions ON ledger FOR SELECT TO PUBLIC USING (region IN ('eu', 'us'))",
+    )
+    .await;
+    let result = exec_session(&ex, sid, "SELECT id FROM ledger ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result[0]).len(), 2);
+
+    // IS NULL reaches exactly the row the other predicates withheld.
+    exec(&ex, "DROP POLICY known_regions ON ledger").await;
+    exec(
+        &ex,
+        "CREATE POLICY unset_only ON ledger FOR SELECT TO PUBLIC USING (region IS NULL)",
+    )
+    .await;
+    let result = exec_session(&ex, sid, "SELECT id FROM ledger ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result[0]).len(), 1);
+    assert_eq!(rows(&result[0])[0][0], Value::Int32(4));
+}

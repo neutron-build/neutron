@@ -2,7 +2,7 @@
 
 use sqlparser::ast::{self, BinaryOperator, Expr};
 
-use crate::security::{PolicyCommand, RlsPolicy, RlsPredicate};
+use crate::security::{CmpOp, PolicyCommand, RlsPolicy, RlsPredicate};
 
 use super::{ExecError, ExecResult, Executor};
 
@@ -164,6 +164,48 @@ impl Executor {
                 Self::compile_rls_equality(left, right)
                     .or_else(|_| Self::compile_rls_equality(right, left))
             }
+            Expr::BinaryOp { left, op, right } if Self::cmp_op(op).is_some() => {
+                let cmp = Self::cmp_op(op).expect("guarded by the match arm");
+                // Either operand may be the column: `amount > 100` and
+                // `100 < amount` mean the same thing, so if the first reading
+                // fails try the mirror with the operator flipped.
+                Self::compile_rls_comparison(left, right, cmp)
+                    .or_else(|_| Self::compile_rls_comparison(right, left, cmp.flipped()))
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let column = Self::policy_column_name(expr)
+                    .ok_or_else(|| Self::unsupported_policy_expr(expr))?;
+                let values = list
+                    .iter()
+                    .map(|item| {
+                        Self::policy_literal(item)
+                            .ok_or_else(|| Self::unsupported_policy_expr(item))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let predicate = RlsPredicate::ColumnInList {
+                    column,
+                    values,
+                    column_id: 0,
+                };
+                Ok(if *negated {
+                    RlsPredicate::Not(Box::new(predicate))
+                } else {
+                    predicate
+                })
+            }
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                let column = Self::policy_column_name(inner)
+                    .ok_or_else(|| Self::unsupported_policy_expr(inner))?;
+                Ok(RlsPredicate::ColumnIsNull {
+                    column,
+                    negated: matches!(expr, Expr::IsNotNull(_)),
+                    column_id: 0,
+                })
+            }
             Expr::Value(v) => match &v.value {
                 ast::Value::Boolean(true) => Ok(RlsPredicate::AlwaysTrue),
                 ast::Value::Boolean(false) | ast::Value::Null => Ok(RlsPredicate::AlwaysFalse),
@@ -219,6 +261,69 @@ impl Executor {
         Err(Self::unsupported_policy_expr(value_expr))
     }
 
+    /// Map a sqlparser operator to the ordering comparisons a policy may use.
+    /// `Eq` is deliberately absent — it has its own richer compilation path
+    /// (CURRENT_USER, tenant settings), handled before this is reached.
+    fn cmp_op(op: &BinaryOperator) -> Option<CmpOp> {
+        match op {
+            BinaryOperator::Lt => Some(CmpOp::Lt),
+            BinaryOperator::LtEq => Some(CmpOp::LtEq),
+            BinaryOperator::Gt => Some(CmpOp::Gt),
+            BinaryOperator::GtEq => Some(CmpOp::GtEq),
+            BinaryOperator::NotEq => Some(CmpOp::NotEq),
+            _ => None,
+        }
+    }
+
+    fn compile_rls_comparison(
+        column_expr: &Expr,
+        value_expr: &Expr,
+        op: CmpOp,
+    ) -> Result<RlsPredicate, ExecError> {
+        let column = Self::policy_column_name(column_expr)
+            .ok_or_else(|| Self::unsupported_policy_expr(column_expr))?;
+        let value = Self::policy_literal(value_expr)
+            .ok_or_else(|| Self::unsupported_policy_expr(value_expr))?;
+        Ok(RlsPredicate::ColumnCmp {
+            column,
+            op,
+            value,
+            column_id: 0,
+        })
+    }
+
+    /// The column a policy operand names, if it names one.
+    fn policy_column_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(id) => Some(id.value.clone()),
+            Expr::CompoundIdentifier(ids) => ids.last().map(|id| id.value.clone()),
+            Expr::Nested(inner) => Self::policy_column_name(inner),
+            _ => None,
+        }
+    }
+
+    /// The constant a policy operand carries, rendered the way the RLS row map
+    /// renders a cell, so the two are directly comparable.
+    fn policy_literal(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Nested(inner) => Self::policy_literal(inner),
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Minus,
+                expr,
+            } => Self::policy_literal(expr).map(|v| format!("-{v}")),
+            Expr::Value(v) => match &v.value {
+                ast::Value::SingleQuotedString(s)
+                | ast::Value::DoubleQuotedString(s)
+                | ast::Value::NationalStringLiteral(s)
+                | ast::Value::EscapedStringLiteral(s) => Some(s.clone()),
+                ast::Value::Number(n, _) => Some(n.clone()),
+                ast::Value::Boolean(b) => Some(b.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn single_quoted_argument(rendered: &str) -> Option<String> {
         let start = rendered.find('\'')? + 1;
         let end = rendered[start..].find('\'')? + start;
@@ -227,7 +332,7 @@ impl Executor {
 
     fn unsupported_policy_expr(expr: &Expr) -> ExecError {
         ExecError::Unsupported(format!(
-            "unsupported row-security predicate '{expr}'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), has_role(), NOT, AND, and OR"
+            "unsupported row-security predicate '{expr}'; supported forms are boolean constants, column equality to a literal/CURRENT_USER/current_setting('nucleus.tenant_id'), column comparison to a literal with <, <=, >, >=, <>, column IN (literal, …), column IS [NOT] NULL, has_role(), NOT, AND, and OR"
         ))
     }
 
@@ -238,7 +343,10 @@ impl Executor {
         match predicate {
             RlsPredicate::ColumnEqStr { column, .. }
             | RlsPredicate::ColumnEqTenant { column, .. }
-            | RlsPredicate::ColumnEqUser { column, .. } => {
+            | RlsPredicate::ColumnEqUser { column, .. }
+            | RlsPredicate::ColumnCmp { column, .. }
+            | RlsPredicate::ColumnInList { column, .. }
+            | RlsPredicate::ColumnIsNull { column, .. } => {
                 if table.column_index(column).is_none() {
                     return Err(ExecError::ColumnNotFound(column.clone()));
                 }

@@ -2846,6 +2846,9 @@ impl Executor {
                 col_names
                     .iter()
                     .zip(row.iter())
+                    // NULL is absence — see `rls_row_map` for why storing it as
+                    // the string "NULL" would be a fail-open.
+                    .filter(|(_, v)| !matches!(v, Value::Null))
                     .map(|(n, v)| ((*n).to_string(), v.to_string()))
                     .collect()
             })
@@ -2874,6 +2877,18 @@ impl Executor {
             def.columns
                 .iter()
                 .zip(row.iter())
+                // A SQL NULL is represented by ABSENCE from the map, never by a
+                // string. `Value::Null.to_string()` is "NULL", which is also what
+                // the text value 'NULL' renders to, so storing it would make the
+                // two indistinguishable: `col = 'NULL'` would match a real NULL,
+                // and an ordering comparison would compare the literal "NULL"
+                // lexically — `"NULL" > "100"` is true, which GRANTS a row it
+                // must not. Absence is unambiguous because the map is built from
+                // the table's full column list, so a missing key can only mean
+                // NULL. Every predicate arm reads through `row.get`, which yields
+                // None for NULL and so denies — matching SQL's rule that a
+                // comparison with NULL is unknown, never true.
+                .filter(|(_, value)| !matches!(value, Value::Null))
                 .map(|(column, value)| (column.name.clone(), value.to_string()))
                 .collect(),
         )
