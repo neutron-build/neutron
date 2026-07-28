@@ -159,33 +159,65 @@ async fn test_windows_stay_indexed_under_projection_and_aggregation() {
     .await;
 }
 
-/// Point lookups. NOTE: `n` (BIGINT) and `s` (TEXT) are deliberately absent —
-/// equality on those columns currently full-scans even with an index, while
-/// UUID / DATE / TIMESTAMP use it. That gap is tracked separately; asserting
-/// the working types here keeps them from regressing to match.
+/// Point lookups on every indexed column type.
+///
+/// `n` (BIGINT) and `s` (TEXT) used to full-scan here while UUID / DATE /
+/// TIMESTAMP did not — not because of the types, but because the executor
+/// preferred a linear `fast_scan_where_eq` whenever the planner's row estimate
+/// exceeded an absolute threshold, and that estimate is `row_count * 10%` for
+/// any column ANALYZE has not measured. The types that appeared to work were
+/// simply the ones whose engine fast-scan is unimplemented.
 #[tokio::test]
 async fn test_point_lookups_reach_the_index() {
     let ex = indexed_table().await;
 
-    assert_indexed(
-        &ex,
-        1,
-        "timestamp equality",
-        "SELECT id FROM a WHERE ts = TIMESTAMP '2026-07-01 00:00:07'",
-    )
-    .await;
-    assert_indexed(
-        &ex,
-        1,
-        "date equality",
-        "SELECT id FROM a WHERE d = DATE '2026-01-10'",
-    )
-    .await;
-    assert_indexed(
-        &ex,
-        1,
-        "uuid equality",
-        "SELECT id FROM a WHERE u = UUID '00000000-0000-0000-0000-000000000005'",
-    )
-    .await;
+    for (label, expected, sql) in [
+        (
+            "bigint equality",
+            1,
+            "SELECT id FROM a WHERE n = 1000040",
+        ),
+        ("text equality", 1, "SELECT id FROM a WHERE s = 'k00042'"),
+        (
+            "timestamp equality",
+            1,
+            "SELECT id FROM a WHERE ts = TIMESTAMP '2026-07-01 00:00:07'",
+        ),
+        (
+            "date equality",
+            1,
+            "SELECT id FROM a WHERE d = DATE '2026-01-10'",
+        ),
+        (
+            "uuid equality",
+            1,
+            "SELECT id FROM a WHERE u = UUID '00000000-0000-0000-0000-000000000005'",
+        ),
+    ] {
+        assert_indexed(&ex, expected, label, sql).await;
+    }
+}
+
+/// The sequential path still exists for a genuinely unselective equality, and
+/// must return the same rows the index would. This asserts correctness rather
+/// than which path ran — the point is that changing the crossover rule did not
+/// change any answer.
+#[tokio::test]
+async fn test_unselective_equality_still_correct() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE lowcard (id INT PRIMARY KEY, flag INT)").await;
+    exec(&ex, "CREATE INDEX lowcard_flag ON lowcard (flag)").await;
+    for i in 0..ROWS {
+        exec(&ex, &format!("INSERT INTO lowcard VALUES ({i}, {})", i % 2)).await;
+    }
+    exec(&ex, "ANALYZE lowcard").await;
+
+    let (_, matched) = scan_cost(&ex, "SELECT id FROM lowcard WHERE flag = 0").await;
+    assert_eq!(
+        matched,
+        ROWS as usize / 2,
+        "half the table matches flag = 0"
+    );
+    let (_, none) = scan_cost(&ex, "SELECT id FROM lowcard WHERE flag = 9").await;
+    assert_eq!(none, 0, "no row has flag = 9");
 }
