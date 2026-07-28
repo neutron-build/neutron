@@ -1,9 +1,9 @@
 ---
 title: Security
-description: Row-level security, data masking, encryption, and audit logging.
+description: Row-level security, encryption, and audit logging.
 ---
 
-Nucleus provides defense-in-depth security: row-level security (RLS), column-level data masking, tenant-aware encryption, and immutable audit logging.
+Nucleus provides defense-in-depth security: row-level security (RLS), tenant-aware encryption, and immutable audit logging.
 
 ## Row-Level Security (RLS)
 
@@ -62,32 +62,17 @@ Users with the `superuser` role bypass all RLS policies.
 
 ## Column-Level Data Masking
 
-Mask sensitive columns based on the querying user's role.
+Not yet available. Nucleus carries an internal masking policy engine, but it has
+no SQL DDL and **no executor enforcement** — no query path applies a mask, so
+values are always returned unmasked.
 
-### Masking Rules
+Do not rely on column masking for isolation. Use RLS, which is enforced, to keep
+a role away from rows it must not read; to restrict access to particular
+*columns*, expose a view that omits them and grant the role access to the view
+rather than the base table. (Nucleus privileges are table-scoped — there is no
+column-level `GRANT`.)
 
-| Rule | Input | Output |
-|------|-------|--------|
-| **Redact** | `555-0123` | `[REDACTED]` |
-| **Email** | `tyler@example.com` | `t***@example.com` |
-| **Partial** (show first 2, last 2) | `555-0123` | `55****23` |
-| **Hash** | `John Smith` | `a1b2c3d4` |
-
-### Apply Masking
-
-```sql
--- Analysts see masked SSNs
-CREATE MASKING POLICY ssn_mask ON employees(ssn)
-    FOR ROLE analyst
-    USING PARTIAL(show_first=0, show_last=4, mask_char='*');
-
--- Support staff see masked emails
-CREATE MASKING POLICY email_mask ON customers(email)
-    FOR ROLE support
-    USING EMAIL;
-```
-
-Masking is applied transparently — queries return masked values without application code changes.
+This page will document the feature when it enforces.
 
 ## Encryption
 
