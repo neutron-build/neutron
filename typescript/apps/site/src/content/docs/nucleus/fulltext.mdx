@@ -1,93 +1,163 @@
 ---
 title: Full-Text Search
-description: BM25-ranked search with stemming and fuzzy matching.
+description: BM25-ranked search as an index on your table, and hybrid search in one query.
 ---
 
-Nucleus includes a built-in full-text search engine with BM25 ranking, language-aware stemming, fuzzy matching, and faceted search — no Elasticsearch or Meilisearch needed.
+Full-text search in Nucleus is an index on a table column, not a separate store. Rows
+are matched with the `@@` operator and ranked with `BM25()`, so search results are
+ordinary rows: joinable, filterable, and covered by the same transactions and
+row-level security policies as everything else.
 
-## Indexing Documents
+Because keyword search and vector search both return rows from the same table, hybrid
+search is a plain SQL query — no fusion built-in, no second system to keep in sync.
+
+## Creating an Index
 
 ```sql
--- Add documents to the FTS index
-SELECT FTS_INDEX(1, 'Rust is a systems programming language');
-SELECT FTS_INDEX(2, 'Python is great for machine learning');
-SELECT FTS_INDEX(3, 'Machine learning with Rust is fast');
+CREATE TABLE articles (
+  id        INT PRIMARY KEY,
+  title     TEXT,
+  body      TEXT,
+  category  TEXT,
+  embedding VECTOR(384)
+);
 
--- Remove a document from the index
-SELECT FTS_REMOVE(2);
-
--- Index statistics
-SELECT FTS_DOC_COUNT();   -- number of indexed documents
-SELECT FTS_TERM_COUNT();  -- number of unique terms
+CREATE INDEX articles_body_fts ON articles USING FTS (body);
 ```
 
-## Searching
+`USING BM25` is accepted as a synonym.
 
-### Basic Search
+The index is maintained by `INSERT`, `UPDATE`, and `DELETE` like any other index, and
+is rebuilt from committed rows if a transaction aborts. There is nothing to
+re-synchronise by hand.
 
-```sql
--- Search with BM25 ranking (returns JSON array)
-SELECT FTS_SEARCH('machine learning', 10);
--- → [{"doc_id":3,"score":2.45}, {"doc_id":2,"score":1.87}]
-```
+**Requirement:** the table needs an integer `PRIMARY KEY`. Documents are keyed on it so
+that maintenance survives deletes, which shift physical row positions. Tables without
+one can still use `@@` — they just don't get an index.
 
-### Fuzzy Search
+## Matching
 
-Find matches even with typos using Levenshtein distance:
-
-```sql
--- Allow up to 2 edits per term
-SELECT FTS_FUZZY_SEARCH('machne learing', 2, 10);
--- → matches "machine learning" despite typos
-```
-
-Maximum edit distance is capped at 3 to prevent combinatorial explosion.
-
-### Filter with FTS
-
-Use `FTS_MATCH` in WHERE clauses to combine full-text search with SQL filtering:
+`column @@ 'query'` is true when the column contains **every** term in the query, after
+stemming and stopword removal.
 
 ```sql
-SELECT id, title, content
+SELECT id, title
 FROM articles
-WHERE FTS_MATCH(id, 'rust performance')
-ORDER BY created_at DESC
+WHERE body @@ 'machine learning'
+  AND category = 'tech'
+ORDER BY published_at DESC
 LIMIT 10;
 ```
 
-## PostgreSQL-Compatible Functions
+`@@` is defined on the row's own text, so it returns the same rows whether or not an
+index exists. The index makes it faster; it never changes the answer.
+
+## Ranking
+
+`BM25(column, 'query')` scores a row against the corpus statistics of that column's
+index.
 
 ```sql
--- BM25 score for a specific document
-SELECT TS_RANK(content, 'rust systems') AS score
-FROM articles;
+SELECT id, title, BM25(body, 'machine learning') AS score
+FROM articles
+WHERE body @@ 'machine learning'
+ORDER BY score DESC
+LIMIT 10;
+```
 
--- Boolean match test
+Okapi BM25 with the standard parameters — `k1 = 1.2` (term frequency saturation) and
+`b = 0.75` (document length normalisation). Shorter documents containing more
+occurrences of rarer terms score higher.
+
+`BM25()` requires an FTS index on the column, because inverse document frequency and
+average document length are properties of the corpus, not of one row. Without an index
+it reports that, rather than scoring against an empty corpus.
+
+## Hybrid Search
+
+Reciprocal Rank Fusion combines a keyword ranking and a vector ranking by their
+positions rather than their scores, which sidesteps the problem that BM25 scores and
+cosine distances are not on a comparable scale.
+
+```sql
+WITH kw AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY BM25(body, 'machine learning') DESC) AS r
+  FROM articles
+  WHERE body @@ 'machine learning'
+  LIMIT 50
+),
+sem AS (
+  SELECT id, ROW_NUMBER() OVER (
+    ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[0.1, 0.2, ...]'), 'cosine')
+  ) AS r
+  FROM articles
+  LIMIT 50
+)
+SELECT COALESCE(kw.id, sem.id) AS id,
+       COALESCE(1.0 / (60 + kw.r), 0) + COALESCE(1.0 / (60 + sem.r), 0) AS score
+FROM kw FULL OUTER JOIN sem ON kw.id = sem.id
+ORDER BY score DESC
+LIMIT 10;
+```
+
+Both halves read the same table in the same snapshot, through the same policies.
+
+The constant `60` is the conventional RRF damping factor; raising it flattens the
+contribution of top ranks. Because fusion is expressed in the query rather than hidden
+in a built-in, you can weight the two halves differently, add a third ranking, or
+replace the fusion entirely without waiting for a new function.
+
+## PostgreSQL Compatibility
+
+The PostgreSQL spelling works and returns the same rows:
+
+```sql
 SELECT * FROM articles
-WHERE TS_MATCH(content, 'machine learning');
+WHERE TO_TSVECTOR(body) @@ PLAINTO_TSQUERY('machine learning');
+```
+
+```sql
+-- Boolean match test
+SELECT * FROM articles WHERE TS_MATCH(body, 'machine learning');
 
 -- Highlight matching terms with <em> tags
-SELECT TS_HEADLINE(content, 'rust') FROM articles;
--- → "...is a systems programming language"
+SELECT TS_HEADLINE(body, 'rust') FROM articles;
 -- → "<em>Rust</em> is a systems programming language"
 
--- Convert text to stemmed query
+-- Convert text to a stemmed query
 SELECT PLAINTO_TSQUERY('machine learning');
 -- → "machine & learn"
 ```
 
-## BM25 Ranking
+Two differences worth knowing:
 
-Nucleus uses the Okapi BM25 algorithm with standard parameters:
+- **`TS_RANK` is not BM25.** Like PostgreSQL's `ts_rank`, it scores a single
+  `(document, query)` pair with no corpus, so it has no inverse document frequency and
+  no length normalisation. It is fine for a rough within-document signal, and it will
+  order results differently from `BM25()`. Use `BM25()` for relevance ranking.
+- **`TO_TSVECTOR` returns text**, a normalised term string, not a distinct `tsvector`
+  type with lexeme positions. It composes correctly with `@@` and `PLAINTO_TSQUERY`;
+  it does not render like PostgreSQL's `'learn':2 'machin':1`.
 
-- **k1 = 1.2** — Term frequency saturation
-- **b = 0.75** — Document length normalization
+## Behaviour to Expect
 
-Shorter documents with more occurrences of rare terms score higher. Posting lists are processed shortest-first for optimal performance.
+- **Corpus statistics are not snapshot-isolated.** `N`, average document length, and
+  document frequencies come from the current index rather than from your transaction's
+  snapshot, so a score can shift as other sessions write. This matches how Lucene,
+  Elasticsearch, and PostgreSQL statistics behave; the *set of rows* you get back is
+  snapshot-exact, only the ranking weights are shared.
+- **Under row-level security**, `@@` and `BM25()` remain available and filter through
+  policy like any other predicate. Index acceleration is skipped, so search falls back
+  to a scan; results are unchanged. Corpus statistics are aggregate and are not
+  partitioned by policy — a document frequency counts rows the querying role cannot
+  read, the same way PostgreSQL's planner statistics do.
+- **Inside an open transaction**, index acceleration is likewise skipped so that
+  uncommitted rows cannot leak into another session's candidate set. `@@` still
+  evaluates correctly against your own uncommitted rows.
 
 ## Stemming
 
-Six built-in language stemmers normalize words to their root form:
+Six built-in language stemmers normalise words to their root form:
 
 | Language | Examples |
 |----------|----------|
@@ -105,17 +175,34 @@ Six built-in language stemmers normalize words to their root form:
 3. Filter stopwords (48 common English words)
 4. Apply language-specific stemming
 
-## Performance
+Both sides of a comparison run through the same pipeline, so a query term matches a
+document term whenever their stems agree.
 
-- **Block-Max WAND** — Early termination for top-k queries (2-5x speedup on large indexes)
-- **Parallel search** — Automatic parallelization when candidate set exceeds 500 documents
-- **Parallel bulk indexing** — Tokenization parallelized across CPU cores
-- **WAL-backed** — Crash-safe with incremental checkpointing
+## Document Store Surface (Legacy)
+
+Nucleus also exposes the inverted index directly, keyed by a document id you supply:
+
+```sql
+SELECT FTS_INDEX(1, 'Rust is a systems programming language');
+SELECT FTS_SEARCH('systems programming', 10);
+-- → [{"doc_id":1,"score":2.45}]
+SELECT FTS_FUZZY_SEARCH('systms programing', 2, 10);
+SELECT FTS_REMOVE(1);
+```
+
+This store is independent of your tables. Nothing ties `doc_id` 1 to any row, so
+keeping it consistent with a table is the application's job — a missed `FTS_REMOVE`
+leaves a deleted row searchable. It is also unavailable while row-level security is
+active, because it has no policy-aware access path.
+
+Prefer `CREATE INDEX ... USING FTS` for anything that indexes table data. The document
+store remains for corpora that genuinely have no table behind them, and for fuzzy and
+faceted search, which the table-attached index does not yet expose.
 
 ## Use Cases
 
-- **Site search** — Full-text search across pages and posts
-- **Product search** — Find products by description with typo tolerance
-- **Log analysis** — Search through structured log messages
-- **Knowledge base** — Search documentation and articles
-- **Content discovery** — Find related content by text similarity
+- **Site search** — full-text search across pages and posts
+- **Product search** — find products by description, ranked by relevance
+- **Log analysis** — search through structured log messages
+- **Knowledge base** — search documentation and articles
+- **Retrieval for AI** — hybrid keyword + vector retrieval in one query, one snapshot

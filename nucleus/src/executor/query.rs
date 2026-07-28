@@ -6870,6 +6870,71 @@ impl Executor {
         }
     }
 
+    /// The `(column, query)` of a full-text `column @@ 'query'` predicate,
+    /// looking through parentheses and into the conjuncts of an AND chain.
+    fn extract_fts_match(&self, expr: &Expr) -> Option<(String, String)> {
+        match expr {
+            Expr::Nested(inner) => self.extract_fts_match(inner),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => self
+                .extract_fts_match(left)
+                .or_else(|| self.extract_fts_match(right)),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::AtAt,
+                right,
+            } => {
+                let column = match left.as_ref() {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+                    _ => return None,
+                };
+                match self.eval_const_expr(right).ok()? {
+                    Value::Text(query) => Some((column, query)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Narrow a full-text query through the table-attached FTS index, so that
+    /// `@@` does not have to tokenize every row in the table.
+    ///
+    /// The index only proposes candidates; the caller rechecks the predicate,
+    /// which is defined row-locally and needs no index to be correct. Skipped
+    /// inside an open transaction, where incremental maintenance may have
+    /// observed rows the transaction has not committed.
+    pub(super) async fn try_fts_index_scan(
+        &self,
+        table_name: &str,
+        label: &str,
+        where_expr: &Expr,
+    ) -> IndexScanResult {
+        if self.rls_active(table_name) || self.current_session().txn_state.read().await.active {
+            return None;
+        }
+        let (column_name, query) = self.extract_fts_match(where_expr)?;
+        let (pk_column, candidates) = self.fts_candidates(table_name, &column_name, &query)?;
+
+        let table_def = self.catalog.get_table(table_name).await?;
+        let pk_idx = table_def.column_index(&pk_column)?;
+
+        let all_rows = self.storage_for(table_name).scan(table_name).await.ok()?;
+        self.metrics.rows_scanned.inc_by(all_rows.len() as u64);
+        let rows = all_rows
+            .into_iter()
+            .filter(|row| {
+                Self::stable_row_id(row, pk_idx).is_some_and(|id| candidates.contains(&id))
+            })
+            .collect();
+        let col_meta = self.build_col_meta_from_cache(table_name, label)?;
+        Some((col_meta, rows, Some(where_expr.clone()), None))
+    }
+
     /// Narrow a JSONB containment query through a live GIN posting map. The
     /// storage scan and full predicate recheck remain authoritative, so a stale
     /// or lossy posting representation can never manufacture a result.
@@ -7006,6 +7071,11 @@ impl Executor {
                         .await
                     {
                         Some(gin)
+                    } else if let Some(fts) = self
+                        .try_fts_index_scan(&table_name, &label, selection)
+                        .await
+                    {
+                        Some(fts)
                     } else {
                         self.try_index_scan_sync(&table_name, &label, selection)
                     }

@@ -204,6 +204,7 @@ fn index_type_to_string(it: &IndexType) -> String {
         IndexType::Gin => "Gin".to_string(),
         IndexType::Gist => "Gist".to_string(),
         IndexType::Rtree => "Rtree".to_string(),
+        IndexType::Fts => "Fts".to_string(),
     }
 }
 
@@ -217,6 +218,7 @@ fn string_to_index_type(s: &str) -> Result<IndexType, PersistenceError> {
         "Gin" => Ok(IndexType::Gin),
         "Gist" => Ok(IndexType::Gist),
         "Rtree" => Ok(IndexType::Rtree),
+        "Fts" => Ok(IndexType::Fts),
         _ => Err(PersistenceError::InvalidIndexType(s.to_string())),
     }
 }
