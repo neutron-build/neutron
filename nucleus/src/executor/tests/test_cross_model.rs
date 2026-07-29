@@ -838,12 +838,20 @@ async fn test_a_transaction_does_not_scale_with_untouched_stores() {
         start.elapsed().as_secs_f64()
     }
 
-    let small = cycle(&ex, 0).await;
+    // Best of three on each side. A single timing sample on a loaded machine
+    // is noise, and a cost test that flakes teaches people to ignore it.
+    let mut small = f64::MAX;
+    for r in 0..3 {
+        small = small.min(cycle(&ex, r * 100).await);
+    }
     // Grow the untouched vector index tenfold.
     for i in 64..640 {
         exec(&ex, &format!("INSERT INTO t VALUES ({i}, {})", vec_lit(i))).await;
     }
-    let large = cycle(&ex, 1_000).await;
+    let mut large = f64::MAX;
+    for r in 0..3 {
+        large = large.min(cycle(&ex, 1_000 + r * 100).await);
+    }
 
     // Generous: a 10x bigger index must not make the cycle 4x costlier. A deep
     // clone per BEGIN would be roughly 10x; lazy capture is flat within noise.
@@ -855,4 +863,72 @@ async fn test_a_transaction_does_not_scale_with_untouched_stores() {
         small * 1000.0,
         large * 1000.0
     );
+}
+
+/// The single scalar a query returned, as text.
+async fn stext(ex: &Executor, sql: &str) -> String {
+    match scalar(&exec(ex, sql).await[0]) {
+        Value::Text(t) => t.clone(),
+        Value::Int32(n) => n.to_string(),
+        Value::Int64(n) => n.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// A stream written inside an aborted transaction must not keep the write.
+///
+/// Streams were one of the models a transaction could write and never roll
+/// back: `XADD` inside a `BEGIN` survived `ROLLBACK`, so an aborted transaction
+/// still published events that downstream consumers may already have read and
+/// acted on. That is worse than a lost write — it is an event that describes
+/// something which never happened.
+#[tokio::test]
+async fn test_stream_writes_roll_back() {
+    let ex = test_executor();
+
+    exec(&ex, "SELECT STREAM_XADD('events', 'kind', 'committed')").await;
+    let before = stext(&ex, "SELECT STREAM_XLEN('events')").await;
+
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "SELECT STREAM_XADD('events', 'kind', 'aborted')").await;
+    exec(&ex, "SELECT STREAM_XADD('events', 'kind', 'aborted2')").await;
+    let during = stext(&ex, "SELECT STREAM_XLEN('events')").await;
+    assert_ne!(during, before, "the transaction should see its own writes");
+    exec(&ex, "ROLLBACK").await;
+
+    let after = stext(&ex, "SELECT STREAM_XLEN('events')").await;
+    assert_eq!(
+        after, before,
+        "ROLLBACK left {during} entries where the committed state had {before} — \
+         an aborted transaction published events that never happened"
+    );
+
+    // The committed entry is still there: rollback reverted the transaction's
+    // writes, not the stream.
+    let kinds = stext(&ex, "SELECT STREAM_XRANGE('events', 0, 9999999999999, 100)").await;
+    assert!(kinds.contains("committed"), "rollback ate a committed entry: {kinds}");
+    assert!(!kinds.contains("aborted"), "rollback kept an aborted entry: {kinds}");
+}
+
+/// A stream CREATED inside an aborted transaction must not survive it.
+#[tokio::test]
+async fn test_a_stream_created_in_an_aborted_transaction_disappears() {
+    let ex = test_executor();
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "SELECT STREAM_XADD('ephemeral', 'k', 'v')").await;
+    exec(&ex, "ROLLBACK").await;
+    let len = stext(&ex, "SELECT STREAM_XLEN('ephemeral')").await;
+    assert_eq!(len, "0", "the stream outlived the transaction that created it");
+}
+
+/// COMMIT keeps stream writes — the rollback path must not have made them
+/// conditional on anything else.
+#[tokio::test]
+async fn test_committed_stream_writes_survive() {
+    let ex = test_executor();
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "SELECT STREAM_XADD('events', 'kind', 'kept')").await;
+    exec(&ex, "COMMIT").await;
+    let kinds = stext(&ex, "SELECT STREAM_XRANGE('events', 0, 9999999999999, 100)").await;
+    assert!(kinds.contains("kept"), "COMMIT dropped a stream write: {kinds}");
 }
