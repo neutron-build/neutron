@@ -1074,6 +1074,29 @@ impl InvertedIndex {
         idf * numerator / denominator
     }
 
+    /// Corpus statistics for the terms of `query`, sufficient to score any
+    /// document's raw text without touching the posting lists again.
+    ///
+    /// This is what lets `BM25(col, query)` be an ordinary scalar function:
+    /// every other input to the BM25 formula (term frequency, document length)
+    /// is derivable from the row's own text, so the index only has to supply
+    /// `N`, `avgdl`, and one document frequency per query term.
+    pub fn bm25_stats(&self, query: &str) -> Bm25Stats {
+        let mut df: HashMap<String, usize> = HashMap::new();
+        for token in tokenize(query) {
+            if df.contains_key(&token.term) {
+                continue;
+            }
+            let n = self.postings.get(&token.term).map_or(0, |p| p.len());
+            df.insert(token.term, n);
+        }
+        Bm25Stats {
+            doc_count: self.doc_count,
+            avgdl: self.avgdl(),
+            df,
+        }
+    }
+
     /// Get the number of indexed documents.
     pub fn doc_count(&self) -> u64 {
         self.doc_count
@@ -1372,6 +1395,90 @@ impl InvertedIndex {
             }
         }
     }
+}
+
+// ============================================================================
+// Row-local scoring (table-attached FTS)
+// ============================================================================
+
+/// Corpus statistics for one query, captured from an inverted index.
+///
+/// Small and cheap: two scalars plus one entry per distinct query term. A query
+/// fetches this once and then scores every candidate row from the row's own
+/// text, so BM25 needs no score plumbing through the executor.
+#[derive(Debug, Clone, Default)]
+pub struct Bm25Stats {
+    /// Number of documents in the corpus (`N`).
+    pub doc_count: u64,
+    /// Mean document length in tokens.
+    pub avgdl: f64,
+    /// Stemmed query term → number of documents containing it.
+    pub df: HashMap<String, usize>,
+}
+
+impl Bm25Stats {
+    /// Robertson/Sparck-Jones IDF, identical to [`InvertedIndex::idf`].
+    fn idf(&self, df: usize) -> f64 {
+        let n = self.doc_count as f64;
+        let df = df as f64;
+        ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
+    }
+}
+
+/// BM25 score of `text` against the query captured in `stats`.
+///
+/// Sums the BM25 contribution of every query term that occurs in `text`; terms
+/// that do not occur contribute nothing. For a document that is present in the
+/// index the stats came from, this returns exactly the score
+/// [`InvertedIndex::search_scored`] assigns it — the agreement is asserted in
+/// `test_bm25_score_matches_index_score`.
+///
+/// The query is not a parameter: `stats.df` already enumerates its terms, so a
+/// caller cannot pair stats with a query they were not computed for.
+pub fn bm25_score(text: &str, stats: &Bm25Stats) -> f64 {
+    let doc_tokens = tokenize(text);
+    let dl = doc_tokens.len() as f64;
+    if stats.df.is_empty() {
+        return 0.0;
+    }
+
+    // Term frequencies for this document, counted once.
+    let mut tf: HashMap<&str, f64> = HashMap::new();
+    for token in &doc_tokens {
+        *tf.entry(token.term.as_str()).or_default() += 1.0;
+    }
+
+    let avgdl = if stats.avgdl > 0.0 { stats.avgdl } else { 1.0 };
+    let mut score = 0.0f64;
+    for (term, &df) in &stats.df {
+        let Some(&tf) = tf.get(term.as_str()) else {
+            continue;
+        };
+        let idf = stats.idf(df);
+        let numerator = tf * (InvertedIndex::K1 + 1.0);
+        let denominator =
+            tf + InvertedIndex::K1 * (1.0 - InvertedIndex::B + InvertedIndex::B * dl / avgdl);
+        score += idf * numerator / denominator;
+    }
+    score
+}
+
+/// Whether `text` contains every term of `query` (conjunctive semantics).
+///
+/// This is the meaning of the `@@` operator and matches PostgreSQL's
+/// `to_tsvector(text) @@ plainto_tsquery(query)`, which ANDs its terms. It is
+/// also the membership rule of [`InvertedIndex::search_scored`], so an
+/// index-accelerated `@@` and a full scan agree row for row.
+///
+/// An empty query matches nothing, mirroring `search_scored`.
+pub fn text_matches(text: &str, query: &str) -> bool {
+    let query_tokens = tokenize(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    let doc_terms: std::collections::HashSet<String> =
+        tokenize(text).into_iter().map(|t| t.term).collect();
+    query_tokens.iter().all(|t| doc_terms.contains(&t.term))
 }
 
 // ============================================================================
@@ -2422,6 +2529,113 @@ pub fn standard_english_analyzer() -> AnalyzerPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small corpus with varied lengths and term frequencies, so that IDF and
+    /// the length-normalisation term both actually move.
+    fn scoring_corpus() -> Vec<(u64, &'static str)> {
+        vec![
+            (1, "machine learning pipelines for production systems"),
+            (2, "machine learning"),
+            (
+                3,
+                "a long document about machine learning and machine translation and \
+                 learning theory and other machine topics at considerable length",
+            ),
+            (4, "database storage engines and write ahead logs"),
+            (5, "learning to cook without a machine"),
+            (6, "distributed consensus protocols"),
+        ]
+    }
+
+    /// The whole point of the row-local design: scoring a document's raw text
+    /// under the index's corpus statistics must reproduce, exactly, the score
+    /// the index itself assigns that document. If this drifts, `ORDER BY BM25`
+    /// silently disagrees with the index it was meant to rank.
+    #[test]
+    fn test_bm25_score_matches_index_score() {
+        let mut idx = InvertedIndex::new();
+        for (id, text) in scoring_corpus() {
+            idx.add_document(id, text);
+        }
+
+        for query in [
+            "machine",
+            "machine learning",
+            "learning machine",
+            "storage engines",
+            "machine learning theory",
+        ] {
+            let stats = idx.bm25_stats(query);
+            let from_index: HashMap<u64, f64> =
+                idx.search_scored(query, usize::MAX).into_iter().collect();
+
+            for (id, text) in scoring_corpus() {
+                let Some(&expected) = from_index.get(&id) else {
+                    // Not a hit: the conjunctive predicate must agree.
+                    assert!(
+                        !text_matches(text, query),
+                        "doc {id} matches '{query}' row-locally but the index missed it"
+                    );
+                    continue;
+                };
+                let actual = bm25_score(text, &stats);
+                assert!(
+                    (actual - expected).abs() < 1e-9,
+                    "query '{query}' doc {id}: row-local {actual} vs index {expected}"
+                );
+            }
+        }
+    }
+
+    /// `@@` and the index's membership rule are the same rule.
+    #[test]
+    fn test_text_matches_agrees_with_index_membership() {
+        let mut idx = InvertedIndex::new();
+        for (id, text) in scoring_corpus() {
+            idx.add_document(id, text);
+        }
+
+        for query in [
+            "machine",
+            "machine learning",
+            "storage",
+            "machine consensus",
+            "nonexistent",
+        ] {
+            let hits: std::collections::HashSet<u64> = idx
+                .search_scored(query, usize::MAX)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            for (id, text) in scoring_corpus() {
+                assert_eq!(
+                    hits.contains(&id),
+                    text_matches(text, query),
+                    "query '{query}' doc {id}: index membership disagrees with @@"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_text_matches_is_conjunctive_and_stems() {
+        // Every term must be present, unlike the OR-semantics `search()`.
+        assert!(text_matches("machine learning systems", "machine learning"));
+        assert!(!text_matches("machine translation", "machine learning"));
+        // Stemming applies to both sides.
+        assert!(text_matches("distributed learning pipelines", "pipeline"));
+        // Stopword-only and empty queries match nothing rather than everything.
+        assert!(!text_matches("anything at all", "the"));
+        assert!(!text_matches("anything at all", ""));
+    }
+
+    #[test]
+    fn test_bm25_score_without_query_terms_is_zero() {
+        let mut idx = InvertedIndex::new();
+        idx.add_document(1, "machine learning");
+        let stats = idx.bm25_stats("");
+        assert_eq!(bm25_score("machine learning", &stats), 0.0);
+    }
 
     #[test]
     fn tokenize_basic() {

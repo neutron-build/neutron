@@ -42,7 +42,10 @@ mod test_durability_format; // M3: format rejection + full-state recovery
 mod test_dml;
 mod test_e2e_smoke; // End-to-end smoke tests exercising all Nucleus capabilities
 mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filtering
+mod test_fts_index; // Table-attached FTS: USING FTS, @@, BM25, hybrid RRF
 mod test_index;
+mod test_index_path_coverage; // which WHERE forms actually reach an index
+mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_integration;
 mod test_jsonb;
 mod test_logical_dump; // T2.1: logical (SQL-text) backup round-trip

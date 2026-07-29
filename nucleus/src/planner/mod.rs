@@ -1218,7 +1218,7 @@ impl QueryPlanner {
             IndexType::Hnsw | IndexType::IvfFlat => {
                 Some(Box::new(cost::HnswAccess::for_dataset(row_count)))
             }
-            IndexType::Gin => Some(Box::new(cost::FtsAccess::new(500.0, 2.0))),
+            IndexType::Gin | IndexType::Fts => Some(Box::new(cost::FtsAccess::new(500.0, 2.0))),
             IndexType::Gist | IndexType::Rtree => Some(Box::new(cost::RTreeAccess::new(50.0))),
         }
     }

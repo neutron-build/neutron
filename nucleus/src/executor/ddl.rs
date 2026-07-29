@@ -30,7 +30,7 @@ use super::schema_types::{
     TriggerTiming, ViewDef,
 };
 use super::types::{
-    ColMeta, EncryptedIndexEntry, GinIndexEntry, VectorIndexEntry, VectorIndexKind,
+    ColMeta, EncryptedIndexEntry, FtsIndexEntry, GinIndexEntry, VectorIndexEntry, VectorIndexKind,
 };
 use super::{ExecError, ExecResult, Executor};
 
@@ -1229,6 +1229,7 @@ impl Executor {
                     // Remove from sync btree_indexes and hash_indexes maps
                     self.btree_indexes.retain(|_, v| v != &index_name);
                     self.gin_indexes.write().remove(&index_name);
+                    self.fts_column_indexes.write().remove(&index_name);
                     // Also clean up hash_indexes if this was a hash index
                     // (hash_indexes is keyed by (table, col), so we just leave it; catalog drop handles it)
                     // Drop the storage engine index (log errors if not present)
@@ -1346,6 +1347,8 @@ impl Executor {
             Some(ref s) if s == "GIST" => crate::catalog::IndexType::Gist,
             Some(ref s) if s == "HNSW" => crate::catalog::IndexType::Hnsw,
             Some(ref s) if s == "IVFFLAT" => crate::catalog::IndexType::IvfFlat,
+            // BM25 is accepted as a synonym so ParadeDB-shaped DDL ports over.
+            Some(ref s) if s == "FTS" || s == "BM25" => crate::catalog::IndexType::Fts,
             _ => crate::catalog::IndexType::BTree,
         };
 
@@ -1362,6 +1365,33 @@ impl Executor {
             if !matches!(table_def.columns[position].data_type, DataType::Jsonb) {
                 return Err(ExecError::Unsupported(format!(
                     "GIN index column '{column}' must have type JSONB"
+                )));
+            }
+        }
+
+        if matches!(index_type, crate::catalog::IndexType::Fts) {
+            if columns.len() != 1 {
+                return Err(ExecError::Unsupported(
+                    "FTS indexes require exactly one TEXT column".into(),
+                ));
+            }
+            let column = &columns[0];
+            let Some(position) = table_def.column_index(column) else {
+                return Err(ExecError::ColumnNotFound(column.clone()));
+            };
+            if !matches!(table_def.columns[position].data_type, DataType::Text) {
+                return Err(ExecError::Unsupported(format!(
+                    "FTS index column '{column}' must have type TEXT"
+                )));
+            }
+            // Documents are keyed on the row's stable id so that maintenance
+            // survives DELETEs (which shift physical positions). Without one,
+            // corpus statistics would drift silently — refuse instead.
+            if self.resolve_pk_column(&table_name, &table_def).is_none() {
+                return Err(ExecError::Unsupported(format!(
+                    "FTS index on '{table_name}' requires an integer PRIMARY KEY \
+                     column to key documents on; the `col @@ 'query'` operator \
+                     still works without an index"
                 )));
             }
         }
@@ -1652,6 +1682,38 @@ impl Executor {
                         generation: self
                             .gin_write_gen
                             .load(std::sync::atomic::Ordering::Acquire),
+                    },
+                );
+            }
+        }
+
+        // For FTS indexes on TEXT columns, build the inverted index from the
+        // rows already in the table, keyed on each row's stable id.
+        if matches!(index_type, crate::catalog::IndexType::Fts) {
+            let table_def = self.get_table(&table_name).await?;
+            if let Some(col_name) = columns.first()
+                && let Some(col_idx) = table_def.column_index(col_name)
+                && let Some(pk_name) = self.resolve_pk_column(&table_name, &table_def)
+                && let Some(pk_idx) = table_def.column_index(&pk_name)
+            {
+                let mut index = crate::fts::InvertedIndex::new();
+                let engine = self.storage_for(&table_name);
+                let existing_rows = engine.scan(&table_name).await.unwrap_or_default();
+                for row in &existing_rows {
+                    let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
+                        continue;
+                    };
+                    if let Some(Value::Text(text)) = row.get(col_idx) {
+                        index.add_document(doc_id, text);
+                    }
+                }
+                self.fts_column_indexes.write().insert(
+                    index_name.clone(),
+                    FtsIndexEntry {
+                        table_name: table_name.clone(),
+                        column_name: col_name.clone(),
+                        pk_column: pk_name,
+                        index,
                     },
                 );
             }

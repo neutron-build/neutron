@@ -37,7 +37,8 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | KV collections | fsync | yes | **no** | **no** | yes (SQL); **no** over RESP |
 | Document | **page cache** | yes | yes, **session-scoped** | **no** | yes |
 | Graph | fsync | yes | yes, **session-scoped** | **no** | yes |
-| FTS | **page cache** | yes, via `fts_index.json` (see below) | partial (undo log, best-effort) | **no** | yes |
+| FTS — table index (`USING FTS`, `@@`, `BM25`) | n/a — derived from rows | rebuilt from base rows at startup | **yes** (rebuilt from committed rows on abort) | n/a — the rows are the SQL commit | **enforced** (rows go through table policies) |
+| FTS — document store (`FTS_*`) | **page cache** | yes, via `fts_index.json` (see below) | partial (undo log, best-effort) | **no** | yes (refused while RLS active) |
 | Geo | **none** | n/a — no state | n/a | n/a | n/a (pure functions) |
 | Vector (HNSW) | fsync | yes | yes, **session-scoped** | **no** | decorative (see below) |
 | Vector (IvfFlat) | **none** (rebuilt) | rebuilt from base rows | via rebuild | n/a | decorative |
@@ -489,6 +490,51 @@ held across an entire `CYPHER` statement. No relationship to SQL tables.
 ---
 
 ## Full-text search
+
+There are two full-text surfaces with different semantics. The table-attached
+index is the one to reach for; the document store is the older, detached one.
+
+### Table-attached index — `CREATE INDEX ... USING FTS`
+
+**Surface.** `CREATE INDEX ... ON <table> USING FTS (<text column>)` (`USING
+BM25` accepted), the `@@` operator, and `BM25(column, query)`
+(`src/executor/ddl.rs`, `src/executor/expr.rs`, `src/executor/scalar_fns.rs`).
+
+**Derived, not stored.** The index holds no authoritative state: it is a
+function of the table's rows. That is what gives it the row in the matrix above
+— there is nothing to lose on a crash, and nothing to roll back independently
+of the SQL commit. It is repopulated by `rebuild_specialty_indexes` at startup
+(`src/executor/mod.rs`) and by `rebuild_table_derived_state` after an abort or a
+bulk rewrite.
+
+**Correctness does not depend on it.** `@@` is defined row-locally
+(`crate::fts::text_matches`), so it evaluates correctly with no index at all.
+The index only narrows the candidate set, and every candidate is rechecked
+against the full predicate. A stale or missing index therefore costs time, not
+answers. `try_fts_index_scan` additionally declines to accelerate while a
+transaction is open or RLS is active, so uncommitted rows cannot reach another
+session's candidate set.
+
+**Documents are keyed on the row's integer primary key**
+(`Executor::stable_row_id`), not on scan position, so `DELETE` cannot silently
+shift the corpus out of alignment. `CREATE INDEX ... USING FTS` refuses a table
+without one rather than accept drift.
+
+**RLS.** Enforced, because the rows come out of the ordinary policy-checked
+table access path. One documented limitation: corpus statistics (`N`, average
+document length, per-term document frequency) are aggregate and not partitioned
+by policy, so a `BM25` score is computed against frequencies that include rows
+the querying role cannot read. This is a statistical channel of the same kind
+PostgreSQL exposes through planner statistics, not a way to read a hidden row.
+
+**Scoring is exact.** `BM25(col, q)` recomputes the score from the row's own
+text plus the index's corpus statistics, and
+`fts::tests::test_bm25_score_matches_index_score` asserts it equals, to within
+1e-9, the score `InvertedIndex::search_scored` assigns the same document. If the
+two ever drift, `ORDER BY BM25(...)` would silently disagree with the index it
+ranks.
+
+### Document store — `FTS_*`
 
 **Surface.** `FTS_INDEX(doc_id, text)`, `FTS_INDEX_FACETED`, `FTS_REMOVE`,
 `FTS_SEARCH(query, limit)`, `FTS_SEARCH_FILTER`, `FTS_FUZZY_SEARCH`,
