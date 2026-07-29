@@ -483,15 +483,13 @@ impl Executor {
         match plan {
             planner::PlanNode::Project { input, columns, .. } => {
                 for col_spec in columns {
-                    // Strip " AS alias" — the alias names the output, not an input.
-                    let expr_text = match col_spec.to_uppercase().rfind(" AS ") {
-                        Some(pos) => col_spec[..pos].trim(),
-                        None => col_spec.trim(),
-                    };
-                    if expr_text == "*" {
+                    if col_spec.trim() == "*" {
                         return None; // wildcard needs every column
                     }
-                    Self::collect_expr_columns(&Self::parse_expr_string(expr_text).ok()?, needed);
+                    // The alias names the output, not an input — only the
+                    // source expression contributes columns.
+                    let (expr, _alias) = Self::parse_projection_spec(col_spec)?;
+                    Self::collect_expr_columns(&expr, needed);
                 }
                 Self::required_scan_columns(input, needed)
             }
@@ -550,6 +548,38 @@ impl Executor {
                 }
                 Some(table.clone())
             }
+            _ => None,
+        }
+    }
+
+    /// Split a plan projection spec into its source expression and its output
+    /// alias.
+    ///
+    /// A spec is the rendered SQL of a `SelectItem`, so an alias is spelled
+    /// `expr AS alias` — but searching the rendered text for `" AS "` also finds
+    /// the one inside `CAST('2' AS INT)`, splitting it into the unparsable
+    /// fragment `(v = CAST('2'` and an "alias" of `INT)`. The fragment then
+    /// fails to parse and the column evaluates to NULL for every row, so
+    /// `SELECT (v = CAST('2' AS INT))` returned NULL while the identical
+    /// predicate in a `WHERE` matched correctly. Let the parser say where the
+    /// alias is instead of guessing from the text.
+    ///
+    /// Returns `None` for anything that is not a single expression select item
+    /// (`*`, a qualified wildcard, an unparsable placeholder); callers fall back
+    /// to treating the spec as opaque text, which is what they did before.
+    fn parse_projection_spec(spec: &str) -> Option<(Expr, Option<String>)> {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {spec}")).ok()?;
+        let Some(Statement::Query(q)) = stmts.into_iter().next() else {
+            return None;
+        };
+        let SetExpr::Select(sel) = *q.body else {
+            return None;
+        };
+        match sel.projection.into_iter().next()? {
+            SelectItem::UnnamedExpr(e) => Some((e, None)),
+            SelectItem::ExprWithAlias { expr, alias } => Some((expr, Some(alias.value))),
             _ => None,
         }
     }
@@ -2513,7 +2543,22 @@ impl Executor {
                                     .iter()
                                     .position(|c| c.name.eq_ignore_ascii_case(&col_name))
                             {
-                                let coerced_scan = Self::coerce_to_storage_type(&val);
+                                // Coerce to the column's declared type BEFORE
+                                // normalising to the storage representation.
+                                // Skipping the first step let a text-spelled
+                                // literal (`v = '2'` on an INT column, which is
+                                // what pgx SimpleProtocol sends) reach the fused
+                                // scan as `Text`, match nothing, and return an
+                                // empty result as the answer — while the same
+                                // predicate on the same data returned the row
+                                // when no index existed to route it here. The
+                                // sequential path in the SeqScan arm has always
+                                // done both steps.
+                                let typed = Self::coerce_to_column_type(
+                                    &val,
+                                    &table_def.columns[col_idx].data_type,
+                                );
+                                let coerced_scan = Self::coerce_to_storage_type(&typed);
                                 let storage = self.storage_for(table);
                                 if let Some((rows, examined)) =
                                     storage.fast_scan_where_eq(table, col_idx, &coerced_scan)
@@ -2934,13 +2979,15 @@ impl Executor {
                     let mut proj_meta = Vec::new();
                     let mut proj_items: Vec<ProjItem> = Vec::new();
                     for col_spec in columns {
-                        // Handle "expr AS alias"
-                        let (col_name, alias) =
-                            if let Some(pos) = col_spec.to_uppercase().rfind(" AS ") {
-                                (&col_spec[..pos], Some(col_spec[pos + 4..].trim()))
-                            } else {
-                                (col_spec.as_str(), None)
-                            };
+                        // Handle "expr AS alias". The split is done by the parser,
+                        // not by searching the text for " AS " — see
+                        // `parse_projection_spec`.
+                        let parsed = Self::parse_projection_spec(col_spec);
+                        let (owned_name, alias) = match &parsed {
+                            Some((expr, a)) => (expr.to_string(), a.as_deref()),
+                            None => (col_spec.clone(), None),
+                        };
+                        let col_name = owned_name.as_str();
                         if let Some(idx) = Self::resolve_plan_col_idx(&meta, col_name) {
                             // Output name: alias, else the PostgreSQL default
                             // for the spec expression ("COUNT(*)" -> "count",
@@ -5232,7 +5279,16 @@ impl Executor {
     /// Returns a list of (column_name, value) pairs for predicates of the form
     /// `column = literal` or `literal = column`, and the remaining expression
     /// that couldn't be pushed down (if any).
-    pub(super) fn extract_index_predicates(&self, expr: &Expr) -> IndexPredicates {
+    /// `table` is needed because every literal here is coerced to the declared
+    /// type of the column it is compared against, **before** any sentinel bound
+    /// is derived from it. Without that, `sentinel_min` looks at the literal's
+    /// own type: `v < '2'` on an `INT` column produced the range
+    /// `Text("")..=Text("2")`, which selects nothing from a map keyed by
+    /// `Int32` — so the predicate returned no rows when an index existed and
+    /// the right row when one did not. Coercing first also keeps the two bounds
+    /// the same type, which is what stops `BTreeMap::range` from being handed a
+    /// reversed range.
+    pub(super) fn extract_index_predicates(&self, table: &str, expr: &Expr) -> IndexPredicates {
         match expr {
             Expr::BinaryOp {
                 left,
@@ -5240,6 +5296,7 @@ impl Executor {
                 right,
             } => {
                 if let Some((col, val)) = self.try_extract_col_eq_literal(left, right) {
+                    let val = self.coerce_to_indexed_column(table, &col, &val);
                     return (vec![(col, val)], vec![], None);
                 }
                 (vec![], vec![], Some(expr.clone()))
@@ -5254,6 +5311,8 @@ impl Executor {
                     && let Some((col, lo, hi)) =
                         self.try_extract_col_between_literals(target, low, high)
                 {
+                    let lo = self.coerce_to_indexed_column(table, &col, &lo);
+                    let hi = self.coerce_to_indexed_column(table, &col, &hi);
                     return (vec![], vec![(col, lo, hi)], None);
                 }
                 (vec![], vec![], Some(expr.clone()))
@@ -5289,6 +5348,9 @@ impl Executor {
                 };
                 if let Some((col, val, col_on_left)) = self.try_extract_col_cmp_literal(left, right)
                 {
+                    // Coerce BEFORE the sentinel is derived — the sentinel takes
+                    // its type from this value.
+                    let val = self.coerce_to_indexed_column(table, &col, &val);
                     // Normalise so we always think in terms of `col OP val`.
                     // If the column was on the right, flip the operator.
                     let effective_op = if col_on_left {
@@ -5322,8 +5384,10 @@ impl Executor {
                 op: ast::BinaryOperator::And,
                 right,
             } => {
-                let (mut left_eq, mut left_ranges, left_rest) = self.extract_index_predicates(left);
-                let (right_eq, right_ranges, right_rest) = self.extract_index_predicates(right);
+                let (mut left_eq, mut left_ranges, left_rest) =
+                    self.extract_index_predicates(table, left);
+                let (right_eq, right_ranges, right_rest) =
+                    self.extract_index_predicates(table, right);
                 left_eq.extend(right_eq);
                 left_ranges.extend(right_ranges);
                 let remaining = match (left_rest, right_rest) {
@@ -5338,7 +5402,7 @@ impl Executor {
                 };
                 (left_eq, left_ranges, remaining)
             }
-            Expr::Nested(inner) => self.extract_index_predicates(inner),
+            Expr::Nested(inner) => self.extract_index_predicates(table, inner),
             _ => (vec![], vec![], Some(expr.clone())),
         }
     }
@@ -6145,6 +6209,14 @@ impl Executor {
                 | DataType::TimestampTz
                 | DataType::Uuid,
             ) => val.cast(target).unwrap_or_else(|_| val.clone()),
+            // NUMERIC is exact and stored as text, so an int/float literal never
+            // equals it bitwise. A decimal literal parses as `Float64`, so
+            // without this arm `v = 2.25` on a NUMERIC column reached the
+            // storage fast paths as a float and matched nothing.
+            (
+                Value::Float64(_) | Value::Int32(_) | Value::Int64(_),
+                DataType::Numeric,
+            ) => val.cast(target).unwrap_or_else(|_| val.clone()),
             _ => val.clone(),
         }
     }
@@ -6857,7 +6929,8 @@ impl Executor {
                     op: ast::BinaryOperator::Eq,
                     ..
                 } => {
-                    let (eq_preds, _, remaining) = self.extract_index_predicates(where_expr);
+                    let (eq_preds, _, remaining) =
+                        self.extract_index_predicates(table_name, where_expr);
                     if remaining.is_some() || eq_preds.len() != 1 {
                         return None;
                     }
@@ -6869,7 +6942,8 @@ impl Executor {
                 }
                 // BETWEEN: col BETWEEN low AND high (always inclusive)
                 Expr::Between { negated: false, .. } => {
-                    let (_, range_preds, remaining) = self.extract_index_predicates(where_expr);
+                    let (_, range_preds, remaining) =
+                        self.extract_index_predicates(table_name, where_expr);
                     if remaining.is_some() || range_preds.len() != 1 {
                         return None;
                     }
@@ -6951,6 +7025,31 @@ impl Executor {
     /// Fully synchronous index scan attempt -- no `.await` points.
     /// Uses parking_lot caches and `index_lookup_sync` to avoid async deadlocks
     /// in the nested Box::pin future chain of execute_select_inner_with_ctes.
+    /// Coerce an index probe value to the declared type of the column the index
+    /// is on.
+    ///
+    /// `extract_index_predicates` yields the literal exactly as the query spelled
+    /// it, so `WHERE v = '2'` on an `INT` column probes a B-tree keyed by
+    /// `Int32` with a `Text` key. The probe matches nothing and — because an
+    /// empty exact-match result is indistinguishable from a legitimately empty
+    /// one — the caller returns zero rows as the answer. The sequential path
+    /// coerces before comparing, so the same predicate returned a row without an
+    /// index and no rows with one.
+    ///
+    /// This is not an exotic spelling: pgx's SimpleProtocol interpolates every
+    /// parameter as a quoted literal, so a Go client's `WHERE id = $1` arrives
+    /// here as text against whatever the column really is.
+    fn coerce_to_indexed_column(&self, table: &str, col_name: &str, value: &Value) -> Value {
+        let cols = self.table_columns.read();
+        match cols
+            .get(table)
+            .and_then(|cs| cs.iter().find(|(n, _)| n.eq_ignore_ascii_case(col_name)))
+        {
+            Some((_, dtype)) => Self::coerce_to_column_type(value, dtype),
+            None => value.clone(),
+        }
+    }
+
     pub(super) fn try_index_scan_sync(
         &self,
         table_name: &str,
@@ -6974,7 +7073,8 @@ impl Executor {
         {
             return None;
         }
-        let (eq_preds, range_preds, _remaining) = self.extract_index_predicates(where_expr);
+        let (eq_preds, range_preds, _remaining) =
+            self.extract_index_predicates(table_name, where_expr);
         if eq_preds.is_empty() && range_preds.is_empty() {
             return None;
         }
@@ -6985,7 +7085,8 @@ impl Executor {
             if let Some(index_name_ref) = self.btree_indexes.get(&key) {
                 let index_name = index_name_ref.clone();
                 drop(index_name_ref);
-                // Try synchronous index lookup via storage engine
+                // `value` was already coerced to the column's declared type by
+                // `extract_index_predicates`.
                 match self
                     .storage_for(table_name)
                     .index_lookup_sync(table_name, &index_name, value)

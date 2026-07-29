@@ -107,6 +107,23 @@ impl FilterOp {
     }
 }
 
+/// True when no key can lie inside `low..=high`, so a `BTreeMap::range` over it
+/// must not be attempted.
+///
+/// `range(low..=high)` **panics** when `low > high`, and ordinary SQL produces
+/// that: a contradictory predicate (`id >= 20 AND id <= -5`), or a bound whose
+/// type does not match the indexed column — a comparison's open end is a
+/// sentinel derived from the *literal's* type, so `v < '2'` on an INT column
+/// yields `Text("")..=Int32(2)`, which is reversed under `Value`'s type-rank
+/// ordering. Either way the answer is "no rows", never a crashed query.
+///
+/// The comparison deliberately uses the same `Ord` the map is keyed by. A
+/// coercing comparison can call these two bounds equal or incomparable and let
+/// the panic straight through.
+pub(crate) fn range_cannot_match(low: &Value, high: &Value) -> bool {
+    low > high
+}
+
 /// Narrow a materialized row to `projection`, in projection order.
 ///
 /// An index past the row's width reads as NULL rather than shrinking the row:
@@ -1059,6 +1076,9 @@ impl StorageEngine for MemoryEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        if range_cannot_match(low, high) {
+            return Ok(Some(Vec::new()));
+        }
         let indexes = self.indexes.read();
         match indexes.get(index_name) {
             Some(idx) => {
@@ -1308,6 +1328,9 @@ impl StorageEngine for MemoryEngine {
             let entries = idx.map.get(val)?;
             Some(entries.iter().map(|_| vec![val.clone()]).collect())
         } else if let Some((low, high)) = range {
+            if range_cannot_match(low, high) {
+                return Some(Vec::new());
+            }
             // Range scan: iterate BTreeMap range, return key values only
             let mut rows = Vec::new();
             for (key, entries) in idx.map.range(low..=high) {

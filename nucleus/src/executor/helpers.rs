@@ -443,10 +443,10 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         // `TIMESTAMP '2024-01-01 00:00:00' = DATE '2024-01-01'` is true). Both
         // use the 2000-01-01 epoch; a date is days, a timestamp is microseconds.
         (Value::Date(d), Value::Timestamp(t)) | (Value::Date(d), Value::TimestampTz(t)) => {
-            Some((*d as i64 * 86_400_000_000).cmp(t))
+            Some(crate::types::date_as_micros(*d).cmp(t))
         }
         (Value::Timestamp(t), Value::Date(d)) | (Value::TimestampTz(t), Value::Date(d)) => {
-            Some(t.cmp(&(*d as i64 * 86_400_000_000)))
+            Some(t.cmp(&crate::types::date_as_micros(*d)))
         }
         (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
         (Value::TimestampTz(a), Value::TimestampTz(b)) => Some(a.cmp(b)),

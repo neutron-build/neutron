@@ -1901,7 +1901,7 @@ impl Executor {
                             .map(Value::Timestamp)
                     }
                     (Value::Date(value), true) => local_timestamp_at_time_zone(
-                        value as i64 * 86_400_000_000,
+                        crate::types::date_as_micros(value),
                         self.session_time_zone()?,
                     )
                     .map(Value::TimestampTz),
