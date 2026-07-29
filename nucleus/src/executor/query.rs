@@ -9565,6 +9565,24 @@ impl Executor {
     ///
     /// Returns None for complex expressions (AND/OR chains, function calls, etc.)
     /// since the zone map optimization is best-effort.
+    /// Combine a lower and an upper bound on the same column into the single
+    /// `Between` the granule-skip logic understands. Order-insensitive; returns
+    /// `None` when the two are not a lower/upper pair (e.g. two lower bounds),
+    /// which the caller handles by keeping one side.
+    ///
+    /// Strict bounds deliberately widen to inclusive: a granule is only ever
+    /// *kept* by being too generous here, and the row-level predicate still
+    /// runs afterwards. Narrowing would be the unsound direction.
+    fn zm_merge_bounds(a: FilterPredicate, b: FilterPredicate) -> Option<FilterPredicate> {
+        use FilterPredicate::*;
+        let (lo, hi) = match (a, b) {
+            (GreaterThan(l) | GreaterThanOrEqual(l), LessThan(h) | LessThanOrEqual(h)) => (l, h),
+            (LessThan(h) | LessThanOrEqual(h), GreaterThan(l) | GreaterThanOrEqual(l)) => (l, h),
+            _ => return None,
+        };
+        Some(Between { min: lo, max: hi })
+    }
+
     fn extract_zone_map_predicate(
         expr: &Expr,
         col_meta: &[ColMeta],
@@ -9578,6 +9596,38 @@ impl Executor {
             Self::coerce_to_column_type(&v, &col_meta[idx].dtype)
         };
         match expr {
+            // A two-sided window — `ts >= lo AND ts < hi` — is THE shape a
+            // time-series query has, and it reached the granule statistics not
+            // at all: without this arm the whole expression fell through to
+            // `None`, so a bounded range pruned nothing while the same range
+            // written as `BETWEEN` pruned fine. Both bounds on one column
+            // collapse to the `Between` predicate the skip logic already
+            // understands; strict bounds widen to inclusive, which can only
+            // keep a granule that the row-level recheck then discards.
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => {
+                let lo = Self::extract_zone_map_predicate(left, col_meta);
+                let hi = Self::extract_zone_map_predicate(right, col_meta);
+                match (lo, hi) {
+                    (Some((lc, lp)), Some((hc, hp))) if lc == hc => {
+                        match Self::zm_merge_bounds(lp, hp) {
+                            Some(merged) => Some((lc, merged)),
+                            // Same column but not a lower/upper pair: keep
+                            // whichever side prunes rather than giving up.
+                            None => Self::extract_zone_map_predicate(left, col_meta),
+                        }
+                    }
+                    // Different columns (or only one side usable): either bound
+                    // alone is still a sound filter, since AND only narrows.
+                    (Some(l), _) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
+            Expr::Nested(inner) => Self::extract_zone_map_predicate(inner, col_meta),
             Expr::BinaryOp { left, op, right } => {
                 // Try col op literal (left=col, right=literal)
                 if let Some((col_idx, val)) =
