@@ -425,6 +425,7 @@ impl Executor {
                     }
                     self.update_vector_indexes_on_insert(&table_name, &row, &table_def);
                     self.update_encrypted_indexes_on_insert(&table_name, &row, &table_def);
+                    self.update_fts_indexes_on_insert(&table_name, &row, &table_def);
                     // Fire AFTER INSERT row-level triggers (only if triggers exist)
                     if has_triggers {
                         self.fire_triggers(
@@ -1965,6 +1966,7 @@ impl Executor {
         self.rebuild_zone_map(table_name).await;
         self.refresh_gin_after_write(table_name).await;
         self.rebuild_position_indexes_for_table(table_name).await;
+        self.rebuild_fts_indexes_for_table(table_name).await;
 
         let session = self.current_session();
         let mut txn = session.txn_state.write().await;
@@ -2087,6 +2089,10 @@ impl Executor {
         };
         let has_encrypted_indexes = {
             let indexes = self.encrypted_indexes.read();
+            indexes.values().any(|e| e.table_name == table_name)
+        };
+        let has_fts_indexes = {
+            let indexes = self.fts_column_indexes.read();
             indexes.values().any(|e| e.table_name == table_name)
         };
 
@@ -2213,9 +2219,9 @@ impl Executor {
                 .await?;
         }
 
-        // Maintain vector and encrypted indexes: remove old values, insert new
+        // Maintain vector, encrypted, and FTS indexes: remove old values, insert new
         // Skip entirely if no such indexes exist for this table
-        if has_vector_indexes || has_encrypted_indexes {
+        if has_vector_indexes || has_encrypted_indexes || has_fts_indexes {
             for (pos, new_row) in &updates {
                 if let Some(&old_row) = row_by_pos.get(pos) {
                     if has_encrypted_indexes {
@@ -2224,12 +2230,20 @@ impl Executor {
                     if has_vector_indexes {
                         self.remove_from_vector_indexes(&table_name, old_row, *pos, &table_def);
                     }
+                    // An UPDATE that moves the primary key leaves the old
+                    // document orphaned unless it is dropped by its old key.
+                    if has_fts_indexes {
+                        self.remove_from_fts_indexes(&table_name, old_row, &table_def);
+                    }
                 }
                 if has_encrypted_indexes {
                     self.update_encrypted_indexes_on_insert(&table_name, new_row, &table_def);
                 }
                 if has_vector_indexes {
                     self.update_vector_indexes_on_insert(&table_name, new_row, &table_def);
+                }
+                if has_fts_indexes {
+                    self.update_fts_indexes_on_insert(&table_name, new_row, &table_def);
                 }
             }
         }
@@ -2508,7 +2522,12 @@ impl Executor {
                 .read()
                 .values()
                 .any(|e| e.table_name == table_name);
-            if has_vec || has_enc {
+            let has_fts = self
+                .fts_column_indexes
+                .read()
+                .values()
+                .any(|e| e.table_name == table_name);
+            if has_vec || has_enc || has_fts {
                 for &pos in &positions {
                     if let Some(&old_row) = row_by_pos.get(&pos) {
                         if has_enc {
@@ -2521,6 +2540,9 @@ impl Executor {
                         }
                         if has_vec {
                             self.remove_from_vector_indexes(&table_name, old_row, pos, &table_def);
+                        }
+                        if has_fts {
+                            self.remove_from_fts_indexes(&table_name, old_row, &table_def);
                         }
                     }
                 }

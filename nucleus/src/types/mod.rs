@@ -893,6 +893,27 @@ impl Ord for Value {
             (Value::Date(a), Value::Date(b)) => a.cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::TimestampTz(a), Value::TimestampTz(b)) => a.cmp(b),
+            // Mixed temporal variants must order by INSTANT, not by type tag.
+            // Without these arms the `_ => type_rank()` fallback below ranked
+            // Date(6) < Timestamp(7) < TimestampTz(8), so a TIMESTAMP literal
+            // against a TIMESTAMPTZ column made `v <= high` false for every row
+            // and the storage fast-scan paths — which compare with raw `Value`
+            // ordering — silently returned nothing. These mirror
+            // `executor::helpers::compare_values`, which had them all along;
+            // that divergence is what let a predicate be true in a projection
+            // and false in the WHERE clause on the same row.
+            //
+            // A date compares as midnight of that day, matching PostgreSQL
+            // (`TIMESTAMP '2024-01-01 00:00:00' = DATE '2024-01-01'`). Both use
+            // the 2000-01-01 epoch; a date is days, a timestamp microseconds.
+            (Value::Date(d), Value::Timestamp(t)) | (Value::Date(d), Value::TimestampTz(t)) => {
+                (*d as i64 * 86_400_000_000).cmp(t)
+            }
+            (Value::Timestamp(t), Value::Date(d)) | (Value::TimestampTz(t), Value::Date(d)) => {
+                t.cmp(&(*d as i64 * 86_400_000_000))
+            }
+            (Value::Timestamp(a), Value::TimestampTz(b))
+            | (Value::TimestampTz(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             (Value::Bytea(a), Value::Bytea(b)) => a.cmp(b),
             (

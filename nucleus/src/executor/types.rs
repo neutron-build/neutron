@@ -154,6 +154,21 @@ pub(crate) struct GinIndexEntry {
     pub generation: u64,
 }
 
+/// A live full-text index over a TEXT column of a table.
+///
+/// Unlike the `FTS_*` sidecar surface — whose document ids are supplied by the
+/// application and kept in sync by hand — this index is attached to the table
+/// and maintained by DML, so it can never disagree with the rows. Documents are
+/// keyed by the row's stable id (its integer primary key), which is why
+/// `CREATE INDEX ... USING FTS` requires one.
+pub(crate) struct FtsIndexEntry {
+    pub table_name: String,
+    pub column_name: String,
+    /// Name of the integer PRIMARY KEY column the documents are keyed on.
+    pub pk_column: String,
+    pub index: crate::fts::InvertedIndex,
+}
+
 /// Cached query result entry.
 pub(crate) struct QueryCacheEntry {
     pub columns: Vec<(String, DataType)>,

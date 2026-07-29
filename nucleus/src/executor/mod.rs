@@ -381,6 +381,9 @@ pub struct Executor {
     /// Advances whenever a write becomes committed. GIN entries are usable
     /// only when stamped with this generation.
     gin_write_gen: AtomicU64,
+    /// Live table-attached full-text indexes: index_name → FtsIndexEntry.
+    /// Distinct from `fts_index`, which is the doc-id-keyed sidecar store.
+    fts_column_indexes: parking_lot::RwLock<HashMap<String, FtsIndexEntry>>,
     /// Sync cache of table column metadata: table_name → [(col_name, DataType)].
     table_columns: parking_lot::RwLock<HashMap<String, Vec<(String, DataType)>>>,
     /// Persistent statistics store populated by ANALYZE, used by EXPLAIN / query planner.
@@ -607,6 +610,7 @@ impl Executor {
             hash_indexes: DashMap::new(),
             gin_indexes: parking_lot::RwLock::new(HashMap::new()),
             gin_write_gen: AtomicU64::new(0),
+            fts_column_indexes: parking_lot::RwLock::new(HashMap::new()),
             table_columns: parking_lot::RwLock::new(HashMap::new()),
             stats_store: Arc::new(planner::StatsStore::new()),
             #[cfg(feature = "server")]
@@ -1286,6 +1290,54 @@ impl Executor {
                 }
                 _ => {}
             }
+        }
+
+        // Table-attached FTS indexes live only in memory, so a reopened
+        // database has the catalog definition but no postings and no corpus.
+        // Rebuild them here or `BM25()` would report "no index" after every
+        // restart, and `@@` would quietly drop to a full scan forever.
+        for idx in &all_indexes {
+            if !matches!(idx.index_type, crate::catalog::IndexType::Fts) {
+                continue;
+            }
+            let Some(col_name) = idx.columns.first().cloned() else {
+                continue;
+            };
+            let Some(table_def) = self.catalog.get_table(&idx.table_name).await else {
+                continue;
+            };
+            let Some(col_idx) = table_def.column_index(&col_name) else {
+                continue;
+            };
+            let Some(pk_name) = self.resolve_pk_column(&idx.table_name, &table_def) else {
+                continue;
+            };
+            let Some(pk_idx) = table_def.column_index(&pk_name) else {
+                continue;
+            };
+            let rows = self
+                .storage_for(&idx.table_name)
+                .scan(&idx.table_name)
+                .await
+                .unwrap_or_default();
+            let mut index = crate::fts::InvertedIndex::new();
+            for row in &rows {
+                let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
+                    continue;
+                };
+                if let Some(Value::Text(text)) = row.get(col_idx) {
+                    index.add_document(doc_id, text);
+                }
+            }
+            self.fts_column_indexes.write().insert(
+                idx.name.clone(),
+                FtsIndexEntry {
+                    table_name: idx.table_name.clone(),
+                    column_name: col_name,
+                    pk_column: pk_name,
+                    index,
+                },
+            );
         }
 
         self.rebuild_all_gin_indexes().await;
@@ -5820,6 +5872,145 @@ impl Executor {
         for (idx_name, id) in wal_deletes {
             self.wal_log_vector_delete(&idx_name, id);
         }
+    }
+
+    /// Add a newly inserted row to any live table-attached FTS indexes.
+    fn update_fts_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
+        let mut indexes = self.fts_column_indexes.write();
+        for entry in indexes.values_mut() {
+            if entry.table_name != table_name {
+                continue;
+            }
+            let (Some(col_idx), Some(pk_idx)) = (
+                table_def.column_index(&entry.column_name),
+                table_def.column_index(&entry.pk_column),
+            ) else {
+                continue;
+            };
+            let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
+                continue;
+            };
+            match row.get(col_idx) {
+                Some(Value::Text(text)) => entry.index.add_document(doc_id, text),
+                // A NULL text column contributes no terms but must not leave a
+                // stale document behind from a previous value.
+                _ => entry.index.remove_document(doc_id),
+            }
+        }
+    }
+
+    /// Drop a row's document from any live table-attached FTS indexes.
+    fn remove_from_fts_indexes(&self, table_name: &str, row: &Row, table_def: &TableDef) {
+        let mut indexes = self.fts_column_indexes.write();
+        for entry in indexes.values_mut() {
+            if entry.table_name != table_name {
+                continue;
+            }
+            let Some(pk_idx) = table_def.column_index(&entry.pk_column) else {
+                continue;
+            };
+            if let Some(doc_id) = Self::stable_row_id(row, pk_idx) {
+                entry.index.remove_document(doc_id);
+            }
+        }
+    }
+
+    /// Rebuild every table-attached FTS index for one table from the
+    /// authoritative committed rows.
+    ///
+    /// Incremental maintenance is the normal path, but it can observe rows a
+    /// transaction later abandons, and bulk paths (table rewrite, TRUNCATE,
+    /// cascade) move rows without passing through it. This is the resync, and
+    /// it is why index-accelerated `@@` cannot return a false negative: the
+    /// abort path in `rollback_transaction` calls it for every table the
+    /// transaction dirtied.
+    pub(super) async fn rebuild_fts_indexes_for_table(&self, table_name: &str) {
+        let has_entry = self
+            .fts_column_indexes
+            .read()
+            .values()
+            .any(|e| e.table_name == table_name);
+        if !has_entry {
+            return;
+        }
+        let Some(table_def) = self.catalog.get_table(table_name).await else {
+            return;
+        };
+        let rows = self
+            .storage_for(table_name)
+            .scan_for_maintenance(table_name)
+            .await
+            .unwrap_or_default();
+
+        let mut indexes = self.fts_column_indexes.write();
+        for entry in indexes.values_mut() {
+            if entry.table_name != table_name {
+                continue;
+            }
+            let (Some(col_idx), Some(pk_idx)) = (
+                table_def.column_index(&entry.column_name),
+                table_def.column_index(&entry.pk_column),
+            ) else {
+                continue;
+            };
+            let mut rebuilt = crate::fts::InvertedIndex::new();
+            for row in &rows {
+                let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
+                    continue;
+                };
+                if let Some(Value::Text(text)) = row.get(col_idx) {
+                    rebuilt.add_document(doc_id, text);
+                }
+            }
+            entry.index = rebuilt;
+        }
+    }
+
+    /// Candidate row ids for `column @@ query`, from the table-attached FTS
+    /// index, or `None` when no usable index covers the column.
+    ///
+    /// Callers must still recheck the predicate on every candidate: the index
+    /// narrows the scan, it does not decide the result.
+    pub(super) fn fts_candidates(
+        &self,
+        table_name: &str,
+        column: &str,
+        query: &str,
+    ) -> Option<(String, std::collections::HashSet<u64>)> {
+        let indexes = self.fts_column_indexes.read();
+        let entry = indexes.values().find(|e| {
+            e.table_name.eq_ignore_ascii_case(table_name)
+                && e.column_name.eq_ignore_ascii_case(column)
+        })?;
+        // `search_scored` is conjunctive, the same rule `text_matches` applies,
+        // so the candidate set is exactly the matching set for a current index.
+        let hits = entry.index.search_scored(query, usize::MAX);
+        Some((entry.pk_column.clone(), hits.into_iter().map(|(id, _)| id).collect()))
+    }
+
+    /// Corpus statistics for `query` from the FTS index on `column`, if one
+    /// exists. `table` narrows the search when the column name is ambiguous
+    /// across tables; `None` accepts a unique match on the column name alone.
+    ///
+    /// Returns `None` when no index covers the column — `BM25()` then reports
+    /// that rather than silently scoring against an empty corpus.
+    pub(super) fn fts_stats_for_column(
+        &self,
+        table: Option<&str>,
+        column: &str,
+        query: &str,
+    ) -> Option<crate::fts::Bm25Stats> {
+        let indexes = self.fts_column_indexes.read();
+        let mut matches = indexes.values().filter(|e| {
+            e.column_name.eq_ignore_ascii_case(column)
+                && table.is_none_or(|t| e.table_name.eq_ignore_ascii_case(t))
+        });
+        let entry = matches.next()?;
+        // Ambiguous unqualified column: refuse rather than guess a corpus.
+        if table.is_none() && matches.next().is_some() {
+            return None;
+        }
+        Some(entry.index.bm25_stats(query))
     }
 
     /// Add a newly inserted row to any live encrypted indexes on the table.

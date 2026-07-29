@@ -389,3 +389,79 @@ async fn test_encrypted_index_survives_restart() {
         assert_eq!(count, 3, "secrets table should have 3 rows after restart");
     }
 }
+
+// ── Table-attached FTS persistence ────────────────────────────────────────────
+
+/// The FTS postings and corpus live only in memory. A reopened database has the
+/// catalog definition but nothing behind it, so scoring must be rebuilt at
+/// startup — otherwise `BM25()` reports "no index" after every restart and
+/// `@@` silently drops to a full scan for the life of the process.
+#[tokio::test]
+async fn test_fts_index_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            "CREATE TABLE articles (id INT PRIMARY KEY, body TEXT)",
+        )
+        .await;
+        exec(
+            &ex,
+            "INSERT INTO articles VALUES (1, 'machine learning pipelines')",
+        )
+        .await;
+        exec(
+            &ex,
+            "INSERT INTO articles VALUES (2, 'database storage engines')",
+        )
+        .await;
+        exec(&ex, "CREATE INDEX articles_fts ON articles USING FTS (body)").await;
+
+        let r = exec(
+            &ex,
+            "SELECT BM25(body, 'machine learning') FROM articles WHERE id = 1",
+        )
+        .await;
+        match rows(&r[0])[0][0] {
+            Value::Float64(s) => assert!(s > 0.0, "pre-restart score was {s}"),
+            ref other => panic!("expected a score, got {other:?}"),
+        }
+    }
+
+    // ── Restart ──
+    {
+        let ex = open_executor(dir.path()).await;
+
+        let matched = exec(
+            &ex,
+            "SELECT id FROM articles WHERE body @@ 'machine learning'",
+        )
+        .await;
+        assert_eq!(rows(&matched[0]).len(), 1, "@@ lost rows across restart");
+
+        let scored = exec(
+            &ex,
+            "SELECT BM25(body, 'machine learning') FROM articles WHERE id = 1",
+        )
+        .await;
+        match rows(&scored[0])[0][0] {
+            Value::Float64(s) => assert!(s > 0.0, "corpus was not rebuilt: score {s}"),
+            ref other => panic!("expected a score after restart, got {other:?}"),
+        }
+
+        // And the rebuilt index stays correct under further writes.
+        exec(
+            &ex,
+            "INSERT INTO articles VALUES (3, 'machine learning at scale')",
+        )
+        .await;
+        let after = exec(
+            &ex,
+            "SELECT id FROM articles WHERE body @@ 'machine learning'",
+        )
+        .await;
+        assert_eq!(rows(&after[0]).len(), 2);
+    }
+}

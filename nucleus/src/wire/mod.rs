@@ -3691,6 +3691,9 @@ fn walk_expr_for_params(
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo
+                    // `body @@ $1` — both sides of a full-text match are text,
+                    // so the column's type describes the placeholder exactly.
+                    | BinaryOperator::AtAt
             ) {
                 if let Some(t) = expr_pg_type(left, tables) {
                     mark_param(right, t, out);
@@ -3763,6 +3766,9 @@ fn walk_expr_for_params(
                 "FTS_SEARCH_FILTER" => &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT],
                 "FTS_INDEX" => &[Type::INT8, Type::TEXT],
                 "FTS_INDEX_FACETED" => &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT],
+                // BM25's first argument must be a column reference, so only the
+                // query placeholder is bindable; typing both is still correct.
+                "BM25" => &[Type::TEXT, Type::TEXT],
                 "KV_INCR" => &[Type::TEXT, Type::INT8],
                 _ => &[],
             };

@@ -1359,6 +1359,23 @@ impl Executor {
             Expr::IsNull(inner) | Expr::IsNotNull(inner) => Self::expr_has_unsupported(inner),
             // Simple identifiers and values are fine
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => false,
+            // Typed literals (`TIMESTAMP '…'`, `DATE '…'`, `UUID '…'`) are
+            // constants, not features. Excluding them sent every query with a
+            // temporal literal in its WHERE down the AST path, which silently
+            // gave up the plan path's index range scan: a bounded time window
+            // over an indexed TIMESTAMP column full-scanned the table while the
+            // identical query over a BIGINT epoch column used the index. Only
+            // safe because `eval_expr_plan` now evaluates them — a supported
+            // marker without an evaluator arm returns NULL and drops every row.
+            Expr::TypedString(_) => false,
+            // `INTERVAL '5 minutes'` is likewise a constant, and `eval_expr_plan`
+            // has evaluated it all along — only this list disagreed. Omitting it
+            // excluded the canonical dashboard predicate
+            // (`ts >= <bound> - INTERVAL '1 hour'`) from plan execution, so a
+            // bounded time window full-scanned purely because of how its upper
+            // bound was spelled. Recurse so an unsupported inner expression is
+            // still caught.
+            Expr::Interval(interval) => Self::expr_has_unsupported(&interval.value),
             // Anything else we don't recognize — skip plan execution
             _ => true,
         }
@@ -2319,11 +2336,29 @@ impl Executor {
                             Self::extract_equality_value(key_expr)
                         });
                         if let Some(val) = key_val {
-                            // For non-PK equality scans with many expected rows, prefer
-                            // fast_scan_where_eq which has better cache locality than
-                            // cloning from the index BTreeMap. For PK/unique lookups
-                            // (estimated_rows ≤ 10), use O(log N) index lookup instead.
-                            if *estimated_rows > 10
+                            // For an unselective equality, a sequential scan can beat
+                            // cloning scattered rows out of the index BTreeMap. The
+                            // crossover is a FRACTION of the table, though, not an
+                            // absolute row count — and `estimated_rows` is
+                            // `row_count * selectivity`, where selectivity defaults to
+                            // 10% for any column ANALYZE has not measured
+                            // (`TableStats::equality_selectivity`). So the old
+                            // `> 10` test really read "this table has more than ~100
+                            // rows", and every indexed equality lookup above that size
+                            // silently degraded to an O(n) scan. The only columns that
+                            // kept using their index were the ones whose engine
+                            // `fast_scan_where_eq` is unimplemented and returns None.
+                            //
+                            // Requiring the estimate to be a third of the table keeps
+                            // the sequential path for genuinely low-cardinality columns
+                            // (measured by ANALYZE) while the 10% default never trips
+                            // it. When the row count is unavailable, prefer the index:
+                            // O(log n + k) is the safe choice under uncertainty.
+                            let unselective = self
+                                .storage_for(table)
+                                .fast_count_all(table)
+                                .is_some_and(|total| total > 0 && estimated_rows * 3 >= total);
+                            if unselective
                                 && let Some((col_name, _)) =
                                     planner::is_equality_predicate(key_expr)
                                 && let Some(col_idx) = table_def
@@ -3642,6 +3677,12 @@ impl Executor {
         meta: &[ColMeta],
     ) -> Result<Value, ExecError> {
         match expr {
+            // Typed literals carry no row dependency, so the general evaluator
+            // is reused rather than reimplemented here. Two evaluators over the
+            // same expressions is how `TIMESTAMP '…'` came to mean one thing in
+            // a projection and another in a WHERE clause; the shared call is the
+            // point, not a shortcut.
+            Expr::TypedString(_) => self.eval_row_expr(expr, row, meta),
             Expr::Identifier(ident) => {
                 let name = ident.value.as_str();
                 if let Some(idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
@@ -6870,6 +6911,71 @@ impl Executor {
         }
     }
 
+    /// The `(column, query)` of a full-text `column @@ 'query'` predicate,
+    /// looking through parentheses and into the conjuncts of an AND chain.
+    fn extract_fts_match(&self, expr: &Expr) -> Option<(String, String)> {
+        match expr {
+            Expr::Nested(inner) => self.extract_fts_match(inner),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => self
+                .extract_fts_match(left)
+                .or_else(|| self.extract_fts_match(right)),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::AtAt,
+                right,
+            } => {
+                let column = match left.as_ref() {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+                    _ => return None,
+                };
+                match self.eval_const_expr(right).ok()? {
+                    Value::Text(query) => Some((column, query)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Narrow a full-text query through the table-attached FTS index, so that
+    /// `@@` does not have to tokenize every row in the table.
+    ///
+    /// The index only proposes candidates; the caller rechecks the predicate,
+    /// which is defined row-locally and needs no index to be correct. Skipped
+    /// inside an open transaction, where incremental maintenance may have
+    /// observed rows the transaction has not committed.
+    pub(super) async fn try_fts_index_scan(
+        &self,
+        table_name: &str,
+        label: &str,
+        where_expr: &Expr,
+    ) -> IndexScanResult {
+        if self.rls_active(table_name) || self.current_session().txn_state.read().await.active {
+            return None;
+        }
+        let (column_name, query) = self.extract_fts_match(where_expr)?;
+        let (pk_column, candidates) = self.fts_candidates(table_name, &column_name, &query)?;
+
+        let table_def = self.catalog.get_table(table_name).await?;
+        let pk_idx = table_def.column_index(&pk_column)?;
+
+        let all_rows = self.storage_for(table_name).scan(table_name).await.ok()?;
+        self.metrics.rows_scanned.inc_by(all_rows.len() as u64);
+        let rows = all_rows
+            .into_iter()
+            .filter(|row| {
+                Self::stable_row_id(row, pk_idx).is_some_and(|id| candidates.contains(&id))
+            })
+            .collect();
+        let col_meta = self.build_col_meta_from_cache(table_name, label)?;
+        Some((col_meta, rows, Some(where_expr.clone()), None))
+    }
+
     /// Narrow a JSONB containment query through a live GIN posting map. The
     /// storage scan and full predicate recheck remain authoritative, so a stale
     /// or lossy posting representation can never manufacture a result.
@@ -7006,6 +7112,11 @@ impl Executor {
                         .await
                     {
                         Some(gin)
+                    } else if let Some(fts) = self
+                        .try_fts_index_scan(&table_name, &label, selection)
+                        .await
+                    {
+                        Some(fts)
                     } else {
                         self.try_index_scan_sync(&table_name, &label, selection)
                     }
