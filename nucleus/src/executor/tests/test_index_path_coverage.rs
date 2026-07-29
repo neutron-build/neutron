@@ -352,3 +352,92 @@ async fn test_unselective_equality_still_correct() {
     let (_, none) = scan_cost(&ex, "SELECT id FROM lowcard WHERE flag = 9").await;
     assert_eq!(none, 0, "no row has flag = 9");
 }
+
+/// An index that stops being used must say so.
+///
+/// `if let Ok(Some(rows)) = …index_lookup_range(…)` treated "this table has no
+/// index", "this index cannot serve this predicate" and "this index is unusable
+/// inside a transaction" as the same silent miss. In an engine whose
+/// characteristic failure is a query that quietly stops using its index while
+/// still returning the right answer, that is the one thing an operator needs to
+/// be able to see.
+#[tokio::test]
+async fn test_index_scan_fallbacks_are_counted() {
+    let ex = indexed_table().await;
+
+    let counts = |ex: &Executor| {
+        (
+            ex.metrics().index_scan_attempts.get(),
+            ex.metrics().index_scan_served.get(),
+            ex.metrics().index_scan_fallbacks.get(),
+        )
+    };
+
+    // A point lookup the index can serve.
+    let (a0, s0, f0) = counts(&ex);
+    exec(&ex, "SELECT id FROM a WHERE n = 1000040").await;
+    let (a1, s1, f1) = counts(&ex);
+    assert!(a1 > a0, "an indexed lookup must count as an attempt");
+    assert!(s1 > s0, "the index served it, so `served` must move");
+    assert_eq!(f1, f0, "nothing fell back");
+
+    // Same predicate inside a transaction: the committed index cannot see the
+    // transaction's own writes, so it must decline — visibly.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "SELECT id FROM a WHERE n = 1000041").await;
+    exec(&ex, "COMMIT").await;
+    let (_, s2, f2) = counts(&ex);
+    assert_eq!(s2, s1, "no index served the in-transaction lookup");
+    assert!(
+        f2 > f1,
+        "declining inside a transaction must be counted, not silent"
+    );
+}
+
+/// A plan that fails for a real reason must not be retried on the AST path.
+///
+/// The fallback was `if let Ok(..) = execute_plan_node(..)`, which swallowed
+/// every error kind: a budget refusal, a storage error and "this plan shape is
+/// not implemented" were one branch. The first two then re-ran the whole query
+/// down a second path, so the reported outcome was whatever the retry happened
+/// to produce rather than the failure that actually occurred.
+///
+/// The assertion is on which counter moves, not only on the error: the AST path
+/// has its own memory gate and refuses too, so an error alone cannot tell a
+/// propagated refusal from a re-executed one.
+#[tokio::test]
+async fn test_a_refused_plan_is_not_silently_re_executed() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE big (id INT PRIMARY KEY, payload TEXT)").await;
+    for i in 0..200 {
+        exec(
+            &ex,
+            &format!("INSERT INTO big VALUES ({i}, '{}')", "x".repeat(512)),
+        )
+        .await;
+    }
+    // Budget far below the ~100 KB working set, so the refusal does not depend
+    // on exact per-row accounting.
+    ex.set_query_memory_limit(4 * 1024);
+    let fallbacks_before = ex.metrics().plan_path_fallbacks.get();
+    let errors_before = ex.metrics().plan_path_errors.get();
+
+    let err = ex
+        .execute("SELECT id, payload FROM big")
+        .await
+        .expect_err("a scan over the budget must fail, not fall back and succeed");
+    assert!(
+        matches!(err, ExecError::MemoryExceeded(_)),
+        "expected the budget refusal to surface, got {err:?}"
+    );
+    assert!(
+        ex.metrics().plan_path_errors.get() > errors_before,
+        "the refusal must be recorded as a plan-path error"
+    );
+    assert_eq!(
+        ex.metrics().plan_path_fallbacks.get(),
+        fallbacks_before,
+        "a budget refusal is not a 'this plan cannot run' fallback — counting it \
+         as one is exactly the retry this guards against"
+    );
+}

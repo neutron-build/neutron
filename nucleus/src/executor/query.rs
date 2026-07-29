@@ -552,6 +552,29 @@ impl Executor {
         }
     }
 
+    /// Record that a planned index scan gave up, and say why.
+    ///
+    /// Every exit from the `IndexScan` node used to be an untagged
+    /// `if let Ok(Some(rows))` miss or a single generic "falling back to AST"
+    /// message, so "this table has no index", "the index cannot serve this
+    /// predicate" and "the index is unusable inside this transaction" were
+    /// indistinguishable from outside — in an engine whose characteristic
+    /// failure is a query that quietly stops using its index while still
+    /// returning the right answer.
+    ///
+    /// The error stays `Unsupported` because that is what makes the caller fall
+    /// back rather than fail.
+    fn index_scan_declined(&self, table: &str, index_name: &str, why: &str) -> ExecError {
+        self.metrics.index_scan_fallbacks.inc();
+        tracing::debug!(
+            target: "nucleus::executor",
+            "index scan on {table} via {index_name} declined: {why}"
+        );
+        ExecError::Unsupported(format!(
+            "index scan on {table} via {index_name} declined: {why}"
+        ))
+    }
+
     /// Split a plan projection spec into its source expression and its output
     /// alias.
     ///
@@ -2391,6 +2414,7 @@ impl Executor {
                     range_predicate_expr,
                     ..
                 } => {
+                    self.metrics.index_scan_attempts.inc();
                     // Committed indexes cannot see this transaction's own
                     // uncommitted writes — bail to the AST/seq-scan path,
                     // which reads through the session's MVCC snapshot (same
@@ -2402,8 +2426,10 @@ impl Executor {
                         .map(|t| t.active)
                         .unwrap_or(true)
                     {
-                        return Err(ExecError::Unsupported(
-                            "index scan bypassed inside transaction".into(),
+                        return Err(self.index_scan_declined(
+                            table,
+                            index_name,
+                            "index is invisible to an open transaction's own writes",
                         ));
                     }
                     let table_def = self.get_table(table).await?;
@@ -2440,10 +2466,13 @@ impl Executor {
                                 self.eval_where_plan(&predicate, row, &meta)
                                     .unwrap_or(false)
                             });
+                            self.metrics.index_scan_served.inc();
                             return Ok((meta, rows));
                         }
-                        return Err(ExecError::Unsupported(
-                            "GIN lookup failed, falling back to AST".into(),
+                        return Err(self.index_scan_declined(
+                            table,
+                            index_name,
+                            "GIN index could not answer the containment predicate",
                         ));
                     }
 
@@ -2494,6 +2523,7 @@ impl Executor {
                                 });
                             }
                             self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                            self.metrics.index_scan_served.inc();
                             return Ok((meta, rows));
                         }
                     }
@@ -2566,6 +2596,12 @@ impl Executor {
                                     // Report rows EXAMINED by the seq scan, not the
                                     // match count — `rows_scanned` is a scan-cost metric.
                                     self.metrics.rows_scanned.inc_by(examined as u64);
+                                    // Deliberately not `served`: the planner
+                                    // picked an index and a sequential scan
+                                    // answered. That is the intended crossover
+                                    // for an unselective equality, but it is
+                                    // still not the index doing the work.
+                                    self.metrics.index_scan_fallbacks.inc();
                                     return Ok((meta, rows));
                                 }
                             }
@@ -2584,6 +2620,7 @@ impl Executor {
                                 .await
                             {
                                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                                self.metrics.index_scan_served.inc();
                                 return Ok((meta, rows));
                             }
                         }
@@ -2591,8 +2628,10 @@ impl Executor {
 
                     // Index lookup failed -- return error to trigger AST fallback
                     // (doing an unfiltered seq scan here would lose the WHERE clause)
-                    Err(ExecError::Unsupported(
-                        "IndexScan lookup failed, falling back to AST".into(),
+                    Err(self.index_scan_declined(
+                        table,
+                        index_name,
+                        "no index access path matched the predicate",
                     ))
                 }
 
@@ -4661,7 +4700,41 @@ impl Executor {
                         if !cache_was_hit {
                             self.plan_cache.write().insert(cache_key, plan.clone());
                         }
-                        if let Ok((meta, rows)) = self.execute_plan_node(&plan, &cte_tables).await {
+                        // The plan path signals "I cannot run this shape, use the
+                        // AST path" by erroring, and it does so with more kinds
+                        // than `Unsupported` — an unresolved column or a runtime
+                        // gap in the plan evaluator both mean "the other path
+                        // knows how". So the fallback stays, and only the kinds
+                        // that can never mean that are propagated.
+                        //
+                        // A refusal is the clearest case: swallowing
+                        // `MemoryExceeded` re-ran the query on a second path,
+                        // and the reported outcome became whatever the retry
+                        // produced rather than the refusal that happened. The
+                        // rest are decisions the server has already made about
+                        // this statement, not statements about the plan.
+                        let planned = self.execute_plan_node(&plan, &cte_tables).await;
+                        if let Err(ref e) = planned
+                            && matches!(
+                                e,
+                                ExecError::MemoryExceeded(_)
+                                    | ExecError::DiskFull(_)
+                                    | ExecError::ReadOnly(_)
+                                    | ExecError::PermissionDenied(_)
+                                    | ExecError::ConstraintViolation(_)
+                            )
+                        {
+                            self.metrics.plan_path_errors.inc();
+                            return Err(planned.unwrap_err());
+                        }
+                        if let Err(e) = &planned {
+                            tracing::debug!(
+                                target: "nucleus::executor",
+                                "plan execution declined, falling back to AST path: {e}"
+                            );
+                            self.metrics.plan_path_fallbacks.inc();
+                        }
+                        if let Ok((meta, rows)) = planned {
                             let columns: Vec<(String, DataType)> = meta
                                 .iter()
                                 .map(|c| (c.name.clone(), c.dtype.clone()))
