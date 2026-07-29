@@ -161,6 +161,12 @@ impl ColumnBatch {
     }
 }
 
+impl AsRef<ColumnBatch> for ColumnBatch {
+    fn as_ref(&self) -> &ColumnBatch {
+        self
+    }
+}
+
 // ============================================================================
 // Vectorized operations
 // ============================================================================
@@ -831,6 +837,41 @@ impl ColumnarStore {
         }
     }
 
+    /// Batches for a MergeTree table with parts pruned by their zone maps.
+    ///
+    /// `None` when the table is not a MergeTree — the declared `ORDER BY` is
+    /// what makes parts range-coherent, so there is nothing to prune without
+    /// one. The caller still applies the full predicate, so pruning only ever
+    /// removes work.
+    /// Shared handles to a MergeTree's parts, pruned by zone map. `None` when
+    /// the table is not a MergeTree.
+    pub fn batches_pruned_shared(
+        &self,
+        table: &str,
+        predicate_col: &str,
+        bounds: &[(CmpOp, ScalarValue)],
+    ) -> Option<Vec<std::sync::Arc<ColumnBatch>>> {
+        let mt = self.merge_trees.get(table)?;
+        Some(mt.scan_matching_shared(predicate_col, bounds))
+    }
+
+    /// Shared handles to every part of a MergeTree. `None` when the table is
+    /// not a MergeTree.
+    pub fn batches_all_shared(&self, table: &str) -> Option<Vec<std::sync::Arc<ColumnBatch>>> {
+        let mt = self.merge_trees.get(table)?;
+        Some(mt.scan_all_shared())
+    }
+
+    pub fn batches_pruned(
+        &self,
+        table: &str,
+        predicate_col: &str,
+        bounds: &[(CmpOp, ScalarValue)],
+    ) -> Option<Vec<ColumnBatch>> {
+        let mt = self.merge_trees.get(table)?;
+        Some(mt.scan_matching(predicate_col, bounds))
+    }
+
     /// SELECT-side accessor: returns batches with `replacing_mergetree`
     /// read-time dedup applied if the table is so registered. Plain tables
     /// pass through unchanged. This is a no-op except for tables registered
@@ -1448,6 +1489,13 @@ impl ZoneMap {
             (Some(mn), Some(mx)) => (mn, mx),
             _ => return false,
         };
+        // A bound of a different type than the column's statistics is not
+        // comparable, and `scalar_lt` answers false for every mixed pair — which
+        // makes `Gt` and `Lt` below evaluate to `!false`, i.e. skip EVERY part.
+        // Never skip on a bound we cannot compare.
+        if !scalar_same_kind(value, min_val) || !scalar_same_kind(value, max_val) {
+            return false;
+        }
         match op {
             CmpOp::Eq => scalar_lt(value, min_val) || scalar_lt(max_val, value),
             CmpOp::Gt => !scalar_lt(value, max_val),
@@ -1457,6 +1505,18 @@ impl ZoneMap {
         }
     }
 }
+/// Whether two scalars are the same variant, and so comparable by `scalar_lt`.
+fn scalar_same_kind(a: &ScalarValue, b: &ScalarValue) -> bool {
+    matches!(
+        (a, b),
+        (ScalarValue::Int32(_), ScalarValue::Int32(_))
+            | (ScalarValue::Int64(_), ScalarValue::Int64(_))
+            | (ScalarValue::Float64(_), ScalarValue::Float64(_))
+            | (ScalarValue::Text(_), ScalarValue::Text(_))
+            | (ScalarValue::Bool(_), ScalarValue::Bool(_))
+    )
+}
+
 /// Returns true if a < b, for comparable scalar types. Mixed types return false.
 fn scalar_lt(a: &ScalarValue, b: &ScalarValue) -> bool {
     match (a, b) {
@@ -2768,6 +2828,19 @@ pub struct MergeTree {
     pub max_part_rows: usize,
     /// Maximum number of parts before triggering a merge.
     pub max_parts: usize,
+    /// Estimated bytes held by hot (in-memory) parts.
+    ///
+    /// Maintained incrementally. Summing `estimate_batch_size` over every part
+    /// on every insert walks every value of every column — an O(table) pass per
+    /// inserted batch, before deciding anything.
+    hot_bytes: usize,
+    /// Hot-memory ceiling per table.
+    pub max_hot_bytes: usize,
+    /// Parts of comparable size needed before a merge is worth doing.
+    pub merge_factor: usize,
+    /// How much bigger than the smallest part in a tier a part may be and
+    /// still count as the same tier.
+    pub tier_ratio: usize,
     /// Data directory for segment files. `None` = in-memory only.
     pub data_dir: Option<PathBuf>,
     /// Size threshold in bytes above which a part is flushed to disk.
@@ -2790,7 +2863,11 @@ impl MergeTree {
             cold_parts: Vec::new(),
             next_part_id: 1,
             max_part_rows: 8192,
-            max_parts: 10,
+            max_parts: 64,
+            hot_bytes: 0,
+            max_hot_bytes: 64 * 1024 * 1024,
+            merge_factor: 4,
+            tier_ratio: 4,
             data_dir: None,
             cold_threshold_bytes: DEFAULT_COLD_THRESHOLD_BYTES,
             merge_sender: None,
@@ -2898,41 +2975,51 @@ impl MergeTree {
             zone_map,
             compressed: None,
         };
+        self.hot_bytes += estimate_batch_size(&part.data);
         self.parts.push(part);
 
-        // Auto-merge if too many parts — consolidates small parts in memory
-        if self.parts.len() > self.max_parts {
-            if self.merge_sender.is_some() {
+        // Size-tiered merging. Merging the two smallest parts on every insert
+        // that pushed the count past a small cap meant a 256-row part was
+        // eventually merged into a 100k-row one, and the cost of each further
+        // insert grew with the table: loading 20k rows took 0.5s and 200k took
+        // 59s — quadratic. Merging only parts of comparable size, `merge_factor`
+        // at a time, makes the total merge work O(n log n); the part count is
+        // then allowed to grow to `max_parts`, which bounds read-side fan-out
+        // rather than write cost.
+        if self.merge_sender.is_some() {
+            if self.parts.len() > self.max_parts {
                 self.queue_background_merge();
-            } else {
-                while self.parts.len() > self.max_parts {
-                    self.merge_smallest_parts();
-                }
+            }
+        } else {
+            while let Some(group) = self.full_tier() {
+                self.merge_parts(&group);
+            }
+            // Hard ceiling: a table whose parts never form a full tier still
+            // must not accumulate parts without limit.
+            while self.parts.len() > self.max_parts {
+                self.merge_smallest_parts();
             }
         }
 
         // Flush oversized parts to disk
         self.flush_cold_parts();
 
-        // Memory cap: if hot data exceeds 4MB, merge all parts into one
-        // consolidated part (in-memory, no disk I/O). This keeps memory bounded
-        // even on slow storage (USB) where disk flushes can't keep up.
-        // The merged part will eventually exceed cold_threshold_bytes and get
-        // flushed to disk by flush_cold_parts() on the next insert.
-        const MAX_HOT_BYTES: usize = 256 * 1024; // 256KB per table
-        let hot_bytes: usize = self
-            .parts
-            .iter()
-            .map(|p| estimate_batch_size(&p.data))
-            .sum();
-        if hot_bytes > MAX_HOT_BYTES {
-            // Merge all hot parts into one — O(N) in memory, no disk I/O
-            while self.parts.len() > 1 {
+        // Bound hot memory. The previous rule summed `estimate_batch_size` over
+        // every part on every insert — an O(table) walk — and if the total
+        // passed 256 KB it merged ALL parts into one. Ten columns of span-shaped
+        // data cross 256 KB at roughly 1,500 rows, so from there on every
+        // 256-row insert rewrote the entire table: loading 100k rows took 14s,
+        // and no merge policy above it could matter. Both halves are fixed —
+        // the size is tracked incrementally, and the response is to push the
+        // largest parts to disk, which is what `cold_threshold_bytes` is for,
+        // rather than to collapse the table into a single part.
+        if self.hot_bytes > self.max_hot_bytes {
+            self.flush_cold_parts();
+            // Still over, and nowhere to flush to (pure in-memory tree): merge
+            // down until it fits, which at least bounds the count of copies.
+            while self.hot_bytes > self.max_hot_bytes && self.parts.len() > 1 {
                 self.merge_smallest_parts();
             }
-            // The single merged part is now large enough for flush_cold_parts()
-            // to pick up on the next cycle (> cold_threshold_bytes = 64KB)
-            self.flush_cold_parts();
         }
     }
 
@@ -2971,6 +3058,93 @@ impl MergeTree {
     }
 
     /// Merge the two smallest parts into one.
+    /// A run of at least `merge_factor` parts whose sizes are within
+    /// `tier_ratio` of the smallest in the run, or `None` when no tier is full.
+    ///
+    /// This is what keeps merge work off the critical path of every insert: a
+    /// large part is only rewritten once enough parts of ITS size exist, so
+    /// each row is copied O(log n) times over the life of the table rather than
+    /// O(n).
+    fn full_tier(&self) -> Option<Vec<usize>> {
+        if self.parts.len() < self.merge_factor {
+            return None;
+        }
+        let mut idx: Vec<usize> = (0..self.parts.len()).collect();
+        idx.sort_by_key(|&i| self.parts[i].row_count);
+        let mut start = 0;
+        while start < idx.len() {
+            let base = self.parts[idx[start]].row_count.max(1);
+            let ceiling = base.saturating_mul(self.tier_ratio);
+            let mut end = start;
+            while end < idx.len() && self.parts[idx[end]].row_count <= ceiling {
+                end += 1;
+            }
+            if end - start >= self.merge_factor {
+                return Some(idx[start..end].to_vec());
+            }
+            start = end.max(start + 1);
+        }
+        None
+    }
+
+    /// Merge the given parts into one, in a single pass over each row.
+    fn merge_parts(&mut self, indices: &[usize]) {
+        if indices.len() < 2 {
+            return;
+        }
+        // Remove highest-index first so the earlier indices stay valid.
+        let mut sorted = indices.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let mut taken: Vec<MergeTreePart> =
+            sorted.iter().map(|&i| self.parts.remove(i)).collect();
+        // Fold smallest-first so each merge step carries as little as possible.
+        taken.sort_by_key(|p| p.row_count);
+        let mut acc = (*taken[0].data).clone();
+        for part in &taken[1..] {
+            acc = merge_sorted_batches(&acc, &part.data, &self.primary_key);
+        }
+        let merged_batch = match &self.merge_strategy {
+            MergeStrategy::Default => acc,
+            MergeStrategy::Replacing { version_column } => {
+                merge_replacing(&acc, &self.primary_key, version_column.as_deref())
+            }
+            MergeStrategy::Aggregating {
+                group_columns: _,
+                sum_columns,
+                count_columns,
+            } => merge_aggregating(&acc, &self.primary_key, sum_columns, count_columns),
+        };
+        let row_count = merged_batch
+            .columns
+            .first()
+            .map(|(_, c)| c.len())
+            .unwrap_or(0);
+        let zone_map = ZoneMap::from_batch(&merged_batch);
+        let part_id = self.next_part_id;
+        self.next_part_id += 1;
+        self.parts.push(MergeTreePart {
+            id: part_id,
+            data: std::sync::Arc::new(merged_batch),
+            row_count,
+            zone_map,
+            // Compression is for cold parts; `flush_cold_parts` compresses on
+            // the way to disk. Compressing every merge result eagerly is work
+            // most parts never need.
+            compressed: None,
+        });
+        self.recompute_hot_bytes();
+    }
+
+    /// Re-sum hot part sizes. O(rows), so only after a merge or a flush — both
+    /// of which already walked the data — never per insert.
+    fn recompute_hot_bytes(&mut self) {
+        self.hot_bytes = self
+            .parts
+            .iter()
+            .map(|p| estimate_batch_size(&p.data))
+            .sum();
+    }
+
     fn merge_smallest_parts(&mut self) {
         if self.parts.len() < 2 {
             return;
@@ -3036,6 +3210,7 @@ impl MergeTree {
             compressed: Some(compressed),
         };
         self.parts.push(merged);
+        self.recompute_hot_bytes();
     }
 
     /// Scan all parts, pruning those whose zone maps exclude the predicate.
@@ -3043,22 +3218,59 @@ impl MergeTree {
     /// Hot parts are returned directly. Cold parts whose zone maps indicate
     /// a possible match are loaded from disk on demand.
     pub fn scan(&self, predicate_col: &str, op: CmpOp, value: &ScalarValue) -> Vec<ColumnBatch> {
-        let mut result = Vec::new();
+        self.scan_matching(predicate_col, &[(op, value.clone())])
+    }
 
-        // Hot parts
+    /// Scan all parts, keeping only those that no bound in `bounds` can rule
+    /// out. A two-sided window (`ts >= lo AND ts < hi`) prunes on both ends;
+    /// one bound alone would leave half the table unpruned.
+    ///
+    /// A part is read unless a bound PROVES it cannot match, so an empty
+    /// `bounds` reads everything and an incomparable bound prunes nothing.
+    pub fn scan_matching(
+        &self,
+        predicate_col: &str,
+        bounds: &[(CmpOp, ScalarValue)],
+    ) -> Vec<ColumnBatch> {
+        self.scan_matching_shared(predicate_col, bounds)
+            .into_iter()
+            .map(|b| (*b).clone())
+            .collect()
+    }
+
+    /// Like `scan_matching`, but hands back shared handles to the surviving
+    /// parts instead of copies of them.
+    ///
+    /// Part data is already behind an `Arc`; cloning it per read copied every
+    /// column of every surviving part, which cost more than the pruning saved —
+    /// a narrow window over 200k rows read in 40 ms where the same data in a
+    /// plain columnar table, whose batches are borrowed, read in 6 ms.
+    pub fn scan_matching_shared(
+        &self,
+        predicate_col: &str,
+        bounds: &[(CmpOp, ScalarValue)],
+    ) -> Vec<std::sync::Arc<ColumnBatch>> {
+        let mut result: Vec<std::sync::Arc<ColumnBatch>> = Vec::new();
+        let skip = |zm: &ZoneMap| {
+            bounds
+                .iter()
+                .any(|(op, value)| zm.can_skip(predicate_col, *op, value))
+        };
+
+        // Hot parts — share, never copy.
         for part in &self.parts {
-            if !part.zone_map.can_skip(predicate_col, op, value) {
-                result.push((*part.data).clone());
+            if !skip(&part.zone_map) {
+                result.push(std::sync::Arc::clone(&part.data));
             }
         }
 
         // Cold parts — check zone map, load from disk if needed
         for cold in &self.cold_parts {
-            if !cold.zone_map.can_skip(predicate_col, op, value) {
+            if !skip(&cold.zone_map) {
                 match SegmentReader::open(&cold.path) {
                     Ok(reader) => {
                         if let Ok(batch) = reader.read_batch() {
-                            result.push(batch);
+                            result.push(std::sync::Arc::new(batch));
                         }
                     }
                     Err(e) => {
@@ -3077,6 +3289,12 @@ impl MergeTree {
     /// Scan all parts (no predicate, full scan).
     ///
     /// Loads cold parts from disk as needed.
+    /// Every part as a shared handle — the unpruned read path, without the
+    /// deep copy `scan_all` makes.
+    pub fn scan_all_shared(&self) -> Vec<std::sync::Arc<ColumnBatch>> {
+        self.scan_matching_shared("", &[])
+    }
+
     pub fn scan_all(&self) -> Vec<ColumnBatch> {
         let mut result: Vec<ColumnBatch> = self.parts.iter().map(|p| (*p.data).clone()).collect();
 
@@ -3186,6 +3404,7 @@ impl MergeTree {
                 }
             }
         }
+        self.recompute_hot_bytes();
     }
 
     /// Force-flush ALL hot parts to disk regardless of size.
@@ -4443,6 +4662,35 @@ mod tests {
         assert_eq!(name_zm.max, Some(ScalarValue::Text("Charlie".into())));
     }
 
+    /// A bound of a type the statistics cannot be compared against must never
+    /// skip anything.
+    ///
+    /// `scalar_lt` answers false for every mixed pair, so the `Gt` and `Lt`
+    /// arms of `can_skip` evaluated to `!false` and skipped EVERY part —
+    /// silently returning no rows for a query that matches. The `Eq`, `Gte` and
+    /// `Lte` arms happened to fail safe, which is what made this look fine.
+    #[test]
+    fn zone_map_never_skips_on_an_incomparable_bound() {
+        let batch = sample_batch();
+        let zm = ZoneMap::from_batch(&batch);
+        // `age` has Int64 statistics; every bound below is a different variant.
+        for op in [CmpOp::Eq, CmpOp::Gt, CmpOp::Lt, CmpOp::Gte, CmpOp::Lte] {
+            for bound in [
+                ScalarValue::Text("30".into()),
+                ScalarValue::Int32(30),
+                ScalarValue::Float64(30.0),
+                ScalarValue::Bool(true),
+            ] {
+                assert!(
+                    !zm.can_skip("age", op, &bound),
+                    "{op:?} with an incomparable {bound:?} must not skip the part"
+                );
+            }
+        }
+        // A comparable bound still prunes, so the guard has not disabled it.
+        assert!(zm.can_skip("age", CmpOp::Gt, &ScalarValue::Int64(1000)));
+    }
+
     #[test]
     fn zone_map_can_skip_gt() {
         let batch = sample_batch();
@@ -4950,7 +5198,11 @@ mod tests {
     #[test]
     fn mergetree_optimize() {
         let mut mt = MergeTree::new(vec!["id".into()]);
-        mt.max_parts = 100; // don't auto-merge
+        // Don't auto-merge: raise the part ceiling AND the tier threshold, since
+        // merging is now size-tiered and fires on a full tier regardless of the
+        // total part count.
+        mt.max_parts = 100;
+        mt.merge_factor = usize::MAX;
 
         for i in 0..5 {
             let batch = ColumnBatch::new(vec![("id".into(), ColumnData::Int64(vec![Some(i)]))]);
