@@ -939,7 +939,34 @@ impl Executor {
                 })
             }
             Err(_e) if create.if_not_exists => {
-                // Table already exists, but IF NOT EXISTS was specified, so succeed silently
+                // Table already exists, so IF NOT EXISTS succeeds without
+                // reconciling anything — PostgreSQL behaves the same way.
+                //
+                // But PostgreSQL has no per-table storage engine, and here the
+                // silence is load-bearing: a migration that ADDS
+                // `WITH (engine = 'mergetree') ORDER BY (...)` to a table
+                // created before that clause existed reports success and
+                // changes nothing, forever. Observe's `spans` table reached
+                // production that way — the schema asks for time-ordered
+                // storage, the engine registry has no entry for it, and every
+                // time-range query full-scans. Say so rather than let a
+                // migration quietly mean nothing.
+                if let Some(requested) = Self::extract_engine_option(&create.table_options) {
+                    let existing = self
+                        .load_engines_meta()
+                        .get(&table_name)
+                        .map(|m| m.engine.clone());
+                    if existing.as_deref() != Some(requested.as_str()) {
+                        tracing::warn!(
+                            table = %table_name,
+                            requested_engine = %requested,
+                            existing_engine = existing.as_deref().unwrap_or("default"),
+                            "CREATE TABLE IF NOT EXISTS skipped an existing table whose storage \
+                             engine differs from the one requested; the engine and any ORDER BY \
+                             key were NOT applied. Recreate the table or migrate it explicitly."
+                        );
+                    }
+                }
                 Ok(ExecResult::Command {
                     tag: "CREATE TABLE".into(),
                     rows_affected: 0,
