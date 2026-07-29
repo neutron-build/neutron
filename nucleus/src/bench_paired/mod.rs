@@ -757,4 +757,228 @@ mod tests {
             assert!(r.sp_avg_us > 0.0 && r.dij_avg_us > 0.0 && r.bfs_avg_us > 0.0);
         }
     }
+
+    /// The B5 gate: the table-attached FTS index must not change an answer, and
+    /// must be faster than the scan it replaces.
+    ///
+    /// Both halves matter and neither is sufficient. An index that returns the
+    /// right rows slowly is pointless; an index that is fast because it stopped
+    /// proposing rows is a data-loss bug, and this design — index proposes,
+    /// `@@` rechecks — fails exactly that way when the two disagree.
+    #[tokio::test]
+    async fn fts_sql_is_exact_and_faster_than_the_scan() {
+        let r = super::bench_fts_sql(2_000, 20, 0xB5_F7_50).await;
+        assert!(
+            r.answers_agree,
+            "the FTS index changed the answer on {} of {} queries",
+            r.mismatches, r.queries
+        );
+        assert!(
+            r.selective_hits > 0.0 && r.broad_hits > r.selective_hits,
+            "the corpus is not shaped as intended: selective {:.1} hits, broad {:.1}",
+            r.selective_hits,
+            r.broad_hits
+        );
+        assert!(
+            r.speedup() > 1.0,
+            "the index was not faster than the scan it replaces on a selective \
+             query: {:.0}us indexed vs {:.0}us scanned over {} docs",
+            r.indexed_us,
+            r.scan_us,
+            r.docs
+        );
+    }
+}
+// ============================================================================
+// FTS through the SQL surface (B5)
+// ============================================================================
+
+/// What a table-attached FTS index buys over the scan it replaces.
+///
+/// [`bench_fts`] above measures the `InvertedIndex` library. This measures the
+/// thing a user actually issues — `WHERE body @@ 'terms'` and `BM25(body, …)`
+/// — end to end through the executor, which is the surface that shipped and
+/// had never been timed.
+///
+/// Paired with correctness in the same run, on the same corpus: the indexed and
+/// unindexed executors must return identical row sets for every query. An index
+/// that is fast because it stopped proposing rows is a regression, and that is
+/// the exact failure mode of this design (the index proposes, `@@` rechecks).
+#[derive(Debug, Clone)]
+pub struct FtsSqlBenchResult {
+    pub docs: usize,
+    pub queries: usize,
+    /// `CREATE INDEX … USING FTS` over an already-populated table.
+    pub build_ms: f64,
+    /// Mean `WHERE body @@ '…'` latency with the index, on a SELECTIVE query
+    /// (a rare term, matching a handful of documents) — what search actually
+    /// looks like, and what an inverted index is for.
+    pub indexed_us: f64,
+    /// The same selective query with no index — the scan it replaces.
+    pub scan_us: f64,
+    /// Indexed latency on a BROAD query (a common term matching a large
+    /// fraction of the corpus). Reported because it is the honest other half:
+    /// an inverted index cannot help much when the answer is most of the table,
+    /// and a benchmark that only shows the selective case is marketing.
+    pub broad_indexed_us: f64,
+    /// The same broad query with no index.
+    pub broad_scan_us: f64,
+    /// Mean documents matched by the selective queries.
+    pub selective_hits: f64,
+    /// Mean documents matched by the broad queries.
+    pub broad_hits: f64,
+    /// Mean `ORDER BY BM25(...) DESC LIMIT k` latency with the index.
+    pub bm25_us: f64,
+    /// True iff indexed and unindexed returned the same rows for every query.
+    pub answers_agree: bool,
+    pub mismatches: usize,
+}
+
+impl FtsSqlBenchResult {
+    /// How many times faster the index made the query. Below 1.0 means the
+    /// index cost more than the scan it replaced.
+    pub fn speedup(&self) -> f64 {
+        if self.indexed_us <= 0.0 {
+            return f64::INFINITY;
+        }
+        self.scan_us / self.indexed_us
+    }
+
+    /// The same ratio on the broad query.
+    pub fn broad_speedup(&self) -> f64 {
+        if self.broad_indexed_us <= 0.0 {
+            return f64::INFINITY;
+        }
+        self.broad_scan_us / self.broad_indexed_us
+    }
+}
+
+/// Build a deterministic corpus and measure `@@` and `BM25()` over it.
+///
+/// The corpus is Zipf-shaped the way real text is: every document draws common
+/// words from `VOCAB`, and each also carries one term unique to it. Selective
+/// queries ask for those rare terms (a handful of hits, which is what search
+/// looks like); broad queries ask for common ones (a large fraction of the
+/// corpus, where no inverted index can do much). Both are reported.
+pub async fn bench_fts_sql(docs: usize, queries: usize, seed: u64) -> FtsSqlBenchResult {
+    use crate::catalog::Catalog;
+    use crate::executor::{ExecResult, Executor};
+    use crate::storage::{MemoryEngine, StorageEngine};
+    use std::sync::Arc;
+
+    let new_executor = || {
+        let catalog = Arc::new(Catalog::new());
+        let storage: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new());
+        Executor::new(catalog, storage)
+    };
+
+    // Same corpus in both executors — the comparison only means anything if the
+    // data is identical, so it is generated once from the seed. `rare<n>` binds
+    // to a small, deterministic set of documents.
+    let mut rng = Rng::new(seed);
+    let rare_terms = (docs / 200).max(8);
+    let corpus: Vec<String> = (0..docs)
+        .map(|i| {
+            let common = random_doc(&mut rng, 12);
+            format!("{common} rare{}", i % rare_terms)
+        })
+        .collect();
+
+    let indexed = new_executor();
+    let scanned = new_executor();
+    for ex in [&indexed, &scanned] {
+        ex.execute("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)")
+            .await
+            .expect("create table");
+        for (i, text) in corpus.iter().enumerate() {
+            ex.execute(&format!("INSERT INTO docs VALUES ({i}, '{text}')"))
+                .await
+                .expect("insert");
+        }
+    }
+
+    let t0 = Instant::now();
+    indexed
+        .execute("CREATE INDEX docs_body ON docs USING FTS (body)")
+        .await
+        .expect("create fts index");
+    let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let ids = |res: &ExecResult| -> Vec<i64> {
+        match res {
+            ExecResult::Select { rows, .. } => {
+                let mut v: Vec<i64> = rows
+                    .iter()
+                    .filter_map(|r| match r.first() {
+                        Some(crate::types::Value::Int32(n)) => Some(i64::from(*n)),
+                        Some(crate::types::Value::Int64(n)) => Some(*n),
+                        _ => None,
+                    })
+                    .collect();
+                v.sort_unstable();
+                v
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    let mut mismatches = 0usize;
+    let mut acc = [(0u128, 0u128, 0usize); 2]; // [selective, broad] = (idx, scan, hits)
+    let mut bm25_nanos = 0u128;
+
+    for qi in 0..queries {
+        let selective = format!("rare{}", rng.below(rare_terms));
+        let broad = VOCAB[rng.below(VOCAB.len())].to_string();
+
+        for (slot, query) in [(0usize, &selective), (1usize, &broad)] {
+            let sql = format!("SELECT id FROM docs WHERE body @@ '{query}'");
+            // A repeated identical statement is served from the result cache,
+            // which would time the cache rather than the index.
+            indexed.clear_all_query_caches();
+            scanned.clear_all_query_caches();
+
+            let t = Instant::now();
+            let a = indexed.execute(&sql).await.expect("indexed query");
+            acc[slot].0 += t.elapsed().as_nanos();
+
+            let t = Instant::now();
+            let b = scanned.execute(&sql).await.expect("scan query");
+            acc[slot].1 += t.elapsed().as_nanos();
+
+            let (a, b) = (ids(&a[0]), ids(&b[0]));
+            acc[slot].2 += a.len();
+            if a != b {
+                mismatches += 1;
+            }
+        }
+
+        // Ranked retrieval, on the shape that has a ranking to do.
+        if qi % 2 == 0 {
+            indexed.clear_all_query_caches();
+            let bm25 = format!(
+                "SELECT id FROM docs WHERE body @@ '{broad}' \
+                 ORDER BY BM25(body, '{broad}') DESC LIMIT 10"
+            );
+            let t = Instant::now();
+            let _ = indexed.execute(&bm25).await.expect("bm25 query");
+            bm25_nanos += t.elapsed().as_nanos();
+        }
+    }
+
+    let q = queries.max(1) as f64;
+    let us = |n: u128| (n as f64 / q) / 1000.0;
+    FtsSqlBenchResult {
+        docs,
+        queries,
+        build_ms,
+        indexed_us: us(acc[0].0),
+        scan_us: us(acc[0].1),
+        broad_indexed_us: us(acc[1].0),
+        broad_scan_us: us(acc[1].1),
+        selective_hits: acc[0].2 as f64 / q,
+        broad_hits: acc[1].2 as f64 / q,
+        bm25_us: (bm25_nanos as f64 / (q / 2.0).max(1.0)) / 1000.0,
+        answers_agree: mismatches == 0,
+        mismatches,
+    }
 }

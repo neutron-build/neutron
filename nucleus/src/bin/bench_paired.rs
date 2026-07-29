@@ -14,8 +14,51 @@
 //! latency/throughput/recall numbers a human wants to eyeball.
 
 use nucleus::bench_paired::{
-    VectorDist, bench_fts, bench_graph, bench_vector_dist, bench_vector_scale_sweep,
+    VectorDist, bench_fts, bench_fts_sql, bench_graph, bench_vector_dist,
+    bench_vector_scale_sweep,
 };
+
+/// `bench_paired fts-sql [docs] [queries]` — B5: full-text search through the
+/// SQL surface (`@@`, `BM25()`), against the sequential scan it replaces.
+fn fts_sql_mode(docs: usize, queries: usize) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let r = rt.block_on(bench_fts_sql(docs, queries, 0xB5_F7_50));
+    println!("\nB5 — full-text search over the SQL surface");
+    println!("  corpus              {} docs, {} queries", r.docs, r.queries);
+    println!("  CREATE INDEX        {:.1} ms", r.build_ms);
+    println!();
+    println!("                      indexed      scan   speedup   mean hits");
+    println!(
+        "  selective @@      {:8.0}us {:8.0}us {:7.1}x {:9.1}",
+        r.indexed_us,
+        r.scan_us,
+        r.speedup(),
+        r.selective_hits
+    );
+    println!(
+        "  broad     @@      {:8.0}us {:8.0}us {:7.1}x {:9.1}",
+        r.broad_indexed_us,
+        r.broad_scan_us,
+        r.broad_speedup(),
+        r.broad_hits
+    );
+    println!();
+    println!("  ORDER BY BM25 LIMIT {:.0} us (broad query)", r.bm25_us);
+    println!(
+        "  answers agree       {}",
+        if r.answers_agree {
+            "yes (indexed == unindexed on every query)".to_string()
+        } else {
+            format!("NO — {} of {} queries diverged", r.mismatches, r.queries)
+        }
+    );
+    if !r.answers_agree {
+        std::process::exit(1);
+    }
+}
 
 fn main() {
     // One-shot scale mode: `bench_paired scale [n] [dim] [k] [queries]` —
@@ -24,6 +67,12 @@ fn main() {
     // is the Phase-2 "vector at scale" gate; the default matrix below stays
     // the fast everyday run.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("fts-sql") {
+        let docs: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+        let queries: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(50);
+        fts_sql_mode(docs, queries);
+        return;
+    }
     // `bench_paired sweep [n] [dim] [k] [queries]` — one clustered build,
     // recall/min-recall across an ef sweep (scale-dip diagnosis).
     if args.get(1).map(String::as_str) == Some("sweep") {
