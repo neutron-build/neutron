@@ -402,10 +402,17 @@ fn batches_to_rows(batches: &[ColumnBatch]) -> Vec<Row> {
 /// `SELECT AVG(dur) … ` over a 17-column span table decoded every JSONB blob
 /// in the table to throw them away, and the columnar layout was pure overhead.
 /// That is why the columnar engine measured SLOWER than the row heap.
-fn batches_to_rows_projected(batches: &[ColumnBatch], projection: &[usize]) -> Vec<Row> {
+fn batches_to_rows_projected(
+    batches: &[ColumnBatch],
+    projection: &[usize],
+    limit: Option<usize>,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for batch in batches {
         for row_i in 0..batch.row_count {
+            if limit.is_some_and(|n| rows.len() >= n) {
+                return rows;
+            }
             let row: Row = projection
                 .iter()
                 .map(|&col_i| match batch.columns.get(col_i) {
@@ -879,6 +886,7 @@ impl StorageEngine for ColumnarStorageEngine {
         &self,
         table: &str,
         projection: &[usize],
+        limit: Option<usize>,
     ) -> Result<Vec<Row>, StorageError> {
         self.flush_write_buffer(table);
         let store = self.store.read();
@@ -886,7 +894,7 @@ impl StorageEngine for ColumnarStorageEngine {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
         let batches = store.batches_all_for_select(table);
-        Ok(batches_to_rows_projected(&batches, projection))
+        Ok(batches_to_rows_projected(&batches, projection, limit))
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {

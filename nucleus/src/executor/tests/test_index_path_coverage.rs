@@ -59,6 +59,16 @@ async fn scan_cost(ex: &Executor, sql: &str) -> (u64, usize) {
     (scanned, rows(&result[0]).len())
 }
 
+/// Column values the engine materialized, and rows returned.
+async fn value_cost(ex: &Executor, sql: &str) -> (u64, usize) {
+    let before = ex.metrics().values_scanned.get();
+    let result = exec(ex, sql).await;
+    (
+        ex.metrics().values_scanned.get() - before,
+        rows(&result[0]).len(),
+    )
+}
+
 /// Generous ceiling: a full scan reads every row, an index reads a handful.
 /// Anything between still passes, so this fires on the failure mode rather than
 /// on plan-choice noise.
@@ -195,6 +205,127 @@ async fn test_point_lookups_reach_the_index() {
         ),
     ] {
         assert_indexed(&ex, expected, label, sql).await;
+    }
+}
+
+/// A ten-column table: wide enough that reading all of it is visibly wrong.
+/// `a` counts up, `b` cycles 0..9 so a filter on it keeps 90% of the rows.
+async fn wide_table() -> Executor {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE wide (id INT PRIMARY KEY, a INT, b INT, c TEXT, d TEXT, \
+         e TEXT, f TEXT, g TEXT, h TEXT, payload TEXT)",
+    )
+    .await;
+    for i in 0..ROWS {
+        exec(
+            &ex,
+            &format!(
+                "INSERT INTO wide VALUES ({i}, {i}, {}, 'c{i}', 'd{i}', 'e{i}', \
+                 'f{i}', 'g{i}', 'h{i}', '{}')",
+                i % 10,
+                "x".repeat(64)
+            ),
+        )
+        .await;
+    }
+    ex
+}
+
+/// The queries whose scans get narrowed, and how many of the ten columns each
+/// one genuinely needs — output columns plus filter columns.
+const NARROWED: [(&str, usize, &str); 5] = [
+    ("bare projection", 1, "SELECT a FROM wide"),
+    (
+        "projection under a filter",
+        2,
+        "SELECT a FROM wide WHERE b > 0",
+    ),
+    (
+        "aggregate under a filter",
+        2,
+        "SELECT AVG(a) FROM wide WHERE b > 0",
+    ),
+    (
+        "grouped aggregate",
+        2,
+        "SELECT b, COUNT(a) FROM wide GROUP BY b",
+    ),
+    (
+        "two columns out, a third filtered on",
+        3,
+        "SELECT a, c FROM wide WHERE b > 0",
+    ),
+];
+
+/// Narrowing a scan must not change a single answer.
+///
+/// `plan_execution = off` routes the same SQL down the AST path, which never
+/// projects — so it is an oracle for exactly the thing that could go wrong
+/// here: a projection that drops a column the query still reads. The failure
+/// mode this guards against is silent (a filter binding to the wrong column
+/// yields plausible rows), so equality against an unprojected run is the
+/// assertion that catches it.
+#[tokio::test]
+async fn test_narrowed_scans_return_what_full_scans_return() {
+    let ex = wide_table().await;
+
+    for (label, _, sql) in NARROWED {
+        let mut projected = rows(&exec(&ex, sql).await[0]).clone();
+
+        exec(&ex, "SET plan_execution = off").await;
+        // The result cache keys on the SQL text, so without this the second run
+        // is served the first run's answer and the comparison is between a
+        // result and itself. A deliberately broken projection passed this test
+        // until the cache was cleared here.
+        ex.clear_all_query_caches();
+        let mut unprojected = rows(&exec(&ex, sql).await[0]).clone();
+        exec(&ex, "SET plan_execution = on").await;
+        ex.clear_all_query_caches();
+
+        // Compared as multisets: none of these queries has an ORDER BY, and
+        // the two paths group by different mechanisms, so row order genuinely
+        // differs. Content is the thing a dropped column would change.
+        projected.sort();
+        unprojected.sort();
+        assert_eq!(
+            projected, unprojected,
+            "{label}: narrowing the scan changed the answer — {sql}"
+        );
+    }
+}
+
+/// A scan must read the columns the query touches and no others.
+///
+/// `scan_projected` shipped, was correct, and was called **zero times** across
+/// an entire benchmark: the pushdown demanded that the scan sit directly under
+/// the `Project` node and carry no filter, which between them excludes every
+/// aggregate and every `WHERE`. Answers were identical with and without it, so
+/// nothing but a cost assertion could see that the optimisation was dead.
+///
+/// Widths below are the columns each query genuinely needs — output columns
+/// plus filter columns. The ceiling is half the table width, so this fires on
+/// "read everything" rather than on an extra column.
+#[tokio::test]
+async fn test_scans_read_only_the_columns_the_query_touches() {
+    const WIDTH: usize = 10;
+    let ex = wide_table().await;
+
+    // Control: a wildcard has to read the whole row, and does.
+    let (full, _) = value_cost(&ex, "SELECT * FROM wide WHERE b > 0").await;
+    assert!(
+        full >= ROWS as u64 * WIDTH as u64,
+        "SELECT * should read every column of every row, read {full}"
+    );
+
+    for (label, needs, sql) in NARROWED {
+        let (values, _) = value_cost(&ex, sql).await;
+        assert!(
+            values <= ROWS as u64 * (WIDTH as u64 / 2),
+            "{label}: needs {needs} of {WIDTH} columns but materialized {values} values \
+             over {ROWS} rows — the scan is no longer projected. {sql}"
+        );
     }
 }
 

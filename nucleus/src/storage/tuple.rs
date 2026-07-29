@@ -648,22 +648,22 @@ pub fn deserialize_row_projected(
         }
     }
 
-    // Build a lookup set for O(1) membership checks.
-    // We use a fixed-size bitset since column counts are small.
-    let mut proj_set = [false; 256];
-    for &col_idx in projection {
-        if col_idx < 256 {
-            proj_set[col_idx] = true;
-        }
-    }
-
     let bitmap = &data[..bitmap_bytes];
     let mut pos = bitmap_bytes;
 
-    // First pass: compute positions of each column.
-    // We need to scan sequentially because columns are variable-length.
-    let mut col_positions: Vec<(usize, bool)> = Vec::with_capacity(ncols);
-    for (i, dtype) in col_types.iter().enumerate() {
+    // First pass: compute positions of each column. Columns are variable-length,
+    // so a projected column's offset is only known by walking the ones before it
+    // — but nothing after the last projected column ever needs an offset, so the
+    // walk stops there. Projecting an early column out of a wide row skips the
+    // size computation for the whole tail.
+    let Some(&last_needed) = projection.iter().max() else {
+        return Some(Vec::new()); // zero-column projection: the row still exists
+    };
+    if last_needed >= ncols {
+        return None;
+    }
+    let mut col_positions: Vec<(usize, bool)> = Vec::with_capacity(last_needed + 1);
+    for (i, dtype) in col_types.iter().enumerate().take(last_needed + 1) {
         let is_null = (bitmap[i / 8] >> (i % 8)) & 1 == 1;
         col_positions.push((pos, is_null));
         if !is_null {

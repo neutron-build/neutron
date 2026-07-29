@@ -1716,6 +1716,38 @@ impl StorageEngine for MvccStorageAdapter {
         Ok(rows)
     }
 
+    /// Same visibility and SIREAD accounting as `scan`, but each visible
+    /// version is narrowed as it is copied out instead of being cloned whole
+    /// and trimmed afterwards. Versions are `Arc<Row>`, so a full clone of a
+    /// wide row is the dominant cost of a scan here.
+    async fn scan_projected(
+        &self,
+        table: &str,
+        projection: &[usize],
+        limit: Option<usize>,
+    ) -> Result<Vec<Row>, StorageError> {
+        let (_txn_id, snap, auto) = self.current_or_auto()?;
+        let results = self
+            .engine
+            .scan(table, &snap)
+            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+        // The read set is every version the snapshot exposed, regardless of
+        // how few columns the query kept — narrowing must not shrink it.
+        if !auto {
+            let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
+            self.maybe_record_siread(_txn_id, table, &indices);
+        }
+        let rows: Vec<Row> = results
+            .into_iter()
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|(_, r)| crate::storage::project_row(&r, projection))
+            .collect();
+        if auto {
+            self.auto_commit(_txn_id);
+        }
+        Ok(rows)
+    }
+
     async fn scan_for_maintenance(&self, table: &str) -> Result<Vec<Row>, StorageError> {
         // Same as scan() but does NOT record SIREAD — used by internal stat/zone-map
         // rebuilds, which are not part of the transaction's logical read set and

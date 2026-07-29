@@ -405,83 +405,252 @@ impl Executor {
         Ok(plan)
     }
 
-    /// Try to push projection column indices from a `Project` node down into its
-    /// child `SeqScan` node.  This enables `scan_projected()` — zero-copy partial
-    /// deserialization that skips non-projected columns during page decoding.
+    /// Try to push a column projection into the `SeqScan` at the base of this
+    /// plan, so the storage engine reads only the columns the query touches.
+    /// This is what enables `scan_projected()` — partial deserialization that
+    /// never decodes a column the query does not mention.
     ///
-    /// The pushdown is only attempted when:
-    /// - The plan root is a `Project` whose immediate child is a `SeqScan`.
-    /// - The `SeqScan` has no filter (filter evaluation may reference columns
-    ///   outside the projection).
-    /// - Every projection item is a plain column name (no expressions, no aliases
-    ///   with computed expressions).
+    /// The pushdown used to require the `SeqScan` to be the *immediate* child of
+    /// the `Project` **and** to carry no filter. Between them those two rules
+    /// excluded almost every real query: any aggregate puts an `Aggregate` /
+    /// `HashAggregate` node in between, and any `WHERE` clause disqualified the
+    /// scan outright. Measured on a 10-column table, `scan_projected` was called
+    /// zero times across an entire benchmark.
+    ///
+    /// Both restrictions are lifted by projecting the **union** of every column
+    /// the plan above the scan references — output columns, filter columns,
+    /// group keys and aggregate arguments. Nothing needs rewriting to make that
+    /// work: `eval_expr_plan` and the `Project` node both resolve identifiers by
+    /// **name** against the column metadata they are handed, so a narrowed row
+    /// binds exactly like a full one as long as the names are present. The
+    /// `Project` node then narrows to the output columns as it always did.
+    ///
+    /// Bailing out is always safe — it just restores the full-row scan — so
+    /// anything this code cannot account for exactly returns without pushing.
     async fn try_push_projection_into_scan(&self, plan: &mut planner::PlanNode) {
-        let planner::PlanNode::Project { input, columns, .. } = plan else {
+        let mut needed: Vec<String> = Vec::new();
+        let Some(table) = Self::required_scan_columns(plan, &mut needed) else {
             return;
         };
-        let planner::PlanNode::SeqScan {
-            table,
-            filter,
-            projection,
-            ..
-        } = input.as_mut()
-        else {
-            return;
+        let Ok(table_def) = self.get_table(&table).await else {
+            return; // schema unavailable — skip the optimisation
         };
 
-        // Only push when there is no filter — filter evaluation may reference
-        // columns outside the projection, so we need the full row.
-        if filter.is_some() {
-            return;
-        }
-
-        // Already has a projection (shouldn't happen, but guard against it).
-        if projection.is_some() {
-            return;
-        }
-
-        // Resolve the table schema to map column names → indices.
-        let table_def = match self.get_table(table).await {
-            Ok(td) => td,
-            Err(_) => return, // schema unavailable — skip optimisation
-        };
-
-        let mut indices: Vec<usize> = Vec::with_capacity(columns.len());
-        for col_spec in columns.iter() {
-            // Strip " AS alias" suffix — we only care about the source column name.
-            let col_name = if let Some(pos) = col_spec.to_uppercase().rfind(" AS ") {
-                col_spec[..pos].trim()
-            } else {
-                col_spec.trim()
-            };
-
-            // Only push simple column references — skip expressions, *, etc.
-            if col_name == "*" || col_name == "?" || col_name.contains('(') {
-                return;
-            }
-
-            // Try to match against table columns (case-insensitive, strip table prefix).
-            let unqualified = col_name
-                .split('.')
-                .next_back()
-                .unwrap_or(col_name)
-                .trim_matches('"');
-
-            if let Some(idx) = table_def
+        let mut indices: Vec<usize> = Vec::with_capacity(needed.len());
+        for name in &needed {
+            let Some(idx) = table_def
                 .columns
                 .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(unqualified))
-            {
-                indices.push(idx);
-            } else {
-                // Column not found in schema — probably a computed expression
-                // that looks like a column name.  Bail out.
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+            else {
+                // An identifier that is not a column of this table: a correlated
+                // outer reference, a bare function name, an alias introduced
+                // upstream. Which columns the plan really needs is no longer
+                // knowable — bail rather than project one away.
                 return;
+            };
+            if !indices.contains(&idx) {
+                indices.push(idx);
             }
         }
 
-        // All columns resolved — push the projection into the SeqScan.
-        *projection = Some(indices);
+        if indices.is_empty() {
+            // `SELECT COUNT(*)` references no column at all. Read one narrow
+            // column anyway: the row count is the answer, and a zero-width row
+            // carries no metadata for the nodes above the scan.
+            indices.push(Self::narrowest_column_index(&table_def));
+        }
+
+        // Projecting every column is the scan we already have, minus a
+        // reordering pass. Don't pay for it.
+        if indices.len() >= table_def.columns.len() {
+            return;
+        }
+
+        if let Some(planner::PlanNode::SeqScan { projection, .. }) = Self::base_scan_mut(plan) {
+            *projection = Some(indices);
+        }
+    }
+
+    /// Collect every column name the plan above the base `SeqScan` will need,
+    /// and return the table that scan reads.
+    ///
+    /// `None` means "do not push a projection": the plan is not a single scan
+    /// under projection/filter/aggregation nodes (a join, an index scan, a
+    /// values list), or one of those nodes holds an expression this code could
+    /// not parse and therefore cannot claim to have accounted for.
+    fn required_scan_columns(plan: &planner::PlanNode, needed: &mut Vec<String>) -> Option<String> {
+        match plan {
+            planner::PlanNode::Project { input, columns, .. } => {
+                for col_spec in columns {
+                    // Strip " AS alias" — the alias names the output, not an input.
+                    let expr_text = match col_spec.to_uppercase().rfind(" AS ") {
+                        Some(pos) => col_spec[..pos].trim(),
+                        None => col_spec.trim(),
+                    };
+                    if expr_text == "*" {
+                        return None; // wildcard needs every column
+                    }
+                    Self::collect_expr_columns(&Self::parse_expr_string(expr_text).ok()?, needed);
+                }
+                Self::required_scan_columns(input, needed)
+            }
+            planner::PlanNode::Filter {
+                input,
+                predicate,
+                predicate_expr,
+                ..
+            } => {
+                let expr = predicate_expr
+                    .clone()
+                    .or_else(|| Self::parse_expr_string(predicate).ok())?;
+                Self::collect_expr_columns(&expr, needed);
+                Self::required_scan_columns(input, needed)
+            }
+            planner::PlanNode::Aggregate {
+                input, aggregates, ..
+            } => {
+                for agg in aggregates {
+                    Self::collect_expr_columns(&Self::parse_expr_string(agg).ok()?, needed);
+                }
+                Self::required_scan_columns(input, needed)
+            }
+            planner::PlanNode::HashAggregate {
+                input,
+                group_keys,
+                aggregates,
+                ..
+            } => {
+                for spec in group_keys.iter().chain(aggregates.iter()) {
+                    Self::collect_expr_columns(&Self::parse_expr_string(spec).ok()?, needed);
+                }
+                Self::required_scan_columns(input, needed)
+            }
+            planner::PlanNode::SeqScan {
+                table,
+                filter,
+                filter_expr,
+                projection,
+                ..
+            } => {
+                if projection.is_some() || table == "<values>" {
+                    return None;
+                }
+                match filter_expr.clone().or_else(|| {
+                    filter
+                        .as_ref()
+                        .and_then(|s| Self::parse_expr_string(s).ok())
+                }) {
+                    Some(expr) => Self::collect_expr_columns(&expr, needed),
+                    // A filter string that will not parse here would still be
+                    // parsed at execution time, against columns this pass never
+                    // saw. Leave the scan alone.
+                    None if filter.is_some() => return None,
+                    None => {}
+                }
+                Some(table.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Append every identifier appearing anywhere in `expr`, lowercased.
+    ///
+    /// This walks with the AST visitor rather than a hand-written `match`
+    /// because the two failure modes are not symmetric: collecting a name that
+    /// is not really needed costs one extra column, while *missing* one
+    /// projects away a column the query still reads. A hand-written match
+    /// silently under-collects the day a new expression form appears.
+    fn collect_expr_columns(expr: &Expr, out: &mut Vec<String>) {
+        let _ = sqlparser::ast::visit_expressions(expr, |e| {
+            match e {
+                Expr::Identifier(ident) => out.push(ident.value.to_lowercase()),
+                Expr::CompoundIdentifier(parts) => {
+                    if let Some(last) = parts.last() {
+                        out.push(last.value.to_lowercase());
+                    }
+                }
+                _ => {}
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+    }
+
+    /// The cheapest column to read when a query needs a row count but no data.
+    /// Fixed-width scalars decode without touching the heap; failing that, the
+    /// first column is still one column instead of all of them.
+    fn narrowest_column_index(table_def: &crate::catalog::TableDef) -> usize {
+        table_def
+            .columns
+            .iter()
+            .position(|c| {
+                matches!(
+                    c.data_type,
+                    DataType::Bool
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float64
+                        | DataType::Date
+                        | DataType::Timestamp
+                )
+            })
+            .unwrap_or(0)
+    }
+
+    /// Apply a sequential scan's WHERE predicate to the rows it produced.
+    ///
+    /// `row_meta` describes the rows as they actually are — narrowed when the
+    /// scan was projected — and drives every row-level evaluation, which is
+    /// sound because those all resolve identifiers by name. `schema_meta` is
+    /// the table's full column list and is used only for zone-map pruning:
+    /// granule statistics are keyed by *schema* column id, so resolving the
+    /// predicate against a narrowed meta would prune on another column's
+    /// min/max and silently drop matching rows.
+    fn filter_scanned_rows(
+        &self,
+        table: &str,
+        mut rows: Vec<Row>,
+        expr: &Expr,
+        row_meta: &[ColMeta],
+        schema_meta: &[ColMeta],
+    ) -> Vec<Row> {
+        // ── Zone map pruning ────────────────────────────────────────────────
+        // Before evaluating the WHERE clause row-by-row, try to skip entire
+        // granules whose min/max stats prove no row can match the predicate.
+        if let Some((col_id, ref predicate)) = Self::extract_zone_map_predicate(expr, schema_meta) {
+            rows = self.apply_zone_map_pruning(rows, table, col_id, predicate);
+        }
+
+        // Try SIMD-accelerated filter first (simple col op literal predicates)
+        if let Some(indices) = self.try_simd_filter(expr, &rows, row_meta) {
+            rows = indices.into_iter().map(|i| rows[i].clone()).collect();
+        } else if cfg!(feature = "server") && rows.len() > 10_000 {
+            #[cfg(feature = "server")]
+            {
+                use rayon::prelude::*;
+                rows = rows
+                    .into_par_iter()
+                    .filter(|row| self.eval_where_plan(expr, row, row_meta).unwrap_or(false))
+                    .collect();
+            }
+        } else {
+            rows.retain(|row| self.eval_where_plan(expr, row, row_meta).unwrap_or(false));
+        }
+        rows
+    }
+
+    /// The `SeqScan` at the base of a projection/filter/aggregation chain.
+    /// Mirrors the descent in [`Self::required_scan_columns`], which has
+    /// already established that this chain ends in one.
+    fn base_scan_mut(plan: &mut planner::PlanNode) -> Option<&mut planner::PlanNode> {
+        match plan {
+            planner::PlanNode::SeqScan { .. } => Some(plan),
+            planner::PlanNode::Project { input, .. }
+            | planner::PlanNode::Filter { input, .. }
+            | planner::PlanNode::Aggregate { input, .. }
+            | planner::PlanNode::HashAggregate { input, .. } => Self::base_scan_mut(input),
+            _ => None,
+        }
     }
 
     /// Push a LIMIT hint into a SeqScan node if no Sort or Aggregate sits between.
@@ -2072,36 +2241,6 @@ impl Executor {
 
                     let table_def = self.get_table(table).await?;
 
-                    // ── Projected scan fast-path ──────────────────────────────
-                    // When the planner pushed projection indices into this node
-                    // and there is no filter, use `scan_projected()` for
-                    // zero-copy partial deserialization (DiskEngine skips
-                    // non-projected columns during page decoding).
-                    if let Some(proj_indices) = projection
-                        && filter.is_none()
-                    {
-                        let proj_meta: Vec<ColMeta> = proj_indices
-                            .iter()
-                            .filter_map(|&idx| {
-                                table_def.columns.get(idx).map(|c| ColMeta {
-                                    table: Some(table.clone()),
-                                    name: c.name.clone(),
-                                    dtype: c.data_type.clone(),
-                                })
-                            })
-                            .collect();
-                        let storage = self.storage_for(table);
-                        let rows = storage.scan_projected(table, proj_indices).await?;
-                        self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                        // Ceiling-check the projected scan against the shared
-                        // query-memory budget (see the full-scan gate below).
-                        drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
-                        return Ok((proj_meta, rows));
-                        // If there IS a filter, fall through to the full scan
-                        // path — the filter may reference columns outside the
-                        // projection.
-                    }
-
                     let meta: Vec<ColMeta> = table_def
                         .columns
                         .iter()
@@ -2146,8 +2285,41 @@ impl Executor {
                             // Report rows EXAMINED by the seq scan, not the (typically
                             // tiny) match count — `rows_scanned` is a scan-cost metric.
                             self.metrics.rows_scanned.inc_by(examined as u64);
+                            self.metrics
+                                .values_scanned
+                                .inc_by((examined * meta.len()) as u64);
                             return Ok((meta, rows));
                         }
+                    }
+
+                    // ── Projected scan ────────────────────────────────────────
+                    // The planner pushed the set of columns this query actually
+                    // touches — output columns plus filter columns — so read
+                    // only those. `scan_projected` skips decoding the rest.
+                    if let Some(proj_indices) = projection
+                        && let Some(proj_meta) = proj_indices
+                            .iter()
+                            .map(|&idx| meta.get(idx).cloned())
+                            // A cached plan outlives the schema it was planned
+                            // against. If an index no longer names a column,
+                            // take the full scan rather than hand back rows
+                            // that do not line up with their metadata.
+                            .collect::<Option<Vec<ColMeta>>>()
+                    {
+                        let mut rows = storage
+                            .scan_projected(table, proj_indices, *scan_limit)
+                            .await?;
+                        self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                        self.metrics
+                            .values_scanned
+                            .inc_by((rows.len() * proj_indices.len()) as u64);
+                        // Ceiling-check the projected scan against the shared
+                        // query-memory budget (see the full-scan gate below).
+                        drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
+                        if let Some(expr) = resolved_expr {
+                            rows = self.filter_scanned_rows(table, rows, &expr, &proj_meta, &meta);
+                        }
+                        return Ok((proj_meta, rows));
                     }
 
                     let mut rows = if let Some(lim) = scan_limit {
@@ -2156,6 +2328,9 @@ impl Executor {
                         storage.scan(table).await?
                     };
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                    self.metrics
+                        .values_scanned
+                        .inc_by((rows.len() * meta.len()) as u64);
                     // Ceiling-check the materialized scan against the shared
                     // query-memory budget: rejects a single scan too large for
                     // the limit (the dominant single-query OOM) and throttles
@@ -2167,35 +2342,7 @@ impl Executor {
                     drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
 
                     if let Some(expr) = resolved_expr {
-                        // ── Zone map pruning ────────────────────────────────
-                        // Before evaluating the WHERE clause row-by-row, try
-                        // to skip entire granules whose min/max stats prove
-                        // no row can match the predicate.
-                        if let Some((col_id, ref predicate)) =
-                            Self::extract_zone_map_predicate(&expr, &meta)
-                        {
-                            rows = self.apply_zone_map_pruning(rows, table, col_id, predicate);
-                        }
-
-                        // Try SIMD-accelerated filter first (simple col op literal predicates)
-                        if let Some(indices) = self.try_simd_filter(&expr, &rows, &meta) {
-                            rows = indices.into_iter().map(|i| rows[i].clone()).collect();
-                        } else if cfg!(feature = "server") && rows.len() > 10_000 {
-                            #[cfg(feature = "server")]
-                            {
-                                use rayon::prelude::*;
-                                rows = rows
-                                    .into_par_iter()
-                                    .filter(|row| {
-                                        self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
-                                    })
-                                    .collect();
-                            }
-                        } else {
-                            rows.retain(|row| {
-                                self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
-                            });
-                        }
+                        rows = self.filter_scanned_rows(table, rows, &expr, &meta, &meta);
                     }
                     Ok((meta, rows))
                 }
