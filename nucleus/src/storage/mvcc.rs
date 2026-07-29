@@ -2735,8 +2735,10 @@ impl StorageEngine for MvccStorageAdapter {
             Some(idx) => {
                 // BTreeMap::range panics if the start bound is greater than the
                 // end bound; a reversed/contradictory range (e.g. `id >= 20 AND
-                // id <= -5`) is simply empty.
-                if value_cmp_coerced(low, high) == Some(std::cmp::Ordering::Greater) {
+                // id <= -5`) is simply empty. The check must use the same `Ord`
+                // the map is keyed by — a coercing comparison reports `Text("")`
+                // vs `Int32(2)` as incomparable and lets the panic through.
+                if crate::storage::range_cannot_match(low, high) {
                     return Ok(Some(Vec::new()));
                 }
                 // Use BTreeMap::range for O(log N + k) instead of O(N) linear scan.
@@ -2773,7 +2775,7 @@ impl StorageEngine for MvccStorageAdapter {
             Some(entries.values().map(|_| vec![val.clone()]).collect())
         } else if let Some((low, high)) = range {
             // Empty/reversed range — BTreeMap::range would panic.
-            if value_cmp_coerced(low, high) == Some(std::cmp::Ordering::Greater) {
+            if crate::storage::range_cannot_match(low, high) {
                 return Some(Vec::new());
             }
             let mut rows = Vec::new();

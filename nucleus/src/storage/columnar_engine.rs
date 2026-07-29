@@ -1140,6 +1140,9 @@ impl StorageEngine for ColumnarStorageEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        if crate::storage::range_cannot_match(low, high) {
+            return Ok(Some(Vec::new()));
+        }
         // Flush write buffer so all single-row inserts have stable positions.
         self.flush_write_buffer(table);
         let positions: Vec<usize> = {

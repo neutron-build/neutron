@@ -558,6 +558,27 @@ impl Value {
             (Value::Text(s), Value::Float64(f)) | (Value::Float64(f), Value::Text(s)) => {
                 s.trim().parse::<f64>().ok().and_then(|v| v.partial_cmp(f)) == Some(Equal)
             }
+            // NUMERIC is exact and held as text, so no cross-variant pair is
+            // ever bitwise equal and `"2.25"` and `"2.250"` are not equal to
+            // each other either. Without these arms `v = 2.25` on a NUMERIC
+            // column — the literal parses as `Float64` — matched nothing in the
+            // storage fast paths while the same predicate in a projection, which
+            // goes through the coercing comparator, was true. Defer to `Ord`,
+            // which already compares these exactly and is what the B-tree
+            // indexes are keyed by, so all three agree by construction.
+            (
+                Value::Numeric(_),
+                Value::Numeric(_) | Value::Int32(_) | Value::Int64(_) | Value::Float64(_),
+            )
+            | (Value::Int32(_) | Value::Int64(_) | Value::Float64(_), Value::Numeric(_)) => {
+                self.cmp(other) == Equal
+            }
+            (Value::Text(s), Value::Numeric(n)) | (Value::Numeric(n), Value::Text(s)) => {
+                match (parse_numeric(s.trim()), parse_numeric(n)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                }
+            }
             // Same-variant and every other combination: strict equality.
             _ => self == other,
         }
@@ -858,6 +879,16 @@ impl Hash for Value {
     }
 }
 
+/// A `DATE` as microseconds since the 2000-01-01 epoch, for comparison against
+/// a `TIMESTAMP`.
+///
+/// Saturating because the value may be a sentinel bound rather than a real
+/// date: `i32::MIN * 86_400_000_000` overflows `i64`, which panics in a debug
+/// build and silently reverses the comparison in a release one.
+pub(crate) fn date_as_micros(days: i32) -> i64 {
+    (days as i64).saturating_mul(86_400_000_000)
+}
+
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -906,11 +937,18 @@ impl Ord for Value {
             // A date compares as midnight of that day, matching PostgreSQL
             // (`TIMESTAMP '2024-01-01 00:00:00' = DATE '2024-01-01'`). Both use
             // the 2000-01-01 epoch; a date is days, a timestamp microseconds.
+            //
+            // Saturating, not wrapping: the open end of a comparison is a
+            // sentinel bound (`sentinel_min` yields `Date(i32::MIN)`), and
+            // `i32::MIN * 86_400_000_000` overflows `i64` — a debug-build panic
+            // inside `Ord`, and a wrapped comparison that reverses the ordering
+            // in release. Saturating keeps the extreme dates at the extremes,
+            // which is exactly what a sentinel means.
             (Value::Date(d), Value::Timestamp(t)) | (Value::Date(d), Value::TimestampTz(t)) => {
-                (*d as i64 * 86_400_000_000).cmp(t)
+                date_as_micros(*d).cmp(t)
             }
             (Value::Timestamp(t), Value::Date(d)) | (Value::TimestampTz(t), Value::Date(d)) => {
-                t.cmp(&(*d as i64 * 86_400_000_000))
+                t.cmp(&date_as_micros(*d))
             }
             (Value::Timestamp(a), Value::TimestampTz(b))
             | (Value::TimestampTz(a), Value::Timestamp(b)) => a.cmp(b),
