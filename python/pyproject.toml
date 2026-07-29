@@ -44,6 +44,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["neutron"]
+# N-009 note: hatchling's default editable mode writes a .pth containing the
+# project root, so tests/ -- and any future sibling directory -- is importable
+# in the consuming application and shadows its own module of that name.
+# dev-mode-exact = true fixes that, but it emits an `editables` redirector that
+# the consuming venv must have installed, and without it neutron stops
+# importing altogether. That is a worse failure than the shadowing, so the fix
+# needs either `editables` declared as a runtime dependency or tests/ moved out
+# of the project root. Left as-is deliberately rather than half-applied.
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

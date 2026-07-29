@@ -37,6 +37,30 @@ _SWAGGER_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+
+async def _dependency_reachable(db: Any, *, timeout: float = 2.0) -> bool:
+    """Is the configured database actually answering?
+
+    Contract §7 distinguishes connected from disconnected by health, which
+    means something has to ask. A cheap SELECT 1 under a short timeout is that
+    question; any failure is unhealthy rather than an exception, because a
+    health endpoint that raises cannot report degradation.
+    """
+    pool = getattr(db, "pool", None)
+    if pool is None:
+        sql = getattr(db, "sql", None)
+        pool = getattr(sql, "_pool", None)
+    if pool is None:
+        # Configured with something that exposes no pool. It was handed to us
+        # as the dependency, so treat its presence as the only signal we have.
+        return True
+    try:
+        await asyncio.wait_for(pool.fetchval("SELECT 1"), timeout)
+    except Exception:
+        return False
+    return True
+
+
 class App:
     """Neutron application.
 
@@ -146,16 +170,25 @@ class App:
             db = neutron_app.db
             if db is None and hasattr(neutron_app.state, "db"):
                 db = neutron_app.state.db
-            # Contract §7: nucleus reflects the HEALTH of the nucleus dependency.
+            # Contract §7: nucleus reflects the HEALTH of the dependency, and
+            # says plainly that feature detection -- Nucleus versus plain
+            # Postgres -- is §1 and not this endpoint. Reporting
+            # "disconnected" for a healthy Postgres both violates that and
+            # makes the field useless for monitoring: it pages for a working
+            # system, and a genuinely unreachable database is indistinguishable
+            # from the normal case. It also left "disconnected" unreachable in
+            # practice, since nothing here ever probed the connection.
+            status = "ok"
             if db is None:
                 nucleus = "unconfigured"
-            elif getattr(getattr(db, "features", None), "is_nucleus", False):
+            elif await _dependency_reachable(db):
                 nucleus = "connected"
             else:
                 nucleus = "disconnected"
+                status = "degraded"
             return JSONResponse(
                 {
-                    "status": "ok",
+                    "status": status,
                     "nucleus": nucleus,
                     "version": neutron_app._version,
                 }
