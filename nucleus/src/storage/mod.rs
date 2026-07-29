@@ -16,8 +16,16 @@ pub mod columnar_wal;
 pub mod compression;
 #[cfg(feature = "server")]
 pub mod disk;
-#[cfg(feature = "server")]
+// Crash injection is pure `std` and is called from durability paths that exist
+// in every build, so it is not server-only. Gating it forced its call sites to
+// be gated instead, which is backwards: the point of this module is that the
+// hooks ship in the artifact that actually runs.
 pub mod crashpoint;
+// Paged storage needs the whole server-only stack — btree, buffer pool, disk,
+// crashpoint, io_uring — and a multi-threaded tokio runtime. Its re-export
+// below was already gated; the module declaration was not, so a core-only
+// build tried to compile it against modules that do not exist there.
+#[cfg(feature = "server")]
 pub mod disk_engine;
 pub mod encrypted_index;
 pub mod encryption;
