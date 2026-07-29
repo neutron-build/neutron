@@ -13,6 +13,10 @@ pub enum OAuthError {
     Http(String),
     /// The token endpoint returned a non-200 status or unparseable body.
     TokenExchange(String),
+    /// The provider rejected a refresh token (`invalid_grant`) — revoked,
+    /// expired, or invalidated. The account must re-authenticate; retrying
+    /// with the same token will never succeed.
+    RefreshRejected(String),
     /// The `state` parameter is missing, wrong, or the cookie is invalid.
     InvalidState,
     /// The `code` query parameter is missing from the callback.
@@ -30,6 +34,7 @@ impl fmt::Display for OAuthError {
             Self::Connect(e)       => write!(f, "OAuth connect: {e}"),
             Self::Http(e)          => write!(f, "OAuth HTTP: {e}"),
             Self::TokenExchange(e) => write!(f, "OAuth token exchange: {e}"),
+            Self::RefreshRejected(e) => write!(f, "OAuth refresh rejected (re-auth required): {e}"),
             Self::InvalidState     => write!(f, "OAuth invalid state parameter"),
             Self::MissingCode      => write!(f, "OAuth missing 'code' parameter"),
             Self::UserInfo(e)      => write!(f, "OAuth userinfo: {e}"),
@@ -54,6 +59,7 @@ mod tests {
         assert!(OAuthError::Connect("c".into()).to_string().contains('c'));
         assert!(OAuthError::Http("h".into()).to_string().contains('h'));
         assert!(OAuthError::TokenExchange("t".into()).to_string().contains('t'));
+        assert!(OAuthError::RefreshRejected("r".into()).to_string().contains('r'));
         assert!(OAuthError::InvalidState.to_string().contains("invalid"));
         assert!(OAuthError::MissingCode.to_string().contains("missing"));
         assert!(OAuthError::UserInfo("u".into()).to_string().contains('u'));
