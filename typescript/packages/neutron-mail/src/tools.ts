@@ -194,6 +194,55 @@ export function createMailTools(options: MailToolOptions): ToolDefinition[] {
         },
       },
       {
+        name: "mail_send",
+        description:
+          "Send a new message, or reply to an existing one by passing reply_to_message_id. " +
+          "Sends real mail from the user's address.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: {
+              type: "array",
+              items: { type: "string" },
+              description: "Recipient email addresses.",
+            },
+            subject: { type: "string", description: "Subject line." },
+            body: { type: "string", description: "Plain-text message body." },
+            reply_to_message_id: {
+              type: "string",
+              description:
+                "Message id being replied to. Set this for replies so the message threads " +
+                "correctly; the subject and recipient are derived from the original.",
+            },
+          },
+          required: ["body"],
+        },
+        // Sending is irreversible and goes out under the user's name. Of
+        // every tool here this is the one that most needs a human in front
+        // of it.
+        needsApproval: true,
+        async execute(input) {
+          const { to, subject, body, reply_to_message_id } = input as {
+            to?: string[];
+            subject?: string;
+            body: string;
+            reply_to_message_id?: string;
+          };
+
+          if (!reply_to_message_id && (!to || to.length === 0)) {
+            throw new Error("mail_send: a new message needs at least one recipient in `to`");
+          }
+
+          const messageId = await client.send(account, {
+            to: (to ?? []).map((email) => ({ email })),
+            subject,
+            text: body,
+            reply_to_message_id,
+          });
+          return { sent: true, message_id: messageId };
+        },
+      },
+      {
         name: "mail_move",
         description:
           "Move messages to another mailbox. Changes the user's real mailbox.",

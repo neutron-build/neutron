@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -25,6 +26,10 @@ func discardLogger() *slog.Logger {
 // demand — a UIDVALIDITY reset, a revoked grant, a crash between two writes.
 
 type memStore struct {
+	// The scheduler syncs accounts concurrently, so the double needs the
+	// same safety the real store gets from its connection pool.
+	mu sync.Mutex
+
 	accounts  map[AccountID]*Account
 	mailboxes map[AccountID][]Mailbox
 	messages  map[AccountID]map[MessageID]*Envelope
@@ -52,12 +57,16 @@ func (m *memStore) Migrate(context.Context) error { return nil }
 func (m *memStore) Close()                        {}
 
 func (m *memStore) PutAccount(_ context.Context, a *Account) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	cp := *a
 	m.accounts[a.ID] = &cp
 	return nil
 }
 
 func (m *memStore) Account(_ context.Context, id AccountID) (*Account, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
 	if !ok {
 		return nil, ErrNoStore
@@ -67,6 +76,8 @@ func (m *memStore) Account(_ context.Context, id AccountID) (*Account, error) {
 }
 
 func (m *memStore) Accounts(context.Context) ([]Account, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var out []Account
 	for _, a := range m.accounts {
 		out = append(out, *a)
@@ -75,6 +86,8 @@ func (m *memStore) Accounts(context.Context) ([]Account, error) {
 }
 
 func (m *memStore) SetNeedsReauth(_ context.Context, id AccountID, needs bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if a, ok := m.accounts[id]; ok {
 		a.NeedsReauth = needs
 	}
@@ -82,15 +95,21 @@ func (m *memStore) SetNeedsReauth(_ context.Context, id AccountID, needs bool) e
 }
 
 func (m *memStore) PutMailboxes(_ context.Context, acct AccountID, boxes []Mailbox) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.mailboxes[acct] = boxes
 	return nil
 }
 
 func (m *memStore) Mailboxes(_ context.Context, acct AccountID) ([]Mailbox, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.mailboxes[acct], nil
 }
 
 func (m *memStore) PutEnvelopes(_ context.Context, acct AccountID, envs []Envelope) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.failPutEnvelopes {
 		m.failPutEnvelopes = false
 		return errors.New("simulated store failure")
@@ -117,6 +136,8 @@ func (m *memStore) PutEnvelopes(_ context.Context, acct AccountID, envs []Envelo
 }
 
 func (m *memStore) Envelope(_ context.Context, acct AccountID, id MessageID) (*Envelope, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	e, ok := m.messages[acct][id]
 	if !ok {
 		return nil, ErrNoStore
@@ -125,6 +146,8 @@ func (m *memStore) Envelope(_ context.Context, acct AccountID, id MessageID) (*E
 }
 
 func (m *memStore) EnvelopeIDs(_ context.Context, acct AccountID, box MailboxID) ([]MessageID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var out []MessageID
 	for id, boxes := range m.members[acct] {
 		if boxes[box] {
@@ -135,6 +158,8 @@ func (m *memStore) EnvelopeIDs(_ context.Context, acct AccountID, box MailboxID)
 }
 
 func (m *memStore) DeleteMessages(_ context.Context, acct AccountID, ids []MessageID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, id := range ids {
 		delete(m.messages[acct], id)
 		delete(m.members[acct], id)
@@ -144,6 +169,8 @@ func (m *memStore) DeleteMessages(_ context.Context, acct AccountID, ids []Messa
 }
 
 func (m *memStore) RemoveFromMailbox(_ context.Context, acct AccountID, box MailboxID, ids []MessageID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, id := range ids {
 		if m.members[acct][id] == nil {
 			continue
@@ -158,6 +185,8 @@ func (m *memStore) RemoveFromMailbox(_ context.Context, acct AccountID, box Mail
 }
 
 func (m *memStore) PutBody(_ context.Context, acct AccountID, b *Body) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.bodies[acct] == nil {
 		m.bodies[acct] = map[MessageID]*Body{}
 	}
@@ -166,6 +195,8 @@ func (m *memStore) PutBody(_ context.Context, acct AccountID, b *Body) error {
 }
 
 func (m *memStore) Body(_ context.Context, acct AccountID, id MessageID) (*Body, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	b, ok := m.bodies[acct][id]
 	if !ok {
 		return nil, ErrNoStore
@@ -174,10 +205,14 @@ func (m *memStore) Body(_ context.Context, acct AccountID, id MessageID) (*Body,
 }
 
 func (m *memStore) Cursor(_ context.Context, acct AccountID, box MailboxID) (Cursor, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.cursors[acct][box], nil
 }
 
 func (m *memStore) PutCursor(_ context.Context, acct AccountID, box MailboxID, cur Cursor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.cursors[acct] == nil {
 		m.cursors[acct] = map[MailboxID]Cursor{}
 	}
@@ -185,23 +220,52 @@ func (m *memStore) PutCursor(_ context.Context, acct AccountID, box MailboxID, c
 	return nil
 }
 
-func (m *memStore) ResetMailbox(ctx context.Context, acct AccountID, box MailboxID) error {
-	ids, _ := m.EnvelopeIDs(ctx, acct, box)
+// ResetMailbox holds the lock for the whole operation rather than calling the
+// other methods, which take it themselves — sync.Mutex is not reentrant.
+func (m *memStore) ResetMailbox(_ context.Context, acct AccountID, box MailboxID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var ids []MessageID
+	for id, boxes := range m.members[acct] {
+		if boxes[box] {
+			ids = append(ids, id)
+		}
+	}
 	if m.cursors[acct] != nil {
 		delete(m.cursors[acct], box)
 	}
-	return m.RemoveFromMailbox(ctx, acct, box, ids)
+
+	for _, id := range ids {
+		if m.members[acct][id] == nil {
+			continue
+		}
+		delete(m.members[acct][id], box)
+		if len(m.members[acct][id]) == 0 {
+			delete(m.messages[acct], id)
+			delete(m.members[acct], id)
+		}
+	}
+	return nil
 }
 
 func (m *memStore) Search(context.Context, AccountID, string, int) ([]Envelope, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return nil, nil
 }
 
 func (m *memStore) Thread(context.Context, AccountID, ThreadID) ([]Envelope, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return nil, nil
 }
 
-func (m *memStore) count(acct AccountID) int { return len(m.messages[acct]) }
+func (m *memStore) count(acct AccountID) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.messages[acct])
+}
 
 var _ Store = (*memStore)(nil)
 

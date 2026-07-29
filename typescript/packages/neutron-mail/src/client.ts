@@ -131,6 +131,22 @@ export class MailError extends Error {
   }
 }
 
+export interface SendRequest {
+  to: Address[];
+  cc?: Address[];
+  bcc?: Address[];
+  subject?: string;
+  text?: string;
+  html?: string;
+  /**
+   * Message being replied to. When set, the threading chain is built
+   * server-side from the stored parent — a reply whose In-Reply-To and
+   * References do not match the real parent silently starts a new
+   * conversation in the recipient's client.
+   */
+  reply_to_message_id?: string;
+}
+
 export interface MailClient {
   accounts(): Promise<Account[]>;
   mailboxes(account: string): Promise<Mailbox[]>;
@@ -143,6 +159,7 @@ export interface MailClient {
     account: string,
     op: { kind: OperationKind; ids: string[]; keyword?: string; target?: string },
   ): Promise<number>;
+  send(account: string, message: SendRequest): Promise<string>;
   health(): Promise<{ status: string; nucleus: boolean; version: string }>;
 }
 
@@ -237,6 +254,14 @@ export function createMailClient(options: MailClientOptions): MailClient {
         { method: "POST", body: JSON.stringify(op) },
       );
       return r.applied;
+    },
+
+    async send(account, message) {
+      const r = await request<{ message_id: string }>(
+        `/v1/accounts/${encodeURIComponent(account)}/send`,
+        { method: "POST", body: JSON.stringify(message) },
+      );
+      return r.message_id;
     },
 
     health() {

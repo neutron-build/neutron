@@ -195,6 +195,62 @@ test("search results are trimmed to what a model can use", async () => {
   assert.equal(m.MessageIDHeader, undefined);
 });
 
+test("send posts the message and returns its id", async () => {
+  const { fn, calls } = stubFetch([{ body: { message_id: "<new@example.com>" } }]);
+  const client = createMailClient({ baseUrl: "http://svc", fetch: fn });
+
+  const id = await client.send("acct-1", {
+    to: [{ email: "bob@example.com" }],
+    subject: "Hello",
+    text: "body",
+  });
+
+  assert.equal(id, "<new@example.com>");
+  assert.match(calls[0].url, /\/v1\/accounts\/acct-1\/send$/);
+  assert.equal(calls[0].init?.method, "POST");
+  const sent = JSON.parse(String(calls[0].init?.body));
+  assert.equal(sent.to[0].email, "bob@example.com");
+});
+
+test("mail_send requires a recipient for a new message", async () => {
+  // A reply derives its recipient from the parent, but a fresh message with
+  // no `to` would otherwise be rejected only after a round trip.
+  const { fn } = stubFetch([{ body: { message_id: "<x>" } }]);
+  const client = createMailClient({ baseUrl: "http://svc", fetch: fn });
+  const tools = createMailTools({ client, account: "acct-1", allowMutations: true });
+  const send = tools.find((t) => t.name === "mail_send");
+  assert.ok(send);
+
+  await assert.rejects(() => send.execute({ body: "no recipient" }), /recipient/);
+});
+
+test("mail_send allows a reply without an explicit recipient", async () => {
+  const { fn, calls } = stubFetch([{ body: { message_id: "<reply@x>" } }]);
+  const client = createMailClient({ baseUrl: "http://svc", fetch: fn });
+  const tools = createMailTools({ client, account: "acct-1", allowMutations: true });
+  const send = tools.find((t) => t.name === "mail_send");
+  assert.ok(send);
+
+  const result = (await send.execute({
+    body: "sounds good",
+    reply_to_message_id: "h:abc",
+  })) as { sent: boolean };
+
+  assert.equal(result.sent, true);
+  const sent = JSON.parse(String(calls[0].init?.body));
+  assert.equal(sent.reply_to_message_id, "h:abc");
+});
+
+test("mail_send requires approval", async () => {
+  const { fn } = stubFetch([{ body: {} }]);
+  const client = createMailClient({ baseUrl: "http://svc", fetch: fn });
+  const tools = createMailTools({ client, account: "acct-1", allowMutations: true });
+  const send = tools.find((t) => t.name === "mail_send");
+
+  assert.ok(send);
+  assert.equal(send.needsApproval, true, "sending mail must be a human decision");
+});
+
 test("the search limit is capped by maxResults", async () => {
   const { fn, calls } = stubFetch([{ body: { messages: [] } }]);
   const client = createMailClient({ baseUrl: "http://svc", fetch: fn });

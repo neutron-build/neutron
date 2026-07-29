@@ -83,7 +83,13 @@ func (e *Engine) SyncAccount(ctx context.Context, acct AccountID, ad Adapter) ([
 		if err != nil {
 			// One unreadable mailbox should not abandon the rest of the
 			// account; a permission-scoped folder is common and normal.
-			if errors.Is(err, ErrReauthRequired) {
+			//
+			// Two conditions are account-wide rather than per-mailbox and
+			// must propagate: a rejected credential, and throttling.
+			// Swallowing a rate limit here would mean the caller sees a
+			// clean result and immediately hammers the next mailbox, which
+			// is precisely what the provider asked us to stop doing.
+			if errors.Is(err, ErrReauthRequired) || errors.Is(err, ErrRateLimited) {
 				return reports, err
 			}
 			e.log.WarnContext(ctx, "mailbox sync failed",
