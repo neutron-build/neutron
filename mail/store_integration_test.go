@@ -327,6 +327,104 @@ func TestIntegrationSearchAndThread(t *testing.T) {
 	}
 }
 
+func TestIntegrationSearchMatchesOnWordsNotSubstrings(t *testing.T) {
+	// This is why Search uses `@@` rather than LIKE. LIKE '%number%' would
+	// match "numbers" but also "renumbered", and would miss "number" when
+	// the query says "numbers". `@@` stems and matches whole terms.
+	s := testStore(t)
+	ctx := context.Background()
+	acct := seedAccount(t, s)
+
+	envs := []Envelope{
+		{
+			ID: HeaderMessageID("<w1@example.com>"), MailboxIDs: []MailboxID{"INBOX"},
+			Subject: "Quarterly numbers", ReceivedAt: time.Now().UTC(),
+		},
+		{
+			ID: HeaderMessageID("<w2@example.com>"), MailboxIDs: []MailboxID{"INBOX"},
+			Subject: "Renumbered the invoices", ReceivedAt: time.Now().UTC(),
+		},
+	}
+	if err := s.PutEnvelopes(ctx, acct, envs); err != nil {
+		t.Fatal(err)
+	}
+
+	// Term matching, not substring: "Renumbered" must not match.
+	hits, err := s.Search(ctx, acct, "numbers", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found, spurious bool
+	for _, h := range hits {
+		if h.Subject == "Quarterly numbers" {
+			found = true
+		}
+		if h.Subject == "Renumbered the invoices" {
+			spurious = true
+		}
+	}
+	if !found {
+		t.Error(`searching "numbers" did not find "Quarterly numbers"`)
+	}
+	if spurious {
+		t.Error(`searching "numbers" matched "Renumbered"; that is substring behaviour, not term matching`)
+	}
+
+	// Characterisation test for a known Nucleus stemmer bug, not an
+	// endorsement of the behaviour. The English stemmer applies its rules
+	// as a mutually exclusive chain, so "numbers" takes the plural rule and
+	// stems to "number", while "number" takes the -er comparative rule and
+	// stems to "numb". Singular and plural of the same noun therefore never
+	// match. See _internal/NEUTRON_GAPS.md.
+	//
+	// When that is fixed this assertion will fail. That is the point: invert
+	// it then, and delete this comment.
+	singular, err := s.Search(ctx, acct, "number", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range singular {
+		if h.Subject == "Quarterly numbers" {
+			t.Error("the stemmer bug appears to be fixed — invert this assertion and update NEUTRON_GAPS.md")
+		}
+	}
+}
+
+func TestIntegrationSearchRequiresEveryTerm(t *testing.T) {
+	// `@@` is an AND across terms, so a two-word query must not return
+	// messages carrying only one of them.
+	s := testStore(t)
+	ctx := context.Background()
+	acct := seedAccount(t, s)
+
+	envs := []Envelope{
+		{
+			ID: HeaderMessageID("<a1@example.com>"), MailboxIDs: []MailboxID{"INBOX"},
+			Subject: "Quarterly revenue numbers", ReceivedAt: time.Now().UTC(),
+		},
+		{
+			ID: HeaderMessageID("<a2@example.com>"), MailboxIDs: []MailboxID{"INBOX"},
+			Subject: "Quarterly offsite", ReceivedAt: time.Now().UTC(),
+		},
+	}
+	if err := s.PutEnvelopes(ctx, acct, envs); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := s.Search(ctx, acct, "quarterly numbers", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hits {
+		if h.Subject == "Quarterly offsite" {
+			t.Error(`a message matching only one term was returned; @@ should require both`)
+		}
+	}
+	if len(hits) == 0 {
+		t.Error("the message carrying both terms was not found")
+	}
+}
+
 func TestIntegrationBodyLifecycle(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
