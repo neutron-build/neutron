@@ -375,7 +375,7 @@ func TestIntegrationSearchMatchesOnWordsNotSubstrings(t *testing.T) {
 	// as a mutually exclusive chain, so "numbers" takes the plural rule and
 	// stems to "number", while "number" takes the -er comparative rule and
 	// stems to "numb". Singular and plural of the same noun therefore never
-	// match. See _internal/NEUTRON_GAPS.md.
+	// match. See docs/NEUTRON_GAPS.md.
 	//
 	// When that is fixed this assertion will fail. That is the point: invert
 	// it then, and delete this comment.
