@@ -20,6 +20,18 @@ type Scheduler struct {
 	adapters func(AccountID) (Adapter, bool)
 	log      *slog.Logger
 
+	// Tokens mints a credential for an account when no request is in
+	// flight. Without it the scheduler can only drive accounts whose
+	// adapters were configured up front — a self-hosted mailbox with an app
+	// password — because there is nothing to authenticate an OAuth account
+	// with between requests.
+	//
+	// With it, and a Resolver, the scheduler asks the application for a
+	// fresh token and builds an adapter per run. Refresh still happens in
+	// exactly one place; this process holds no refresh token.
+	Tokens  TokenSource
+	Resolve Resolver
+
 	// Interval is how often each account is synced. Defaults to 5 minutes.
 	//
 	// Polling rather than IMAP IDLE is deliberate for the general case:
@@ -134,10 +146,15 @@ func (s *Scheduler) eligible(a Account) bool {
 }
 
 func (s *Scheduler) syncOne(ctx context.Context, a Account) {
-	ad, ok := s.adapters(a.ID)
-	if !ok {
+	ad, release, err := s.adapterFor(ctx, a.ID)
+	if err != nil {
+		s.handleFailure(ctx, a.ID, err)
 		return
 	}
+	if ad == nil {
+		return
+	}
+	defer release()
 
 	if s.Jitter {
 		// Spread the load so many accounts on one provider do not arrive
@@ -172,6 +189,33 @@ func (s *Scheduler) syncOne(ctx context.Context, a Account) {
 		s.log.InfoContext(ctx, "account synced",
 			"account", a.ID, "created", created, "updated", updated, "deleted", deleted)
 	}
+}
+
+// adapterFor obtains an adapter for a background run.
+//
+// Two paths, and a deployment may use either or both. A statically configured
+// adapter is returned as-is and outlives the run. Otherwise a token is
+// requested from the application and an adapter built for this run only, so
+// the connection never outlives the credential that authorised it.
+//
+// A nil adapter with a nil error means "this account is not syncable here",
+// which is an ordinary state — not every account has a credential path — and
+// must not be logged as a failure on every tick.
+func (s *Scheduler) adapterFor(ctx context.Context, acct AccountID) (Adapter, func(), error) {
+	if s.adapters != nil {
+		if ad, ok := s.adapters(acct); ok {
+			return ad, func() {}, nil
+		}
+	}
+	if s.Tokens == nil || s.Resolve == nil {
+		return nil, nil, nil
+	}
+
+	cred, err := s.Tokens.Token(ctx, acct)
+	if err != nil {
+		return nil, nil, err
+	}
+	return s.Resolve(ctx, acct, cred)
 }
 
 // handleFailure decides whether and when to try the account again.
