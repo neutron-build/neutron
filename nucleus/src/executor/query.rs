@@ -552,6 +552,178 @@ impl Executor {
         }
     }
 
+    /// Answer `col IN (…)` from an index by probing it once per distinct value.
+    ///
+    /// Returns the candidate rows and how many the probe examined, or `None` to
+    /// let the caller scan. The candidates are a **superset** of the answer —
+    /// the caller must still apply the full predicate, which it does — because
+    /// the IN-list may be one conjunct of a larger `WHERE`.
+    ///
+    /// Only a top-level conjunct qualifies. Under an `OR`, rows can satisfy the
+    /// predicate without satisfying the IN-list at all, so probing it would drop
+    /// them; `find_in_list_conjunct` descends through `AND` and parentheses only.
+    async fn try_in_list_index_probe(
+        &self,
+        table: &str,
+        expr: &Expr,
+        meta: &[ColMeta],
+    ) -> Option<(Vec<Row>, usize)> {
+        // Same contract as every other index path: a committed index cannot see
+        // this transaction's own uncommitted writes.
+        if self
+            .current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(true)
+        {
+            return None;
+        }
+        let (col_name, values) = self.find_in_list_conjunct(expr)?;
+        let col = meta.iter().find(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+
+        // Distinct, in the column's own type — `IN ('1', '1', 2)` must probe
+        // twice, not three times, and `'1'` must probe as the column's type for
+        // the same reason a text-spelled equality does.
+        let mut probes: Vec<Value> = Vec::with_capacity(values.len());
+        for v in &values {
+            let typed = Self::coerce_to_column_type(v, &col.dtype);
+            if !probes.contains(&typed) {
+                probes.push(typed);
+            }
+        }
+
+        // A long list stops being cheaper than one pass over the table. Same
+        // shape as the equality crossover: a third of the table.
+        let storage = self.storage_for(table);
+        if let Some(total) = storage.fast_count_all(table)
+            && total > 0
+            && probes.len() * 3 >= total
+        {
+            return None;
+        }
+
+        let index_name = self
+            .btree_indexes
+            .get(&(table.to_string(), col_name.to_lowercase()))?
+            .clone();
+
+        let mut rows = Vec::new();
+        for probe in &probes {
+            match storage.index_lookup(table, &index_name, probe).await {
+                Ok(Some(hits)) => rows.extend(hits),
+                // Anything else means the index cannot answer this probe, and a
+                // partial answer is worse than none — abandon the whole attempt.
+                _ => {
+                    self.metrics.index_scan_fallbacks.inc();
+                    return None;
+                }
+            }
+        }
+        self.metrics.index_scan_attempts.inc();
+        self.metrics.index_scan_served.inc();
+        let examined = rows.len();
+        Some((rows, examined))
+    }
+
+    /// A `col IN (literal, …)` sitting as a top-level conjunct of `expr`.
+    ///
+    /// Descends through `AND` and parentheses only — never `OR`, where the
+    /// IN-list is not a necessary condition — and rejects `NOT IN`, whose
+    /// complement no index probe can enumerate.
+    fn find_in_list_conjunct(&self, expr: &Expr) -> Option<(String, Vec<Value>)> {
+        match expr {
+            Expr::Nested(inner) => self.find_in_list_conjunct(inner),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => self
+                .find_in_list_conjunct(left)
+                .or_else(|| self.find_in_list_conjunct(right)),
+            Expr::InList {
+                expr: target,
+                list,
+                negated: false,
+            } => {
+                let col = match target.as_ref() {
+                    Expr::Identifier(i) => i.value.clone(),
+                    Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+                    _ => return None,
+                };
+                if list.is_empty() {
+                    return None;
+                }
+                let mut values = Vec::with_capacity(list.len());
+                for item in list {
+                    // Every element must be a constant. One non-constant and the
+                    // list is not an enumerable key set.
+                    values.push(self.eval_const_expr(item).ok()?);
+                }
+                Some((col, values))
+            }
+            // `col = a OR col = b` is the same key set spelled differently, and
+            // it is what hand-written SQL and some ORMs emit. The whole `OR`
+            // tree has to resolve to one column: if any branch tests something
+            // else, rows can satisfy the predicate without matching any probe.
+            Expr::BinaryOp {
+                op: ast::BinaryOperator::Or,
+                ..
+            } => {
+                let mut col = None;
+                let mut values = Vec::new();
+                if !self.collect_eq_disjunction(expr, &mut col, &mut values) {
+                    return None;
+                }
+                Some((col?, values))
+            }
+            _ => None,
+        }
+    }
+
+    /// Flatten an `OR` tree of `col = literal` tests over a single column.
+    /// Returns false the moment a branch is anything else.
+    fn collect_eq_disjunction(
+        &self,
+        expr: &Expr,
+        col: &mut Option<String>,
+        values: &mut Vec<Value>,
+    ) -> bool {
+        match expr {
+            Expr::Nested(inner) => self.collect_eq_disjunction(inner, col, values),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Or,
+                right,
+            } => {
+                self.collect_eq_disjunction(left, col, values)
+                    && self.collect_eq_disjunction(right, col, values)
+            }
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } => {
+                let Some((name, val)) = self.try_extract_col_eq_literal(left, right) else {
+                    return false;
+                };
+                match col {
+                    Some(seen) if !seen.eq_ignore_ascii_case(&name) => false,
+                    Some(_) => {
+                        values.push(val);
+                        true
+                    }
+                    None => {
+                        *col = Some(name);
+                        values.push(val);
+                        true
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Record that a planned index scan gave up, and say why.
     ///
     /// Every exit from the `IndexScan` node used to be an untagged
@@ -2311,6 +2483,26 @@ impl Executor {
                             .as_ref()
                             .and_then(|s| Self::parse_expr_string(s).ok())
                     });
+
+                    // ── IN-list index probe ──────────────────────────────────
+                    // `col IN (a, b, c)` is a disjunction of equalities, which
+                    // no single range covers, so it fell straight through to a
+                    // full scan even with an index on `col` — leaving the ORM
+                    // batch-fetch shape (`WHERE id IN (…)`, what every
+                    // `findMany`/`WHERE id = ANY($1)` compiles to) as the one
+                    // everyday query guaranteed never to use its index. Probe
+                    // the index once per distinct value instead: O(k log n).
+                    if let Some(ref expr) = resolved_expr
+                        && let Some((rows, examined)) =
+                            self.try_in_list_index_probe(table, expr, &meta).await
+                    {
+                        self.metrics.rows_scanned.inc_by(examined as u64);
+                        self.metrics
+                            .values_scanned
+                            .inc_by((examined * meta.len()) as u64);
+                        let rows = self.filter_scanned_rows(table, rows, expr, &meta, &meta);
+                        return Ok((meta, rows));
+                    }
 
                     // ── Fast equality scan path ──────────────────────────────
                     // When the filter is a simple `col = literal`, use the

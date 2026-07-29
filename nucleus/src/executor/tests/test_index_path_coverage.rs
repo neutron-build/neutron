@@ -441,3 +441,90 @@ async fn test_a_refused_plan_is_not_silently_re_executed() {
          as one is exactly the retry this guards against"
     );
 }
+
+/// A key-set predicate must use the index it has.
+///
+/// `col IN (a, b, c)` is a disjunction of equalities, which no single range
+/// covers, so it fell through to a full scan even with an index on the column —
+/// leaving the ORM batch-fetch shape (`findMany`, `WHERE id = ANY($1)`) as the
+/// one everyday query guaranteed never to use its index.
+#[tokio::test]
+async fn test_key_set_predicates_reach_the_index() {
+    let ex = indexed_table().await;
+
+    for (label, expected, sql) in [
+        ("single-element IN", 1, "SELECT id FROM a WHERE n IN (1000040)"),
+        (
+            "multi-element IN",
+            3,
+            "SELECT id FROM a WHERE n IN (1000040, 1000041, 1000042)",
+        ),
+        (
+            "text IN",
+            2,
+            "SELECT id FROM a WHERE s IN ('k00042', 'k00043')",
+        ),
+        (
+            "IN with duplicates",
+            2,
+            "SELECT id FROM a WHERE n IN (1000050, 1000050, 1000051)",
+        ),
+        (
+            "text-spelled elements against a BIGINT column",
+            2,
+            "SELECT id FROM a WHERE n IN ('1000060', '1000061')",
+        ),
+        (
+            "equality disjunction, the same key set spelled with OR",
+            2,
+            "SELECT id FROM a WHERE n = 1000070 OR n = 1000071",
+        ),
+        (
+            "IN as one conjunct of a larger predicate",
+            1,
+            "SELECT id FROM a WHERE n IN (1000080, 1000081) AND s = 'k00080'",
+        ),
+    ] {
+        assert_indexed(&ex, expected, label, sql).await;
+    }
+}
+
+/// The probe is only valid where the key set is a necessary condition. These
+/// shapes must keep their answers even though the index cannot serve them.
+///
+/// Under `OR` a row can satisfy the predicate without matching any probed key,
+/// so probing would silently drop it — the failure would be missing rows, not a
+/// slow query, which is why these are asserted on results rather than on cost.
+#[tokio::test]
+async fn test_key_set_probe_does_not_change_answers() {
+    let ex = indexed_table().await;
+
+    for (label, expected, sql) in [
+        (
+            // i=90, i=91 by n; i=95 by s.
+            "IN under OR with another column",
+            3,
+            "SELECT id FROM a WHERE n IN (1000090, 1000091) OR s = 'k00095'",
+        ),
+        (
+            "NOT IN",
+            ROWS as usize - 2,
+            "SELECT id FROM a WHERE n NOT IN (1000100, 1000101)",
+        ),
+        (
+            "disjunction over two different columns",
+            2,
+            "SELECT id FROM a WHERE n = 1000110 OR s = 'k00111'",
+        ),
+        (
+            "IN with no matching key",
+            0,
+            "SELECT id FROM a WHERE n IN (7, 8, 9)",
+        ),
+        ("empty-ish IN with one miss", 0, "SELECT id FROM a WHERE n IN (0)"),
+    ] {
+        ex.clear_all_query_caches();
+        let (_, matched) = scan_cost(&ex, sql).await;
+        assert_eq!(matched, expected, "{label}: wrong row count — {sql}");
+    }
+}
