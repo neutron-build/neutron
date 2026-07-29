@@ -793,3 +793,66 @@ async fn test_cross_model_rollback_all_models() {
     };
     assert_eq!(blob_count, 1, "blob: transient blob rolled back");
 }
+
+/// A transaction must not cost anything proportional to the specialty stores it
+/// does not touch.
+///
+/// Before M8 (`1c4c069`) `BEGIN` deep-cloned every process-global store so
+/// `ROLLBACK` had something to restore — every HNSW graph included — so a
+/// SQL-only transaction paid for the whole vector index just to open. Before
+/// images are captured lazily now, at the session's first write to each store.
+/// That is invisible to every answer, so only a cost assertion protects it.
+///
+/// Run against the MVCC engine on purpose. The non-MVCC path still snapshots
+/// and restores every table's rows at BEGIN/ROLLBACK (`txn.rs`), which is a
+/// separate O(database) cost and would drown this signal — see the note in
+/// `_internal/ENGINE_PERFORMANCE_PROGRAM.md` §7.
+#[tokio::test]
+async fn test_a_transaction_does_not_scale_with_untouched_stores() {
+    let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
+    let storage: std::sync::Arc<dyn crate::storage::StorageEngine> =
+        std::sync::Arc::new(crate::storage::MvccStorageAdapter::new());
+    let ex = Executor::new(catalog, storage);
+
+    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY, v VECTOR(16))").await;
+    exec(&ex, "CREATE TABLE plain (id INT PRIMARY KEY, n INT)").await;
+
+    let vec_lit = |i: i32| {
+        let dims: Vec<String> = (0..16)
+            .map(|d| format!("{}", (i + d) as f32 * 0.5))
+            .collect();
+        format!("VECTOR('[{}]')", dims.join(","))
+    };
+    for i in 0..64 {
+        exec(&ex, &format!("INSERT INTO t VALUES ({i}, {})", vec_lit(i))).await;
+    }
+    exec(&ex, "CREATE INDEX t_v ON t USING HNSW (v)").await;
+
+    async fn cycle(ex: &Executor, base: i32) -> f64 {
+        let start = std::time::Instant::now();
+        for n in 0..20 {
+            exec(ex, "BEGIN").await;
+            exec(ex, &format!("INSERT INTO plain VALUES ({}, {n})", base + n)).await;
+            exec(ex, "ROLLBACK").await;
+        }
+        start.elapsed().as_secs_f64()
+    }
+
+    let small = cycle(&ex, 0).await;
+    // Grow the untouched vector index tenfold.
+    for i in 64..640 {
+        exec(&ex, &format!("INSERT INTO t VALUES ({i}, {})", vec_lit(i))).await;
+    }
+    let large = cycle(&ex, 1_000).await;
+
+    // Generous: a 10x bigger index must not make the cycle 4x costlier. A deep
+    // clone per BEGIN would be roughly 10x; lazy capture is flat within noise.
+    assert!(
+        large < small * 4.0 + 0.010,
+        "BEGIN/ROLLBACK scaled with an UNTOUCHED vector index — {:.2}ms for 20 \
+         transactions with 64 vectors, {:.2}ms with 640. The cross-model \
+         before-image is being captured eagerly again.",
+        small * 1000.0,
+        large * 1000.0
+    );
+}
