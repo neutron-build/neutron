@@ -578,6 +578,32 @@ fn physical_batches_for_read<'a>(
     }
 }
 
+/// Reconstruct rows from part slices, reading only the projected columns of the
+/// rows each slice covers.
+fn slices_to_rows_projected(
+    slices: &[crate::columnar::PartSlice],
+    projection: &[usize],
+    limit: Option<usize>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for slice in slices {
+        for row_i in slice.start..slice.end {
+            if limit.is_some_and(|n| rows.len() >= n) {
+                return rows;
+            }
+            let row: Row = projection
+                .iter()
+                .map(|&col_i| match slice.batch.columns.get(col_i) {
+                    Some((_, col)) => coldata_get(col, row_i),
+                    None => Value::Null,
+                })
+                .collect();
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 /// Translate an executor filter predicate into zone-map bounds.
 ///
 /// Every bound returned must be one the statistics can *disprove*; a predicate
@@ -1054,8 +1080,8 @@ impl StorageEngine for ColumnarStorageEngine {
         let batches = read.refs();
             return Ok(batches_to_rows_projected(&batches, projection, limit));
         }
-        match store.batches_pruned(table, col, &bounds) {
-            Some(batches) => Ok(batches_to_rows_projected(&batches, projection, limit)),
+        match store.batches_pruned_slices(table, col, &bounds) {
+            Some(slices) => Ok(slices_to_rows_projected(&slices, projection, limit)),
             // Not a MergeTree: no declared order, so no range-coherent parts.
             None => {
                 let read = batches_for_read(&store, table);
@@ -2225,6 +2251,172 @@ mod merge_tree_pruning_tests {
         assert!(
             kept.is_empty(),
             "no part can match, so the scan should be handed no batches at all"
+        );
+    }
+}
+
+#[cfg(test)]
+mod intra_part_narrowing_tests {
+    use super::*;
+    use crate::columnar::{CmpOp, MergeStrategy, ScalarValue};
+    use crate::storage::granule_stats::FilterPredicate;
+    use crate::types::DataType;
+
+    /// One MergeTree part holding a wide, sorted key range, so a window landing
+    /// inside it has somewhere to be narrowed to.
+    async fn one_wide_part() -> ColumnarStorageEngine {
+        let eng = ColumnarStorageEngine::new();
+        eng.create_table("spans").await.unwrap();
+        eng.register_merge_tree("spans", vec!["1".into()], MergeStrategy::Default);
+        eng.store_table_schema(
+            "spans",
+            &[("id".into(), DataType::Int64), ("ts".into(), DataType::Int64)],
+        );
+        let rows: Vec<Row> = (0..5_000i64)
+            .map(|i| vec![Value::Int64(i), Value::Int64(i * 10)])
+            .collect();
+        eng.insert_batch("spans", rows).await.unwrap();
+        eng.scan("spans").await.unwrap(); // force the part to be cut
+        eng
+    }
+
+    /// A window inside a part reads only the rows it covers — not the part.
+    ///
+    /// Zone maps answer "can this part match?", never "where in it". A part of
+    /// 5,000 rows and a window over 11 of them were the same amount of work
+    /// until the sorted key column was searched directly.
+    #[tokio::test]
+    async fn test_a_window_inside_a_part_reads_only_that_window() {
+        let eng = one_wide_part().await;
+        let pred = FilterPredicate::Between {
+            min: Value::Int64(20_000),
+            max: Value::Int64(20_100),
+        };
+        let rows = eng
+            .scan_projected_pruned("spans", &[0, 1], None, Some(("1", &pred)))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            11,
+            "ts 20000..=20100 step 10 is 11 rows; reading {} means the whole \
+             part was materialized and filtered above",
+            rows.len()
+        );
+        for r in &rows {
+            let Value::Int64(ts) = r[1] else {
+                panic!("expected ts")
+            };
+            assert!((20_000..=20_100).contains(&ts), "row outside the window: {ts}");
+        }
+    }
+
+    /// Narrowing must never drop a row the window covers, at either edge or
+    /// past either end of the part.
+    #[tokio::test]
+    async fn test_narrowing_keeps_every_covered_row() {
+        let eng = one_wide_part().await;
+        let full = eng.scan_projected("spans", &[0, 1], None).await.unwrap();
+        assert_eq!(full.len(), 5_000);
+
+        for (label, lo, hi) in [
+            ("first row", 0, 0),
+            ("straddling the start", -500, 30),
+            ("straddling the end", 49_980, 60_000),
+            ("last row", 49_990, 49_990),
+            ("whole part", -1, 50_000),
+            ("empty, between two keys", 15, 19),
+        ] {
+            let pred = FilterPredicate::Between {
+                min: Value::Int64(lo),
+                max: Value::Int64(hi),
+            };
+            let got = eng
+                .scan_projected_pruned("spans", &[0, 1], None, Some(("1", &pred)))
+                .await
+                .unwrap();
+            let expected: Vec<&Row> = full
+                .iter()
+                .filter(|r| matches!(r[1], Value::Int64(ts) if (lo..=hi).contains(&ts)))
+                .collect();
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "{label}: window [{lo}, {hi}] covers {} rows, narrowing returned {}",
+                expected.len(),
+                got.len()
+            );
+            for r in expected {
+                assert!(got.contains(r), "{label}: narrowing dropped {r:?}");
+            }
+        }
+    }
+
+    /// A bound the column cannot be compared against, or a predicate on some
+    /// other column, must fall back to the whole part rather than guess.
+    #[tokio::test]
+    async fn test_unnarrowable_predicates_read_the_part() {
+        let eng = one_wide_part().await;
+        for (label, col, pred) in [
+            (
+                "text bound against an integer key",
+                "1",
+                FilterPredicate::Between {
+                    min: Value::Text("20000".into()),
+                    max: Value::Text("20100".into()),
+                },
+            ),
+            (
+                "predicate on a column the part is not sorted by",
+                "0",
+                FilterPredicate::Between {
+                    min: Value::Int64(0),
+                    max: Value::Int64(4_999),
+                },
+            ),
+        ] {
+            let rows = eng
+                .scan_projected_pruned("spans", &[0, 1], None, Some((col, &pred)))
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                5_000,
+                "{label}: nothing is provable here, so the whole part must be read"
+            );
+        }
+    }
+
+    /// The search is over the sorted column itself, so the cost of a narrow
+    /// window does not grow with the size of the part it lands in.
+    #[tokio::test]
+    async fn test_narrowing_is_sublinear_in_part_size() {
+        let eng = ColumnarStorageEngine::new();
+        eng.create_table("t").await.unwrap();
+        eng.register_merge_tree("t", vec!["1".into()], MergeStrategy::Default);
+        eng.store_table_schema(
+            "t",
+            &[("id".into(), DataType::Int64), ("k".into(), DataType::Int64)],
+        );
+        let rows: Vec<Row> = (0..50_000i64)
+            .map(|i| vec![Value::Int64(i), Value::Int64(i)])
+            .collect();
+        eng.insert_batch("t", rows).await.unwrap();
+        eng.scan("t").await.unwrap();
+
+        let bounds = [
+            (CmpOp::Gte, ScalarValue::Int64(25_000)),
+            (CmpOp::Lte, ScalarValue::Int64(25_004)),
+        ];
+        let slices = eng
+            .store
+            .read()
+            .batches_pruned_slices("t", "1", &bounds)
+            .expect("registered as a MergeTree");
+        let scanned: usize = slices.iter().map(|s| s.len()).sum();
+        assert_eq!(
+            scanned, 5,
+            "a 5-row window in a 50,000-row part should hand the scan 5 rows, not {scanned}"
         );
     }
 }
