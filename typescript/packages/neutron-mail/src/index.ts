@@ -10,6 +10,7 @@ export type {
   MailClient,
   MailClientOptions,
   OperationKind,
+  SendRequest,
   SyncReport,
 } from "./client.js";
 

@@ -26,6 +26,11 @@ type Service struct {
 	// fetches need one; pure reads against the mirror do not, which is why
 	// an account with no adapter still serves search and thread requests.
 	Adapters func(AccountID) (Adapter, bool)
+
+	// Senders resolves an account to its outbound SMTP sender. Sending is
+	// SMTP submission on every provider that supports it, so it is resolved
+	// separately from the read adapter rather than folded into it.
+	Senders func(AccountID) (*Sender, Address, bool)
 }
 
 // NewService builds the HTTP surface over a store and engine.
@@ -46,8 +51,76 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/accounts/{account}/messages/{message}/body", s.body)
 	mux.HandleFunc("POST /v1/accounts/{account}/sync", s.sync)
 	mux.HandleFunc("POST /v1/accounts/{account}/operations", s.operation)
+	mux.HandleFunc("POST /v1/accounts/{account}/send", s.send)
 
 	return mux
+}
+
+// send submits a new message or a reply.
+//
+// A reply carries reply_to_message_id, and the threading chain is built from
+// the stored parent rather than trusted from the caller: In-Reply-To and
+// References have to reference the real parent or the reply silently starts a
+// new conversation in the recipient's client.
+func (s *Service) send(w http.ResponseWriter, r *http.Request) {
+	acct := AccountID(r.PathValue("account"))
+
+	var req struct {
+		To               []Address `json:"to"`
+		Cc               []Address `json:"cc,omitempty"`
+		Bcc              []Address `json:"bcc,omitempty"`
+		Subject          string    `json:"subject"`
+		Text             string    `json:"text,omitempty"`
+		HTML             string    `json:"html,omitempty"`
+		ReplyToMessageID MessageID `json:"reply_to_message_id,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeProblem(w, http.StatusBadRequest, "Malformed Request", err.Error())
+		return
+	}
+
+	sender, from, ok := s.sender(acct)
+	if !ok {
+		writeProblem(w, http.StatusServiceUnavailable, "No Sender",
+			fmt.Sprintf("account %s has no configured outbound sender", acct))
+		return
+	}
+
+	var msg *Outgoing
+	if req.ReplyToMessageID != "" {
+		parent, err := s.store.Envelope(r.Context(), acct, req.ReplyToMessageID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		msg = ReplyTo(parent, from, req.Text)
+		if req.Subject != "" {
+			msg.Subject = req.Subject
+		}
+		if len(req.To) > 0 {
+			msg.To = req.To
+		}
+		msg.HTML = req.HTML
+	} else {
+		msg = &Outgoing{
+			From: from, To: req.To, Cc: req.Cc, Bcc: req.Bcc,
+			Subject: req.Subject, Text: req.Text, HTML: req.HTML,
+		}
+	}
+
+	messageID, err := sender.Send(r.Context(), msg)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"message_id": messageID})
+}
+
+func (s *Service) sender(acct AccountID) (*Sender, Address, bool) {
+	if s.Senders == nil {
+		return nil, Address{}, false
+	}
+	return s.Senders(acct)
 }
 
 // ---------------------------------------------------------------------------

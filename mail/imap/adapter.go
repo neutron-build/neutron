@@ -594,7 +594,16 @@ func (a *Adapter) uidOf(ctx context.Context, env mail.Envelope) (uint32, bool) {
 }
 
 // Apply pushes a mutation.
+//
+// The mailbox is re-selected read-write first. Syncing selects with EXAMINE
+// so that reading never sets \Seen as a side effect, and a server refuses
+// STORE, COPY, and EXPUNGE against a read-only selection — without this every
+// mutation fails with "mailbox selected read only".
 func (a *Adapter) Apply(ctx context.Context, op mail.Operation) error {
+	if err := a.selectWritable(ctx); err != nil {
+		return err
+	}
+
 	uids := make([]string, 0, len(op.IDs))
 	for _, id := range op.IDs {
 		uid, err := a.uidFor(ctx, id)
@@ -638,6 +647,19 @@ func (a *Adapter) Apply(ctx context.Context, op mail.Operation) error {
 	default:
 		return fmt.Errorf("imap: unsupported operation %d", op.Kind)
 	}
+}
+
+// selectWritable re-opens the current mailbox read-write if it was opened
+// read-only, leaving it selected for the caller's commands.
+func (a *Adapter) selectWritable(ctx context.Context) error {
+	if a.conn.selected == "" {
+		return fmt.Errorf("imap: no mailbox selected")
+	}
+	if !a.conn.selectedReadOnly {
+		return nil
+	}
+	_, _, err := a.conn.Select(ctx, a.conn.selected, false)
+	return err
 }
 
 func imapFlag(keyword string) string {

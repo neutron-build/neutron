@@ -30,6 +30,8 @@ Gmail / Graph / IMAP / JMAP     mail lives here
 | `sync.go` | Sync engine: pagination, reset recovery, deletion sweep |
 | `store.go` | `PgStore` — the mirror, over pgwire |
 | `schema.go` | DDL; runs on Nucleus or stock PostgreSQL |
+| `scheduler.go` | Periodic sync, per-account backoff |
+| `send.go` | SMTP submission, reply threading |
 | `service.go` | HTTP surface, RFC 7807 errors |
 | `imap/` | Hand-rolled IMAP client, CONDSTORE + QRESYNC |
 | `jmap/` | JMAP (RFC 8620/8621) |
@@ -79,18 +81,43 @@ messages and advancing the cursor, an identity upgrade.
 cannot tell you whether the SQL is right:
 
 ```bash
-NEUTRON_MAIL_TEST_DATABASE_URL=postgres://user:pass@localhost:5432/mailtest go test ./...
+nucleus start --port 55432 --memory &
+NEUTRON_MAIL_TEST_DATABASE_URL='postgres://postgres@127.0.0.1:55432/postgres?sslmode=disable' \
+  go test ./...
 ```
 
 Those tests drop and recreate their tables. Never point them at a database
 you care about.
 
+The **differential oracle** in `imap/live_test.go` is the one test that proves
+an adapter reads a real server correctly. It syncs, changes the mailbox from
+outside over SMTP, resyncs, and compares:
+
+```bash
+docker run -d -p 13143:3143 -p 13025:3025 \
+  -e GREENMAIL_OPTS='-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled' \
+  greenmail/standalone:latest
+
+NEUTRON_MAIL_TEST_IMAP=127.0.0.1:13143 NEUTRON_MAIL_TEST_SMTP=127.0.0.1:13025 \
+  go test ./imap/...
+```
+
+It has already earned its place: it caught `Apply` failing against every
+server, because syncing selects a mailbox with EXAMINE (read-only, so reading
+never sets `\Seen`) and `STORE` is refused on a read-only selection. No unit
+test would have found that.
+
 ## Status
 
-IMAP and JMAP are testable end to end against a local Stalwart, which speaks
-both. **Gmail and Graph are written against the documented APIs and covered by
-unit tests over their normalization logic, but have not been run against live
-servers** — that needs real accounts and registered OAuth apps.
+130 Go tests and 16 TypeScript tests, all passing, including the live oracle
+against GreenMail and the store suite against a real Nucleus.
+
+**Gmail and Graph have never been run against live servers.** They are written
+against the documented APIs and unit-tested over their normalization logic,
+but verifying them needs real accounts and registered OAuth apps. JMAP is
+unit-tested against a stub server rather than a live one, for the same reason.
+
+Adapters are not wired in `main.go`; see Running above.
 
 Search currently uses `LIKE`. The table-attached full-text index
 (`CREATE INDEX ... USING FTS`, `@@`, `BM25`) is the intended implementation

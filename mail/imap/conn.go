@@ -25,10 +25,16 @@ type Conn struct {
 	tag  int
 	caps map[string]bool
 
-	// selected tracks the currently selected mailbox, so SELECT is skipped
-	// when the mailbox has not changed. On large mailboxes SELECT is not
-	// cheap — the server re-reports the full flag and count state.
+	// selected tracks the currently selected mailbox.
 	selected string
+
+	// selectedReadOnly records whether the current selection came from
+	// EXAMINE rather than SELECT.
+	//
+	// Syncing uses EXAMINE so that reading never sets \Seen, but a server
+	// refuses STORE and EXPUNGE against a read-only selection. Mutations
+	// therefore have to re-SELECT first, and this is how they know to.
+	selectedReadOnly bool
 
 	uidValidity uint32
 	highestMod  uint64
@@ -53,10 +59,26 @@ type Config struct {
 	// TLSConfig overrides the default. Leave nil outside tests.
 	TLSConfig *tls.Config
 
+	// Plaintext disables TLS entirely.
+	//
+	// This exists for local test servers. It puts the password on the wire
+	// in the clear, so Dial refuses it for any non-loopback host — a
+	// plaintext session leaving the machine is never what a caller meant.
+	Plaintext bool
+
 	Timeout time.Duration
 }
 
-// Dial opens a TLS connection and authenticates.
+// isLoopback reports whether host names only this machine.
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// Dial opens a connection and authenticates.
 func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 993
@@ -65,14 +87,23 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		cfg.Timeout = 30 * time.Second
 	}
 
-	tlsCfg := cfg.TLSConfig
-	if tlsCfg == nil {
-		tlsCfg = &tls.Config{ServerName: cfg.Host, MinVersion: tls.VersionTLS12}
-	}
-
 	dialer := &net.Dialer{Timeout: cfg.Timeout}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	raw, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+
+	var raw net.Conn
+	var err error
+	if cfg.Plaintext {
+		if !isLoopback(cfg.Host) {
+			return nil, fmt.Errorf("imap: refusing a plaintext connection to non-loopback host %q", cfg.Host)
+		}
+		raw, err = dialer.DialContext(ctx, "tcp", addr)
+	} else {
+		tlsCfg := cfg.TLSConfig
+		if tlsCfg == nil {
+			tlsCfg = &tls.Config{ServerName: cfg.Host, MinVersion: tls.VersionTLS12}
+		}
+		raw, err = tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("imap: dial %s: %w", addr, err)
 	}
@@ -265,6 +296,7 @@ func (c *Conn) Select(ctx context.Context, mailbox string, readOnly bool) (uidVa
 	}
 
 	c.selected = mailbox
+	c.selectedReadOnly = readOnly
 	c.uidValidity, c.highestMod = 0, 0
 	for _, line := range resp {
 		if len(line) < 3 || !line[1].atomEq("OK") {
