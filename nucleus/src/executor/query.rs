@@ -593,9 +593,9 @@ impl Executor {
             }
         }
 
+        let storage = self.storage_for(table);
         // A long list stops being cheaper than one pass over the table. Same
         // shape as the equality crossover: a third of the table.
-        let storage = self.storage_for(table);
         if let Some(total) = storage.fast_count_all(table)
             && total > 0
             && probes.len() * 3 >= total
@@ -822,27 +822,36 @@ impl Executor {
             .unwrap_or(0)
     }
 
-    /// Apply a sequential scan's WHERE predicate to the rows it produced.
+    /// Apply a scan's WHERE predicate to the rows it produced.
     ///
     /// `row_meta` describes the rows as they actually are — narrowed when the
     /// scan was projected — and drives every row-level evaluation, which is
-    /// sound because those all resolve identifiers by name. `schema_meta` is
-    /// the table's full column list and is used only for zone-map pruning:
-    /// granule statistics are keyed by *schema* column id, so resolving the
-    /// predicate against a narrowed meta would prune on another column's
-    /// min/max and silently drop matching rows.
+    /// sound because those all resolve identifiers by name.
+    ///
+    /// `zone_map_meta` is `Some(full schema)` only when `rows` is a complete
+    /// scan of the table in scan order, and `None` otherwise. Both parts of
+    /// that matter. Granule statistics are keyed by *schema* column id, so a
+    /// narrowed meta would prune on another column's min/max; and granules are
+    /// positional, so pruning a SUBSET of the table charges granule `i`'s
+    /// statistics against whatever rows happen to sit at that offset. Handing
+    /// index-probe results to the zone map dropped a row that matched, and the
+    /// `zm_row_total != rows.len()` net did not catch it — equal counts are not
+    /// evidence that these are the same rows.
     fn filter_scanned_rows(
         &self,
         table: &str,
         mut rows: Vec<Row>,
         expr: &Expr,
         row_meta: &[ColMeta],
-        schema_meta: &[ColMeta],
+        zone_map_meta: Option<&[ColMeta]>,
     ) -> Vec<Row> {
         // ── Zone map pruning ────────────────────────────────────────────────
         // Before evaluating the WHERE clause row-by-row, try to skip entire
         // granules whose min/max stats prove no row can match the predicate.
-        if let Some((col_id, ref predicate)) = Self::extract_zone_map_predicate(expr, schema_meta) {
+        if let Some(schema_meta) = zone_map_meta
+            && let Some((col_id, ref predicate)) =
+                Self::extract_zone_map_predicate(expr, schema_meta)
+        {
             rows = self.apply_zone_map_pruning(rows, table, col_id, predicate);
         }
 
@@ -2500,7 +2509,8 @@ impl Executor {
                         self.metrics
                             .values_scanned
                             .inc_by((examined * meta.len()) as u64);
-                        let rows = self.filter_scanned_rows(table, rows, expr, &meta, &meta);
+                        // No zone maps: these rows are index hits, not a scan.
+                        let rows = self.filter_scanned_rows(table, rows, expr, &meta, None);
                         return Ok((meta, rows));
                     }
 
@@ -2562,7 +2572,17 @@ impl Executor {
                         // query-memory budget (see the full-scan gate below).
                         drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
                         if let Some(expr) = resolved_expr {
-                            rows = self.filter_scanned_rows(table, rows, &expr, &proj_meta, &meta);
+                            rows = self.filter_scanned_rows(
+                                table,
+                                rows,
+                                &expr,
+                                &proj_meta,
+                                // A projected scan still reads every row in
+                                // scan order, so granules still line up — but a
+                                // LIMIT truncates it, and a partial scan must
+                                // not be pruned positionally.
+                                scan_limit.is_none().then_some(meta.as_slice()),
+                            );
                         }
                         return Ok((proj_meta, rows));
                     }
@@ -2587,7 +2607,13 @@ impl Executor {
                     drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
 
                     if let Some(expr) = resolved_expr {
-                        rows = self.filter_scanned_rows(table, rows, &expr, &meta, &meta);
+                        rows = self.filter_scanned_rows(
+                            table,
+                            rows,
+                            &expr,
+                            &meta,
+                            scan_limit.is_none().then_some(meta.as_slice()),
+                        );
                     }
                     Ok((meta, rows))
                 }

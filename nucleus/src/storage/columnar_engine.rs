@@ -872,10 +872,11 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
-        // batches_all_for_select applies replacing_mergetree dedup for tables
-        // registered via crate::columnar::register_replacing_table; plain
-        // tables pass through unchanged.
-        let batches = store.batches_all_for_select(table);
+        // `batches_for_read` applies replacing_mergetree dedup for tables
+        // registered via crate::columnar::register_replacing_table and
+        // materializes MergeTree parts; a plain table is borrowed rather than
+        // cloned.
+        let batches = batches_for_read(&store, table);
         Ok(batches_to_rows(&batches))
     }
 
@@ -893,7 +894,13 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
-        let batches = store.batches_all_for_select(table);
+        // `batches_for_read` borrows the stored columns; `batches_all_for_select`
+        // CLONES every column of every row first, so a column store paid for a
+        // full copy of the table before the projection narrowed it to one
+        // column. That copy was the entire cost of a columnar query — the
+        // borrowing accessor already existed and only the aggregate fast paths
+        // were using it.
+        let batches = batches_for_read(&store, table);
         Ok(batches_to_rows_projected(&batches, projection, limit))
     }
 
@@ -906,7 +913,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
-        let batches = store.batches_all_for_select(table);
+        let batches = batches_for_read(&store, table);
         Ok(batches_to_rows_limit(&batches, limit))
     }
 
