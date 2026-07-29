@@ -2609,12 +2609,21 @@ impl Executor {
                         });
                         let mut rows = match &prune {
                             Some((col_id, pred)) if *col_id < meta.len() => {
+                                // Columnar batches name their columns by
+                                // POSITION ("0", "1", …), which is also what the
+                                // on-disk format and `merge_sorted_batches` use
+                                // to align parts. The zone map is keyed the same
+                                // way, so the hint has to speak that name — a
+                                // hint of `ts` matched no statistics and pruned
+                                // nothing. Engines that ignore the hint are
+                                // unaffected.
+                                let positional = col_id.to_string();
                                 storage
                                     .scan_projected_pruned(
                                         table,
                                         proj_indices,
                                         *scan_limit,
-                                        Some((meta[*col_id].name.as_str(), pred)),
+                                        Some((positional.as_str(), pred)),
                                     )
                                     .await?
                             }

@@ -876,7 +876,10 @@ pub async fn bench_fts_sql(docs: usize, queries: usize, seed: u64) -> FtsSqlBenc
     // data is identical, so it is generated once from the seed. `rare<n>` binds
     // to a small, deterministic set of documents.
     let mut rng = Rng::new(seed);
-    let rare_terms = (docs / 200).max(8);
+    // ~1% of the corpus per rare term. Real search is far more selective than
+    // that, and a term landing on the index's 10%-of-table crossover would make
+    // the index correctly decline — measuring the scan twice.
+    let rare_terms = (docs / 20).max(50);
     let corpus: Vec<String> = (0..docs)
         .map(|i| {
             let common = random_doc(&mut rng, 12);

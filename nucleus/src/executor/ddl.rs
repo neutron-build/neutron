@@ -887,25 +887,38 @@ impl Executor {
                         }
                         _ => MergeStrategy::Default,
                     };
-                    // The sort key is NOT registered on the per-table engine
-                    // that serves this table's reads, so the table is stored as
-                    // plain columnar and `ORDER BY` prunes nothing. That is
-                    // deliberate and measured, not an oversight: routing the
-                    // table into the real MergeTree makes it slower on both
-                    // axes than leaving it out. At 200k span-shaped rows —
-                    // load / narrow-window COUNT(*):
+                    // Register the sort key on the PER-TABLE engine — the one
+                    // that serves this table's reads. Registering only on the
+                    // executor's `columnar_store` left it in a store nothing
+                    // scans, which is why a declared ORDER BY pruned nothing.
                     //
-                    //   as columnar (today)   0.70 s /  4.6 ms
-                    //   as a real MergeTree   1.42 s / 27.4 ms
-                    //
-                    // Say so rather than accept the declaration in silence, the
-                    // same way `IF NOT EXISTS` now reports a discarded engine.
-                    tracing::warn!(
-                        "table '{table_name}': ORDER BY ({}) is recorded but not yet used for \
-                         read pruning; the table is stored as columnar. See \
-                         ColumnarStorageEngine::register_merge_tree.",
-                        order_by_cols.join(", ")
-                    );
+                    // The key is translated from column NAMES to the positional
+                    // names the columnar batches actually carry. `rows_to_batch`
+                    // names columns "0", "1", … by their position in the row,
+                    // and `ZoneMap`, `sort_by_pk` and `merge_sorted_batches` all
+                    // look columns up by name — so a key of `ts` matched nothing
+                    // and the sort silently did not happen. Translating here
+                    // keeps the batch naming (which is also the on-disk format,
+                    // and which `merge_sorted_batches` uses to align batches
+                    // across parts) untouched.
+                    let positional_key: Vec<String> = order_by_cols
+                        .iter()
+                        .filter_map(|name| table_def.column_index(name).map(|i| i.to_string()))
+                        .collect();
+                    #[cfg(feature = "server")]
+                    if positional_key.len() == order_by_cols.len()
+                        && let Some(eng) = self.table_engines.read().get(&table_name)
+                        && let Some(col) = eng.as_columnar()
+                    {
+                        col.register_merge_tree(&table_name, positional_key.clone(), strategy.clone());
+                    }
+                    if positional_key.len() != order_by_cols.len() {
+                        tracing::warn!(
+                            "table '{table_name}': ORDER BY ({}) names a column the table does \
+                             not have; the sort key is not in effect",
+                            order_by_cols.join(", ")
+                        );
+                    }
                     self.columnar_store
                         .write()
                         .create_merge_tree_table_with_strategy(
