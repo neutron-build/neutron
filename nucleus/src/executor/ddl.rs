@@ -587,6 +587,7 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         let table_name = crate::sql::object_name_key(&create.name);
         let mut columns = sql::extract_columns(&create.columns)?;
+        Self::apply_analyzer_options(&create.table_options, &mut columns)?;
         let mut constraints = sql::extract_constraints(&create.columns, &create.constraints);
         let primary_key_declarations = create
             .columns
@@ -1016,6 +1017,102 @@ impl Executor {
         false
     }
 
+    /// Apply `WITH (analyzer = '…')` / `WITH (analyzer_<column> = '…')` from
+    /// CREATE TABLE onto the column definitions.
+    ///
+    /// The analyzer is fixed at CREATE TABLE and there is no statement to change
+    /// it afterwards. That is deliberate: changing how a column is tokenized
+    /// invalidates every FTS index and every stored posting over it, so it is a
+    /// migration — re-create the table and re-load — not an ALTER. Fixing it at
+    /// creation is also what makes `@@` stable: the operator means one thing for
+    /// the life of the column, whether or not an index exists.
+    ///
+    /// The bare key sets every TEXT column; `analyzer_<column>` sets one and
+    /// wins over the bare key.
+    fn apply_analyzer_options(
+        table_options: &ast::CreateTableOptions,
+        columns: &mut [crate::catalog::ColumnDef],
+    ) -> Result<(), ExecError> {
+        let parse = |raw: &str| -> Result<crate::fts::Analyzer, ExecError> {
+            crate::fts::Analyzer::parse(raw).ok_or_else(|| {
+                ExecError::Unsupported(format!(
+                    "unknown analyzer '{raw}'; expected 'english' or 'simple'"
+                ))
+            })
+        };
+
+        if let Some(raw) = Self::extract_table_option(table_options, "analyzer") {
+            let analyzer = parse(&raw)?;
+            for col in columns
+                .iter_mut()
+                .filter(|c| matches!(c.data_type, DataType::Text))
+            {
+                col.analyzer = Some(analyzer.as_str().to_string());
+            }
+        }
+
+        // Per-column overrides. An option naming a column that does not exist,
+        // or one that is not TEXT, is an error — silently ignoring it would
+        // leave the caller believing a tokenizer is in effect that is not.
+        for (key, raw) in Self::all_table_options(table_options) {
+            let Some(col_name) = key.strip_prefix("analyzer_") else {
+                continue;
+            };
+            let analyzer = parse(&raw)?;
+            let Some(col) = columns
+                .iter_mut()
+                .find(|c| c.name.eq_ignore_ascii_case(col_name))
+            else {
+                return Err(ExecError::ColumnNotFound(col_name.to_string()));
+            };
+            if !matches!(col.data_type, DataType::Text) {
+                return Err(ExecError::Unsupported(format!(
+                    "analyzer_{col_name} names a {} column; analyzers apply to TEXT",
+                    col.data_type
+                )));
+            }
+            col.analyzer = Some(analyzer.as_str().to_string());
+        }
+        Ok(())
+    }
+
+    /// The analyzer declared on a column, or the engine default.
+    pub(super) async fn column_analyzer(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> crate::fts::Analyzer {
+        let Some(def) = self.catalog.get_table(table).await else {
+            return crate::fts::Analyzer::default();
+        };
+        def.columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(column))
+            .and_then(|c| c.analyzer.as_deref())
+            .and_then(crate::fts::Analyzer::parse)
+            .unwrap_or_default()
+    }
+
+    /// Extract `WITH (key = 'value')` from CREATE INDEX options.
+    fn extract_index_with_option(with: &[ast::Expr], key: &str) -> Option<String> {
+        for expr in with {
+            if let ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } = expr
+                && let ast::Expr::Identifier(ident) = left.as_ref()
+                && ident.value.eq_ignore_ascii_case(key)
+            {
+                return Some(match right.as_ref() {
+                    ast::Expr::Value(v) => v.to_string().trim_matches('\'').to_string(),
+                    other => other.to_string().trim_matches('\'').to_string(),
+                });
+            }
+        }
+        None
+    }
+
     /// Extract `WITH (engine = 'columnar')` from CREATE TABLE options.
     /// Returns the engine name (lowercase) if specified.
     /// Normalize an engine name to nucleus's snake_case keys. Accepts both the
@@ -1030,6 +1127,35 @@ impl Executor {
             "summingmergetree" => "summing_mergetree".to_string(),
             _ => lower,
         }
+    }
+
+    /// Every `key = 'value'` in a CREATE TABLE option list, keys lowercased.
+    fn all_table_options(opts: &ast::CreateTableOptions) -> Vec<(String, String)> {
+        let sql_opts = match opts {
+            ast::CreateTableOptions::With(v)
+            | ast::CreateTableOptions::Options(v)
+            | ast::CreateTableOptions::Plain(v)
+            | ast::CreateTableOptions::TableProperties(v) => v,
+            ast::CreateTableOptions::None => return Vec::new(),
+        };
+        sql_opts
+            .iter()
+            .filter_map(|opt| match opt {
+                ast::SqlOption::KeyValue { key, value } => Some((
+                    key.value.to_ascii_lowercase(),
+                    value.to_string().trim_matches('\'').to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One `key = 'value'` from a CREATE TABLE option list.
+    fn extract_table_option(opts: &ast::CreateTableOptions, key: &str) -> Option<String> {
+        Self::all_table_options(opts)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     fn extract_engine_option(opts: &ast::CreateTableOptions) -> Option<String> {
@@ -1444,6 +1570,37 @@ impl Executor {
 
         // Parse index options (for vector indexes: distance metric, dims, etc.)
         let mut options = std::collections::HashMap::new();
+
+        // `WITH (analyzer = '…')` on CREATE INDEX is accepted only when it
+        // AGREES with the column's own declaration. The analyzer belongs to the
+        // column — `@@` is row-local so that an index cannot change an answer —
+        // so an index is not allowed to introduce or override one. Set it with
+        // `ALTER TABLE … ALTER COLUMN … SET ANALYZER` instead.
+        if let Some(requested) = Self::extract_index_with_option(&create_index.with, "analyzer") {
+            if !matches!(index_type, crate::catalog::IndexType::Fts) {
+                return Err(ExecError::Unsupported(
+                    "analyzer = '…' applies only to FTS indexes".into(),
+                ));
+            }
+            let Some(requested_analyzer) = crate::fts::Analyzer::parse(&requested) else {
+                return Err(ExecError::Unsupported(format!(
+                    "unknown analyzer '{requested}'; expected 'english' or 'simple'"
+                )));
+            };
+            let declared = self.column_analyzer(&table_name, &columns[0]).await;
+            if requested_analyzer != declared {
+                return Err(ExecError::Unsupported(format!(
+                    "index declares analyzer '{}' but column '{}' uses '{}'; \
+                     an index cannot change what `@@` means — set it with \
+                     ALTER TABLE {table_name} ALTER COLUMN {} SET ANALYZER '{}'",
+                    requested_analyzer.as_str(),
+                    columns[0],
+                    declared.as_str(),
+                    columns[0],
+                    requested_analyzer.as_str(),
+                )));
+            }
+        }
         let mut vec_col_idx: Option<usize> = None;
         let mut vec_dims: usize = 0;
 
@@ -1534,6 +1691,11 @@ impl Executor {
                 }
             }
         }
+
+        let fts_analyzer = match columns.first() {
+            Some(col) => self.column_analyzer(&table_name, col).await,
+            None => crate::fts::Analyzer::default(),
+        };
 
         // Register the index in the catalog
         let index_def = crate::catalog::IndexDef {
@@ -1742,7 +1904,7 @@ impl Executor {
                 && let Some(pk_name) = self.resolve_pk_column(&table_name, &table_def)
                 && let Some(pk_idx) = table_def.column_index(&pk_name)
             {
-                let mut index = crate::fts::InvertedIndex::new();
+                let mut index = crate::fts::InvertedIndex::with_analyzer(fts_analyzer);
                 let engine = self.storage_for(&table_name);
                 let existing_rows = engine.scan(&table_name).await.unwrap_or_default();
                 for row in &existing_rows {
@@ -2017,6 +2179,7 @@ impl Executor {
                         // silently resolve to this new one — which is the
                         // rename-then-re-add attack with extra steps.
                         id: table_def.next_column_id(),
+                    analyzer: None,
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col);

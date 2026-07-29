@@ -724,6 +724,43 @@ impl Executor {
         }
     }
 
+    /// The unqualified column name an expression refers to, if it is a plain
+    /// column reference.
+    pub(super) fn column_ref_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(i) => Some(i.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+            Expr::Nested(inner) => Self::column_ref_name(inner),
+            _ => None,
+        }
+    }
+
+    /// The analyzer declared on this column, or the engine default.
+    ///
+    /// Read from the COLUMN, never from an index over it. `@@` is defined
+    /// row-locally precisely so that adding an index cannot change an answer;
+    /// resolving the analyzer from an index would make `CREATE INDEX` redefine
+    /// the operator for that column and `DROP INDEX` redefine it back.
+    pub(super) fn fts_analyzer_for(&self, meta: &[ColMeta], column: &str) -> crate::fts::Analyzer {
+        let Some(table) = meta
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(column))
+            .and_then(|c| c.table.clone())
+        else {
+            return crate::fts::Analyzer::default();
+        };
+        self.catalog
+            .get_table_cached(&table)
+            .and_then(|def| {
+                def.columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(column))
+                    .and_then(|c| c.analyzer.clone())
+            })
+            .and_then(|a| crate::fts::Analyzer::parse(&a))
+            .unwrap_or_default()
+    }
+
     /// Record that a planned index scan gave up, and say why.
     ///
     /// Every exit from the `IndexScan` node used to be an untagged
@@ -4155,6 +4192,34 @@ impl Executor {
             // a projection and another in a WHERE clause; the shared call is the
             // point, not a shortcut.
             Expr::TypedString(_) => self.eval_row_expr(expr, row, meta),
+            // `@@` is handled here, before the operands collapse to two bare
+            // `Value`s, because the answer depends on WHICH COLUMN is on the
+            // left. An FTS index may be built with a non-default analyzer, and
+            // the index only ever proposes candidates — this recheck is the
+            // authority. If the two tokenize differently the index stops
+            // proposing rows that match, and that is a wrong answer rather than
+            // a slow one.
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::AtAt,
+                right,
+            } => {
+                let text = self.eval_expr_plan(left, row, meta)?;
+                let query = self.eval_expr_plan(right, row, meta)?;
+                let (Value::Text(text), Value::Text(query)) = (text, query) else {
+                    // Same refusal the generic operator path gives: `@@` on a
+                    // non-text operand is a mistake, not a false.
+                    return Err(ExecError::Unsupported(
+                        "@@ requires text operands: `column @@ 'query'`".into(),
+                    ));
+                };
+                let analyzer = Self::column_ref_name(left)
+                    .map(|col| self.fts_analyzer_for(meta, &col))
+                    .unwrap_or_default();
+                Ok(Value::Bool(crate::fts::text_matches_with(
+                    &text, &query, analyzer,
+                )))
+            }
             Expr::Identifier(ident) => {
                 let name = ident.value.as_str();
                 if let Some(idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {

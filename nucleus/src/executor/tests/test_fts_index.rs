@@ -574,3 +574,168 @@ async fn test_hybrid_rrf_over_one_table() {
         "fused scores are not descending: {scores:?}"
     );
 }
+
+/// Documents where the choice of analyzer visibly changes what matches:
+/// stopwords that are real terms, and words that stem together but are not the
+/// same token.
+async fn seeded_codes(ex: &Executor) {
+    exec(
+        ex,
+        "CREATE TABLE logs (id INT PRIMARY KEY, line TEXT) WITH (analyzer = 'simple')",
+    )
+    .await;
+    for (id, line) in [
+        (1, "ERROR no route to host"),
+        (2, "WARN routing table updated"),
+        (3, "INFO a record was written"),
+        (4, "DEBUG routes recomputed"),
+    ] {
+        exec(ex, &format!("INSERT INTO logs VALUES ({id}, '{line}')")).await;
+    }
+}
+
+/// The analyzer is declared on the COLUMN, so `@@` means the same thing with
+/// and without an index — the same property `test_at_at_identical_with_and_without_index`
+/// asserts for the default analyzer, now asserted for a non-default one.
+///
+/// This is why the analyzer is not an index option. The FTS index only proposes
+/// candidate rows and `@@` rechecks each one row-locally; if the declaration
+/// lived on the index, creating one would redefine the operator for that column
+/// and dropping it would redefine it back.
+#[tokio::test]
+async fn test_analyzer_is_the_columns_not_the_indexs() {
+    let queries = [
+        "SELECT id FROM logs WHERE line @@ 'routing'",
+        "SELECT id FROM logs WHERE line @@ 'routes'",
+        "SELECT id FROM logs WHERE line @@ 'no route'",
+        "SELECT id FROM logs WHERE line @@ 'a record'",
+        "SELECT id FROM logs WHERE line @@ 'ERROR host'",
+        "SELECT id FROM logs WHERE line @@ 'absent'",
+    ];
+
+    let unindexed = test_executor();
+    seeded_codes(&unindexed).await;
+
+    let indexed = test_executor();
+    seeded_codes(&indexed).await;
+    exec(&indexed, "CREATE INDEX logs_line ON logs USING FTS (line)").await;
+
+    for sql in queries {
+        let mut a = ids(&unindexed, sql).await;
+        let mut b = ids(&indexed, sql).await;
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "the index changed the answer for: {sql}");
+    }
+
+    // And dropping the index does not change it back.
+    exec(&indexed, "DROP INDEX logs_line").await;
+    for sql in queries {
+        let mut a = ids(&unindexed, sql).await;
+        let mut b = ids(&indexed, sql).await;
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "dropping the index changed the answer for: {sql}");
+    }
+}
+
+/// The analyzer actually does something: `simple` keeps stopwords and does not
+/// stem, `english` does the opposite. Asserted on the indexed table so the
+/// choice is observably in effect rather than silently ignored.
+#[tokio::test]
+async fn test_analyzer_choice_is_observable() {
+    let simple = test_executor();
+    seeded_codes(&simple).await; // declared WITH (analyzer = 'simple')
+
+    let english = test_executor();
+    exec(
+        &english,
+        "CREATE TABLE logs (id INT PRIMARY KEY, line TEXT)",
+    )
+    .await;
+    for (id, line) in [
+        (1, "ERROR no route to host"),
+        (2, "WARN routing table updated"),
+        (3, "INFO a record was written"),
+        (4, "DEBUG routes recomputed"),
+    ] {
+        exec(&english, &format!("INSERT INTO logs VALUES ({id}, '{line}')")).await;
+    }
+
+    // "routing" and "routes" stem together under english, not under simple.
+    let s = ids(&simple, "SELECT id FROM logs WHERE line @@ 'routes'").await;
+    let e = ids(&english, "SELECT id FROM logs WHERE line @@ 'routes'").await;
+    assert_eq!(s, vec![4], "simple matches only the literal word 'routes'");
+    assert!(
+        e.len() > s.len(),
+        "english stems 'routes'/'routing' together, so it matches more: {e:?}"
+    );
+
+    // "a" is a stopword to english — it cannot be searched for at all — but is
+    // an ordinary term to simple.
+    let s = ids(&simple, "SELECT id FROM logs WHERE line @@ 'a'").await;
+    let e = ids(&english, "SELECT id FROM logs WHERE line @@ 'a'").await;
+    assert_eq!(s, vec![3], "simple keeps 'a' as a term");
+    assert!(e.is_empty(), "english drops 'a' as a stopword: {e:?}");
+}
+
+/// An analyzer name the engine does not implement is an error, not a silent
+/// fallback to the default. A fallback would index the corpus one way and
+/// recheck it another, and the symptom is missing rows.
+#[tokio::test]
+async fn test_unknown_analyzer_is_rejected() {
+    let ex = test_executor();
+    let err = ex
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT) WITH (analyzer = 'klingon')")
+        .await
+        .expect_err("an unimplemented analyzer must be refused, not defaulted");
+    assert!(
+        format!("{err}").contains("klingon"),
+        "the error should name the analyzer it rejected: {err}"
+    );
+
+    // An analyzer naming a column that is not TEXT, or does not exist.
+    let err = ex
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT) WITH (analyzer_id = 'simple')")
+        .await
+        .expect_err("analyzers apply to TEXT columns");
+    assert!(format!("{err}").contains("TEXT"), "{err}");
+    let err = ex
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT) WITH (analyzer_nope = 'simple')")
+        .await
+        .expect_err("an analyzer for a column that does not exist");
+    assert!(format!("{err}").contains("nope"), "{err}");
+}
+
+/// An index may not introduce or override a column's analyzer — that is the
+/// whole point of the declaration living on the column. It may restate it.
+#[tokio::test]
+async fn test_an_index_cannot_change_the_analyzer() {
+    let ex = test_executor();
+    seeded_codes(&ex).await; // column declares 'simple'
+
+    let err = ex
+        .execute("CREATE INDEX logs_line ON logs USING FTS (line) WITH (analyzer = 'english')")
+        .await
+        .expect_err("an index must not redefine what `@@` means");
+    let msg = format!("{err}");
+    assert!(msg.contains("simple") && msg.contains("english"), "{msg}");
+    assert!(
+        msg.contains("SET ANALYZER") || msg.contains("ALTER TABLE"),
+        "the error should point at where the analyzer belongs: {msg}"
+    );
+
+    // Restating the column's own analyzer is fine.
+    exec(
+        &ex,
+        "CREATE INDEX logs_line ON logs USING FTS (line) WITH (analyzer = 'simple')",
+    )
+    .await;
+
+    // And it applies only where it means something.
+    let err = ex
+        .execute("CREATE INDEX logs_id ON logs (id) WITH (analyzer = 'simple')")
+        .await
+        .expect_err("analyzer on a btree index must be refused");
+    assert!(format!("{err}").contains("FTS"), "{err}");
+}
