@@ -86,11 +86,38 @@ export interface SyncReport {
 
 export type OperationKind = "add_keyword" | "remove_keyword" | "move" | "delete";
 
+/**
+ * How the engine should reach the user's provider for this request.
+ *
+ * The engine stores no credentials. Better Auth already holds and refreshes
+ * provider tokens, so the caller fetches a fresh one and passes it in — a
+ * second credential store would be a second thing to secure and a second
+ * refresh implementation to keep correct.
+ */
+export interface MailCredential {
+  provider: "gmail" | "graph" | "imap" | "jmap";
+  /** OAuth access token, already refreshed. Required for gmail and graph. */
+  accessToken?: string;
+  /** App password, for IMAP without OAuth. */
+  password?: string;
+  email?: string;
+  /** Server address. Required for imap and jmap. */
+  host?: string;
+  port?: number;
+}
+
 export interface MailClientOptions {
   /** Base URL of the neutron-mail service, e.g. http://localhost:8090 */
   baseUrl: string;
   /** Bearer token, if the service sits behind auth. */
   token?: string;
+  /**
+   * Resolves the provider credential for a request.
+   *
+   * A function rather than a value because access tokens expire: this is
+   * called per request so the caller can hand back a freshly refreshed one.
+   */
+  credential?: () => MailCredential | Promise<MailCredential>;
   /** Request timeout in milliseconds. Defaults to 30s. */
   timeoutMs?: number;
   fetch?: typeof globalThis.fetch;
@@ -185,6 +212,17 @@ export function createMailClient(options: MailClientOptions): MailClient {
       };
       if (options.token) headers.authorization = `Bearer ${options.token}`;
       if (init?.body) headers["content-type"] = "application/json";
+
+      // Resolved per request, because access tokens expire between them.
+      if (options.credential) {
+        const cred = await options.credential();
+        headers["x-mail-provider"] = cred.provider;
+        if (cred.accessToken) headers["x-mail-token"] = cred.accessToken;
+        if (cred.password) headers["x-mail-password"] = cred.password;
+        if (cred.email) headers["x-mail-email"] = cred.email;
+        if (cred.host) headers["x-mail-host"] = cred.host;
+        if (cred.port) headers["x-mail-port"] = String(cred.port);
+      }
 
       const response = await doFetch(`${baseUrl}${path}`, {
         ...init,

@@ -9,6 +9,7 @@ export type {
   Mailbox,
   MailClient,
   MailClientOptions,
+  MailCredential,
   OperationKind,
   SendRequest,
   SyncReport,

@@ -22,10 +22,11 @@ type Service struct {
 	store Store
 	eng   *Engine
 
-	// Adapters resolves an account to its live adapter. Sync and body
-	// fetches need one; pure reads against the mirror do not, which is why
-	// an account with no adapter still serves search and thread requests.
-	Adapters func(AccountID) (Adapter, bool)
+	// Resolve builds an adapter for one request from the credential the
+	// caller supplied. Sync, body fetches, and mutations need one; pure
+	// reads against the mirror do not, which is why a deployment with no
+	// resolver still serves search and thread requests.
+	Resolve Resolver
 
 	// Senders resolves an account to its outbound SMTP sender. Sending is
 	// SMTP submission on every provider that supports it, so it is resolved
@@ -264,12 +265,12 @@ func (s *Service) body(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ad, ok := s.adapter(acct)
-	if !ok {
-		writeProblem(w, http.StatusServiceUnavailable, "No Adapter",
-			fmt.Sprintf("account %s has no connected adapter to fetch from", acct))
+	ad, release, err := s.adapterFor(r, acct)
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "No Adapter", err.Error())
 		return
 	}
+	defer release()
 
 	body, err := s.eng.Body(r.Context(), acct, id, ad)
 	if err != nil {
@@ -281,12 +282,12 @@ func (s *Service) body(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) sync(w http.ResponseWriter, r *http.Request) {
 	acct := AccountID(r.PathValue("account"))
-	ad, ok := s.adapter(acct)
-	if !ok {
-		writeProblem(w, http.StatusServiceUnavailable, "No Adapter",
-			fmt.Sprintf("account %s has no connected adapter", acct))
+	ad, release, err := s.adapterFor(r, acct)
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "No Adapter", err.Error())
 		return
 	}
+	defer release()
 
 	reports, err := s.eng.SyncAccount(r.Context(), acct, ad)
 	if err != nil {
@@ -321,14 +322,14 @@ func (s *Service) operation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ad, ok := s.adapter(acct)
-	if !ok {
-		writeProblem(w, http.StatusServiceUnavailable, "No Adapter",
-			fmt.Sprintf("account %s has no connected adapter", acct))
+	ad, release, err := s.adapterFor(r, acct)
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "No Adapter", err.Error())
 		return
 	}
+	defer release()
 
-	err := s.eng.Apply(r.Context(), acct, Operation{
+	err = s.eng.Apply(r.Context(), acct, Operation{
 		Kind: kind, IDs: req.IDs, Keyword: req.Keyword, Target: req.Target,
 	}, ad)
 	if err != nil {
@@ -353,9 +354,18 @@ func parseOpKind(s string) (OpKind, bool) {
 	}
 }
 
-func (s *Service) adapter(acct AccountID) (Adapter, bool) {
-	if s.Adapters == nil {
-		return nil, false
+// adapterFor resolves an adapter for one request.
+//
+// The returned release must always be called — a per-request adapter owns a
+// live connection, and leaking it exhausts the concurrent-connection cap that
+// Gmail and most IMAP servers enforce.
+func (s *Service) adapterFor(r *http.Request, acct AccountID) (Adapter, func(), error) {
+	if s.Resolve == nil {
+		return nil, nil, fmt.Errorf("mail: this deployment has no adapter resolver configured")
 	}
-	return s.Adapters(acct)
+	cred, err := CredentialFromRequest(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	return s.Resolve(r.Context(), acct, cred)
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/neutron-build/neutron/mail"
+	"github.com/neutron-build/neutron/mail/dialer"
 )
 
 func main() {
@@ -55,29 +56,20 @@ func main() {
 	engine := mail.NewEngine(store, log)
 	svc := mail.NewService(store, engine)
 
-	// Nothing syncs on its own without this: the mirror would only advance
-	// when a client happened to call the sync endpoint, leaving it stale by
-	// exactly as long as nobody looked.
-	scheduler := mail.NewScheduler(store, engine, func(a mail.AccountID) (mail.Adapter, bool) {
-		if svc.Adapters == nil {
-			return nil, false
-		}
-		return svc.Adapters(a)
-	}, log)
-	scheduler.Interval = syncInterval
-	go func() {
-		if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error("scheduler stopped", "err", err)
-		}
-	}()
+	// Adapters are built per request from the credential the caller sends.
+	// The engine stores no credentials of its own: both consuming products
+	// run Better Auth, which already holds and refreshes provider tokens,
+	// and a second credential store here would mean a second thing to
+	// secure and a second refresh implementation to keep correct.
+	svc.Resolve = dialer.New()
 
-	// Adapters are not wired here. Constructing one needs a credential per
-	// account, and credential custody is deployment-specific: an operator
-	// self-hosting for one mailbox supplies an app password, while a
-	// multi-tenant deployment resolves an OAuth token per account. Leaving
-	// this nil serves the mirror read-only, which is a useful state on its
-	// own and a safe default.
-	svc.Adapters = nil
+	// Sync is caller-driven for the same reason. Background polling needs a
+	// credential when no request is in flight, and this process has none —
+	// so the app, which does, calls POST /sync on its own cadence. The
+	// built-in scheduler stays available for a self-hosted deployment that
+	// holds its own app password.
+	log.Info("credentials are per-request; sync is driven by the caller",
+		"sync_interval_flag_unused", syncInterval)
 
 	server := &http.Server{
 		Addr:              *addr,
