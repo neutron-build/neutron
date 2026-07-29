@@ -2561,9 +2561,28 @@ impl Executor {
                             // that do not line up with their metadata.
                             .collect::<Option<Vec<ColMeta>>>()
                     {
-                        let mut rows = storage
-                            .scan_projected(table, proj_indices, *scan_limit)
-                            .await?;
+                        // Hand the engine the predicate BEFORE it materializes
+                        // anything. Zone maps were only ever consulted after the
+                        // rows existed, where they can discard rows but cannot
+                        // save any of the work of producing them; statistics
+                        // only pay for themselves below the scan.
+                        let prune = resolved_expr.as_ref().and_then(|e| {
+                            Self::extract_zone_map_predicate(e, &meta)
+                                .map(|(col_id, pred)| (col_id as usize, pred))
+                        });
+                        let mut rows = match &prune {
+                            Some((col_id, pred)) if *col_id < meta.len() => {
+                                storage
+                                    .scan_projected_pruned(
+                                        table,
+                                        proj_indices,
+                                        *scan_limit,
+                                        Some((meta[*col_id].name.as_str(), pred)),
+                                    )
+                                    .await?
+                            }
+                            _ => storage.scan_projected(table, proj_indices, *scan_limit).await?,
+                        };
                         self.metrics.rows_scanned.inc_by(rows.len() as u64);
                         self.metrics
                             .values_scanned
@@ -2580,8 +2599,10 @@ impl Executor {
                                 // A projected scan still reads every row in
                                 // scan order, so granules still line up — but a
                                 // LIMIT truncates it, and a partial scan must
-                                // not be pruned positionally.
-                                scan_limit.is_none().then_some(meta.as_slice()),
+                                // not be pruned positionally. Neither does one
+                                // the engine already pruned below the scan.
+                                (scan_limit.is_none() && prune.is_none())
+                                    .then_some(meta.as_slice()),
                             );
                         }
                         return Ok((proj_meta, rows));

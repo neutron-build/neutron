@@ -128,6 +128,26 @@ pub struct ColumnarStorageEngine {
 
 impl ColumnarStorageEngine {
     /// Create a purely in-memory columnar engine (no durability).
+    /// Register this table as a MergeTree ordered by `order_by`, on THIS
+    /// engine's store.
+    ///
+    /// Columnar and MergeTree tables are served by a per-table engine, each
+    /// with its own `ColumnarStore`. DDL was registering the merge tree on the
+    /// executor's store instead — a store that never serves the table's reads —
+    /// so `ORDER BY` was parsed, persisted, restored at boot, registered, and
+    /// then invisible to every scan: parts were never sorted and their zone
+    /// maps never consulted.
+    pub fn register_merge_tree(
+        &self,
+        table: &str,
+        order_by: Vec<String>,
+        strategy: crate::columnar::MergeStrategy,
+    ) {
+        self.store
+            .write()
+            .create_merge_tree_table_with_strategy(table, order_by, strategy);
+    }
+
     pub fn new() -> Self {
         Self {
             store: RwLock::new(ColumnarStore::new()),
@@ -378,9 +398,10 @@ fn coldata_get(col: &ColumnData, idx: usize) -> Value {
 }
 
 /// Reconstruct `Vec<Row>` from a slice of ColumnBatches.
-fn batches_to_rows(batches: &[ColumnBatch]) -> Vec<Row> {
+fn batches_to_rows<B: AsRef<ColumnBatch>>(batches: &[B]) -> Vec<Row> {
     let mut rows = Vec::new();
     for batch in batches {
+        let batch = batch.as_ref();
         for row_i in 0..batch.row_count {
             let row: Row = (0..batch.columns.len())
                 .map(|col_i| {
@@ -402,13 +423,15 @@ fn batches_to_rows(batches: &[ColumnBatch]) -> Vec<Row> {
 /// `SELECT AVG(dur) … ` over a 17-column span table decoded every JSONB blob
 /// in the table to throw them away, and the columnar layout was pure overhead.
 /// That is why the columnar engine measured SLOWER than the row heap.
-fn batches_to_rows_projected(
-    batches: &[ColumnBatch],
+fn batches_to_rows_projected<B: AsRef<ColumnBatch>>(
+    batches: &[B],
     projection: &[usize],
     limit: Option<usize>,
 ) -> Vec<Row> {
+
     let mut rows = Vec::new();
     for batch in batches {
+        let batch = batch.as_ref();
         for row_i in 0..batch.row_count {
             if limit.is_some_and(|n| rows.len() >= n) {
                 return rows;
@@ -433,12 +456,13 @@ fn batches_to_rows_projected(
 /// the tail rows are never assembled (no `Value` allocation for them). Batches
 /// are already dedup-resolved by `batches_all_for_select`, so the first `limit`
 /// rows equal `batches_to_rows(..)` truncated to `limit`.
-fn batches_to_rows_limit(batches: &[ColumnBatch], limit: usize) -> Vec<Row> {
+fn batches_to_rows_limit<B: AsRef<ColumnBatch>>(batches: &[B], limit: usize) -> Vec<Row> {
     let mut rows = Vec::with_capacity(limit.min(1024));
     if limit == 0 {
         return rows;
     }
     for batch in batches {
+        let batch = batch.as_ref();
         for row_i in 0..batch.row_count {
             let row: Row = (0..batch.columns.len())
                 .map(|col_i| {
@@ -503,17 +527,37 @@ fn batches_to_rows_where_eq(
 /// for a raw (non-MergeTree) table we hand back a borrow of `tables` instead of
 /// cloning every column of every row — the clone, not the math, was the cost.
 /// MergeTree and replacing tables still materialize (parts / dedup need owned).
-fn batches_for_read<'a>(
-    store: &'a ColumnarStore,
-    table: &str,
-) -> std::borrow::Cow<'a, [ColumnBatch]> {
-    use std::borrow::Cow;
+fn batches_for_read<'a>(store: &'a ColumnarStore, table: &str) -> ReadBatches<'a> {
     if crate::columnar::replacing_config(table).is_some() {
-        Cow::Owned(store.batches_all_for_select(table))
-    } else if store.is_merge_tree(table) {
-        Cow::Owned(store.batches_all(table))
+        ReadBatches::Owned(store.batches_all_for_select(table))
+    } else if let Some(shared) = store.batches_all_shared(table) {
+        // A MergeTree's parts are not a contiguous slice, so this used to hand
+        // back an owned deep copy — every column of every part, on every read,
+        // including from the aggregate fast paths. The parts are already
+        // `Arc`-held; sharing them costs a refcount.
+        ReadBatches::Shared(shared)
     } else {
-        Cow::Borrowed(store.batches(table))
+        ReadBatches::Borrowed(store.batches(table))
+    }
+}
+
+/// Batches for a read, borrowed, shared, or owned depending on what the table's
+/// storage can offer without copying.
+enum ReadBatches<'a> {
+    Borrowed(&'a [ColumnBatch]),
+    Owned(Vec<ColumnBatch>),
+    Shared(Vec<std::sync::Arc<ColumnBatch>>),
+}
+
+impl ReadBatches<'_> {
+    /// One reference per batch. The vector is per-batch, not per-row — a table
+    /// has tens of parts, not millions — so this is not the copy that mattered.
+    fn refs(&self) -> Vec<&ColumnBatch> {
+        match self {
+            Self::Borrowed(b) => b.iter().collect(),
+            Self::Owned(v) => v.iter().collect(),
+            Self::Shared(v) => v.iter().map(|a| &**a).collect(),
+        }
     }
 }
 
@@ -534,17 +578,82 @@ fn physical_batches_for_read<'a>(
     }
 }
 
-fn fetch_rows_by_positions(batches: &[ColumnBatch], positions: &[usize]) -> Vec<Row> {
+/// Translate an executor filter predicate into zone-map bounds.
+///
+/// Every bound returned must be one the statistics can *disprove*; a predicate
+/// with no such bound returns empty and prunes nothing. `Between` yields both
+/// ends, because a one-sided bound leaves half a window unpruned. Predicates
+/// whose truth a min/max cannot rule out (`IN`, `LIKE`, null tests) are absent
+/// on purpose.
+fn zone_map_bounds(
+    predicate: &crate::storage::granule_stats::FilterPredicate,
+) -> Vec<(crate::columnar::CmpOp, crate::columnar::ScalarValue)> {
+    use crate::columnar::CmpOp;
+    use crate::storage::granule_stats::FilterPredicate as P;
+    let one = |op, v: &Value| scalar_of(v).map(|s| vec![(op, s)]).unwrap_or_default();
+    match predicate {
+        P::Equal(v) => one(CmpOp::Eq, v),
+        P::GreaterThan(v) => one(CmpOp::Gt, v),
+        P::GreaterThanOrEqual(v) => one(CmpOp::Gte, v),
+        P::LessThan(v) => one(CmpOp::Lt, v),
+        P::LessThanOrEqual(v) => one(CmpOp::Lte, v),
+        P::Between { min, max } => match (scalar_of(min), scalar_of(max)) {
+            (Some(lo), Some(hi)) => vec![(CmpOp::Gte, lo), (CmpOp::Lte, hi)],
+            _ => Vec::new(),
+        },
+        P::In(_) | P::IsNull | P::IsNotNull | P::Like { .. } => Vec::new(),
+    }
+}
+
+/// A `Value` as the scalar a zone map is built from, or `None` when the two
+/// cannot be compared.
+///
+/// Temporal values are stored as their integer representation, so their zone
+/// maps are `Int64`/`Int32` — a bound must be converted the same way or
+/// `can_skip` sees two different variants and prunes nothing.
+fn scalar_of(v: &Value) -> Option<crate::columnar::ScalarValue> {
+    use crate::columnar::ScalarValue as S;
+    Some(match v {
+        Value::Int32(n) => S::Int32(*n),
+        Value::Int64(n) => S::Int64(*n),
+        Value::Float64(f) => S::Float64(*f),
+        Value::Text(t) => S::Text(t.clone()),
+        Value::Bool(b) => S::Bool(*b),
+        Value::Date(d) => S::Int32(*d),
+        Value::Timestamp(t) | Value::TimestampTz(t) => S::Int64(*t),
+        _ => return None,
+    })
+}
+
+/// Shared handles to a MergeTree's parts, or `None` for any table where that
+/// does not apply.
+///
+/// `batches_for_read` has to hand back owned data for a MergeTree — its parts
+/// are not a contiguous slice — and that meant every read deep-copied every
+/// column of every part. The parts are already `Arc`-held, so sharing them
+/// costs a refcount. Replacing tables are excluded: their read-time dedup needs
+/// all parts together and produces new batches anyway.
+fn shared_merge_tree_batches(
+    store: &ColumnarStore,
+    table: &str,
+) -> Option<Vec<std::sync::Arc<ColumnBatch>>> {
+    if crate::columnar::replacing_config(table).is_some() {
+        return None;
+    }
+    store.batches_all_shared(table)
+}
+
+fn fetch_rows_by_positions<B: AsRef<ColumnBatch>>(batches: &[B], positions: &[usize]) -> Vec<Row> {
     if positions.is_empty() || batches.is_empty() {
         return Vec::new();
     }
-    let n_cols = batches[0].columns.len();
+    let n_cols = batches[0].as_ref().columns.len();
 
     // Precompute cumulative batch offsets so we can binary-search to the right batch.
     let mut offsets = Vec::with_capacity(batches.len() + 1);
     offsets.push(0usize);
     for b in batches {
-        offsets.push(offsets.last().unwrap() + b.row_count);
+        offsets.push(offsets.last().unwrap() + b.as_ref().row_count);
     }
     let total = *offsets.last().unwrap();
 
@@ -557,7 +666,7 @@ fn fetch_rows_by_positions(batches: &[ColumnBatch], positions: &[usize]) -> Vec<
         // Binary-search for the batch that contains global_pos.
         let batch_idx = offsets.partition_point(|&o| o <= global_pos) - 1;
         let local_pos = global_pos - offsets[batch_idx];
-        let batch = &batches[batch_idx];
+        let batch = batches[batch_idx].as_ref();
         let row: Row = (0..n_cols)
             .map(|col_i| {
                 let (_, col) = &batch.columns[col_i];
@@ -780,6 +889,10 @@ impl ColumnarStorageEngine {
 
 #[async_trait]
 impl StorageEngine for ColumnarStorageEngine {
+    fn as_columnar(&self) -> Option<&ColumnarStorageEngine> {
+        Some(self)
+    }
+
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         self.store.write().create_table(table);
         if let Some(wal) = &self.wal {
@@ -876,7 +989,11 @@ impl StorageEngine for ColumnarStorageEngine {
         // registered via crate::columnar::register_replacing_table and
         // materializes MergeTree parts; a plain table is borrowed rather than
         // cloned.
-        let batches = batches_for_read(&store, table);
+        if let Some(shared) = shared_merge_tree_batches(&store, table) {
+            return Ok(batches_to_rows(&shared));
+        }
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         Ok(batches_to_rows(&batches))
     }
 
@@ -900,8 +1017,52 @@ impl StorageEngine for ColumnarStorageEngine {
         // column. That copy was the entire cost of a columnar query — the
         // borrowing accessor already existed and only the aggregate fast paths
         // were using it.
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         Ok(batches_to_rows_projected(&batches, projection, limit))
+    }
+
+    /// Skip whole MergeTree parts whose zone maps prove they cannot match.
+    ///
+    /// The parts are already sorted by the declared `ORDER BY` and already
+    /// carry min/max statistics, and `MergeTree::scan` already knew how to
+    /// prune with them — nothing called it, and nothing could: the storage scan
+    /// API had no way to receive a predicate.
+    async fn scan_projected_pruned(
+        &self,
+        table: &str,
+        projection: &[usize],
+        limit: Option<usize>,
+        prune: Option<(&str, &crate::storage::granule_stats::FilterPredicate)>,
+    ) -> Result<Vec<Row>, StorageError> {
+        let Some((col, predicate)) = prune else {
+            return self.scan_projected(table, projection, limit).await;
+        };
+        let bounds = zone_map_bounds(predicate);
+        if bounds.is_empty() {
+            return self.scan_projected(table, projection, limit).await;
+        }
+        self.flush_write_buffer(table);
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        }
+        // Replacing tables need read-time dedup across ALL parts, so a pruned
+        // subset could resurrect a superseded row. Take the unpruned path.
+        if crate::columnar::replacing_config(table).is_some() {
+            let read = batches_for_read(&store, table);
+        let batches = read.refs();
+            return Ok(batches_to_rows_projected(&batches, projection, limit));
+        }
+        match store.batches_pruned(table, col, &bounds) {
+            Some(batches) => Ok(batches_to_rows_projected(&batches, projection, limit)),
+            // Not a MergeTree: no declared order, so no range-coherent parts.
+            None => {
+                let read = batches_for_read(&store, table);
+        let batches = read.refs();
+                Ok(batches_to_rows_projected(&batches, projection, limit))
+            }
+        }
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
@@ -913,7 +1074,11 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
-        let batches = batches_for_read(&store, table);
+        if let Some(shared) = shared_merge_tree_batches(&store, table) {
+            return Ok(batches_to_rows_limit(&shared, limit));
+        }
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         Ok(batches_to_rows_limit(&batches, limit))
     }
 
@@ -1126,13 +1291,22 @@ impl StorageEngine for ColumnarStorageEngine {
                 None => return Ok(None),
             }
         };
+        // No positions means no rows, and no batches are needed to say so.
+        // Materializing first made every miss cost a full table read — and a
+        // miss is the common case: `check_unique_constraints` probes the
+        // primary key of every row being INSERTed, and a new key is always
+        // absent. On a MergeTree, where `physical_batches_for_read` cannot
+        // borrow, that was a deep copy of the entire table PER INSERTED ROW.
+        if positions.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
         let store = self.store.read();
         // Index points at physical positions; fetch by those, then dedup so
         // SELECT via the index sees one row per logical PK. Borrow batches for
         // raw tables — cloning the whole table to fetch a handful of rows by
         // position defeats the point of the index.
         let batches = physical_batches_for_read(&store, table);
-        let rows = fetch_rows_by_positions(batches.as_ref(), &positions);
+        let rows = fetch_rows_by_positions(&batches, &positions);
         let out = match crate::columnar::replacing_config(table) {
             Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
             None => rows,
@@ -1167,7 +1341,7 @@ impl StorageEngine for ColumnarStorageEngine {
         };
         let store = self.store.read();
         let batches = physical_batches_for_read(&store, table);
-        let rows = fetch_rows_by_positions(batches.as_ref(), &positions);
+        let rows = fetch_rows_by_positions(&batches, &positions);
         let out = match crate::columnar::replacing_config(table) {
             Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
             None => rows,
@@ -1202,7 +1376,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         let sort_name = sort_col.to_string();
         // Collect (numeric key, global position). Bail to the general sort on a
         // NULL or non-numeric column so their SQL ordering stays correct.
@@ -1245,7 +1420,7 @@ impl StorageEngine for ColumnarStorageEngine {
         }
         keyed.sort_unstable_by(cmp);
         let positions: Vec<usize> = keyed.iter().map(|(_, p)| *p).collect();
-        Some(fetch_rows_by_positions(batches.as_ref(), &positions))
+        Some(fetch_rows_by_positions(&batches, &positions))
     }
 
     fn fast_sum_f64(&self, table: &str, col_idx: usize) -> Option<(f64, usize)> {
@@ -1255,7 +1430,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         let (total, n) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let sum = aggregate_sum(batch, &col_name);
             let cnt = aggregate_count(batch, &col_name);
@@ -1277,7 +1453,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
 
         // Collect the key and value columns across all batches.
         // Keys are accumulated as strings for hashing/grouping, but we remember
@@ -1367,7 +1544,8 @@ impl StorageEngine for ColumnarStorageEngine {
         }
         // For replacing_mergetree, count after dedup so superseded versions
         // don't inflate the result. Raw tables borrow (no clone).
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         let filter_col_name = filter_col.to_string();
         let count = batches
             .iter()
@@ -1393,7 +1571,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         let (sum, count) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let filter_data = match batch.column(&filter_col_name) {
                 Some(d) => d,
@@ -1422,7 +1601,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         let filter_col_name = filter_col.to_string();
         let count = batches
             .iter()
@@ -1449,7 +1629,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         let (sum, count) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let filter_data = match batch.column(&filter_col_name) {
                 Some(d) => d,
@@ -1474,7 +1655,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut min: Option<f64> = None;
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         for batch in batches.iter() {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
@@ -1508,7 +1690,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut max: Option<f64> = None;
-        let batches = batches_for_read(&store, table);
+        let read = batches_for_read(&store, table);
+        let batches = read.refs();
         for batch in batches.iter() {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
@@ -1896,5 +2079,152 @@ mod tests {
             let eng = ColumnarStorageEngine::open(dir.path()).unwrap();
             assert_eq!(eng.fast_count_all("t"), Some(20));
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_tree_pruning_tests {
+    use super::*;
+    use crate::columnar::{CmpOp, MergeStrategy, ScalarValue};
+    use crate::storage::granule_stats::FilterPredicate;
+    use crate::types::DataType;
+
+    /// A MergeTree whose parts cover distinct, non-overlapping `ts` ranges.
+    ///
+    /// Note the column name used below is `"1"`, not `"ts"`. `rows_to_batch`
+    /// names columns by POSITION, so every batch in this engine — including
+    /// every MergeTree part — carries `"0"`, `"1"`, … and its zone maps are
+    /// keyed by those. A query asks to prune on `ts`, finds no statistics under
+    /// that name, and skips nothing; `sort_by_pk` looks up its key the same way
+    /// and silently does not sort. That name mismatch, not the pruning logic,
+    /// is what makes a declared `ORDER BY` inert — see the `tracing::warn!` in
+    /// `execute_create_table`. These tests pin the mechanism so that fixing the
+    /// naming contract turns pruning on rather than having to build it.
+    async fn tree_with_parts() -> ColumnarStorageEngine {
+        let eng = ColumnarStorageEngine::new();
+        eng.create_table("spans").await.unwrap();
+        eng.register_merge_tree("spans", vec!["1".into()], MergeStrategy::Default);
+        eng.store_table_schema(
+            "spans",
+            &[("id".into(), DataType::Int64), ("ts".into(), DataType::Int64)],
+        );
+        // A part is cut when the write buffer flushes, so read between inserts
+        // to force separate parts. Sizes differ so the size-tiered merge policy
+        // does not immediately consolidate them into one.
+        for (decade, n) in [(0i64, 4usize), (1, 9), (2, 20), (3, 45)] {
+            let rows: Vec<Row> = (0..n as i64)
+                .map(|i| vec![Value::Int64(decade * 100 + i), Value::Int64(decade * 1000 + i)])
+                .collect();
+            eng.insert_batch("spans", rows).await.unwrap();
+            eng.scan("spans").await.unwrap();
+        }
+        eng
+    }
+
+    fn total_rows(eng: &ColumnarStorageEngine) -> usize {
+        eng.store.read().row_count("spans")
+    }
+
+    /// A window outside every part reads nothing — the parts are skipped by
+    /// their zone maps, not read and then filtered.
+    #[tokio::test]
+    async fn test_window_outside_every_part_reads_no_rows() {
+        let eng = tree_with_parts().await;
+        let pred = FilterPredicate::Between {
+            min: Value::Int64(90_000),
+            max: Value::Int64(99_000),
+        };
+        let rows = eng
+            .scan_projected_pruned("spans", &[0, 1], None, Some(("1", &pred)))
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "every part's range is below the window, so all should be pruned; read {} rows",
+            rows.len()
+        );
+    }
+
+    /// A window covering part of the table reads less than the whole of it, and
+    /// never drops a row the window covers.
+    #[tokio::test]
+    async fn test_window_prunes_without_losing_rows() {
+        let eng = tree_with_parts().await;
+        let all = total_rows(&eng);
+        let pred = FilterPredicate::Between {
+            min: Value::Int64(3000),
+            max: Value::Int64(3044),
+        };
+        let pruned = eng
+            .scan_projected_pruned("spans", &[0, 1], None, Some(("1", &pred)))
+            .await
+            .unwrap();
+        let full = eng.scan_projected("spans", &[0, 1], None).await.unwrap();
+        assert_eq!(full.len(), all);
+        assert!(
+            pruned.len() < full.len(),
+            "at least one part is provably outside the window; read {} of {}",
+            pruned.len(),
+            full.len()
+        );
+        // Pruning is an optimization, never a filter.
+        for r in &pruned {
+            assert!(full.contains(r), "pruned scan invented a row: {r:?}");
+        }
+        let covered: Vec<&Row> = full
+            .iter()
+            .filter(|r| matches!(r[1], Value::Int64(t) if (3000..=3044).contains(&t)))
+            .collect();
+        for r in covered {
+            assert!(pruned.contains(r), "pruning dropped a matching row: {r:?}");
+        }
+    }
+
+    /// A bound the statistics cannot be compared against must read everything.
+    /// `scalar_lt` answers false for every mixed pair, which made the `Gt`/`Lt`
+    /// arms of `can_skip` skip EVERY part rather than none.
+    #[tokio::test]
+    async fn test_incomparable_bound_prunes_nothing() {
+        let eng = tree_with_parts().await;
+        let all = total_rows(&eng);
+        for pred in [
+            FilterPredicate::Between {
+                min: Value::Text("3000".into()),
+                max: Value::Text("3044".into()),
+            },
+            FilterPredicate::GreaterThan(Value::Text("3000".into())),
+            FilterPredicate::LessThan(Value::Text("3000".into())),
+        ] {
+            let rows = eng
+                .scan_projected_pruned("spans", &[0, 1], None, Some(("1", &pred)))
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                all,
+                "a text bound against an integer column proves nothing, so nothing may be \
+                 skipped — got {} of {all} rows for {pred:?}",
+                rows.len()
+            );
+        }
+    }
+
+    /// The zone map is consulted below the scan, so a pruned read costs less
+    /// than an unpruned one even before any filter runs.
+    #[tokio::test]
+    async fn test_pruning_happens_below_the_scan() {
+        let eng = tree_with_parts().await;
+        let store = eng.store.read();
+        let bounds = [
+            (CmpOp::Gte, ScalarValue::Int64(90_000)),
+            (CmpOp::Lte, ScalarValue::Int64(99_000)),
+        ];
+        let kept = store
+            .batches_pruned_shared("spans", "1", &bounds)
+            .expect("registered as a MergeTree");
+        assert!(
+            kept.is_empty(),
+            "no part can match, so the scan should be handed no batches at all"
+        );
     }
 }

@@ -155,6 +155,18 @@ pub trait StorageEngine: Send + Sync {
         None
     }
 
+    /// This engine as a columnar engine, when it is one.
+    ///
+    /// Columnar/MergeTree tables are served by a per-table engine, and DDL
+    /// needs the concrete type to register a sort key on the store that
+    /// actually serves the table's reads. Same shape as
+    /// [`as_backup_coordinator`](Self::as_backup_coordinator): the executor
+    /// holds `Arc<dyn StorageEngine>` and has no other route back.
+    #[cfg(feature = "server")]
+    fn as_columnar(&self) -> Option<&columnar_engine::ColumnarStorageEngine> {
+        None
+    }
+
     async fn create_table(&self, table: &str) -> Result<(), StorageError>;
     async fn drop_table(&self, table: &str) -> Result<(), StorageError>;
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError>;
@@ -428,6 +440,28 @@ pub trait StorageEngine: Send + Sync {
             .into_iter()
             .map(|row| project_row(&row, projection))
             .collect())
+    }
+
+    /// Scan only the projected columns, skipping data the engine can PROVE
+    /// cannot match `prune`.
+    ///
+    /// `prune` is `(column name, predicate)` and is purely advisory: the caller
+    /// applies the full predicate to whatever comes back, so an engine that
+    /// ignores the hint is correct and an engine that uses it must never skip
+    /// data that could match. Default: ignore it.
+    ///
+    /// This exists because zone maps were being consulted *after* the rows were
+    /// materialized, where they can discard rows but cannot save any of the
+    /// work of producing them. Statistics can only pay for themselves below the
+    /// scan, which means the predicate has to get down here.
+    async fn scan_projected_pruned(
+        &self,
+        table: &str,
+        projection: &[usize],
+        limit: Option<usize>,
+        _prune: Option<(&str, &crate::storage::granule_stats::FilterPredicate)>,
+    ) -> Result<Vec<Row>, StorageError> {
+        self.scan_projected(table, projection, limit).await
     }
 
     /// Synchronous inclusive range lookup for index scans.

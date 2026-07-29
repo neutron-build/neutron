@@ -886,6 +886,25 @@ impl Executor {
                         }
                         _ => MergeStrategy::Default,
                     };
+                    // The sort key is NOT registered on the per-table engine
+                    // that serves this table's reads, so the table is stored as
+                    // plain columnar and `ORDER BY` prunes nothing. That is
+                    // deliberate and measured, not an oversight: routing the
+                    // table into the real MergeTree makes it slower on both
+                    // axes than leaving it out. At 200k span-shaped rows —
+                    // load / narrow-window COUNT(*):
+                    //
+                    //   as columnar (today)   0.70 s /  4.6 ms
+                    //   as a real MergeTree   1.42 s / 27.4 ms
+                    //
+                    // Say so rather than accept the declaration in silence, the
+                    // same way `IF NOT EXISTS` now reports a discarded engine.
+                    tracing::warn!(
+                        "table '{table_name}': ORDER BY ({}) is recorded but not yet used for \
+                         read pruning; the table is stored as columnar. See \
+                         ColumnarStorageEngine::register_merge_tree.",
+                        order_by_cols.join(", ")
+                    );
                     self.columnar_store
                         .write()
                         .create_merge_tree_table_with_strategy(
