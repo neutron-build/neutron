@@ -588,6 +588,10 @@ impl Executor {
         // Long blocking materialization on a tokio worker stalls the IO
         // driver (delays unrelated connections, including CancelRequests) —
         // notify the runtime.
+        // `block_in_place` needs a multi-threaded runtime, which only the
+        // `server` feature enables; a core-only build can never take that arm,
+        // so it is compiled out rather than guarded at runtime alone.
+        #[cfg(feature = "server")]
         let rows = match tokio::runtime::Handle::try_current() {
             Ok(handle)
                 if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
@@ -597,6 +601,8 @@ impl Executor {
             }
             _ => materialize()?,
         };
+        #[cfg(not(feature = "server"))]
+        let rows = materialize()?;
         Ok((combined_meta, rows))
     }
 }

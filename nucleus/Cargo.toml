@@ -26,7 +26,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = { version = "0.61", features = ["visitor"] }
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "macros"] }
+# `time` is needed by the graceful-shutdown drain, which is not server-specific;
+# the `server` feature pulls `tokio/full` anyway, so this only affects core-only.
+tokio = { version = "1", features = ["sync", "macros", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4.5.58", features = ["derive"], optional = true }

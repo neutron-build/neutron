@@ -158,6 +158,10 @@ pub fn io_fault(name: &str) -> Option<std::io::Error> {
 }
 
 /// Convenience for call sites returning `io::Result`: fail if armed.
+///
+/// Gated to match its only consumer (`storage::mvcc_wal`, server-only) so a
+/// core-only build does not warn about an unused macro.
+#[cfg(feature = "server")]
 macro_rules! io_fault_check {
     ($name:expr) => {
         if let Some(e) = $crate::storage::crashpoint::io_fault($name) {
@@ -165,6 +169,7 @@ macro_rules! io_fault_check {
         }
     };
 }
+#[cfg(feature = "server")]
 pub(crate) use io_fault_check;
 
 /// Abort the process if `name` is the armed crashpoint and its skip count is

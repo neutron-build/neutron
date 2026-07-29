@@ -156,6 +156,10 @@ impl DatabaseBuilder {
         };
         #[cfg(not(feature = "server"))]
         let catalog_path: Option<std::path::PathBuf> = None;
+        // Only DurableMvcc sets `catalog_path`, and that mode is server-only, so
+        // in a core-only build this is dead code that still has to compile —
+        // against a `persistence` module that does not exist there.
+        #[cfg(feature = "server")]
         if let Some(ref cp) = catalog_path {
             let persistence = crate::storage::persistence::CatalogPersistence::new(cp);
             if let Err(e) = persistence.load_catalog_sync(&catalog) {
