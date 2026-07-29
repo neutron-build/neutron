@@ -855,6 +855,18 @@ impl ColumnarStore {
         Some(mt.scan_matching_shared(predicate_col, bounds))
     }
 
+    /// Surviving parts of a MergeTree, each narrowed to the row range that can
+    /// match. `None` when the table is not a MergeTree.
+    pub fn batches_pruned_slices(
+        &self,
+        table: &str,
+        predicate_col: &str,
+        bounds: &[(CmpOp, ScalarValue)],
+    ) -> Option<Vec<PartSlice>> {
+        let mt = self.merge_trees.get(table)?;
+        Some(mt.scan_matching_slices(predicate_col, bounds))
+    }
+
     /// Shared handles to every part of a MergeTree. `None` when the table is
     /// not a MergeTree.
     pub fn batches_all_shared(&self, table: &str) -> Option<Vec<std::sync::Arc<ColumnBatch>>> {
@@ -2855,6 +2867,120 @@ pub struct MergeTree {
     pub merge_strategy: MergeStrategy,
 }
 
+/// A contiguous run of rows inside one part.
+///
+/// Zone maps prune at PART granularity, which answers "can this part match?"
+/// but not "where in it". A part holding 50k rows sorted by `ts` and a window
+/// covering five of them were, until this existed, the same amount of work —
+/// the whole part was read and then filtered. Because the part is sorted by its
+/// key, the answer is a contiguous range and binary search finds it exactly.
+/// ClickHouse approximates this with marks every `index_granularity` rows
+/// because its parts live on disk; for an in-memory part, searching the column
+/// itself is both exact and cheaper than maintaining a second structure.
+pub struct PartSlice {
+    pub batch: std::sync::Arc<ColumnBatch>,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl PartSlice {
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Compare the value at `idx` against `scalar`. `None` when the column and the
+/// scalar are different kinds, or the value is NULL — neither can be ordered,
+/// and a bound that cannot be compared must never narrow anything.
+fn coldata_cmp_scalar(col: &ColumnData, idx: usize, scalar: &ScalarValue) -> Option<std::cmp::Ordering> {
+    match (col, scalar) {
+        (ColumnData::Int64(v), ScalarValue::Int64(s)) => v.get(idx)?.as_ref().map(|x| x.cmp(s)),
+        (ColumnData::Int32(v), ScalarValue::Int32(s)) => v.get(idx)?.as_ref().map(|x| x.cmp(s)),
+        (ColumnData::Float64(v), ScalarValue::Float64(s)) => {
+            v.get(idx)?.as_ref().and_then(|x| x.partial_cmp(s))
+        }
+        (ColumnData::Text(v), ScalarValue::Text(s)) => {
+            v.get(idx)?.as_ref().map(|x| x.as_str().cmp(s.as_str()))
+        }
+        (ColumnData::Bool(v), ScalarValue::Bool(s)) => v.get(idx)?.as_ref().map(|x| x.cmp(s)),
+        _ => None,
+    }
+}
+
+/// The row range of a SORTED column that can satisfy `bounds`.
+///
+/// Returns `None` when the range cannot be narrowed — an incomparable bound, a
+/// NULL anywhere in the searched region, an operator with no ordered meaning —
+/// in which case the caller must read the whole part. Narrowing is an
+/// optimisation and the caller rechecks every row it returns, so the only
+/// unacceptable outcome is narrowing too much.
+fn sorted_range(col: &ColumnData, bounds: &[(CmpOp, ScalarValue)]) -> Option<(usize, usize)> {
+    let n = col.len();
+    if n == 0 || bounds.is_empty() {
+        return None;
+    }
+    // Every value must be comparable to every bound, or a binary search over
+    // the column is not answering the question asked. Checking the endpoints
+    // catches a type mismatch; a NULL in the middle of a sorted column would
+    // break ordering, so any NULL disables narrowing.
+    for (_, scalar) in bounds {
+        coldata_cmp_scalar(col, 0, scalar)?;
+        coldata_cmp_scalar(col, n - 1, scalar)?;
+    }
+    let has_null = match col {
+        ColumnData::Bool(v) => v.iter().any(Option::is_none),
+        ColumnData::Int32(v) => v.iter().any(Option::is_none),
+        ColumnData::Int64(v) => v.iter().any(Option::is_none),
+        ColumnData::Float64(v) => v.iter().any(Option::is_none),
+        ColumnData::Text(v) => v.iter().any(Option::is_none),
+    };
+    if has_null {
+        return None;
+    }
+
+    let (mut lo, mut hi) = (0usize, n);
+    for (op, scalar) in bounds {
+        // `partition_point` over the sorted column: the number of rows for
+        // which the predicate is true, given the column is non-decreasing.
+        let first_ge = |s: &ScalarValue| -> usize {
+            let (mut a, mut b) = (0usize, n);
+            while a < b {
+                let m = a + (b - a) / 2;
+                match coldata_cmp_scalar(col, m, s) {
+                    Some(std::cmp::Ordering::Less) => a = m + 1,
+                    _ => b = m,
+                }
+            }
+            a
+        };
+        let first_gt = |s: &ScalarValue| -> usize {
+            let (mut a, mut b) = (0usize, n);
+            while a < b {
+                let m = a + (b - a) / 2;
+                match coldata_cmp_scalar(col, m, s) {
+                    Some(std::cmp::Ordering::Greater) => b = m,
+                    _ => a = m + 1,
+                }
+            }
+            a
+        };
+        match op {
+            CmpOp::Gte => lo = lo.max(first_ge(scalar)),
+            CmpOp::Gt => lo = lo.max(first_gt(scalar)),
+            CmpOp::Lte => hi = hi.min(first_gt(scalar)),
+            CmpOp::Lt => hi = hi.min(first_ge(scalar)),
+            CmpOp::Eq => {
+                lo = lo.max(first_ge(scalar));
+                hi = hi.min(first_gt(scalar));
+            }
+        }
+    }
+    Some((lo.min(n), hi.clamp(lo.min(n), n)))
+}
+
 impl MergeTree {
     pub fn new(primary_key: Vec<String>) -> Self {
         MergeTree {
@@ -3322,6 +3448,53 @@ impl MergeTree {
     /// Scan all parts (no predicate, full scan).
     ///
     /// Loads cold parts from disk as needed.
+    /// Surviving parts, each narrowed to the row range that can match.
+    ///
+    /// Two levels of skipping: the zone map rules out whole parts, then — when
+    /// the predicate is on the FIRST key column, which is the one the part is
+    /// sorted by — binary search narrows what is left to a contiguous range.
+    /// Without the second level a window landing inside a part read the whole
+    /// part, which on 200k rows was 37.6ms against plain columnar's 7.3ms.
+    ///
+    /// A range that cannot be established (bound of a different type, NULLs in
+    /// the column, a predicate on some other column) yields the whole part.
+    /// Narrowing is an optimisation and every row is rechecked above, so the
+    /// only unacceptable outcome is narrowing too much.
+    pub fn scan_matching_slices(
+        &self,
+        predicate_col: &str,
+        bounds: &[(CmpOp, ScalarValue)],
+    ) -> Vec<PartSlice> {
+        let sorted_by_predicate = self
+            .primary_key
+            .first()
+            .is_some_and(|k| k == predicate_col);
+
+        let narrow = |batch: std::sync::Arc<ColumnBatch>| -> PartSlice {
+            let full = PartSlice {
+                start: 0,
+                end: batch.row_count,
+                batch: std::sync::Arc::clone(&batch),
+            };
+            if !sorted_by_predicate {
+                return full;
+            }
+            match batch
+                .column(predicate_col)
+                .and_then(|col| sorted_range(col, bounds))
+            {
+                Some((start, end)) => PartSlice { batch, start, end },
+                None => full,
+            }
+        };
+
+        self.scan_matching_shared(predicate_col, bounds)
+            .into_iter()
+            .map(narrow)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
     /// Every part as a shared handle — the unpruned read path, without the
     /// deep copy `scan_all` makes.
     pub fn scan_all_shared(&self) -> Vec<std::sync::Arc<ColumnBatch>> {
