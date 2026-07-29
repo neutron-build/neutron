@@ -3388,6 +3388,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -3395,6 +3396,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                 ],
                 constraints: vec![],
@@ -3750,6 +3752,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                     ColumnDef {
                         name: "label".into(),
@@ -3757,6 +3760,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                     ColumnDef {
                         name: "score".into(),
@@ -3764,6 +3768,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -3771,6 +3776,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                 ],
                 constraints: vec![],
@@ -4236,6 +4242,7 @@ mod tests {
                     nullable: false,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
                 ColumnDef {
                     name: "b".into(),
@@ -4243,6 +4250,7 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
                 ColumnDef {
                     name: "c".into(),
@@ -4250,6 +4258,7 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
                 ColumnDef {
                     name: "d".into(),
@@ -4257,6 +4266,7 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
                 ColumnDef {
                     name: "e".into(),
@@ -4264,6 +4274,7 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
             ],
             constraints: vec![],

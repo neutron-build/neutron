@@ -348,6 +348,7 @@ pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, Par
                 // 1-based so `0` stays available as "no id recorded" for
                 // columns read from a pre-id snapshot.
                 id: idx as u32 + 1,
+                    analyzer: None,
             })
         })
         .collect()

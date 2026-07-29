@@ -735,6 +735,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -742,6 +743,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
+                    analyzer: None,
                     },
                 ],
                 constraints: vec![],

@@ -29,8 +29,50 @@ pub struct Token {
     pub position: usize,
 }
 
+/// How text is turned into terms, named after PostgreSQL's text search
+/// configurations.
+///
+/// The choice has to be the SAME for the documents an index holds and for the
+/// `@@` recheck that runs over candidate rows. The index only ever proposes
+/// candidates — `@@` is defined row-locally so it is correct with or without an
+/// index — but if the two disagree the index stops proposing rows that match,
+/// and that is a wrong answer, not a slow one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Analyzer {
+    /// Lowercase, drop English stopwords, Porter-stem. Right for prose.
+    #[default]
+    English,
+    /// Lowercase only. Right for identifiers, codes, SKUs and log lines, where
+    /// stemming mangles terms and stopword removal deletes real ones (`a`, `it`,
+    /// `no` are all words a code search needs).
+    Simple,
+}
+
+impl Analyzer {
+    /// Parse an `analyzer = '…'` index option.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "english" | "default" => Some(Analyzer::English),
+            "simple" | "none" | "keyword" => Some(Analyzer::Simple),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Analyzer::English => "english",
+            Analyzer::Simple => "simple",
+        }
+    }
+}
+
 /// Tokenize text: lowercase, split on non-alphanumeric, filter stopwords, stem.
 pub fn tokenize(text: &str) -> Vec<Token> {
+    tokenize_with(text, Analyzer::English)
+}
+
+/// Tokenize under a specific analyzer.
+pub fn tokenize_with(text: &str, analyzer: Analyzer) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut position = 0;
 
@@ -40,14 +82,16 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             continue;
         }
         let lower = word.to_lowercase();
-        if is_stopword(&lower) {
-            continue;
-        }
-        let stemmed = stem(&lower);
-        tokens.push(Token {
-            term: stemmed,
-            position,
-        });
+        let term = match analyzer {
+            Analyzer::English => {
+                if is_stopword(&lower) {
+                    continue;
+                }
+                stem(&lower)
+            }
+            Analyzer::Simple => lower,
+        };
+        tokens.push(Token { term, position });
         position += 1;
     }
 
@@ -386,6 +430,11 @@ pub struct InvertedIndex {
     /// Optional WAL for binary persistence.
     #[serde(skip)]
     wal: Option<Arc<fts_wal::FtsWal>>,
+    /// How this index turns text into terms. Every document it holds and every
+    /// query it answers use this; the `@@` recheck over its candidates must use
+    /// the same one or the index silently stops proposing matching rows.
+    #[serde(default)]
+    analyzer: Analyzer,
 }
 
 impl Default for InvertedIndex {
@@ -396,6 +445,12 @@ impl Default for InvertedIndex {
 
 impl InvertedIndex {
     pub fn new() -> Self {
+        Self::with_analyzer(Analyzer::English)
+    }
+
+    /// An index that tokenizes with `analyzer`. Whatever reads it back must use
+    /// the same one — see [`Analyzer`].
+    pub fn with_analyzer(analyzer: Analyzer) -> Self {
         Self {
             postings: HashMap::new(),
             docs: HashMap::new(),
@@ -403,7 +458,13 @@ impl InvertedIndex {
             doc_count: 0,
             total_length: 0,
             wal: None,
+            analyzer,
         }
+    }
+
+    /// The analyzer this index was built with.
+    pub fn analyzer(&self) -> Analyzer {
+        self.analyzer
     }
 
     /// Open a WAL-backed inverted index from a directory.
@@ -419,6 +480,7 @@ impl InvertedIndex {
             doc_count: 0,
             total_length: 0,
             wal: Some(Arc::new(wal)),
+            analyzer: Analyzer::English,
         };
         // Re-index every recovered document (re-tokenize from original text).
         for (doc_id, text) in state.docs {
@@ -458,7 +520,7 @@ impl InvertedIndex {
             self.remove_document_internal(doc_id);
         }
 
-        let tokens = tokenize(text);
+        let tokens = tokenize_with(text, self.analyzer);
         let doc_length = tokens.len();
 
         // Track document info
@@ -547,7 +609,7 @@ impl InvertedIndex {
         let original = self.get_original_text(doc_id)?;
 
         // Tokenize query to get search terms (lowercased via tokenizer)
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         let terms: std::collections::HashSet<String> =
             query_tokens.iter().map(|t| t.term.clone()).collect();
 
@@ -614,7 +676,7 @@ impl InvertedIndex {
     /// Much faster than `search()` for single-document membership tests
     /// because it skips BM25 scoring entirely.
     pub fn contains_doc(&self, doc_id: u64, query: &str) -> bool {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         for token in &query_tokens {
             if let Some(postings) = self.postings.get(&token.term)
                 && postings.iter().any(|p| p.doc_id == doc_id)
@@ -776,7 +838,7 @@ impl InvertedIndex {
         limit: usize,
         facet_fields: &[&str],
     ) -> FacetedSearchResult {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         if query_tokens.is_empty() {
             return FacetedSearchResult {
                 results: vec![],
@@ -850,7 +912,7 @@ impl InvertedIndex {
         field: &str,
         value: &str,
     ) -> Vec<(u64, f64)> {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         if query_tokens.is_empty() {
             return vec![];
         }
@@ -897,7 +959,7 @@ impl InvertedIndex {
     /// evaluated first. This improves cache locality and enables early pruning
     /// when combined with intersection-based queries.
     pub fn search(&self, query: &str, limit: usize) -> Vec<(u64, f64)> {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         if query_tokens.is_empty() {
             return vec![];
         }
@@ -952,7 +1014,7 @@ impl InvertedIndex {
     /// Unlike `search()` (which uses OR semantics — any term matches),
     /// `search_scored()` requires ALL query terms to appear in a document.
     pub fn search_scored(&self, query: &str, limit: usize) -> Vec<(u64, f64)> {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         if query_tokens.is_empty() {
             return vec![];
         }
@@ -1083,7 +1145,7 @@ impl InvertedIndex {
     /// `N`, `avgdl`, and one document frequency per query term.
     pub fn bm25_stats(&self, query: &str) -> Bm25Stats {
         let mut df: HashMap<String, usize> = HashMap::new();
-        for token in tokenize(query) {
+        for token in tokenize_with(query, self.analyzer) {
             if df.contains_key(&token.term) {
                 continue;
             }
@@ -1141,7 +1203,7 @@ impl InvertedIndex {
     /// `std::thread::scope`. Below the threshold, falls back to the
     /// single-threaded `search` method.
     pub fn par_search(&self, query: &str, limit: usize) -> Vec<(u64, f64)> {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         if query_tokens.is_empty() {
             return vec![];
         }
@@ -1219,7 +1281,7 @@ impl InvertedIndex {
     /// Falls back to single-threaded `search_scored` when the candidate
     /// set is below `PAR_SCORE_THRESHOLD` (500 docs).
     pub fn par_search_scored(&self, query: &str, limit: usize) -> Vec<(u64, f64)> {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_with(query, self.analyzer);
         if query_tokens.is_empty() {
             return vec![];
         }
@@ -1344,6 +1406,7 @@ impl InvertedIndex {
 
         // Phase 1: tokenize in parallel.
         // Each thread returns (doc_id, doc_length, term→positions).
+        let analyzer = self.analyzer;
         let tokenized: Vec<(u64, usize, HashMap<String, Vec<usize>>)> = std::thread::scope(|s| {
             let handles: Vec<_> = docs
                 .chunks(chunk_size)
@@ -1351,7 +1414,7 @@ impl InvertedIndex {
                     s.spawn(move || {
                         let mut results = Vec::with_capacity(chunk.len());
                         for &(doc_id, text) in chunk {
-                            let tokens = tokenize(text);
+                            let tokens = tokenize_with(text, analyzer);
                             let doc_length = tokens.len();
                             let mut term_positions: HashMap<String, Vec<usize>> = HashMap::new();
                             for token in &tokens {
@@ -1472,12 +1535,20 @@ pub fn bm25_score(text: &str, stats: &Bm25Stats) -> f64 {
 ///
 /// An empty query matches nothing, mirroring `search_scored`.
 pub fn text_matches(text: &str, query: &str) -> bool {
-    let query_tokens = tokenize(query);
+    text_matches_with(text, query, Analyzer::English)
+}
+
+/// `@@` under a specific analyzer. Must match the analyzer the column's FTS
+/// index was built with — see [`Analyzer`].
+pub fn text_matches_with(text: &str, query: &str, analyzer: Analyzer) -> bool {
+    let query_tokens = tokenize_with(query, analyzer);
     if query_tokens.is_empty() {
         return false;
     }
-    let doc_terms: std::collections::HashSet<String> =
-        tokenize(text).into_iter().map(|t| t.term).collect();
+    let doc_terms: std::collections::HashSet<String> = tokenize_with(text, analyzer)
+        .into_iter()
+        .map(|t| t.term)
+        .collect();
     query_tokens.iter().all(|t| doc_terms.contains(&t.term))
 }
 
@@ -1802,7 +1873,7 @@ impl InvertedIndex {
     /// max contribution can't push a document into the top-k are skipped.
     /// This provides 2-5x speedup over exhaustive scoring for long posting lists.
     pub fn search_bmw(&self, query: &str, k: usize) -> Vec<(u64, f64)> {
-        let tokens = tokenize(query);
+        let tokens = tokenize_with(query, self.analyzer);
         if tokens.is_empty() || k == 0 {
             return Vec::new();
         }

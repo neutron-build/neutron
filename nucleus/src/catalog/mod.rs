@@ -46,6 +46,20 @@ pub struct ColumnDef {
     /// pre-id snapshot. Those are backfilled by position on load, so `0` should
     /// not survive into a live catalog.
     pub id: u32,
+    /// How text in this column is turned into search terms — `None` means the
+    /// engine default (`english`).
+    ///
+    /// This belongs to the COLUMN, not to any index over it. `@@` is defined
+    /// row-locally so that adding an index cannot change an answer; hanging the
+    /// analyzer on the index would make `CREATE INDEX` redefine the operator
+    /// for that column, and `DROP INDEX` redefine it back. An FTS index reads
+    /// this value and must agree with it — the index only proposes candidates,
+    /// and a recheck that tokenizes differently silently drops rows that match.
+    ///
+    /// This is also the layer an explicit per-query form would default from,
+    /// the way PostgreSQL's `default_text_search_config` backs
+    /// `to_tsvector(config, text)`.
+    pub analyzer: Option<String>,
 }
 
 /// A table-level constraint.
@@ -644,6 +658,7 @@ mod tests {
                     nullable: false,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -651,6 +666,7 @@ mod tests {
                     nullable: false,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
                 ColumnDef {
                     name: "active".into(),
@@ -658,6 +674,7 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     id: 0,
+                    analyzer: None,
                 },
             ],
             constraints: vec![],
@@ -688,6 +705,7 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 id: 0,
+                    analyzer: None,
             }],
             constraints: vec![],
             append_only: false,
@@ -810,6 +828,7 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 id: 0,
+                    analyzer: None,
             }],
             constraints: vec![],
             append_only: false,

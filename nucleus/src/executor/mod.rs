@@ -1320,7 +1320,17 @@ impl Executor {
                 .scan(&idx.table_name)
                 .await
                 .unwrap_or_default();
-            let mut index = crate::fts::InvertedIndex::new();
+            // Rebuild with the COLUMN's analyzer — a restart that re-tokenized
+            // the corpus differently from the `@@` recheck would silently stop
+            // matching rows.
+            let analyzer = table_def
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&col_name))
+                .and_then(|c| c.analyzer.as_deref())
+                .and_then(crate::fts::Analyzer::parse)
+                .unwrap_or_default();
+            let mut index = crate::fts::InvertedIndex::with_analyzer(analyzer);
             for row in &rows {
                 let Some(doc_id) = Self::stable_row_id(row, pk_idx) else {
                     continue;

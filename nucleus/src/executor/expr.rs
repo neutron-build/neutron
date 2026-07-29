@@ -959,6 +959,32 @@ impl Executor {
     ) -> Result<Value, ExecError> {
         let _guard = ExprDepthGuard::enter()?;
         match expr {
+            // Handled before the operands collapse to two bare `Value`s: which
+            // analyzer `@@` uses depends on the column on the left. The plan
+            // evaluator does the same — two evaluators over one operator is how
+            // `TIMESTAMP '…'` came to mean different things in a projection and
+            // a WHERE, and this operator has the same exposure.
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::AtAt,
+                right,
+            } => {
+                let text = self.eval_row_expr(left, row, col_meta)?;
+                let query = self.eval_row_expr(right, row, col_meta)?;
+                let (Value::Text(text), Value::Text(query)) = (text, query) else {
+                    // Same refusal the generic operator path gives: `@@` on a
+                    // non-text operand is a mistake, not a false.
+                    return Err(ExecError::Unsupported(
+                        "@@ requires text operands: `column @@ 'query'`".into(),
+                    ));
+                };
+                let analyzer = Self::column_ref_name(left)
+                    .map(|col| self.fts_analyzer_for(col_meta, &col))
+                    .unwrap_or_default();
+                Ok(Value::Bool(crate::fts::text_matches_with(
+                    &text, &query, analyzer,
+                )))
+            }
             Expr::Identifier(ident) => {
                 let idx = self.resolve_column(col_meta, None, &ident.value)?;
                 Ok(row[idx].clone())
