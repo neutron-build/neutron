@@ -31,6 +31,7 @@ Gmail / Graph / IMAP / JMAP     mail lives here
 | `store.go` | `PgStore` — the mirror, over pgwire |
 | `schema.go` | DDL; runs on Nucleus or stock PostgreSQL |
 | `scheduler.go` | Periodic sync, per-account backoff |
+| `tokensource.go` | Token callback — how background sync gets a credential |
 | `send.go` | SMTP submission, reply threading |
 | `service.go` | HTTP surface, RFC 7807 errors |
 | `imap/` | Hand-rolled IMAP client, CONDSTORE + QRESYNC |
