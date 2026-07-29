@@ -233,6 +233,24 @@ pub struct MetricsRegistry {
     pub index_join_attempts: Counter,
     pub index_join_used: Counter,
     pub index_join_skipped: Counter,
+    /// Plans whose `IndexScan` node was reached — the planner decided an index
+    /// was the right access path.
+    pub index_scan_attempts: Counter,
+    /// `IndexScan` nodes that the index actually answered.
+    pub index_scan_served: Counter,
+    /// `IndexScan` nodes that gave up and let a sequential scan answer instead.
+    ///
+    /// This is the number that had nowhere to be seen: an index that exists but
+    /// cannot serve the predicate, an index that is unusable inside a
+    /// transaction, and a table with no index at all were all the same silent
+    /// `if let Ok(Some(rows))` miss. A query that quietly stopped using its
+    /// index looks identical to one that never had it, in a system whose whole
+    /// failure mode is "answers stayed correct and only cost changed".
+    pub index_scan_fallbacks: Counter,
+    /// Planned queries that declined to execute and fell back to the AST path.
+    pub plan_path_fallbacks: Counter,
+    /// Planned queries that failed with a real error rather than declining.
+    pub plan_path_errors: Counter,
     pub wal_bytes_written: Counter,
     pub wal_syncs: Counter,
     pub cache_hits: Counter,
@@ -292,6 +310,26 @@ impl MetricsRegistry {
             index_join_skipped: Counter::new(
                 "nucleus_index_join_skipped_total",
                 "Index-join optimizations skipped",
+            ),
+            index_scan_attempts: Counter::new(
+                "nucleus_index_scan_attempts_total",
+                "Index scan plan nodes reached",
+            ),
+            index_scan_served: Counter::new(
+                "nucleus_index_scan_served_total",
+                "Index scan plan nodes answered by the index",
+            ),
+            index_scan_fallbacks: Counter::new(
+                "nucleus_index_scan_fallbacks_total",
+                "Index scan plan nodes that fell back to a sequential scan",
+            ),
+            plan_path_fallbacks: Counter::new(
+                "nucleus_plan_path_fallbacks_total",
+                "Planned queries that declined and fell back to the AST path",
+            ),
+            plan_path_errors: Counter::new(
+                "nucleus_plan_path_errors_total",
+                "Planned queries that failed with a real error",
             ),
             wal_bytes_written: Counter::new("nucleus_wal_bytes_written_total", "WAL bytes written"),
             wal_syncs: Counter::new("nucleus_wal_syncs_total", "WAL sync operations"),
@@ -381,6 +419,11 @@ impl MetricsRegistry {
         render_counter(&mut out, &self.index_join_attempts);
         render_counter(&mut out, &self.index_join_used);
         render_counter(&mut out, &self.index_join_skipped);
+        render_counter(&mut out, &self.plan_path_errors);
+        render_counter(&mut out, &self.plan_path_fallbacks);
+        render_counter(&mut out, &self.index_scan_fallbacks);
+        render_counter(&mut out, &self.index_scan_served);
+        render_counter(&mut out, &self.index_scan_attempts);
         render_counter(&mut out, &self.wal_bytes_written);
         render_counter(&mut out, &self.wal_syncs);
         render_counter(&mut out, &self.cache_hits);
@@ -453,6 +496,11 @@ impl MetricsRegistry {
         add_counter(&mut rows, &self.index_join_attempts);
         add_counter(&mut rows, &self.index_join_used);
         add_counter(&mut rows, &self.index_join_skipped);
+        add_counter(&mut rows, &self.plan_path_errors);
+        add_counter(&mut rows, &self.plan_path_fallbacks);
+        add_counter(&mut rows, &self.index_scan_fallbacks);
+        add_counter(&mut rows, &self.index_scan_served);
+        add_counter(&mut rows, &self.index_scan_attempts);
         add_counter(&mut rows, &self.wal_bytes_written);
         add_counter(&mut rows, &self.wal_syncs);
         add_counter(&mut rows, &self.cache_hits);
@@ -685,8 +733,8 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 18 counters + 7 gauges + 1 uptime + 1 histogram = 27
-        assert_eq!(rows.len(), 27);
+        // 23 counters + 7 gauges + 1 uptime + 1 histogram = 32
+        assert_eq!(rows.len(), 32);
 
         // Check a counter row
         let qt = rows
