@@ -394,6 +394,34 @@ fn batches_to_rows(batches: &[ColumnBatch]) -> Vec<Row> {
     rows
 }
 
+/// Reconstruct rows containing ONLY `projection`, in that order.
+///
+/// The whole point of a column store is not touching columns a query never
+/// mentions. Without this the engine inherited the default `scan_projected`,
+/// which calls `scan()` and discards columns afterwards — so a
+/// `SELECT AVG(dur) … ` over a 17-column span table decoded every JSONB blob
+/// in the table to throw them away, and the columnar layout was pure overhead.
+/// That is why the columnar engine measured SLOWER than the row heap.
+fn batches_to_rows_projected(batches: &[ColumnBatch], projection: &[usize]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_i in 0..batch.row_count {
+            let row: Row = projection
+                .iter()
+                .map(|&col_i| match batch.columns.get(col_i) {
+                    Some((_, col)) => coldata_get(col, row_i),
+                    // A projection index past this batch's width (schema
+                    // evolution: the column was added after this batch was
+                    // written) reads as NULL, matching a full scan.
+                    None => crate::types::Value::Null,
+                })
+                .collect();
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 /// Reconstruct at most `limit` rows, stopping as soon as the limit is reached so
 /// the tail rows are never assembled (no `Value` allocation for them). Batches
 /// are already dedup-resolved by `batches_all_for_select`, so the first `limit`
@@ -842,6 +870,23 @@ impl StorageEngine for ColumnarStorageEngine {
         // tables pass through unchanged.
         let batches = store.batches_all_for_select(table);
         Ok(batches_to_rows(&batches))
+    }
+
+    /// Read only the projected columns. The default implementation scans every
+    /// column and discards the unwanted ones, which defeats the entire purpose
+    /// of a column store; `DiskEngine` already overrides it for the same reason.
+    async fn scan_projected(
+        &self,
+        table: &str,
+        projection: &[usize],
+    ) -> Result<Vec<Row>, StorageError> {
+        self.flush_write_buffer(table);
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        }
+        let batches = store.batches_all_for_select(table);
+        Ok(batches_to_rows_projected(&batches, projection))
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
