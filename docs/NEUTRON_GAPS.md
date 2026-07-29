@@ -14,6 +14,26 @@ evidence.
 
 ## FIXED
 
+### Rust Nucleus client had no table-attached FTS
+**Where:** `rust/crates/neutron-nucleus/src/models/fts.rs`
+
+The client only spoke the doc-id sidecar API (`FTS_INDEX`, `FTS_SEARCH`), which
+returns `(doc_id, score)` pairs rather than rows — not joinable, not
+filterable, not covered by row-level security. The table-attached index shipped
+in `1bb99cc` and the client never caught up.
+
+Fixed: added `create_index`, `drop_index`, `matches` (`@@`), and `bm25`, which
+return real primary keys from real tables. The document-store methods stay for
+corpora with no table behind them and for fuzzy search, which the
+table-attached index does not yet expose; the module doc now says which to
+reach for.
+
+Table and column names interpolate into DDL, where bind parameters are not
+allowed, so identifiers are validated and rejected rather than quoted — quoting
+a hostile identifier still lets it terminate the quote. Tested against the
+obvious escapes.
+
+
 ### neutron-oauth could not redeem a refresh token
 **Where:** `rust/crates/neutron-oauth/src/token.rs`
 **Hit while:** building the mail connector, which needs long-lived provider access.
@@ -71,19 +91,6 @@ check. Either adopt `rust-stemmers`, or gate each rule on a measure function.
 **Worked around** in `mail/store.go` with a characterisation test
 (`TestIntegrationSearchMatchesOnWordsNotSubstrings`) that pins current
 behaviour and fails loudly once this is fixed.
-
-### Rust Nucleus client still on the legacy doc-id FTS API
-**Where:** `rust/crates/neutron-nucleus/src/models/fts.rs`
-**Severity:** medium — silently gives worse results than the engine can produce.
-
-The client calls `FTS_INDEX` / `FTS_SEARCH`, the doc-id sidecar API that
-predates the table-attached index shipped in `1bb99cc`. The legacy scalar
-functions still exist so nothing is broken, but the client cannot return rows —
-only `(doc_id, score)` pairs — so results are not joinable, not filterable, and
-not covered by row-level security.
-
-The engine feature is now on `main`. The client should gain the row-returning
-path: `CREATE INDEX ... USING FTS`, matched with `@@`, ranked by `BM25()`.
 
 ### `nucleus start` has no `--config` flag
 **Severity:** low, but it blocks automation.
