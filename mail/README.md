@@ -64,9 +64,10 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mail go run ./cmd/neutron-mail
 
 Serves on `:8090`. `GET /health` reports `{status, nucleus, version}`.
 
-Adapters are not wired in `main.go`, because constructing one needs a
-credential per account and credential custody is deployment-specific. With
-none wired the service serves the mirror read-only, which is a safe default.
+Adapters are built per request from the credential the caller sends, so the
+engine stores none of its own. Background sync uses a token callback: the
+engine asks the application for a fresh token, because with no request in
+flight there is nothing to carry one. See `tokensource.go`.
 
 ## Testing
 
@@ -110,7 +111,7 @@ test would have found that.
 
 ## Status
 
-130 Go tests and 16 TypeScript tests, all passing, including the live oracle
+148 Go tests and 16 TypeScript tests, all passing, including the live oracle
 against GreenMail and the store suite against a real Nucleus.
 
 **Gmail and Graph have never been run against live servers.** They are written
@@ -118,12 +119,17 @@ against the documented APIs and unit-tested over their normalization logic,
 but verifying them needs real accounts and registered OAuth apps. JMAP is
 unit-tested against a stub server rather than a live one, for the same reason.
 
-Adapters are not wired in `main.go`; see Running above.
+Search matches with Nucleus's `@@` — stemmed terms, stopwords dropped, every
+term required — rather than `LIKE`. It runs without an index: the
+table-attached FTS index needs an integer `PRIMARY KEY`, and `mail_messages` is
+keyed on `(account_id, id)`, text, because message identity comes from provider
+IDs and Message-ID headers rather than being minted locally. `@@` is defined
+row-locally so it stays correct unindexed; it just scans. Results order by
+recency, which is the right default for mail anyway.
 
-Search currently uses `LIKE`. The table-attached full-text index
-(`CREATE INDEX ... USING FTS`, `@@`, `BM25`) is the intended implementation
-and lives on an unmerged Nucleus branch; swapping the body of `PgStore.Search`
-is the only change required.
+One caveat worth knowing: Nucleus's English stemmer currently stems singular
+and plural forms of many nouns differently, so searching "folder" will not find
+"folders". See `docs/NEUTRON_GAPS.md`.
 
 ## Before serving Gmail users
 
