@@ -528,3 +528,59 @@ async fn test_key_set_probe_does_not_change_answers() {
         assert_eq!(matched, expected, "{label}: wrong row count — {sql}");
     }
 }
+
+/// Zone maps may only prune a complete scan, in scan order.
+///
+/// Granule statistics are positional: granule `i` describes the rows at offset
+/// `i * GRANULE_SIZE` of a full scan. Handed any other row set — index-probe
+/// hits, a LIMIT-truncated scan — granule `i`'s min/max is charged against
+/// whatever rows happen to sit at that offset, and rows that match get dropped.
+///
+/// The existing safety net compares granule row counts against the row count
+/// being filtered, which reads as a guard and is not one: equal counts are not
+/// evidence that these are the same rows. A single index hit was pruned by a
+/// single-granule zone map and `WHERE id IN (6)` returned nothing for a row
+/// that existed, while `WHERE id = 6` on the same row returned it.
+#[tokio::test]
+async fn test_index_hits_are_not_pruned_by_positional_zone_maps() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE z (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL, tag TEXT NOT NULL)",
+    )
+    .await;
+    let vals: Vec<String> = (1..=29)
+        .map(|i| format!("({i},{i},'{}')", if i % 3 == 0 { "keep" } else { "move" }))
+        .collect();
+    exec(&ex, &format!("INSERT INTO z VALUES {}", vals.join(","))).await;
+    // An UPDATE that rewrites most of the table, then an INSERT — the shape
+    // that leaves the zone map describing a different row set than the index.
+    exec(&ex, "UPDATE z SET c1 = 1 WHERE tag <> 'keep'").await;
+    exec(&ex, "INSERT INTO z VALUES (30, -5, 'new')").await;
+
+    for (label, sql, expected) in [
+        ("equality", "SELECT id FROM z WHERE id = 6", vec![6]),
+        ("key set", "SELECT id FROM z WHERE id IN (6)", vec![6]),
+        (
+            "multi key set",
+            "SELECT id FROM z WHERE id IN (6, 30)",
+            vec![6, 30],
+        ),
+        (
+            "key set with a residual predicate",
+            "SELECT id FROM z WHERE id IN (6) AND tag = 'keep'",
+            vec![6],
+        ),
+    ] {
+        ex.clear_all_query_caches();
+        let got: Vec<i64> = rows(&exec(&ex, sql).await[0])
+            .iter()
+            .filter_map(|r| match r.first() {
+                Some(Value::Int32(n)) => Some(i64::from(*n)),
+                Some(Value::Int64(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, expected, "{label}: {sql}");
+    }
+}
