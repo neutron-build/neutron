@@ -2593,6 +2593,90 @@ mod tests {
         assert_eq!(*scalar(&res[0]), Value::Null);
     }
 
+    // Column pruning on the engine that actually ships.
+    //
+    // `DiskEngine::scan_projected` skips decoding non-projected columns, but
+    // production never talks to a `DiskEngine` directly — `main.rs` wraps every
+    // one of them in a `BufferedDiskEngine` for transaction atomicity. A trait
+    // method the wrapper does not forward silently falls back to the default
+    // (scan every column, then discard), so the pruning would exist only in
+    // tests that construct the inner engine themselves. Both the forwarded path
+    // and the in-transaction overlay path are exercised here.
+    #[tokio::test]
+    async fn test_projected_scan_through_the_production_engine() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("test.db"), catalog.clone()).unwrap());
+        let engine: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(Arc::clone(&disk)));
+        let ex = Arc::new(Executor::new(catalog, engine));
+
+        run(
+            &ex,
+            "CREATE TABLE wide (id INT PRIMARY KEY, a INT, b INT, c TEXT, d TEXT, \
+             e TEXT, f TEXT, g TEXT, h TEXT, payload TEXT)",
+        )
+        .await;
+        let filler = "x".repeat(64);
+        for i in 0..200 {
+            run(
+                &ex,
+                &format!(
+                    "INSERT INTO wide VALUES ({i}, {i}, {}, 'c{i}', 'd{i}', 'e{i}', \
+                     'f{i}', 'g{i}', 'h{i}', '{filler}')",
+                    i % 10
+                ),
+            )
+            .await;
+        }
+
+        // Auto-commit: forwarded straight to the disk engine's projected read.
+        let before = ex.metrics().values_scanned.get();
+        let scans_before = disk.projected_scan_count();
+        let res = run(&ex, "SELECT a FROM wide WHERE b > 0").await;
+        let read = ex.metrics().values_scanned.get() - before;
+        assert_eq!(rows(&res[0]).len(), 180, "9 of every 10 rows match b > 0");
+        assert_eq!(
+            read,
+            200 * 2,
+            "the query touches 2 of 10 columns; reading {read} values over 200 rows \
+             means the planner stopped narrowing the scan"
+        );
+        assert!(
+            disk.projected_scan_count() > scans_before,
+            "the narrowed scan never reached DiskEngine::scan_projected — the \
+             wrapper is not forwarding it, so column pruning does nothing here"
+        );
+
+        // Inside a transaction the buffered overlay is the authority on which
+        // rows exist, and it must narrow to the same columns.
+        run(&ex, "BEGIN").await;
+        run(
+            &ex,
+            &format!(
+                "INSERT INTO wide VALUES (999, 999, 5, 'c', 'd', 'e', 'f', 'g', 'h', '{filler}')"
+            ),
+        )
+        .await;
+        let res = run(&ex, "SELECT a FROM wide WHERE b > 0").await;
+        assert_eq!(
+            rows(&res[0]).len(),
+            181,
+            "a projected scan inside a transaction must see the buffered insert"
+        );
+        assert!(
+            rows(&res[0]).iter().all(|r| r.len() == 1),
+            "projected rows carry exactly the projected columns"
+        );
+        run(&ex, "ROLLBACK").await;
+
+        let res = run(&ex, "SELECT a FROM wide WHERE b > 0").await;
+        assert_eq!(rows(&res[0]).len(), 180, "rollback removed the buffered row");
+    }
+
     // Audit: ADD COLUMN on an INDEXED table (disk engine). The backfill's
     // update re-reads existing tuples for index maintenance, so verify the
     // index still resolves and the new column is writable afterward.

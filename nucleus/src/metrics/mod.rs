@@ -222,6 +222,13 @@ pub struct MetricsRegistry {
     pub queries_update: Counter,
     pub queries_delete: Counter,
     pub rows_scanned: Counter,
+    /// Column values materialized by table scans — `rows × width`.
+    ///
+    /// `rows_scanned` alone cannot see the difference between reading two
+    /// columns of a wide row and reading all seventeen, which is precisely the
+    /// cost a projected scan removes. A scan that narrows correctly shows up
+    /// here and nowhere else.
+    pub values_scanned: Counter,
     pub rows_returned: Counter,
     pub index_join_attempts: Counter,
     pub index_join_used: Counter,
@@ -269,6 +276,10 @@ impl MetricsRegistry {
             queries_update: Counter::new("nucleus_queries_update_total", "Total UPDATE queries"),
             queries_delete: Counter::new("nucleus_queries_delete_total", "Total DELETE queries"),
             rows_scanned: Counter::new("nucleus_rows_scanned_total", "Total rows scanned"),
+            values_scanned: Counter::new(
+                "nucleus_values_scanned_total",
+                "Total column values materialized by table scans",
+            ),
             rows_returned: Counter::new("nucleus_rows_returned_total", "Total rows returned"),
             index_join_attempts: Counter::new(
                 "nucleus_index_join_attempts_total",
@@ -365,6 +376,7 @@ impl MetricsRegistry {
         render_counter(&mut out, &self.queries_update);
         render_counter(&mut out, &self.queries_delete);
         render_counter(&mut out, &self.rows_scanned);
+        render_counter(&mut out, &self.values_scanned);
         render_counter(&mut out, &self.rows_returned);
         render_counter(&mut out, &self.index_join_attempts);
         render_counter(&mut out, &self.index_join_used);
@@ -436,6 +448,7 @@ impl MetricsRegistry {
         add_counter(&mut rows, &self.queries_update);
         add_counter(&mut rows, &self.queries_delete);
         add_counter(&mut rows, &self.rows_scanned);
+        add_counter(&mut rows, &self.values_scanned);
         add_counter(&mut rows, &self.rows_returned);
         add_counter(&mut rows, &self.index_join_attempts);
         add_counter(&mut rows, &self.index_join_used);
@@ -672,8 +685,8 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 17 counters + 7 gauges + 1 uptime + 1 histogram = 26
-        assert_eq!(rows.len(), 26);
+        // 18 counters + 7 gauges + 1 uptime + 1 histogram = 27
+        assert_eq!(rows.len(), 27);
 
         // Check a counter row
         let qt = rows

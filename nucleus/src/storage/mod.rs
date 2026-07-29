@@ -107,6 +107,20 @@ impl FilterOp {
     }
 }
 
+/// Narrow a materialized row to `projection`, in projection order.
+///
+/// An index past the row's width reads as NULL rather than shrinking the row:
+/// the caller pairs these rows with column metadata built from the same
+/// projection, and a row that silently loses a column stops lining up with it.
+/// (Schema evolution is the real source of a short row — a column added after
+/// this one was written.)
+pub(crate) fn project_row(row: &Row, projection: &[usize]) -> Row {
+    projection
+        .iter()
+        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
 /// The storage engine trait. All storage backends implement this.
 /// Principle 1: subsystems interact through clean abstractions.
 #[async_trait::async_trait]
@@ -377,23 +391,25 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// `projection` contains 0-based column indices into the table schema.
     /// The returned rows contain only those columns, in projection order.
-    /// Default: delegates to `scan()` and post-filters columns.
+    /// `limit`, when set, stops as soon as that many rows are assembled —
+    /// same contract as `scan_limit`, so a projected scan never gives up the
+    /// early exit a `LIMIT` would otherwise have had.
+    /// Default: delegates to `scan()`/`scan_limit()` and post-filters columns.
     /// Engines with page-level access (e.g. DiskEngine) override this to
     /// skip decoding non-projected columns during deserialization.
     async fn scan_projected(
         &self,
         table: &str,
         projection: &[usize],
+        limit: Option<usize>,
     ) -> Result<Vec<Row>, StorageError> {
-        let rows = self.scan(table).await?;
+        let rows = match limit {
+            Some(n) => self.scan_limit(table, n).await?,
+            None => self.scan(table).await?,
+        };
         Ok(rows
             .into_iter()
-            .map(|row| {
-                projection
-                    .iter()
-                    .filter_map(|&i| row.get(i).cloned())
-                    .collect()
-            })
+            .map(|row| project_row(&row, projection))
             .collect())
     }
 
@@ -828,6 +844,27 @@ impl StorageEngine for MemoryEngine {
             .get(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
         Ok(rows.clone())
+    }
+
+    /// Narrow each row as it is copied out of the table. The default
+    /// implementation would clone every row whole and then throw most of it
+    /// away, which makes a projected scan of a wide table *more* expensive
+    /// than an unprojected one.
+    async fn scan_projected(
+        &self,
+        table: &str,
+        projection: &[usize],
+        limit: Option<usize>,
+    ) -> Result<Vec<Row>, StorageError> {
+        let tables = self.tables.read().await;
+        let rows = tables
+            .get(table)
+            .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
+        Ok(rows
+            .iter()
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|row| project_row(row, projection))
+            .collect())
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {

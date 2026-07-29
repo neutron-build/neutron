@@ -31,7 +31,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use super::disk_engine::DiskEngine;
-use super::{StorageEngine, StorageError};
+use super::{StorageEngine, StorageError, project_row};
 use crate::types::{Row, Value};
 
 /// First synthetic position handed out for a row that exists only in a
@@ -358,6 +358,35 @@ impl StorageEngine for BufferedDiskEngine {
             .await?
             .into_iter()
             .map(|(_, row)| row)
+            .collect())
+    }
+
+    /// Delegate the projected read to the disk engine underneath.
+    ///
+    /// Without this override the trait default runs — `scan()` every column,
+    /// then discard — and `DiskEngine::scan_projected` becomes unreachable.
+    /// This wrapper is what production runs (`main.rs` wraps every `DiskEngine`
+    /// in it), so an un-overridden method here means the optimisation exists
+    /// only in tests that talk to the inner engine directly.
+    async fn scan_projected(
+        &self,
+        table: &str,
+        projection: &[usize],
+        limit: Option<usize>,
+    ) -> Result<Vec<Row>, StorageError> {
+        if !self.is_in_txn() {
+            return self.inner.scan_projected(table, projection, limit).await;
+        }
+        // With a live transaction buffer the overlay is the authority on which
+        // rows exist, and buffered inserts/deletes shift which ones are the
+        // "first n" — so materialize the buffered view and narrow it here.
+        let mut rows = self.scan(table).await?;
+        if let Some(n) = limit {
+            rows.truncate(n);
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| project_row(&row, projection))
             .collect())
     }
 

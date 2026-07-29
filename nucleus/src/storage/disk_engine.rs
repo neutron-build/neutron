@@ -195,6 +195,14 @@ pub struct DiskEngine {
     txn_state: parking_lot::Mutex<Option<DiskTxnState>>,
     /// Monotonically increasing transaction ID counter for WAL records.
     next_txn_id: AtomicU64,
+    /// Calls that reached [`StorageEngine::scan_projected`] on this engine.
+    ///
+    /// Column pruning has no observable effect on results — same rows, same
+    /// values, just less decoding — so nothing but a counter can tell a
+    /// projected read from a full one that was trimmed afterwards. That
+    /// distinction is exactly what got lost when the wrapper in front of this
+    /// engine did not forward the call.
+    projected_scans: AtomicU64,
     /// Serializes `save_table_directory` writers. Frame latches now make each
     /// individual page write atomic, but the directory spans page 0 plus a
     /// chain of overflow pages, and a latch is only ever held on one of them
@@ -708,6 +716,7 @@ impl DiskEngine {
             txn_state: parking_lot::Mutex::new(None),
             dir_save_lock: parking_lot::Mutex::new(()),
             next_txn_id: AtomicU64::new(1),
+            projected_scans: AtomicU64::new(0),
         };
 
         // For existing databases, load the table directory from the (potentially recovered) meta page
@@ -1233,6 +1242,12 @@ impl DiskEngine {
             .iter()
             .map(|(name, meta)| (name.clone(), meta.epoch))
             .collect()
+    }
+
+    /// How many projected scans this engine has served. See
+    /// [`DiskEngine::projected_scans`] for why this is worth counting.
+    pub fn projected_scan_count(&self) -> u64 {
+        self.projected_scans.load(AtomicOrdering::Relaxed)
     }
 
     // ========================================================================
@@ -2439,7 +2454,12 @@ impl StorageEngine for DiskEngine {
         &self,
         table: &str,
         projection: &[usize],
+        limit: Option<usize>,
     ) -> Result<Vec<Row>, StorageError> {
+        self.projected_scans.fetch_add(1, AtomicOrdering::Relaxed);
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let col_types = self.col_types(table)?;
         let pages = self.table_pages(table)?;
         let mut rows = Vec::new();
@@ -2462,10 +2482,18 @@ impl StorageEngine for DiskEngine {
                 .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             for (_slot_idx, tuple_data) in page::iter_tuples(&pg) {
-                if let Some(row) =
-                    tuple::deserialize_row_projected(tuple_data, &col_types, projection)
-                {
-                    rows.push(row);
+                match tuple::deserialize_row_projected(tuple_data, &col_types, projection) {
+                    Some(row) => rows.push(row),
+                    // Same contract as `scan`: a tuple that fails to deserialize is
+                    // corruption, not an empty row. Surface it instead of dropping
+                    // it silently.
+                    None => tracing::error!(
+                        target: "nucleus::storage",
+                        "failed to deserialize tuple on page {page_id} (slot {_slot_idx}); row omitted from projected scan"
+                    ),
+                }
+                if limit.is_some_and(|n| rows.len() >= n) {
+                    return Ok(rows);
                 }
             }
         }
