@@ -467,6 +467,25 @@ impl InvertedIndex {
         self.analyzer
     }
 
+    /// An upper bound on how many documents can match `query`, computed from
+    /// posting-list lengths without scoring anything.
+    ///
+    /// Matching is conjunctive, so no more documents can match than the
+    /// rarest term appears in. This exists so a caller can decide whether the
+    /// index is worth using BEFORE paying to build the hit set — the decision
+    /// and the work it is meant to avoid were otherwise the same operation.
+    pub fn max_matching_docs(&self, query: &str) -> usize {
+        let terms = tokenize_with(query, self.analyzer);
+        if terms.is_empty() {
+            return 0;
+        }
+        terms
+            .iter()
+            .map(|t| self.postings.get(&t.term).map_or(0, |p| p.len()))
+            .min()
+            .unwrap_or(0)
+    }
+
     /// Open a WAL-backed inverted index from a directory.
     ///
     /// Reads the WAL file (if it exists), replays all entries, and re-indexes

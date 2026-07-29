@@ -5998,6 +5998,25 @@ impl Executor {
         Some((entry.pk_column.clone(), hits.into_iter().map(|(id, _)| id).collect()))
     }
 
+    /// An upper bound on the number of rows `query` can match on `column`,
+    /// from posting-list lengths alone — no scoring, no hit set.
+    ///
+    /// Lets the planner decide whether the index is worth using before paying
+    /// for the work the decision exists to avoid.
+    pub(super) fn fts_match_upper_bound(
+        &self,
+        table_name: &str,
+        column: &str,
+        query: &str,
+    ) -> Option<usize> {
+        let indexes = self.fts_column_indexes.read();
+        let entry = indexes.values().find(|e| {
+            e.table_name.eq_ignore_ascii_case(table_name)
+                && e.column_name.eq_ignore_ascii_case(column)
+        })?;
+        Some(entry.index.max_matching_docs(query))
+    }
+
     /// Corpus statistics for `query` from the FTS index on `column`, if one
     /// exists. `table` narrows the search when the column name is ambiguous
     /// across tables; `None` accepts a unique match on the column name alone.

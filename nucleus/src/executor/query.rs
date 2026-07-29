@@ -7584,12 +7584,64 @@ impl Executor {
             return None;
         }
         let (column_name, query) = self.extract_fts_match(where_expr)?;
+        let storage = self.storage_for(table_name);
+
+        // Decide BEFORE building the hit set. `max_matching_docs` reads posting
+        // list lengths only, so declining here costs nothing — deciding after
+        // `fts_candidates` meant paying for the scoring pass the decision was
+        // meant to avoid, which left a broad query measurably slower than a
+        // plain scan even when the index correctly declined to serve it.
+        if let (Some(bound), Some(total)) = (
+            self.fts_match_upper_bound(table_name, &column_name, &query),
+            storage.fast_count_all(table_name),
+        ) && total > 0
+            && bound * 10 >= total
+        {
+            self.metrics.index_scan_fallbacks.inc();
+            return None;
+        }
+
         let (pk_column, candidates) = self.fts_candidates(table_name, &column_name, &query)?;
 
         let table_def = self.catalog.get_table(table_name).await?;
         let pk_idx = table_def.column_index(&pk_column)?;
 
-        let all_rows = self.storage_for(table_name).scan(table_name).await.ok()?;
+        let col_meta = self.build_col_meta_from_cache(table_name, label)?;
+
+        // `stable_row_id` IS the primary key value, so the candidate set is a
+        // set of keys and each one is a point lookup. Scanning the whole table
+        // and testing membership meant the index only ever saved the `@@`
+        // recheck, never the scan — which is most of the cost.
+        if let Some(pk_index) = self
+            .btree_indexes
+            .get(&(table_name.to_string(), pk_column.to_lowercase()))
+            .map(|n| n.clone())
+        {
+            let mut rows = Vec::with_capacity(candidates.len());
+            let mut usable = true;
+            for id in &candidates {
+                let key = Self::coerce_to_column_type(
+                    &Value::Int64(*id as i64),
+                    &table_def.columns[pk_idx].data_type,
+                );
+                match storage.index_lookup(table_name, &pk_index, &key).await {
+                    Ok(Some(hits)) => rows.extend(hits),
+                    // Anything else and this key is unaccounted for; a partial
+                    // answer is worse than none, so take the scan below.
+                    _ => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if usable {
+                self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                self.metrics.index_scan_served.inc();
+                return Some((col_meta, rows, Some(where_expr.clone()), None));
+            }
+        }
+
+        let all_rows = storage.scan(table_name).await.ok()?;
         self.metrics.rows_scanned.inc_by(all_rows.len() as u64);
         let rows = all_rows
             .into_iter()
@@ -7597,7 +7649,6 @@ impl Executor {
                 Self::stable_row_id(row, pk_idx).is_some_and(|id| candidates.contains(&id))
             })
             .collect();
-        let col_meta = self.build_col_meta_from_cache(table_name, label)?;
         Some((col_meta, rows, Some(where_expr.clone()), None))
     }
 
