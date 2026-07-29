@@ -579,25 +579,32 @@ func (s *PgStore) ResetMailbox(ctx context.Context, acct AccountID, box MailboxI
 // Reads for consumers
 // ---------------------------------------------------------------------------
 
-// Search finds messages by substring across subject, preview, and sender.
+// Search finds messages matching a query across subject, preview, and sender.
 //
-// This is deliberately the simple form. The table-attached full-text index —
-// CREATE INDEX ... USING FTS, matched with @@ and ranked by BM25 — is the
-// intended implementation, but it currently lives on an unmerged Nucleus
-// branch. Swapping this body for that query is the only change required; the
-// signature is already the one a ranked search wants.
+// Matching uses Nucleus's `@@` operator rather than LIKE: it stems, drops
+// stopwords, and requires every term, so "quarterly numbers" finds "the
+// quarterly number" and does not match a substring buried inside an unrelated
+// word. LIKE does none of that.
+//
+// It runs without a full-text index. The table-attached index needs an integer
+// PRIMARY KEY, and mail_messages is keyed on (account_id, id) — text, because
+// message identity is derived from provider IDs and Message-ID headers, not
+// minted by us. `@@` is defined row-locally so it stays correct unindexed; it
+// just scans. See _internal/NEUTRON_GAPS.md.
+//
+// BM25 ranking is likewise unavailable without the index, so results are
+// ordered by recency, which is the right default for mail anyway.
 func (s *PgStore) Search(ctx context.Context, acct AccountID, query string, limit int) ([]Envelope, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	pattern := "%" + query + "%"
 	rows, err := s.pool.Query(ctx,
 		`SELECT `+envelopeColumns+` FROM mail_messages
 		  WHERE account_id = $1
-		    AND (subject LIKE $2 OR preview LIKE $2 OR from_addrs LIKE $2)
+		    AND (subject @@ $2 OR preview @@ $2 OR from_addrs @@ $2)
 		  ORDER BY received_at DESC
 		  LIMIT $3`,
-		string(acct), pattern, limit)
+		string(acct), query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("mail: search: %w", err)
 	}
