@@ -55,6 +55,11 @@ pub(super) struct CrossModelLevel {
     pub blob_touched: HashSet<String>,
     pub vector: Option<HashMap<String, VectorIndexEntry>>,
     pub vector_touched: HashSet<String>,
+    /// Before-image per touched stream: `None` means the stream did not exist
+    /// at this level's start, so rolling back removes it. Per-stream rather
+    /// than a whole-map clone because a transaction usually writes one stream
+    /// and there is no reason to copy the others.
+    pub streams: HashMap<String, Option<crate::pubsub::Stream>>,
 }
 
 /// Cross-model state for one session's open transaction.
@@ -275,6 +280,31 @@ impl Executor {
         });
     }
 
+    // ── Streams ─────────────────────────────────────────────────────────────
+
+    /// Record that this transaction is about to modify stream `name`.
+    ///
+    /// Must be called BEFORE the mutation and while NOT holding the `streams`
+    /// write guard — this takes a read guard, and the reverse order would
+    /// deadlock against a concurrent writer.
+    ///
+    /// Streams were one of the models a transaction could write and never roll
+    /// back: `XADD` inside a `BEGIN` stayed in the stream after `ROLLBACK`, so
+    /// an aborted transaction still published events that downstream consumers
+    /// had already acted on.
+    pub(super) fn cross_model_touch_stream(&self, name: &str) {
+        let session = self.current_session();
+        let mut guard = session.cross_model.lock();
+        let Some(cm) = guard.as_mut() else { return };
+        // Read the before-image once, outside the per-level loop.
+        let before = self.streams.read().get(name).cloned();
+        for_each_level!(cm, lvl, {
+            lvl.streams
+                .entry(name.to_string())
+                .or_insert_with(|| before.clone());
+        });
+    }
+
     // ── FTS (already op-scoped) ─────────────────────────────────────────────
 
     /// Record an FTS mutation for rollback. Unlike the pre-M8 hook this uses a
@@ -346,6 +376,21 @@ impl Executor {
                     Some(entry) => {
                         live.insert(name.clone(), entry.clone());
                     }
+                    None => {
+                        live.remove(name);
+                    }
+                }
+            }
+        }
+        if !level.streams.is_empty() {
+            let mut live = self.streams.write();
+            for (name, before) in &level.streams {
+                match before {
+                    Some(stream) => {
+                        live.insert(name.clone(), stream.clone());
+                    }
+                    // The stream did not exist when this level started, so the
+                    // transaction created it; roll that back too.
                     None => {
                         live.remove(name);
                     }

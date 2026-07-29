@@ -415,7 +415,7 @@ pub struct StreamEntry {
 }
 
 /// A consumer group tracks delivery and pending acknowledgments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub name: String,
     pub last_delivered_id: StreamEntryId,
@@ -424,6 +424,7 @@ pub struct ConsumerGroup {
 }
 
 /// An append-only stream with consumer groups and optional max length.
+#[derive(Clone)]
 pub struct Stream {
     pub entries: Vec<StreamEntry>,
     pub last_id: StreamEntryId,

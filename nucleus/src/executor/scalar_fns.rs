@@ -3715,6 +3715,10 @@ impl Executor {
                     fields.push((field, value));
                     i += 2;
                 }
+                // Record the before-image before taking the write guard —
+                // an aborted transaction must not leave the appended entry
+                // behind for consumers that already read it.
+                self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
                 let stream = streams.entry(stream_name.clone()).or_default();
                 let id = stream.xadd(fields.clone());
@@ -3787,6 +3791,7 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let start_ms = val_to_u64(&args[2], "STREAM_XGROUP_CREATE start_id")?;
+                self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
                 let stream = streams.entry(stream_name).or_default();
                 stream.xgroup_create(&group, crate::pubsub::StreamEntryId::new(start_ms, 0));
@@ -3809,6 +3814,9 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let count = val_to_u64(&args[3], "STREAM_XREADGROUP count")? as usize;
+                // A read that advances the group cursor and records a pending
+                // entry is a write as far as rollback is concerned.
+                self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
                 match streams.get_mut(&stream_name) {
                     Some(stream) => {
@@ -3831,6 +3839,7 @@ impl Executor {
                 };
                 let id_ms = val_to_u64(&args[2], "STREAM_XACK id_ms")?;
                 let id_seq = val_to_u64(&args[3], "STREAM_XACK id_seq")?;
+                self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
                 match streams.get_mut(&stream_name) {
                     Some(stream) => {
