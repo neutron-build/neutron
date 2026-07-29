@@ -590,7 +590,7 @@ func (s *PgStore) ResetMailbox(ctx context.Context, acct AccountID, box MailboxI
 // PRIMARY KEY, and mail_messages is keyed on (account_id, id) — text, because
 // message identity is derived from provider IDs and Message-ID headers, not
 // minted by us. `@@` is defined row-locally so it stays correct unindexed; it
-// just scans. See _internal/NEUTRON_GAPS.md.
+// just scans. See docs/NEUTRON_GAPS.md.
 //
 // BM25 ranking is likewise unavailable without the index, so results are
 // ordered by recency, which is the right default for mail anyway.
