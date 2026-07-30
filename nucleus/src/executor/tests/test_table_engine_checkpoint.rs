@@ -112,3 +112,70 @@ async fn checkpoint_table_engines_recovers_after_restart() {
         "all 50 rows must be recoverable from the checkpointed snapshot"
     );
 }
+/// `sync_schema` is another `{}` trait default that the per-table engines
+/// inherit — the shape that produced R0 and the missing checkpoint above. Here
+/// the default is CORRECT (these engines address columns positionally and
+/// re-read the catalog, so there is no cached column schema to go stale, unlike
+/// the disk engine's meta page), but "correct" is a claim that needs a test
+/// standing behind it rather than a reading of the code. If a per-table engine
+/// ever starts caching its column shape, ALTER stops agreeing with SELECT and
+/// this catches it.
+#[tokio::test]
+async fn alter_add_column_backfills_on_every_per_table_engine() {
+    for eng in ["columnar", "mergetree", "lsm"] {
+        let ex = super::test_executor();
+        let ddl = if eng == "mergetree" {
+            "CREATE TABLE t (id INT, v INT) WITH (engine='mergetree') ORDER BY (id)".to_string()
+        } else {
+            format!("CREATE TABLE t (id INT, v INT) WITH (engine='{eng}')")
+        };
+        exec(&ex, &ddl).await;
+        exec(&ex, "INSERT INTO t VALUES (1, 100)").await;
+        exec(&ex, "INSERT INTO t VALUES (2, 200)").await;
+        exec(&ex, "ALTER TABLE t ADD COLUMN w INT DEFAULT 7").await;
+
+        let res = exec(&ex, "SELECT id, v, w FROM t ORDER BY id").await;
+        let rows = match &res[0] {
+            crate::executor::ExecResult::Select { rows, .. } => rows.clone(),
+            other => panic!("{eng}: expected Select, got {other:?}"),
+        };
+        use crate::types::Value::Int32;
+        assert_eq!(
+            rows,
+            vec![
+                vec![Int32(1), Int32(100), Int32(7)],
+                vec![Int32(2), Int32(200), Int32(7)],
+            ],
+            "{eng}: ALTER TABLE ADD COLUMN did not backfill existing rows correctly"
+        );
+    }
+}
+
+/// The LSM engine reaches the same checkpoint call. It has no separate WAL —
+/// its durable representation is an SSTable, and `flush_all_dirty` forces the
+/// memtables out — so there is no file to shrink here; what this asserts is
+/// that driving the shared checkpoint path over a per-table LSM engine is
+/// reachable and lossless. A future LSM WAL would compact through the exact
+/// same call.
+#[tokio::test]
+async fn checkpoint_table_engines_is_lossless_for_lsm() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(&ex, "CREATE TABLE t (id INT, v INT) WITH (engine='lsm')").await;
+    for i in 0..100 {
+        exec(&ex, &format!("INSERT INTO t VALUES ({i}, {i})")).await;
+    }
+
+    ex.checkpoint_table_engines().await;
+
+    let res = exec(&ex, "SELECT COUNT(*) FROM t").await;
+    let n = match &res[0] {
+        crate::executor::ExecResult::Select { rows, .. } => match &rows[0][0] {
+            crate::types::Value::Int64(v) => *v,
+            crate::types::Value::Int32(v) => *v as i64,
+            other => panic!("unexpected count cell: {other:?}"),
+        },
+        other => panic!("expected Select, got {other:?}"),
+    };
+    assert_eq!(n, 100, "LSM checkpoint must not lose or duplicate rows");
+}
