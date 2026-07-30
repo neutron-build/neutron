@@ -107,6 +107,39 @@ impl FilterOp {
     }
 }
 
+/// Transaction isolation levels, ordered weakest to strongest.
+///
+/// `READ UNCOMMITTED` is absent on purpose: like PostgreSQL, Nucleus treats a
+/// request for it as `READ COMMITTED` rather than offering dirty reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Snapshot,
+    Serializable,
+}
+
+impl IsolationLevel {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "read uncommitted" | "read committed" => Some(Self::ReadCommitted),
+            "repeatable read" => Some(Self::RepeatableRead),
+            "snapshot" => Some(Self::Snapshot),
+            "serializable" => Some(Self::Serializable),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadCommitted => "read committed",
+            Self::RepeatableRead => "repeatable read",
+            Self::Snapshot => "snapshot",
+            Self::Serializable => "serializable",
+        }
+    }
+}
+
 /// True when no key can lie inside `low..=high`, so a `BTreeMap::range` over it
 /// must not be attempted.
 ///
@@ -496,8 +529,25 @@ pub trait StorageEngine: Send + Sync {
 
     // -- Transaction lifecycle (default: auto-commit / no-op) --
 
-    /// Set the isolation level for the next BEGIN. Default: Snapshot.
-    /// Recognized values: "read committed", "repeatable read", "snapshot", "serializable".
+    /// The strongest isolation level this engine can actually honour.
+    ///
+    /// The caller REFUSES anything stronger. Silently accepting a level an
+    /// engine does not implement is how `BEGIN ISOLATION LEVEL SERIALIZABLE`
+    /// came to run at read-committed on the shipping engine: two transactions
+    /// doing a read-modify-write both committed and one increment was lost,
+    /// where PostgreSQL aborts one with 40001. Nothing surfaced it, because
+    /// `set_next_isolation_level` has a no-op default and the engine that
+    /// `main.rs` builds never overrode it.
+    ///
+    /// The default is the weakest level, so an engine that implements nothing
+    /// promises nothing. Raise it only with evidence — over-claiming here costs
+    /// users data, under-claiming costs them an error message.
+    fn max_isolation_level(&self) -> IsolationLevel {
+        IsolationLevel::ReadCommitted
+    }
+
+    /// Set the isolation level for the next BEGIN. Only ever called with a
+    /// level at or below [`max_isolation_level`](Self::max_isolation_level).
     fn set_next_isolation_level(&self, _level: &str) {}
     /// Fsync the WAL to stable storage. Ensures all auto-committed writes are
     /// durable against OS/power crashes. No-op for engines without a WAL.

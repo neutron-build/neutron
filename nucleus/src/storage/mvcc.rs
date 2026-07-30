@@ -2349,6 +2349,12 @@ impl StorageEngine for MvccStorageAdapter {
     }
     // -- Transaction lifecycle --
 
+    /// Full SSI: SIREAD tracking and rw-conflict detection, so a serialization
+    /// anomaly aborts one transaction rather than losing a write.
+    fn max_isolation_level(&self) -> crate::storage::IsolationLevel {
+        crate::storage::IsolationLevel::Serializable
+    }
+
     fn set_next_isolation_level(&self, level: &str) {
         let iso = match level.to_lowercase().as_str() {
             "read committed" => IsolationLevel::ReadCommitted,
