@@ -2103,6 +2103,35 @@ impl Executor {
             .map_err(|_| self.query_mem_err())
     }
 
+    /// Accept an isolation-level request only if the engine can honour it.
+    ///
+    /// Refusing is the point. A database that accepts `SERIALIZABLE` and runs
+    /// read-committed does not fail — it loses writes, silently, and the
+    /// application has no way to find out. PostgreSQL never downgrades a level;
+    /// neither should this. The error names what the engine does provide so the
+    /// fix is obvious.
+    pub(super) fn require_isolation_level(&self, requested: &str) -> Result<(), ExecError> {
+        let Some(level) = crate::storage::IsolationLevel::parse(requested) else {
+            return Err(ExecError::Unsupported(format!(
+                "unknown isolation level '{requested}'"
+            )));
+        };
+        let available = self.storage.max_isolation_level();
+        if level > available {
+            return Err(ExecError::Unsupported(format!(
+                "isolation level {} is not available on this storage engine, which \
+                 provides {}. Accepting it would run your transaction at {} while \
+                 reporting {} — use the MVCC engine for serializable isolation.",
+                level.as_str().to_uppercase(),
+                available.as_str().to_uppercase(),
+                available.as_str().to_uppercase(),
+                level.as_str().to_uppercase(),
+            )));
+        }
+        self.storage.set_next_isolation_level(level.as_str());
+        Ok(())
+    }
+
     /// The uniform "query exceeded its memory limit" error (SQLSTATE 53200).
     fn query_mem_err(&self) -> ExecError {
         ExecError::MemoryExceeded(format!(
@@ -2854,7 +2883,6 @@ impl Executor {
     /// RLS enabled on the table AND the session is not a superuser. This is the
     /// FAIL-CLOSED gate every fast/bypass read path checks — when true, that
     /// path must defer to the general materialize-and-filter path.
-    #[allow(dead_code)] // wired as enforcement lands (T2.2)
     pub(super) fn rls_active(&self, table: &str) -> bool {
         if self
             .current_session()
@@ -2867,10 +2895,108 @@ impl Executor {
         self.with_visible_security(|security| security.rls.is_enabled(table))
     }
 
+    /// Whether a masking policy applies to `table` for this session.
+    ///
+    /// Superusers see unmasked data, matching the RLS rule directly above.
+    pub(super) fn masking_active(&self, table: &str) -> bool {
+        if self
+            .current_session()
+            .session_context
+            .read()
+            .has_role("superuser")
+        {
+            return false;
+        }
+        self.with_visible_security(|security| security.masking.covers_table(table))
+    }
+
+    /// Whether `table` carries ANY row- or column-level policy for this session.
+    ///
+    /// Every fast path that returns rows without going through the secured
+    /// materialization must consult this, not `rls_active` alone. Masking is a
+    /// second policy over the same rows, and each path that checked only RLS
+    /// returned the column masking was supposed to redact — `SELECT ssn FROM
+    /// people WHERE id = 1` came back in the clear because a storage-level
+    /// filtered scan answered it first. One name for the concept so the next
+    /// policy type joins in one place instead of leaking through whichever
+    /// path nobody updated.
+    pub(super) fn table_is_secured(&self, table: &str) -> bool {
+        self.rls_active(table) || self.masking_active(table)
+    }
+
+    /// Whether ANY table carries a row- or column-level policy for this
+    /// session. The whole-query equivalent of [`table_is_secured`].
+    pub(super) fn any_table_secured(&self) -> bool {
+        self.any_rls_active() || self.any_masking_active()
+    }
+
+    /// Whether any masking policy exists for this session.
+    pub(super) fn any_masking_active(&self) -> bool {
+        if self
+            .current_session()
+            .session_context
+            .read()
+            .has_role("superuser")
+        {
+            return false;
+        }
+        self.with_visible_security(|security| security.masking.any_policies())
+    }
+
+    /// Apply column masking to rows already filtered by RLS.
+    ///
+    /// Masking had a policy engine, a rule set, DDL to declare it and tests —
+    /// and `mask_row` had no callers outside those tests, so every masked
+    /// column returned its real value to every principal. This is where the
+    /// declaration becomes enforcement.
+    ///
+    /// Applied positionally against the table's column list rather than through
+    /// a name→string map, so an unmasked column keeps its type and its value
+    /// untouched; only a column with a rule is replaced, by the redacted text
+    /// the rule produces.
+    pub(super) fn mask_rows(&self, table: &str, rows: Vec<Row>) -> Vec<Row> {
+        if rows.is_empty() || !self.masking_active(table) {
+            return rows;
+        }
+        let Some(def) = self.catalog.get_table_cached(table) else {
+            // No schema means no way to tell which column is which. Fail
+            // closed: a masked table whose columns cannot be resolved returns
+            // nothing rather than returning them unmasked.
+            return Vec::new();
+        };
+        let ctx = self.current_session().session_context.read().clone();
+        // Resolve each column's rule once, not once per row.
+        let rules: Vec<crate::security::MaskingRule> = self.with_visible_security(|security| {
+            def.columns
+                .iter()
+                .map(|c| security.masking.get_rule(table, &c.name, &ctx).clone())
+                .collect()
+        });
+        if rules
+            .iter()
+            .all(|r| matches!(r, crate::security::MaskingRule::None))
+        {
+            return rows;
+        }
+        rows.into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .enumerate()
+                    .map(|(i, value)| match rules.get(i) {
+                        Some(crate::security::MaskingRule::None) | None => value,
+                        // NULL carries no information to redact, and turning it
+                        // into a masked string would invent a value.
+                        Some(_) if matches!(value, Value::Null) => value,
+                        Some(rule) => Value::Text(rule.apply(&value.to_string())),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Whether ANY table in the current query needs RLS filtering — used to
     /// disable the SQL-text-keyed result cache path wholesale when policies are
     /// live (cheap: only true for non-superuser sessions with ≥1 enabled table).
-    #[allow(dead_code)] // wired as enforcement lands (T2.2)
     pub(super) fn any_rls_active(&self) -> bool {
         if self
             .current_session()
@@ -4859,7 +4985,7 @@ impl Executor {
                 let sql_text = query.to_string();
                 let cacheable = !in_txn
                     && !Self::query_cache_disabled()
-                    && !self.any_rls_active()
+                    && !self.any_table_secured()
                     && Self::query_result_is_cacheable(&sql_text);
                 // Snapshot the write generation at the point of the cache check.
                 // If a DML increments it before we store the result, query_cache_put
@@ -4917,7 +5043,7 @@ impl Executor {
                             ast::TransactionIsolationLevel::ReadUncommitted => "read committed",
                             ast::TransactionIsolationLevel::Snapshot => "snapshot",
                         };
-                        self.storage.set_next_isolation_level(level_str);
+                        self.require_isolation_level(level_str)?;
                     }
                 }
                 self.begin_transaction().await

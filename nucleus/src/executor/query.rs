@@ -4854,7 +4854,12 @@ impl Executor {
             // Every optimization below can bypass ordinary row materialization.
             // Until it consumes secured scans directly, route RLS queries through
             // the single fail-closed AST/table-factor path.
-            let rls_guarded = self.any_rls_active();
+            // Masking joins RLS in routing a query down the single fail-closed
+            // AST path. The optimisations below bypass ordinary row
+            // materialization, and a masked column that is never materialized
+            // is never masked — a table with masking but no RLS would otherwise
+            // return real values through the plan path.
+            let rls_guarded = self.any_rls_active() || self.any_masking_active();
 
             // Handle CTEs (WITH clause)
             let mut cte_tables = if let Some(ref with) = query.with {
@@ -7736,7 +7741,7 @@ impl Executor {
         // Columnar fast-aggregate (before any row scan)
         // Intercepts COUNT(*) / SUM / AVG / GROUP BY on ColumnarStorageEngine tables.
         // Returns None if the engine doesn't support it or the pattern is unsupported.
-        if !self.any_rls_active()
+        if !self.any_table_secured()
             && let Some(fast) = self.try_columnar_fast_aggregate(select, cte_tables)?
         {
             return Ok(SelectResult::Projected(fast));
@@ -7746,7 +7751,7 @@ impl Executor {
         // (SELECT list + WHERE) are covered by a single B-tree index, return
         // results directly from the index without any heap/table access.
         // This achieves 1.5-2x speedup for covering index queries.
-        if !self.any_rls_active()
+        if !self.any_table_secured()
             && select.from.len() == 1
             && select.from[0].joins.is_empty()
             && let TableFactor::Table {
@@ -7771,7 +7776,7 @@ impl Executor {
         // Index-aware optimization (fully synchronous)
         // For simple single-table queries with WHERE equality predicates,
         // try to use a B-tree index instead of a full table scan.
-        let index_result: IndexScanResult = if !self.any_rls_active()
+        let index_result: IndexScanResult = if !self.any_table_secured()
             && select.from.len() == 1
             && select.from[0].joins.is_empty()
         {
@@ -7831,7 +7836,7 @@ impl Executor {
                     rows
                 };
                 (col_meta, filtered, sorted_by)
-            } else if !self.any_rls_active()
+            } else if !self.any_table_secured()
                 && let Some((col_meta, rows)) = self.try_columnar_filtered_scan(select, cte_tables)
             {
                 // Columnar filter pushdown: engine filtered non-matching rows before
@@ -7976,7 +7981,7 @@ impl Executor {
         // When FROM t1, t2 WHERE t1.pk = t2.fk AND t2.filter, defer loading t1
         // until we know the join strategy. If t2 is small and t1's join key is
         // indexed, use batch index lookups instead of scanning all of t1.
-        if !self.any_rls_active()
+        if !self.any_table_secured()
             && from.len() == 2
             && from[0].joins.is_empty()
             && from[1].joins.is_empty()
@@ -8182,7 +8187,7 @@ impl Executor {
                 // Index nested-loop optimization: when one side is small and the
                 // join key on the other side is indexed, replace the full table
                 // with batch index lookups — avoids scanning the large table.
-                let effective_left = if !self.any_rls_active()
+                let effective_left = if !self.any_table_secured()
                     && filtered_right.len() < 1000
                     && left_keys.len() == 1
                 {
@@ -8457,7 +8462,7 @@ impl Executor {
 
                 // For JOIN-aware AST execution, attempt indexed lookup using relation-local
                 // pushdown predicates before falling back to full table scan.
-                if !self.rls_active(&table_name)
+                if !self.table_is_secured(&table_name)
                     && let Some(where_expr) = pushdown_expr
                     && let Some((col_meta, rows, remaining_where, _sorted_by)) =
                         self.try_index_scan_sync(&table_name, &label, where_expr)
@@ -8483,7 +8488,7 @@ impl Executor {
                     .collect();
 
                 // Try storage-level filtered scan for pushed-down predicates
-                if !self.rls_active(&table_name)
+                if !self.table_is_secured(&table_name)
                     && let Some(where_expr) = pushdown_expr
                     && let Some((rows, examined)) =
                         self.try_storage_fast_scan(&table_name, where_expr, &col_meta)
@@ -8497,6 +8502,7 @@ impl Executor {
                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
                 rows =
                     self.rls_filter_rows(&table_name, crate::security::PolicyCommand::Select, rows);
+                rows = self.mask_rows(&table_name, rows);
 
                 // ── Zone map pruning ────────────────────────────────────
                 // If a pushdown predicate is available, try to skip entire
