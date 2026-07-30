@@ -330,7 +330,7 @@ impl Executor {
                 #[cfg(feature = "server")]
                 if format != "binary"
                     && columns.is_empty()
-                    && !self.any_rls_active()
+                    && !self.any_table_secured()
                     && self.copy_streaming_enabled()
                 {
                     let storage = self.storage_for(&table);
@@ -351,6 +351,7 @@ impl Executor {
                 let all_rows = self.storage.scan(&table).await?;
                 let all_rows =
                     self.rls_filter_rows(&table, crate::security::PolicyCommand::Select, all_rows);
+                let all_rows = self.mask_rows(&table, all_rows);
                 (col_names, all_rows)
             }
             ast::CopySource::Query(query) => {
