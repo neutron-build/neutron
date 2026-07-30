@@ -160,16 +160,23 @@ async fn replacing_mergetree_delete_via_pk_removes_all_physical_versions() {
     let pre = select_rows(&ex, "SELECT id FROM d").await;
     assert_eq!(pre.len(), 2);
 
-    // DELETE WHERE id='rm' must wipe every physical version of 'rm'.
+    // DELETE WHERE id='rm' must leave NO version of 'rm' behind.
+    //
+    // The row count is deliberately not asserted. How many physical versions
+    // exist when the DELETE runs depends on whether a background merge has
+    // collapsed them yet — a ReplacingMergeTree deduplicates during merges, and
+    // that is the whole point of the engine. This test previously demanded
+    // exactly 3, which only held while the declared ORDER BY was inert and no
+    // merge ever ran (see b5aff3b). The invariant that actually matters is
+    // below: nothing resurrects.
     let res = exec(&ex, "DELETE FROM d WHERE id='rm'").await;
-    if let ExecResult::Command { rows_affected, .. } = res {
-        assert_eq!(
-            rows_affected, 3,
-            "DELETE must remove all 3 physical versions of 'rm'"
-        );
-    } else {
+    let ExecResult::Command { rows_affected, .. } = res else {
         panic!("expected Command result for DELETE");
-    }
+    };
+    assert!(
+        rows_affected >= 1,
+        "DELETE matched no physical row for 'rm'"
+    );
 
     let after = select_rows(&ex, "SELECT id FROM d WHERE id='rm'").await;
     assert!(
@@ -180,6 +187,18 @@ async fn replacing_mergetree_delete_via_pk_removes_all_physical_versions() {
     let remaining = select_rows(&ex, "SELECT id FROM d").await;
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0][0], Value::Text("keep".into()));
+
+    // And it stays gone. A version left behind in an unmerged part resurfaces
+    // when a later write triggers the merge that would have collapsed it, so
+    // re-checking only after more writes is what actually rules that out.
+    for v in 4..12 {
+        exec(&ex, &format!("INSERT INTO d (id, version) VALUES ('other{v}', {v})")).await;
+    }
+    let after = select_rows(&ex, "SELECT id FROM d WHERE id='rm'").await;
+    assert!(
+        after.is_empty(),
+        "a version of 'rm' resurrected once later writes forced a merge"
+    );
 }
 
 #[tokio::test]
