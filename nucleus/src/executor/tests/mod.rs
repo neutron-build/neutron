@@ -73,4 +73,5 @@ mod test_streaming_lazy; // Lazy per-partition/pair output emitters for the Grac
 mod test_streaming_metamorphic; // streaming ≡ materialized over random queries (transitive SQLite oracle)
 mod test_streaming_scan; // Phase 1.1: opt-in streaming scan (SET stream_results = on)
 mod test_table_engine_checkpoint; // R4: per-table engine WAL compaction is reachable, not just implemented
+mod test_txn_lazy_snapshot; // R8: BEGIN/SAVEPOINT do not clone the whole database
 mod test_txn; // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

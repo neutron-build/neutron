@@ -1297,9 +1297,11 @@ impl Executor {
     /// would trade a correctness bug for a worse performance one.
     pub(super) async fn storage_for_write(&self, table: &str) -> Arc<dyn StorageEngine> {
         let engine = self.storage_for(table);
-        // Only tables with a per-table override are at risk; the default engine
-        // is already handled by MVCC or by the legacy snapshot.
-        if !self.table_engines.read().contains_key(table) || engine.supports_mvcc() {
+        // An engine with MVCC rolls itself back; everything else needs a
+        // before-image. That covers per-table override engines AND a non-MVCC
+        // default engine — the two used to be handled by different mechanisms,
+        // and the whole-database one was the expensive half (see BEGIN).
+        if engine.supports_mvcc() {
             return engine;
         }
         let session = self.current_session();

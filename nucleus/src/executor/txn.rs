@@ -40,17 +40,16 @@ impl Executor {
         if self.storage.supports_mvcc() {
             // MVCC engine handles snapshot isolation internally.
             self.storage.begin_txn().await?;
-        } else {
-            // Legacy: capture a snapshot of every table's rows for rollback.
-            let table_names = self.catalog.table_names().await;
-            let mut snapshot = HashMap::new();
-            for name in &table_names {
-                if let Ok(rows) = self.storage.scan(name).await {
-                    snapshot.insert(name.clone(), rows);
-                }
-            }
-            txn.snapshot = Some(snapshot);
         }
+        // A non-MVCC engine needs before-images to roll back, but they are
+        // captured LAZILY, at this transaction's first write to each table
+        // (`storage_for_write`). BEGIN used to scan and clone EVERY table in
+        // the database here — O(whole database) to open a transaction, paid in
+        // full by a transaction that reads one row and writes nothing. On an
+        // embedded database an untouched table took `BEGIN; ROLLBACK` from
+        // 19.7ms to 138.7ms just by existing. Nothing about a table this
+        // transaction never touches can need restoring, so the work was not
+        // merely early, it was unnecessary.
 
         // Arm per-session cross-model tracking. Before-images are captured
         // lazily, at this session's first write to each store, so a SQL-only
@@ -201,25 +200,10 @@ impl Executor {
 
         if self.storage.supports_mvcc() {
             self.storage.abort_txn().await?;
-        } else if let Some(snapshot) = txn.snapshot.take() {
-            // Legacy: restore each table to its snapshotted state. Positions
-            // come from scan_physical, never from `0..len` — an engine is free
-            // to address rows by something other than a dense scan ordinal
-            // (the paged engine uses physical (page, slot) addresses), and
-            // synthesising ordinals there would write over unrelated pages.
-            for (table_name, original_rows) in &snapshot {
-                if let Ok(current_rows) = self.storage.scan_physical(table_name).await
-                    && !current_rows.is_empty()
-                {
-                    let positions: Vec<usize> =
-                        current_rows.iter().map(|(pos, _)| *pos).collect();
-                    let _ = self.storage.delete(table_name, &positions).await;
-                }
-                for row in original_rows {
-                    let _ = self.storage.insert(table_name, row.clone()).await;
-                }
-            }
         }
+        // Non-MVCC engines restore from the lazily captured before-images
+        // below (`engine_snapshots`), which now cover the default engine as
+        // well as per-table override engines — one mechanism instead of two.
 
         // Revert cross-model writes. Scoped to this session's write-set: an
         // entity another session wrote since this BEGIN is left alone.
@@ -280,22 +264,15 @@ impl Executor {
 
         if self.storage.supports_mvcc() {
             self.storage.savepoint(name).await?;
-        } else {
-            // Legacy: capture current state of all tables
-            let table_names = self.catalog.table_names().await;
-            let mut snapshot = HashMap::new();
-            for tbl in &table_names {
-                if let Ok(rows) = self.storage.scan(tbl).await {
-                    snapshot.insert(tbl.clone(), rows);
-                }
-            }
-            txn.savepoints.push((name.to_string(), snapshot));
         }
-        // Per-table-engine tables: capture the CURRENT state of the ones this
-        // transaction has already written. A table first written after this
-        // savepoint needs no entry — its base image, taken at that first write,
-        // is already the state as of this savepoint, because nothing had
-        // touched it before.
+        // Non-MVCC engines: same lazy treatment as BEGIN. SAVEPOINT used to
+        // clone every table in the database too, so a transaction taking
+        // savepoints in a loop paid the whole database for each one.
+        //
+        // Capture the CURRENT state of the tables this transaction has already
+        // written. A table first written AFTER this savepoint needs no entry —
+        // its base image, taken at that first write, is already the state as of
+        // this savepoint, because nothing had touched it before.
         {
             let touched: Vec<String> = txn.engine_snapshots.keys().cloned().collect();
             let mut level = HashMap::new();
@@ -371,29 +348,14 @@ impl Executor {
         let mut txn = sess.txn_state.write().await;
         if self.storage.supports_mvcc() {
             self.storage.rollback_to_savepoint(name).await?;
-        } else {
-            let pos = txn.savepoints.iter().rposition(|(n, _)| n == name);
-            if let Some(pos) = pos {
-                let (_, snapshot) = txn.savepoints[pos].clone();
-                for (table_name, original_rows) in &snapshot {
-                    // scan_physical, not `0..len` — see rollback above.
-                    if let Ok(current_rows) = self.storage.scan_physical(table_name).await
-                        && !current_rows.is_empty()
-                    {
-                        let positions: Vec<usize> =
-                            current_rows.iter().map(|(pos, _)| *pos).collect();
-                        let _ = self.storage.delete(table_name, &positions).await;
-                    }
-                    for row in original_rows {
-                        let _ = self.storage.insert(table_name, row.clone()).await;
-                    }
-                }
-                txn.savepoints.truncate(pos + 1);
-            } else {
-                return Err(ExecError::Unsupported(format!(
-                    "savepoint {name} does not exist"
-                )));
-            }
+        } else if !txn.engine_savepoints.iter().any(|(n, _)| n == name) {
+            // Non-MVCC engines revert from `engine_savepoints` below. The name
+            // still has to exist — rolling back to a savepoint that was never
+            // taken must be an error, not a silent no-op that leaves the
+            // transaction's writes in place while reporting success.
+            return Err(ExecError::Unsupported(format!(
+                "savepoint {name} does not exist"
+            )));
         }
         // Per-table-engine tables: revert to this level's image. Tables first
         // written after the savepoint are absent from the level and must be
