@@ -534,7 +534,8 @@ impl Executor {
                                         },
                                     )
                                     .await?;
-                                    self.storage_for(&table_name)
+                                    self.storage_for_write(&table_name)
+                                        .await
                                         .update(&table_name, &[(pos, updated.clone())])
                                         .await?;
                                     if let Some(returning_items) = returning {
@@ -672,7 +673,7 @@ impl Executor {
                     }
                 }
             }
-            let storage = self.storage_for(&table_name);
+            let storage = self.storage_for_write(&table_name).await;
             if unique_col_sets.is_empty() {
                 storage.insert_batch(&table_name, inserted_rows).await?;
             } else {
@@ -1325,7 +1326,7 @@ impl Executor {
                         }
 
                         let child_table = &child_table_def.name;
-                        let child_storage = self.storage_for(child_table);
+                        let child_storage = self.storage_for_write(child_table).await;
 
                         if let Some(update_pairs) = new_parent_rows {
                             // -- ON UPDATE handling --
@@ -2252,7 +2253,7 @@ impl Executor {
         // on the new values (the snapshot enforce_constraints above can't see a
         // concurrent txn's uncommitted row), so two concurrent updates can't move
         // two rows to the same key. Otherwise use the plain update path.
-        let storage = self.storage_for(&table_name);
+        let storage = self.storage_for_write(&table_name).await;
         // Carry the row each position was resolved from. Statement execution
         // awaits between resolving a position and writing it — triggers, RLS,
         // constraints, derived-index maintenance — and on the paged engine a
@@ -2565,7 +2566,8 @@ impl Executor {
             .filter_map(|pos| row_by_pos.get(pos).map(|row| (*pos, (*row).clone())))
             .collect();
         let count = self
-            .storage_for(&table_name)
+            .storage_for_write(&table_name)
+            .await
             .delete_if_unchanged(&table_name, &targets)
             .await?;
 

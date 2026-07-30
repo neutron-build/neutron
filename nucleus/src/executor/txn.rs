@@ -63,6 +63,8 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.engine_snapshots.clear();
+        txn.engine_savepoints.clear();
         txn.aborted = false;
 
         txn.active = true;
@@ -159,12 +161,15 @@ impl Executor {
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
+        txn.engine_savepoints.clear();
         txn.security_snapshot = None;
         txn.security_pending = None;
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.engine_snapshots.clear();
+        txn.engine_savepoints.clear();
         *sess.cross_model.lock() = None; // Discard the write-set on commit
         self.metrics.open_transactions.dec();
         drop(txn);
@@ -226,6 +231,11 @@ impl Executor {
             self.cross_model_revert(cm.base, cm.fts_ops);
         }
 
+        // Undo writes to tables served by a per-table engine. Those engines
+        // provide no transaction of their own, so this is the only thing that
+        // reverts them — see `storage_for_write`.
+        let engine_snapshots: Vec<(String, Vec<crate::types::Row>)> =
+            txn.engine_snapshots.drain().collect();
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
         txn.active = false;
         txn.snapshot = None;
@@ -236,9 +246,15 @@ impl Executor {
         txn.policy_dirty = false;
         txn.gin_dirty = false;
         txn.derived_dirty_tables.clear();
+        txn.engine_snapshots.clear();
+        txn.engine_savepoints.clear();
 
         self.metrics.open_transactions.dec();
         drop(txn);
+
+        for (table, original) in &engine_snapshots {
+            self.restore_table_from(table, original).await;
+        }
 
         // Incremental index maintenance may have observed transaction-local
         // rows. Rebuild after abort from the now-authoritative committed image.
@@ -274,6 +290,21 @@ impl Executor {
                 }
             }
             txn.savepoints.push((name.to_string(), snapshot));
+        }
+        // Per-table-engine tables: capture the CURRENT state of the ones this
+        // transaction has already written. A table first written after this
+        // savepoint needs no entry — its base image, taken at that first write,
+        // is already the state as of this savepoint, because nothing had
+        // touched it before.
+        {
+            let touched: Vec<String> = txn.engine_snapshots.keys().cloned().collect();
+            let mut level = HashMap::new();
+            for tbl in touched {
+                if let Ok(rows) = self.storage_for(&tbl).scan(&tbl).await {
+                    level.insert(tbl, rows);
+                }
+            }
+            txn.engine_savepoints.push((name.to_string(), level));
         }
         let security_snapshot = txn
             .security_pending
@@ -311,6 +342,9 @@ impl Executor {
             if let Some(pos) = txn.savepoints.iter().rposition(|(n, _)| n == name) {
                 txn.savepoints.truncate(pos);
             }
+        }
+        if let Some(pos) = txn.engine_savepoints.iter().rposition(|(n, _)| n == name) {
+            txn.engine_savepoints.truncate(pos);
         }
         if let Some(pos) = txn.security_savepoints.iter().rposition(|(n, _)| n == name) {
             txn.security_savepoints.truncate(pos);
@@ -361,6 +395,27 @@ impl Executor {
                 )));
             }
         }
+        // Per-table-engine tables: revert to this level's image. Tables first
+        // written after the savepoint are absent from the level and must be
+        // reverted to their base image, which is the state as of this savepoint
+        // for exactly the same reason they were absent.
+        let engine_revert: Vec<(String, Vec<crate::types::Row>)> = {
+            match txn.engine_savepoints.iter().rposition(|(n, _)| n == name) {
+                Some(pos) => {
+                    let level = txn.engine_savepoints[pos].1.clone();
+                    let mut out: Vec<(String, Vec<crate::types::Row>)> = level.into_iter().collect();
+                    for (tbl, base) in txn.engine_snapshots.iter() {
+                        if !out.iter().any(|(t, _)| t == tbl) {
+                            out.push((tbl.clone(), base.clone()));
+                        }
+                    }
+                    txn.engine_savepoints.truncate(pos + 1);
+                    out
+                }
+                None => Vec::new(),
+            }
+        };
+
         let security_pos = txn
             .security_savepoints
             .iter()
@@ -373,6 +428,10 @@ impl Executor {
         txn.policy_dirty = true;
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
         drop(txn);
+
+        for (table, original) in &engine_revert {
+            self.restore_table_from(table, original).await;
+        }
 
         // Revert cross-model writes made after the savepoint. Taken out from
         // under the mutex first so the stores are only locked afterwards.

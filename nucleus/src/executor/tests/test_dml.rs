@@ -1419,3 +1419,159 @@ async fn test_cte_delete() {
 }
 
 // ======================================================================
+
+// ── Transactions must cover tables served by a per-table engine ────────────
+
+/// Build an executor on the engine the server actually ships.
+async fn shipping_executor(dir: &std::path::Path) -> Executor {
+    use crate::storage::buffered_engine::BufferedDiskEngine;
+    use crate::storage::disk_engine::DiskEngine;
+    let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
+    let disk =
+        std::sync::Arc::new(DiskEngine::open(&dir.join("t.db"), catalog.clone()).unwrap());
+    let engine: std::sync::Arc<dyn crate::storage::StorageEngine> =
+        std::sync::Arc::new(BufferedDiskEngine::new(disk));
+    Executor::new(catalog, engine)
+}
+
+const PER_TABLE_ENGINES: [(&str, &str); 4] = [
+    ("heap", ""),
+    ("columnar", "WITH (engine='columnar')"),
+    ("mergetree", "WITH (engine='mergetree') ORDER BY (id)"),
+    ("lsm", "WITH (engine='lsm')"),
+];
+
+/// ROLLBACK must undo writes to a table declared `WITH (engine=…)`.
+///
+/// It did not. Those tables are written through `storage_for`, never through
+/// `self.storage`, so nothing in the transaction machinery reached them: the
+/// columnar and LSM engines inherit the trait's silent `Ok(())` for `begin_txn`
+/// and `abort_txn`, and the legacy whole-database snapshot is skipped entirely
+/// when the DEFAULT engine reports MVCC — which the shipping one does. Measured
+/// before the fix: `BEGIN; INSERT; UPDATE; ROLLBACK` left BOTH changes in place
+/// on columnar, mergetree and lsm, while the heap reverted correctly.
+///
+/// Observe declares `spans WITH (engine='mergetree')`, so this is a production
+/// table shape, and no test in the suite combined a per-table engine with
+/// ROLLBACK — which is why it went unnoticed.
+#[tokio::test]
+async fn test_rollback_reverts_per_table_engine_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = shipping_executor(dir.path()).await;
+
+    for (label, clause) in PER_TABLE_ENGINES {
+        exec(&ex, &format!("CREATE TABLE {label} (id INT PRIMARY KEY, v INT) {clause}")).await;
+        exec(&ex, &format!("INSERT INTO {label} VALUES (1, 100)")).await;
+
+        exec(&ex, "BEGIN").await;
+        exec(&ex, &format!("INSERT INTO {label} VALUES (2, 200)")).await;
+        exec(&ex, &format!("UPDATE {label} SET v = 999 WHERE id = 1")).await;
+        exec(&ex, "ROLLBACK").await;
+
+        let after = rows(&exec(&ex, &format!("SELECT id, v FROM {label} ORDER BY id")).await[0])
+            .clone();
+        assert_eq!(
+            after,
+            vec![vec![Value::Int32(1), Value::Int32(100)]],
+            "{label}: ROLLBACK left the transaction's writes behind"
+        );
+    }
+}
+
+/// COMMIT must keep them — the revert path must not be unconditional.
+#[tokio::test]
+async fn test_commit_keeps_per_table_engine_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = shipping_executor(dir.path()).await;
+
+    for (label, clause) in PER_TABLE_ENGINES {
+        exec(&ex, &format!("CREATE TABLE {label} (id INT PRIMARY KEY, v INT) {clause}")).await;
+        exec(&ex, "BEGIN").await;
+        exec(&ex, &format!("INSERT INTO {label} VALUES (1, 100)")).await;
+        exec(&ex, &format!("INSERT INTO {label} VALUES (2, 200)")).await;
+        exec(&ex, "COMMIT").await;
+
+        let after = rows(&exec(&ex, &format!("SELECT id, v FROM {label} ORDER BY id")).await[0])
+            .clone();
+        assert_eq!(after.len(), 2, "{label}: COMMIT dropped the writes");
+    }
+}
+
+/// ROLLBACK TO SAVEPOINT must revert only what came after the savepoint,
+/// whether the table was first written before it or after it.
+#[tokio::test]
+async fn test_savepoint_reverts_per_table_engine_writes_to_that_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = shipping_executor(dir.path()).await;
+
+    for (label, clause) in PER_TABLE_ENGINES {
+        let early = format!("{label}_early");
+        let late = format!("{label}_late");
+        for t in [&early, &late] {
+            exec(&ex, &format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT) {clause}")).await;
+            exec(&ex, &format!("INSERT INTO {t} VALUES (1, 100)")).await;
+        }
+
+        exec(&ex, "BEGIN").await;
+        // Written BEFORE the savepoint — this must survive the partial rollback.
+        exec(&ex, &format!("INSERT INTO {early} VALUES (2, 200)")).await;
+        exec(&ex, "SAVEPOINT sp").await;
+        // Written AFTER — both of these must be reverted.
+        exec(&ex, &format!("INSERT INTO {early} VALUES (3, 300)")).await;
+        exec(&ex, &format!("INSERT INTO {late} VALUES (4, 400)")).await;
+        exec(&ex, "ROLLBACK TO SAVEPOINT sp").await;
+        exec(&ex, "COMMIT").await;
+
+        let e = rows(&exec(&ex, &format!("SELECT id FROM {early} ORDER BY id")).await[0]).clone();
+        assert_eq!(
+            e,
+            vec![vec![Value::Int32(1)], vec![Value::Int32(2)]],
+            "{label}: the pre-savepoint write was lost or the post-savepoint one kept"
+        );
+        let l = rows(&exec(&ex, &format!("SELECT id FROM {late} ORDER BY id")).await[0]).clone();
+        assert_eq!(
+            l,
+            vec![vec![Value::Int32(1)]],
+            "{label}: a table first written after the savepoint was not reverted"
+        );
+    }
+}
+
+/// The before-image is taken at the first WRITE, not at BEGIN.
+///
+/// These are analytics tables; copying one at every BEGIN would trade a
+/// correctness bug for a worse performance one. A read-only transaction, and a
+/// transaction that writes some other table, must not pay for the big one.
+#[tokio::test]
+async fn test_begin_does_not_copy_untouched_per_table_engines() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = shipping_executor(dir.path()).await;
+    exec(&ex, "CREATE TABLE big (id INT PRIMARY KEY, v INT) WITH (engine='columnar')").await;
+    exec(&ex, "CREATE TABLE small (id INT PRIMARY KEY, v INT)").await;
+    for i in 0..2_000 {
+        exec(&ex, &format!("INSERT INTO big VALUES ({i}, {i})")).await;
+    }
+
+    async fn cycle(ex: &Executor, n: i32) -> f64 {
+        let start = std::time::Instant::now();
+        for k in 0..10 {
+            exec(ex, "BEGIN").await;
+            exec(ex, &format!("INSERT INTO small VALUES ({}, 1)", n + k)).await;
+            exec(ex, "ROLLBACK").await;
+        }
+        start.elapsed().as_secs_f64()
+    }
+    let mut base = f64::MAX;
+    for r in 0..3 {
+        base = base.min(cycle(&ex, r * 100).await);
+    }
+
+    // Ten transactions that never touch `big` must not cost anything like ten
+    // copies of it. A copy of 2,000 rows is far more than a millisecond apiece.
+    assert!(
+        base < 1.0,
+        "10 transactions touching only `small` took {:.0}ms — the untouched \
+         columnar table is being copied at BEGIN",
+        base * 1000.0
+    );
+}
