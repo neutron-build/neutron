@@ -96,6 +96,17 @@ pub struct RecoveredTable {
 pub struct MvccWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Append/fsync bookkeeping, so the engine above can answer "is there
+    /// un-fsynced work?" and group concurrent committers onto one fsync.
+    ///
+    /// Every specialty WAL (KV, collections, timeseries, vector, graph,
+    /// streams, CDC) already carries one of these; the SQL WAL did not, which
+    /// is precisely why `MvccStorageAdapter` could not implement
+    /// `durability_pending`/`make_durable` and inherited their trait defaults
+    /// (`false` / `Ok(())`). The executor's commit-point force then skipped
+    /// the engine entirely and an autocommit write was acked having only been
+    /// `flush()`ed into the OS page cache.
+    sync: crate::storage::wal_util::WalSync,
 }
 
 /// Write one length-prefixed, CRC-suffixed record onto any writer. Shares the
@@ -129,6 +140,7 @@ impl MvccWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                sync: crate::storage::wal_util::WalSync::new(),
             },
             state,
         ))
@@ -146,19 +158,43 @@ impl MvccWal {
         w.write_all(&payload)?;
         w.write_all(&crc.to_le_bytes())?;
         let r = w.flush();
+        // Bump the LSN under the writer lock, so a concurrent `group_sync`'s
+        // captured mark is exact.
+        self.sync.on_append();
         crate::storage::crashpoint::reach("wal.after_append");
         r
     }
 
-    /// Fsync the WAL file to ensure durability.
-    pub fn sync(&self) -> io::Result<()> {
+    /// Flush + fsync, returning the highest append LSN the fsync durably
+    /// covered. The mark is read under the writer lock, so every append at or
+    /// below it is guaranteed flushed before the `sync_all`.
+    fn sync_covering(&self) -> io::Result<u64> {
         let mut w = self.writer.lock();
+        let covered = self.sync.current();
         w.flush()?;
         crate::storage::crashpoint::io_fault_check!("wal.fsync");
         crate::storage::crashpoint::reach("wal.before_fsync");
-        let r = w.get_ref().sync_all();
+        w.get_ref().sync_all()?;
         crate::storage::crashpoint::reach("wal.after_fsync");
-        r
+        Ok(covered)
+    }
+
+    /// Fsync the WAL file to ensure durability.
+    pub fn sync(&self) -> io::Result<()> {
+        let covered = self.sync_covering()?;
+        self.sync.mark_synced(covered);
+        Ok(())
+    }
+
+    /// Group-commit sync: returns only once a completed fsync covers every
+    /// append made before this call. Concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.sync.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.sync.is_dirty()
     }
 
     /// Log a COMMIT and immediately fsync.
