@@ -162,7 +162,16 @@ impl ErrorCodec for PgWireErrorCodec {
                 // a conflict the client can win by retrying — the holder is
                 // still there — so classifying it as 40001 would send drivers
                 // into a retry loop against a lock that is not moving.
-                let code = if msg.contains("lock_not_available") {
+                let code = if msg.contains("current transaction is aborted") {
+                    // Commands issued after a transaction was aborted. Checked
+                    // FIRST because the engine reports this through
+                    // `StorageError`, where the `Runtime` arm's identical check
+                    // never sees it — so a serializable transaction killed to
+                    // break a deadlock could have its FOLLOW-UP statement
+                    // classified XX000, which tells a driver nothing. 25P02 is
+                    // what PostgreSQL sends and what clients act on.
+                    ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("lock_not_available") {
                     ErrorCode::LockNotAvailable
                 } else if msg.contains("write conflict")
                     || msg.contains("WriteConflict")
@@ -301,7 +310,16 @@ impl ErrorCodec for BinaryErrorCodec {
                 // a conflict the client can win by retrying — the holder is
                 // still there — so classifying it as 40001 would send drivers
                 // into a retry loop against a lock that is not moving.
-                let code = if msg.contains("lock_not_available") {
+                let code = if msg.contains("current transaction is aborted") {
+                    // Commands issued after a transaction was aborted. Checked
+                    // FIRST because the engine reports this through
+                    // `StorageError`, where the `Runtime` arm's identical check
+                    // never sees it — so a serializable transaction killed to
+                    // break a deadlock could have its FOLLOW-UP statement
+                    // classified XX000, which tells a driver nothing. 25P02 is
+                    // what PostgreSQL sends and what clients act on.
+                    ErrorCode::InFailedSqlTransaction
+                } else if msg.contains("lock_not_available") {
                     ErrorCode::LockNotAvailable
                 } else if msg.contains("write conflict")
                     || msg.contains("WriteConflict")
@@ -416,6 +434,24 @@ mod tests {
         assert_eq!(
             PgWireErrorCodec.code_to_string(ErrorCode::SerializationFailure),
             "40001"
+        );
+
+        // A killed transaction's FOLLOW-UP statement reports that the
+        // transaction is aborted, through StorageError rather than Runtime.
+        // That must be 25P02, not the XX000 catch-all: a driver reading XX000
+        // learns nothing, where 25P02 says "roll back and start over".
+        let after = ExecError::Storage(crate::storage::StorageError::Io(
+            "current transaction is aborted (it was killed to break a deadlock), \
+             commands ignored until end of transaction block: issue ROLLBACK"
+                .into(),
+        ));
+        assert_eq!(
+            PgWireErrorCodec.encode(&after).code,
+            ErrorCode::InFailedSqlTransaction
+        );
+        assert_eq!(
+            PgWireErrorCodec.code_to_string(ErrorCode::InFailedSqlTransaction),
+            "25P02"
         );
     }
 
