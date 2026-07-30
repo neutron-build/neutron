@@ -892,6 +892,20 @@ impl MaskingEngine {
     }
 
     /// Get the masking rule for a specific table/column/role combination.
+    /// Whether any masking policy exists at all.
+    ///
+    /// The executor uses this to decide whether a query must take the secured
+    /// path. Masking that is declared and never applied is worse than absent:
+    /// an absent feature is not relied on.
+    pub fn any_policies(&self) -> bool {
+        !self.policies.is_empty()
+    }
+
+    /// Whether any masking policy covers `table`.
+    pub fn covers_table(&self, table: &str) -> bool {
+        self.policies.iter().any(|p| p.table == table)
+    }
+
     pub fn get_rule(&self, table: &str, column: &str, ctx: &SessionContext) -> &MaskingRule {
         for policy in &self.policies {
             if policy.table == table && policy.column == column && ctx.has_role(&policy.role) {
