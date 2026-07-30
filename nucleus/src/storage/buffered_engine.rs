@@ -390,6 +390,39 @@ impl StorageEngine for BufferedDiskEngine {
             .collect())
     }
 
+    /// Forward the chunked scan to the disk engine, which streams page by page.
+    ///
+    /// The trait default materializes the ENTIRE table and then chunks it,
+    /// which defeats the whole point of the streaming-execution tier — its
+    /// purpose is to bound memory, and the producer feeding it was reading
+    /// every row into a `Vec` first. Same wrapper and same shape as
+    /// `scan_projected` (`6af5260`): a method the inner engine implements and
+    /// the wrapper production runs did not forward.
+    async fn scan_chunked(
+        &self,
+        table: &str,
+        tx: tokio::sync::mpsc::Sender<Vec<Row>>,
+        batch_size: usize,
+    ) -> Result<(), StorageError> {
+        if !self.is_in_txn() {
+            return self.inner.scan_chunked(table, tx, batch_size).await;
+        }
+        // Inside a transaction the buffered overlay is the authority on which
+        // rows exist, so stream from it rather than from the pages underneath.
+        let rows = self.scan(table).await?;
+        for chunk in rows.chunks(batch_size.max(1)) {
+            if tx.send(chunk.to_vec()).await.is_err() {
+                break; // receiver dropped
+            }
+        }
+        Ok(())
+    }
+
+    /// Checkpointing is the inner engine's — the buffer holds no durable state.
+    async fn checkpoint(&self) -> Result<(), StorageError> {
+        StorageEngine::checkpoint(self.inner.as_ref()).await
+    }
+
     async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
         if !self.is_in_txn() {
             return self.inner.scan_physical(table).await;
@@ -605,6 +638,19 @@ impl StorageEngine for BufferedDiskEngine {
 
     fn supports_mvcc(&self) -> bool {
         true // We provide transaction atomicity + rollback
+    }
+
+    /// Read committed, and no more.
+    ///
+    /// This engine buffers a session's writes and applies them at COMMIT, which
+    /// gives atomicity and rollback — but reads go straight to the inner engine,
+    /// so another session's commit becomes visible mid-transaction, and there is
+    /// no conflict detection of any kind. It cannot honour REPEATABLE READ,
+    /// SNAPSHOT or SERIALIZABLE, and until this method existed it accepted all
+    /// three and provided none of them. `MvccStorageAdapter` is the engine with
+    /// real snapshot isolation and SSI.
+    fn max_isolation_level(&self) -> crate::storage::IsolationLevel {
+        crate::storage::IsolationLevel::ReadCommitted
     }
 
     async fn make_durable(&self) -> Result<(), StorageError> {

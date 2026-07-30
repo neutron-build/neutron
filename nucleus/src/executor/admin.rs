@@ -151,7 +151,10 @@ impl Executor {
             // Handle SET TRANSACTION ISOLATION LEVEL
             if var_name == "transaction_isolation" || var_name == "default_transaction_isolation" {
                 let level = val.trim_matches('\'').trim_matches('"').to_lowercase();
-                self.storage.set_next_isolation_level(&level);
+                // Same refusal as BEGIN ISOLATION LEVEL: a SET that reports
+                // success and silently gives a weaker level is the same bug
+                // through a different door.
+                self.require_isolation_level(&level)?;
             }
 
             session.settings.write().insert(var_name.clone(), val);

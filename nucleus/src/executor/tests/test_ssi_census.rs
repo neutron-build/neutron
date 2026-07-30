@@ -305,3 +305,69 @@ async fn lost_update_same_row_is_prevented() {
 // seqscan. This is an SSI completeness gap, tracked separately; it is distinct
 // from the scan read-set regressions this census gates (which concern EXISTING
 // rows and are covered above). Adding predicate-lock tracking would close it.
+
+// ─── Isolation levels an engine cannot honour must be refused ───────────────
+
+/// An engine that cannot provide SERIALIZABLE must say so, not pretend.
+///
+/// `BEGIN ISOLATION LEVEL SERIALIZABLE` on the shipping disk engine used to
+/// succeed and run at read-committed: `set_next_isolation_level` had a no-op
+/// trait default and `BufferedDiskEngine` never overrode it, while
+/// `supports_mvcc()` returned true. Two transactions doing a read-modify-write
+/// both committed and one increment was lost, where PostgreSQL aborts one with
+/// 40001. Nothing surfaced it because the request was accepted.
+///
+/// Losing a write is worse than refusing a connection setting: the application
+/// cannot detect it, and the data is gone.
+#[tokio::test]
+async fn test_an_engine_refuses_isolation_it_cannot_provide() {
+    use crate::storage::buffered_engine::BufferedDiskEngine;
+    use crate::storage::disk_engine::DiskEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
+    let disk =
+        std::sync::Arc::new(DiskEngine::open(&dir.path().join("t.db"), catalog.clone()).unwrap());
+    let engine: std::sync::Arc<dyn crate::storage::StorageEngine> =
+        std::sync::Arc::new(BufferedDiskEngine::new(disk));
+    let ex = Executor::new(catalog, engine);
+
+    for level in ["SERIALIZABLE", "REPEATABLE READ"] {
+        let err = ex
+            .execute(&format!("BEGIN TRANSACTION ISOLATION LEVEL {level}"))
+            .await
+            .expect_err("an engine that cannot provide {level} must refuse it");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("READ COMMITTED"),
+            "the error must name what the engine DOES provide: {msg}"
+        );
+    }
+
+    // The level it can honour is still accepted, and so is a plain BEGIN.
+    exec(&ex, "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED").await;
+    exec(&ex, "ROLLBACK").await;
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "ROLLBACK").await;
+
+    // And the same refusal through SET, which is the other door into it.
+    let err = ex
+        .execute("SET transaction_isolation = 'serializable'")
+        .await
+        .expect_err("SET must refuse it too");
+    assert!(format!("{err}").contains("READ COMMITTED"), "{err}");
+}
+
+/// The MVCC engine has SSI, so it must still accept every level.
+#[tokio::test]
+async fn test_the_mvcc_engine_still_accepts_serializable() {
+    let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
+    let storage: std::sync::Arc<dyn crate::storage::StorageEngine> =
+        std::sync::Arc::new(crate::storage::MvccStorageAdapter::new());
+    let ex = Executor::new(catalog, storage);
+    for level in ["SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED", "SNAPSHOT"] {
+        exec(&ex, &format!("BEGIN TRANSACTION ISOLATION LEVEL {level}")).await;
+        exec(&ex, "ROLLBACK").await;
+    }
+    exec(&ex, "SET transaction_isolation = 'serializable'").await;
+}
