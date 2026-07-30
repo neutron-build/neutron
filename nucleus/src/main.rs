@@ -1584,6 +1584,12 @@ async fn cmd_start(cfg: StartConfig) {
                         if let Err(e) = executor_for_workers.columnar_store().write().checkpoint() {
                             tracing::warn!("Columnar WAL checkpoint failed: {e}");
                         }
+                        // Per-table storage engines (WITH (engine='columnar'
+                        // |'mergetree'|'lsm')): distinct from the columnar
+                        // MODEL checkpointed just above. Each has its own WAL
+                        // that otherwise grows unbounded — see
+                        // `checkpoint_table_engines`'s doc comment.
+                        executor_for_workers.checkpoint_table_engines().await;
                     }
                     nucleus::background::BackgroundTask::ReplicationSync => {
                         if let Some(ref wal_path) = wal_path_for_workers {
