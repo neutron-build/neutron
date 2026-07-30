@@ -113,6 +113,34 @@ pub struct BufferedDiskEngine {
     /// Per-session transaction buffers, keyed by storage session id.
     /// An entry exists iff that session has an explicit transaction open.
     txn_bufs: RwLock<HashMap<u64, TxnBuffer>>,
+    /// Table-level strict-2PL locks, used ONLY by sessions that asked for
+    /// SERIALIZABLE. See `storage::lock_manager` for why locking rather than
+    /// SSI, and why table granularity.
+    locks: super::lock_manager::LockManager,
+    /// Isolation level requested for each session's NEXT transaction, set by
+    /// `set_next_isolation_level` and consumed at `begin_txn`.
+    ///
+    /// This map is the whole reason R1 could stop refusing SERIALIZABLE here:
+    /// the trait method used to be an inherited `{}` no-op, so the engine never
+    /// learned what the client asked for and ran read-committed regardless.
+    pending_level: RwLock<HashMap<u64, super::IsolationLevel>>,
+    /// Isolation level of each session's OPEN transaction. Present iff that
+    /// session is inside a transaction that requested serializable.
+    serializable_txns: RwLock<std::collections::HashSet<u64>>,
+    /// Sessions whose serializable transaction was killed to break a deadlock
+    /// and which have not yet issued ROLLBACK.
+    ///
+    /// A transaction killed by wait-die can never commit, so its locks are
+    /// released at the instant it dies rather than waiting for the client to
+    /// clean up — otherwise the OLDER transaction it was competing with waits
+    /// on a lock nobody will ever drop, and a client that simply stops talking
+    /// after the error wedges the table permanently. But its buffered writes
+    /// are still sitting in `txn_bufs`, so a client that ignores the error and
+    /// COMMITs anyway would apply them with no locks held. Poisoning closes
+    /// that: every subsequent operation, COMMIT included, fails until ROLLBACK.
+    /// This is what PostgreSQL does with "current transaction is aborted,
+    /// commands ignored until end of transaction block".
+    poisoned: RwLock<std::collections::HashSet<u64>>,
 }
 
 /// The storage session id of the current execution context (0 = default /
@@ -133,6 +161,97 @@ impl BufferedDiskEngine {
         Self {
             inner,
             txn_bufs: RwLock::new(HashMap::new()),
+            locks: super::lock_manager::LockManager::new(),
+            pending_level: RwLock::new(HashMap::new()),
+            serializable_txns: RwLock::new(std::collections::HashSet::new()),
+            poisoned: RwLock::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// The error every operation on a killed transaction returns.
+    fn poisoned_err() -> StorageError {
+        StorageError::Io(
+            "current transaction is aborted (it was killed to break a deadlock), \
+             commands ignored until end of transaction block: issue ROLLBACK"
+                .into(),
+        )
+    }
+
+    /// Kill this session's serializable transaction: release its locks so the
+    /// transaction it was competing with can proceed, and poison it so nothing
+    /// it buffered can still be committed.
+    fn poison(&self, id: u64) {
+        self.poisoned.write().insert(id);
+        self.serializable_txns.write().remove(&id);
+        self.locks.release_all(id);
+    }
+
+    fn is_poisoned(&self, id: u64) -> bool {
+        let p = self.poisoned.read();
+        !p.is_empty() && p.contains(&id)
+    }
+
+    /// Acquire a lock, converting a wait-die death into a poisoned transaction.
+    async fn lock(
+        &self,
+        table: &str,
+        mode: super::lock_manager::LockMode,
+    ) -> Result<(), StorageError> {
+        let id = current_session_id();
+        if self.is_poisoned(id) {
+            return Err(Self::poisoned_err());
+        }
+        if !self.is_serializable_txn() {
+            return Ok(());
+        }
+        match self.locks.acquire(id, table, mode).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.poison(id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether this session is inside a SERIALIZABLE transaction, and therefore
+    /// must take 2PL locks.
+    ///
+    /// One `RwLock` read on the hot path. Every session that did not ask for
+    /// SERIALIZABLE — which is all of them by default — finds an empty set and
+    /// takes no locks at all, so the existing read-committed path is unchanged.
+    fn is_serializable_txn(&self) -> bool {
+        let set = self.serializable_txns.read();
+        !set.is_empty() && set.contains(&current_session_id())
+    }
+
+    /// Take a shared (read) lock on `table` if this is a serializable
+    /// transaction. Called from every path that returns rows.
+    async fn lock_read(&self, table: &str) -> Result<(), StorageError> {
+        self.lock(table, super::lock_manager::LockMode::Shared).await
+    }
+
+    /// Take an exclusive (write) lock on `table` if this is a serializable
+    /// transaction. Called from every path that mutates rows.
+    async fn lock_write(&self, table: &str) -> Result<(), StorageError> {
+        self.lock(table, super::lock_manager::LockMode::Exclusive)
+            .await
+    }
+
+    /// Synchronous paths (the `*_sync` index probes and `fast_count_all`) have
+    /// no way to await a lock. A serializable transaction must not read through
+    /// them unlocked, so they decline and let the caller fall back to the async
+    /// path that does lock. Returns true when the sync fast path is allowed.
+    fn sync_fastpath_allowed(&self) -> bool {
+        !self.is_serializable_txn()
+    }
+
+    /// End a serializable transaction: drop it from the set and release every
+    /// lock it holds. Idempotent, and a no-op for non-serializable sessions.
+    fn end_serializable_txn(&self, id: u64) {
+        let was_serializable = self.serializable_txns.write().remove(&id);
+        self.poisoned.write().remove(&id);
+        if was_serializable {
+            self.locks.release_all(id);
         }
     }
 
@@ -315,6 +434,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
+        self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             txn.ops.push(BufferedOp::CreateTable {
                 table: table.to_string(),
@@ -325,6 +445,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
+        self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             txn.ops.push(BufferedOp::DropTable {
                 table: table.to_string(),
@@ -335,6 +456,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
+        self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             let pending_pos = txn.take_pending_pos();
             txn.ops.push(BufferedOp::Insert {
@@ -348,6 +470,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
+        self.lock_read(table).await?;
         // Outside a transaction there is nothing to overlay, so take the inner
         // engine's own scan (which is cheaper than materializing positions).
         if !self.is_in_txn() {
@@ -374,6 +497,7 @@ impl StorageEngine for BufferedDiskEngine {
         projection: &[usize],
         limit: Option<usize>,
     ) -> Result<Vec<Row>, StorageError> {
+        self.lock_read(table).await?;
         if !self.is_in_txn() {
             return self.inner.scan_projected(table, projection, limit).await;
         }
@@ -404,6 +528,7 @@ impl StorageEngine for BufferedDiskEngine {
         tx: tokio::sync::mpsc::Sender<Vec<Row>>,
         batch_size: usize,
     ) -> Result<(), StorageError> {
+        self.lock_read(table).await?;
         if !self.is_in_txn() {
             return self.inner.scan_chunked(table, tx, batch_size).await;
         }
@@ -424,6 +549,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        self.lock_read(table).await?;
         if !self.is_in_txn() {
             return self.inner.scan_physical(table).await;
         }
@@ -436,6 +562,7 @@ impl StorageEngine for BufferedDiskEngine {
         col_idx: usize,
         value: &Value,
     ) -> Result<Vec<(usize, Row)>, StorageError> {
+        self.lock_read(table).await?;
         if !self.is_in_txn() {
             return self
                 .inner
@@ -451,6 +578,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        self.lock_read(table).await?;
         // With a live transaction buffer the limit must be applied to the
         // buffered view (buffered inserts/deletes shift which rows are the
         // "first n"), so fall back to the full materialize-then-truncate path.
@@ -465,6 +593,11 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     fn fast_count_all(&self, table: &str) -> Option<usize> {
+        // See `index_lookup_sync` — a serializable transaction cannot take
+        // its lock from a sync path, so decline and let the async path run.
+        if !self.sync_fastpath_allowed() {
+            return None;
+        }
         let mut count = self.inner.fast_count_all(table)?;
         // Adjust for this session's buffered transaction ops
         let bufs = self.txn_bufs.read();
@@ -486,6 +619,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
+        self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             txn.ops.push(BufferedOp::Delete {
                 table: table.to_string(),
@@ -497,6 +631,7 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
+        self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             txn.ops.push(BufferedOp::Update {
                 table: table.to_string(),
@@ -512,6 +647,7 @@ impl StorageEngine for BufferedDiskEngine {
         table: &str,
         updates: &[(usize, Row, Row)],
     ) -> Result<usize, StorageError> {
+        self.lock_write(table).await?;
         if self.is_in_txn() {
             // Buffered writes are this session's alone and are replayed against
             // the engine only at COMMIT, so nothing can have moved underneath
@@ -530,6 +666,7 @@ impl StorageEngine for BufferedDiskEngine {
         table: &str,
         targets: &[(usize, Row)],
     ) -> Result<usize, StorageError> {
+        self.lock_write(table).await?;
         if self.is_in_txn() {
             let positions: Vec<usize> = targets.iter().map(|(pos, _)| *pos).collect();
             return self.delete(table, &positions).await;
@@ -549,33 +686,68 @@ impl StorageEngine for BufferedDiskEngine {
 
     async fn begin_txn(&self) -> Result<(), StorageError> {
         let id = current_session_id();
+        // Consume the level requested for this transaction. Taking it (rather
+        // than peeking) matches PostgreSQL: the level applies to the next
+        // transaction, and the one after it reverts to the default.
+        let level = self.pending_level.write().remove(&id);
         let mut bufs = self.txn_bufs.write();
         if bufs.contains_key(&id) {
             return Err(StorageError::Io("transaction already active".into()));
         }
         bufs.insert(id, TxnBuffer::new());
+        drop(bufs);
+        if level == Some(super::IsolationLevel::Serializable) {
+            self.serializable_txns.write().insert(id);
+        }
         Ok(())
     }
 
     async fn commit_txn(&self) -> Result<(), StorageError> {
+        let id = current_session_id();
+        // A transaction killed to break a deadlock already gave up its locks,
+        // so applying its buffered writes now would write with no locks held —
+        // exactly the unserializable outcome the kill existed to prevent.
+        // Discard them and make the client say ROLLBACK.
+        if self.is_poisoned(id) {
+            self.txn_bufs.write().remove(&id);
+            self.end_serializable_txn(id);
+            return Err(Self::poisoned_err());
+        }
         let ops = {
             let mut bufs = self.txn_bufs.write();
-            match bufs.remove(&current_session_id()) {
+            match bufs.remove(&id) {
                 Some(txn) => txn.ops,
-                None => return Ok(()), // no active txn — no-op
+                None => {
+                    // No active txn — but still drop any locks, so a stray
+                    // COMMIT cannot strand them.
+                    self.end_serializable_txn(id);
+                    return Ok(());
+                }
             }
         };
-        self.apply_buffer(ops).await?;
+        let applied = self.apply_buffer(ops).await;
         // COMMIT is the durability point for the buffered ops just applied.
         // The executor's statement-level make_durable skipped them while the
         // transaction was open (writes were only in the in-memory buffer), so
         // force the WAL here before COMMIT is acked.
-        self.inner.make_durable().await
+        let result = match applied {
+            Ok(()) => self.inner.make_durable().await,
+            Err(e) => Err(e),
+        };
+        // Strict 2PL: locks are held until the transaction ENDS, which is here
+        // — after the writes are applied and durable. Releasing any earlier
+        // would let another transaction read a value this one might still fail
+        // to commit. Released on the error path too, or a failed COMMIT would
+        // hold its locks forever.
+        self.end_serializable_txn(id);
+        result
     }
 
     async fn abort_txn(&self) -> Result<(), StorageError> {
+        let id = current_session_id();
         // Discard this session's buffered operations.
-        self.txn_bufs.write().remove(&current_session_id());
+        self.txn_bufs.write().remove(&id);
+        self.end_serializable_txn(id);
         Ok(())
     }
 
@@ -632,25 +804,62 @@ impl StorageEngine for BufferedDiskEngine {
     fn drop_storage_session(&self, id: u64) {
         // A client that disconnects mid-transaction must not leave an orphaned
         // buffer behind — it would hold "transaction already active" against
-        // the session id forever.
+        // the session id forever. The same is true of its 2PL locks, and far
+        // worse: an abandoned exclusive lock blocks every other serializable
+        // transaction on that table permanently.
         self.txn_bufs.write().remove(&id);
+        self.pending_level.write().remove(&id);
+        self.end_serializable_txn(id);
     }
 
     fn supports_mvcc(&self) -> bool {
         true // We provide transaction atomicity + rollback
     }
 
-    /// Read committed, and no more.
+    /// Read committed, or SERIALIZABLE — with nothing in between.
     ///
-    /// This engine buffers a session's writes and applies them at COMMIT, which
-    /// gives atomicity and rollback — but reads go straight to the inner engine,
-    /// so another session's commit becomes visible mid-transaction, and there is
-    /// no conflict detection of any kind. It cannot honour REPEATABLE READ,
-    /// SNAPSHOT or SERIALIZABLE, and until this method existed it accepted all
-    /// three and provided none of them. `MvccStorageAdapter` is the engine with
-    /// real snapshot isolation and SSI.
+    /// The gap is not an oversight. This engine has no versioning: reads go
+    /// straight to the inner engine's current state, so another session's
+    /// commit becomes visible mid-transaction. REPEATABLE READ and SNAPSHOT
+    /// are defined by what a stable read snapshot shows, and there is no
+    /// snapshot here to stabilise — providing them would mean putting MVCC on
+    /// disk. SERIALIZABLE is reachable without any of that, because strict 2PL
+    /// (see `storage::lock_manager`) delivers conflict-serializable schedules
+    /// from the lock discipline alone.
+    ///
+    /// So the ladder is not monotonic in implementation cost, only in strength,
+    /// and `IsolationLevel`'s ordering is what the executor compares against.
+    /// Reporting SERIALIZABLE here therefore also accepts the two levels
+    /// beneath it, which is correct rather than convenient: SERIALIZABLE is
+    /// strictly stronger than both, so running a REPEATABLE READ transaction
+    /// under 2PL gives the client more than it asked for and never less. That
+    /// is exactly what PostgreSQL's own docs permit ("a level may provide
+    /// stronger guarantees than requested").
     fn max_isolation_level(&self) -> crate::storage::IsolationLevel {
-        crate::storage::IsolationLevel::ReadCommitted
+        crate::storage::IsolationLevel::Serializable
+    }
+
+    /// Record the level for this session's next transaction.
+    ///
+    /// Previously the inherited `{}` default, which is how `BEGIN ISOLATION
+    /// LEVEL SERIALIZABLE` used to run read-committed here without a word.
+    fn set_next_isolation_level(&self, level: &str) {
+        let id = current_session_id();
+        match super::IsolationLevel::parse(level) {
+            // Read committed is the floor and needs no bookkeeping; clearing
+            // keeps a session that steps back down from stranding an entry.
+            Some(super::IsolationLevel::ReadCommitted) | None => {
+                self.pending_level.write().remove(&id);
+            }
+            // Everything above read-committed is served by 2PL. See
+            // `max_isolation_level` for why serving a weaker request with a
+            // stronger mechanism is correct.
+            Some(_) => {
+                self.pending_level
+                    .write()
+                    .insert(id, super::IsolationLevel::Serializable);
+            }
+        }
     }
 
     async fn make_durable(&self) -> Result<(), StorageError> {
@@ -692,6 +901,7 @@ impl StorageEngine for BufferedDiskEngine {
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        self.lock_read(table).await?;
         self.inner.index_lookup(table, index_name, value).await
     }
 
@@ -702,6 +912,7 @@ impl StorageEngine for BufferedDiskEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        self.lock_read(table).await?;
         self.inner
             .index_lookup_range(table, index_name, low, high)
             .await
@@ -713,6 +924,12 @@ impl StorageEngine for BufferedDiskEngine {
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // A serializable transaction must not read through a path that
+        // cannot await its 2PL lock. Decline so the caller falls back to
+        // the async path, which locks.
+        if !self.sync_fastpath_allowed() {
+            return Ok(None);
+        }
         // Inside a transaction the inner engine's index reflects only COMMITTED
         // rows — it cannot see this transaction's own buffered inserts. A unique
         // check that trusted it would miss an in-transaction duplicate (a second
@@ -731,6 +948,12 @@ impl StorageEngine for BufferedDiskEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // A serializable transaction must not read through a path that
+        // cannot await its 2PL lock. Decline so the caller falls back to
+        // the async path, which locks.
+        if !self.sync_fastpath_allowed() {
+            return Ok(None);
+        }
         self.inner
             .index_lookup_range_sync(table, index_name, low, high)
     }
@@ -742,6 +965,11 @@ impl StorageEngine for BufferedDiskEngine {
         eq_value: Option<&Value>,
         range: Option<(&Value, &Value)>,
     ) -> Option<Vec<Row>> {
+        // See `index_lookup_sync` — a serializable transaction cannot take
+        // its lock from a sync path, so decline and let the async path run.
+        if !self.sync_fastpath_allowed() {
+            return None;
+        }
         self.inner
             .index_only_scan(table, index_name, eq_value, range)
     }
