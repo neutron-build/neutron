@@ -15,7 +15,8 @@ files are historical scratch material and are not release evidence.
 |---|---|
 | Single-node server and pgwire SQL | Primary development target; correctness work remains |
 | Embedded/core Rust library | Builds and tests without server features |
-| Trusted SCRAM roles and relational RLS | Implemented; broader surface and masking audit remains |
+| Trusted SCRAM roles, relational RLS, column masking | Implemented and enforced on every row-returning path |
+| SERIALIZABLE isolation | Implemented on both shipping engines (2PL on disk, SSI on MVCC); table-granularity locking serializes a hot table |
 | RESP and specialty data models | Experimental until durability, policy, and compatibility gates pass |
 | Browser/WASM | Experimental build target |
 | Distributed/Raft mode | **Incomplete and unsupported** |
