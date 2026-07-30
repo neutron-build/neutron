@@ -278,8 +278,27 @@ pub struct MetricsRegistry {
     /// finding #33.
     pub memory_writes_rejected: Gauge,
 
+    // ── Serializable (strict 2PL) lock table ────────────────────────────
+    // Table-level 2PL trades concurrency for correctness, so the cost of that
+    // trade has to be visible. Without these, a serializable workload that
+    // slows down offers nothing to look at: waiting on a lock and simply doing
+    // more work are indistinguishable from the outside.
+    /// Lock acquisitions that were granted without waiting.
+    pub lock_acquired_immediate: Counter,
+    /// Lock acquisitions that had to wait for a conflicting holder.
+    pub lock_waits: Counter,
+    /// Transactions killed by wait-die to break a potential deadlock.
+    /// This is the number that turns into client-visible 40001 retries.
+    pub lock_deadlock_kills: Counter,
+    /// Waits abandoned because they exceeded `lock_timeout`.
+    pub lock_timeouts: Counter,
+    /// Tables currently held under at least one lock.
+    pub locks_held: Gauge,
+
     // Histograms
     pub query_duration: Histogram,
+    /// How long lock acquisition blocked, for waits that actually blocked.
+    pub lock_wait_duration: Histogram,
 
     // Startup time for uptime tracking
     started_at: Instant,
@@ -365,7 +384,32 @@ impl MetricsRegistry {
                 "1 while writes are rejected due to critical memory pressure",
             ),
 
+            lock_acquired_immediate: Counter::new(
+                "nucleus_lock_acquired_immediate_total",
+                "Serializable lock acquisitions granted without waiting",
+            ),
+            lock_waits: Counter::new(
+                "nucleus_lock_waits_total",
+                "Serializable lock acquisitions that had to wait",
+            ),
+            lock_deadlock_kills: Counter::new(
+                "nucleus_lock_deadlock_kills_total",
+                "Serializable transactions killed by wait-die to break a deadlock",
+            ),
+            lock_timeouts: Counter::new(
+                "nucleus_lock_timeouts_total",
+                "Serializable lock waits abandoned after lock_timeout",
+            ),
+            locks_held: Gauge::new(
+                "nucleus_locks_held",
+                "Tables currently held under at least one serializable lock",
+            ),
             query_duration: Histogram::query_duration(),
+            lock_wait_duration: Histogram::new(
+                "nucleus_lock_wait_duration_seconds",
+                "Time blocked acquiring a serializable table lock",
+                vec![0.0001, 0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 30.0],
+            ),
 
             started_at: Instant::now(),
         }
@@ -423,6 +467,10 @@ impl MetricsRegistry {
         render_counter(&mut out, &self.plan_path_fallbacks);
         render_counter(&mut out, &self.index_scan_fallbacks);
         render_counter(&mut out, &self.index_scan_served);
+        render_counter(&mut out, &self.lock_acquired_immediate);
+        render_counter(&mut out, &self.lock_waits);
+        render_counter(&mut out, &self.lock_deadlock_kills);
+        render_counter(&mut out, &self.lock_timeouts);
         render_counter(&mut out, &self.index_scan_attempts);
         render_counter(&mut out, &self.wal_bytes_written);
         render_counter(&mut out, &self.wal_syncs);
@@ -452,24 +500,27 @@ impl MetricsRegistry {
             self.uptime_secs()
         ));
 
-        // Histogram
-        let h = &self.query_duration;
-        out.push_str(&format!("# HELP {} {}\n", h.name, h.help));
-        out.push_str(&format!("# TYPE {} histogram\n", h.name));
-        let counts = h.bucket_counts();
-        for (i, bound) in h.bounds.iter().enumerate() {
+        render_gauge(&mut out, &self.locks_held);
+
+        // Histograms
+        for h in [&self.query_duration, &self.lock_wait_duration] {
+            out.push_str(&format!("# HELP {} {}\n", h.name, h.help));
+            out.push_str(&format!("# TYPE {} histogram\n", h.name));
+            let counts = h.bucket_counts();
+            for (i, bound) in h.bounds.iter().enumerate() {
+                out.push_str(&format!(
+                    "{}_bucket{{le=\"{}\"}} {}\n",
+                    h.name, bound, counts[i]
+                ));
+            }
             out.push_str(&format!(
-                "{}_bucket{{le=\"{}\"}} {}\n",
-                h.name, bound, counts[i]
+                "{}_bucket{{le=\"+Inf\"}} {}\n",
+                h.name,
+                counts[h.bounds.len()]
             ));
+            out.push_str(&format!("{}_sum {}\n", h.name, h.sum()));
+            out.push_str(&format!("{}_count {}\n\n", h.name, h.count()));
         }
-        out.push_str(&format!(
-            "{}_bucket{{le=\"+Inf\"}} {}\n",
-            h.name,
-            counts[h.bounds.len()]
-        ));
-        out.push_str(&format!("{}_sum {}\n", h.name, h.sum()));
-        out.push_str(&format!("{}_count {}\n\n", h.name, h.count()));
 
         out
     }
@@ -498,6 +549,10 @@ impl MetricsRegistry {
         add_counter(&mut rows, &self.index_join_skipped);
         add_counter(&mut rows, &self.plan_path_errors);
         add_counter(&mut rows, &self.plan_path_fallbacks);
+        add_counter(&mut rows, &self.lock_acquired_immediate);
+        add_counter(&mut rows, &self.lock_waits);
+        add_counter(&mut rows, &self.lock_deadlock_kills);
+        add_counter(&mut rows, &self.lock_timeouts);
         add_counter(&mut rows, &self.index_scan_fallbacks);
         add_counter(&mut rows, &self.index_scan_served);
         add_counter(&mut rows, &self.index_scan_attempts);
@@ -523,15 +578,15 @@ impl MetricsRegistry {
             format!("{:.3}", self.uptime_secs()),
         ));
 
-        rows.push((
-            self.query_duration.name.clone(),
-            "histogram".to_string(),
-            format!(
-                "count={} sum={:.6}",
-                self.query_duration.count(),
-                self.query_duration.sum()
-            ),
-        ));
+        add_gauge(&mut rows, &self.locks_held);
+
+        for h in [&self.query_duration, &self.lock_wait_duration] {
+            rows.push((
+                h.name.clone(),
+                "histogram".to_string(),
+                format!("count={} sum={:.6}", h.count(), h.sum()),
+            ));
+        }
 
         rows
     }
@@ -733,8 +788,13 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 23 counters + 7 gauges + 1 uptime + 1 histogram = 32
-        assert_eq!(rows.len(), 32);
+        // 27 counters + 8 gauges + 1 uptime + 2 histograms = 38.
+        // The count is asserted deliberately: `as_rows` is SHOW METRICS, and a
+        // metric added to the registry but not to the render/rows lists is
+        // silently invisible to every operator — the same declared-but-unwired
+        // shape as the rest of this engine. Update this number ONLY alongside
+        // adding the metric to both `render_prometheus` and `as_rows`.
+        assert_eq!(rows.len(), 38);
 
         // Check a counter row
         let qt = rows

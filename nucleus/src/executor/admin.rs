@@ -10,7 +10,9 @@ use sqlparser::ast;
 use crate::fault::SubsystemHealth;
 use crate::types::{DataType, Row, Value};
 
-use super::helpers::{grantee_name, parse_grant_objects, parse_privileges, parse_time_zone};
+use super::helpers::{
+    grantee_name, parse_grant_objects, parse_lock_timeout, parse_privileges, parse_time_zone,
+};
 use super::schema_types::{CursorDef, RoleDef};
 use super::{ExecError, ExecResult, Executor};
 
@@ -155,6 +157,14 @@ impl Executor {
                 // success and silently gives a weaker level is the same bug
                 // through a different door.
                 self.require_isolation_level(&level)?;
+            }
+
+            // `SET lock_timeout = '5s'` / `= 5000` — how long a SERIALIZABLE
+            // transaction may block on a table lock before giving up. Same name
+            // and same units (milliseconds) as PostgreSQL, 0 to disable.
+            if var_name == "lock_timeout" {
+                let ms = parse_lock_timeout(&val)?;
+                self.storage.set_lock_timeout_ms(ms);
             }
 
             session.settings.write().insert(var_name.clone(), val);
