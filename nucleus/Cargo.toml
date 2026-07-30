@@ -198,6 +198,11 @@ path = "src/bin/probe_raft_crash.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "probe_crossmodel_commit_order"
+path = "src/bin/probe_crossmodel_commit_order.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "probe_io_faults"
 path = "src/bin/probe_io_faults.rs"
 required-features = ["server"]
