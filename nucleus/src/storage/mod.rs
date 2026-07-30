@@ -35,6 +35,7 @@ pub mod granule_stats;
 pub mod io_uring;
 #[cfg(feature = "server")]
 pub mod kv_wal;
+pub mod lock_manager;
 pub mod lsm;
 #[cfg(feature = "server")]
 pub mod lsm_engine;
