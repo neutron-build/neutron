@@ -22,6 +22,32 @@ use std::sync::Arc;
 // Tokenization
 // ============================================================================
 
+/// The top `limit` hits by score, descending, ties broken by ascending doc id.
+///
+/// Selects rather than sorts. Every caller here wants a handful of results out
+/// of everything that matched, and a full sort of the match set costs
+/// `O(m log m)` where selection costs `O(m + k log k)` — on an OR query over
+/// 10k documents that difference measured 36x the cost of the same query over
+/// 1k, which is not what an inverted index is supposed to do with a tenfold
+/// corpus. The comparator is total, so the top-k and their order are identical
+/// to what the full sort produced.
+fn top_k_by_score(mut hits: Vec<(u64, f64)>, limit: usize) -> Vec<(u64, f64)> {
+    let cmp = |a: &(u64, f64), b: &(u64, f64)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    if limit == 0 {
+        return Vec::new();
+    }
+    if hits.len() > limit {
+        hits.select_nth_unstable_by(limit - 1, cmp);
+        hits.truncate(limit);
+    }
+    hits.sort_by(cmp);
+    hits
+}
+
 /// A token extracted from text, with position information.
 #[derive(Debug, Clone)]
 pub struct Token {
@@ -906,13 +932,8 @@ impl InvertedIndex {
         }
 
         // Sort and truncate results
-        let mut results: Vec<(u64, f64)> = scores.into_iter().collect();
-        results.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        results.truncate(limit);
+        let results: Vec<(u64, f64)> = scores.into_iter().collect();
+        let results = top_k_by_score(results, limit);
 
         FacetedSearchResult {
             results,
@@ -961,14 +982,8 @@ impl InvertedIndex {
             }
         }
 
-        let mut results: Vec<(u64, f64)> = scores.into_iter().collect();
-        results.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        results.truncate(limit);
-        results
+        let results: Vec<(u64, f64)> = scores.into_iter().collect();
+        top_k_by_score(results, limit)
     }
 
     /// Search for documents matching a query. Returns (doc_id, score) pairs sorted by score DESC.
@@ -1008,14 +1023,8 @@ impl InvertedIndex {
         }
 
         // Sort by score descending, then doc_id ascending for deterministic tiebreaking
-        let mut results: Vec<(u64, f64)> = scores.into_iter().collect();
-        results.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        results.truncate(limit);
-        results
+        let results: Vec<(u64, f64)> = scores.into_iter().collect();
+        top_k_by_score(results, limit)
     }
 
     /// Search for documents matching ALL query terms (AND semantics) with
@@ -1110,14 +1119,8 @@ impl InvertedIndex {
         }
 
         // Sort by score descending, then doc_id ascending for deterministic tiebreaking
-        let mut results: Vec<(u64, f64)> = candidate_docs.into_iter().collect();
-        results.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        results.truncate(limit);
-        results
+        let results: Vec<(u64, f64)> = candidate_docs.into_iter().collect();
+        top_k_by_score(results, limit)
     }
 
     /// BM25 parameters.
@@ -3859,33 +3862,26 @@ mod tests {
 
         assert_eq!(idx.doc_count(), 10_000);
 
-        // Measure multi-term query performance
-        let start = std::time::Instant::now();
         let iterations = 100;
-        for _ in 0..iterations {
-            let _ = idx.search("database query optimizer", 10);
-        }
-        let search_elapsed = start.elapsed();
 
-        let start_scored = std::time::Instant::now();
-        for _ in 0..iterations {
-            let _ = idx.search_scored("database query optimizer", 10);
-        }
-        let scored_elapsed = start_scored.elapsed();
-
-        // Assert that both methods complete within reasonable time
-        // 100 queries over 10K docs should take < 5 seconds on any modern machine
-        // (includes deterministic tiebreaker sorting overhead)
-        assert!(
-            search_elapsed.as_secs() < 5,
-            "search took too long: {:?}",
-            search_elapsed
-        );
-        assert!(
-            scored_elapsed.as_secs() < 5,
-            "search_scored took too long: {:?}",
-            scored_elapsed
-        );
+        // NO timing assertion here, deliberately.
+        //
+        // This test used to assert `elapsed < 5s` for 100 queries over 10k
+        // documents. `cargo test` runs the ~2000 tests in this binary in
+        // PARALLEL, so any wall-clock number measured here is measuring
+        // contention: the same binary timed 1.8s alone and 6.5s alongside the
+        // suite. Rewriting it as a scaling ratio did not save it either — the
+        // contention skews the longer measurement more, so the ratio moved too
+        // (under 20 alone, 32.6 under load). A guard that fails on machine load
+        // teaches people to ignore guards.
+        //
+        // Rewriting it was still worth doing: as a ratio it immediately exposed
+        // a real defect the absolute threshold had hidden — a 10x corpus cost
+        // 36x, because every search path fully sorted the whole match set to
+        // return the top ten. That is fixed (`top_k_by_score`). The measurement
+        // itself now lives where a measurement belongs, in `bench_paired`,
+        // which runs alone and in release.
+        let _ = iterations;
 
         // Verify results are valid
         let search_results = idx.search("database storage engine", 10);
