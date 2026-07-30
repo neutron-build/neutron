@@ -1289,6 +1289,12 @@ impl MvccStorageAdapter {
     /// `PRAGMA synchronous = FULL`.
     ///
     /// Explicit transactions (BEGIN/COMMIT) always fsync automatically.
+    /// Access the underlying WAL (if any).
+    #[cfg(feature = "server")]
+    pub fn wal(&self) -> Option<&Arc<MvccWal>> {
+        self.wal.as_ref()
+    }
+
     pub fn wal_sync(&self) -> Result<(), StorageError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
@@ -1485,6 +1491,34 @@ macro_rules! wal_log_commit {
 impl StorageEngine for MvccStorageAdapter {
     fn sync(&self) -> Result<(), StorageError> {
         self.wal_sync()
+    }
+
+    /// Whether the WAL holds appends no completed fsync covers yet.
+    ///
+    /// This adapter used to inherit the trait default (`false`), which made
+    /// the executor's commit-point force — `force_wal_durability`, the thing
+    /// standing between an autocommit write and a durability claim — skip the
+    /// engine entirely. Explicit COMMIT was unaffected (`commit_txn` fsyncs
+    /// inline via `log_commit`), so the hole was autocommit-only: the WAL
+    /// record was `write()`n and `flush()`ed into the OS page cache, the
+    /// client was acked, and a power loss took the write. The crash probes
+    /// missed it because their child calls `db.sync()` after every insert and
+    /// only then prints `DURABLE` — they proved fsynced writes survive, which
+    /// was never in question, rather than that an acked write is fsynced.
+    #[cfg(feature = "server")]
+    fn durability_pending(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.is_dirty())
+    }
+
+    /// Fsync the WAL, grouping concurrent committers onto one fsync. Called at
+    /// the commit point for autocommit writes, gated on `synchronous_commit`.
+    async fn make_durable(&self) -> Result<(), StorageError> {
+        #[cfg(feature = "server")]
+        if let Some(ref wal) = self.wal {
+            wal.group_sync()
+                .map_err(|e| StorageError::Io(format!("WAL sync: {e}")))?;
+        }
+        Ok(())
     }
 
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
