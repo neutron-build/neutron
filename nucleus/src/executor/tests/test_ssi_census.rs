@@ -319,17 +319,17 @@ async fn lost_update_same_row_is_prevented() {
 ///
 /// Losing a write is worse than refusing a connection setting: the application
 /// cannot detect it, and the data is gone.
+/// The subject is `MemoryEngine`, which implements no isolation machinery at
+/// all and therefore inherits the weakest declaration. It used to be
+/// `BufferedDiskEngine`; that engine now provides real SERIALIZABLE through
+/// strict 2PL (R6, see `test_2pl_census`), so it is no longer an example of an
+/// engine that must refuse. The CONTRACT under test is unchanged and is the
+/// point: an engine that cannot provide a level says so instead of pretending.
 #[tokio::test]
 async fn test_an_engine_refuses_isolation_it_cannot_provide() {
-    use crate::storage::buffered_engine::BufferedDiskEngine;
-    use crate::storage::disk_engine::DiskEngine;
-
-    let dir = tempfile::tempdir().unwrap();
     let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
-    let disk =
-        std::sync::Arc::new(DiskEngine::open(&dir.path().join("t.db"), catalog.clone()).unwrap());
     let engine: std::sync::Arc<dyn crate::storage::StorageEngine> =
-        std::sync::Arc::new(BufferedDiskEngine::new(disk));
+        std::sync::Arc::new(crate::storage::MemoryEngine::new());
     let ex = Executor::new(catalog, engine);
 
     for level in ["SERIALIZABLE", "REPEATABLE READ"] {

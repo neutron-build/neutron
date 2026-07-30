@@ -64,6 +64,7 @@ mod test_scalar_fns;
 mod test_specialty_persistence;
 mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
 mod test_sql_wal_ack_durability; // R4: an acked autocommit SQL write is fsync-durable
+mod test_2pl_census; // R6: serializable anomaly census for the DISK engine (strict 2PL)
 mod test_ssi_census; // B1: end-to-end SSI anomaly census (gate for MVCC scan changes)
 mod test_streaming_aggregate; // Grace hash aggregation: bounded-memory GROUP BY with spill
 mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN with spill
