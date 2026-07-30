@@ -261,15 +261,50 @@ session B's autocommit `INSERT` survived an unrelated session A's `ROLLBACK`, an
 error state is implemented: a statement error aborts the transaction and a later
 `COMMIT` becomes a `ROLLBACK` (`src/executor/txn.rs:89-98`).
 
-**Isolation.** `SHOW transaction_isolation` reports `read committed`
-**[verified]**, and the default engine behaves that way — **[verified]** an open
-transaction saw a row another session committed after its `BEGIN`. Note the
-MVCC engine's internal default is `IsolationLevel::Snapshot`
-(`src/storage/mvcc.rs:824`, and the parse fallback at `:2292`), i.e. repeatable
-read; `serializable` is a distinct level with SSI checks at `:1196-1214`.
-**[code]** The reported level and the engine-internal default can therefore
-disagree depending on which engine backs the table — treat `SHOW
-transaction_isolation` as advisory.
+**Isolation.** The default is `read committed`, and the default engine behaves
+that way — **[verified]** an open transaction saw a row another session
+committed after its `BEGIN`.
+
+`SERIALIZABLE` is available on both shipping engines, by two different
+mechanisms:
+
+- **`BufferedDiskEngine`** (what `main.rs` builds for every server deployment)
+  uses **table-level strict two-phase locking** (`src/storage/lock_manager.rs`).
+  It has no versioning, so SSI — which needs a stable read snapshot to detect
+  antidependencies against — is not available to it; 2PL yields
+  conflict-serializable schedules from the lock discipline alone. Table
+  granularity is deliberate: serializability must exclude phantoms, and a row
+  lock cannot lock a row that does not exist yet.
+- **`MvccStorageAdapter`** (`--memory`, and embedded `durable_mvcc`) uses
+  **SSI**: snapshots plus rw-antidependency tracking, with the conflict check
+  at commit.
+
+Consequences worth knowing before you turn it on:
+
+- **Only SERIALIZABLE transactions take locks.** As in PostgreSQL, the
+  guarantee holds *among serializable transactions*; a concurrent
+  read-committed session can still write a table a serializable transaction is
+  reading. Every non-serializable session is unaffected and pays nothing.
+- **Under 2PL the loser BLOCKS**, where under SSI it proceeds and fails at
+  commit. Deadlock is prevented by wait-die (older waits, younger dies), so
+  there is no detector and no false negatives — but a younger transaction can
+  be killed before it has done anything wrong. It returns **SQLSTATE 40001**
+  and should be retried, exactly like an SSI abort.
+- **Waits are bounded by `lock_timeout`** (default 10s, `SET lock_timeout =
+  '5s'`, `0` disables). Exceeding it returns **SQLSTATE 55P03
+  `lock_not_available`** — deliberately *not* 40001, because the holder is
+  still there and retrying will not help.
+- **Table-level locking serializes a hot table.** A write-heavy serializable
+  workload on one table will effectively run one transaction at a time. That is
+  correct but slow; use it where you need the guarantee, not by default.
+- Observability: `nucleus_lock_waits_total`,
+  `nucleus_lock_wait_duration_seconds`, `nucleus_lock_deadlock_kills_total`,
+  `nucleus_lock_timeouts_total`, `nucleus_locks_held`.
+
+An engine that cannot honour a requested level now **refuses** it rather than
+silently downgrading (`MemoryEngine` does this). Before that, `BEGIN ISOLATION
+LEVEL SERIALIZABLE` on the disk engine was accepted and run at read-committed,
+and two concurrent read-modify-writes both committed with one increment lost.
 
 **Policy.** RLS is enforced here and only here as real policy: `USING` filters
 `SELECT`/`UPDATE`/`DELETE`, `WITH CHECK` validates `INSERT`/`UPDATE`, filtering

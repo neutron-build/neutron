@@ -88,6 +88,23 @@ async fn start_nucleus_server(port: u16, engine: &str) {
     let storage: Arc<dyn StorageEngine> = match engine {
         "memory" => Arc::new(MemoryEngine::new()),
         "columnar" => Arc::new(ColumnarStorageEngine::new()),
+        // The engine `main.rs` actually builds: paged B-tree on disk, wrapped
+        // for transaction atomicity. Every other option here is RAM-resident,
+        // which made every published comparison against an on-disk PostgreSQL
+        // partly a measurement of RAM versus disk rather than of the engines.
+        // A benchmark whose result is decided by the storage medium is not a
+        // benchmark of the database.
+        "disk" | "buffered-disk" => {
+            let dir = std::env::temp_dir().join(format!("nucleus-pgcompare-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let disk = Arc::new(
+                nucleus::storage::DiskEngine::open(&dir.join("bench.db"), catalog.clone())
+                    .expect("open disk engine"),
+            );
+            Arc::new(nucleus::storage::buffered_engine::BufferedDiskEngine::new(
+                disk,
+            ))
+        }
         _ => Arc::new(MvccStorageAdapter::new()),
     };
     let executor = Arc::new(Executor::new(catalog, storage));

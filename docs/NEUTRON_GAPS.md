@@ -160,3 +160,31 @@ comes from provider IDs and Message-ID headers rather than being minted
 locally. So it gets `@@` matching but no index and no `BM25` ranking. That is
 the documented trade, not a defect; worth revisiting only if mail search
 becomes slow enough to justify a surrogate key.
+
+## No SDK client retries a serialization failure (found 2026-07-30)
+
+`SELECT ... FOR` a serializable transaction can now fail with **SQLSTATE 40001**
+on the shipping engine — that is new. Before R6 the disk engine refused
+`SERIALIZABLE` outright, so 40001 only ever came from the in-memory MVCC engine
+and effectively never reached an application. Strict 2PL with wait-die means a
+younger transaction is killed on conflict, and `lock_timeout` adds **55P03
+`lock_not_available`** as a second new error class.
+
+Grepped every SDK (`go/`, `python/`, `typescript/`, `rs/`, `elixir/`, `zig/`,
+`julia/`) for `40001`: **zero hits.** No client has retry-on-serialization-
+failure logic, and `FRAMEWORK_CONTRACT.md` does not mention isolation levels at
+all. Every SDK's transaction helper will surface a retryable conflict to
+application code as a hard error.
+
+What each client needs:
+
+- Retry the transaction on `40001` with bounded attempts and backoff. This is
+  the contract of the error — PostgreSQL drivers do not do it for you, the
+  application layer does, and a framework SDK is that layer.
+- Do **not** retry `55P03`. The lock is still held; retrying spins against a
+  transaction that is not moving. Surface it with the `lock_timeout` hint.
+- Document that `SERIALIZABLE` on Nucleus's disk engine is table-level 2PL, so
+  a hot table serializes — see `nucleus/docs/MODEL_SEMANTICS.md`.
+
+This is the highest-value item in the post-R6 follow-up: the isolation level is
+now real and usable in the engine, and unusable through the SDKs.
