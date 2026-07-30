@@ -317,6 +317,48 @@ pub(super) fn validate_binary_collation(collation: &ast::ObjectName) -> Result<(
     }
 }
 
+/// Parse a `lock_timeout` value into milliseconds.
+///
+/// Accepts a bare number (milliseconds, as PostgreSQL does) or a number with a
+/// `us`/`ms`/`s`/`min` suffix. `0` disables the timeout. Rejecting an
+/// unparseable value matters more here than it looks: silently treating
+/// `'5s'` as 0 would turn the setting into "wait forever", which is exactly the
+/// failure the timeout exists to prevent, and the client would have been told
+/// the SET succeeded.
+pub(super) fn parse_lock_timeout(value: &str) -> Result<u64, ExecError> {
+    let raw = value.trim().trim_matches(['\'', '"']).trim().to_lowercase();
+    if raw.is_empty() {
+        return Err(ExecError::Runtime("lock_timeout requires a value".into()));
+    }
+    let (digits, unit) = raw.split_at(
+        raw.find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(raw.len()),
+    );
+    let n: f64 = digits.parse().map_err(|_| {
+        ExecError::Runtime(format!(
+            "invalid value for lock_timeout: '{value}' (expected milliseconds, \
+             or a value with a us/ms/s/min suffix)"
+        ))
+    })?;
+    let ms = match unit.trim() {
+        "" | "ms" => n,
+        "us" => n / 1000.0,
+        "s" => n * 1000.0,
+        "min" => n * 60_000.0,
+        other => {
+            return Err(ExecError::Runtime(format!(
+                "invalid unit '{other}' for lock_timeout (use us, ms, s, or min)"
+            )));
+        }
+    };
+    if !ms.is_finite() || ms < 0.0 {
+        return Err(ExecError::Runtime(format!(
+            "lock_timeout must be a non-negative duration, got '{value}'"
+        )));
+    }
+    Ok(ms.round() as u64)
+}
+
 pub(super) fn parse_time_zone(value: &str) -> Result<Tz, ExecError> {
     let name = value.trim().trim_matches(['\'', '"']);
     name.parse::<Tz>()

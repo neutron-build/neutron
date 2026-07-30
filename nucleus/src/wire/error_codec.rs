@@ -38,6 +38,8 @@ pub enum ErrorCode {
     DuplicateTable,
     /// Transaction serialization failure (conflict)
     SerializationFailure,
+    /// A lock could not be obtained within `lock_timeout`
+    LockNotAvailable,
     /// Statement issued inside an already-aborted transaction block
     InFailedSqlTransaction,
     /// Statement cancelled at user request (wire CancelRequest / timeout)
@@ -156,7 +158,13 @@ impl ErrorCodec for PgWireErrorCodec {
                 // 40001 and none of them read the message. A serialization
                 // failure delivered as a generic storage error is a
                 // transaction that silently stops being retried.
-                let code = if msg.contains("write conflict")
+                // Checked before the serialization arm: a lock timeout is NOT
+                // a conflict the client can win by retrying — the holder is
+                // still there — so classifying it as 40001 would send drivers
+                // into a retry loop against a lock that is not moving.
+                let code = if msg.contains("lock_not_available") {
+                    ErrorCode::LockNotAvailable
+                } else if msg.contains("write conflict")
                     || msg.contains("WriteConflict")
                     || msg.contains("could not serialize")
                 {
@@ -209,6 +217,7 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::IntegrityConstraintViolation => "23000".to_string(),
             ErrorCode::DuplicateTable => "42P07".to_string(),
             ErrorCode::SerializationFailure => "40001".to_string(),
+            ErrorCode::LockNotAvailable => "55P03".to_string(),
             ErrorCode::CatalogError => "42000".to_string(),
             ErrorCode::StorageError => "XX000".to_string(),
             ErrorCode::DivisionByZero => "22012".to_string(),
@@ -288,7 +297,13 @@ impl ErrorCodec for BinaryErrorCodec {
                 // 40001 and none of them read the message. A serialization
                 // failure delivered as a generic storage error is a
                 // transaction that silently stops being retried.
-                let code = if msg.contains("write conflict")
+                // Checked before the serialization arm: a lock timeout is NOT
+                // a conflict the client can win by retrying — the holder is
+                // still there — so classifying it as 40001 would send drivers
+                // into a retry loop against a lock that is not moving.
+                let code = if msg.contains("lock_not_available") {
+                    ErrorCode::LockNotAvailable
+                } else if msg.contains("write conflict")
                     || msg.contains("WriteConflict")
                     || msg.contains("could not serialize")
                 {
@@ -337,6 +352,7 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::IntegrityConstraintViolation => "2000".to_string(),
             ErrorCode::DuplicateTable => "1007".to_string(),
             ErrorCode::SerializationFailure => "3001".to_string(),
+            ErrorCode::LockNotAvailable => "3004".to_string(),
             ErrorCode::InFailedSqlTransaction => "3002".to_string(),
             ErrorCode::QueryCanceled => "3003".to_string(),
             ErrorCode::CatalogError => "1008".to_string(),

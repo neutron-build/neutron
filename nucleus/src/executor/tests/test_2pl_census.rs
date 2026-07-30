@@ -553,6 +553,71 @@ async fn a_killed_transaction_cannot_commit_anyway() {
     );
 }
 
+/// `SET lock_timeout` bounds how long a serializable transaction blocks. The
+/// value has to actually reach the lock table — a SET that parses, reports
+/// success and changes nothing is the exact defect shape this whole series has
+/// been about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_lock_timeout_bounds_the_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    seed_accounts(&ex).await;
+    exec(&ex, "SET lock_timeout = '80ms'").await;
+
+    // `holder` locks first and never lets go, so `waiter` is OLDER-safe: it
+    // waits rather than dying, which is the case a timeout has to rescue.
+    let waiter_s = ex.create_session();
+    let holder_s = ex.create_session();
+    ex.execute_with_session(waiter_s, BEGIN_SER).await.unwrap();
+    ex.execute_with_session(waiter_s, "SELECT * FROM accounts")
+        .await
+        .unwrap();
+    ex.execute_with_session(holder_s, BEGIN_SER).await.unwrap();
+    // holder is YOUNGER, so its write dies rather than waiting — take the
+    // exclusive lock on a table waiter has not read, then have waiter want it.
+    exec(&ex, "CREATE TABLE side (id INT, v INT)").await;
+    exec(&ex, "INSERT INTO side VALUES (1, 1)").await;
+    ex.execute_with_session(holder_s, "UPDATE side SET v = 2 WHERE id = 1")
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let r = ex
+        .execute_with_session(waiter_s, "SELECT * FROM side")
+        .await;
+    let waited = started.elapsed();
+
+    let err = r.expect_err("the older waiter should have timed out");
+    assert!(
+        format!("{err:?}").contains("lock_not_available"),
+        "a lock timeout must be reported as such, not as a serialization \
+         failure a client would retry forever: {err:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "waited {waited:?} — the 80ms bound did not reach the lock table"
+    );
+    let _ = ex.execute_with_session(waiter_s, "ROLLBACK").await;
+    let _ = ex.execute_with_session(holder_s, "ROLLBACK").await;
+}
+
+/// A bad `lock_timeout` must be refused. Silently coercing `'5s'` to 0 would
+/// turn the setting into "wait forever" — the exact failure it prevents —
+/// while telling the client the SET succeeded.
+#[tokio::test]
+async fn an_invalid_lock_timeout_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = disk_executor(dir.path());
+    for bad in ["'abc'", "'5 fortnights'", "'-1'"] {
+        let r = ex.execute(&format!("SET lock_timeout = {bad}")).await;
+        assert!(r.is_err(), "SET lock_timeout = {bad} should have failed");
+    }
+    // And the accepted forms really are accepted.
+    for good in ["0", "5000", "'250ms'", "'2s'", "'1min'"] {
+        exec(&ex, &format!("SET lock_timeout = {good}")).await;
+    }
+}
+
 /// The disk engine now ACCEPTS serializable rather than refusing it (R1's
 /// refusal was explicitly the honest interim, not the destination).
 #[tokio::test]

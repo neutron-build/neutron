@@ -737,6 +737,9 @@ async fn cmd_start(cfg: StartConfig) {
     // At-rest key copy for the query spill manager (external sort), if encrypted.
     let spill_encryptor: Option<nucleus::storage::encryption::PageEncryptor>;
 
+    // Kept so the metrics registry — built after storage — can be attached to
+    // the lock table. Lock waits are otherwise invisible.
+    let mut buffered_for_metrics: Option<Arc<BufferedDiskEngine>> = None;
     let storage: Arc<dyn StorageEngine> = if memory {
         tracing::info!("Storage: in-memory with MVCC snapshot isolation");
         disk_engine = None;
@@ -970,12 +973,19 @@ async fn cmd_start(cfg: StartConfig) {
 
         // Wrap DiskEngine in BufferedDiskEngine for transaction atomicity + rollback
         let buffered = Arc::new(BufferedDiskEngine::new(engine));
-        tracing::info!("Transaction support: buffered write-ahead (atomicity + rollback)");
+        tracing::info!(
+            "Transaction support: buffered write-ahead (atomicity + rollback), \
+             SERIALIZABLE via table-level strict 2PL"
+        );
+        buffered_for_metrics = Some(buffered.clone());
         buffered as Arc<dyn StorageEngine>
     };
 
     // Set up shared metrics registry
     let metrics = Arc::new(MetricsRegistry::new());
+    if let Some(ref buffered) = buffered_for_metrics {
+        buffered.set_metrics(metrics.clone());
+    }
 
     // Set up replication manager — mode depends on --replicate-from flag
     let replication = Arc::new(parking_lot::RwLock::new(if is_replica {

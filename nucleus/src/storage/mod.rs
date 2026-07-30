@@ -543,6 +543,12 @@ pub trait StorageEngine: Send + Sync {
     /// The default is the weakest level, so an engine that implements nothing
     /// promises nothing. Raise it only with evidence — over-claiming here costs
     /// users data, under-claiming costs them an error message.
+    /// Bound how long a transaction may block acquiring a lock, in
+    /// milliseconds (0 = wait forever). Default: no-op — an optimistic engine
+    /// has nothing to time out, and an engine with no isolation machinery has
+    /// no locks to wait on.
+    fn set_lock_timeout_ms(&self, _ms: u64) {}
+
     fn max_isolation_level(&self) -> IsolationLevel {
         IsolationLevel::ReadCommitted
     }

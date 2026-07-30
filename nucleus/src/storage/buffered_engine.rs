@@ -141,6 +141,8 @@ pub struct BufferedDiskEngine {
     /// This is what PostgreSQL does with "current transaction is aborted,
     /// commands ignored until end of transaction block".
     poisoned: RwLock<std::collections::HashSet<u64>>,
+    /// Metrics registry, attached after construction (see `set_metrics`).
+    metrics: RwLock<Option<Arc<crate::metrics::MetricsRegistry>>>,
 }
 
 /// The storage session id of the current execution context (0 = default /
@@ -165,6 +167,7 @@ impl BufferedDiskEngine {
             pending_level: RwLock::new(HashMap::new()),
             serializable_txns: RwLock::new(std::collections::HashSet::new()),
             poisoned: RwLock::new(std::collections::HashSet::new()),
+            metrics: RwLock::new(None),
         }
     }
 
@@ -205,13 +208,63 @@ impl BufferedDiskEngine {
             return Ok(());
         }
         match self.locks.acquire(id, table, mode).await {
-            Ok(()) => Ok(()),
+            Ok(outcome) => {
+                if let Some(m) = self.metrics.read().as_ref() {
+                    match outcome {
+                        super::lock_manager::AcquireOutcome::Immediate => {
+                            m.lock_acquired_immediate.inc()
+                        }
+                        super::lock_manager::AcquireOutcome::Waited(d) => {
+                            m.lock_waits.inc();
+                            m.lock_wait_duration.observe(d.as_secs_f64());
+                        }
+                    }
+                    m.locks_held.set(self.locks.locked_table_count() as i64);
+                }
+                Ok(())
+            }
             Err(e) => {
-                self.poison(id);
+                // A timeout is not a deadlock kill, and the difference is not
+                // cosmetic. A KILLED transaction has already had its locks
+                // released (that is the point — the older transaction it beat
+                // is waiting on them), so it must be poisoned or it could
+                // commit buffered writes with no locks held. A TIMED-OUT
+                // transaction is still alive and still holds everything it
+                // acquired; only its statement failed. Poisoning it would
+                // release locks strict 2PL says it keeps until it ends, and it
+                // also swallowed the real error — a second lock attempt within
+                // the same statement then reported "aborted to break a
+                // deadlock" for what was actually a timeout, pointing whoever
+                // read it at entirely the wrong problem.
+                //
+                // The executor already marks the transaction aborted on any
+                // statement error and refuses further commands until ROLLBACK,
+                // which is where the locks are released. That is PostgreSQL's
+                // behaviour for `lock_timeout` too.
+                let timed_out = e.to_string().contains("lock_not_available");
+                if let Some(m) = self.metrics.read().as_ref() {
+                    if timed_out {
+                        m.lock_timeouts.inc();
+                    } else {
+                        m.lock_deadlock_kills.inc();
+                    }
+                }
+                if !timed_out {
+                    self.poison(id);
+                }
                 Err(e)
             }
         }
     }
+
+    /// Attach the metrics registry. Optional: the engine is constructed before
+    /// the registry in `main.rs`, and embedded users have none at all, so lock
+    /// accounting must degrade to a null check rather than being required.
+    pub fn set_metrics(&self, metrics: Arc<crate::metrics::MetricsRegistry>) {
+        *self.metrics.write() = Some(metrics);
+    }
+
+
 
     /// Whether this session is inside a SERIALIZABLE transaction, and therefore
     /// must take 2PL locks.
@@ -252,6 +305,9 @@ impl BufferedDiskEngine {
         self.poisoned.write().remove(&id);
         if was_serializable {
             self.locks.release_all(id);
+            if let Some(m) = self.metrics.read().as_ref() {
+                m.locks_held.set(self.locks.locked_table_count() as i64);
+            }
         }
     }
 
@@ -843,6 +899,12 @@ impl StorageEngine for BufferedDiskEngine {
     ///
     /// Previously the inherited `{}` default, which is how `BEGIN ISOLATION
     /// LEVEL SERIALIZABLE` used to run read-committed here without a word.
+    /// Bound serializable lock waits. Wait-die rules out deadlock but not a
+    /// long wait behind a slow or idle-in-transaction holder.
+    fn set_lock_timeout_ms(&self, ms: u64) {
+        self.locks.set_timeout_ms(ms);
+    }
+
     fn set_next_isolation_level(&self, level: &str) {
         let id = current_session_id();
         match super::IsolationLevel::parse(level) {

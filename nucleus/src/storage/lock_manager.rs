@@ -60,6 +60,11 @@ use tokio::sync::Notify;
 
 use super::StorageError;
 
+/// Default `lock_timeout`, in milliseconds. Long enough that a legitimately
+/// slow transaction is not cut off, short enough that a stuck one surfaces as
+/// an error rather than a hang.
+const DEFAULT_LOCK_TIMEOUT_MS: u64 = 10_000;
+
 /// What a transaction holds on one table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LockMode {
@@ -83,6 +88,17 @@ impl TableLock {
     }
 }
 
+/// What a lock acquisition did, for metrics. The lock manager deliberately
+/// does not depend on the metrics registry — it is a storage primitive and the
+/// registry lives above it — so it reports and lets the caller record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AcquireOutcome {
+    /// Granted with no conflicting holder.
+    Immediate,
+    /// Granted, but only after blocking for `waited`.
+    Waited(std::time::Duration),
+}
+
 /// Table-level strict-2PL lock table, shared by all sessions of one engine.
 pub struct LockManager {
     locks: Mutex<HashMap<String, TableLock>>,
@@ -92,6 +108,16 @@ pub struct LockManager {
     txns: Mutex<HashMap<u64, TxnLocks>>,
     /// Woken whenever any lock is released, so waiters re-check.
     released: Notify,
+    /// How long a waiter may block before giving up, in milliseconds.
+    /// 0 disables the timeout (wait forever, the original behaviour).
+    ///
+    /// Wait-die guarantees no DEADLOCK, but it does not bound how long an older
+    /// transaction waits: the holder it is waiting on may simply be slow, or
+    /// idle-in-transaction because a client walked away mid-statement. Without
+    /// a bound, one such transaction parks every older one behind it
+    /// indefinitely, which is indistinguishable from a hang to everyone
+    /// involved. PostgreSQL exposes the same escape hatch as `lock_timeout`.
+    timeout_ms: AtomicU64,
 }
 
 #[derive(Default)]
@@ -113,7 +139,32 @@ impl LockManager {
             next_age: AtomicU64::new(1),
             txns: Mutex::new(HashMap::new()),
             released: Notify::new(),
+            timeout_ms: AtomicU64::new(DEFAULT_LOCK_TIMEOUT_MS),
         }
+    }
+
+    /// Set the lock wait bound. 0 disables it.
+    pub fn set_timeout_ms(&self, ms: u64) {
+        self.timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.load(Ordering::Relaxed)
+    }
+
+    /// The error a waiter returns when it gives up.
+    ///
+    /// Deliberately NOT a serialization failure: 40001 tells a client "retry,
+    /// this was a conflict you could win next time", and a lock still held by
+    /// a stuck transaction is not that. Reporting it as 40001 would send
+    /// clients into a retry loop against a lock that is not going anywhere.
+    /// `55P03 lock_not_available` is what PostgreSQL uses.
+    fn timed_out(table: &str, waited_ms: u64) -> StorageError {
+        StorageError::Io(format!(
+            "lock_not_available: timed out after {waited_ms}ms waiting for a lock \
+             on table '{table}' (raise lock_timeout, or find the transaction \
+             holding it)"
+        ))
     }
 
     /// The serialization failure a dying transaction reports. Worded so the
@@ -206,15 +257,42 @@ impl LockManager {
         txn: u64,
         table: &str,
         mode: LockMode,
-    ) -> Result<(), StorageError> {
+    ) -> Result<AcquireOutcome, StorageError> {
+        // Register interest BEFORE the first try, so a release racing between
+        // a failed try and the await cannot be missed.
+        let woken = self.released.notified();
+        if self.try_grant(txn, table, mode)? {
+            return Ok(AcquireOutcome::Immediate);
+        }
+        let started = std::time::Instant::now();
+        let budget = self.timeout_ms();
+        let mut woken = Some(woken);
         loop {
-            // Register interest BEFORE the try, so a release racing between the
-            // failed try and the await cannot be missed.
-            let woken = self.released.notified();
-            if self.try_grant(txn, table, mode)? {
-                return Ok(());
+            let wait = match woken.take() {
+                Some(w) => w,
+                None => self.released.notified(),
+            };
+            if budget == 0 {
+                wait.await;
+            } else {
+                let elapsed = started.elapsed().as_millis() as u64;
+                if elapsed >= budget {
+                    return Err(Self::timed_out(table, elapsed));
+                }
+                let remaining = std::time::Duration::from_millis(budget - elapsed);
+                // A timeout here is not itself the answer — the lock may have
+                // been released in the same instant — so fall through to one
+                // more try_grant and let the elapsed check above decide.
+                let _ = tokio::time::timeout(remaining, wait).await;
             }
-            woken.await;
+            let next = self.released.notified();
+            if self.try_grant(txn, table, mode)? {
+                return Ok(AcquireOutcome::Waited(started.elapsed()));
+            }
+            if budget > 0 && started.elapsed().as_millis() as u64 >= budget {
+                return Err(Self::timed_out(table, started.elapsed().as_millis() as u64));
+            }
+            woken = Some(next);
         }
     }
 
@@ -248,6 +326,11 @@ impl LockManager {
             }
         }
         self.released.notify_waiters();
+    }
+
+    /// Tables currently held under at least one lock.
+    pub fn locked_table_count(&self) -> usize {
+        self.locks.lock().len()
     }
 
     /// Whether `txn` currently holds any lock (test/observability).
@@ -336,6 +419,112 @@ mod tests {
         lm.release_all(1);
         assert_eq!(lm.locked_tables(), 0, "released locks must not leak entries");
         assert!(!lm.holds_any(1));
+    }
+
+    #[tokio::test]
+    async fn a_wait_reports_that_it_waited() {
+        let lm = Arc::new(LockManager::new());
+        lm.acquire(2, "other", LockMode::Shared).await.unwrap();
+        lm.acquire(1, "t", LockMode::Exclusive).await.unwrap();
+        let lm2 = lm.clone();
+        let waiter = tokio::spawn(async move { lm2.acquire(2, "t", LockMode::Shared).await });
+        tokio::task::yield_now().await;
+        lm.release_all(1);
+        // The outcome distinguishes "granted immediately" from "blocked", which
+        // is the whole point of reporting it: a lock table with no waits and one
+        // saturated with them look identical without this.
+        assert!(matches!(
+            waiter.await.unwrap().unwrap(),
+            AcquireOutcome::Waited(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_immediate_grant_reports_immediate() {
+        let lm = LockManager::new();
+        assert_eq!(
+            lm.acquire(1, "t", LockMode::Exclusive).await.unwrap(),
+            AcquireOutcome::Immediate
+        );
+    }
+
+    /// Wait-die rules out deadlock but NOT a long wait: the holder may simply
+    /// be slow, or idle-in-transaction because a client walked away. Without a
+    /// bound, one such transaction parks every older one behind it forever,
+    /// which is indistinguishable from a hang.
+    #[tokio::test]
+    async fn a_wait_gives_up_after_lock_timeout() {
+        let lm = Arc::new(LockManager::new());
+        lm.set_timeout_ms(60);
+        // txn 2 is OLDER (locks first), so it waits rather than dying...
+        lm.acquire(2, "other", LockMode::Shared).await.unwrap();
+        // ...behind txn 1, which holds and never releases.
+        lm.acquire(1, "t", LockMode::Exclusive).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let r = lm.acquire(2, "t", LockMode::Shared).await;
+        let waited = started.elapsed();
+
+        let err = r.expect_err("the wait should have timed out");
+        assert!(
+            err.to_string().contains("lock_not_available"),
+            "a timeout must be distinguishable from a deadlock kill: {err}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(50),
+            "gave up after only {waited:?} — it should have waited out the budget"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "waited {waited:?}, far past the 60ms budget"
+        );
+    }
+
+    /// A timeout of 0 means the original behaviour: wait indefinitely.
+    #[tokio::test]
+    async fn a_zero_timeout_waits_indefinitely() {
+        let lm = Arc::new(LockManager::new());
+        lm.set_timeout_ms(0);
+        lm.acquire(2, "other", LockMode::Shared).await.unwrap();
+        lm.acquire(1, "t", LockMode::Exclusive).await.unwrap();
+        let lm2 = lm.clone();
+        let waiter = tokio::spawn(async move { lm2.acquire(2, "t", LockMode::Shared).await });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a 0 timeout must not give up — it disables the bound"
+        );
+        lm.release_all(1);
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    /// The waiter must be granted the lock if it is released in the same
+    /// instant the budget expires, rather than reporting a spurious timeout.
+    #[tokio::test]
+    async fn a_release_just_before_the_deadline_still_grants() {
+        let lm = Arc::new(LockManager::new());
+        lm.set_timeout_ms(400);
+        lm.acquire(2, "other", LockMode::Shared).await.unwrap();
+        lm.acquire(1, "t", LockMode::Exclusive).await.unwrap();
+        let lm2 = lm.clone();
+        let waiter = tokio::spawn(async move { lm2.acquire(2, "t", LockMode::Shared).await });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        lm.release_all(1);
+        assert!(
+            waiter.await.unwrap().is_ok(),
+            "a lock released well inside the budget must be granted"
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_table_count_tracks_live_locks() {
+        let lm = LockManager::new();
+        assert_eq!(lm.locked_table_count(), 0);
+        lm.acquire(1, "a", LockMode::Shared).await.unwrap();
+        lm.acquire(1, "b", LockMode::Exclusive).await.unwrap();
+        assert_eq!(lm.locked_table_count(), 2);
+        lm.release_all(1);
+        assert_eq!(lm.locked_table_count(), 0);
     }
 
     #[tokio::test]
