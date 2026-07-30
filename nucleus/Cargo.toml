@@ -203,6 +203,11 @@ path = "src/bin/probe_crossmodel_commit_order.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "probe_serializable"
+path = "src/bin/probe_serializable.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "probe_io_faults"
 path = "src/bin/probe_io_faults.rs"
 required-features = ["server"]

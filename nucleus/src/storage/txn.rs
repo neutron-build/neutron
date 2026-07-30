@@ -316,6 +316,23 @@ pub struct TransactionManager {
     /// between concurrent txns, and (b) decide when a committed txn's SSI data can
     /// be purged (only once every concurrent peer has also finished).
     ssi_concurrent: Mutex<HashMap<u64, HashSet<u64>>>,
+    /// Serializes the COMMIT POINT of serializable transactions.
+    ///
+    /// `check_serializable_commit` only reports a dangerous structure when a
+    /// conflicting counterpart has already COMMITTED. Validation and commit
+    /// were two separate steps with nothing between them, so two transactions
+    /// that are each other's counterpart could both validate while the other
+    /// was still active — each seeing no committed conflict — and then both
+    /// commit. That is the classic validate-then-commit race, and it let cross
+    /// -table write skew through roughly once in 1,500 rounds of
+    /// `probe_serializable`, which is precisely the anomaly SSI exists to stop.
+    ///
+    /// Holding this across check+commit makes the pair atomic with respect to
+    /// other serializable committers: the second one now observes the first as
+    /// committed and aborts. It serializes only the commit point, and only for
+    /// SERIALIZABLE transactions — read-committed and snapshot transactions
+    /// never take it.
+    serial_commit: Mutex<()>,
 }
 
 impl Default for TransactionManager {
@@ -339,6 +356,7 @@ impl TransactionManager {
             ssi_rw_conflicts: Mutex::new(HashSet::new()),
             ssi_txns: Mutex::new(HashSet::new()),
             ssi_concurrent: Mutex::new(HashMap::new()),
+            serial_commit: Mutex::new(()),
         }
     }
 
@@ -737,6 +755,36 @@ impl TransactionManager {
     ///
     /// and at least one of T_in or T_out has already committed,
     /// then a serialization anomaly (write skew) is possible — abort T.
+    ///
+    /// # KNOWN GAP — this check is incomplete
+    ///
+    /// The deferral below (abort only when a counterpart has already
+    /// COMMITTED) is not the textbook rule, which aborts any PIVOT — a txn with
+    /// both an incoming and an outgoing rw-antidependency — on the theorem that
+    /// every cycle contains one. Deferring is unsound in principle: the pivot
+    /// itself can commit first, after which neither counterpart is a pivot and
+    /// nobody aborts.
+    ///
+    /// It is deliberately kept anyway, because the textbook rule was tried and
+    /// is worse here: in a two-transaction write skew BOTH participants are
+    /// pivots, so both abort. That is still serializable but makes no progress,
+    /// and it broke three census tests that (correctly) require exactly one
+    /// survivor. Cahill's algorithm avoids that with per-transaction
+    /// inConflict/outConflict flags this implementation does not carry; adding
+    /// them is the real fix.
+    ///
+    /// `probe_serializable` reproduces the residual hole at roughly 1 in 1,500
+    /// rounds on this engine:
+    ///
+    /// ```sh
+    /// cargo run --release --features server --bin probe_serializable -- \
+    ///     --rounds 1500 --txns 2 --engine mvcc --seed 15838
+    /// ```
+    ///
+    /// The disk engine (`BufferedDiskEngine`, what a server actually runs)
+    /// gets serializability from strict 2PL instead and is clean across every
+    /// run of that probe. This gap is confined to `MvccStorageAdapter`
+    /// (`--memory` and embedded `durable_mvcc`).
     pub fn check_serializable_commit(&self, txn_id: u64) -> Result<(), String> {
         let conflicts = self.ssi_rw_conflicts.lock();
         let committed = self.committed.lock();
@@ -792,7 +840,15 @@ impl TransactionManager {
     /// Returns Err if a serialization anomaly is detected.
     pub fn commit_serializable(&self, txn: &mut Transaction) -> Result<(), String> {
         if txn.isolation == IsolationLevel::Serializable {
+            // Validation and commit must be ATOMIC with respect to other
+            // serializable committers — see `serial_commit`. Taken before the
+            // check and held past `commit()`, which is what makes a concurrent
+            // counterpart visible as committed to whichever transaction
+            // validates second.
+            let _commit_point = self.serial_commit.lock();
             self.check_serializable_commit(txn.id)?;
+            self.commit(txn);
+            return Ok(());
         }
         self.commit(txn);
         Ok(())

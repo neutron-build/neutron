@@ -1191,6 +1191,19 @@ impl MvccStorageAdapter {
             .map(|t| t.isolation)
     }
 
+    /// Whether the current session is inside a SERIALIZABLE transaction.
+    ///
+    /// Read fast paths that cannot record SIREAD must DECLINE for such a
+    /// transaction and let the caller fall back to a path that can. A fast path
+    /// that answers a serializable read without registering it is invisible to
+    /// the conflict graph, so no rw-antidependency edge forms and the anomaly
+    /// SSI exists to stop walks straight through — found by
+    /// `probe_serializable` as a cross-table write skew that survived roughly
+    /// once in 1,500 rounds, because `WHERE id = ?` was answered from an index.
+    fn serializable_txn_active(&self) -> bool {
+        matches!(self.current_isolation(), Some(IsolationLevel::Serializable))
+    }
+
     /// If the current transaction is SERIALIZABLE, record SIREAD locks.
     fn maybe_record_siread(&self, txn_id: u64, table: &str, row_indices: &[usize]) {
         if let Some(IsolationLevel::Serializable) = self.current_isolation() {
@@ -1899,6 +1912,11 @@ impl StorageEngine for MvccStorageAdapter {
         key_col: usize,
         val_col: Option<usize>,
     ) -> Option<Vec<(Value, i64, Option<f64>)>> {
+        // See `serializable_txn_active`: a serializable read must be visible to
+        // the conflict graph, and this path records no SIREAD.
+        if self.serializable_txn_active() {
+            return None;
+        }
         let (_txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
@@ -1976,6 +1994,11 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(f64, usize)> {
+        // See `serializable_txn_active`: a serializable read must be visible to
+        // the conflict graph, and this path records no SIREAD.
+        if self.serializable_txn_active() {
+            return None;
+        }
         let (_txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
@@ -2027,6 +2050,11 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<usize> {
+        // See `serializable_txn_active` — declining keeps the read visible to
+        // SSI by forcing the caller onto a SIREAD-recording path.
+        if self.serializable_txn_active() {
+            return None;
+        }
         let (_txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
@@ -2113,6 +2141,11 @@ impl StorageEngine for MvccStorageAdapter {
         desc: bool,
         k: usize,
     ) -> Option<Vec<Row>> {
+        // See `serializable_txn_active` — declining keeps the read visible to
+        // SSI by forcing the caller onto a SIREAD-recording path.
+        if self.serializable_txn_active() {
+            return None;
+        }
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -2715,6 +2748,11 @@ impl StorageEngine for MvccStorageAdapter {
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // A serializable read must reach the conflict graph. This path cannot
+        // record SIREAD, so decline and let the caller use one that does.
+        if self.serializable_txn_active() {
+            return Ok(None);
+        }
         self.index_lookup_sync(table, index_name, value)
     }
 
@@ -2725,6 +2763,11 @@ impl StorageEngine for MvccStorageAdapter {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // See `serializable_txn_active`: a serializable read must be visible to
+        // the conflict graph, and this path records no SIREAD.
+        if self.serializable_txn_active() {
+            return Ok(None);
+        }
         self.index_lookup_range_sync(table, index_name, low, high)
     }
 
@@ -2734,6 +2777,11 @@ impl StorageEngine for MvccStorageAdapter {
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // A serializable read must reach the conflict graph. This path cannot
+        // record SIREAD, so decline and let the caller use one that does.
+        if self.serializable_txn_active() {
+            return Ok(None);
+        }
         // Inside ANY explicit transaction, the cached `idx.map` rows are unsafe:
         // they hold snapshot-independent COPIES that lag `tbl.rows` in the window
         // between a concurrent commit() and its index rebuild, and they carry no
@@ -2764,6 +2812,11 @@ impl StorageEngine for MvccStorageAdapter {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // See `serializable_txn_active`: a serializable read must be visible to
+        // the conflict graph, and this path records no SIREAD.
+        if self.serializable_txn_active() {
+            return Ok(None);
+        }
         // Same stale-index guard as index_lookup_sync: any explicit txn must use
         // the snapshot-correct chain path, not the cached idx.map row copies.
         let sess = self.mvcc_session();
@@ -2801,6 +2854,11 @@ impl StorageEngine for MvccStorageAdapter {
         eq_value: Option<&Value>,
         range: Option<(&Value, &Value)>,
     ) -> Option<Vec<Row>> {
+        // See `serializable_txn_active` — declining keeps the read visible to
+        // SSI by forcing the caller onto a SIREAD-recording path.
+        if self.serializable_txn_active() {
+            return None;
+        }
         // Inside any explicit transaction, fall back to the snapshot-correct
         // path — the cached index covers no MVCC visibility and can be stale
         // between a concurrent commit and its rebuild.
@@ -2875,6 +2933,11 @@ impl StorageEngine for MvccStorageAdapter {
     /// During an active explicit transaction the count reflects the last commit,
     /// not mid-txn inserts/deletes (those are accounted for at COMMIT).
     fn fast_count_all(&self, table: &str) -> Option<usize> {
+        // See `serializable_txn_active` — declining keeps the read visible to
+        // SSI by forcing the caller onto a SIREAD-recording path.
+        if self.serializable_txn_active() {
+            return None;
+        }
         self.committed_counts
             .read()
             .get(table)
