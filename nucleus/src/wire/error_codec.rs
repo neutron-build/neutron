@@ -149,7 +149,17 @@ impl ErrorCodec for PgWireErrorCodec {
             }
             ExecError::Storage(stor_err) => {
                 let msg = stor_err.to_string();
-                let code = if msg.contains("write conflict") || msg.contains("WriteConflict") {
+                // `could not serialize access` is the 2PL deadlock-break kill
+                // (see `storage::lock_manager`); "write conflict" is the MVCC
+                // SSI abort. Both are SQLSTATE 40001, and the code is the only
+                // thing a client acts on: pgx, psycopg and JDBC all retry on
+                // 40001 and none of them read the message. A serialization
+                // failure delivered as a generic storage error is a
+                // transaction that silently stops being retried.
+                let code = if msg.contains("write conflict")
+                    || msg.contains("WriteConflict")
+                    || msg.contains("could not serialize")
+                {
                     ErrorCode::SerializationFailure
                 } else if msg.contains("not found") {
                     ErrorCode::UndefinedTable
@@ -271,7 +281,17 @@ impl ErrorCodec for BinaryErrorCodec {
             }
             ExecError::Storage(stor_err) => {
                 let msg = stor_err.to_string();
-                let code = if msg.contains("write conflict") || msg.contains("WriteConflict") {
+                // `could not serialize access` is the 2PL deadlock-break kill
+                // (see `storage::lock_manager`); "write conflict" is the MVCC
+                // SSI abort. Both are SQLSTATE 40001, and the code is the only
+                // thing a client acts on: pgx, psycopg and JDBC all retry on
+                // 40001 and none of them read the message. A serialization
+                // failure delivered as a generic storage error is a
+                // transaction that silently stops being retried.
+                let code = if msg.contains("write conflict")
+                    || msg.contains("WriteConflict")
+                    || msg.contains("could not serialize")
+                {
                     ErrorCode::SerializationFailure
                 } else if msg.contains("not found") {
                     ErrorCode::UndefinedTable
@@ -344,6 +364,43 @@ mod tests {
         let details = codec.encode(&err);
         assert_eq!(details.code, ErrorCode::UndefinedColumn);
         assert_eq!(codec.code_to_string(ErrorCode::UndefinedColumn), "42703");
+    }
+
+    /// Both serialization-failure shapes must reach the client as SQLSTATE
+    /// 40001, because that code is the entire retry contract: pgx, psycopg and
+    /// JDBC all retry on 40001 and none of them read the message. Delivered as
+    /// a generic `XX000` storage error, a killed serializable transaction
+    /// silently stops being retried by every driver in the ecosystem — the
+    /// feature is then correct in the engine and unusable over the wire.
+    ///
+    /// The 2PL kill (`could not serialize access`, `storage::lock_manager`)
+    /// was exactly that until this test existed; only the MVCC SSI abort's
+    /// "write conflict" wording was matched.
+    #[test]
+    fn serialization_failures_map_to_40001_over_the_wire() {
+        let cases = [
+            // MVCC SSI abort.
+            "write conflict on table t",
+            // 2PL deadlock-break kill.
+            "could not serialize access to table 'accounts' due to concurrent \
+             update: this SERIALIZABLE transaction was aborted to break a \
+             potential deadlock (retry the transaction)",
+        ];
+        for msg in cases {
+            for codec in [&PgWireErrorCodec as &dyn ErrorCodec, &BinaryErrorCodec] {
+                let err = ExecError::Storage(crate::storage::StorageError::Io(msg.to_string()));
+                let details = codec.encode(&err);
+                assert_eq!(
+                    details.code,
+                    ErrorCode::SerializationFailure,
+                    "not classified as a serialization failure: {msg}"
+                );
+            }
+        }
+        assert_eq!(
+            PgWireErrorCodec.code_to_string(ErrorCode::SerializationFailure),
+            "40001"
+        );
     }
 
     #[test]
