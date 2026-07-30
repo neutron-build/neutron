@@ -160,6 +160,24 @@ pub(super) struct TxnState {
     pub snapshot: Option<HashMap<String, Vec<Row>>>,
     /// Savepoint stack: each entry is (name, snapshot of all tables at that point).
     pub savepoints: Vec<(String, HashMap<String, Vec<Row>>)>,
+    /// Before-images for tables served by a PER-TABLE engine that provides no
+    /// transaction of its own (`WITH (engine='columnar'|'mergetree'|'lsm')`).
+    ///
+    /// Those tables are written through `storage_for`, never `self.storage`, and
+    /// their engines inherit the trait's silent `Ok(())` for `begin_txn` and
+    /// `abort_txn`. The legacy whole-database snapshot above does not cover them
+    /// either — it is skipped entirely when the DEFAULT engine reports MVCC,
+    /// which the shipping one does. So `BEGIN; INSERT; UPDATE; ROLLBACK` left
+    /// BOTH changes in place on a columnar table. Measured, not inferred.
+    ///
+    /// Captured lazily, at this transaction's first write to each such table:
+    /// an analytics table can hold hundreds of thousands of rows, and copying
+    /// it at every `BEGIN` would be a worse problem than the bug.
+    pub engine_snapshots: HashMap<String, Vec<Row>>,
+    /// The same, per savepoint level. A table first written AFTER a savepoint
+    /// needs no entry here — its base image is already the state as of that
+    /// savepoint, because nothing had touched it earlier.
+    pub engine_savepoints: Vec<(String, HashMap<String, Vec<Row>>)>,
     /// Security catalog at BEGIN, used to make policy DDL transactional.
     pub security_snapshot: Option<SecurityManager>,
     /// Session-local security catalog staged by policy DDL until COMMIT.
@@ -187,6 +205,8 @@ impl TxnState {
             active: false,
             snapshot: None,
             savepoints: Vec::new(),
+            engine_snapshots: HashMap::new(),
+            engine_savepoints: Vec::new(),
             security_snapshot: None,
             security_pending: None,
             security_savepoints: Vec::new(),

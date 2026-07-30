@@ -1279,6 +1279,64 @@ impl Executor {
             .unwrap_or_else(|| self.storage.clone())
     }
 
+    /// The engine serving `table`, having first recorded whatever this
+    /// transaction needs to undo the write that is about to happen.
+    ///
+    /// Use this wherever a row is inserted, updated or deleted; `storage_for`
+    /// remains correct for reads. A table with a PER-TABLE engine
+    /// (`WITH (engine='columnar'|'mergetree'|'lsm')`) is written through that
+    /// engine and never through `self.storage`, so none of the transaction
+    /// machinery reached it: those engines inherit the trait's silent `Ok(())`
+    /// for `begin_txn`/`abort_txn`, and the legacy whole-database snapshot is
+    /// skipped entirely when the DEFAULT engine reports MVCC — which the
+    /// shipping one does. The result was that `BEGIN; INSERT; UPDATE; ROLLBACK`
+    /// left both changes in place on a columnar, mergetree or LSM table.
+    ///
+    /// The before-image is taken on the FIRST write to each such table, not at
+    /// `BEGIN`: these are analytics tables, and copying one at every `BEGIN`
+    /// would trade a correctness bug for a worse performance one.
+    pub(super) async fn storage_for_write(&self, table: &str) -> Arc<dyn StorageEngine> {
+        let engine = self.storage_for(table);
+        // Only tables with a per-table override are at risk; the default engine
+        // is already handled by MVCC or by the legacy snapshot.
+        if !self.table_engines.read().contains_key(table) || engine.supports_mvcc() {
+            return engine;
+        }
+        let session = self.current_session();
+        {
+            let txn = session.txn_state.read().await;
+            if !txn.active || txn.engine_snapshots.contains_key(table) {
+                return engine;
+            }
+        }
+        // Scan without holding the transaction lock — the engine takes its own.
+        let before = engine.scan(table).await.unwrap_or_default();
+        let mut txn = session.txn_state.write().await;
+        if txn.active {
+            txn.engine_snapshots
+                .entry(table.to_string())
+                .or_insert(before);
+        }
+        engine
+    }
+
+    /// Put `table` back to `original`, through the engine that actually serves
+    /// it. Used to undo writes to a per-table engine on ROLLBACK.
+    pub(super) async fn restore_table_from(&self, table: &str, original: &[Row]) {
+        let engine = self.storage_for(table);
+        // Positions come from `scan_physical`, never `0..len` — an engine is
+        // free to address rows by something other than a dense scan ordinal.
+        if let Ok(current) = engine.scan_physical(table).await
+            && !current.is_empty()
+        {
+            let positions: Vec<usize> = current.iter().map(|(pos, _)| *pos).collect();
+            let _ = engine.delete(table, &positions).await;
+        }
+        for row in original {
+            let _ = engine.insert(table, row.clone()).await;
+        }
+    }
+
     pub(super) async fn execute_drop(
         &self,
         object_type: ast::ObjectType,
