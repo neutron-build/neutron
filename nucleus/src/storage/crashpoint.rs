@@ -70,6 +70,14 @@ pub const ALL_POINTS: &[&str] = &[
     "checkpoint.after",
     "meta.before_rename",
     "meta.after_rename",
+    // Between the two commit-time durability forces for a cross-model
+    // transaction: specialty stores (KV/timeseries/vector/graph/streams) are
+    // already fsynced, the SQL WAL is not yet. See the ordering comment on
+    // `force_specialty_durability`/`force_wal_durability` in executor/mod.rs
+    // for why that is the deliberately SAFE half of this window — a crash
+    // here must leave an orphaned specialty write, never a durable SQL row
+    // referencing a specialty write that was never made durable.
+    "commit.after_specialty_before_sql",
 ];
 
 /// Raft durability boundaries, kept separate from [`ALL_POINTS`] because a SQL
@@ -111,6 +119,13 @@ pub const ALL_IO_POINTS: &[&str] = &[
     // rather than answer from memory; these points make that path testable.
     "raft.hardstate_write",
     "raft.log_append",
+    // Specialty-store WALs (KV / collections / timeseries / vector / graph /
+    // streams) reach durability through `force_specialty_durability`, forced
+    // BEFORE the SQL WAL at the same commit boundary — see the ordering
+    // comment on that call in executor/mod.rs. `kv.wal_fsync` makes that
+    // ordering directly testable: fail it and assert the SQL WAL was never
+    // forced either, instead of trusting an unobservable crash race.
+    "kv.wal_fsync",
 ];
 
 fn io_armed() -> Option<&'static str> {

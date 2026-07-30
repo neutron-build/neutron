@@ -187,6 +187,9 @@ impl KvWal {
     /// append LSN the fsync covers. The append counter is bumped under the same
     /// lock, so every append at or below the returned mark is on stable storage.
     fn sync_covering(&self) -> io::Result<u64> {
+        if let Some(e) = crate::storage::crashpoint::io_fault("kv.wal_fsync") {
+            return Err(e);
+        }
         let mut w = self.writer.lock();
         let covered = self.syncer.current();
         w.flush()?;

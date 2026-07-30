@@ -33,8 +33,15 @@ Read these three before deploying anything, in this order:
 3. [docs/runbooks/](docs/runbooks/) — backup/restore/PITR, upgrade, rollback,
    security, incident.
 
-Cross-model rollback works in-process, but crash-atomic commit across
-model-specific WALs is not claimed. A **running** server can snapshot itself
+Cross-model rollback works in-process, but a transaction that writes both SQL
+rows and a model-specific store (KV, timeseries, vector, graph, streams) is
+not crash-atomic across their separate WALs: a crash in the fsync window
+between the two can leave the specialty write durable with the SQL commit
+that would have referenced it not yet durable. That ordering is deliberate —
+the alternative is a durable SQL row referencing a specialty write that was
+never made durable — but it means a crash there can still surface as an
+orphaned specialty write after recovery, not a fully atomic commit. A
+**running** server can snapshot itself
 with `BACKUP DATABASE TO '<path>'` (superuser only); the `nucleus backup` CLI
 deliberately refuses a live data directory, because an external process cannot
 pin WAL retention or observe an LSN and can therefore only produce a torn copy.

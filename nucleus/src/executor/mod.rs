@@ -3599,6 +3599,35 @@ impl Executor {
         wal.checkpoint(&snapshots)
     }
 
+    /// Checkpoint every per-table storage engine (`WITH (engine='columnar'
+    /// |'mergetree'|'lsm')`): flush write buffers and compact that table's own
+    /// WAL to a snapshot.
+    ///
+    /// Same shape as the other WALs on this page: `ColumnarStorageEngine` and
+    /// `LsmStorageEngine` log every insert/update/delete unconditionally, with
+    /// no consumer or reader required, so without periodic compaction each
+    /// one grows one record per write forever — the same mechanism behind the
+    /// 2026-06-30 observe-nucleus OOM (there, the CDC log; see
+    /// `checkpoint_cdc_wal`). `flush_all_dirty` is the method that actually
+    /// compacts (`checkpoint` is the trait's `{}` default both engines
+    /// inherit) and nothing was calling it outside of tests: a table created
+    /// with a per-table engine and sustained writes had an unbounded WAL on a
+    /// running server. Called from the recurring `WalCheckpoint` background
+    /// task on the same cadence as the primary storage WAL.
+    pub async fn checkpoint_table_engines(&self) {
+        let engines: Vec<(String, Arc<dyn StorageEngine>)> = self
+            .table_engines
+            .read()
+            .iter()
+            .map(|(name, engine)| (name.clone(), engine.clone()))
+            .collect();
+        for (table, engine) in engines {
+            if let Err(e) = engine.flush_all_dirty().await {
+                tracing::warn!("per-table engine WAL checkpoint failed for '{table}': {e}");
+            }
+        }
+    }
+
     /// Get a reference to the CDC log.
     #[cfg(feature = "server")]
     pub fn cdc_log(&self) -> &parking_lot::RwLock<crate::reactive::CdcLog> {
@@ -5334,7 +5363,45 @@ impl Executor {
             }
         }
 
-        // Commit-time durability: force the WAL before the statement is acked.
+        // Commit-time durability, specialty stores FIRST, SQL WAL LAST.
+        //
+        // A cross-model write touches both in one transaction (a scalar
+        // function reaches KV / timeseries / vector / graph / streams
+        // alongside the SQL rows), and the two are forced by separate calls
+        // with a crash window between them. Whichever is forced second is the
+        // one a crash in that window leaves NOT durable, so the failure mode
+        // depends on which order this runs in:
+        //
+        //   SQL last:   crash after the SQL WAL is durable, before specialty
+        //               is. The client can already have been acked (or, if the
+        //               specialty force below then errors, is told the
+        //               statement FAILED while the SQL WAL already committed
+        //               it) — a retry double-writes, and any durable SQL row
+        //               that referenced the specialty write now references
+        //               something that was never made durable.
+        //   Specialty
+        //   last:       crash after specialty is durable, before the SQL WAL
+        //               is. The specialty write sits unreferenced by anything
+        //               durably committed — an orphan, reclaimable the same
+        //               way a page allocated then not catalogued is (see the
+        //               storage-before-catalog ordering above). And if the
+        //               specialty force itself errors, that happens BEFORE the
+        //               SQL WAL is ever forced, so the error prevents the SQL
+        //               commit from being acked at all, instead of following a
+        //               commit that already happened.
+        //
+        // Orphaned-but-harmless beats durably-referencing-nothing, so specialty
+        // goes first. This is not crash-atomicity across the two WALs — a crash
+        // in the window is still a partial write — it only makes the partial
+        // deterministically the safe half.
+        if result.is_ok() && (is_commit || !in_txn) && self.synchronous_commit_enabled() {
+            self.force_specialty_durability()?;
+            // Specialty is fsynced, SQL is not yet — see the crashpoint's doc
+            // comment in `storage::crashpoint::ALL_POINTS` for what a crash
+            // exactly here must (and must not) do to recovery.
+            crate::storage::crashpoint::reach("commit.after_specialty_before_sql");
+        }
+
         // Autocommit writes (and DDL) are their own commit point; writes made
         // inside an explicit transaction defer to COMMIT. Skipped when the
         // session runs with synchronous_commit=off — those writes become
@@ -5346,14 +5413,6 @@ impl Executor {
             // The write already applied in memory; if the WAL can't be made
             // durable the client must NOT get a success ack.
             self.force_wal_durability().await?;
-        }
-
-        // Specialty-store durability: KV / timeseries / vector / graph / streams
-        // / CDC writes reach their WALs through scalar functions and the KV
-        // path, not SQL DML, so they miss the gate above. Force them on the same
-        // autocommit/commit boundary. `is_dirty()` makes this ~free for reads.
-        if result.is_ok() && (is_commit || !in_txn) && self.synchronous_commit_enabled() {
-            self.force_specialty_durability()?;
         }
 
         result
