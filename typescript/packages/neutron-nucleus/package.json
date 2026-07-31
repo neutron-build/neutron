@@ -94,7 +94,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js dist/integration.test.js dist/transport.test.js",
+    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js dist/integration.test.js dist/transport.test.js dist/retry.test.js",
     "lint": "tsc --noEmit --pretty false",
     "typecheck": "tsc --noEmit"
   },

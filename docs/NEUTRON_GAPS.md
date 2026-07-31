@@ -186,5 +186,28 @@ What each client needs:
 - Document that `SERIALIZABLE` on Nucleus's disk engine is table-level 2PL, so
   a hot table serializes — see `nucleus/docs/MODEL_SEMANTICS.md`.
 
-This is the highest-value item in the post-R6 follow-up: the isolation level is
-now real and usable in the engine, and unusable through the SDKs.
+**STATUS 2026-07-30 — fixed in Go, Python and TypeScript.** Each now ships
+`isSerializationFailure` / `isLockNotAvailable` classification (by SQLSTATE, never
+by message text) plus a retry helper with jittered exponential backoff:
+
+- **Go** — `client.WithTx(ctx, opts, fn)` in `go/nucleus/retry.go`. The SDK had
+  `Begin`/`Commit`/`Rollback` but no managed helper at all, so there was nowhere
+  for retry to live; `WithTx` also guarantees rollback on panic, which matters
+  more than usual here because an abandoned exclusive lock blocks every other
+  serializable transaction on that table until the session drops.
+- **Python** — `with_tx(db, fn, isolation=...)` in
+  `python/neutron/nucleus/retry.py`.
+- **TypeScript** — `withRetry(fn, opts)` in
+  `typescript/packages/neutron-nucleus/src/retry.ts`, composed with the existing
+  `sql.transaction(fn, { isolationLevel })` which already owned the boundary.
+
+All three treat **55P03 as non-retryable** — the holder is still there, so
+retrying spins against a lock that is not moving — and all three have a test
+asserting a lock timeout is attempted exactly once. Backoff is full-jitter
+because under wait-die the younger transaction loses every round, so a fixed
+backoff can starve it indefinitely.
+
+**Still open:** Rust, Elixir, Zig and Julia clients have no retry helper, and
+`FRAMEWORK_CONTRACT.md` still does not mention isolation levels or the retry
+contract at all — it should, since it is the document every SDK is written
+against.
