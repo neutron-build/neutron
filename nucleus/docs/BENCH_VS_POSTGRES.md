@@ -55,12 +55,36 @@ Three consequences worth stating plainly:
 1. **Any published write-throughput comparison against PostgreSQL on macOS is
    invalid unless `wal_sync_method` is equalised.** Not "roughly comparable" —
    invalid, by two orders of magnitude on the dominant term.
-2. **Nucleus offers no knob for this.** PostgreSQL exposes `wal_sync_method`
-   precisely so an operator can choose. Nucleus has `synchronous_commit`
-   (on/off), which is all-or-nothing: full drive barrier, or a bounded loss
-   window. The middle setting most databases actually run in — flush to the OS,
-   don't force the drive — is not reachable. That is a real gap, and it is
-   the honest explanation for the write numbers rather than an excuse for them.
+2. **Nucleus offers no usable knob for this.** PostgreSQL exposes
+   `wal_sync_method` precisely so an operator can choose. Nucleus has
+   `synchronous_commit` (on/off) — all-or-nothing: full drive barrier, or a
+   bounded loss window. The middle setting most databases actually run in
+   (flush to the OS, don't force the drive) is not reachable.
+
+   There IS a `SyncMode` enum (`Fsync` / `Fdatasync` / `None`) in
+   `src/storage/wal.rs`, but two things make it not the answer today:
+   - `MvccWal::sync_covering` calls `sync_all()` unconditionally and never
+     consults it, so the MVCC engine's WAL ignores the setting entirely.
+   - `SyncMode::Fdatasync` is **not a cheaper option on macOS** — measured, not
+     assumed. Rust's `File::sync_data` issues `F_FULLFSYNC` exactly as
+     `sync_all` does:
+
+     | call | cost |
+     |---|---:|
+     | `File::sync_all` | 3,872.4 µs |
+     | `File::sync_data` | 3,849.2 µs |
+
+     A 0.6% difference — i.e. none. So on macOS the enum offers `Fsync`,
+     something indistinguishable from `Fsync`, and `None` (no durability at
+     all). A durability knob that silently does nothing is worse than an absent
+     one, because an operator who sets it believes they made a choice. On Linux
+     `sync_data` is a real `fdatasync` and the distinction does hold; the
+     defect is that the mode does not say which platform it means.
+
+   Adding a genuine "flush to OS, don't force the drive" mode means weakening
+   durability on a path the crash matrix covers, so it belongs behind
+   `probe_crash_points` / `probe_io_faults` runs rather than a quick patch.
+   Deliberately not done here.
 3. The comparison is only meaningful on **Linux** with matched settings, or on
    macOS with PostgreSQL set to `wal_sync_method = fsync_writethrough` (its
    F_FULLFSYNC equivalent). Neither has been run yet.
