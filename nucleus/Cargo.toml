@@ -123,6 +123,11 @@ path = "src/bin/pg_compare.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "attr_pk_write"
+path = "src/bin/attr_pk_write.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
 required-features = ["bench-tools"]

@@ -3124,6 +3124,10 @@ impl DiskEngine {
         slot_idx: u16,
         row: &Row,
     ) -> Result<(), StorageError> {
+        // Benchmark attribution only — see `crate::bench_hooks`.
+        if crate::bench_hooks::skip_index_insert() {
+            return Ok(());
+        }
         let mut indexes = self.indexes.write();
         for (idx_name, idx) in indexes.iter_mut() {
             if idx.table == table && idx.col_idx < row.len() {

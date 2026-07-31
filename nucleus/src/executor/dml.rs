@@ -914,6 +914,11 @@ impl Executor {
             return Ok(());
         }
 
+        // Benchmark attribution only — see `crate::bench_hooks`.
+        if crate::bench_hooks::skip_unique_probe() {
+            return Ok(());
+        }
+
         let mut unique_col_sets: Vec<Vec<usize>> = Vec::new();
 
         for constraint in &table_def.constraints {
