@@ -332,6 +332,21 @@ function hydrateApp(data: LoaderData) {
       // and the SSR HTML remains intact.
       return;
     }
+    // <Island> renders `h("neutron-island", …, h(Component, props))`, so the
+    // full-tree hydrate above ALREADY mounted every island component inside
+    // the app root. Letting initIslands() hydrate them again creates a second
+    // Preact root over the same container: the static markup matches on both
+    // passes so nothing visibly duplicates at first, but each root then
+    // inserts its own dynamic nodes — a percentage rendered twice ("16%%"),
+    // two progress bars, two copies of a conditional list. Claim them for the
+    // app root so the island runtime only handles markers the router doesn't
+    // own (SSR-only pages, or islands mounted outside #app).
+    appElement.querySelectorAll<HTMLElement & { __neutronHydrated?: boolean }>(
+      "neutron-island"
+    ).forEach((island) => {
+      island.__neutronHydrated = true;
+    });
+
     initIslands();
 
     // Notify ScrollReveal (and other components) that hydration is complete.
