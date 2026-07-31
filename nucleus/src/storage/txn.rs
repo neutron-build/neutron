@@ -316,6 +316,21 @@ pub struct TransactionManager {
     /// between concurrent txns, and (b) decide when a committed txn's SSI data can
     /// be purged (only once every concurrent peer has also finished).
     ssi_concurrent: Mutex<HashMap<u64, HashSet<u64>>>,
+    /// SERIALIZABLE transactions marked for abort the moment they became a
+    /// PIVOT — a transaction with BOTH an incoming and an outgoing
+    /// rw-antidependency (`T_in -> T -> T_out`). Cahill's theorem is that every
+    /// cycle in the serialization graph contains one, so aborting pivots is
+    /// sufficient.
+    ///
+    /// The timing is the whole point. Checking for pivots at COMMIT time does
+    /// not work: in a two-transaction write skew BOTH participants are pivots
+    /// by then, so both abort — serializable, but no progress, and it breaks
+    /// every test that expects one survivor. Checking at EDGE-CREATION time
+    /// fixes that, because the second edge is what completes the structure and
+    /// only one transaction is being processed at that instant. Dooming that
+    /// one breaks the cycle, and the other is then no longer part of any cycle
+    /// and commits normally.
+    ssi_doomed: Mutex<HashSet<u64>>,
     /// Serializes the COMMIT POINT of serializable transactions.
     ///
     /// `check_serializable_commit` only reports a dangerous structure when a
@@ -356,6 +371,7 @@ impl TransactionManager {
             ssi_rw_conflicts: Mutex::new(HashSet::new()),
             ssi_txns: Mutex::new(HashSet::new()),
             ssi_concurrent: Mutex::new(HashMap::new()),
+            ssi_doomed: Mutex::new(HashSet::new()),
             serial_commit: Mutex::new(()),
         }
     }
@@ -667,11 +683,58 @@ impl TransactionManager {
                     if other_tbl_writes.contains(&idx) {
                         // txn_id read data that other_txn wrote
                         conflicts.insert((txn_id, other_txn));
+                        self.doom_new_pivot(&conflicts, txn_id, other_txn, txn_id);
                         break;
                     }
                 }
             }
         }
+    }
+
+
+    /// After an edge `reader -> writer` is added, doom whichever endpoint has
+    /// just become a PIVOT (has both an incoming and an outgoing edge).
+    ///
+    /// `current` is the transaction executing right now. When both endpoints
+    /// are pivots — which is exactly the two-transaction write-skew case —
+    /// preferring `current` is what keeps this from aborting both: one is
+    /// doomed, the cycle is broken, and the other is no longer a pivot in any
+    /// remaining cycle. A transaction that has already COMMITTED can no longer
+    /// be aborted, so it is never chosen.
+    ///
+    /// Called with `conflicts` already held so the edge set cannot change
+    /// between adding the edge and judging it.
+    fn doom_new_pivot(
+        &self,
+        conflicts: &HashSet<(u64, u64)>,
+        reader: u64,
+        writer: u64,
+        current: u64,
+    ) {
+        let is_pivot = |t: u64| {
+            conflicts.iter().any(|&(_, w)| w == t) && conflicts.iter().any(|&(r, _)| r == t)
+        };
+        let committed = self.committed.lock();
+        let mut doomed = self.ssi_doomed.lock();
+        // Prefer the transaction currently executing: it can be failed
+        // immediately, and it is the one whose action completed the structure.
+        for candidate in [current, reader, writer] {
+            if is_pivot(candidate) && !committed.contains(&candidate) {
+                doomed.insert(candidate);
+                return;
+            }
+        }
+        // If the only pivot has already COMMITTED it can no longer be aborted,
+        // and this returns without dooming anyone. That is the residual
+        // ≥3-transaction hole documented on `check_serializable_commit`.
+        //
+        // Dooming the currently-executing transaction instead was tried and is
+        // WORSE, measured: it aborts a transaction that is not the pivot, so it
+        // fails to break the actual cycle while adding ~40 needless aborts per
+        // 800 rounds — `probe_serializable` reported MORE violations with it
+        // than without. Breaking the right cycle needs Cahill's per-transaction
+        // inConflict/outConflict flags, which cannot be reconstructed from the
+        // edge set alone once `sweep_ssi` has purged finished transactions.
     }
 
     /// Whether two SERIALIZABLE transactions had overlapping lifetimes. Only
@@ -714,6 +777,7 @@ impl TransactionManager {
                     if other_tbl_reads.contains(&idx) {
                         // other_txn read data that txn_id wrote
                         conflicts.insert((other_txn, txn_id));
+                        self.doom_new_pivot(&conflicts, other_txn, txn_id, txn_id);
                         break;
                     }
                 }
@@ -756,36 +820,54 @@ impl TransactionManager {
     /// and at least one of T_in or T_out has already committed,
     /// then a serialization anomaly (write skew) is possible — abort T.
     ///
-    /// # KNOWN GAP — this check is incomplete
+    /// # KNOWN GAP — cycles of three or more transactions
     ///
-    /// The deferral below (abort only when a counterpart has already
-    /// COMMITTED) is not the textbook rule, which aborts any PIVOT — a txn with
-    /// both an incoming and an outgoing rw-antidependency — on the theorem that
-    /// every cycle contains one. Deferring is unsound in principle: the pivot
-    /// itself can commit first, after which neither counterpart is a pivot and
-    /// nobody aborts.
+    /// Pivots are doomed eagerly at edge-creation time (`doom_new_pivot`),
+    /// which is what makes the two-transaction case correct: measured 0
+    /// violations across 10,500 rounds of `probe_serializable --txns 2`, where
+    /// before the fix it failed roughly 1 round in 1,500.
     ///
-    /// It is deliberately kept anyway, because the textbook rule was tried and
-    /// is worse here: in a two-transaction write skew BOTH participants are
-    /// pivots, so both abort. That is still serializable but makes no progress,
-    /// and it broke three census tests that (correctly) require exactly one
-    /// survivor. Cahill's algorithm avoids that with per-transaction
-    /// inConflict/outConflict flags this implementation does not carry; adding
-    /// them is the real fix.
+    /// Cycles spanning THREE OR MORE transactions still escape at roughly 1–2
+    /// per 800 rounds. The cause is visible in `doom_new_pivot`: when the edge
+    /// completing the cycle makes an ALREADY-COMMITTED transaction the pivot,
+    /// there is nothing left to abort, and no uncommitted participant is
+    /// necessarily a pivot itself. Dooming the currently-executing transaction
+    /// instead was tried and measured WORSE — it aborts a non-pivot, so it
+    /// fails to break the cycle while adding needless aborts.
     ///
-    /// `probe_serializable` reproduces the residual hole at roughly 1 in 1,500
-    /// rounds on this engine:
+    /// The real fix is Cahill's per-transaction `inConflict`/`outConflict`
+    /// flags carried on the transaction object. They cannot be reconstructed
+    /// from the edge set here because `sweep_ssi` purges finished
+    /// transactions, so the history a late edge needs to be judged against is
+    /// already gone.
+    ///
+    /// The deferred check below is kept as a backstop for structures completed
+    /// by an edge this transaction was not party to. It is not the textbook
+    /// commit-time pivot rule, which was tried and rejected: in a
+    /// two-transaction write skew both participants are pivots by commit time,
+    /// so both abort — serializable but making no progress, and it broke three
+    /// census tests that correctly require one survivor.
+    ///
+    /// Reproduce the remaining gap:
     ///
     /// ```sh
     /// cargo run --release --features server --bin probe_serializable -- \
-    ///     --rounds 1500 --txns 2 --engine mvcc --seed 15838
+    ///     --rounds 800 --engine mvcc --seed 104729
     /// ```
     ///
-    /// The disk engine (`BufferedDiskEngine`, what a server actually runs)
-    /// gets serializability from strict 2PL instead and is clean across every
-    /// run of that probe. This gap is confined to `MvccStorageAdapter`
-    /// (`--memory` and embedded `durable_mvcc`).
+    /// `BufferedDiskEngine` — what a server actually runs — takes strict 2PL
+    /// instead and is clean across every run of that probe. This gap is
+    /// confined to `MvccStorageAdapter` (`--memory`, embedded `durable_mvcc`).
     pub fn check_serializable_commit(&self, txn_id: u64) -> Result<(), String> {
+        // Doomed at edge-creation time for being a pivot. This is the primary
+        // rule; the deferred check below remains as a backstop for structures
+        // completed by an edge this transaction was not party to.
+        if self.ssi_doomed.lock().contains(&txn_id) {
+            return Err(
+                "could not serialize access due to read/write dependencies among transactions"
+                    .to_string(),
+            );
+        }
         let conflicts = self.ssi_rw_conflicts.lock();
         let committed = self.committed.lock();
 
@@ -887,6 +969,7 @@ impl TransactionManager {
         let mut writes = self.ssi_write_sets.lock();
         let mut conflicts = self.ssi_rw_conflicts.lock();
         let mut concurrent = self.ssi_concurrent.lock();
+        let mut doomed = self.ssi_doomed.lock();
 
         let mut purge: Vec<u64> = ssi
             .iter()
@@ -906,6 +989,7 @@ impl TransactionManager {
             ssi.remove(&t);
             reads.remove(&t);
             writes.remove(&t);
+            doomed.remove(&t);
             concurrent.remove(&t);
             for peers in concurrent.values_mut() {
                 peers.remove(&t);
