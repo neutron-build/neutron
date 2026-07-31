@@ -291,6 +291,91 @@ Subscriptions use PostgreSQL `LISTEN`/`NOTIFY` semantics or the `SUBSCRIBE(chann
 | `CDC_COUNT` | `CDC_COUNT()` | BIGINT |
 | `CDC_TABLE_READ` | `CDC_TABLE_READ(table TEXT, after_sequence BIGINT, limit BIGINT)` | TEXT (JSON array of `{seq, table, change, ts}`) |
 
+## 3.14 Transactions and Isolation
+
+Every SDK exposes transactions. Until this section existed, none of them agreed
+on what a failed one means — and an audit found **zero** clients handling a
+serialization failure, so every SDK surfaced a retryable conflict to
+application code as a hard error. That was not seven independent oversights;
+it was a gap in this document.
+
+### Isolation levels
+
+Nucleus accepts the PostgreSQL levels. What it actually provides depends on the
+storage engine, and an engine that cannot honour a requested level **MUST
+refuse it** rather than silently running weaker:
+
+| engine | provides | mechanism |
+|---|---|---|
+| `BufferedDiskEngine` (server default) | SERIALIZABLE | table-level strict 2PL, wait-die |
+| `MvccStorageAdapter` (`--memory`, embedded) | SERIALIZABLE | SSI |
+| `MemoryEngine` | READ COMMITTED | none |
+
+Two consequences SDKs must document:
+
+- The guarantee holds **only among SERIALIZABLE transactions**, as in
+  PostgreSQL. A concurrent read-committed session can still write a table a
+  serializable transaction is reading.
+- Under table-level 2PL a **hot table serializes**. SERIALIZABLE is for where
+  the guarantee is needed, not a default to switch on globally.
+
+### Error classification — REQUIRED
+
+Classify by **SQLSTATE**, never by message text. The code is the contract; the
+message is free-form and changes.
+
+| SQLSTATE | meaning | retry? |
+|---|---|---|
+| `40001` | serialization failure — conflict lost (2PL kill or SSI abort) | **YES**, re-run the whole transaction |
+| `25P02` | statement issued after the transaction was already aborted | **YES**, re-run the whole transaction |
+| `55P03` | `lock_not_available` — `lock_timeout` elapsed | **NO** |
+
+`55P03` is the one that must not be lumped in with the others. It means the
+lock is still held, so retrying spins against something that is not moving —
+one stuck transaction becomes a busy loop. Surface it with the `lock_timeout`
+hint instead.
+
+Classification MUST see through wrapping (`errors.As` in Go, the `cause` chain
+in JS, `sqlstate`/`pgcode` in Python): every layer between driver and
+application adds context, so a classifier that only works on the bare driver
+error works nowhere real.
+
+### Retry helper — REQUIRED
+
+Each SDK MUST provide a managed transaction helper that retries serialization
+failures. PostgreSQL drivers deliberately do not do this — they surface the
+code and stop, leaving the decision to the application, and a framework SDK
+*is* that layer.
+
+Required behaviour:
+
+1. Re-run the **entire** transaction body on `40001`/`25P02`, bounded attempts.
+2. Never retry `55P03`, or any other SQLSTATE.
+3. **Full-jitter** backoff. Two conflicting transactions that retry in lockstep
+   collide again on the same schedule, and under wait-die the younger one loses
+   every round — a fixed backoff can starve it indefinitely.
+4. Roll back on panic/exception. An abandoned exclusive lock blocks every other
+   serializable transaction on that table until the session is dropped.
+5. Document that the callback **must be idempotent outside the database**: it
+   can run more than once, and only its database work is rolled back between
+   attempts.
+
+Reference implementations: `go/nucleus/retry.go` (`Client.WithTx`),
+`python/neutron/nucleus/retry.py` (`with_tx`),
+`typescript/packages/neutron-nucleus/src/retry.ts` (`withRetry`).
+
+Each ships a test asserting a `55P03` is attempted **exactly once** — that is
+the assertion that fails if someone later collapses the classifier into a
+single "is this retryable" check.
+
+### Observability
+
+Servers expose `nucleus_lock_waits_total`,
+`nucleus_lock_wait_duration_seconds`, `nucleus_lock_deadlock_kills_total`,
+`nucleus_lock_timeouts_total` and `nucleus_locks_held`. A rising
+`lock_deadlock_kills` rate is the signal that a workload is contending on one
+table and needs finer-grained access, not a bigger retry budget.
+
 ## 4. OpenAPI Specification
 
 All frameworks MUST generate OpenAPI 3.1 specs with these conventions:

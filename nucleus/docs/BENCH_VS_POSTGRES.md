@@ -192,8 +192,37 @@ Top frames of a bulk load under `sample`: allocation churn (`RawVec::finish_grow
 `reserve`, `grow_one` — the largest single bucket), `BufferPool::fetch_page` +
 `pin_if_present` + `PageTable::lookup`, `Value::eq`, and `btree::find_leaf`.
 
-The allocation churn is the untested lead. Per row the engine allocates for
-`serialize_row`, for the index key, and for the `Vec<Row>` results of the
-uniqueness probe — none of which are reused across rows of the same statement.
-A per-statement scratch buffer is the next thing to try, and it should be
-measured with the interleaved A/B protocol above before it is believed.
+The allocation churn looked like the lead. It was tested and it is not — see
+below.
+
+**3. Lazy `col_types` in the uniqueness probe.** `DiskEngine::col_types` takes
+the `tables` read lock and CLONES a `Vec<DataType>` on every call, and the PK
+insert path calls it twice per row (once in `index_lookup_inner` for the
+uniqueness probe, once in `insert`). In the probe it was resolved BEFORE the
+B-tree lookup, so on the common path — a non-duplicate key, empty result,
+nothing decoded — the clone was pure waste on every row of every bulk load.
+Moving it after the lookup and skipping it entirely on an empty result:
+
+    baseline       : 1885 / 1894 / 1901 / 2014 / 1987 ms
+    lazy col_types : 1882 / 1875 / 1991 / 1968 / 2007 ms
+
+**No win.** Reverted.
+
+### What three failed attempts actually tell us
+
+Batching the loop, cheapening the hash, and removing two allocations per row
+all measured as noise. The cost is therefore **not** in per-row lock
+acquisition, not in page-table hashing, and not in the allocations those paths
+make. Reading the code and the sampling profile produced three plausible
+hypotheses and three wrong ones.
+
+The next attempt should NOT be another code-reading hypothesis. It should be a
+differential measurement that isolates the cost directly — e.g. time a bulk
+load with the B-tree index maintenance stubbed out versus the uniqueness probe
+stubbed out, to attribute the ~38 µs/row between the two halves of the PK cost
+before changing anything. Until that attribution exists, further optimisation
+here is guessing.
+
+Note also that absolute numbers drift substantially between measurement batches
+on this machine (the same unchanged binary measured 1505 ms in one batch and
+1885 ms in another). Only interleaved A/B within a single loop is meaningful.
