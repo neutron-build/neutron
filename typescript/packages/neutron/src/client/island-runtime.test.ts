@@ -126,3 +126,43 @@ describe("initIslands — standalone manifest hydration", () => {
     expect(island.__neutronHydrated).toBe(true);
   });
 });
+
+describe("router-owned islands", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    (window as any).__ISLAND_COMPONENTS__ = undefined;
+  });
+
+  // Regression: <Island> renders h("neutron-island", …, h(Component)), so the
+  // router's full-tree hydrate already mounts every island component. If
+  // initIslands() then hydrates the same container it creates a SECOND Preact
+  // root over the same DOM — statics match so nothing looks wrong at first,
+  // but each root inserts its own dynamic nodes (a percentage rendered as
+  // "16%%", two progress bars). hydrateApp() claims them by setting
+  // __neutronHydrated; this locks in that initIslands() honours the claim.
+  it("skips islands already claimed by the app root", async () => {
+    document.body.innerHTML = `
+      <neutron-island data-island-id="i9" data-component="counter"
+        data-client="load" data-props="{}" data-src="/src/components/Counter.tsx">
+        <button>count:0</button>
+      </neutron-island>`;
+
+    const island = document.querySelector("neutron-island") as HTMLElement & {
+      __neutronHydrated?: boolean;
+    };
+    island.__neutronHydrated = true; // what hydrateApp() does
+
+    let imported = 0;
+    initIslands({
+      "/src/components/Counter.tsx": async () => {
+        imported++;
+        return { Counter };
+      },
+    });
+    await flush();
+    await flush();
+
+    expect(imported).toBe(0);
+    expect(island.querySelectorAll("button").length).toBe(1);
+  });
+});
