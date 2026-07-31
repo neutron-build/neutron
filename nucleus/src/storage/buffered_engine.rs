@@ -76,9 +76,32 @@ enum BufferedOp {
     },
 }
 
+/// One table's buffered writes, folded into the form a read needs.
+///
+/// The op log is the source of truth (COMMIT replays it, savepoints truncate
+/// it), but replaying it on every read made reads quadratic in the number of
+/// writes: each `overlay()` walked all k ops, and a `Delete` op cost a full
+/// `retain` over the table. A transaction doing n single-row DELETEs over m
+/// rows therefore paid O(n * k * m). This is the same information folded once
+/// per write, so a read is a single pass.
+#[derive(Default)]
+struct TableOverlay {
+    /// Positions removed from the committed image (and pending rows dropped).
+    deleted: HashSet<usize>,
+    /// Latest replacement row for a committed position.
+    updates: HashMap<usize, Row>,
+    /// Rows that exist only in this transaction, keyed by pending position.
+    /// `BTreeMap` so they read back in the order they were inserted, which is
+    /// what replaying the append-only log produced.
+    inserts: std::collections::BTreeMap<usize, Row>,
+}
+
 /// Transaction state — holds buffered operations until commit/abort.
 struct TxnBuffer {
     ops: Vec<BufferedOp>,
+    /// `ops` folded per table — derived state, never authoritative. Rebuilt
+    /// wholesale after a savepoint truncate.
+    overlays: HashMap<String, TableOverlay>,
     /// Savepoint stack: `(name, ops.len() at SAVEPOINT time)`.
     ///
     /// Nothing in this buffer has touched the underlying engine yet, so a
@@ -95,6 +118,7 @@ impl TxnBuffer {
     fn new() -> Self {
         Self {
             ops: Vec::new(),
+            overlays: HashMap::new(),
             savepoints: Vec::new(),
             next_pending: PENDING_POS_BASE,
         }
@@ -104,6 +128,64 @@ impl TxnBuffer {
         let pos = self.next_pending;
         self.next_pending += 1;
         pos
+    }
+
+    /// Append an op and fold it into the derived overlay. Every mutation of
+    /// `ops` goes through here so the two cannot drift.
+    fn push_op(&mut self, op: BufferedOp) {
+        Self::fold(&mut self.overlays, &op);
+        self.ops.push(op);
+    }
+
+    /// Apply one op to the folded view. Ordering matters and is preserved:
+    /// a DELETE after an UPDATE wins, an UPDATE after a DELETE is a no-op
+    /// (the row is gone), and an UPDATE to a pending row edits it in place —
+    /// exactly what replaying the log against a materialised view did.
+    fn fold(overlays: &mut HashMap<String, TableOverlay>, op: &BufferedOp) {
+        match op {
+            BufferedOp::Insert {
+                table,
+                pending_pos,
+                row,
+            } => {
+                overlays
+                    .entry(table.clone())
+                    .or_default()
+                    .inserts
+                    .insert(*pending_pos, row.clone());
+            }
+            BufferedOp::Delete { table, positions } => {
+                let ov = overlays.entry(table.clone()).or_default();
+                for &pos in positions {
+                    ov.inserts.remove(&pos);
+                    ov.updates.remove(&pos);
+                    ov.deleted.insert(pos);
+                }
+            }
+            BufferedOp::Update { table, updates } => {
+                let ov = overlays.entry(table.clone()).or_default();
+                for (pos, new_row) in updates {
+                    if ov.deleted.contains(pos) {
+                        continue;
+                    }
+                    if let Some(slot) = ov.inserts.get_mut(pos) {
+                        *slot = new_row.clone();
+                    } else {
+                        ov.updates.insert(*pos, new_row.clone());
+                    }
+                }
+            }
+            BufferedOp::CreateTable { .. } | BufferedOp::DropTable { .. } => {}
+        }
+    }
+
+    /// Refold every op. Used after `ROLLBACK TO SAVEPOINT` truncates the log,
+    /// which the incremental fold cannot undo.
+    fn refold(&mut self) {
+        self.overlays.clear();
+        for op in &self.ops {
+            Self::fold(&mut self.overlays, op);
+        }
     }
 }
 
@@ -442,39 +524,34 @@ impl BufferedDiskEngine {
     /// This session's view of a table as `(position, row)` pairs: the engine's
     /// committed rows at their real addresses, with this transaction's own
     /// buffered writes overlaid at synthetic ones.
-    async fn overlay(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+    async fn overlay_tagged(
+        &self,
+        table: &str,
+        site: usize,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
         let mut rows = self.inner.scan_physical(table).await?;
+        crate::bench_hooks::record_overlay(site, rows.len());
 
         let bufs = self.txn_bufs.read();
         let Some(txn) = bufs.get(&current_session_id()) else {
             return Ok(rows);
         };
-        for op in &txn.ops {
-            match op {
-                BufferedOp::Insert {
-                    table: t,
-                    pending_pos,
-                    row,
-                } if t == table => {
-                    rows.push((*pending_pos, row.clone()));
+        let Some(ov) = txn.overlays.get(table) else {
+            return Ok(rows);
+        };
+
+        // One pass, using the folded view rather than replaying the op log.
+        if !ov.deleted.is_empty() {
+            rows.retain(|(pos, _)| !ov.deleted.contains(pos));
+        }
+        if !ov.updates.is_empty() {
+            for (pos, row) in rows.iter_mut() {
+                if let Some(new_row) = ov.updates.get(pos) {
+                    *row = new_row.clone();
                 }
-                BufferedOp::Delete {
-                    table: t,
-                    positions,
-                } if t == table => {
-                    let drop: HashSet<usize> = positions.iter().copied().collect();
-                    rows.retain(|(pos, _)| !drop.contains(pos));
-                }
-                BufferedOp::Update { table: t, updates } if t == table => {
-                    for (pos, new_row) in updates {
-                        if let Some(slot) = rows.iter_mut().find(|(p, _)| p == pos) {
-                            slot.1 = new_row.clone();
-                        }
-                    }
-                }
-                _ => {}
             }
         }
+        rows.extend(ov.inserts.iter().map(|(pos, row)| (*pos, row.clone())));
         Ok(rows)
     }
 }
@@ -492,7 +569,7 @@ impl StorageEngine for BufferedDiskEngine {
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
-            txn.ops.push(BufferedOp::CreateTable {
+            txn.push_op(BufferedOp::CreateTable {
                 table: table.to_string(),
             });
             return Ok(());
@@ -503,7 +580,7 @@ impl StorageEngine for BufferedDiskEngine {
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
         self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
-            txn.ops.push(BufferedOp::DropTable {
+            txn.push_op(BufferedOp::DropTable {
                 table: table.to_string(),
             });
             return Ok(());
@@ -515,7 +592,7 @@ impl StorageEngine for BufferedDiskEngine {
         self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
             let pending_pos = txn.take_pending_pos();
-            txn.ops.push(BufferedOp::Insert {
+            txn.push_op(BufferedOp::Insert {
                 table: table.to_string(),
                 pending_pos,
                 row,
@@ -533,7 +610,7 @@ impl StorageEngine for BufferedDiskEngine {
             return self.inner.scan(table).await;
         }
         Ok(self
-            .overlay(table)
+            .overlay_tagged(table, 0)
             .await?
             .into_iter()
             .map(|(_, row)| row)
@@ -609,7 +686,7 @@ impl StorageEngine for BufferedDiskEngine {
         if !self.is_in_txn() {
             return self.inner.scan_physical(table).await;
         }
-        self.overlay(table).await
+        self.overlay_tagged(table, 1).await
     }
 
     async fn scan_where_eq_positions(
@@ -626,7 +703,7 @@ impl StorageEngine for BufferedDiskEngine {
                 .await;
         }
         Ok(self
-            .overlay(table)
+            .overlay_tagged(table, 2)
             .await?
             .into_iter()
             .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v.loose_eq(value)))
@@ -677,7 +754,7 @@ impl StorageEngine for BufferedDiskEngine {
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
         self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
-            txn.ops.push(BufferedOp::Delete {
+            txn.push_op(BufferedOp::Delete {
                 table: table.to_string(),
                 positions: positions.to_vec(),
             });
@@ -689,7 +766,7 @@ impl StorageEngine for BufferedDiskEngine {
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
         self.lock_write(table).await?;
         if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
-            txn.ops.push(BufferedOp::Update {
+            txn.push_op(BufferedOp::Update {
                 table: table.to_string(),
                 updates: updates.to_vec(),
             });
@@ -837,6 +914,9 @@ impl StorageEngine for BufferedDiskEngine {
         };
         let mark = txn.savepoints[pos].1;
         txn.ops.truncate(mark);
+        // The incremental fold cannot be undone entry by entry, so rebuild it
+        // from the surviving log.
+        txn.refold();
         // The savepoint stays live after rolling back to it (Postgres
         // semantics); the ones nested inside it do not.
         txn.savepoints.truncate(pos + 1);
@@ -1055,6 +1135,132 @@ mod tests {
     use crate::catalog::{Catalog, ColumnDef, TableDef};
     use crate::storage::disk_engine::DiskEngine;
     use crate::types::{DataType, Value};
+
+    /// The overlay used to be computed by replaying the whole op log against a
+    /// materialised view on EVERY read. That is now folded incrementally, which
+    /// is only safe if the fold reproduces the replay exactly — including the
+    /// order-sensitive cases (DELETE after UPDATE, UPDATE after DELETE, UPDATE
+    /// of a pending row, DELETE of a pending row).
+    ///
+    /// This replays a pseudo-random op sequence both ways and compares. It is
+    /// the guard on the fold, not on the speed.
+    #[test]
+    fn folded_overlay_matches_op_log_replay() {
+        /// Exactly the old `overlay()` inner loop, kept here as the oracle.
+        fn replay(ops: &[BufferedOp], table: &str, base: &[(usize, Row)]) -> Vec<(usize, Row)> {
+            let mut rows = base.to_vec();
+            for op in ops {
+                match op {
+                    BufferedOp::Insert {
+                        table: t,
+                        pending_pos,
+                        row,
+                    } if t == table => rows.push((*pending_pos, row.clone())),
+                    BufferedOp::Delete {
+                        table: t,
+                        positions,
+                    } if t == table => {
+                        let drop: HashSet<usize> = positions.iter().copied().collect();
+                        rows.retain(|(pos, _)| !drop.contains(pos));
+                    }
+                    BufferedOp::Update { table: t, updates } if t == table => {
+                        for (pos, new_row) in updates {
+                            if let Some(slot) = rows.iter_mut().find(|(p, _)| p == pos) {
+                                slot.1 = new_row.clone();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rows
+        }
+
+        fn folded(txn: &TxnBuffer, table: &str, base: &[(usize, Row)]) -> Vec<(usize, Row)> {
+            let mut rows = base.to_vec();
+            let Some(ov) = txn.overlays.get(table) else {
+                return rows;
+            };
+            rows.retain(|(pos, _)| !ov.deleted.contains(pos));
+            for (pos, row) in rows.iter_mut() {
+                if let Some(new_row) = ov.updates.get(pos) {
+                    *row = new_row.clone();
+                }
+            }
+            rows.extend(ov.inserts.iter().map(|(pos, row)| (*pos, row.clone())));
+            rows
+        }
+
+        let base: Vec<(usize, Row)> = (0..24)
+            .map(|i| (i * 7, vec![Value::Int64(i as i64), Value::Int64(0)]))
+            .collect();
+
+        // xorshift so the sequence is fixed and the failure is reproducible.
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for round in 0..200 {
+            let mut txn = TxnBuffer::new();
+            // Track live positions so ops aim at plausible targets, including
+            // pending ones — that is where the ordering cases live.
+            let mut live: Vec<usize> = base.iter().map(|(p, _)| *p).collect();
+
+            for _ in 0..30 {
+                match rnd() % 3 {
+                    0 => {
+                        let pos = txn.take_pending_pos();
+                        live.push(pos);
+                        txn.push_op(BufferedOp::Insert {
+                            table: "t".into(),
+                            pending_pos: pos,
+                            row: vec![Value::Int64(rnd() as i64 % 100), Value::Int64(1)],
+                        });
+                    }
+                    1 if !live.is_empty() => {
+                        let victim = live[(rnd() as usize) % live.len()];
+                        txn.push_op(BufferedOp::Delete {
+                            table: "t".into(),
+                            positions: vec![victim],
+                        });
+                        live.retain(|p| *p != victim);
+                    }
+                    _ if !live.is_empty() => {
+                        let target = live[(rnd() as usize) % live.len()];
+                        txn.push_op(BufferedOp::Update {
+                            table: "t".into(),
+                            updates: vec![(
+                                target,
+                                vec![Value::Int64(rnd() as i64 % 100), Value::Int64(2)],
+                            )],
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            assert_eq!(
+                folded(&txn, "t", &base),
+                replay(&txn.ops, "t", &base),
+                "fold diverged from op-log replay in round {round}"
+            );
+
+            // A savepoint truncate cannot be undone incrementally, so the
+            // refold after it must also match.
+            let keep = txn.ops.len() / 2;
+            txn.ops.truncate(keep);
+            txn.refold();
+            assert_eq!(
+                folded(&txn, "t", &base),
+                replay(&txn.ops, "t", &base),
+                "refold after truncate diverged in round {round}"
+            );
+        }
+    }
 
     async fn setup(path: &std::path::Path) -> (Arc<BufferedDiskEngine>, Arc<Catalog>) {
         let catalog = Arc::new(Catalog::new());

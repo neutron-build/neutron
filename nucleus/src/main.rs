@@ -1055,10 +1055,24 @@ async fn cmd_start(cfg: StartConfig) {
     // Query execution memory budget (T1.2): make the operator's configured
     // memory limit the ceiling for the hash-join result circuit-breaker, instead
     // of the hardcoded 256 MB default that ignored config. 0 → unlimited.
-    executor.set_query_memory_limit((config.server.max_memory_mb as u64) * 1024 * 1024);
+    //
+    // A FRACTION of the RSS cap, not all of it. Set equal, the working-set
+    // limit can never fire first: one query is permitted to reserve the whole
+    // cap, so the RSS watchdog trips and the blanket write-reject fires while
+    // no single query has done anything the budget considers wrong. A query
+    // that is genuinely too big should get a 53200 that names the query.
+    let query_mem_mb = config
+        .server
+        .max_memory_mb
+        .saturating_mul(config.server.query_memory_percent.min(100))
+        / 100;
+    executor.set_query_memory_limit((query_mem_mb as u64) * 1024 * 1024);
+    executor.set_reject_writes_on_memory_critical(config.server.reject_writes_on_memory_critical);
     if config.server.max_memory_mb > 0 {
         tracing::info!(
-            "Query memory budget: {} MB (hash-join circuit-breaker)",
+            "Query memory budget: {} MB ({}% of the {} MB server limit)",
+            query_mem_mb,
+            config.server.query_memory_percent,
             config.server.max_memory_mb
         );
     }

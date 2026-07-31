@@ -507,6 +507,9 @@ pub struct Executor {
     /// TRUNCATE) are rejected while this flag is set. Cleared when RSS drops
     /// below the pressure threshold.
     memory_critical: Arc<AtomicBool>,
+    /// Whether a set `memory_critical` should actually refuse writes. Off by
+    /// default — see the gate in `execute_statement_inner` for why.
+    reject_writes_on_memory_critical: Arc<AtomicBool>,
     /// Monotonically increasing write generation counter.
     /// Incremented on every successful DML/DDL. `query_cache_put` snapshots
     /// this before the query executes; if it has changed by the time the result
@@ -680,6 +683,7 @@ impl Executor {
             plan_cache_key_hint: parking_lot::Mutex::new(None),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
             memory_critical: Arc::new(AtomicBool::new(false)),
+            reject_writes_on_memory_critical: Arc::new(AtomicBool::new(false)),
             security: parking_lot::RwLock::new(crate::security::SecurityManager::new()),
             policy_gen: AtomicU64::new(0),
         }
@@ -3329,6 +3333,14 @@ impl Executor {
         &self.memory_critical
     }
 
+    /// Opt in to refusing writes while the RSS watchdog reports critical
+    /// pressure (`server.reject_writes_on_memory_critical`). DELETE and
+    /// TRUNCATE stay allowed regardless — see the gate for the reasoning.
+    pub fn set_reject_writes_on_memory_critical(&self, on: bool) {
+        self.reject_writes_on_memory_critical
+            .store(on, Ordering::Relaxed);
+    }
+
     /// Get a reference to the persistent graph store.
     pub fn graph_store(&self) -> &parking_lot::RwLock<GraphStore> {
         &self.graph_store
@@ -4934,11 +4946,34 @@ impl Executor {
                 | Statement::Truncate(_)
         );
 
-        // Reject write operations when the memory watchdog has flagged critical pressure.
-        // Reads (SELECT) are always allowed so clients can still query data.
-        if is_dml_write && self.memory_critical.load(Ordering::Relaxed) {
+        // Load-shed under critical memory pressure — off unless an operator
+        // turns it on (`server.reject_writes_on_memory_critical`).
+        //
+        // This used to reject EVERY write whenever the RSS watchdog was
+        // flagged, which is the wrong lever on three counts. RSS is not the
+        // server's working set (it includes the buffer pool and memory the
+        // allocator has not returned to the OS), so the flag sets while the
+        // server can still comfortably serve a 200-byte INSERT. Rejecting
+        // writes has no feedback path to RSS — the memory is held by caches and
+        // the pool, not by pending writes — so it never clears the condition it
+        // reacts to. And it sheds the cheap operation while leaving the
+        // expensive one (a big SELECT, which is what actually allocates a large
+        // working set) untouched. Query-memory reservations are the mechanism
+        // that bounds allocation; this is at most a last-ditch valve.
+        //
+        // DELETE and TRUNCATE are exempt even when it is on: they RECLAIM
+        // space, so refusing them blocks the retention job that would end the
+        // pressure. That case was observed in production — a retention job
+        // failing with 53200 during exactly the pressure it existed to relieve.
+        if is_dml_write
+            && self.reject_writes_on_memory_critical.load(Ordering::Relaxed)
+            && self.memory_critical.load(Ordering::Relaxed)
+            && !matches!(&stmt, Statement::Delete(_) | Statement::Truncate(_))
+        {
             return Err(ExecError::MemoryExceeded(
-                "server is under critical memory pressure; writes are temporarily rejected".into(),
+                "server is under critical memory pressure; writes are temporarily rejected \
+                 (server.reject_writes_on_memory_critical)"
+                    .into(),
             ));
         }
 

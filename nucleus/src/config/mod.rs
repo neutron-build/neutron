@@ -41,6 +41,31 @@ pub struct ServerConfig {
     /// forever and grows the database without bound.
     #[serde(default = "default_idle_in_transaction_timeout_secs")]
     pub idle_in_transaction_timeout_secs: u64,
+    /// Percent of `max_memory_mb` a single query's working set may reserve.
+    ///
+    /// These were the same number, which made the query budget useless as a
+    /// guard: one query could reserve the entire RSS cap, so the working-set
+    /// limit could never fire BEFORE the RSS watchdog did. Keeping it below
+    /// 100 means an oversized query gets a clean 53200 naming the query, while
+    /// the rest of the server keeps serving.
+    #[serde(default = "default_query_memory_percent")]
+    pub query_memory_percent: usize,
+    /// Reject ALL writes while the RSS watchdog reports critical pressure.
+    ///
+    /// Off by default, and it should stay off. RSS is not the server's working
+    /// set — it includes the buffer pool and whatever the allocator has not
+    /// returned to the OS — so the flag can be set while the server is
+    /// perfectly able to serve a small INSERT. Worse, rejecting writes has no
+    /// feedback path to RSS (the memory is held by caches and the pool, not by
+    /// pending writes), so it does not clear the condition it reacts to; it
+    /// just blocks the workload until something else frees memory. Bounding
+    /// query working sets is the mechanism that actually limits allocation.
+    ///
+    /// Space-reclaiming statements (DELETE, TRUNCATE) are never rejected even
+    /// when this is on: refusing the retention job that would free the memory
+    /// is the exact opposite of the intent.
+    #[serde(default = "default_reject_writes_on_memory_critical")]
+    pub reject_writes_on_memory_critical: bool,
 }
 
 fn default_host() -> String {
@@ -61,6 +86,12 @@ fn default_max_memory_mb() -> usize {
 fn default_idle_in_transaction_timeout_secs() -> u64 {
     0
 }
+fn default_query_memory_percent() -> usize {
+    75
+}
+fn default_reject_writes_on_memory_critical() -> bool {
+    false
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -71,6 +102,8 @@ impl Default for ServerConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             max_memory_mb: default_max_memory_mb(),
             idle_in_transaction_timeout_secs: default_idle_in_transaction_timeout_secs(),
+            query_memory_percent: default_query_memory_percent(),
+            reject_writes_on_memory_critical: default_reject_writes_on_memory_critical(),
         }
     }
 }
@@ -1196,6 +1229,8 @@ port = 5555
                 idle_timeout_secs: 99,
                 max_memory_mb: 512,
                 idle_in_transaction_timeout_secs: 0,
+                query_memory_percent: default_query_memory_percent(),
+                reject_writes_on_memory_critical: false,
             },
             storage: StorageConfig {
                 data_dir: "/tmp/nucleus".to_string(),

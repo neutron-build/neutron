@@ -18,7 +18,7 @@
 //! accept duplicate keys or stop maintaining indexes; `legacy_leaf_ops` is
 //! merely slower. `attr_pk_write` is the only caller.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static SKIP_UNIQUE_PROBE: AtomicBool = AtomicBool::new(false);
 static SKIP_INDEX_INSERT: AtomicBool = AtomicBool::new(false);
@@ -44,6 +44,51 @@ pub fn set_legacy_leaf_ops(on: bool) {
 #[inline]
 pub fn legacy_leaf_ops() -> bool {
     LEGACY_LEAF_OPS.load(Ordering::Relaxed)
+}
+
+/// Counters for the transactional-overlay investigation: how many times a
+/// single statement rebuilds the buffered view, and over how many rows.
+/// Call sites that rebuild the buffered view, so a single statement's rebuilds
+/// can be attributed instead of guessed at.
+pub const OVERLAY_SITES: [&str; 6] = [
+    "scan",
+    "scan_physical",
+    "scan_where_eq_positions",
+    "scan_limit",
+    "other",
+    "storage_for_write:before-image",
+];
+
+static OVERLAY_CALLS: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static OVERLAY_ROWS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub fn record_overlay(site: usize, rows: usize) {
+    OVERLAY_CALLS[site.min(5)].fetch_add(1, Ordering::Relaxed);
+    OVERLAY_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+}
+
+/// (per-site call counts, total rows materialised)
+pub fn overlay_counters() -> ([u64; 6], u64) {
+    let mut calls = [0u64; 6];
+    for (i, c) in OVERLAY_CALLS.iter().enumerate() {
+        calls[i] = c.load(Ordering::Relaxed);
+    }
+    (calls, OVERLAY_ROWS.load(Ordering::Relaxed))
+}
+
+pub fn reset_overlay_counters() {
+    for c in OVERLAY_CALLS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    OVERLAY_ROWS.store(0, Ordering::Relaxed);
 }
 
 #[inline]

@@ -74,6 +74,7 @@ pub mod error;
 pub mod migrate;
 pub mod models;
 pub mod pool;
+pub mod retry;
 
 pub use client::{Features, NucleusClient};
 pub use db::{Db, NucleusTransaction};

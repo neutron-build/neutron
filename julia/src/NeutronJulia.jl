@@ -74,6 +74,7 @@ include("models/cdc.jl")
 include("models/pubsub.jl")
 
 # ── Connection Pool ───────────────────────────────────────────────────────────
+include("retry.jl")
 include("pool.jl")
 
 # ── Exports ───────────────────────────────────────────────────────────────────
@@ -84,6 +85,8 @@ export NucleusError, NotNucleusError, require_nucleus
 # Client + transaction + pool
 export NucleusClient, NucleusFeatures, NucleusTransaction
 export connect, transaction
+export with_retry, is_serialization_failure, is_lock_not_available, sqlstate
+export SQLSTATE_SERIALIZATION_FAILURE, SQLSTATE_LOCK_NOT_AVAILABLE, SQLSTATE_IN_FAILED_TRANSACTION
 export ConnectionPool, acquire, release, with_pool, idle_count
 
 # Model handle types

@@ -1941,6 +1941,31 @@ impl Executor {
     /// Repair every derived representation whose row IDs or values can become
     /// stale after UPDATE/DELETE, FK actions, or a schema rewrite.
     pub(super) async fn rebuild_table_derived_state(&self, table_name: &str) {
+        // Inside an explicit transaction this is deferred to COMMIT/ROLLBACK,
+        // which already rebuild every table in `derived_dirty_tables`.
+        //
+        // Running it per statement was quadratic: each write scanned the whole
+        // table to rebuild indexes, so a transaction doing n single-row DELETEs
+        // over a table of m rows did n full scans (2,000 deletes over 20k rows
+        // ran 20 minutes; the same deletes in auto-commit took ~10s). It was
+        // also rebuilding from the WRONG image — on the buffered engine a
+        // transaction's writes have not reached the inner engine yet, so the
+        // "fresh" index it built excluded the very writes that dirtied it.
+        //
+        // Deferring is therefore both cheaper and no less correct: the rebuild
+        // that matters is the one at COMMIT, against the applied rows. Note
+        // `incremental_maintenance_eligible` already declines inside a
+        // transaction for the same reason, which is what routed every
+        // transactional write into this full rebuild.
+        {
+            let session = self.current_session();
+            let mut txn = session.txn_state.write().await;
+            if txn.active {
+                txn.derived_dirty_tables.insert(table_name.to_string());
+                return;
+            }
+        }
+
         // TRUNCATE recreates the physical table and therefore removes its
         // engine-local indexes while catalog definitions remain. Re-create any
         // missing physical indexes before rebuilding their postings.

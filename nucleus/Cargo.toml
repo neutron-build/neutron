@@ -123,6 +123,11 @@ path = "src/bin/pg_compare.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "repro_txn_delete"
+path = "src/bin/repro_txn_delete.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "attr_pk_write"
 path = "src/bin/attr_pk_write.rs"
 required-features = ["server"]
