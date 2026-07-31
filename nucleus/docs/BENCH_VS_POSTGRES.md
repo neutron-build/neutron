@@ -118,3 +118,82 @@ Three consequences worth stating plainly:
   `bench_paired` covers those against inline brute-force references and is
   explicitly Nucleus-only — its numbers must not be published as cross-system
   wins.
+
+## Write-path investigation, 2026-07-30 — where the cost actually is
+
+Bulk load (200 statements × 500-row `INSERT`) is the largest remaining gap:
+~1,510 ms for 50k rows vs PostgreSQL's ~120 ms. `fsync` accounts for only
+~425 ms of that (100 commits × 4.25 ms F_FULLFSYNC), so ~1,090 ms is real work.
+Scaling is **linear**, not quadratic — 12.5k/25k/50k/100k gave
+971/2246/4336/8282 ms — so this is a constant factor, not an algorithmic bug.
+
+**Localised to the disk path, not the executor.** Same 50k bulk load by engine:
+
+| engine | time |
+|---|---:|
+| `memory` | 164 ms |
+| `columnar` | 162 ms |
+| `mvcc` | 203 ms |
+| `disk` | ~1,510 ms |
+
+So parsing + executor cost ~3.3 µs/row; the remaining ~27 µs/row is the paged
+storage engine.
+
+**The PRIMARY KEY is 4× of it.** Identical load, same engine:
+
+| schema | time | per row |
+|---|---:|---:|
+| no primary key | ~630 ms | 12.6 µs |
+| `id INT PRIMARY KEY` | ~2,525 ms | 50.5 µs |
+
+A PK costs ~38 µs/row: one `index_lookup_sync` uniqueness probe plus one
+`index_insert` for B-tree maintenance. PostgreSQL does the whole load *with* a
+PK in ~120–200 ms. **This is the single biggest remaining write gap.**
+
+### Two fixes that were tried, measured, and REVERTED
+
+Both looked obviously right and neither survived an interleaved A/B. They are
+recorded because the next person will have the same two ideas.
+
+**1. `insert_batch` on `DiskEngine` + forwarding from `BufferedDiskEngine`.**
+Neither overrides it, so both inherit the trait default — a per-row
+`insert()` loop — while `columnar_engine` and `mvcc` do implement it. The
+hypothesis was that hoisting the column-type lookup, the `tables` read lock,
+and the page latch out of the loop (one latch per PAGE instead of per ROW)
+would pay. Implemented, then A/B'd against the trait default on a no-PK table,
+alternating binaries to control for thermal drift:
+
+    per-row loop : 583 / 562 / 545 / 497 ms   (mean ~547)
+    insert_batch : 545 / 546 / 539 / 513 ms   (mean ~536)
+
+~2%, ranges fully overlapping. **No win.** The per-row cost is not lock or
+latch re-acquisition, so batching cannot amortise it.
+
+**2. Replacing SipHash with FxHash in the buffer pool's page table.**
+`PageTable` is `HashMap<u32, u32>` with Rust's default hasher — SipHash-1-3, a
+keyed cryptographic hash, on an engine-generated `u32` key, on the hottest
+lookup in the storage layer. A `sample` profile of a bulk load showed SipHash's
+`write` among the top frames. Implemented as an inline FxHash (no new
+dependency), then A/B'd:
+
+    siphash : 1511 / 1492 / 1488 / 1488 / 1504 ms
+    fxhash  : 1510 / 1483 / 1507 / 1502 / 1508 ms
+
+**No win.** Worth recording *how* this nearly shipped: a non-interleaved
+measurement right after the profiling run showed 1504 ms against a 2416 ms
+"baseline" — an apparent 40% improvement that was entirely thermal drift
+between measurement batches. Interleaving the two binaries in the same loop
+made it vanish. **Never compare a change against a baseline measured in a
+different batch.**
+
+### What the profile actually says to look at
+
+Top frames of a bulk load under `sample`: allocation churn (`RawVec::finish_grow`,
+`reserve`, `grow_one` — the largest single bucket), `BufferPool::fetch_page` +
+`pin_if_present` + `PageTable::lookup`, `Value::eq`, and `btree::find_leaf`.
+
+The allocation churn is the untested lead. Per row the engine allocates for
+`serialize_row`, for the index key, and for the `Vec<Row>` results of the
+uniqueness probe — none of which are reused across rows of the same statement.
+A per-statement scratch buffer is the next thing to try, and it should be
+measured with the interleaved A/B protocol above before it is believed.
