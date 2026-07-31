@@ -226,3 +226,102 @@ here is guessing.
 Note also that absolute numbers drift substantially between measurement batches
 on this machine (the same unchanged binary measured 1505 ms in one batch and
 1885 ms in another). Only interleaved A/B within a single loop is meaningful.
+
+## Write-path attribution, 2026-07-31 — the measurement, and what it found
+
+The attribution above was done. `src/bin/attr_pk_write.rs` runs the same 50k
+bulk load four ways in one process, with each half of the PK cost switchable at
+runtime (`src/bench_hooks.rs`), arms interleaved and their order rotated per
+round:
+
+| arm | uniqueness probe | B-tree maintenance | median |
+|---|:-:|:-:|---:|
+| `full` | yes | yes | 3,214 ms |
+| `noprobe` | — | yes | 2,705 ms |
+| `noidx` | yes | — | 689 ms |
+| `none` | — | — | 671 ms |
+
+| component | µs/row |
+|---|---:|
+| whole PK cost (`full - none`) | 50.9 |
+| **B-tree maintenance** (`noprobe - none`) | **40.7** |
+| uniqueness probe (`full - noprobe`) | 10.2 |
+| — of which fixed overhead (`noidx - none`) | 0.4 |
+| — of which tree descent | 9.8 |
+
+**80% of the PK cost was B-tree maintenance, not the uniqueness probe.** Note
+what this says about the three reverted attempts: two of them (`insert_batch`,
+lazy `col_types`) were measured on a *no-PK* table or inside the probe — that
+is, against the 20% — so they could not have shown a win even if they were
+right.
+
+### The bug: `try_insert_leaf` rebuilt the whole page for every row
+
+Adding one entry to a leaf did this:
+
+1. `collect_leaf_entries` — **one heap allocation per entry already on the
+   page**, plus the outer `Vec`. A 4 KiB leaf holds ~200 entries, so a single
+   row insert allocated ~200 times.
+2. a linear search over the decoded `Vec`,
+3. `write_leaf_entries` — re-serialise every entry and zero-fill the tail.
+
+Entries are contiguous and variable-length, so a sorted insert is just a
+`copy_within` of the tail: one walk to find the byte offset, one memmove, one
+write, zero allocations. That is what it does now.
+
+This is also the resolution of "allocation churn is the largest single bucket"
+in the earlier sampling profile. The profile was right; the previous attempt
+attacked the wrong allocations (two per row in the probe, worth 0.4 µs/row)
+instead of the ~200 per row in the leaf insert.
+
+Interleaved A/B, both paths compiled into one binary and alternated
+(`attr_pk_write --ab`):
+
+    50k rows   legacy  : 3015 / 3144 / 3158 / 3083 / 3170 ms   (median 3144)
+               in-place: 1296 / 1270 / 1222 / 1300 / 1599 ms   (median 1296)
+               -59%, 37.0 µs/row
+
+    100k rows  legacy  : 15973 / 14681 / 16386 ms   (median 15973)
+               in-place: 4326 / 6751 / 5161 ms      (median 5161)
+               -68%, 108.1 µs/row
+
+Ranges do not overlap, unlike all three earlier attempts. A third run on a
+hotter machine gave -70%. Gate re-run green: 4174/0 with `server`, 1989/0
+`--no-default-features`, clippy 0, `probe_index_coherence` 0 divergences across
+all five engines, `probe_engines` 0, `probe_crash_points` 0 findings.
+
+### Head-to-head re-run after the fix, 2026-07-31
+
+Same command, same host, PostgreSQL 17.10, 100k rows, 200 iterations:
+
+| Workload | Nucleus | PostgreSQL | Ratio |
+|---|---:|---:|---:|
+| `GROUP BY` + `AVG` | 175 µs | 14,255 µs | **81× faster** |
+| `COUNT(*)` | 72 µs | 3,431 µs | **48× faster** |
+| Filter + `ORDER BY` + `LIMIT 20` | 201 µs | 6,651 µs | **33× faster** |
+| `SUM` aggregate | 191 µs | 6,136 µs | **32× faster** |
+| Point query (PK lookup) | 68 µs | 83 µs | 1.2× |
+| Range scan, 100 rows | 133 µs | 88 µs | 0.7× (PG faster) |
+| Single-row `INSERT` | 3,892 µs | 115 µs | 0.03× (fsync, see above) |
+| Bulk load 100k rows | 2,060 ms | 351 ms | 0.17× (PG 5.9× faster) |
+
+**Do not read this table against the 2026-07-30 one term by term.** It is a
+different measurement batch and PostgreSQL moved too (its `COUNT(*)` went
+19,005 → 3,431 µs without any change to PostgreSQL), which is the same
+cross-batch drift documented above. The size of the leaf-insert fix is the
+interleaved A/B (-59%/-68%/-70%), not the difference between these two tables.
+What this snapshot does establish is the shape after the fix: analytical reads
+win by 30-80×, point lookups are a wash, and writes still lose — now on fsync
+policy rather than on leaf rewriting.
+
+### Still open on this path
+
+- `delete_leaf_entry` has the identical decode-and-rewrite shape. It was
+  rewritten in place and then **reverted**, because it could not be shown to
+  matter: autocommit DELETEs are fsync-bound (~5.3 ms each, so the A/B was 2%
+  with overlapping ranges), and the transactional variant never finished — a
+  20k-row table with 2,000 `DELETE ... WHERE id = ?` inside one transaction ran
+  for 20 minutes. **That hang is the more interesting finding and is not yet
+  localised**; measure it before touching the leaf delete again.
+- The uniqueness probe's remaining 10.2 µs/row is almost entirely tree descent
+  (9.8), i.e. real B-tree work, not overhead.

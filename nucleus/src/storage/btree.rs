@@ -605,24 +605,90 @@ fn scan_leaf_for_key(pg: &PageBuf, key: &[u8]) -> Vec<RowId> {
     results
 }
 
+/// Insert one entry into a leaf, in place.
+///
+/// This is the hot path of every indexed INSERT, and it used to
+/// `collect_leaf_entries` first — one heap allocation per entry already on the
+/// page (~200 on a full 4 KiB leaf), then a full rewrite plus a zero-fill of
+/// the tail, to add a single entry. Attribution (`attr_pk_write`) put ~40 of
+/// the ~50 us/row that a PRIMARY KEY costs on the paged engine inside
+/// `index_insert`, and that allocation storm is what a sampling profile had
+/// been showing all along as `RawVec::finish_grow` / `reserve` / `grow_one`.
+///
+/// Entries are contiguous and variable-length, so a sorted insert is just a
+/// `copy_within` of the tail: one walk to find the byte offset, one memmove,
+/// one write. No allocation, and the untouched prefix and tail bytes are never
+/// rewritten.
 fn try_insert_leaf(pg: &mut PageBuf, key: &[u8], row_id: &RowId) -> bool {
+    // Benchmark attribution only — see `crate::bench_hooks`.
+    if crate::bench_hooks::legacy_leaf_ops() {
+        return try_insert_leaf_rewrite(pg, key, row_id);
+    }
+
+    let entry_size = 2 + key.len() + 6;
+    let count = page::read_u16(pg, IDX_ENTRY_COUNT) as usize;
+
+    // One walk does three jobs: locate the sorted insertion offset, find the
+    // end of the entries (= used space), and detect corruption.
+    let mut pos = IDX_HEADER_SIZE;
+    let mut insert_at: Option<usize> = None;
+    let mut intact = true;
+    for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            intact = false;
+            break;
+        }
+        let key_len = page::read_u16(pg, pos) as usize;
+        let entry_len = 2 + key_len + 6;
+        if pos + entry_len > PAGE_SIZE {
+            intact = false;
+            break;
+        }
+        if insert_at.is_none() && &pg[pos + 2..pos + 2 + key_len] >= key {
+            insert_at = Some(pos);
+        }
+        pos += entry_len;
+    }
+
+    // A corrupt key_len means the walk stopped early, so `pos` is not the real
+    // end of the entries. Fall back to the collect-and-rewrite path, which
+    // truncates the page at the corruption — same behaviour as before.
+    if !intact {
+        return try_insert_leaf_rewrite(pg, key, row_id);
+    }
+
+    let end = pos;
+    if PAGE_SIZE - end < entry_size {
+        return false;
+    }
+
+    let at = insert_at.unwrap_or(end);
+    if at < end {
+        pg.copy_within(at..end, at + entry_size);
+    }
+    page::write_u16(pg, at, key.len() as u16);
+    pg[at + 2..at + 2 + key.len()].copy_from_slice(key);
+    pg[at + 2 + key.len()..at + entry_size].copy_from_slice(&row_id.encode());
+    page::write_u16(pg, IDX_ENTRY_COUNT, (count + 1) as u16);
+    true
+}
+
+/// The original decode-everything-and-rewrite insert. Still used when a leaf
+/// page turns out to be corrupt (it truncates the page at the bad entry, which
+/// the in-place path cannot do), and as the `legacy` arm of `attr_pk_write`.
+fn try_insert_leaf_rewrite(pg: &mut PageBuf, key: &[u8], row_id: &RowId) -> bool {
     let entry_size = 2 + key.len() + 6;
     if index_free_space(pg) < entry_size {
         return false;
     }
 
-    // Collect entries, insert in sorted position
     let mut entries: Vec<Vec<u8>> = collect_leaf_entries(pg);
     let new_entry = encode_leaf_entry(key, row_id);
-
-    // Find insertion position
-    let pos = entries
+    let at = entries
         .iter()
         .position(|e| extract_key(e) >= key)
         .unwrap_or(entries.len());
-    entries.insert(pos, new_entry);
-
-    // Rewrite all entries
+    entries.insert(at, new_entry);
     write_leaf_entries(pg, &entries);
     true
 }
