@@ -31,6 +31,20 @@ export type { TransportConfig, MobileTransportConfig } from './transport.js';
 export { detectFeatures } from './features.js';
 export { requireNucleus, assertIdentifier } from './helpers.js';
 export { migrate, migrateDown, migrationStatus } from './migrate.js';
+// Serialization-failure retry. SERIALIZABLE is real on both Nucleus engines, so
+// a conflicting transaction now genuinely returns 40001 and must be re-run —
+// no PostgreSQL driver does that for you.
+export {
+  withRetry,
+  isSerializationFailure,
+  isLockNotAvailable,
+  sqlState,
+  RetryExhaustedError,
+  SERIALIZATION_FAILURE,
+  LOCK_NOT_AVAILABLE,
+  IN_FAILED_TRANSACTION,
+} from './retry.js';
+export type { RetryOptions } from './retry.js';
 export type { Migration, MigrationRecord } from './migrate.js';
 
 // ---------------------------------------------------------------------------
