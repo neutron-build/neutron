@@ -90,6 +90,17 @@ pub const NucleusClient = struct {
     pool: PgPool,
     /// Number of slots in the pool that hold live connections.
     active_pool_size: u16,
+    /// SQLSTATE of the last server error, captured before the connection goes
+    /// back to the pool.
+    ///
+    /// Without this the code was unreachable: `PgClient` records it, but the
+    /// pooled connection is released on the way out of every call, so by the
+    /// time a caller saw the Zig error the SQLSTATE was gone. That made 40001
+    /// indistinguishable from any other `ServerError` — a serialization
+    /// failure could not be told from a syntax error, so it could not be
+    /// retried. See `retry.zig`.
+    last_error_code: [8]u8,
+    last_error_code_len: usize,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) NucleusClient {
         return .{
@@ -99,6 +110,8 @@ pub const NucleusClient = struct {
             .connected = false,
             .pool = PgPool.init(),
             .active_pool_size = 0,
+            .last_error_code = undefined,
+            .last_error_code_len = 0,
         };
     }
 
@@ -220,7 +233,10 @@ pub const NucleusClient = struct {
         const conn = try self.acquireHealthy();
         defer self.pool.release(conn);
 
-        const result = try conn.query(sql_str);
+        const result = conn.query(sql_str) catch |err| {
+            self.captureErrorCode(conn);
+            return err;
+        };
         return result.scalar();
     }
 
@@ -230,7 +246,10 @@ pub const NucleusClient = struct {
         const conn = try self.acquireHealthy();
         defer self.pool.release(conn);
 
-        return try conn.query(sql_str);
+        return conn.query(sql_str) catch |err| {
+            self.captureErrorCode(conn);
+            return err;
+        };
     }
 
     /// Execute a statement (INSERT/UPDATE/DELETE) and return the command tag.
@@ -239,7 +258,25 @@ pub const NucleusClient = struct {
         const conn = try self.acquireHealthy();
         defer self.pool.release(conn);
 
-        return try conn.execute(sql_str);
+        return conn.execute(sql_str) catch |err| {
+            self.captureErrorCode(conn);
+            return err;
+        };
+    }
+
+    /// Copy the connection's SQLSTATE up to the client before the connection
+    /// is released back to the pool.
+    fn captureErrorCode(self: *NucleusClient, conn: *const PgClient) void {
+        const code = conn.lastErrorCode();
+        const n = @min(code.len, self.last_error_code.len);
+        @memcpy(self.last_error_code[0..n], code[0..n]);
+        self.last_error_code_len = n;
+    }
+
+    /// SQLSTATE of the last server error, or an empty slice if none. This is
+    /// the raw five-character code — classify on it, never on message text.
+    pub fn lastErrorCode(self: *const NucleusClient) []const u8 {
+        return self.last_error_code[0..self.last_error_code_len];
     }
 
     pub fn isNucleus(self: *const NucleusClient) bool {

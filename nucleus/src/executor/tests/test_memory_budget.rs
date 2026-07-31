@@ -157,3 +157,48 @@ async fn union_and_cross_join_run_under_generous_budget() {
         assert!(r.is_ok(), "expected success for `{sql}`, got {r:?}");
     }
 }
+
+// --- RSS watchdog write-reject valve --------------------------------------
+//
+// The watchdog measures process RSS, which is not the server's working set.
+// Rejecting every write when it trips blocked small INSERTs that the server
+// could serve, and — the case actually seen in production — blocked the
+// retention DELETEs that would have ENDED the pressure. These pin the fixed
+// behaviour: off unless asked for, and space-reclaiming statements always run.
+
+#[tokio::test]
+async fn memory_critical_does_not_reject_writes_by_default() {
+    let ex = test_executor();
+    seed(&ex, 5).await;
+    ex.memory_critical_flag()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let r = ex.execute("INSERT INTO big VALUES (9991, 1, 'x')").await;
+    assert!(
+        r.is_ok(),
+        "a small INSERT must not be refused just because RSS is high: {r:?}"
+    );
+}
+
+#[tokio::test]
+async fn memory_critical_never_rejects_space_reclaiming_statements() {
+    let ex = test_executor();
+    seed(&ex, 5).await;
+    // Even with the valve explicitly enabled.
+    ex.set_reject_writes_on_memory_critical(true);
+    ex.memory_critical_flag()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let deleted = ex.execute("DELETE FROM big WHERE id = 1").await;
+    assert!(
+        deleted.is_ok(),
+        "DELETE frees space; refusing it blocks the job that relieves the pressure: {deleted:?}"
+    );
+
+    // ...while an INSERT is refused, which is what the valve is for.
+    let inserted = ex.execute("INSERT INTO big VALUES (9992, 1, 'x')").await;
+    assert!(
+        is_mem_exceeded(&inserted),
+        "with the valve on, INSERT should be shed: {inserted:?}"
+    );
+}
