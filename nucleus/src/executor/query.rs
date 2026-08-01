@@ -4997,14 +4997,17 @@ impl Executor {
                         if Self::plan_reuse_is_literal_safe(&query, select)
                             && let Some(reused) = Self::try_reuse_plan(cached, select)
                         {
+                            crate::bench_hooks::record_plan(0);
                             Some(reused)
                         } else {
                             // Not literal-safe to transplant, or transplant failed —
                             // re-plan with the current (correctly-substituted) AST.
+                            crate::bench_hooks::record_plan(1);
                             self.plan_query(&query).await.ok()
                         }
                     } else {
                         // Cache miss — plan from scratch, check executability
+                        crate::bench_hooks::record_plan(2);
                         self.plan_query(&query)
                             .await
                             .ok()
@@ -5075,6 +5078,7 @@ impl Executor {
             }
 
             // --- AST-based execution fallback ---
+            crate::bench_hooks::record_plan(3);
             let mut order_by = query.order_by;
             let mut limit_clause = query.limit_clause;
 

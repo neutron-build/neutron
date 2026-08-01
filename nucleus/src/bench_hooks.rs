@@ -91,6 +91,40 @@ pub fn reset_overlay_counters() {
     OVERLAY_ROWS.store(0, Ordering::Relaxed);
 }
 
+/// Plan-cache outcome counters, for attributing per-call query cost.
+///
+/// A query that re-plans on every execution and one that reuses a cached plan
+/// look identical from the outside and differ by tens of microseconds. These
+/// say which is happening instead of leaving it to be inferred from a timing.
+/// Order: hit+reused, hit-but-replanned, miss (planned from scratch), and
+/// not-eligible-for-the-plan-path-at-all.
+pub const PLAN_SITES: [&str; 4] = ["reused", "hit_replanned", "miss_planned", "ineligible"];
+static PLAN_COUNTS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+#[inline]
+pub fn record_plan(site: usize) {
+    PLAN_COUNTS[site.min(3)].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn plan_counters() -> [u64; 4] {
+    let mut out = [0u64; 4];
+    for (i, c) in PLAN_COUNTS.iter().enumerate() {
+        out[i] = c.load(Ordering::Relaxed);
+    }
+    out
+}
+
+pub fn reset_plan_counters() {
+    for c in PLAN_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Opt-in event log for the SSI conflict graph.
 ///
 /// The serializability oracle is nondeterministic — the same binary on the same

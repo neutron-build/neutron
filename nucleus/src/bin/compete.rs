@@ -435,11 +435,25 @@ async fn bench_query_prepared(
         let _ = executor.execute_prepared(&handle, &[]).await;
     }
     // Timed iterations
+    nucleus::bench_hooks::reset_plan_counters();
     let mut stats = Stats::new();
     for _ in 0..n {
         let t = Instant::now();
         let _ = executor.execute_prepared(&handle, &[]).await;
         stats.record(t.elapsed());
+    }
+    // Which plan-cache outcome this workload actually took, per timed call. A
+    // query that re-plans every time and one that reuses a cached plan differ
+    // by tens of microseconds and are indistinguishable from the latency alone.
+    if std::env::var("NUCLEUS_PLAN_COUNTERS").is_ok() {
+        let c = nucleus::bench_hooks::plan_counters();
+        let parts: Vec<String> = nucleus::bench_hooks::PLAN_SITES
+            .iter()
+            .zip(c.iter())
+            .filter(|(_, v)| **v > 0)
+            .map(|(name, v)| format!("{name}={v}"))
+            .collect();
+        eprintln!("      plan[{}]: {}", n, parts.join(" "));
     }
     stats
 }
@@ -2558,6 +2572,20 @@ async fn bench_vs_sqlite(
         (
             "2-Table JOIN",
             "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100",
+        ),
+        // Same join, explicit `JOIN ... ON` instead of the comma form. The two
+        // are semantically identical; `query_eligible_for_plan` rejects any
+        // SELECT with `from.len() > 1`, so only this one reaches the plan path.
+        (
+            "2-Table JOIN (explicit ON)",
+            "SELECT u.name, o.amount FROM bench_orders o JOIN bench_users u ON u.id = o.user_id WHERE o.id < 100",
+        ),
+        // Same join again, with NO table aliases. `query_eligible_for_plan`
+        // rejects any join whose tables are aliased, so this is the only one of
+        // the three that the plan path will accept.
+        (
+            "2-Table JOIN (no alias)",
+            "SELECT bench_users.name, bench_orders.amount FROM bench_orders JOIN bench_users ON bench_users.id = bench_orders.user_id WHERE bench_orders.id < 100",
         ),
     ];
 
