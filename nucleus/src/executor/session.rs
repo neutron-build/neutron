@@ -263,6 +263,20 @@ pub struct Session {
     /// executor's long loops check it cooperatively and abort with SQLSTATE
     /// 57014. Cleared at each statement start.
     pub(super) cancel_requested: AtomicBool,
+    /// Normalized SQL key computed by `parse_with_ast_cache` for THIS session's
+    /// current top-level statement, consumed by `execute_query_planned`.
+    ///
+    /// Per-session, and it must stay that way. This used to be one slot on the
+    /// `Executor`, shared by every connection: session A stored the key for
+    /// `SELECT ... FROM acct1`, session B overwrote it with the key for
+    /// `acct2`, and whichever took it first looked its plan up under the other
+    /// statement's key — executing the wrong table's plan with this
+    /// statement's literals re-bound, so the row id was right and the TABLE was
+    /// wrong. A silent cross-table wrong answer on a plain concurrent SELECT.
+    /// The old comment called the slot "race-safe: a `None` just means we fall
+    /// back"; `None` was indeed safe, a stale `Some` from another session was
+    /// not.
+    pub(super) plan_cache_key_hint: parking_lot::Mutex<Option<String>>,
 }
 
 impl Default for Session {
@@ -305,6 +319,7 @@ impl Session {
             executing: AtomicBool::new(false),
             stream_capable_consumer: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
+            plan_cache_key_hint: parking_lot::Mutex::new(None),
         }
     }
 

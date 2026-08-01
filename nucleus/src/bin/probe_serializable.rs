@@ -51,7 +51,17 @@ const ACCOUNTS: i64 = 4;
 /// actually needs checking — partial overlap, where some transactions commit
 /// concurrently and the serial order is not forced.
 const TABLES: usize = 4;
+/// Per-table starting balance, deliberately DISTINCT per table.
+///
+/// With every table seeded to the same value, a read served from the wrong
+/// table returns a right-looking number and the oracle cannot tell a
+/// misattributed SIREAD (an SSI bug) from a misrouted scan (a wrong-answer
+/// bug). Spacing the tables 1000 apart makes the two diagnosable: a read that
+/// crosses tables now shows up in the final state.
 const INITIAL: i64 = 100;
+fn initial_of(tbl: usize) -> i64 {
+    INITIAL + (tbl as i64) * 1000
+}
 
 /// Deterministic xorshift — `rand` is not a dependency of this crate's probes
 /// and a seeded generator is what makes a failure reproducible.
@@ -198,6 +208,13 @@ async fn main() {
         "checking the DEFINITION (result == some serial order), not a list of named anomalies\n"
     );
 
+    // `--trace` records every SSI edge, dooming decision and sweep, and prints
+    // the log for any round that fails. The oracle is nondeterministic — the
+    // same seed gives a violation in one batch and not the next — so a failing
+    // round cannot be re-run and inspected. It has to be recorded live.
+    let trace = args.iter().any(|a| a == "--trace");
+    nucleus::bench_hooks::set_ssi_trace(trace);
+
     let mut rng = Rng(seed);
     let orders = permutations(per_round.min(6));
     let mut violations: Vec<String> = Vec::new();
@@ -218,7 +235,7 @@ async fn main() {
                 .await
                 .unwrap();
             for i in 1..=ACCOUNTS {
-                ex.execute(&format!("INSERT INTO acct{t} VALUES ({i}, {INITIAL})"))
+                ex.execute(&format!("INSERT INTO acct{t} VALUES ({i}, {})", initial_of(t)))
                     .await
                     .unwrap();
             }
@@ -226,6 +243,9 @@ async fn main() {
 
         let scripts: Vec<Script> = (0..per_round).map(|_| Script::random(&mut rng)).collect();
         let gate = Arc::new(tokio::sync::Barrier::new(per_round));
+        // Drop the setup's events (CREATE TABLE + seed INSERTs) so the log holds
+        // only this round's concurrent phase.
+        let _ = nucleus::bench_hooks::take_ssi_log();
 
         let mut handles = Vec::new();
         for (i, script) in scripts.iter().copied().enumerate() {
@@ -277,8 +297,10 @@ async fn main() {
         }
 
         let mut committed: Vec<usize> = Vec::new();
+        let mut txn_ids: Vec<(usize, bool)> = Vec::new();
         for h in handles {
             let (i, ok) = h.await.unwrap();
+            txn_ids.push((i, ok));
             if ok {
                 committed.push(i);
                 committed_total += 1;
@@ -291,6 +313,10 @@ async fn main() {
             all_committed_rounds += 1;
         }
 
+        // Take the log BEFORE the read-back, or the oracle's own SELECTs append
+        // to it.
+        let round_log = nucleus::bench_hooks::take_ssi_log();
+
         let actual = read_all(&ex).await;
 
         // Replay every serial order of the COMMITTED transactions. An aborted
@@ -302,7 +328,9 @@ async fn main() {
             if seq.len() != committed.len() {
                 continue;
             }
-            let mut state = vec![vec![INITIAL; ACCOUNTS as usize]; TABLES];
+            let mut state: Vec<Vec<i64>> = (0..TABLES)
+                .map(|t| vec![initial_of(t); ACCOUNTS as usize])
+                .collect();
             for &i in &seq {
                 scripts[i].apply(&mut state);
             }
@@ -315,10 +343,20 @@ async fn main() {
         let _ = std::fs::remove_dir_all(&dir);
 
         if !matched {
-            violations.push(format!(
+            let mut detail = format!(
                 "round {round}: final state {actual:?} matches no serial order of the \
-                 committed transactions {committed:?}\n         scripts: {scripts:?}"
-            ));
+                 committed transactions {committed:?}\n         scripts: {scripts:?}\
+                 \n         outcome: {txn_ids:?}"
+            );
+            if trace {
+                detail.push_str("\n         --- SSI trace ---\n");
+                for line in round_log.iter().filter(|l| !l.is_empty()) {
+                    detail.push_str("         ");
+                    detail.push_str(line);
+                    detail.push('\n');
+                }
+            }
+            violations.push(detail);
             if violations.len() >= 5 {
                 break;
             }

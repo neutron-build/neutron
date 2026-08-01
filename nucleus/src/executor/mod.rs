@@ -493,11 +493,9 @@ pub struct Executor {
     /// cached AST and substitutes literal values via DFS walk (~5-10x faster
     /// than re-parsing). Bounded to 4096 entries. Invalidated on DDL.
     ast_cache: parking_lot::RwLock<AstCache>,
-    /// Hint for plan cache key: stores the normalized SQL key from
-    /// `parse_with_ast_cache()` for single-statement SQL, so `execute_query()`
-    /// can skip the expensive `query.to_string()` + `normalize_sql_for_cache()`.
-    /// Race-safe: a `None` just means we fall back to `to_string()`.
-    plan_cache_key_hint: parking_lot::Mutex<Option<String>>,
+    // The plan-cache key hint lives on `Session`, NOT here. It was an
+    // Executor-wide slot, which let one connection consume the key another
+    // connection had just stored — see `Session::plan_cache_key_hint`.
     /// Zone map index for granule-level pruning (Phase 2A).
     /// Tracks min/max per column per 8K-row granule. Expected speedup: 5-10x on selective queries.
     #[allow(dead_code)]
@@ -680,7 +678,6 @@ impl Executor {
             uncorrelated_subquery_cache: parking_lot::RwLock::new(HashMap::new()),
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
             ast_cache: parking_lot::RwLock::new(AstCache::new(4096)),
-            plan_cache_key_hint: parking_lot::Mutex::new(None),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
             memory_critical: Arc::new(AtomicBool::new(false)),
             reject_writes_on_memory_critical: Arc::new(AtomicBool::new(false)),
@@ -3145,23 +3142,38 @@ impl Executor {
         self.ast_cache.write().clear();
         self.global_prepared_cache.write().clear();
         self.uncorrelated_subquery_cache.write().clear();
-        *self.plan_cache_key_hint.lock() = None;
+        *self.current_session().plan_cache_key_hint.lock() = None;
     }
 
     /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.
     /// Returns `Some(key)` if a hint was stored, `None` otherwise.
     /// Used by the wire protocol handler to carry the normalized SQL key
     /// from the Parse phase to the Execute phase for plan cache lookups.
+    ///
+    /// Reads THIS session's slot. Sharing one slot across sessions let a
+    /// concurrent connection's key be consumed here, and the plan it names
+    /// scans a different table.
     pub fn take_plan_cache_key_hint(&self) -> Option<String> {
-        self.plan_cache_key_hint.lock().take()
+        self.current_session().plan_cache_key_hint.lock().take()
     }
 
-    /// Set the plan cache key hint for the next `execute_query` call.
-    /// Used by the wire protocol handler to pre-populate the hint before
-    /// executing pre-parsed statements, enabling plan cache reuse without
-    /// the expensive `query.to_string()` + `normalize_sql_for_cache()`.
+    /// Set the plan cache key hint for the next `execute_query` call on this
+    /// session. Used by the wire protocol handler to pre-populate the hint
+    /// before executing pre-parsed statements, enabling plan cache reuse
+    /// without the expensive `query.to_string()` + `normalize_sql_for_cache()`.
     pub fn set_plan_cache_key_hint(&self, key: String) {
-        *self.plan_cache_key_hint.lock() = Some(key);
+        *self.current_session().plan_cache_key_hint.lock() = Some(key);
+    }
+
+    /// Set the hint on a NAMED session rather than the ambient one.
+    ///
+    /// The wire protocol's Execute handler runs before it enters the session
+    /// scope, so `current_session()` there is the shared default — which is
+    /// how one connection's key reached another's statement. It knows the
+    /// session id, so it says which session it means.
+    #[cfg(feature = "server")]
+    pub fn set_plan_cache_key_hint_for(&self, session_id: u64, key: String) {
+        *self.get_session(session_id).plan_cache_key_hint.lock() = Some(key);
     }
 
     /// Execute SQL within a specific session's scope. This is the primary
@@ -3965,7 +3977,7 @@ impl Executor {
         }
         // Seed the plan cache key hint so execute_query() can skip
         // query.to_string() + normalize_sql_for_cache().
-        *self.plan_cache_key_hint.lock() = Some(handle.plan_cache_key.clone());
+        *self.current_session().plan_cache_key_hint.lock() = Some(handle.plan_cache_key.clone());
         self.uncorrelated_subquery_cache.write().clear();
         self.execute_statement(ast).await
     }

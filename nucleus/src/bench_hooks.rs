@@ -91,6 +91,43 @@ pub fn reset_overlay_counters() {
     OVERLAY_ROWS.store(0, Ordering::Relaxed);
 }
 
+/// Opt-in event log for the SSI conflict graph.
+///
+/// The serializability oracle is nondeterministic — the same binary on the same
+/// seed gives 4 violations in one batch and 1 in the next — so a violation
+/// cannot be re-run and inspected. The only way to see the structure that
+/// escaped is to have recorded it while it happened. This log is written by
+/// every SSI edge-creation and dooming site; the probe resets it per round and
+/// dumps it when a round fails to match any serial order.
+///
+/// Off by default and behind one `Relaxed` load, like the switches above.
+/// The mutex is a LEAF lock: never take another lock while holding it, or it
+/// inverts against the canonical SSI lock order.
+static SSI_TRACE: AtomicBool = AtomicBool::new(false);
+static SSI_LOG: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+pub fn set_ssi_trace(on: bool) {
+    SSI_TRACE.store(on, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn ssi_trace_on() -> bool {
+    SSI_TRACE.load(Ordering::Relaxed)
+}
+
+/// Record one SSI event. The closure is only called when tracing is on, so a
+/// traced call site costs a load and nothing else in a normal run.
+#[inline]
+pub fn ssi_event(f: impl FnOnce() -> String) {
+    if SSI_TRACE.load(Ordering::Relaxed) {
+        SSI_LOG.lock().push(f());
+    }
+}
+
+pub fn take_ssi_log() -> Vec<String> {
+    std::mem::take(&mut *SSI_LOG.lock())
+}
+
 #[inline]
 pub fn skip_unique_probe() -> bool {
     SKIP_UNIQUE_PROBE.load(Ordering::Relaxed)
