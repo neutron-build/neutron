@@ -10204,6 +10204,26 @@ impl Executor {
         &self,
         sql: &str,
     ) -> Result<Vec<sqlparser::ast::Statement>, crate::sql::ParseError> {
+        let (stmts, key) = self.parse_with_ast_cache_keyed(sql)?;
+        // In-executor callers reach `execute_query_planned` on this same task,
+        // so the session slot carries the key the short distance to it.
+        if let Some(k) = key {
+            *self.current_session().plan_cache_key_hint.lock() = Some(k);
+        }
+        Ok(stmts)
+    }
+
+    /// Same, but RETURNS the plan-cache key instead of stashing it.
+    ///
+    /// The wire protocol parses in one phase and executes in another, and its
+    /// Parse handler does not run inside a session scope — so a stashed key
+    /// would land in the shared default session and be readable by any other
+    /// connection. Returning it removes the shared state from that path
+    /// entirely; the key travels in the `ParsedStatement` instead.
+    pub(crate) fn parse_with_ast_cache_keyed(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<sqlparser::ast::Statement>, Option<String>), crate::sql::ParseError> {
         let (norm_key, literals) = Self::normalize_sql_with_literals(sql);
 
         // Try cache lookup
@@ -10214,20 +10234,14 @@ impl Executor {
             if literals.is_empty() {
                 // No literals to substitute — return deep clone directly
                 let stmts = (*cached_arc).clone();
-                // Store hint for plan cache key (avoids query.to_string() + re-normalize)
-                if stmts.len() == 1 {
-                    *self.plan_cache_key_hint.lock() = Some(norm_key);
-                }
-                return Ok(stmts);
+                let key = (stmts.len() == 1).then(|| norm_key.clone());
+                return Ok((stmts, key));
             }
             let mut cloned = (*cached_arc).clone();
             let subs = Self::substitute_ast_literals(&mut cloned, &literals);
             if subs == expected_count {
-                // Store hint for plan cache key
-                if cloned.len() == 1 {
-                    *self.plan_cache_key_hint.lock() = Some(norm_key);
-                }
-                return Ok(cloned);
+                let key = (cloned.len() == 1).then(|| norm_key.clone());
+                return Ok((cloned, key));
             }
             // Substitution count mismatch — fall through to re-parse
         }
@@ -10235,14 +10249,11 @@ impl Executor {
 
         // Cache miss or mismatch — parse and cache
         let ast = crate::sql::parse(sql)?;
-        // Store hint for plan cache key
-        if ast.len() == 1 {
-            *self.plan_cache_key_hint.lock() = Some(norm_key.clone());
-        }
+        let key = (ast.len() == 1).then(|| norm_key.clone());
         self.ast_cache
             .write()
             .insert(norm_key, ast.clone(), literals.len());
-        Ok(ast)
+        Ok((ast, key))
     }
 
     // ========================================================================

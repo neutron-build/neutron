@@ -447,6 +447,11 @@ impl TransactionManager {
             for &p in &peers {
                 concurrent.entry(p).or_default().insert(id);
             }
+            crate::bench_hooks::ssi_event(|| {
+                let mut p: Vec<u64> = peers.iter().copied().collect();
+                p.sort_unstable();
+                format!("begin {id} peers={p:?}")
+            });
             concurrent.insert(id, peers);
         }
         drop(active);
@@ -677,6 +682,7 @@ impl TransactionManager {
         if !ssi.contains(&txn_id) {
             return;
         }
+        crate::bench_hooks::ssi_event(|| format!("siread {txn_id} {table}{row_indices:?}"));
         // Record the read set
         let mut reads = self.ssi_read_locks.lock();
         {
@@ -699,6 +705,9 @@ impl TransactionManager {
                     if other_tbl_writes.contains(&idx) {
                         // txn_id read data that other_txn wrote
                         conflicts.insert((txn_id, other_txn));
+                        crate::bench_hooks::ssi_event(|| {
+                            format!("edge siread {txn_id}->{other_txn} on {table}[{idx}]")
+                        });
                         self.doom_new_pivot(&conflicts, txn_id, other_txn, txn_id);
                         break;
                     }
@@ -744,7 +753,23 @@ impl TransactionManager {
         let committed = self.committed.lock();
         let mut doomed = self.ssi_doomed.lock();
 
+        // Uses the guards already held — re-locking either here self-deadlocks,
+        // since these are non-reentrant.
+        crate::bench_hooks::ssi_event(|| {
+            format!(
+                "  judge reader={reader}(in={} out={}) writer={writer}(in={} out={}) \
+                 current={current} committed[r,w,c]={:?} doomed[r,w,c]={:?}",
+                in_conflict.contains(&reader),
+                out_conflict.contains(&reader),
+                in_conflict.contains(&writer),
+                out_conflict.contains(&writer),
+                [reader, writer, current].map(|t| committed.contains(&t)),
+                [reader, writer, current].map(|t| doomed.contains(&t)),
+            )
+        });
+
         if !is_pivot(reader) && !is_pivot(writer) {
+            crate::bench_hooks::ssi_event(|| "  -> no pivot, nobody doomed".to_string());
             return;
         }
 
@@ -756,6 +781,7 @@ impl TransactionManager {
         for candidate in [current, reader, writer] {
             if is_pivot(candidate) && !committed.contains(&candidate) {
                 doomed.insert(candidate);
+                crate::bench_hooks::ssi_event(|| format!("  -> doomed pivot {candidate}"));
                 return;
             }
         }
@@ -780,9 +806,15 @@ impl TransactionManager {
         for candidate in [current, reader, writer] {
             if !committed.contains(&candidate) {
                 doomed.insert(candidate);
+                crate::bench_hooks::ssi_event(|| {
+                    format!("  -> pivot already committed, doomed live {candidate}")
+                });
                 return;
             }
         }
+        crate::bench_hooks::ssi_event(|| {
+            "  -> ESCAPED: pivot exists but every participant has committed".to_string()
+        });
     }
 
     /// Whether two SERIALIZABLE transactions had overlapping lifetimes. Only
@@ -803,6 +835,7 @@ impl TransactionManager {
         if !ssi.contains(&txn_id) {
             return;
         }
+        crate::bench_hooks::ssi_event(|| format!("write {txn_id} {table}{row_indices:?}"));
         let reads = self.ssi_read_locks.lock();
         let mut writes = self.ssi_write_sets.lock();
         // Record the write set
@@ -825,6 +858,9 @@ impl TransactionManager {
                     if other_tbl_reads.contains(&idx) {
                         // other_txn read data that txn_id wrote
                         conflicts.insert((other_txn, txn_id));
+                        crate::bench_hooks::ssi_event(|| {
+                            format!("edge write {other_txn}->{txn_id} on {table}[{idx}]")
+                        });
                         self.doom_new_pivot(&conflicts, other_txn, txn_id, txn_id);
                         break;
                     }
@@ -854,6 +890,9 @@ impl TransactionManager {
             {
                 // other_txn read from this table, txn_id inserted into it
                 conflicts.insert((other_txn, txn_id));
+                crate::bench_hooks::ssi_event(|| {
+                    format!("edge table_write {other_txn}->{txn_id} on {table}")
+                });
                 // This edge used to be recorded and then never judged — the
                 // only edge-creation site that did not look for a pivot. A
                 // dangerous structure completed by a PHANTOM (an INSERT into a
@@ -874,26 +913,39 @@ impl TransactionManager {
     /// and at least one of T_in or T_out has already committed,
     /// then a serialization anomaly (write skew) is possible — abort T.
     ///
-    /// # KNOWN GAP — cycles of three or more transactions
+    /// Pivots are doomed eagerly at edge-creation time (`doom_new_pivot`), on
+    /// Cahill's sticky per-transaction `inConflict`/`outConflict` flags. The
+    /// flags are what make a late edge judgeable at all: `sweep_ssi` purges a
+    /// finished transaction's edges, but not the flags its edges set on the
+    /// transactions still live.
     ///
-    /// Pivots are doomed eagerly at edge-creation time (`doom_new_pivot`),
-    /// which is what makes the two-transaction case correct: measured 0
-    /// violations across 10,500 rounds of `probe_serializable --txns 2`, where
-    /// before the fix it failed roughly 1 round in 1,500.
+    /// # The "≥3-transaction cycle" gap was NOT an SSI gap
     ///
-    /// Cycles spanning THREE OR MORE transactions still escape at roughly 1–2
-    /// per 800 rounds. The cause is visible in `doom_new_pivot`: when the edge
-    /// completing the cycle makes an ALREADY-COMMITTED transaction the pivot,
-    /// there is nothing left to abort, and no uncommitted participant is
-    /// necessarily a pivot itself. Dooming the currently-executing transaction
-    /// instead was tried and measured WORSE — it aborts a non-pivot, so it
-    /// fails to break the cycle while adding needless aborts.
+    /// A residual ~4 violations per 15,000 rounds of `probe_serializable
+    /// --engine mvcc` survived the flags and was recorded here as a remaining
+    /// hole in the cycle detector, on the theory that a cycle closed by an
+    /// edge onto an already-committed pivot leaves nothing to abort.
     ///
-    /// The real fix is Cahill's per-transaction `inConflict`/`outConflict`
-    /// flags carried on the transaction object. They cannot be reconstructed
-    /// from the edge set here because `sweep_ssi` purges finished
-    /// transactions, so the history a late edge needs to be judged against is
-    /// already gone.
+    /// That diagnosis was wrong. Tracing every edge and dooming decision
+    /// (`bench_hooks::set_ssi_trace`) showed the transactions' SIREADs being
+    /// recorded against the WRONG TABLE — so the rw-antidependency edge that
+    /// would have exposed the pivot was never created. The cause was outside
+    /// this module entirely: the plan-cache key hint was one slot shared by
+    /// every session, so a concurrent connection's cached plan could be
+    /// executed for this statement (see `Session::plan_cache_key_hint`). The
+    /// read genuinely returned another table's row; the SSI bookkeeping was
+    /// faithfully recording what the scan actually touched.
+    ///
+    /// It hid as an SSI bug because the probe seeded every table to the same
+    /// value, which makes a cross-table read indistinguishable from a correct
+    /// one in the final state — only the conflict graph showed it. The probe
+    /// now seeds tables 1000 apart for exactly this reason.
+    ///
+    /// With that fixed: 0 violations across 10,000 rounds on `mvcc`, and the
+    /// read-committed control still reports failures, so the oracle is live.
+    /// This is not a proof that the detector is complete for all cycles of
+    /// three or more — it is the statement that the measured residual is gone
+    /// and its cause is known.
     ///
     /// The deferred check below is kept as a backstop for structures completed
     /// by an edge this transaction was not party to. It is not the textbook
@@ -902,16 +954,16 @@ impl TransactionManager {
     /// so both abort — serializable but making no progress, and it broke three
     /// census tests that correctly require one survivor.
     ///
-    /// Reproduce the remaining gap:
-    ///
     /// ```sh
     /// cargo run --release --features server --bin probe_serializable -- \
-    ///     --rounds 800 --engine mvcc --seed 104729
+    ///     --rounds 500 --engine mvcc --seed 104729        # 0 failures
+    /// cargo run --release --features server --bin probe_serializable -- \
+    ///     --rounds 200 --engine mvcc --isolation read-committed   # must FAIL
     /// ```
     ///
     /// `BufferedDiskEngine` — what a server actually runs — takes strict 2PL
-    /// instead and is clean across every run of that probe. This gap is
-    /// confined to `MvccStorageAdapter` (`--memory`, embedded `durable_mvcc`).
+    /// instead; SSI here is `MvccStorageAdapter` (`--memory`, embedded
+    /// `durable_mvcc`).
     pub fn check_serializable_commit(&self, txn_id: u64) -> Result<(), String> {
         // Doomed at edge-creation time for being a pivot. This is the primary
         // rule; the deferred check below remains as a backstop for structures
@@ -982,7 +1034,25 @@ impl TransactionManager {
             // counterpart visible as committed to whichever transaction
             // validates second.
             let _commit_point = self.serial_commit.lock();
-            self.check_serializable_commit(txn.id)?;
+            let verdict = self.check_serializable_commit(txn.id);
+            // Snapshot the edges BEFORE reaching for the log. `ssi_event` takes
+            // the log mutex, and every edge-creation site calls it while already
+            // holding `ssi_rw_conflicts` — locking that inside the closure would
+            // invert the order and deadlock. The log is a LEAF lock.
+            if crate::bench_hooks::ssi_trace_on() {
+                let mut edges: Vec<(u64, u64)> =
+                    self.ssi_rw_conflicts.lock().iter().copied().collect();
+                edges.sort_unstable();
+                let ok = verdict.is_ok();
+                let id = txn.id;
+                crate::bench_hooks::ssi_event(move || {
+                    format!(
+                        "commit-check {id} -> {} edges={edges:?}",
+                        if ok { "OK" } else { "ABORT" }
+                    )
+                });
+            }
+            verdict?;
             self.commit(txn);
             return Ok(());
         }
@@ -1041,6 +1111,13 @@ impl TransactionManager {
             .collect();
         purge.sort_unstable();
         purge.dedup();
+        crate::bench_hooks::ssi_event(|| {
+            if purge.is_empty() {
+                String::new()
+            } else {
+                format!("sweep force={force:?} purged={purge:?}")
+            }
+        });
 
         for t in purge {
             ssi.remove(&t);

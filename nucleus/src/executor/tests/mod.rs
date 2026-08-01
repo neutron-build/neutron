@@ -46,6 +46,7 @@ mod test_fts_index; // Table-attached FTS: USING FTS, @@, BM25, hybrid RRF
 mod test_index;
 mod test_index_path_coverage; // which WHERE forms actually reach an index
 mod test_masking; // column masking is enforced, not merely declared
+mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross sessions
 mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_integration;

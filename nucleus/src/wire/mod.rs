@@ -479,11 +479,15 @@ impl QueryParser for NucleusQueryParser {
         // On cache hit, clones the cached AST and substitutes literals via
         // DFS walk instead of re-parsing the SQL string.
         let plan_cache_key;
-        let ast = match self.executor.parse_with_ast_cache(sql) {
-            Ok(stmts) => {
-                // Retrieve the plan cache key hint that parse_with_ast_cache
-                // stored, so we can carry it through to the Execute phase.
-                plan_cache_key = self.executor.take_plan_cache_key_hint();
+        // Keyed variant: the key comes back as a value and rides in the
+        // `ParsedStatement` to the Execute phase. It must NOT be routed through
+        // a slot on the executor — Parse runs outside any session scope, so a
+        // stashed key lands in the shared default session where a concurrently
+        // parsing connection can consume it and execute the wrong statement's
+        // plan.
+        let ast = match self.executor.parse_with_ast_cache_keyed(sql) {
+            Ok((stmts, key)) => {
+                plan_cache_key = key;
                 Some(stmts)
             }
             Err(_) => {
@@ -1995,7 +1999,10 @@ impl ExtendedQueryHandler for NucleusHandler {
             // execute_query() can look up cached plans without the expensive
             // query.to_string() + normalize_sql_for_cache() round-trip.
             if let Some(ref key) = parsed_stmt.plan_cache_key {
-                self.executor.set_plan_cache_key_hint(key.clone());
+                // Named session, not the ambient one: this runs before the
+                // session scope is entered.
+                self.executor
+                    .set_plan_cache_key_hint_for(session_id, key.clone());
             }
             match Self::try_ast_execute(&self.executor, session_id, cached_ast, portal) {
                 Ok(fut) => fut.await.map_err(exec_error_to_pgwire),
