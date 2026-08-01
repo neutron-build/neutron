@@ -753,16 +753,18 @@ pub fn extract_column_name(expr: &sqlparser::ast::Expr) -> Option<String> {
 
 /// Describes one side of a range bound extracted from a predicate.
 #[derive(Debug)]
-struct RangeBound {
+pub(crate) struct RangeBound {
     /// Serialized value string (the literal side of the comparison).
-    val: String,
+    pub(crate) val: String,
     /// Whether this bound is a lower bound (true) or upper bound (false).
-    is_lo: bool,
+    pub(crate) is_lo: bool,
 }
 
 /// If `expr` is a range comparison (`<`, `<=`, `>`, `>=`) on a column against a literal,
 /// return `(col_name, RangeBound)`.  Returns None for equality, LIKE, or other forms.
-fn extract_range_bound(expr: &sqlparser::ast::Expr) -> Option<(String, RangeBound)> {
+pub(crate) fn extract_range_bound(
+    expr: &sqlparser::ast::Expr,
+) -> Option<(String, RangeBound)> {
     use sqlparser::ast::BinaryOperator;
     if let sqlparser::ast::Expr::BinaryOp { left, op, right } = expr {
         // col op literal
@@ -789,16 +791,23 @@ fn extract_range_bound(expr: &sqlparser::ast::Expr) -> Option<(String, RangeBoun
     None
 }
 
-/// Scan `predicates` looking for range comparisons that bracket the same column.
+/// Scan `predicates` looking for range comparisons on an indexed column.
 ///
 /// Returns `(col, lo_val, hi_val, combined_predicate_str)` for the first column
-/// that has both a lower AND an upper bound, or `None` if no such pair exists.
+/// carrying AT LEAST ONE bound; each bound is `None` when that side is open.
+///
+/// One-sided ranges are included deliberately. Requiring both sides meant
+/// `id < 100` produced no range plan, and the per-predicate loop below then
+/// emitted an IndexScan carrying the whole `<` predicate as a `lookup_key` —
+/// which the executor can only read as an equality. It declined, and the query
+/// silently lost its index and re-ran on the AST path. A half-open scan is a
+/// normal B-tree operation; there was never a reason to require two bounds.
 ///
 /// Only columns listed in `indexed_cols` (BTree index column names) are considered.
 pub fn find_range_scan_opportunity(
     predicates: &[&sqlparser::ast::Expr],
     indexed_cols: &[String],
-) -> Option<(String, String, String, String)> {
+) -> Option<(String, Option<String>, Option<String>, String)> {
     use std::collections::HashMap;
 
     // Fast path: handle BETWEEN expressions directly (single AST node with both bounds).
@@ -816,7 +825,7 @@ pub fn find_range_scan_opportunity(
             let lo_val = low.to_string();
             let hi_val = high.to_string();
             let pred_str = pred.to_string();
-            return Some((col.to_lowercase(), lo_val, hi_val, pred_str));
+            return Some((col.to_lowercase(), Some(lo_val), Some(hi_val), pred_str));
         }
     }
 
@@ -844,16 +853,29 @@ pub fn find_range_scan_opportunity(
         }
     }
 
-    // Return the first column that has both bounds.
-    for (key, lo_val) in &lo_map {
-        if let Some(hi_val) = hi_map.get(key) {
-            let preds = pred_map.get(key).cloned().unwrap_or_default();
-            let pred_str = preds.join(" AND ");
-            // Return original-case column name (from the predicate).
-            return Some((key.clone(), lo_val.clone(), hi_val.clone(), pred_str));
-        }
-    }
-    None
+    // Prefer a column with both bounds — a bracketed range reads fewer index
+    // entries than a half-open one, so it is the better plan when both exist.
+    // `pred_map` holds every column carrying at least one bound, so a
+    // single-bound column is only chosen when no bracketed one is available.
+    //
+    // HashMap iteration order is unspecified, and the chosen column decides the
+    // plan, so both picks take the minimum key: the same query must not
+    // alternate between indexes across runs.
+    let bracketed = lo_map
+        .keys()
+        .filter(|k| hi_map.contains_key(*k))
+        .min()
+        .cloned();
+    let key = bracketed.or_else(|| pred_map.keys().min().cloned())?;
+    let preds = pred_map.get(&key).cloned().unwrap_or_default();
+    let pred_str = preds.join(" AND ");
+    // Return original-case column name (from the predicate).
+    Some((
+        key.clone(),
+        lo_map.get(&key).cloned(),
+        hi_map.get(&key).cloned(),
+        pred_str,
+    ))
 }
 
 /// Check if an expression is a simple equality predicate (col = literal).
@@ -1115,8 +1137,8 @@ impl QueryPlanner {
                     let seq_cost = estimate_seq_scan_cost(stats.page_count, stats.row_count);
 
                     if idx_cost.0 < seq_cost.0 {
-                        let lo_expr = parse_expr_safe(&lo_val);
-                        let hi_expr = parse_expr_safe(&hi_val);
+                        let lo_expr = lo_val.as_deref().and_then(parse_expr_safe);
+                        let hi_expr = hi_val.as_deref().and_then(parse_expr_safe);
                         let (rp_str, rp_expr) = if range_pred_str.is_empty() {
                             (None, None)
                         } else {
@@ -1130,9 +1152,9 @@ impl QueryPlanner {
                             estimated_cost: idx_cost,
                             lookup_key: None,
                             lookup_key_expr: None,
-                            range_lo: Some(lo_val),
+                            range_lo: lo_val,
                             range_lo_expr: lo_expr,
-                            range_hi: Some(hi_val),
+                            range_hi: hi_val,
                             range_hi_expr: hi_expr,
                             range_predicate: rp_str,
                             range_predicate_expr: rp_expr,
@@ -1328,8 +1350,8 @@ impl QueryPlanner {
                     // and idempotent; dropping a predicate is a correctness bug.
                     best_covered = Vec::new();
 
-                    let lo_expr = parse_expr_safe(&lo_val);
-                    let hi_expr = parse_expr_safe(&hi_val);
+                    let lo_expr = lo_val.as_deref().and_then(parse_expr_safe);
+                    let hi_expr = hi_val.as_deref().and_then(parse_expr_safe);
                     let (rp_str, rp_expr) = if range_pred_str.is_empty() {
                         (None, None)
                     } else {
@@ -1343,9 +1365,9 @@ impl QueryPlanner {
                         estimated_cost: Cost(idx_cost.total()),
                         lookup_key: None,
                         lookup_key_expr: None,
-                        range_lo: Some(lo_val),
+                        range_lo: lo_val,
                         range_lo_expr: lo_expr,
-                        range_hi: Some(hi_val),
+                        range_hi: hi_val,
                         range_hi_expr: hi_expr,
                         range_predicate: rp_str,
                         range_predicate_expr: rp_expr,

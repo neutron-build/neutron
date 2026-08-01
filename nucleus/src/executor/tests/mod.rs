@@ -50,6 +50,7 @@ mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross
 mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_integration;
+mod test_join_plan_path; // which JOIN spellings actually reach the plan executor
 mod test_jsonb;
 mod test_logical_dump; // T2.1: logical (SQL-text) backup round-trip
 mod test_memory_budget; // T1.2: query memory-budget enforcement (gating)

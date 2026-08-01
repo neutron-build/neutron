@@ -2760,8 +2760,8 @@ impl StorageEngine for MvccStorageAdapter {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         // See `serializable_txn_active`: a serializable read must be visible to
         // the conflict graph, and this path records no SIREAD.
@@ -2809,8 +2809,8 @@ impl StorageEngine for MvccStorageAdapter {
         &self,
         _table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         // See `serializable_txn_active`: a serializable read must be visible to
         // the conflict graph, and this path records no SIREAD.
@@ -2838,7 +2838,7 @@ impl StorageEngine for MvccStorageAdapter {
                 // BTreeMap iterates in key order, so no sort needed.
                 let rows: Vec<Row> = idx
                     .map
-                    .range(low..=high)
+                    .range((low, high))
                     .flat_map(|(_, r)| r.values().cloned())
                     .collect();
                 Ok(Some(rows))
@@ -2873,7 +2873,10 @@ impl StorageEngine for MvccStorageAdapter {
             Some(entries.values().map(|_| vec![val.clone()]).collect())
         } else if let Some((low, high)) = range {
             // Empty/reversed range — BTreeMap::range would panic.
-            if crate::storage::range_cannot_match(low, high) {
+            if crate::storage::range_cannot_match(
+                std::ops::Bound::Included(low),
+                std::ops::Bound::Included(high),
+            ) {
                 return Some(Vec::new());
             }
             let mut rows = Vec::new();

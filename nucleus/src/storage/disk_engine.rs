@@ -2762,8 +2762,8 @@ impl StorageEngine for DiskEngine {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(Some(
             self.index_lookup_range_inner(table, index_name, low, high)?,
@@ -2783,8 +2783,8 @@ impl StorageEngine for DiskEngine {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(Some(
             self.index_lookup_range_inner(table, index_name, low, high)?,
@@ -3070,9 +3070,10 @@ impl DiskEngine {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Vec<Row>, StorageError> {
+        use std::ops::Bound;
         let col_types = self.col_types(table)?;
         let indexes = self.indexes.read();
         let idx = indexes
@@ -3085,25 +3086,62 @@ impl DiskEngine {
             )));
         }
 
-        let Some(low_norm) = normalize_index_bound_value(low, &idx.col_type) else {
+        // A bound that does not normalize to the index's column type cannot
+        // match anything; an ABSENT bound is not that case, it is the whole
+        // side of the domain.
+        let encode = |b: Bound<&Value>| -> Result<Bound<Vec<u8>>, ()> {
+            match b {
+                Bound::Unbounded => Ok(Bound::Unbounded),
+                Bound::Included(v) => normalize_index_bound_value(v, &idx.col_type)
+                    .map(|n| Bound::Included(serialize_index_key(&n)))
+                    .ok_or(()),
+                Bound::Excluded(v) => normalize_index_bound_value(v, &idx.col_type)
+                    .map(|n| Bound::Excluded(serialize_index_key(&n)))
+                    .ok_or(()),
+            }
+        };
+        let (Ok(low_key), Ok(high_key)) = (encode(low), encode(high)) else {
             return Ok(Vec::new());
         };
-        let Some(high_norm) = normalize_index_bound_value(high, &idx.col_type) else {
-            return Ok(Vec::new());
+
+        // `range_scan` takes inclusive endpoints, so an exclusive bound is
+        // scanned as inclusive and its boundary key dropped below. Widening
+        // without the drop would return rows the caller did not ask for —
+        // callers that post-filter would hide it, and callers that do not
+        // would get a wrong answer.
+        let lo_bytes = match &low_key {
+            Bound::Included(k) | Bound::Excluded(k) => Some(k.as_slice()),
+            Bound::Unbounded => None,
         };
-        let low_key = serialize_index_key(&low_norm);
-        let high_key = serialize_index_key(&high_norm);
-        if low_key > high_key {
-            return Ok(Vec::new());
+        let hi_bytes = match &high_key {
+            Bound::Included(k) | Bound::Excluded(k) => Some(k.as_slice()),
+            Bound::Unbounded => None,
+        };
+        if let (Some(l), Some(h)) = (lo_bytes, hi_bytes) {
+            let empty = match (&low_key, &high_key) {
+                (Bound::Included(_), Bound::Included(_)) => l > h,
+                _ => l >= h,
+            };
+            if empty {
+                return Ok(Vec::new());
+            }
         }
 
         let key_rids = idx
             .btree
-            .range_scan(Some(&low_key), Some(&high_key))
+            .range_scan(lo_bytes, hi_bytes)
             .map_err(|e| StorageError::Io(e.to_string()))?;
 
+        let excluded_lo = matches!(low_key, Bound::Excluded(_));
+        let excluded_hi = matches!(high_key, Bound::Excluded(_));
         let mut rows = Vec::with_capacity(key_rids.len());
-        for (_, rid) in key_rids {
+        for (key, rid) in key_rids {
+            if excluded_lo && lo_bytes.is_some_and(|l| key == l) {
+                continue;
+            }
+            if excluded_hi && hi_bytes.is_some_and(|h| key == h) {
+                continue;
+            }
             let pg = self
                 .pool
                 .read_guard(rid.page_id)
@@ -3948,8 +3986,8 @@ mod tests {
             .index_lookup_range(
                 "indexed_range",
                 "idx_range",
-                &Value::Int64(5),
-                &Value::Int64(10),
+                std::ops::Bound::Included(&Value::Int64(5)),
+                std::ops::Bound::Included(&Value::Int64(10)),
             )
             .await
             .unwrap()
@@ -5300,7 +5338,12 @@ mod tests {
 
             // And the index still answers for the whole surviving set.
             let all = engine
-                .index_lookup_range("t", "ix", &Value::Int32(1), &Value::Int32(10))
+                .index_lookup_range(
+                    "t",
+                    "ix",
+                    std::ops::Bound::Included(&Value::Int32(1)),
+                    std::ops::Bound::Included(&Value::Int32(10)),
+                )
                 .await
                 .unwrap()
                 .expect("index_lookup_range returned no index");

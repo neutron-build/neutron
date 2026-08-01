@@ -58,6 +58,7 @@ use crate::types::{Row, Value};
 
 // Sync RwLock for index structures (never held across .await points).
 use parking_lot::RwLock as SyncRwLock;
+pub use std::ops::Bound;
 
 #[cfg(feature = "server")]
 pub use columnar_engine::ColumnarStorageEngine;
@@ -154,8 +155,16 @@ impl IsolationLevel {
 /// The comparison deliberately uses the same `Ord` the map is keyed by. A
 /// coercing comparison can call these two bounds equal or incomparable and let
 /// the panic straight through.
-pub(crate) fn range_cannot_match(low: &Value, high: &Value) -> bool {
-    low > high
+pub(crate) fn range_cannot_match(low: Bound<&Value>, high: Bound<&Value>) -> bool {
+    match (low, high) {
+        (Bound::Included(l), Bound::Included(h)) => l > h,
+        // Any strict side makes an equal pair empty rather than single-valued.
+        (Bound::Included(l), Bound::Excluded(h))
+        | (Bound::Excluded(l), Bound::Included(h))
+        | (Bound::Excluded(l), Bound::Excluded(h)) => l >= h,
+        // An open side can always be satisfied.
+        _ => false,
+    }
 }
 
 /// Narrow a materialized row to `projection`, in projection order.
@@ -429,13 +438,22 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(None)
     }
-    /// Range-lookup rows via a named index for inclusive bounds.
+    /// Range-lookup rows via a named index.
+    ///
+    /// Bounds are `std::ops::Bound`, not a `&Value` pair, because SQL can ask
+    /// for ranges this layer previously could not express. A one-sided
+    /// predicate (`id < 100`) has no opposite bound, and synthesizing one is
+    /// impossible for an unbounded domain like TEXT. The planner therefore had
+    /// nowhere to put a single bound, so it emitted the predicate as a
+    /// `lookup_key` the executor could only interpret as an equality — which it
+    /// is not — and every one-sided range on an indexed column declined the
+    /// index scan and re-ran the whole query on the AST path.
     async fn index_lookup_range(
         &self,
         _table: &str,
         _index_name: &str,
-        _low: &Value,
-        _high: &Value,
+        _low: Bound<&Value>,
+        _high: Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(None)
     }
@@ -498,13 +516,13 @@ pub trait StorageEngine: Send + Sync {
         self.scan_projected(table, projection, limit).await
     }
 
-    /// Synchronous inclusive range lookup for index scans.
+    /// Synchronous range lookup for index scans.
     fn index_lookup_range_sync(
         &self,
         _table: &str,
         _index_name: &str,
-        _low: &Value,
-        _high: &Value,
+        _low: Bound<&Value>,
+        _high: Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(None)
     }
@@ -1141,8 +1159,8 @@ impl StorageEngine for MemoryEngine {
         &self,
         _table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: Bound<&Value>,
+        high: Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         self.index_lookup_range_sync(_table, index_name, low, high)
     }
@@ -1164,8 +1182,8 @@ impl StorageEngine for MemoryEngine {
         &self,
         _table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: Bound<&Value>,
+        high: Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         if range_cannot_match(low, high) {
             return Ok(Some(Vec::new()));
@@ -1177,7 +1195,7 @@ impl StorageEngine for MemoryEngine {
                 // BTreeMap iterates in key order (= index column order).
                 let rows: Vec<Row> = idx
                     .map
-                    .range(low..=high)
+                    .range((low, high))
                     .flat_map(|(_, r)| r.iter().cloned())
                     .collect();
                 Ok(Some(rows))
@@ -1419,7 +1437,7 @@ impl StorageEngine for MemoryEngine {
             let entries = idx.map.get(val)?;
             Some(entries.iter().map(|_| vec![val.clone()]).collect())
         } else if let Some((low, high)) = range {
-            if range_cannot_match(low, high) {
+            if range_cannot_match(Bound::Included(low), Bound::Included(high)) {
                 return Some(Vec::new());
             }
             // Range scan: iterate BTreeMap range, return key values only

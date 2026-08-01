@@ -647,6 +647,11 @@ fn main_impl() {
     let mut divergences = 0usize;
     let mut panics = 0usize;
     let mut nuc_errors = 0usize;
+    // Coverage, not correctness: how many of these queries the PLAN executor
+    // actually answered. Joins reached the plan path for the first time in
+    // 2026-08; before that this fuzzer reported "clean" while exercising only
+    // the AST path. A zero here means the run proved nothing about the planner.
+    let mut plan_served = 0u64;
 
     'outer: for iter in 0..iterations {
         let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
@@ -759,6 +764,7 @@ fn main_impl() {
                 _ => {} // both errored or SQLite errored — skip
             }
         }
+        plan_served += ex.metrics().plan_path_served.get();
     }
 
     println!("\n════ SUMMARY ════");
@@ -766,6 +772,13 @@ fn main_impl() {
     println!("RESULT divergences : {divergences}");
     println!("PANICS             : {panics}");
     println!("nucleus-only errors: {nuc_errors}");
+    println!("plan-path answered : {plan_served} / {total}");
+    if plan_served == 0 {
+        println!(
+            "\nWARNING: the plan executor answered NOTHING — this run says \
+             nothing about the planner, only about the AST path."
+        );
+    }
     if divergences == 0 && panics == 0 {
         println!("\nNo divergences and no panics. probe_joins clean.");
     } else {

@@ -1296,8 +1296,8 @@ impl StorageEngine for ColumnarStorageEngine {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         self.index_lookup_range_sync(table, index_name, low, high)
     }
@@ -1344,8 +1344,8 @@ impl StorageEngine for ColumnarStorageEngine {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         if crate::storage::range_cannot_match(low, high) {
             return Ok(Some(Vec::new()));
@@ -1358,7 +1358,7 @@ impl StorageEngine for ColumnarStorageEngine {
                 Some(idx) => {
                     // BTreeMap::range: O(log n) seek + O(k) scan over compact position entries.
                     idx.map
-                        .range(low..=high)
+                        .range((low, high))
                         .flat_map(|(_, pos)| pos.iter().copied())
                         .collect()
                 }

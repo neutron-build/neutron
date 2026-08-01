@@ -134,55 +134,73 @@ operations lose — with two results worth naming rather than burying:
   on macOS do not issue a full drive barrier. This is a durability-level
   difference, not an engine one, and the number is meaningless as a speed
   comparison. See the section above.
-- **The 2-table JOIN (0.1×) is NOT explained by fsync** — it is a read. SQLite
-  is 7× faster on a join of two 50k tables, embedded-to-embedded. **Explained
-  2026-07-31: joins never execute on the plan path at all.** See below.
+- **The 2-table JOIN was 0.1x and it was NOT fsync** — it is a read. Diagnosed
+  2026-07-31 and fixed 2026-08-01; the history is kept below because the first
+  diagnosis was half right and the correction is the useful part.
 
-### Why the join is slow — attributed, 2026-07-31
+### The join — diagnosed 2026-07-31, fixed 2026-08-01
 
-Measured with per-call plan-cache outcome counters
-(`bench_hooks::record_plan`, printed by `NUCLEUS_PLAN_COUNTERS=1 compete`),
-which say which path each of the 1,000 timed calls actually took instead of
-leaving it to be inferred from a latency. Three spellings of the *same* join:
+**What the 2026-07-31 pass concluded.** Per-call plan-cache counters
+(`bench_hooks::record_plan`, printed by `NUCLEUS_PLAN_COUNTERS=1 compete`)
+showed no spelling of the join reaching the plan executor: comma joins were
+rejected outright (`select.from.len() > 1`), any *aliased* join was rejected
+because a scan labels its columns with the real table name, and even the
+alias-free form entered the plan path, re-planned, and still fell back to AST.
+Everything ran on `build_from_rows_with_ctes`.
 
-| Query shape | Plan outcome, 1000 calls | Nucleus | SQLite |
-|---|---|---:|---:|
-| `FROM a, b WHERE a.id = b.x` (comma) | `ineligible=1000` | 71.8 µs | 8.9 µs |
-| `FROM b JOIN a ON …` **with aliases** | `ineligible=1000` | 53.6 µs | 9.0 µs |
-| `FROM b JOIN a ON …` **no aliases** | `hit_replanned=1000` **and** `ineligible=1000` | 64.3 µs | 9.0 µs |
+**What that pass got wrong.** It concluded the fix was to make joins *reach* the
+plan executor. Doing exactly that made the join **100x slower**: 8.52-8.96 ms
+against the AST path's 87.5 us, alternating on one binary. The plan path's only
+join strategies materialize both inputs, so a hash join emitting 100 rows read
+all 50,000 rows of the other table — while the AST path had had an index
+nested-loop (`try_index_join`) for this shape all along. Reaching the planner is
+only an improvement if the planner can do what the other path was doing.
 
-So the cost is not in "the join algorithm". **No spelling of the join reaches
-the plan executor**, by three independent routes in `query_eligible_for_plan`:
+**The fix**, therefore, was four things, not one:
 
-1. **Comma joins** are rejected outright (`select.from.len() > 1`) — `plan_query`
-   only walks `from.first()` and would silently drop the rest.
-2. **Any join whose tables are aliased** is rejected, because the plan path's
-   `SeqScan` meta carries the real table name and cannot resolve an alias. This
-   is the one that matters in practice: essentially every hand-written join
-   uses aliases.
-3. Even the alias-free form, which *is* eligible, records **both** counters on
-   every call — it enters the plan path, re-plans (the cached plan is never
-   reused), and then still falls back to AST execution. It pays for planning
-   and gets nothing, which is why it is *slower* than the aliased form.
+1. `try_plan_index_join` — an index nested-loop for the plan path, so a join
+   probes an index instead of reading a whole table.
+2. Alias resolution and comma-join desugaring in the AST before planning, so
+   every spelling reaches the planner and `EXPLAIN` describes what runs.
+3. One-sided range predicates (`id < 100`) can now be expressed by the storage
+   layer at all — `index_lookup_range` takes `Bound`, not an inclusive pair.
+   Before, the planner had nowhere to put a single bound, so it emitted the
+   predicate as an equality `lookup_key`, the executor declined it, and the
+   whole query re-ran on the AST path with no index. This was never
+   join-specific; it fired on every one-sided range on an indexed column.
+4. Plan *reuse* for the shapes that were re-planning on a cache hit: one-sided
+   ranges, aggregate projections, single-predicate filters, and joins.
 
-Everything therefore runs on `build_from_rows_with_ctes`, the AST fallback.
+**Result**, same host and command, pgwire section against PostgreSQL:
 
-Two consequences worth knowing:
+| | before | after |
+|---|---:|---:|
+| 2-table JOIN vs PostgreSQL | 9.00 ms (0.0x) | **163.7 us (0.8x)** |
 
-- **`EXPLAIN`/`EXPLAIN ANALYZE` are misleading for joins.** They call
-  `plan_query` unconditionally, so they print a `Project → Filter → Index Scan`
-  tree, and `EXPLAIN ANALYZE` reports ~15 µs — for a plan that execution does
-  not use. The query really takes ~54–72 µs on a different path. Do not read a
-  join's EXPLAIN output as a description of what ran.
-- The single-table workloads above are not all on the fast path either:
-  `Range Scan` and `GROUP BY + AVG` both report `hit_replanned=1000`, i.e. a
-  plan-cache hit whose plan is discarded and re-planned on every execution.
-  Only `Filter + Sort + Limit` reports `reused`.
+**Where the remaining time goes** (`attr_join`, interleaved arms, one process):
 
-Fixing this is a planner change (alias resolution in plan conditions, comma-join
-desugaring, and making a join plan actually executable), not a local patch. It
-is not attempted here — this section records the attribution so the work starts
-from evidence rather than from the join algorithm, which is not the problem.
+```
+full 79 us = outer scan 43 + index probes 14 + assembly/projection 22
+```
+
+The join algorithm is no longer the cost — the outer scan is, at roughly 400 ns
+per returned row. `index_lookup_range` clones whole rows out of the index,
+including columns the query never projects. That is the materialisation model
+(every stage builds `Vec<Row>` of owned `Value`s), and closing it is the
+streaming/projection-pushdown work, not a join change.
+
+### Two measurement traps this cost, both worth knowing
+
+- **The result cache will answer your benchmark.** Repeating one identical
+  SELECT hits a 30-second-TTL result cache (`query_cache_get`). An attribution
+  pass that did not invalidate it read ~9 us for every arm and had the join
+  beating SQLite — wrong by 10x. `attr_join` now calls
+  `query_cache_invalidate_all()` outside the timer and keeps a `cached` arm so
+  the effect is visible rather than lurking.
+- **`EXPLAIN` timing is not planning cost.** A 35 us EXPLAIN arm supported the
+  inference that re-planning dominated the join. Eliminating re-planning
+  recovered ~8 us, not 35. The inference was wrong and only the measurement
+  caught it.
 
 ## What has not been measured
 
