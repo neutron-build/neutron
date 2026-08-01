@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static SKIP_UNIQUE_PROBE: AtomicBool = AtomicBool::new(false);
 static SKIP_INDEX_INSERT: AtomicBool = AtomicBool::new(false);
 static LEGACY_LEAF_OPS: AtomicBool = AtomicBool::new(false);
+static SKIP_INDEX_DELETE: AtomicBool = AtomicBool::new(false);
 
 /// Skip PK/UNIQUE constraint checking on INSERT. Duplicate keys are accepted.
 pub fn set_skip_unique_probe(on: bool) {
@@ -32,6 +33,13 @@ pub fn set_skip_unique_probe(on: bool) {
 /// Skip B-tree index maintenance on INSERT. Indexes go stale immediately.
 pub fn set_skip_index_insert(on: bool) {
     SKIP_INDEX_INSERT.store(on, Ordering::Relaxed);
+}
+
+/// Skip B-tree index maintenance on DELETE. Indexes keep entries for rows that
+/// no longer exist, so this arm answers "what does leaf deletion cost" and
+/// nothing else. `attr_delete` is the only caller.
+pub fn set_skip_index_delete(on: bool) {
+    SKIP_INDEX_DELETE.store(on, Ordering::Relaxed);
 }
 
 /// Use the old decode-and-rewrite B-tree leaf insert instead of the in-place
@@ -170,4 +178,9 @@ pub fn skip_unique_probe() -> bool {
 #[inline]
 pub fn skip_index_insert() -> bool {
     SKIP_INDEX_INSERT.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn skip_index_delete() -> bool {
+    SKIP_INDEX_DELETE.load(Ordering::Relaxed)
 }

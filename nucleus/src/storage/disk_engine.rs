@@ -3188,6 +3188,10 @@ impl DiskEngine {
     /// B-tree's structural lock (see the module docs on `btree.rs`), so every
     /// mutating entry point must hold it exclusively.
     fn index_delete(&self, table: &str, page_id: u32, slot_idx: u16, row: &Row) {
+        // Benchmark attribution only — see `crate::bench_hooks`.
+        if crate::bench_hooks::skip_index_delete() {
+            return;
+        }
         let indexes = self.indexes.write();
         for (idx_name, idx) in indexes.iter() {
             if idx.table == table && idx.col_idx < row.len() {
