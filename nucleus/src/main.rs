@@ -1102,14 +1102,11 @@ async fn cmd_start(cfg: StartConfig) {
             first.detail
         );
         let interval = std::time::Duration::from_secs(config.storage.disk_check_interval_secs);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await; // the first tick completes immediately
-            loop {
-                ticker.tick().await;
-                guard.evaluate();
-            }
-        });
+        // Supervised in `DiskGuard` rather than inline here: read-only is
+        // latched and ONLY a later reading clears it, so if this loop stops the
+        // server refuses writes until it is restarted — and an inline
+        // `tokio::spawn` swallowed a panicking reading without a trace.
+        guard.spawn_monitor(interval);
     }
 
     // Commit-time durability default (config wal.synchronous_commit;

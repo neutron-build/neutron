@@ -389,10 +389,10 @@ defmodule Neutron.Middleware.Dispatch do
   @moduledoc "Dispatches the request to the user's router module."
   @behaviour Plug
 
-  # Deliberately does NOT validate `:router` here. `Plug.Builder` calls
-  # `init/1` at compile time, and `Neutron.Middleware` declares
-  # `plug Neutron.Middleware.Dispatch` with no options, so validating at init
-  # fails the build. The missing router surfaces from `call/2` instead.
+  # Deliberately does NOT validate `:router` here: the router arrives at
+  # RUNTIME, forwarded from `Neutron.Middleware`'s `builder_opts()`, so there
+  # is nothing to validate when `init/1` runs. A genuinely absent router still
+  # raises from `call/2`.
   @impl true
   def init(opts), do: opts
 
@@ -480,8 +480,17 @@ defmodule Neutron.Middleware do
   plug Neutron.Middleware.Timeout
   # Layer 9: OTel tracing
   plug Neutron.Middleware.OTel
-  # Layer 10: Router dispatch (calls into user's router)
-  plug Neutron.Middleware.Dispatch
+  # Layer 10: Router dispatch (calls into user's router).
+  #
+  # `builder_opts()` is load-bearing. `Plug.Builder` resolves a bare `plug Mod`
+  # at COMPILE time by calling `Mod.init([])`, and the pipeline's own runtime
+  # options are never handed to it. Dispatch therefore received `[]` on every
+  # request and raised `KeyError` on `:router` — for the exact plug
+  # `Neutron.child_spec/1` gives Bandit, so every request through an assembled
+  # server 500'd. `builder_opts()` forwards the options passed to
+  # `Neutron.Middleware.call/2` (where `child_spec/1` puts `:router`) down to
+  # this plug.
+  plug Neutron.Middleware.Dispatch, builder_opts()
 
   @doc false
   def init(opts) do

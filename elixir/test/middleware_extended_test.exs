@@ -186,6 +186,61 @@ defmodule Neutron.MiddlewareExtendedTest do
     end
   end
 
+  describe "Neutron.Middleware (the assembled pipeline)" do
+    defmodule PipelineRouter do
+      use Plug.Router
+      plug :match
+      plug :dispatch
+
+      get "/ping" do
+        send_resp(conn, 200, "pong")
+      end
+
+      match _ do
+        send_resp(conn, 404, "not found")
+      end
+    end
+
+    # Every other middleware test drives ONE plug directly. That is why the
+    # assembled stack could raise `KeyError` on `:router` for every request
+    # while the suite stayed green: `Plug.Builder` resolves a bare `plug Mod`
+    # at compile time with `init([])`, so Dispatch never saw the router that
+    # `Neutron.child_spec/1` passes. This test runs a request through the
+    # pipeline Bandit is actually given.
+    test "a request reaches the router through the full 10-layer stack" do
+      opts = Neutron.Middleware.init(router: PipelineRouter, nucleus: nil)
+
+      conn =
+        conn(:get, "/ping")
+        |> Neutron.Middleware.call(opts)
+
+      assert conn.status == 200
+      assert conn.resp_body == "pong"
+    end
+
+    test "the pipeline still applies its own layers" do
+      opts = Neutron.Middleware.init(router: PipelineRouter, nucleus: nil)
+
+      conn =
+        conn(:get, "/ping")
+        |> Neutron.Middleware.call(opts)
+
+      # Layer 1 ran: RequestId sets the header on the way through.
+      assert [req_id] = Plug.Conn.get_resp_header(conn, "x-request-id")
+      assert req_id != ""
+    end
+
+    test "an unmatched route reaches the router's catch-all, not a crash" do
+      opts = Neutron.Middleware.init(router: PipelineRouter, nucleus: nil)
+
+      conn =
+        conn(:get, "/nope")
+        |> Neutron.Middleware.call(opts)
+
+      assert conn.status == 404
+    end
+  end
+
   describe "Neutron.Middleware.Dispatch" do
     defmodule TestRouter do
       use Plug.Router
@@ -213,9 +268,9 @@ defmodule Neutron.MiddlewareExtendedTest do
     end
 
     test "raises when no router is configured" do
-      # Raised from `call/2`, not `init/1`: `Plug.Builder` runs `init/1` at
-      # compile time and `Neutron.Middleware` plugs Dispatch with no options,
-      # so an init-time check would fail the build instead.
+      # Raised from `call/2`, not `init/1`: the router arrives at runtime via
+      # `Neutron.Middleware`'s `builder_opts()`, so `init/1` has nothing to
+      # validate.
       assert_raise KeyError, fn ->
         conn(:get, "/hello")
         |> Neutron.Middleware.Dispatch.call(Neutron.Middleware.Dispatch.init([]))
