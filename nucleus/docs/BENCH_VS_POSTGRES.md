@@ -135,8 +135,54 @@ operations lose — with two results worth naming rather than burying:
   difference, not an engine one, and the number is meaningless as a speed
   comparison. See the section above.
 - **The 2-table JOIN (0.1×) is NOT explained by fsync** — it is a read. SQLite
-  is 7× faster on a join of two 50k tables, embedded-to-embedded. That is a real
-  gap in the join path and it is not currently explained.
+  is 7× faster on a join of two 50k tables, embedded-to-embedded. **Explained
+  2026-07-31: joins never execute on the plan path at all.** See below.
+
+### Why the join is slow — attributed, 2026-07-31
+
+Measured with per-call plan-cache outcome counters
+(`bench_hooks::record_plan`, printed by `NUCLEUS_PLAN_COUNTERS=1 compete`),
+which say which path each of the 1,000 timed calls actually took instead of
+leaving it to be inferred from a latency. Three spellings of the *same* join:
+
+| Query shape | Plan outcome, 1000 calls | Nucleus | SQLite |
+|---|---|---:|---:|
+| `FROM a, b WHERE a.id = b.x` (comma) | `ineligible=1000` | 71.8 µs | 8.9 µs |
+| `FROM b JOIN a ON …` **with aliases** | `ineligible=1000` | 53.6 µs | 9.0 µs |
+| `FROM b JOIN a ON …` **no aliases** | `hit_replanned=1000` **and** `ineligible=1000` | 64.3 µs | 9.0 µs |
+
+So the cost is not in "the join algorithm". **No spelling of the join reaches
+the plan executor**, by three independent routes in `query_eligible_for_plan`:
+
+1. **Comma joins** are rejected outright (`select.from.len() > 1`) — `plan_query`
+   only walks `from.first()` and would silently drop the rest.
+2. **Any join whose tables are aliased** is rejected, because the plan path's
+   `SeqScan` meta carries the real table name and cannot resolve an alias. This
+   is the one that matters in practice: essentially every hand-written join
+   uses aliases.
+3. Even the alias-free form, which *is* eligible, records **both** counters on
+   every call — it enters the plan path, re-plans (the cached plan is never
+   reused), and then still falls back to AST execution. It pays for planning
+   and gets nothing, which is why it is *slower* than the aliased form.
+
+Everything therefore runs on `build_from_rows_with_ctes`, the AST fallback.
+
+Two consequences worth knowing:
+
+- **`EXPLAIN`/`EXPLAIN ANALYZE` are misleading for joins.** They call
+  `plan_query` unconditionally, so they print a `Project → Filter → Index Scan`
+  tree, and `EXPLAIN ANALYZE` reports ~15 µs — for a plan that execution does
+  not use. The query really takes ~54–72 µs on a different path. Do not read a
+  join's EXPLAIN output as a description of what ran.
+- The single-table workloads above are not all on the fast path either:
+  `Range Scan` and `GROUP BY + AVG` both report `hit_replanned=1000`, i.e. a
+  plan-cache hit whose plan is discarded and re-planned on every execution.
+  Only `Filter + Sort + Limit` reports `reused`.
+
+Fixing this is a planner change (alias resolution in plan conditions, comma-join
+desugaring, and making a join plan actually executable), not a local patch. It
+is not attempted here — this section records the attribution so the work starts
+from evidence rather than from the join algorithm, which is not the problem.
 
 ## What has not been measured
 
