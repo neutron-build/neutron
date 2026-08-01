@@ -41,7 +41,10 @@ defmodule Neutron.Cache do
 
   @doc false
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    # Overridable so a test can run an isolated cache instead of colliding with
+    # the application-supervised one ({:error, {:already_started, _}}).
+    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc """

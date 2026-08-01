@@ -220,6 +220,24 @@ defmodule Neutron.Jobs.Queue do
     {:noreply, state}
   end
 
+  # `Task.Supervisor.async_nolink` ALSO delivers the task's return value as
+  # `{ref, value}`, followed by `{:DOWN, ref, ...}`. Completion is already
+  # reported by the explicit `send(parent, {:job_complete, ...})` inside the
+  # task, so both are redundant here — but an unmatched message is a
+  # FunctionClauseError, and that crashed the queue in the middle of a poll the
+  # first time any job ran.
+  @impl true
+  def handle_info({ref, _task_return}, state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, state}
+  end
+
+  # Backstop: a task that dies hard sends no `:job_complete`, only this.
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) when is_reference(ref) do
+    {:noreply, state}
+  end
+
   # --- Internal ---
 
   defp execute_job(job, state) do

@@ -181,19 +181,19 @@ defmodule Neutron.CacheTest do
   describe "GenServer lifecycle" do
     test "starts as a GenServer" do
       # The GenServer handles the sweep timer
-      {:ok, pid} = Cache.start_link([])
+      {:ok, pid} = Cache.start_link(name: :"cache_#{System.unique_integer([:positive])}")
       assert Process.alive?(pid)
       GenServer.stop(pid)
     end
 
     test "schedules sweep on init" do
-      {:ok, pid} = Cache.start_link([])
+      {:ok, pid} = Cache.start_link(name: :"cache_#{System.unique_integer([:positive])}")
       assert Process.alive?(pid)
       GenServer.stop(pid)
     end
 
     test "handles :sweep message" do
-      {:ok, pid} = Cache.start_link([])
+      {:ok, pid} = Cache.start_link(name: :"cache_#{System.unique_integer([:positive])}")
 
       # Insert expired entry
       :ets.insert(:neutron_cache, {"sweep_test", "old", 0})

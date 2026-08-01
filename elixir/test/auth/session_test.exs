@@ -184,13 +184,13 @@ defmodule Neutron.Auth.SessionSweeperTest do
   end
 
   test "starts as a GenServer" do
-    {:ok, pid} = SessionSweeper.start_link([])
+    {:ok, pid} = SessionSweeper.start_link(name: :"sweeper_#{System.unique_integer([:positive])}")
     assert Process.alive?(pid)
     GenServer.stop(pid)
   end
 
   test "responds to :sweep message" do
-    {:ok, pid} = SessionSweeper.start_link([])
+    {:ok, pid} = SessionSweeper.start_link(name: :"sweeper_#{System.unique_integer([:positive])}")
 
     # Insert an expired session
     :ets.insert(:neutron_sessions, {"expired-1", %{
@@ -211,7 +211,7 @@ defmodule Neutron.Auth.SessionSweeperTest do
   end
 
   test "schedules periodic sweep" do
-    {:ok, pid} = SessionSweeper.start_link([])
+    {:ok, pid} = SessionSweeper.start_link(name: :"sweeper_#{System.unique_integer([:positive])}")
     # The sweeper should have scheduled a :sweep message
     # We can verify it's alive and processing
     assert Process.alive?(pid)

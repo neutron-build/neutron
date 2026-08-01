@@ -137,6 +137,15 @@ defmodule Neutron.Realtime.ChannelTest do
   end
 
   describe "join rejection (invalid topic)" do
+    # `start_link` links the caller, so a child whose `init` returns
+    # `{:stop, reason}` sends the test process an EXIT and kills it before the
+    # assertion runs — the {:error, _} return is correct, the test just could
+    # not survive to see it.
+    setup do
+      Process.flag(:trap_exit, true)
+      :ok
+    end
+
     test "channel stops when join returns {:error, reason}" do
       topic = "test:reject:#{System.unique_integer()}"
 
