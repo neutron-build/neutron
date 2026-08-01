@@ -17,27 +17,20 @@ defmodule Nucleus.Retry do
   `Postgrex.Error` wrapping so a code stays visible after the SDK wraps it.
   """
 
-  @doc """
-  The transaction lost a conflict and MUST be retried from the beginning.
-
-  Raised by two mechanisms: strict 2PL wait-die on the disk engine (the younger
-  transaction is killed to break a potential deadlock) and SSI on the MVCC
-  engine (a dangerous structure detected at commit).
-  """
+  # 40001 — the transaction lost a conflict and MUST be retried from the
+  # beginning. Raised by two mechanisms: strict 2PL wait-die on the disk engine
+  # (the younger transaction is killed to break a potential deadlock) and SSI on
+  # the MVCC engine (a dangerous structure detected at commit).
   @serialization_failure "40001"
 
-  @doc """
-  `lock_timeout` elapsed waiting for a table lock. Deliberately NOT retryable:
-  the holder is still there, so retrying spins against a lock that is not
-  moving. Raise `lock_timeout` or find the transaction holding it.
-  """
+  # 55P03 — `lock_timeout` elapsed waiting for a table lock. Deliberately NOT
+  # retryable: the holder is still there, so retrying spins against a lock that
+  # is not moving. Raise `lock_timeout` or find the transaction holding it.
   @lock_not_available "55P03"
 
-  @doc """
-  A statement was issued after the transaction had already been aborted. Only
-  ROLLBACK is accepted, so the whole transaction must re-run — which is what
-  `with_tx/3` does.
-  """
+  # 25P02 — a statement was issued after the transaction had already been
+  # aborted. Only ROLLBACK is accepted, so the whole transaction must re-run,
+  # which is what `with_tx/3` does.
   @in_failed_transaction "25P02"
 
   @default_max_attempts 5
@@ -150,6 +143,7 @@ defmodule Nucleus.Retry do
   defp retryable?({:error, reason}), do: serialization_failure?(reason)
   defp retryable?(_), do: false
 
+  # Only ever reached for a result `retryable?/1` accepted, which is always
+  # `{:error, reason}`.
   defp error_of({:error, reason}), do: reason
-  defp error_of(other), do: other
 end

@@ -125,11 +125,23 @@ defmodule Neutron.Auth.Plug do
   Requires that `current_user` has the given role.
   """
   @spec require_role(Plug.Conn.t(), String.t() | [String.t()]) :: Plug.Conn.t()
+  # `role in roles` cannot be written in a guard when `roles` is a runtime
+  # variable — a guard's `in` needs a compile-time list or range. That made this
+  # module, and therefore the whole framework, fail to compile; the membership
+  # test belongs in the body. Deny stays the default: an unrecognised user shape
+  # or a role outside the list falls through to 403.
   def require_role(conn, roles) when is_list(roles) do
-    case conn.assigns[:current_user] do
-      %{"role" => role} when role in roles -> conn
-      %{role: role} when role in roles -> conn
-      _ -> Neutron.Error.send_error(conn, Neutron.Error.forbidden("Insufficient permissions"))
+    user_role =
+      case conn.assigns[:current_user] do
+        %{"role" => role} -> role
+        %{role: role} -> role
+        _ -> nil
+      end
+
+    if not is_nil(user_role) and user_role in roles do
+      conn
+    else
+      Neutron.Error.send_error(conn, Neutron.Error.forbidden("Insufficient permissions"))
     end
   end
 

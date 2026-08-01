@@ -1,52 +1,3 @@
-defmodule Neutron.Middleware do
-  @moduledoc """
-  Middleware pipeline implementing the 10-layer stack from FRAMEWORK_CONTRACT.md.
-
-  Layers (outermost first):
-  1. **RequestId** — generates UUID in `X-Request-Id`
-  2. **Logger** — structured request/response logging
-  3. **Recovery** — catches exceptions, returns 500
-  4. **CORS** — configurable cross-origin headers
-  5. **Compress** — gzip via Plug.Deflate (if accepted)
-  6. **RateLimit** — ETS-based sliding window per IP
-  7. **Auth** — JWT verification (optional)
-  8. **Timeout** — Task.async with deadline
-  9. **OTel** — OpenTelemetry span creation
-  10. **Router** — route dispatch
-
-  ## Usage
-
-  The middleware pipeline is automatically assembled when you start a Neutron server.
-  Each layer can be configured individually.
-  """
-
-  use Plug.Builder
-  require Logger
-
-  # Layer 1: Request ID
-  plug Neutron.Middleware.RequestId
-  # Layer 2: Logger
-  plug Neutron.Middleware.RequestLogger
-  # Layer 3: Recovery (exception handler)
-  plug Neutron.Middleware.Recovery
-  # Layer 4: CORS
-  plug Neutron.Middleware.Cors
-  # Layer 5: Compression
-  plug Plug.Head
-  # Layer 6: Rate Limiting
-  plug Neutron.Middleware.RateLimit
-  # Layer 8: Request Timeout
-  plug Neutron.Middleware.Timeout
-  # Layer 9: OTel tracing
-  plug Neutron.Middleware.OTel
-  # Layer 10: Router dispatch (calls into user's router)
-  plug Neutron.Middleware.Dispatch
-
-  @doc false
-  def init(opts) do
-    opts
-  end
-end
 
 # =============================================================================
 # Layer 1: Request ID
@@ -54,6 +5,9 @@ end
 defmodule Neutron.Middleware.RequestId do
   @moduledoc "Assigns a unique request ID to each request via X-Request-Id header."
   @behaviour Plug
+
+  # `&&&` / `|||` in generate_uuid/0 are Bitwise operators, not Kernel ones.
+  import Bitwise
 
   @impl true
   def init(opts), do: opts
@@ -461,5 +415,64 @@ defmodule Neutron.ETS.Manager do
     :ets.new(:neutron_cache, [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
     :ets.new(:neutron_sessions, [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
     {:ok, %{}}
+  end
+end
+
+
+# =============================================================================
+# Layer 10 pipeline — defined LAST, deliberately.
+#
+# `Plug.Builder` calls each plug module's `init/1` while compiling the module
+# that declares it. Every plug below was defined AFTER this pipeline, so when
+# `Neutron.Middleware` compiled none of them existed yet and the whole file
+# failed to build. Keep this module beneath the plugs it names.
+# =============================================================================
+defmodule Neutron.Middleware do
+  @moduledoc """
+  Middleware pipeline implementing the 10-layer stack from FRAMEWORK_CONTRACT.md.
+
+  Layers (outermost first):
+  1. **RequestId** — generates UUID in `X-Request-Id`
+  2. **Logger** — structured request/response logging
+  3. **Recovery** — catches exceptions, returns 500
+  4. **CORS** — configurable cross-origin headers
+  5. **Compress** — gzip via Plug.Deflate (if accepted)
+  6. **RateLimit** — ETS-based sliding window per IP
+  7. **Auth** — JWT verification (optional)
+  8. **Timeout** — Task.async with deadline
+  9. **OTel** — OpenTelemetry span creation
+  10. **Router** — route dispatch
+
+  ## Usage
+
+  The middleware pipeline is automatically assembled when you start a Neutron server.
+  Each layer can be configured individually.
+  """
+
+  use Plug.Builder
+  require Logger
+
+  # Layer 1: Request ID
+  plug Neutron.Middleware.RequestId
+  # Layer 2: Logger
+  plug Neutron.Middleware.RequestLogger
+  # Layer 3: Recovery (exception handler)
+  plug Neutron.Middleware.Recovery
+  # Layer 4: CORS
+  plug Neutron.Middleware.Cors
+  # Layer 5: Compression
+  plug Plug.Head
+  # Layer 6: Rate Limiting
+  plug Neutron.Middleware.RateLimit
+  # Layer 8: Request Timeout
+  plug Neutron.Middleware.Timeout
+  # Layer 9: OTel tracing
+  plug Neutron.Middleware.OTel
+  # Layer 10: Router dispatch (calls into user's router)
+  plug Neutron.Middleware.Dispatch
+
+  @doc false
+  def init(opts) do
+    opts
   end
 end

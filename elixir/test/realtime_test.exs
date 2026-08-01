@@ -141,7 +141,10 @@ defmodule Neutron.Realtime.SocketTest do
   end
 end
 
-defmodule Neutron.Realtime.ChannelTest do
+# Renamed: `Neutron.Realtime.ChannelTest` is already defined in
+# test/realtime/channel_test.exs, and two files cannot define the same module —
+# the collision made the whole suite fail to compile.
+defmodule Neutron.Realtime.ChannelBroadcastTest do
   use ExUnit.Case, async: true
 
   alias Neutron.Realtime.Channel

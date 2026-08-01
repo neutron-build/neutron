@@ -130,7 +130,7 @@ pub fn withRetry(
         }
 
         if (attempt < attempts) {
-            std.time.sleep(jitter(&rng, delay));
+            std.Thread.sleep(jitter(&rng, delay));
             delay = @min(delay * 2, opts.max_delay_ns);
         }
     }
