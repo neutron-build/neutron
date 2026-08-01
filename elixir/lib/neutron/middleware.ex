@@ -302,8 +302,16 @@ defmodule Neutron.Middleware.Timeout do
     |> Plug.Conn.assign(:timeout_watcher, watcher)
     |> Plug.Conn.register_before_send(fn conn ->
       # Request completed in time — stop the watcher.
+      #
+      # `:kill`, not `:normal`. An exit signal of `:normal` sent to a process
+      # OTHER than self is discarded unless that process traps exits, and this
+      # watcher does not — so the previous `Process.exit(pid, :normal)` did
+      # nothing at all and every watcher stayed alive, holding a monitor, until
+      # its own timeout elapsed. At the default 30 s that is one lingering
+      # process per request for thirty seconds. The watcher holds no state that
+      # needs unwinding, so an unconditional kill is the right signal.
       if pid = conn.assigns[:timeout_watcher] do
-        Process.exit(pid, :normal)
+        Process.exit(pid, :kill)
       end
 
       conn
@@ -381,6 +389,10 @@ defmodule Neutron.Middleware.Dispatch do
   @moduledoc "Dispatches the request to the user's router module."
   @behaviour Plug
 
+  # Deliberately does NOT validate `:router` here. `Plug.Builder` calls
+  # `init/1` at compile time, and `Neutron.Middleware` declares
+  # `plug Neutron.Middleware.Dispatch` with no options, so validating at init
+  # fails the build. The missing router surfaces from `call/2` instead.
   @impl true
   def init(opts), do: opts
 
