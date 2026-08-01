@@ -104,7 +104,7 @@ Three consequences worth stating plainly:
 - These are **one host, one run**. Treat them as a direction, not a
   specification.
 
-## SQLite, 2026-07-31
+## SQLite, re-measured 2026-08-01
 
 ```sh
 cargo run --release --features bench-tools --bin compete -- --backends nucleus,sqlite
@@ -115,16 +115,22 @@ protocol cost on either side.
 
 | Workload | Nucleus | SQLite | Ratio |
 |---|---:|---:|---:|
-| `COUNT(*)` | 2.3 µs | 379.2 µs | **165× faster** |
-| `UPDATE` by PK | 16.4 µs | 285.6 µs | **18× faster** |
-| `GROUP BY` + `AVG` | 22.60 ms | 59.15 ms | **2.9× faster** |
-| `SUM` with `WHERE` | 8.44 ms | 16.90 ms | **2.1× faster** |
-| Filter + sort + limit | 10.47 ms | 17.16 ms | **1.6× faster** |
-| Point query (PK) | 3.0 µs | 3.8 µs | 1.3× |
-| Range scan | 40.2 µs | 11.5 µs | 0.3× (SQLite faster) |
-| `DELETE` by PK | 6.5 µs | 1.1 µs | 0.2× (SQLite faster) |
-| 2-table JOIN | 101.2 µs | 13.7 µs | **0.1× (SQLite 7× faster)** |
-| Single `INSERT` | 6.03 ms | 1.9 µs | **0.0× (SQLite ~3,000× faster)** |
+| `COUNT(*)` | 1.7 µs | 268.5 µs | **163× faster** |
+| `UPDATE` by PK | 15.4 µs | 239.8 µs | **15× faster** |
+| `GROUP BY` + `AVG` | 15.39 ms | 49.30 ms | **3.2× faster** |
+| `SUM` with `WHERE` | 8.70 ms | 20.17 ms | **2.3× faster** |
+| Filter + sort + limit | 6.45 ms | 14.85 ms | **2.1× faster** |
+| Point query (PK) | 2.0 µs | 2.5 µs | 1.2× |
+| Range scan | 15.5 µs | 7.0 µs | 0.5× (SQLite faster) |
+| `DELETE` by PK | 7.3 µs | 1.2 µs | 0.2× (SQLite faster) |
+| 2-table JOIN | 106.7 µs | 13.4 µs | 0.1× (SQLite 8× faster) |
+| Single `INSERT` | 7.83 ms | 1.9 µs | **0.0× (SQLite ~4,000× faster)** |
+
+Two rows moved since the 2026-07-31 run for a reason worth naming: `Range scan` went 0.3x -> 0.5x (26.9 -> 15.5 µs) and
+`GROUP BY` 3.0x -> 3.2x, purely because both had been **re-planning on every
+execution despite a plan-cache hit** and now reuse. `NUCLEUS_PLAN_COUNTERS=1`
+reports `reused=1000` for `Range Scan`, `GROUP BY + AVG` and `2-Table JOIN`
+where all three read `hit_replanned=1000` before.
 
 The same shape as the PostgreSQL comparison — aggregates win, small point
 operations lose — with two results worth naming rather than burying:
@@ -175,7 +181,11 @@ only an improvement if the planner can do what the other path was doing.
 
 | | before | after |
 |---|---:|---:|
-| 2-table JOIN vs PostgreSQL | 9.00 ms (0.0x) | **163.7 us (0.8x)** |
+| 2-table JOIN vs PostgreSQL | 9.00 ms (0.0x) | **149.5 us (0.8x)** |
+
+(An earlier draft of this section said 163.7 us. That was measured on the
+index-join build, before plan reuse landed; 149.5 us is the current binary
+measured with nothing else running on the host.)
 
 **Where the remaining time goes** (`attr_join`, interleaved arms, one process):
 
