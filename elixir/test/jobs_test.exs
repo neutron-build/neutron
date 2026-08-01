@@ -195,7 +195,9 @@ defmodule Neutron.Jobs.WorkerTest do
   use ExUnit.Case, async: true
 
   test "defines the perform/1 callback" do
-    assert function_exported?(Neutron.TestWorker, :perform, 1)
+    # `function_exported?/3` is false for a module that is not loaded yet.
+      Code.ensure_loaded(Neutron.TestWorker)
+      assert function_exported?(Neutron.TestWorker, :perform, 1)
   end
 
   test "worker performs successfully" do

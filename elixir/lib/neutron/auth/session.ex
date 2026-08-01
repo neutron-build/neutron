@@ -262,7 +262,12 @@ defmodule Neutron.Auth.SessionSweeper do
   @default_interval_ms 60_000
 
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    # `:name` is overridable so a test can run an isolated sweeper. Defaulting
+    # to the module name is right for the supervised instance, but it made
+    # every test that started one collide with the application's own sweeper
+    # ({:error, {:already_started, _}}) and there was no way to opt out.
+    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @impl true
