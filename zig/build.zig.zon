@@ -2,7 +2,15 @@
     .name = .neutron_zig,
     .version = "0.1.0",
     .fingerprint = 0xc573b9d0bd7b4cab,
-    .minimum_zig_version = "0.14.0",
+    // 0.15.x. NOT 0.14 (this manifest's format, `b.addLibrary` and
+    // `.root_module` in build.zig are all 0.15+, and 0.14.1 additionally fails
+    // to link libSystem on current macOS), and NOT 0.16: that release removed
+    // `std.io`, `std.net`, `std.Thread.Mutex`, `std.time.nanoTimestamp` and
+    // `std.crypto.random`, which this source uses throughout. Building with
+    // 0.16 produces ~28 errors that look like our bugs and are not — they are
+    // Zig's pre-1.0 stdlib churn. Pinned here so the next person does not spend
+    // the afternoon rediscovering that.
+    .minimum_zig_version = "0.15.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

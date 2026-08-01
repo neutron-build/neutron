@@ -50,6 +50,13 @@ defmodule Neutron.Router do
 
   defmacro __using__(_opts) do
     quote do
+      # Registered BEFORE `use Plug.Router` on purpose. `Plug.Router`'s own
+      # `__before_compile__` builds the dispatch table and drops the route
+      # macros from scope, so a callback registered after it runs too late:
+      # the catch-all below fails with "undefined function match/2". Ours must
+      # be in place first.
+      @before_compile Neutron.Router
+
       use Plug.Router
       import Neutron.Router, only: [scope: 2]
       import Neutron.Router.Helpers
@@ -59,8 +66,6 @@ defmodule Neutron.Router do
 
       # Store route metadata for OpenAPI generation
       Module.register_attribute(__MODULE__, :neutron_routes, accumulate: true)
-
-      @before_compile Neutron.Router
     end
   end
 
@@ -94,11 +99,17 @@ defmodule Neutron.Router do
       @doc false
       def __neutron_routes__, do: @neutron_routes
 
-      # Catch-all 404
+      # Catch-all 404.
+      #
+      # `conn` is bound by `Plug.Router`'s `match` in the CALLER's context, so a
+      # hygienic reference here resolves to `Neutron.Router` and fails with
+      # "undefined variable conn". `var!` reaches the caller's binding.
       match _ do
         Neutron.Error.send_error(
-          conn,
-          Neutron.Error.not_found("Route not found: #{conn.method} #{conn.request_path}")
+          var!(conn),
+          Neutron.Error.not_found(
+            "Route not found: #{var!(conn).method} #{var!(conn).request_path}"
+          )
         )
       end
     end
