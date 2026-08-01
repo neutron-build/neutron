@@ -225,6 +225,8 @@ pub struct DiskGuard {
     level: AtomicU8,
     last: RwLock<Option<DiskObservation>>,
     probe_failures: AtomicU64,
+    checks: AtomicU64,
+    monitor_panics: AtomicU64,
 }
 
 impl DiskGuard {
@@ -242,6 +244,8 @@ impl DiskGuard {
             level: AtomicU8::new(DiskLevel::Normal.as_u8()),
             last: RwLock::new(None),
             probe_failures: AtomicU64::new(0),
+            checks: AtomicU64::new(0),
+            monitor_panics: AtomicU64::new(0),
         }
     }
 
@@ -264,6 +268,53 @@ impl DiskGuard {
 
     pub fn probe_failures(&self) -> u64 {
         self.probe_failures.load(Ordering::Relaxed)
+    }
+
+    /// Readings taken since start. The monitor's liveness signal: read-only is
+    /// only ever cleared by a later reading, so a counter that stops advancing
+    /// means writes can never resume without a restart — which is precisely
+    /// what "writes resume automatically" promises will not happen.
+    pub fn checks_completed(&self) -> u64 {
+        self.checks.load(Ordering::Relaxed)
+    }
+
+    /// Times a reading panicked and the monitor loop caught it.
+    pub fn monitor_panics(&self) -> u64 {
+        self.monitor_panics.load(Ordering::Relaxed)
+    }
+
+    /// Run the watermark monitor until the process exits.
+    ///
+    /// This lives here rather than as a bare `tokio::spawn` in `main.rs` for
+    /// two reasons. It was untestable there, and the promise the operator sees
+    /// — "writes resume automatically" — is only true while this loop keeps
+    /// running: read-only is latched and nothing else clears it. A panicking
+    /// reading used to kill the task silently, leaving a server that refused
+    /// writes forever with no indication why and no fix but a restart. Now a
+    /// panic is caught, counted and logged, and the next tick still happens.
+    pub fn spawn_monitor(
+        self: Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // the first tick completes immediately
+            loop {
+                ticker.tick().await;
+                let guard = Arc::clone(&self);
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || guard.evaluate()));
+                if result.is_err() {
+                    let n = self.monitor_panics.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::error!(
+                        "disk watermark check panicked ({n} so far); the monitor survived and \
+                         will take the next reading. Investigate anyway: read-only mode is \
+                         cleared only by a reading, so a check that never succeeds leaves the \
+                         server refusing writes until it is restarted"
+                    );
+                }
+            }
+        })
     }
 
     pub fn watermarks(&self) -> DiskWatermarks {
@@ -298,6 +349,7 @@ impl DiskGuard {
                     changed,
                 };
                 *self.last.write() = Some(obs.clone());
+                self.checks.fetch_add(1, Ordering::Relaxed);
                 return obs;
             }
         };
@@ -362,6 +414,7 @@ impl DiskGuard {
             changed,
         };
         *self.last.write() = Some(obs.clone());
+        self.checks.fetch_add(1, Ordering::Relaxed);
         obs
     }
 
@@ -406,6 +459,7 @@ mod tests {
         total: u64,
         available: parking_lot::Mutex<u64>,
         fail: parking_lot::Mutex<bool>,
+        panic_on_probe: parking_lot::Mutex<bool>,
     }
 
     impl FakeProbe {
@@ -414,6 +468,7 @@ mod tests {
                 total,
                 available: parking_lot::Mutex::new(available),
                 fail: parking_lot::Mutex::new(false),
+                panic_on_probe: parking_lot::Mutex::new(false),
             })
         }
         fn set_available(&self, v: u64) {
@@ -422,10 +477,16 @@ mod tests {
         fn set_fail(&self, v: bool) {
             *self.fail.lock() = v;
         }
+        fn set_panic(&self, v: bool) {
+            *self.panic_on_probe.lock() = v;
+        }
     }
 
     impl SpaceProbe for FakeProbe {
         fn probe(&self, _path: &Path) -> std::io::Result<SpaceInfo> {
+            if *self.panic_on_probe.lock() {
+                panic!("injected probe panic");
+            }
             if *self.fail.lock() {
                 return Err(std::io::Error::other("injected probe failure"));
             }
@@ -632,5 +693,68 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(2048), "2.0 KiB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    /// Let the paused clock run until `cond` holds, bounded so a broken monitor
+    /// fails the test instead of hanging it.
+    async fn wait_for(cond: impl Fn() -> bool) {
+        for _ in 0..30 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    }
+
+    /// The promise in the operator-facing error is "writes resume
+    /// automatically". That is only true while the monitor keeps taking
+    /// readings: read-only is latched and nothing else clears it. A panicking
+    /// reading used to kill the spawned task silently, and the only recovery
+    /// was a restart — the reported symptom this guards against.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_reading_does_not_stop_the_monitor() {
+        let probe = FakeProbe::new(100 * GIB, 2 * GIB);
+        let (g, service) = guard(probe.clone(), marks());
+        let g = Arc::new(g);
+        assert_eq!(g.evaluate().level, DiskLevel::Critical);
+        assert!(service.is_read_only());
+
+        // A reading panics. Before supervision this killed the task outright.
+        probe.set_panic(true);
+        let handle = Arc::clone(&g).spawn_monitor(std::time::Duration::from_secs(30));
+
+        // Paused time auto-advances while every task is idle, so sleeping here
+        // lets the monitor's ticker fire without any real delay.
+        wait_for(|| g.monitor_panics() >= 1).await;
+        assert!(g.monitor_panics() >= 1, "the panic was not caught");
+        assert!(!handle.is_finished(), "the monitor task died on a panic");
+
+        // Space is freed. The monitor must still be alive to notice.
+        probe.set_panic(false);
+        probe.set_available(7 * GIB);
+        wait_for(|| !service.is_read_only()).await;
+        assert!(
+            !service.is_read_only(),
+            "writes did not resume automatically — a restart would be the only fix"
+        );
+        handle.abort();
+    }
+
+    /// Liveness is observable at all. Without a counter, "the monitor stopped"
+    /// and "the disk is still full" look identical from outside.
+    #[tokio::test(start_paused = true)]
+    async fn the_monitor_reports_that_it_is_still_taking_readings() {
+        let probe = FakeProbe::new(100 * GIB, 50 * GIB);
+        let (g, _service) = guard(probe, marks());
+        let g = Arc::new(g);
+        let handle = Arc::clone(&g).spawn_monitor(std::time::Duration::from_secs(30));
+
+        wait_for(|| g.checks_completed() >= 3).await;
+        assert!(
+            g.checks_completed() >= 3,
+            "the monitor is not taking readings: {} in 30 ticks",
+            g.checks_completed()
+        );
+        handle.abort();
     }
 }
