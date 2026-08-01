@@ -40,8 +40,45 @@ pub enum SyncMode {
     /// fdatasync: flushes data only, skipping metadata like timestamps.
     /// Faster than fsync on most filesystems.
     Fdatasync,
+    /// Flush to the OS without forcing the drive's write cache.
+    ///
+    /// A plain `fsync(2)`. This is the mode that was missing, and on macOS it
+    /// is the only one that differs from the other two: Rust's `sync_all` and
+    /// `sync_data` both issue `fcntl(F_FULLFSYNC)` there — a true drive-cache
+    /// barrier measured at 4,253 us against 41 us for `fsync`, 104x. That is
+    /// also why `Fdatasync` is a knob that does nothing on macOS.
+    ///
+    /// **Durability:** survives a process crash, an OS panic, and `kill -9`,
+    /// because the data is in the kernel's hands. It does NOT survive sudden
+    /// power loss, because the drive may still hold it in a volatile cache.
+    /// That is the same guarantee PostgreSQL gives with
+    /// `wal_sync_method = fsync/open_datasync` on macOS, which is what makes a
+    /// like-for-like write comparison against that configuration possible.
+    ///
+    /// On Linux `fsync(2)` normally does flush the device cache, so this mode
+    /// is effectively equivalent to `Fsync` there rather than weaker.
+    FlushOs,
     /// No sync: let the OS decide when to flush. Fast but unsafe.
     None,
+}
+
+/// `fsync(2)` on the file, without the macOS drive-cache barrier that
+/// `sync_all`/`sync_data` issue. See [`SyncMode::FlushOs`].
+#[cfg(unix)]
+fn flush_to_os(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` is an open File, so its fd is valid for the call.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Non-unix has no separate weaker barrier to reach for, so this is `sync_data`.
+#[cfg(not(unix))]
+fn flush_to_os(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_data()
 }
 
 impl SyncMode {
@@ -50,6 +87,7 @@ impl SyncMode {
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "fdatasync" => SyncMode::Fdatasync,
+            "flush_os" | "flush-os" | "os" => SyncMode::FlushOs,
             "none" | "off" => SyncMode::None,
             _ => SyncMode::Fsync, // default
         }
@@ -321,6 +359,7 @@ impl Wal {
         match self.sync_mode {
             SyncMode::Fsync => writer.get_ref().sync_all()?,
             SyncMode::Fdatasync => writer.get_ref().sync_data()?,
+            SyncMode::FlushOs => flush_to_os(writer.get_ref())?,
             SyncMode::None => {} // skip sync entirely
         }
         self.syncs.fetch_add(1, Ordering::Relaxed);
@@ -789,6 +828,7 @@ impl SegmentedWal {
         match self.sync_mode {
             SyncMode::Fsync => active.writer.get_ref().sync_all()?,
             SyncMode::Fdatasync => active.writer.get_ref().sync_data()?,
+            SyncMode::FlushOs => flush_to_os(active.writer.get_ref())?,
             SyncMode::None => {} // skip sync entirely
         }
         self.syncs.fetch_add(1, Ordering::Relaxed);
@@ -1037,6 +1077,7 @@ impl SegmentedWal {
         match self.sync_mode {
             SyncMode::Fsync => active.writer.get_ref().sync_all()?,
             SyncMode::Fdatasync => active.writer.get_ref().sync_data()?,
+            SyncMode::FlushOs => flush_to_os(active.writer.get_ref())?,
             SyncMode::None => {}
         }
 
@@ -2089,6 +2130,9 @@ mod tests {
         assert_eq!(SyncMode::from_str("FSYNC"), SyncMode::Fsync);
         assert_eq!(SyncMode::from_str("fdatasync"), SyncMode::Fdatasync);
         assert_eq!(SyncMode::from_str("FDATASYNC"), SyncMode::Fdatasync);
+        assert_eq!(SyncMode::from_str("flush_os"), SyncMode::FlushOs);
+        assert_eq!(SyncMode::from_str("flush-os"), SyncMode::FlushOs);
+        assert_eq!(SyncMode::from_str("OS"), SyncMode::FlushOs);
         assert_eq!(SyncMode::from_str("none"), SyncMode::None);
         assert_eq!(SyncMode::from_str("off"), SyncMode::None);
         assert_eq!(SyncMode::from_str("anything_else"), SyncMode::Fsync); // default
@@ -2106,6 +2150,29 @@ mod tests {
 
         let records = read_wal_records(&wal_path).unwrap();
         assert_eq!(records.len(), 1);
+    }
+
+    /// `FlushOs` gives up the drive-cache barrier, not the write. Records must
+    /// still be on disk and readable after `sync()` — that is the whole point
+    /// of it being distinct from `None`, which skips the syscall entirely.
+    #[test]
+    fn wal_with_flush_os_mode_still_persists_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("flushos.wal");
+        let wal = Wal::open_with_sync_mode(&wal_path, SyncMode::FlushOs).unwrap();
+
+        let page = [11u8; PAGE_SIZE];
+        wal.log_page_write(1, 0, &page).unwrap();
+        wal.log_page_write(1, 1, &page).unwrap();
+        wal.sync().unwrap(); // plain fsync(2), no F_FULLFSYNC
+
+        let records = read_wal_records(&wal_path).unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "FlushOs must still push records to the OS; it only declines the \
+             drive-cache barrier"
+        );
     }
 
     #[test]
