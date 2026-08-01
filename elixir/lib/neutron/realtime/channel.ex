@@ -72,12 +72,9 @@ defmodule Neutron.Realtime.Channel do
       require Logger
 
       @impl Neutron.Realtime.Channel
-      def handle_info(_msg, socket), do: {:noreply, socket}
-
-      @impl Neutron.Realtime.Channel
       def terminate(_reason, _socket), do: :ok
 
-      defoverridable handle_info: 2, terminate: 2
+      defoverridable terminate: 2
 
       # --- GenServer Implementation ---
 
@@ -139,12 +136,18 @@ defmodule Neutron.Realtime.Channel do
         {:stop, :normal, socket}
       end
 
-      def handle_info(msg, socket) do
-        case __MODULE__.handle_info(msg, socket) do
-          {:noreply, socket} -> {:noreply, socket}
-          {:stop, reason, socket} -> {:stop, reason, socket}
-        end
-      end
+      # Catch-all. This used to read `__MODULE__.handle_info(msg, socket)`,
+      # which is THIS function — `handle_info/2` is both the GenServer callback
+      # and the Channel callback, and the earlier default had already been
+      # consumed by `defoverridable`, so the call recursed into itself forever.
+      # Any message that was not the transport's `:DOWN` — every broadcast
+      # delivered to a channel subscribed to its own topic — spun the process at
+      # 100% CPU, deaf to system messages, so even `GenServer.stop/2` hung.
+      # Overridable so a channel can handle its own messages, with `super/2`
+      # for this behaviour.
+      def handle_info(_msg, socket), do: {:noreply, socket}
+
+      defoverridable handle_info: 2
 
       # --- Channel Helpers ---
 

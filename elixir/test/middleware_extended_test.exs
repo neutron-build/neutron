@@ -213,8 +213,12 @@ defmodule Neutron.MiddlewareExtendedTest do
     end
 
     test "raises when no router is configured" do
+      # Raised from `call/2`, not `init/1`: `Plug.Builder` runs `init/1` at
+      # compile time and `Neutron.Middleware` plugs Dispatch with no options,
+      # so an init-time check would fail the build instead.
       assert_raise KeyError, fn ->
-        Neutron.Middleware.Dispatch.init([])
+        conn(:get, "/hello")
+        |> Neutron.Middleware.Dispatch.call(Neutron.Middleware.Dispatch.init([]))
       end
     end
 

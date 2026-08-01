@@ -133,11 +133,27 @@ defmodule Neutron.Realtime.Socket do
         {:push, {:text, reply}, state}
 
       channel_module ->
-        case DynamicSupervisor.start_child(
-               Neutron.Realtime.Supervisor,
-               {channel_module,
-                topic: topic, params: payload, transport_pid: self()}
-             ) do
+        # `start_child/2` does not always return a tagged tuple: a channel
+        # module that is missing or not loaded makes `Supervisor.child_spec/2`
+        # RAISE, and an unavailable supervisor makes it EXIT. Either one
+        # propagating from here takes down the whole socket — and with it every
+        # other channel the client had joined — because one topic was
+        # misconfigured. Normalise both into the error reply the client
+        # already understands.
+        result =
+          try do
+            DynamicSupervisor.start_child(
+              Neutron.Realtime.Supervisor,
+              {channel_module,
+               topic: topic, params: payload, transport_pid: self()}
+            )
+          rescue
+            e -> {:error, Exception.message(e)}
+          catch
+            :exit, reason -> {:error, {:supervisor_unavailable, reason}}
+          end
+
+        case result do
           {:ok, pid} ->
             joined = Map.put(state.joined, topic, pid)
 
