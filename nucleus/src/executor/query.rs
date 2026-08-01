@@ -111,11 +111,36 @@ impl Executor {
         stmt: &Statement,
     ) -> Result<planner::PlanNode, ExecError> {
         match stmt {
-            Statement::Query(query) => self.plan_query(query).await,
+            // Normalize exactly as the executor does. EXPLAIN that plans the
+            // raw AST describes a plan the query will not use — for an aliased
+            // join it reported a join plan while execution ran the AST path.
+            Statement::Query(query) => {
+                let normalized = Self::plan_normalized_query(query);
+                self.plan_query(normalized.as_ref().unwrap_or(query)).await
+            }
             _ => Err(ExecError::Unsupported(
                 "EXPLAIN only supports SELECT queries".into(),
             )),
         }
+    }
+
+    /// The AST the plan path actually plans: table aliases resolved to base
+    /// table names, then comma joins folded into explicit joins. `None` when
+    /// neither rewrite applies and the original AST is already what gets
+    /// planned.
+    ///
+    /// Both the executor and EXPLAIN must go through this. They diverged
+    /// before, and a plan shown by EXPLAIN that the executor never runs is
+    /// worse than no plan at all.
+    pub(super) fn plan_normalized_query(query: &ast::Query) -> Option<ast::Query> {
+        let unaliased = match query.body.as_ref() {
+            SetExpr::Select(s) => Self::table_alias_map(s)
+                .filter(|m| !m.is_empty())
+                .map(|m| Self::resolve_table_aliases(query, &m)),
+            _ => None,
+        };
+        let base = unaliased.as_ref().unwrap_or(query);
+        Self::desugar_comma_joins(base).or(unaliased)
     }
 
     /// Build a plan tree for a SELECT query.
@@ -1560,14 +1585,176 @@ impl Executor {
         Ok(Some(ExecResult::SelectStream { columns, source }))
     }
 
+    /// Map every table alias in a FROM clause to the base table it names.
+    ///
+    /// `None` means the aliases cannot be resolved by renaming and the caller
+    /// must not try: two relations in the same FROM resolve to the SAME base
+    /// table (a self-join), where rewriting `a.id` and `b.id` both to
+    /// `orders.id` would merge two distinct relations and quietly produce the
+    /// wrong join. `None` is also returned for a relation that is not a plain
+    /// named table, since it has no base name to rewrite to.
+    ///
+    /// An empty map means "no aliases to resolve", which is a success.
+    pub(super) fn table_alias_map(select: &ast::Select) -> Option<HashMap<String, String>> {
+        let mut map = HashMap::new();
+        let mut bases: HashSet<String> = HashSet::new();
+        for twj in &select.from {
+            let factors =
+                std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation));
+            for factor in factors {
+                let TableFactor::Table { name, alias, .. } = factor else {
+                    return None;
+                };
+                let base = crate::sql::object_name_key(name);
+                if !bases.insert(base.to_lowercase()) {
+                    return None;
+                }
+                if let Some(a) = alias
+                    && !a.name.value.eq_ignore_ascii_case(&base)
+                {
+                    map.insert(a.name.value.to_lowercase(), base);
+                }
+            }
+        }
+        Some(map)
+    }
+
+    /// Rewrite `alias.col` to `table.col` throughout a query, and drop the
+    /// aliases that made the rewrite necessary.
+    ///
+    /// The plan path labels every scanned column with its real table name, so
+    /// `u.id` resolved against nothing and the eligibility gate rejected every
+    /// aliased join outright — which is nearly every join anyone writes. The
+    /// alternative was to thread an output qualifier through each plan node and
+    /// its twenty construction sites; renaming the references up front reaches
+    /// the same place without giving the plan tree a second notion of identity.
+    fn resolve_table_aliases(query: &ast::Query, map: &HashMap<String, String>) -> ast::Query {
+        use std::ops::ControlFlow;
+        let mut q = query.clone();
+        let _ = sqlparser::ast::visit_expressions_mut(&mut q, |e: &mut Expr| {
+            if let Expr::CompoundIdentifier(parts) = e
+                && parts.len() >= 2
+                && let Some(base) = map.get(&parts[parts.len() - 2].value.to_lowercase())
+            {
+                let qual = parts.len() - 2;
+                parts[qual].value = base.clone();
+                parts[qual].quote_style = None;
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        if let SetExpr::Select(select) = q.body.as_mut() {
+            for twj in &mut select.from {
+                let factors = std::iter::once(&mut twj.relation)
+                    .chain(twj.joins.iter_mut().map(|j| &mut j.relation));
+                for factor in factors {
+                    if let TableFactor::Table { alias, .. } = factor {
+                        *alias = None;
+                    }
+                }
+            }
+        }
+        q
+    }
+
+    /// True when `expr` is an equality joining a column of `left` to a column
+    /// of `right` — the condition a comma join leaves stranded in its WHERE.
+    fn bridges_relations(
+        expr: &Expr,
+        left: &HashSet<String>,
+        right: &HashSet<String>,
+    ) -> bool {
+        let Expr::BinaryOp {
+            left: l,
+            op: ast::BinaryOperator::Eq,
+            right: r,
+        } = expr
+        else {
+            return false;
+        };
+        let qualifier = |e: &Expr| match e {
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                Some(parts[parts.len() - 2].value.to_lowercase())
+            }
+            _ => None,
+        };
+        let (Some(lq), Some(rq)) = (qualifier(l), qualifier(r)) else {
+            return false;
+        };
+        (left.contains(&lq) && right.contains(&rq)) || (left.contains(&rq) && right.contains(&lq))
+    }
+
+    /// Rewrite `FROM a, b WHERE a.k = b.k` into `FROM a JOIN b ON a.k = b.k`.
+    ///
+    /// The two spellings are the same query, but only the second one could be
+    /// planned: `plan_query` walks `from.first()` and its explicit joins, so a
+    /// comma join would have silently dropped `from[1..]`, and the eligibility
+    /// gate rejected the shape outright rather than return wrong rows.
+    ///
+    /// Promoting the bridging equality out of the WHERE and into an ON is the
+    /// part that matters. Left in the WHERE it is a filter over a full cross
+    /// product, which is both quadratic and liable to trip the cross-join row
+    /// ceiling on tables that join to a perfectly ordinary result.
+    fn desugar_comma_joins(query: &ast::Query) -> Option<ast::Query> {
+        {
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                return None;
+            };
+            if select.from.len() < 2
+                || select.from.iter().any(|t| {
+                    !t.joins.is_empty() || !matches!(t.relation, TableFactor::Table { .. })
+                })
+            {
+                return None;
+            }
+        }
+        let mut q = query.clone();
+        let SetExpr::Select(select) = q.body.as_mut() else {
+            return None;
+        };
+
+        let mut conjuncts: Vec<Expr> = match &select.selection {
+            Some(e) => planner::split_conjunction(e).into_iter().cloned().collect(),
+            None => Vec::new(),
+        };
+
+        let mut joined = Self::table_factor_names(&select.from[0].relation);
+        let mut joins: Vec<ast::Join> = Vec::new();
+        for twj in &select.from[1..] {
+            let right = Self::table_factor_names(&twj.relation);
+            let bridge = conjuncts
+                .iter()
+                .position(|c| Self::bridges_relations(c, &joined, &right))
+                .map(|i| conjuncts.remove(i));
+            // No bridging equality is a genuine cross join, not a failure —
+            // `FROM a, b` with an unrelated WHERE means the cartesian product.
+            let join_operator = match bridge {
+                Some(on) => ast::JoinOperator::Inner(ast::JoinConstraint::On(on)),
+                None => ast::JoinOperator::CrossJoin(ast::JoinConstraint::None),
+            };
+            joins.push(ast::Join {
+                relation: twj.relation.clone(),
+                global: false,
+                join_operator,
+            });
+            joined.extend(right);
+        }
+
+        select.selection = Self::combine_predicates(conjuncts);
+        let mut base = select.from[0].clone();
+        base.joins = joins;
+        select.from = vec![base];
+        Some(q)
+    }
+
     /// Check if a SELECT query is safe enough for plan-driven execution.
     /// Returns false for subqueries and expression features we still cannot
     /// evaluate correctly in the plan path.
     pub(super) fn query_eligible_for_plan(select: &ast::Select, query: &ast::Query) -> bool {
-        // Comma-separated FROM (implicit cross/hash join: `FROM a, b`) is not
-        // handled by the plan path — plan_query only walks select.from.first()
-        // and its explicit joins, silently dropping from[1..]. Fall back to AST
-        // execution (build_from_rows_with_ctes), which forms the full product.
+        // Comma-separated FROM (`FROM a, b`) reaches the plan path only after
+        // `desugar_comma_joins` has folded it into explicit joins —
+        // `plan_query` walks `from.first()` and its joins, and would silently
+        // drop `from[1..]`. Anything still carrying multiple FROM entries here
+        // is a shape the rewrite declined; it belongs on the AST path.
         if select.from.len() > 1 {
             return false;
         }
@@ -1638,31 +1825,14 @@ impl Executor {
                 TableFactor::Derived { .. } | TableFactor::NestedJoin { .. } => return false,
                 _ => {}
             }
-            // Table aliases in join queries break condition evaluation in the plan path
-            // because SeqScan meta uses the actual table name, not the alias.
-            // Fall back to AST execution when joins use aliases.
-            if !from.joins.is_empty() {
-                let base_alias = if let TableFactor::Table { alias, name, .. } = &from.relation {
-                    alias
-                        .as_ref()
-                        .map(|a| a.name.value != crate::sql::object_name_key(name))
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                let join_has_alias = from.joins.iter().any(|j| {
-                    if let TableFactor::Table { alias, name, .. } = &j.relation {
-                        alias
-                            .as_ref()
-                            .map(|a| a.name.value != crate::sql::object_name_key(name))
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                });
-                if base_alias || join_has_alias {
-                    return false;
-                }
+            // Table aliases in join queries break condition evaluation in the
+            // plan path because a scan labels its columns with the real table
+            // name, not the alias. `resolve_table_aliases` rewrites the
+            // references before planning; this only has to reject the cases it
+            // cannot rewrite — chiefly a self-join, where two aliases name the
+            // same base table and renaming would merge them.
+            if !from.joins.is_empty() && Self::table_alias_map(select).is_none() {
+                return false;
             }
         }
         // No UNION/INTERSECT/EXCEPT
@@ -2454,6 +2624,238 @@ impl Executor {
         }
     }
 
+    /// Split a join-key spec (`orders.user_id`) into its qualifier and column.
+    fn split_col_spec(spec: &str) -> (Option<String>, String) {
+        let s = spec.trim().trim_matches('"');
+        match s.rsplit_once('.') {
+            Some((q, c)) => (
+                Some(q.trim().trim_matches('"').to_lowercase()),
+                c.trim().trim_matches('"').to_string(),
+            ),
+            None => (None, s.to_string()),
+        }
+    }
+
+    /// Index nested-loop join for the plan path.
+    ///
+    /// Both plan-path join strategies materialize BOTH inputs: a hash join that
+    /// emits 100 rows still reads all 50,000 rows of the other table just to
+    /// build its side. The AST path has had an index nested-loop for exactly
+    /// this shape all along (`try_index_join`) — which is why simply making
+    /// joins *reach* the plan executor measured **100x slower**, 8.5–9.0 ms
+    /// against 87.5 µs, alternating on one binary. Reaching the planner is only
+    /// an improvement if the planner can do the thing the other path was doing.
+    ///
+    /// Returns `None` whenever the shape does not qualify, so the caller falls
+    /// through to the hash join unchanged.
+    async fn try_plan_index_join(
+        &self,
+        left: &planner::PlanNode,
+        right: &planner::PlanNode,
+        key: &str,
+        cte_tables: &CteTableMap,
+    ) -> Result<Option<(Vec<ColMeta>, Vec<Row>)>, ExecError> {
+        // Committed indexes cannot see an open transaction's own writes — the
+        // same guard the IndexScan arm applies, for the same reason.
+        if self
+            .current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(true)
+        {
+            return Ok(None);
+        }
+        let Some((lhs, rhs)) = key.split_once('=') else {
+            return Ok(None);
+        };
+        let specs = [Self::split_col_spec(lhs), Self::split_col_spec(rhs)];
+
+        for inner_is_left in [true, false] {
+            let (inner_plan, outer_plan) = if inner_is_left {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            // The inner side must be a whole base table: a filter, projection
+            // or limit on it means the index would skip rows the scan keeps.
+            let planner::PlanNode::SeqScan {
+                table,
+                filter: None,
+                filter_expr: None,
+                projection: None,
+                scan_limit: None,
+                ..
+            } = inner_plan
+            else {
+                continue;
+            };
+            let Ok(table_def) = self.get_table(table).await else {
+                continue;
+            };
+
+            // Which half of the key belongs to the inner table.
+            let table_lower = table.to_lowercase();
+            let Some(pos) = specs
+                .iter()
+                .position(|(q, _)| q.as_deref() == Some(table_lower.as_str()))
+            else {
+                continue;
+            };
+            let inner_col = &specs[pos].1;
+            let outer_spec = &specs[1 - pos];
+
+            let indexes = self.catalog.get_indexes_cached(table).unwrap_or_default();
+            let Some(index) = indexes.iter().find(|i| {
+                i.columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(inner_col))
+                    && i.columns.len() == 1
+            }) else {
+                continue;
+            };
+
+            let Some(inner_count) = self.storage_for(table).fast_count_all(table) else {
+                continue;
+            };
+            if inner_count == 0 {
+                continue;
+            }
+
+            let (outer_meta, outer_rows) = self.execute_plan_node(outer_plan, cte_tables).await?;
+            // Probing costs one index descent per outer row, so it only wins
+            // while the outer side is small against the table it is probing.
+            // A non-unique index can return many rows per probe, so it needs
+            // more headroom before it beats one sequential pass.
+            let budget = if index.unique {
+                inner_count
+            } else {
+                inner_count / 4
+            };
+            if outer_rows.len() >= budget {
+                return Ok(None);
+            }
+
+            let outer_spec_str = match &outer_spec.0 {
+                Some(q) => format!("{q}.{}", outer_spec.1),
+                None => outer_spec.1.clone(),
+            };
+            let Some(outer_idx) =
+                Self::resolve_plan_col_idx_for_join_side(&outer_meta, &outer_spec_str)
+            else {
+                return Ok(None);
+            };
+
+            // Resolved ONCE, and a miss declines the whole strategy. Computing
+            // it per row with an `unwrap_or(usize::MAX)` fallback would turn a
+            // column that could not be located into `Some(kv) != None` for
+            // every row — an empty join reported as the answer.
+            let Some(inner_col_idx) = table_def
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(inner_col))
+            else {
+                return Ok(None);
+            };
+
+            let inner_meta: Vec<ColMeta> = table_def
+                .columns
+                .iter()
+                .map(|c| ColMeta {
+                    table: Some(table.clone()),
+                    name: c.name.clone(),
+                    dtype: c.data_type.clone(),
+                })
+                .collect();
+
+            // Pre-flight: an engine with no index-lookup support answers
+            // `Ok(None)`, which is indistinguishable from "no matching rows".
+            // Probing on it would return an empty join instead of declining.
+            let probe = outer_rows
+                .iter()
+                .filter_map(|r| r.get(outer_idx))
+                .find(|v| !matches!(v, Value::Null));
+            let Some(first) = probe else {
+                // Every key is NULL, and NULL never equi-joins.
+                let meta = if inner_is_left {
+                    [inner_meta, outer_meta].concat()
+                } else {
+                    [outer_meta, inner_meta].concat()
+                };
+                return Ok(Some((meta, Vec::new())));
+            };
+            let coerced = Self::coerce_index_value(
+                first.clone(),
+                table,
+                &index.name,
+                &table_def,
+                &self.catalog,
+            );
+            if !matches!(
+                self.storage_for(table)
+                    .index_lookup(table, &index.name, &coerced)
+                    .await,
+                Ok(Some(_))
+            ) {
+                return Ok(None);
+            }
+
+            let mut result_rows = Vec::new();
+            for orow in &outer_rows {
+                let Some(kv) = orow.get(outer_idx) else {
+                    continue;
+                };
+                if matches!(kv, Value::Null) {
+                    continue;
+                }
+                let coerced = Self::coerce_index_value(
+                    kv.clone(),
+                    table,
+                    &index.name,
+                    &table_def,
+                    &self.catalog,
+                );
+                let Ok(Some(matches)) = self
+                    .storage_for(table)
+                    .index_lookup(table, &index.name, &coerced)
+                    .await
+                else {
+                    return Ok(None);
+                };
+                for irow in matches {
+                    // The index is an access path, not the predicate: it can
+                    // propose a row whose key merely encodes alike. Re-check.
+                    if irow.get(inner_col_idx) != Some(kv) {
+                        continue;
+                    }
+                    // `irow` is owned and used once, so it is MOVED into the
+                    // output; only the outer row, which is reused across
+                    // probes, has to be cloned. Cloning both copied every
+                    // string twice per result row.
+                    let combined: Row = if inner_is_left {
+                        let mut v = irow;
+                        v.extend(orow.iter().cloned());
+                        v
+                    } else {
+                        let mut v = orow.clone();
+                        v.extend(irow);
+                        v
+                    };
+                    result_rows.push(combined);
+                }
+            }
+            drop(self.reserve_query_memory(Self::estimate_rows_bytes(&result_rows))?);
+            let meta = if inner_is_left {
+                [inner_meta, outer_meta].concat()
+            } else {
+                [outer_meta, inner_meta].concat()
+            };
+            self.metrics.index_join_used.inc();
+            return Ok(Some((meta, result_rows)));
+        }
+        Ok(None)
+    }
+
     /// Parse a SQL expression string back into an AST Expr.
     pub(super) fn parse_expr_string(s: &str) -> Result<Expr, ExecError> {
         use sqlparser::dialect::PostgreSqlDialect;
@@ -2774,24 +3176,47 @@ impl Executor {
                             .and_then(|s| Self::parse_expr_string(s).ok())
                     });
 
-                    if let (Some(lo_expr), Some(hi_expr)) = (lo_resolved, hi_resolved)
-                        && let (Ok(lo_raw), Ok(hi_raw)) = (
-                            self.eval_const_expr(&lo_expr),
-                            self.eval_const_expr(&hi_expr),
+                    // A one-sided range (`id < 100`) is a range scan with one
+                    // open end, not a missing plan. Requiring BOTH bounds here
+                    // meant every such predicate fell through to the equality
+                    // branch below, which cannot read a `<` and declined — so
+                    // the index was lost AND the query re-ran on the AST path.
+                    // Only "neither bound" means this is not a range scan.
+                    let bound_of = |e: Option<&Expr>| -> Option<Option<Value>> {
+                        match e {
+                            None => Some(None),
+                            Some(expr) => self.eval_const_expr(expr).ok().map(Some),
+                        }
+                    };
+                    if (lo_resolved.is_some() || hi_resolved.is_some())
+                        && let (Some(lo_raw), Some(hi_raw)) = (
+                            bound_of(lo_resolved.as_ref()),
+                            bound_of(hi_resolved.as_ref()),
                         )
                     {
                         // Coerce range bounds to indexed column type (Int64→Int32 for INT columns)
-                        let (lo_val, hi_val) = Self::coerce_index_bounds(
-                            lo_raw,
-                            hi_raw,
-                            table,
-                            index_name,
-                            &table_def,
-                            &self.catalog,
-                        );
+                        let coerce = |v: Value| {
+                            Self::coerce_index_value(
+                                v,
+                                table,
+                                index_name,
+                                &table_def,
+                                &self.catalog,
+                            )
+                        };
+                        let lo_val = lo_raw.map(coerce);
+                        let hi_val = hi_raw.map(coerce);
+                        let lo_bound = match &lo_val {
+                            Some(v) => std::ops::Bound::Included(v),
+                            None => std::ops::Bound::Unbounded,
+                        };
+                        let hi_bound = match &hi_val {
+                            Some(v) => std::ops::Bound::Included(v),
+                            None => std::ops::Bound::Unbounded,
+                        };
                         if let Ok(Some(mut rows)) = self
                             .storage_for(table)
-                            .index_lookup_range(table, index_name, &lo_val, &hi_val)
+                            .index_lookup_range(table, index_name, lo_bound, hi_bound)
                             .await
                         {
                             // Post-filter: enforce strict bounds and residual predicates.
@@ -3453,6 +3878,15 @@ impl Executor {
                     hash_keys,
                     ..
                 } => {
+                    // Probe an index instead of reading a whole table, when the
+                    // shape allows it. Falls through to the hash join otherwise.
+                    if let Some(key) = hash_keys.first()
+                        && hash_keys.len() == 1
+                        && let Some(joined) =
+                            self.try_plan_index_join(left, right, key, cte_tables).await?
+                    {
+                        return Ok(joined);
+                    }
                     let (left_meta, left_rows) = self.execute_plan_node(left, cte_tables).await?;
                     let (right_meta, right_rows) =
                         self.execute_plan_node(right, cte_tables).await?;
@@ -4097,6 +4531,22 @@ impl Executor {
         })
     }
 
+    /// True when `spec` is a bare or dotted column reference (`price`,
+    /// `p.price`, `"my col"`), as opposed to an expression that merely
+    /// contains a dot (`l.qty * p.price`, `COUNT(*)`).
+    ///
+    /// Operators, whitespace and parentheses are what separate the two, so a
+    /// quoted identifier containing any of them (`"my col"`) is not recognised
+    /// here and simply misses this path — it still resolves by exact name
+    /// above. Failing to recognise a column reference costs a lookup; mistaking
+    /// an expression for one returns the wrong column's value.
+    fn spec_is_column_reference(spec: &str) -> bool {
+        !spec.is_empty()
+            && spec
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.' | '"'))
+    }
+
     pub(super) fn resolve_plan_col_idx(meta: &[ColMeta], col_spec: &str) -> Option<usize> {
         if let Some(idx) = meta
             .iter()
@@ -4110,29 +4560,38 @@ impl Executor {
         // `users.name` to the first `name` column of a join — a wrong-RESULT
         // bug whenever two joined tables share a column name.
         let trimmed = col_spec.trim();
-        if let Some(dot) = trimmed.rfind('.') {
-            let table = trimmed[..dot].trim().trim_matches('"');
-            let col = trimmed[dot + 1..].trim().trim_matches('"');
-            if let Some(idx) = meta.iter().position(|c| {
-                c.name.eq_ignore_ascii_case(col)
-                    && c.table
-                        .as_deref()
-                        .is_some_and(|t| t.eq_ignore_ascii_case(table))
-            }) {
+        //
+        // ...but ONLY when the spec is itself a column reference. Splitting an
+        // arbitrary expression on its last `.` resolved `l.qty * p.price` to
+        // the column `price`, so the projection returned one operand in place
+        // of the product — and `p.price * l.qty` returned the other one. An
+        // expression must fall through to the evaluator below, never be
+        // mistaken for the column whose name happens to end the string.
+        if Self::spec_is_column_reference(trimmed) {
+            if let Some(dot) = trimmed.rfind('.') {
+                let table = trimmed[..dot].trim().trim_matches('"');
+                let col = trimmed[dot + 1..].trim().trim_matches('"');
+                if let Some(idx) = meta.iter().position(|c| {
+                    c.name.eq_ignore_ascii_case(col)
+                        && c.table
+                            .as_deref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(table))
+                }) {
+                    return Some(idx);
+                }
+            }
+
+            let unqualified = trimmed
+                .split('.')
+                .next_back()
+                .unwrap_or(col_spec)
+                .trim_matches('"');
+            if let Some(idx) = meta
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(unqualified))
+            {
                 return Some(idx);
             }
-        }
-
-        let unqualified = trimmed
-            .split('.')
-            .next_back()
-            .unwrap_or(col_spec)
-            .trim_matches('"');
-        if let Some(idx) = meta
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(unqualified))
-        {
-            return Some(idx);
         }
 
         // Expression spec vs default-named output column: plan nodes name
@@ -4968,10 +5427,18 @@ impl Executor {
                     .get("plan_execution")
                     .map(|v| !v.eq_ignore_ascii_case("off"))
                     .unwrap_or(true); // default ON
+                // `planned_query` is the query the plan path actually plans:
+                // the original with table aliases resolved to base table names.
+                // Everything downstream — planning, the cached-plan literal
+                // transplant, EXPLAIN — must read the SAME AST, or a cached
+                // plan built from resolved names gets this statement's
+                // unresolved WHERE grafted onto it.
+                let normalized = Self::plan_normalized_query(&query);
+                let planned_query = normalized.as_ref().unwrap_or(&query);
                 if use_plan
                     && !rls_guarded
-                    && let SetExpr::Select(ref select) = *query.body
-                    && Self::query_eligible_for_plan(select, &query)
+                    && let SetExpr::Select(ref select) = *planned_query.body
+                    && Self::query_eligible_for_plan(select, planned_query)
                 {
                     // Use pre-computed normalized key from parse_with_ast_cache()
                     // when available (avoids expensive query.to_string() + re-normalize).
@@ -4994,7 +5461,7 @@ impl Executor {
                         // outside the WHERE (projection / GROUP BY / HAVING / ORDER BY);
                         // otherwise the cached plan would keep the previously-planned
                         // query's literals there. Re-plan from the current AST when not.
-                        if Self::plan_reuse_is_literal_safe(&query, select)
+                        if Self::plan_reuse_is_literal_safe(planned_query, select)
                             && let Some(reused) = Self::try_reuse_plan(cached, select)
                         {
                             crate::bench_hooks::record_plan(0);
@@ -5003,12 +5470,12 @@ impl Executor {
                             // Not literal-safe to transplant, or transplant failed —
                             // re-plan with the current (correctly-substituted) AST.
                             crate::bench_hooks::record_plan(1);
-                            self.plan_query(&query).await.ok()
+                            self.plan_query(planned_query).await.ok()
                         }
                     } else {
                         // Cache miss — plan from scratch, check executability
                         crate::bench_hooks::record_plan(2);
-                        self.plan_query(&query)
+                        self.plan_query(planned_query)
                             .await
                             .ok()
                             .filter(Self::plan_is_executable)
@@ -5056,6 +5523,7 @@ impl Executor {
                             self.metrics.plan_path_fallbacks.inc();
                         }
                         if let Ok((meta, rows)) = planned {
+                            self.metrics.plan_path_served.inc();
                             let columns: Vec<(String, DataType)> = meta
                                 .iter()
                                 .map(|c| (c.name.clone(), c.dtype.clone()))
@@ -5850,9 +6318,12 @@ impl Executor {
         low: &Value,
         high: &Value,
     ) -> Option<Vec<Row>> {
-        if let Ok(Some(rows)) = self
-            .storage_for(table_name)
-            .index_lookup_range_sync(table_name, index_name, low, high)
+        if let Ok(Some(rows)) = self.storage_for(table_name).index_lookup_range_sync(
+            table_name,
+            index_name,
+            std::ops::Bound::Included(low),
+            std::ops::Bound::Included(high),
+        )
         {
             return Some(rows);
         }
@@ -6617,30 +7088,6 @@ impl Executor {
     }
 
     /// Coerce range bounds to the indexed column's data type.
-    fn coerce_index_bounds(
-        lo: Value,
-        hi: Value,
-        table: &str,
-        index_name: &str,
-        table_def: &crate::catalog::TableDef,
-        catalog: &crate::catalog::Catalog,
-    ) -> (Value, Value) {
-        let idx_defs = catalog.get_indexes_cached(table).unwrap_or_default();
-        if let Some(idx) = idx_defs.iter().find(|i| i.name == index_name)
-            && let Some(col_name) = idx.columns.first()
-            && let Some(col) = table_def
-                .columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(col_name))
-        {
-            return (
-                Self::coerce_to_column_type(&lo, &col.data_type),
-                Self::coerce_to_column_type(&hi, &col.data_type),
-            );
-        }
-        (lo, hi)
-    }
-
     /// Coerce an index lookup value to the indexed column's data type.
     fn coerce_index_value(
         val: Value,
@@ -9282,8 +9729,10 @@ impl Executor {
         mut cached_plan: planner::PlanNode,
         select: &ast::Select,
     ) -> Option<planner::PlanNode> {
-        // Only handle single-table queries (no JOINs)
-        if select.from.len() != 1 || !select.from.first().is_none_or(|f| f.joins.is_empty()) {
+        // Joins ARE reusable now (see `transplant_join_sides`); what is not is
+        // a comma FROM that reached here un-desugared, since the plan tree has
+        // no node corresponding to `from[1..]`.
+        if select.from.len() != 1 {
             return None;
         }
         let where_expr = select.selection.clone();
@@ -9292,6 +9741,25 @@ impl Executor {
         } else {
             None
         }
+    }
+
+    /// Whether `expr` contains any literal value that a cached plan could hold
+    /// stale. Used to decide plan reuse, so it errs toward "yes" — an
+    /// expression it cannot walk is treated as carrying one.
+    fn expr_contains_literal(expr: &Expr) -> bool {
+        use std::ops::ControlFlow;
+        let mut owned = expr.clone();
+        let found = sqlparser::ast::visit_expressions_mut(&mut owned, |e: &mut Expr| {
+            match e {
+                // A typed literal (`TIMESTAMP '…'`) and an INTERVAL are values
+                // just as much as a bare number is.
+                Expr::Value(_) | Expr::TypedString(_) | Expr::Interval(_) => {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        });
+        found.is_break()
     }
 
     /// Whether a cached plan can be reused for `select` by only transplanting the
@@ -9311,7 +9779,13 @@ impl Executor {
     /// the second (full-scale differential-fuzzer finding, seed 305419896).
     fn plan_reuse_is_literal_safe(query: &ast::Query, select: &ast::Select) -> bool {
         use ast::Expr;
-        let is_col = |e: &Expr| matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+        // The hazard is a STALE LITERAL kept from whichever query first
+        // populated the entry, so the precise test is "does this expression
+        // contain a literal", not "is it a bare column". Requiring bare columns
+        // also disqualified `COUNT(*)` and `AVG(amount)`, which carry no
+        // literal and cannot go stale — that alone forced every aggregate
+        // query to re-plan on a cache HIT.
+        let is_col = |e: &Expr| !Self::expr_contains_literal(e);
         // Projection: bare columns or wildcards only.
         let proj_ok = select.projection.iter().all(|item| match item {
             ast::SelectItem::UnnamedExpr(e) => is_col(e),
@@ -9348,6 +9822,76 @@ impl Executor {
     /// Recursively traverse the plan tree to find the leaf scan node and
     /// transplant the current WHERE clause expressions into it.
     /// Returns true if transplanting succeeded.
+    /// Base tables scanned anywhere under `plan`, lowercased.
+    ///
+    /// Used to re-partition a WHERE clause across a cached join plan the same
+    /// way `plan_query` partitioned it when the plan was built.
+    fn collect_plan_tables(plan: &planner::PlanNode, out: &mut HashSet<String>) {
+        match plan {
+            planner::PlanNode::SeqScan { table, .. }
+            | planner::PlanNode::IndexScan { table, .. } => {
+                out.insert(table.to_lowercase());
+            }
+            planner::PlanNode::NestedLoopJoin { left, right, .. }
+            | planner::PlanNode::HashJoin { left, right, .. } => {
+                Self::collect_plan_tables(left, out);
+                Self::collect_plan_tables(right, out);
+            }
+            planner::PlanNode::Filter { input, .. }
+            | planner::PlanNode::Sort { input, .. }
+            | planner::PlanNode::Limit { input, .. }
+            | planner::PlanNode::Project { input, .. }
+            | planner::PlanNode::HashAggregate { input, .. }
+            | planner::PlanNode::Aggregate { input, .. } => {
+                Self::collect_plan_tables(input, out)
+            }
+        }
+    }
+
+    /// Re-push a WHERE clause into the two sides of a cached join plan.
+    ///
+    /// Mirrors `plan_query`'s partitioning exactly — a predicate belongs to a
+    /// side when it references that side's tables and only those, and anything
+    /// referencing both (or nothing) is residual and belongs to the Filter
+    /// above the join. Returns the residual, or `None` if a side could not be
+    /// transplanted.
+    ///
+    /// Two implementations of "which side does this predicate belong to" would
+    /// be free to drift, and the failure mode is a wrong answer, so this reuses
+    /// `partition_predicates_for_relation` rather than re-deriving the rule.
+    fn transplant_join_sides(
+        left: &mut planner::PlanNode,
+        right: &mut planner::PlanNode,
+        preds: Vec<Expr>,
+    ) -> Option<Vec<Expr>> {
+        let mut left_tables = HashSet::new();
+        Self::collect_plan_tables(left, &mut left_tables);
+        let mut right_tables = HashSet::new();
+        Self::collect_plan_tables(right, &mut right_tables);
+        // A table on both sides is a self-join; the qualifier no longer picks
+        // out one relation, so decline rather than guess.
+        if left_tables.is_empty()
+            || right_tables.is_empty()
+            || !left_tables.is_disjoint(&right_tables)
+        {
+            return None;
+        }
+
+        let (left_preds, rest) = Self::partition_predicates_for_relation(preds, &left_tables);
+        let (right_preds, residual) =
+            Self::partition_predicates_for_relation(rest, &right_tables);
+
+        let left_where = Self::combine_predicates(left_preds);
+        let right_where = Self::combine_predicates(right_preds);
+        if !Self::transplant_scan_exprs(left, &left_where) {
+            return None;
+        }
+        if !Self::transplant_scan_exprs(right, &right_where) {
+            return None;
+        }
+        Some(residual)
+    }
+
     fn transplant_scan_exprs(plan: &mut planner::PlanNode, where_expr: &Option<ast::Expr>) -> bool {
         match plan {
             // Leaf: SeqScan — replace filter with current WHERE
@@ -9381,18 +9925,48 @@ impl Executor {
                     *lookup_key_expr = Some(expr.clone());
                     *lookup_key = Some(expr.to_string());
                     true
-                } else if range_lo_expr.is_some() {
-                    // Range IndexScan: extract bounds from BETWEEN
-                    if let ast::Expr::Between { low, high, .. } = expr {
-                        *range_lo_expr = Some(*low.clone());
-                        *range_lo = Some(low.to_string());
-                        *range_hi_expr = Some(*high.clone());
-                        *range_hi = Some(high.to_string());
-                        *range_predicate_expr = Some(expr.clone());
-                        *range_predicate = Some(expr.to_string());
-                        true
-                    } else {
-                        false
+                } else if range_lo_expr.is_some() || range_hi_expr.is_some() {
+                    // Range IndexScan. `BETWEEN` sets both ends; a one-sided
+                    // comparison (`id < 100`) sets one and leaves the other
+                    // open. Handling only BETWEEN here meant every one-sided
+                    // range re-planned on a cache HIT — measured at 50.2 us
+                    // per call against 38.3 us for the BETWEEN spelling of the
+                    // same scan, on identical rows.
+                    match expr {
+                        ast::Expr::Between { low, high, .. } => {
+                            *range_lo_expr = Some(*low.clone());
+                            *range_lo = Some(low.to_string());
+                            *range_hi_expr = Some(*high.clone());
+                            *range_hi = Some(high.to_string());
+                            *range_predicate_expr = Some(expr.clone());
+                            *range_predicate = Some(expr.to_string());
+                            true
+                        }
+                        _ => {
+                            // Same extractor the planner used to build these
+                            // bounds; a second opinion on which side a `<` is
+                            // would be free to drift from it.
+                            let Some((_, bound)) = planner::extract_range_bound(expr) else {
+                                return false;
+                            };
+                            // The cache key preserves the operator, so a shared
+                            // entry always bounds the same side. A mismatch
+                            // means the key is not describing the plan.
+                            if bound.is_lo != range_lo_expr.is_some() {
+                                return false;
+                            }
+                            let parsed = Self::parse_expr_string(&bound.val).ok();
+                            if bound.is_lo {
+                                *range_lo_expr = parsed;
+                                *range_lo = Some(bound.val);
+                            } else {
+                                *range_hi_expr = parsed;
+                                *range_hi = Some(bound.val);
+                            }
+                            *range_predicate_expr = Some(expr.clone());
+                            *range_predicate = Some(expr.to_string());
+                            true
+                        }
                     }
                 } else {
                     false
@@ -9410,11 +9984,57 @@ impl Executor {
                     Some(e) => e,
                     None => return false,
                 };
+                // A join underneath means the predicates were split across the
+                // two sides when this plan was built, and the Filter kept only
+                // what belonged to neither. The scan-oriented logic below
+                // assumes a single scan child and cannot express that.
+                if matches!(
+                    input.as_ref(),
+                    planner::PlanNode::HashJoin { .. } | planner::PlanNode::NestedLoopJoin { .. }
+                ) {
+                    let preds: Vec<Expr> = planner::split_conjunction(full_where)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    let (l, r) = match input.as_mut() {
+                        planner::PlanNode::HashJoin { left, right, .. }
+                        | planner::PlanNode::NestedLoopJoin { left, right, .. } => (left, right),
+                        _ => unreachable!("guarded by the matches! above"),
+                    };
+                    let Some(residual) = Self::transplant_join_sides(l, r, preds) else {
+                        return false;
+                    };
+                    // No residual means the planner would not have built this
+                    // Filter — the cached structure does not match this query.
+                    let Some(combined) = Self::combine_predicates(residual) else {
+                        return false;
+                    };
+                    *predicate = combined.to_string();
+                    *predicate_expr = Some(combined);
+                    return true;
+                }
+
                 // Split the WHERE into conjunction predicates
                 let preds: Vec<&ast::Expr> = planner::split_conjunction(full_where);
-                if preds.len() < 2 {
-                    // Single predicate but plan has Filter+Scan — structure mismatch
+                if preds.is_empty() {
                     return false;
+                }
+                if preds.len() == 1 {
+                    // NOT a structure mismatch. A two-sided range index scan
+                    // narrows to [lo, hi] and the planner deliberately leaves
+                    // the FULL predicate on the Filter above it, because the
+                    // scan's bounds are inclusive and the predicate may be
+                    // strict. One predicate feeding both nodes is exactly that
+                    // shape, and rejecting it re-planned every `BETWEEN` query
+                    // on a cache hit. The cache key is the normalised SQL, so a
+                    // shared entry always has the same predicate structure.
+                    let only = Some(preds[0].clone());
+                    if !Self::transplant_scan_exprs(input, &only) {
+                        return false;
+                    }
+                    *predicate_expr = only.clone();
+                    *predicate = preds[0].to_string();
+                    return true;
                 }
                 // Determine which predicate the child scan consumed.
                 // For IndexScan: the index column name tells us which predicate matches.
@@ -9491,8 +10111,19 @@ impl Executor {
             | planner::PlanNode::Aggregate { input, .. } => {
                 Self::transplant_scan_exprs(input, where_expr)
             }
-            // JOINs: don't try to reuse
-            _ => false,
+            // A join with no Filter above it: every predicate was pushed into
+            // one side or the other, so re-pushing must leave nothing over.
+            planner::PlanNode::HashJoin { left, right, .. }
+            | planner::PlanNode::NestedLoopJoin { left, right, .. } => {
+                let preds: Vec<Expr> = match where_expr {
+                    Some(e) => planner::split_conjunction(e).into_iter().cloned().collect(),
+                    None => Vec::new(),
+                };
+                match Self::transplant_join_sides(left, right, preds) {
+                    Some(residual) => residual.is_empty(),
+                    None => false,
+                }
+            }
         }
     }
 

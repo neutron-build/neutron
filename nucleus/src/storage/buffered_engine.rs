@@ -1051,8 +1051,8 @@ impl StorageEngine for BufferedDiskEngine {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         self.lock_read(table).await?;
         self.inner
@@ -1087,8 +1087,8 @@ impl StorageEngine for BufferedDiskEngine {
         &self,
         table: &str,
         index_name: &str,
-        low: &Value,
-        high: &Value,
+        low: std::ops::Bound<&Value>,
+        high: std::ops::Bound<&Value>,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         // A serializable transaction must not read through a path that
         // cannot await its 2PL lock. Decline so the caller falls back to

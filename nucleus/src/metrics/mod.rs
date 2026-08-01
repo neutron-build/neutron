@@ -247,6 +247,13 @@ pub struct MetricsRegistry {
     /// index looks identical to one that never had it, in a system whose whole
     /// failure mode is "answers stayed correct and only cost changed".
     pub index_scan_fallbacks: Counter,
+    /// SELECTs answered by the plan executor.
+    ///
+    /// The counterpart to `plan_path_fallbacks`, which alone cannot tell
+    /// "planned and ran" from "never planned at all": a query rejected by
+    /// `query_eligible_for_plan` never reaches the plan block, so it records no
+    /// fallback either. Every JOIN spelling but one was silently in that state.
+    pub plan_path_served: Counter,
     /// Planned queries that declined to execute and fell back to the AST path.
     pub plan_path_fallbacks: Counter,
     /// Planned queries that failed with a real error rather than declining.
@@ -341,6 +348,10 @@ impl MetricsRegistry {
             index_scan_fallbacks: Counter::new(
                 "nucleus_index_scan_fallbacks_total",
                 "Index scan plan nodes that fell back to a sequential scan",
+            ),
+            plan_path_served: Counter::new(
+                "nucleus_plan_path_served_total",
+                "SELECTs answered by the plan executor",
             ),
             plan_path_fallbacks: Counter::new(
                 "nucleus_plan_path_fallbacks_total",
@@ -464,6 +475,7 @@ impl MetricsRegistry {
         render_counter(&mut out, &self.index_join_used);
         render_counter(&mut out, &self.index_join_skipped);
         render_counter(&mut out, &self.plan_path_errors);
+        render_counter(&mut out, &self.plan_path_served);
         render_counter(&mut out, &self.plan_path_fallbacks);
         render_counter(&mut out, &self.index_scan_fallbacks);
         render_counter(&mut out, &self.index_scan_served);
@@ -548,6 +560,7 @@ impl MetricsRegistry {
         add_counter(&mut rows, &self.index_join_used);
         add_counter(&mut rows, &self.index_join_skipped);
         add_counter(&mut rows, &self.plan_path_errors);
+        add_counter(&mut rows, &self.plan_path_served);
         add_counter(&mut rows, &self.plan_path_fallbacks);
         add_counter(&mut rows, &self.lock_acquired_immediate);
         add_counter(&mut rows, &self.lock_waits);
@@ -788,13 +801,13 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 27 counters + 8 gauges + 1 uptime + 2 histograms = 38.
+        // 28 counters + 8 gauges + 1 uptime + 2 histograms = 39.
         // The count is asserted deliberately: `as_rows` is SHOW METRICS, and a
         // metric added to the registry but not to the render/rows lists is
         // silently invisible to every operator — the same declared-but-unwired
         // shape as the rest of this engine. Update this number ONLY alongside
         // adding the metric to both `render_prometheus` and `as_rows`.
-        assert_eq!(rows.len(), 38);
+        assert_eq!(rows.len(), 39);
 
         // Check a counter row
         let qt = rows

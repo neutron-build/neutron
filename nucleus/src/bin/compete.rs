@@ -2569,23 +2569,15 @@ async fn bench_vs_sqlite(
             "SUM with WHERE",
             "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'",
         ),
+        // The comma form is the one to keep measuring: it is the spelling that
+        // reached the plan path last of the three, so it exercises alias
+        // resolution AND comma-join desugaring. The explicit-ON and unaliased
+        // variants were carried here while the gap was being attributed; they
+        // now execute the same plan as this one, so a separate row would report
+        // the same number three times. See `docs/BENCH_VS_POSTGRES.md`.
         (
             "2-Table JOIN",
             "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100",
-        ),
-        // Same join, explicit `JOIN ... ON` instead of the comma form. The two
-        // are semantically identical; `query_eligible_for_plan` rejects any
-        // SELECT with `from.len() > 1`, so only this one reaches the plan path.
-        (
-            "2-Table JOIN (explicit ON)",
-            "SELECT u.name, o.amount FROM bench_orders o JOIN bench_users u ON u.id = o.user_id WHERE o.id < 100",
-        ),
-        // Same join again, with NO table aliases. `query_eligible_for_plan`
-        // rejects any join whose tables are aliased, so this is the only one of
-        // the three that the plan path will accept.
-        (
-            "2-Table JOIN (no alias)",
-            "SELECT bench_users.name, bench_orders.amount FROM bench_orders JOIN bench_users ON bench_users.id = bench_orders.user_id WHERE bench_orders.id < 100",
         ),
     ];
 
