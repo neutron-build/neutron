@@ -87,15 +87,40 @@ async fn run_delete(
     if txn {
         ex.execute("BEGIN").await.expect("begin");
     }
+    bench_hooks::reset_overlay_counters();
+    let stmt_start = Instant::now();
     for k in 0..deletes {
         let key = 1 + k * stride;
         ex.execute(&format!("DELETE FROM t WHERE id = {key}"))
             .await
             .expect("delete");
     }
+    let stmt_us = stmt_start.elapsed().as_micros();
+    let commit_start = Instant::now();
     if txn {
         ex.execute("COMMIT").await.expect("commit");
     }
+    let commit_us = commit_start.elapsed().as_micros();
+    // Per-statement work and commit work are different problems with different
+    // fixes; the total cannot tell them apart.
+    let (ov_calls, ov_rows) = bench_hooks::overlay_counters();
+    let ov: Vec<String> = bench_hooks::OVERLAY_SITES
+        .iter()
+        .zip(ov_calls.iter())
+        .filter(|(_, n)| **n > 0)
+        .map(|(s, n)| format!("{s}={n}"))
+        .collect();
+    println!(
+        "        statements {stmt_us} us ({:.0} us/delete) + commit {commit_us} us",
+        stmt_us as f64 / deletes as f64
+    );
+    // Rebuilding the buffered view is O(table); doing it per statement is the
+    // shape that made this path quadratic before. Count it, do not assume.
+    println!(
+        "        overlay rebuilds: {}  rows materialised={ov_rows} ({:.0} rows per delete)",
+        if ov.is_empty() { "none".into() } else { ov.join(" ") },
+        ov_rows as f64 / deletes as f64
+    );
     let elapsed = t.elapsed().as_micros();
     let scanned = ex.metrics().rows_scanned.get() - scanned_before;
     // Rows READ to perform `deletes` deletions by primary key. If this is not

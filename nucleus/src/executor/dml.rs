@@ -2034,7 +2034,17 @@ impl Executor {
         // Build column metadata for expression evaluation
         let col_meta = self.table_col_meta(&table_def);
 
-        // Fast path: PK/unique equality WHERE → filtered scan (avoids materializing all rows)
+        // NOT a fast path, despite the name: `scan_where_eq_positions` is a
+        // FULL page scan that filters inline (`DiskEngine::scan_addressed`),
+        // and inside a transaction `BufferedDiskEngine` materialises the whole
+        // table on top of it. Measured by `attr_join`'s sibling `attr_delete`:
+        // 20,000 rows materialised per single-row DELETE on a 20k table, so the
+        // cost is O(table) per statement and quadratic over a batch.
+        // It stays until storage exposes an index -> POSITIONS lookup; the
+        // index preference used by the SELECT fast path in `executor/mod.rs`
+        // cannot be copied here because `index_lookup` returns rows, and
+        // UPDATE/DELETE need addresses.
+        // Fast path: PK/unique equality WHERE → filtered scan
         let (mut all_rows, pre_filtered) =
             match Self::extract_pk_eq_value(&update.selection, &table_def) {
                 Some((col_idx, eq_value)) => {
@@ -2042,8 +2052,11 @@ impl Executor {
                         .storage_for(&table_name)
                         .scan_where_eq_positions(&table_name, col_idx, &eq_value)
                         .await?;
-                    // Count rows actually matched, not a literal 1 (the equality
-                    // scan still examines the matching rows).
+                    // UNDERSTATES the real cost: this is the number of rows
+                    // MATCHED, while the scan above examined every row in the
+                    // table. `rows_scanned` reading 1 for a single-row DELETE
+                    // is what hid the O(table) behaviour above — do not read it
+                    // as evidence that this statement used an index.
                     self.metrics.rows_scanned.inc_by(matches.len() as u64);
                     (matches.into_iter().collect::<Vec<_>>(), true)
                 }
