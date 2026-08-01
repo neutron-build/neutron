@@ -77,7 +77,21 @@ real writer instead of the plausible one.
 |------|-----------|------------------------|
 | `fsync` (default) | Data + metadata flushed before a commit is acknowledged | Nothing acknowledged |
 | `fdatasync` | Data flushed; filesystem metadata may lag | Nothing acknowledged on filesystems where data ordering suffices |
+| `flush_os` | Handed to the kernel with `fsync(2)`, no drive-cache barrier | Anything the drive still holds in its volatile cache |
 | `none` | Writes land in the OS page cache only | Any window the OS has not flushed |
+
+`flush_os` exists because on macOS the other two are the same thing. Rust's
+`sync_all` and `sync_data` both issue `fcntl(F_FULLFSYNC)` there — a real drive
+barrier, measured at 4,253 µs against 41 µs for plain `fsync(2)`, a factor of
+104. That is why `fdatasync` is a no-op knob on macOS, and why any write
+benchmark against a PostgreSQL running its macOS default `wal_sync_method` is
+invalid unless the two are equalised (see `docs/BENCH_VS_POSTGRES.md`).
+
+`flush_os` gives the PostgreSQL-on-macOS guarantee explicitly: **survives a
+process crash, an OS panic and `kill -9`; does not survive sudden power loss.**
+On Linux `fsync(2)` normally does flush the device cache, so the mode is
+effectively equal to `fsync` there rather than weaker. It is opt-in, and the
+default remains `fsync` — durability should only be traded away deliberately.
 
 `fsync` is the default and the only mode the crash matrix asserts against. A
 commit acknowledged under `fsync` must survive a power loss; that is the

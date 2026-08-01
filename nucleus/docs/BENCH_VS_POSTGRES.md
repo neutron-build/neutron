@@ -104,6 +104,40 @@ Three consequences worth stating plainly:
 - These are **one host, one run**. Treat them as a direction, not a
   specification.
 
+## SQLite, 2026-07-31
+
+```sh
+cargo run --release --features bench-tools --bin compete -- --backends nucleus,sqlite
+```
+
+Embedded-to-embedded (Nucleus direct API vs `rusqlite`), 50,000 rows, so no
+protocol cost on either side.
+
+| Workload | Nucleus | SQLite | Ratio |
+|---|---:|---:|---:|
+| `COUNT(*)` | 2.3 µs | 379.2 µs | **165× faster** |
+| `UPDATE` by PK | 16.4 µs | 285.6 µs | **18× faster** |
+| `GROUP BY` + `AVG` | 22.60 ms | 59.15 ms | **2.9× faster** |
+| `SUM` with `WHERE` | 8.44 ms | 16.90 ms | **2.1× faster** |
+| Filter + sort + limit | 10.47 ms | 17.16 ms | **1.6× faster** |
+| Point query (PK) | 3.0 µs | 3.8 µs | 1.3× |
+| Range scan | 40.2 µs | 11.5 µs | 0.3× (SQLite faster) |
+| `DELETE` by PK | 6.5 µs | 1.1 µs | 0.2× (SQLite faster) |
+| 2-table JOIN | 101.2 µs | 13.7 µs | **0.1× (SQLite 7× faster)** |
+| Single `INSERT` | 6.03 ms | 1.9 µs | **0.0× (SQLite ~3,000× faster)** |
+
+The same shape as the PostgreSQL comparison — aggregates win, small point
+operations lose — with two results worth naming rather than burying:
+
+- **Single INSERT is the F_FULLFSYNC gap again**, and it is at its most extreme
+  here: 6.03 ms against 1.9 µs. `rusqlite` opens with SQLite's defaults, which
+  on macOS do not issue a full drive barrier. This is a durability-level
+  difference, not an engine one, and the number is meaningless as a speed
+  comparison. See the section above.
+- **The 2-table JOIN (0.1×) is NOT explained by fsync** — it is a read. SQLite
+  is 7× faster on a join of two 50k tables, embedded-to-embedded. That is a real
+  gap in the join path and it is not currently explained.
+
 ## What has not been measured
 
 - ClickHouse (the OLAP comparison that would actually stress the columnar and

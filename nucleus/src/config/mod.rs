@@ -210,6 +210,24 @@ pub struct WalConfig {
     pub checkpoint_interval_secs: u64,
     #[serde(default = "default_group_commit_interval_us")]
     pub group_commit_interval_us: u64,
+    /// How the WAL is forced to stable storage. One of:
+    ///
+    /// - `fsync` (default) — `sync_all`. On macOS this is `F_FULLFSYNC`, a true
+    ///   drive-cache barrier: survives power loss, and costs ~4,253 µs here.
+    /// - `fdatasync` — `sync_data`. Distinct on Linux; on macOS it is measurably
+    ///   the same as `fsync` (3,849 vs 3,872 µs), so it is a knob that does
+    ///   nothing there.
+    /// - `flush_os` — plain `fsync(2)`, ~41 µs on this host. Survives process
+    ///   crash, OS panic and `kill -9`; does NOT survive power loss, because the
+    ///   drive may still hold the data in a volatile cache. This is the
+    ///   guarantee PostgreSQL gives on macOS with its default
+    ///   `wal_sync_method`, which is what makes an equal-footing write
+    ///   comparison possible at all. On Linux `fsync(2)` normally does flush the
+    ///   device, so the mode is not weaker there.
+    /// - `none` / `off` — no sync. Loses committed data on any crash.
+    ///
+    /// The default stays `fsync`: durability is not something to trade away by
+    /// accident, only deliberately.
     #[serde(default = "default_sync_mode")]
     pub sync_mode: String,
     /// Commit-time durability: "on" (default) forces the WAL (group commit)
