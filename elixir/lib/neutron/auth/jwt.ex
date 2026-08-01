@@ -56,9 +56,11 @@ defmodule Neutron.Auth.JWT do
     jwk = JOSE.JWK.from_oct(secret)
     jws = JOSE.JWS.from_map(%{"alg" => @algorithm})
 
+    # `JOSE.JWT.sign/3` is (jwk, jws, payload). Piping the JWT in first put a
+    # JWT struct in the JWK slot, so every call died in `:jose_jws.from/1` —
+    # signing never worked at all.
     {_, token} =
-      JOSE.JWT.from_map(claims)
-      |> JOSE.JWT.sign(jwk, jws)
+      JOSE.JWT.sign(jwk, jws, claims)
       |> JOSE.JWS.compact()
 
     {:ok, token}

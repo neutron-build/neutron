@@ -331,6 +331,20 @@ pub struct TransactionManager {
     /// one breaks the cycle, and the other is then no longer part of any cycle
     /// and commits normally.
     ssi_doomed: Mutex<HashSet<u64>>,
+    /// Cahill's per-transaction `inConflict` / `outConflict` flags: T is in
+    /// `ssi_in_conflict` iff some transaction has an rw-antidependency INTO T,
+    /// and in `ssi_out_conflict` iff T has one OUT to some transaction.
+    ///
+    /// These exist because the edge set cannot answer "is T a pivot?" reliably.
+    /// `sweep_ssi` purges a finished transaction and every edge touching it, so
+    /// a structure whose first edge involved a since-purged transaction becomes
+    /// invisible — `is_pivot` computed from live edges silently loses history.
+    /// The flags are STICKY: they are set when the edge is created and cleared
+    /// only when the transaction they describe is itself purged, so they still
+    /// answer correctly after the counterpart is gone. That is the whole reason
+    /// the >=3-transaction cycles escaped.
+    ssi_in_conflict: Mutex<HashSet<u64>>,
+    ssi_out_conflict: Mutex<HashSet<u64>>,
     /// Serializes the COMMIT POINT of serializable transactions.
     ///
     /// `check_serializable_commit` only reports a dangerous structure when a
@@ -372,6 +386,8 @@ impl TransactionManager {
             ssi_txns: Mutex::new(HashSet::new()),
             ssi_concurrent: Mutex::new(HashMap::new()),
             ssi_doomed: Mutex::new(HashSet::new()),
+            ssi_in_conflict: Mutex::new(HashSet::new()),
+            ssi_out_conflict: Mutex::new(HashSet::new()),
             serial_commit: Mutex::new(()),
         }
     }
@@ -706,35 +722,67 @@ impl TransactionManager {
     /// between adding the edge and judging it.
     fn doom_new_pivot(
         &self,
-        conflicts: &HashSet<(u64, u64)>,
+        _conflicts: &HashSet<(u64, u64)>,
         reader: u64,
         writer: u64,
         current: u64,
     ) {
-        let is_pivot = |t: u64| {
-            conflicts.iter().any(|&(_, w)| w == t) && conflicts.iter().any(|&(r, _)| r == t)
-        };
+        // Record the edge on Cahill's sticky per-transaction flags. `reader`
+        // read something `writer` wrote, so the antidependency runs
+        // reader -> writer: it is outgoing for the reader, incoming for the
+        // writer.
+        let mut in_conflict = self.ssi_in_conflict.lock();
+        let mut out_conflict = self.ssi_out_conflict.lock();
+        out_conflict.insert(reader);
+        in_conflict.insert(writer);
+
+        // A pivot has BOTH. Read from the flags, not from the live edge set:
+        // the edges of a purged transaction are gone, the flags are not.
+        let is_pivot =
+            |t: u64| in_conflict.contains(&t) && out_conflict.contains(&t);
+
         let committed = self.committed.lock();
         let mut doomed = self.ssi_doomed.lock();
-        // Prefer the transaction currently executing: it can be failed
-        // immediately, and it is the one whose action completed the structure.
+
+        if !is_pivot(reader) && !is_pivot(writer) {
+            return;
+        }
+
+        // Abort the pivot when it can still be aborted — it is the transaction
+        // whose removal actually breaks the structure. `current` is preferred
+        // among pivots because it can fail immediately, and because in the
+        // two-transaction write skew both endpoints are pivots and dooming
+        // both would abort a structure that only needs one victim.
         for candidate in [current, reader, writer] {
             if is_pivot(candidate) && !committed.contains(&candidate) {
                 doomed.insert(candidate);
                 return;
             }
         }
-        // If the only pivot has already COMMITTED it can no longer be aborted,
-        // and this returns without dooming anyone. That is the residual
-        // ≥3-transaction hole documented on `check_serializable_commit`.
+
+        // The pivot has already committed, so it is beyond reach. A cycle
+        // through it can still be completed by a transaction that has NOT
+        // committed, and that one must not be allowed to close it — so doom
+        // whichever participant is still live, preferring the one executing
+        // now.
         //
-        // Dooming the currently-executing transaction instead was tried and is
-        // WORSE, measured: it aborts a transaction that is not the pivot, so it
-        // fails to break the actual cycle while adding ~40 needless aborts per
-        // 800 rounds — `probe_serializable` reported MORE violations with it
-        // than without. Breaking the right cycle needs Cahill's per-transaction
-        // inConflict/outConflict flags, which cannot be reconstructed from the
-        // edge set alone once `sweep_ssi` has purged finished transactions.
+        // Reaching here at all is what the >=3-transaction gap was: the old
+        // code computed pivot-ness from the live edge set, so a structure
+        // whose earlier edge touched a purged transaction was never recognised
+        // and nobody was doomed. Dooming a non-pivot was measured WORSE back
+        // then, but that measurement was taken with the lossy edge-set test —
+        // it was aborting transactions that were not part of any structure.
+        // With the flags the test fires only on a real one.
+        // Not-committed is the whole test: an already-aborted transaction is
+        // harmless to doom, and taking `active` here would invert the lock
+        // order against `sweep_ssi`, which holds it while reaching for these
+        // same flags.
+        for candidate in [current, reader, writer] {
+            if !committed.contains(&candidate) {
+                doomed.insert(candidate);
+                return;
+            }
+        }
     }
 
     /// Whether two SERIALIZABLE transactions had overlapping lifetimes. Only
@@ -806,6 +854,12 @@ impl TransactionManager {
             {
                 // other_txn read from this table, txn_id inserted into it
                 conflicts.insert((other_txn, txn_id));
+                // This edge used to be recorded and then never judged — the
+                // only edge-creation site that did not look for a pivot. A
+                // dangerous structure completed by a PHANTOM (an INSERT into a
+                // table someone else scanned) was therefore invisible, however
+                // good the pivot rule was.
+                self.doom_new_pivot(&conflicts, other_txn, txn_id, txn_id);
             }
         }
     }
@@ -969,6 +1023,9 @@ impl TransactionManager {
         let mut writes = self.ssi_write_sets.lock();
         let mut conflicts = self.ssi_rw_conflicts.lock();
         let mut concurrent = self.ssi_concurrent.lock();
+        // Flag locks come BEFORE `doomed`, matching `doom_new_pivot`.
+        let mut in_conflict = self.ssi_in_conflict.lock();
+        let mut out_conflict = self.ssi_out_conflict.lock();
         let mut doomed = self.ssi_doomed.lock();
 
         let mut purge: Vec<u64> = ssi
@@ -990,6 +1047,8 @@ impl TransactionManager {
             reads.remove(&t);
             writes.remove(&t);
             doomed.remove(&t);
+            in_conflict.remove(&t);
+            out_conflict.remove(&t);
             concurrent.remove(&t);
             for peers in concurrent.values_mut() {
                 peers.remove(&t);
