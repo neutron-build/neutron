@@ -292,6 +292,12 @@ impl DiskGuard {
     /// reading used to kill the task silently, leaving a server that refused
     /// writes forever with no indication why and no fix but a restart. Now a
     /// panic is caught, counted and logged, and the next tick still happens.
+    ///
+    /// Gated on `server` because it needs a Tokio runtime: `tokio::spawn` and
+    /// `task::JoinHandle` do not exist without the `rt` feature, and the
+    /// core-only build (`--no-default-features`) does not pull it in. Only
+    /// `main.rs` calls this, so the gate costs nothing.
+    #[cfg(feature = "server")]
     pub fn spawn_monitor(
         self: Arc<Self>,
         interval: std::time::Duration,

@@ -560,7 +560,21 @@ impl DiskEngine {
         let mut lsn_floor: u64 = 0;
         if !is_new {
             let single_file_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-            let mut records = wal::read_wal_records(&wal_path).unwrap_or_default();
+            // A missing WAL is normal (first open after a clean create); any
+            // OTHER error is not, and `unwrap_or_default()` silently turned it
+            // into "replay nothing" — the same shape as the `Wal::open` defect,
+            // but here it discards recovery itself rather than the file.
+            let mut records = match wal::read_wal_records(&wal_path) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => {
+                    return Err(StorageError::Io(format!(
+                        "WAL recovery could not read {}: {e}. Refusing to open and silently \
+                         discard unreplayed commits.",
+                        wal_path.display()
+                    )));
+                }
+            };
             if use_segmented_wal {
                 records.extend(wal::read_wal_dir_records(&wal_dir).unwrap_or_default());
             }
