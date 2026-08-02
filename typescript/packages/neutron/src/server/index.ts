@@ -324,6 +324,7 @@ export async function createServer(
   const resolvedDistDir = path.resolve(resolvedRootDir, distDir);
   const resolvedRoutesDir = path.resolve(resolvedRootDir, routesDir);
   const clientEntryScriptSrc = getClientEntryScriptSrc(resolvedDistDir);
+  const stylesheetHrefs = getClientStylesheetHrefs(resolvedDistDir);
   const staticRouteHeaders = loadStaticRouteHeaders(resolvedDistDir);
   const staticHtmlCache = buildStaticHtmlCache(resolvedDistDir);
   const corsOptions = resolveCorsOptions(cors);
@@ -686,6 +687,7 @@ export async function createServer(
             match,
             ssrServer,
             clientEntryScriptSrc,
+            stylesheetHrefs,
             routeModuleCache,
             loaderDataCacheStore,
             requestTrace,
@@ -719,6 +721,7 @@ export async function createServer(
         match,
         ssrServer,
         clientEntryScriptSrc,
+        stylesheetHrefs,
         routeModuleCache,
         loaderDataCacheStore,
         requestTrace,
@@ -827,6 +830,7 @@ async function handleAppRouteRequest(
   match: RouteMatch,
   ssrServer: SsrServer,
   clientEntryScriptSrc: string | null,
+  stylesheetHrefs: string[],
   moduleCache: Map<string, Promise<RouteModule>>,
   loaderDataCache: NeutronLoaderCacheStore,
   requestTrace: RequestTraceContext,
@@ -844,6 +848,7 @@ async function handleAppRouteRequest(
   );
   return renderAppRoute(request, match, routeModules, {
     clientEntryScriptSrc,
+    stylesheetHrefs,
     loaderDataCache,
     requestTrace,
     hooks,
@@ -1400,6 +1405,18 @@ function getClientEntryScriptSrc(distDir: string): string | null {
   );
 
   return match?.[1] || null;
+}
+
+function getClientStylesheetHrefs(distDir: string): string[] {
+  const assetsDir = path.join(distDir, "assets");
+  if (!fs.existsSync(assetsDir)) {
+    return [];
+  }
+  return fs
+    .readdirSync(assetsDir)
+    .filter((name) => name.endsWith(".css"))
+    .sort()
+    .map((name) => `/assets/${name}`);
 }
 
 

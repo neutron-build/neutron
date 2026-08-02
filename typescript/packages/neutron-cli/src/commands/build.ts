@@ -310,6 +310,7 @@ export async function build(): Promise<void> {
     routes,
     pageRoutes,
     clientEntryScriptSrc,
+    clientCssFiles,
     userConfig,
     runtimeAliases: preactAliases,
     runtimeNoExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
@@ -984,6 +985,7 @@ interface RuntimeBundleBuilderOptions {
   routes: Route[];
   pageRoutes: Route[];
   clientEntryScriptSrc: string | null;
+  clientCssFiles: string[];
   userConfig: Record<string, any>;
   runtimeAliases?: Array<{ find: string; replacement: string }> | Record<string, string>;
   runtimeNoExternal?: string[];
@@ -1114,6 +1116,7 @@ async function buildRuntimeBundle(
       runtimeRoutes,
       appRoutes,
       options.clientEntryScriptSrc,
+      options.clientCssFiles,
       entryPath,
       options.routeRules,
       globalMiddlewarePath
@@ -1238,6 +1241,7 @@ function generateRuntimeEntrySource(
   runtimeRoutes: RuntimeRouteDef[],
   appRoutes: Route[],
   clientEntryScriptSrc: string | null,
+  clientCssFiles: string[],
   entryPath: string,
   routeRules: NeutronConfig["routes"] | undefined,
   globalMiddlewarePath?: string
@@ -1281,6 +1285,7 @@ function generateRuntimeEntrySource(
 ${imports.join("\n")}
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
+const CLIENT_STYLESHEET_HREFS = ${JSON.stringify(clientCssFiles)};
 const ROUTE_RULES = compileRouteRules(${routeRulesJson});
 
 const ROUTE_DEFS = [
@@ -1348,6 +1353,7 @@ async function handleNeutronRequestInner(request) {
     routeModules,
     {
       clientEntryScriptSrc: CLIENT_ENTRY_SCRIPT_SRC,
+      stylesheetHrefs: CLIENT_STYLESHEET_HREFS,
       loaderDataCache: LOADER_DATA_CACHE,
       requestTrace: {
         requestId: String(++__requestSeq),

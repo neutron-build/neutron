@@ -1,7 +1,7 @@
 {
   "packageManager": "pnpm9",
   "packages": {
-    "count": 21,
+    "count": 23,
     "items": [
       {
         "name": "@neutron-build/agents",
@@ -30,6 +30,14 @@
       {
         "name": "@neutron-build/data",
         "path": "packages/neutron-data"
+      },
+      {
+        "name": "@neutron-build/mail",
+        "path": "packages/neutron-mail"
+      },
+      {
+        "name": "@neutron-build/mcp",
+        "path": "packages/neutron-mcp"
       },
       {
         "name": "@neutron-build/nucleus",

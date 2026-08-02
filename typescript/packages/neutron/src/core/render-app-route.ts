@@ -61,6 +61,7 @@ export interface RenderHooks {
 }
 export interface RenderAppRouteOptions {
   clientEntryScriptSrc: string | null;
+  stylesheetHrefs?: string[];
   loaderDataCache: NeutronLoaderCacheStore;
   requestTrace: RenderRequestTrace;
   hooks?: RenderHooks;
@@ -324,7 +325,8 @@ function renderErrorResponse(
   route: Route,
   error: Error,
   clientEntryScriptSrc: string | null,
-  includeClientRuntime: boolean
+  includeClientRuntime: boolean,
+  stylesheetHrefs: string[]
 ): Response {
   const boundary = findNearestErrorBoundary(allRoutes, modules, route);
 
@@ -346,7 +348,10 @@ function renderErrorResponse(
     {},
     undefined,
     clientEntryScriptSrc,
-    includeClientRuntime
+    includeClientRuntime,
+    undefined,
+    null,
+    stylesheetHrefs
   );
 
   return new Response(fullHtml, {
@@ -358,12 +363,17 @@ function renderErrorResponse(
 function buildHtmlPrefix(
   pathname: string,
   headHtml: string = "",
-  seo: SeoMetaInput | null = null
+  seo: SeoMetaInput | null = null,
+  stylesheetHrefs: string[] = []
 ): string {
+  const stylesheetLinks = [...new Set(stylesheetHrefs)]
+    .filter(Boolean)
+    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}">`)
+    .join("\n");
   return `<!DOCTYPE html>
 ${buildHtmlOpenTag(seo?.htmlAttrs)}
 <head>
-${headHtml || renderDocumentHead(pathname, null)}
+${headHtml || renderDocumentHead(pathname, null)}${stylesheetLinks ? `\n${stylesheetLinks}` : ""}
 </head>
 ${buildBodyOpenTag(seo?.bodyAttrs)}
 <div id="app">`;
@@ -415,9 +425,10 @@ function wrapHtml(
   clientEntryScriptSrc: string | null = null,
   includeClientRuntime: boolean = true,
   nonce?: string,
-  seo: SeoMetaInput | null = null
+  seo: SeoMetaInput | null = null,
+  stylesheetHrefs: string[] = []
 ): string {
-  return `${buildHtmlPrefix(pathname, headHtml, seo)}${content}${buildHtmlSuffix(
+  return `${buildHtmlPrefix(pathname, headHtml, seo, stylesheetHrefs)}${content}${buildHtmlSuffix(
     loaderData,
     actionData,
     clientEntryScriptSrc,
@@ -483,6 +494,7 @@ interface RenderAppRouteHtmlResponseArgs {
   loaderData: Record<string, unknown>;
   actionData?: unknown;
   clientEntryScriptSrc: string | null;
+  stylesheetHrefs: string[];
   includeClientRuntime: boolean;
   headers: Headers;
   nonce?: string;
@@ -513,7 +525,8 @@ async function renderAppRouteHtmlResponse(
       args.clientEntryScriptSrc,
       args.includeClientRuntime,
       args.nonce,
-      args.seo ?? null
+      args.seo ?? null,
+      args.stylesheetHrefs
     );
   };
 
@@ -522,7 +535,12 @@ async function renderAppRouteHtmlResponse(
     return new Response(composeFullDocument(), { headers });
   }
 
-  const shellPrefix = buildHtmlPrefix(args.pathname, args.headHtml, args.seo ?? null);
+  const shellPrefix = buildHtmlPrefix(
+    args.pathname,
+    args.headHtml,
+    args.seo ?? null,
+    args.stylesheetHrefs
+  );
   const shellSuffix = buildHtmlSuffix(
     args.loaderData,
     args.actionData,
@@ -571,7 +589,14 @@ export async function renderAppRoute(
   routeModules: Map<string, RouteModule>,
   opts: RenderAppRouteOptions
 ): Promise<Response> {
-  const { clientEntryScriptSrc, loaderDataCache, requestTrace, hooks, globalMiddleware } = opts;
+  const {
+    clientEntryScriptSrc,
+    stylesheetHrefs = [],
+    loaderDataCache,
+    requestTrace,
+    hooks,
+    globalMiddleware,
+  } = opts;
   const allRoutes = [...match.layouts, match.route];
   const includeClientRuntime = allRoutes.every((route) => route.config.hydrate !== false);
   const middlewares: MiddlewareFn[] = [];
@@ -703,7 +728,8 @@ export async function renderAppRoute(
           match.route,
           toError(error),
           clientEntryScriptSrc,
-          includeClientRuntime
+          includeClientRuntime,
+          stylesheetHrefs
         );
       }
     }
@@ -859,7 +885,8 @@ export async function renderAppRoute(
           errorRoute!,
           toError(result.error),
           clientEntryScriptSrc,
-          includeClientRuntime
+          includeClientRuntime,
+          stylesheetHrefs
         );
       }
       if (result.data !== undefined) {
@@ -901,6 +928,9 @@ export async function renderAppRoute(
         payload.__action__ = actionData;
       }
       payload.__head__ = headHtml;
+      if (stylesheetHrefs.length > 0) {
+        payload.__css__ = stylesheetHrefs;
+      }
       routeHeaders.set("Content-Type", "application/json");
       return new Response(encodeSerializedPayloadAsJson(payload), {
         headers: routeHeaders,
@@ -938,6 +968,7 @@ export async function renderAppRoute(
         headHtml,
         seo,
         clientEntryScriptSrc,
+        stylesheetHrefs,
         includeClientRuntime,
         headers: routeHeaders,
         // Outermost layout/route — the most likely author of a stray <html>.
@@ -965,7 +996,8 @@ export async function renderAppRoute(
         match.route,
         toError(error),
         clientEntryScriptSrc,
-        includeClientRuntime
+        includeClientRuntime,
+        stylesheetHrefs
       );
     }
   });

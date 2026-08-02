@@ -42,6 +42,11 @@ async function writeFixtureApp(rootDir: string): Promise<void> {
     "console.log('fixture client entry');",
     "utf-8"
   );
+  await fs.writeFile(
+    path.join(rootDir, "dist", "assets", "index-test.css"),
+    "body { color: rebeccapurple; }",
+    "utf-8"
+  );
 
   await fs.writeFile(
     path.join(rootDir, "src", "routes", "users", "[id].ts"),
@@ -256,7 +261,9 @@ describe("server e2e matrix", () => {
       const appHtml = await fetch(`${baseUrl}/users/1`);
       expect(appHtml.status).toBe(200);
       expect(appHtml.headers.get("content-type")).toContain("text/html");
-      expect(await appHtml.text()).toContain("User route: User 1");
+      const appHtmlText = await appHtml.text();
+      expect(appHtmlText).toContain("User route: User 1");
+      expect(appHtmlText).toContain('<link rel="stylesheet" href="/assets/index-test.css">');
 
       const appJson = await fetch(`${baseUrl}/users/1`, {
         headers: { Accept: "application/json" },
@@ -266,6 +273,7 @@ describe("server e2e matrix", () => {
         await appJson.json()
       );
       expect((appPayload["route:users/[id].ts"] as { user: { id: string } }).user.id).toBe("1");
+      expect(appPayload.__css__).toEqual(["/assets/index-test.css"]);
 
       const formInitial = await fetch(`${baseUrl}/form`, {
         headers: { Accept: "application/json" },
