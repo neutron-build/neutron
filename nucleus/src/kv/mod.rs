@@ -291,14 +291,15 @@ impl KvStore {
     pub fn set(&self, key: &str, value: Value, ttl_secs: Option<u64>) {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.log_set(key, &value) {
+            // One record carrying the value AND the expiry decided with it.
+            // These used to be two independent appends, so a crash between
+            // them replayed a key the client asked to be temporary as a
+            // permanent one — a leaked lock, lease, or secret. The `None` case
+            // is equally load-bearing: it clears an expiry the key already had,
+            // which is what the in-memory write below does, and what a bare
+            // `ENTRY_SET` record would NOT have done on replay.
+            if let Err(e) = wal.log_set_with_expiry(key, &value, ttl_secs.map(abs_expiry_ms)) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
-            if let Some(secs) = ttl_secs {
-                let abs_ms = epoch_ms_now() + secs * 1000;
-                if let Err(e) = wal.log_expire(key, abs_ms) {
-                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-                }
             }
         }
         // checked_add: a huge TTL (e.g. i64::MAX seconds) would overflow
@@ -438,17 +439,23 @@ impl KvStore {
             // checked_add: a huge TTL overflows Instant + Duration and panics.
             // Treat an overflowing TTL as "never expires".
             let Some(new_exp) = Instant::now().checked_add(Duration::from_secs(ttl_secs)) else {
+                // "Never expires" in memory has to mean the same thing in the
+                // log, or a restart resurrects the expiry this branch dropped.
+                #[cfg(feature = "server")]
+                if let Some(ref wal) = self.wal
+                    && let Err(e) = wal.log_set_with_expiry(key, &entry.value, None)
+                {
+                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+                }
                 entry.expires_at = None;
                 self.bump_version();
                 return true;
             };
             #[cfg(feature = "server")]
-            if let Some(ref wal) = self.wal {
-                // saturating: ttl_secs * 1000 (u64) would also overflow.
-                let abs_ms = epoch_ms_now().saturating_add(ttl_secs.saturating_mul(1000));
-                if let Err(e) = wal.log_expire(key, abs_ms) {
-                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-                }
+            if let Some(ref wal) = self.wal
+                && let Err(e) = wal.log_expire(key, abs_expiry_ms(ttl_secs))
+            {
+                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
             entry.expires_at = Some(new_exp);
             shard.add_expiry(key, new_exp);
@@ -473,6 +480,17 @@ impl KvStore {
             }
             if let Some(old_exp) = entry.expires_at {
                 shard.remove_expiry(key, old_exp);
+            }
+            // PERSIST logged nothing at all, so the log still held the key's
+            // old EXPIRE record: the server answered `TTL -1` and a restart
+            // brought the expiry back, after which the key the client had made
+            // permanent silently disappeared. There is no "clear expiry"
+            // record, so re-log the value with an explicit `None` expiry.
+            #[cfg(feature = "server")]
+            if let Some(ref wal) = self.wal
+                && let Err(e) = wal.log_set_with_expiry(key, &entry.value, None)
+            {
+                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
             entry.expires_at = None;
             self.bump_version();
@@ -621,9 +639,14 @@ impl KvStore {
     pub fn mset(&self, pairs: &[(&str, Value)]) {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
+            // `SetExact` with no TTL, not `Set`: the in-memory write below
+            // stores `expires_at: None`, so MSET over a key that had a TTL
+            // clears it. A plain `Set` record preserves the old expiry on
+            // replay, and the key would then vanish after a restart despite
+            // the live server reporting it as permanent.
             let batch: Vec<(KvWalOp, &str, Option<&Value>, Option<u64>)> = pairs
                 .iter()
-                .map(|(key, value)| (KvWalOp::Set, *key, Some(value), None))
+                .map(|(key, value)| (KvWalOp::SetExact, *key, Some(value), None))
                 .collect();
             if let Err(e) = wal.log_batch(&batch) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -651,6 +674,13 @@ impl KvStore {
     /// acquire). The value and its expiry are decided and WAL-logged inside
     /// the same critical section, so a crash can never leave a lock without
     /// its TTL.
+    ///
+    /// That last sentence was false until the expiry moved into the SET record
+    /// itself. Holding one shard lock across two independent WAL appends makes
+    /// the pair atomic against other *threads*, which is not the failure this
+    /// lock guards against: a crash lands between the two appends regardless of
+    /// who holds what, and replay then produced a lock with no expiry — held
+    /// forever by a process that no longer exists.
     pub fn setnx_ttl(&self, key: &str, value: Value, ttl_secs: Option<u64>) -> bool {
         let shard = self.data.shard(key);
         let mut data = shard.data.write();
@@ -664,16 +694,10 @@ impl KvStore {
             }
         }
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.log_set(key, &value) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
-            if let Some(secs) = ttl_secs {
-                let abs_ms = epoch_ms_now().saturating_add(secs.saturating_mul(1000));
-                if let Err(e) = wal.log_expire(key, abs_ms) {
-                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-                }
-            }
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.log_set_with_expiry(key, &value, ttl_secs.map(abs_expiry_ms))
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
         }
         // checked_add: a huge TTL would overflow Instant + Duration and
         // panic; treat it as "never expires" (same rule as `set`).
@@ -788,16 +812,21 @@ impl KvStore {
             // checked_add: a huge TTL overflows Instant + Duration and panics.
             // Treat an overflowing TTL as "never expires" (same rule as `expire`).
             let Some(new_exp) = Instant::now().checked_add(Duration::from_secs(ttl_secs)) else {
+                #[cfg(feature = "server")]
+                if let Some(ref wal) = self.wal
+                    && let Err(e) = wal.log_set_with_expiry(key, &entry.value, None)
+                {
+                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+                }
                 entry.expires_at = None;
                 self.bump_version();
                 return true;
             };
             #[cfg(feature = "server")]
-            if let Some(ref wal) = self.wal {
-                let abs_ms = epoch_ms_now().saturating_add(ttl_secs.saturating_mul(1000));
-                if let Err(e) = wal.log_expire(key, abs_ms) {
-                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-                }
+            if let Some(ref wal) = self.wal
+                && let Err(e) = wal.log_expire(key, abs_expiry_ms(ttl_secs))
+            {
+                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
             entry.expires_at = Some(new_exp);
             shard.add_expiry(key, new_exp);
@@ -1488,15 +1517,15 @@ impl KvStore {
                     }
                     #[cfg(feature = "server")]
                     if let Some(ref wal) = self.wal {
-                        if let Err(e) = wal.log_set(key, &entry.value) {
-                            tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
-                        }
-                        if let Some(exp) = entry.expires_at {
+                        // The restored expiry belongs to the restored value:
+                        // one record, so a crash mid-rollback cannot resurrect
+                        // the pre-transaction value without its TTL.
+                        let abs_ms = entry.expires_at.map(|exp| {
                             let remaining = exp.saturating_duration_since(Instant::now());
-                            let abs_ms = epoch_ms_now() + remaining.as_millis() as u64;
-                            if let Err(e) = wal.log_expire(key, abs_ms) {
-                                tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
-                            }
+                            epoch_ms_now().saturating_add(remaining.as_millis() as u64)
+                        });
+                        if let Err(e) = wal.log_set_with_expiry(key, &entry.value, abs_ms) {
+                            tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
                         }
                     }
                     shard.data.write().insert(key.clone(), entry.clone());
@@ -1582,6 +1611,18 @@ fn epoch_ms_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// A TTL in seconds as absolute epoch milliseconds, saturating.
+///
+/// `epoch_ms_now() + secs * 1000` overflows u64 for a large TTL: in release
+/// that wraps to a moment in the past, so the key the client asked to keep for
+/// ~forever is already expired when the log replays. Saturating keeps the
+/// in-memory rule ("an overflowing TTL means never expires") and the logged
+/// rule pointed the same way.
+#[cfg(feature = "server")]
+fn abs_expiry_ms(secs: u64) -> u64 {
+    epoch_ms_now().saturating_add(secs.saturating_mul(1000))
 }
 
 /// Convert an `Instant` expiration to absolute epoch milliseconds.
@@ -2438,6 +2479,78 @@ mod tests {
             "TTL must survive recovery, got {}",
             ttl
         );
+    }
+
+    /// PERSIST used to log nothing at all, so the key's old EXPIRE record was
+    /// still the last word on disk: the live server answered `TTL -1` and the
+    /// restart brought the expiry back, after which a key the client had made
+    /// permanent quietly disappeared.
+    #[cfg(feature = "server")]
+    #[test]
+    fn wal_persist_reopen_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        store.set("cfg", Value::Text("keep-me".into()), Some(3600));
+        assert!(store.persist("cfg"));
+        assert_eq!(store.ttl("cfg"), -1, "PERSIST is visible in memory");
+        drop(store);
+
+        let store2 = KvStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("cfg"), Some(Value::Text("keep-me".into())));
+        assert_eq!(
+            store2.ttl("cfg"),
+            -1,
+            "the expiry PERSIST removed came back after recovery"
+        );
+    }
+
+    /// SET with no TTL over a key that had one clears it, and the clearing has
+    /// to survive a restart for the same reason PERSIST does.
+    #[cfg(feature = "server")]
+    #[test]
+    fn wal_set_without_ttl_clears_expiry_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        store.set("k", Value::Int32(1), Some(3600));
+        store.set("k", Value::Int32(2), None);
+        assert_eq!(store.ttl("k"), -1);
+        drop(store);
+
+        let store2 = KvStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("k"), Some(Value::Int32(2)));
+        assert_eq!(store2.ttl("k"), -1, "the replaced key's old TTL survived");
+    }
+
+    /// INCR deliberately keeps the key's TTL, in memory and on replay.
+    #[cfg(feature = "server")]
+    #[test]
+    fn wal_incr_preserves_ttl_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        store.set("hits", Value::Int64(1), Some(3600));
+        assert_eq!(store.incr("hits").unwrap(), 2);
+        drop(store);
+
+        let store2 = KvStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("hits"), Some(Value::Int64(2)));
+        let ttl = store2.ttl("hits");
+        assert!(ttl > 3500 && ttl <= 3600, "TTL must survive INCR, got {ttl}");
+    }
+
+    /// MSET stores permanent values; a key that had a TTL must not keep it.
+    #[cfg(feature = "server")]
+    #[test]
+    fn wal_mset_clears_expiry_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        store.set("a", Value::Int32(0), Some(3600));
+        store.mset(&[("a", Value::Int32(1)), ("b", Value::Int32(2))]);
+        assert_eq!(store.ttl("a"), -1);
+        drop(store);
+
+        let store2 = KvStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("a"), Some(Value::Int32(1)));
+        assert_eq!(store2.ttl("a"), -1, "MSET left the old TTL on disk");
     }
 
     #[cfg(feature = "server")]
