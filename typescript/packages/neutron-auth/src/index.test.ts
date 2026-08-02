@@ -1,462 +1,467 @@
 import assert from "node:assert/strict";
 import { describe, it, mock } from "node:test";
+import { betterAuth } from "better-auth";
+import { memoryAdapter } from "better-auth/adapters/memory";
 import {
+  authJsResolutionFromResponse,
   createAuthContextMiddleware,
+  createAuthJsAdapter,
+  createBetterAuthAdapter,
   createProtectedRouteMiddleware,
   getAuthFromContext,
   requireAuth,
-  createBetterAuthAdapter,
-  createAuthJsAdapter,
   type AuthAdapter,
   type AuthSession,
   type NeutronAuthState,
 } from "./index.js";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function fakeAdapter(
-  session: AuthSession | null,
-  name = "test-adapter"
-): AuthAdapter {
+function fakeAdapter(session: AuthSession | null, name = "test-adapter"): AuthAdapter {
   return {
     name,
-    async getSession(_request: Request) {
+    async getSession() {
       return session;
     },
   };
 }
 
-const OK_RESPONSE = () => new Response("ok", { status: 200 });
+const ok = () => new Response("ok", { status: 200 });
 
-// ---------------------------------------------------------------------------
-// createAuthContextMiddleware
-// ---------------------------------------------------------------------------
+type BetterAuthGetSessionArgs = {
+  headers: Headers;
+  query?: { disableCookieCache?: boolean; disableRefresh?: boolean };
+  returnHeaders: true;
+};
 
-describe("createAuthContextMiddleware", () => {
-  it("populates context with authenticated state when session has a user", async () => {
+// Compile-time contract check against the installed Better Auth server type.
+function acceptBetterAuth(auth: ReturnType<typeof betterAuth>) {
+  return createBetterAuthAdapter({ auth });
+}
+void acceptBetterAuth;
+
+describe("auth context", () => {
+  it("populates authenticated state from a legacy custom adapter", async () => {
     const session: AuthSession = { user: { id: "u1", email: "a@b.com" } };
-    const adapter = fakeAdapter(session);
-    const mw = createAuthContextMiddleware({ adapter });
-
-    const ctx: Record<string, unknown> = {};
-    const response = await mw(
-      new Request("https://example.com"),
-      ctx,
-      async () => OK_RESPONSE()
-    );
+    const context: Record<string, unknown> = {};
+    const middleware = createAuthContextMiddleware({ adapter: fakeAdapter(session) });
+    const response = await middleware(new Request("https://example.com"), context, async () => ok());
 
     assert.equal(response.status, 200);
-    const auth = ctx["auth"] as NeutronAuthState;
+    const auth = context.auth as NeutronAuthState;
     assert.equal(auth.adapter, "test-adapter");
     assert.equal(auth.isAuthenticated, true);
-    assert.deepEqual(auth.user, { id: "u1", email: "a@b.com" });
+    assert.deepEqual(auth.user, session.user);
     assert.equal(auth.session, session);
   });
 
-  it("sets isAuthenticated to false when session has no user", async () => {
-    const adapter = fakeAdapter({ expiresAt: "2099-01-01" });
-    const mw = createAuthContextMiddleware({ adapter });
-
-    const ctx: Record<string, unknown> = {};
-    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
-
-    const auth = ctx["auth"] as NeutronAuthState;
-    assert.equal(auth.isAuthenticated, false);
-    assert.equal(auth.user, null);
+  it("supports a custom context key", async () => {
+    const context: Record<string, unknown> = {};
+    const middleware = createAuthContextMiddleware({
+      adapter: fakeAdapter({ user: { id: "u1" } }),
+      contextKey: "identity",
+    });
+    await middleware(new Request("https://example.com"), context, async () => ok());
+    assert.equal(context.auth, undefined);
+    assert.equal((context.identity as NeutronAuthState).isAuthenticated, true);
   });
 
-  it("sets isAuthenticated to false when session is null", async () => {
-    const adapter = fakeAdapter(null);
-    const mw = createAuthContextMiddleware({ adapter });
-
-    const ctx: Record<string, unknown> = {};
-    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
-
-    const auth = ctx["auth"] as NeutronAuthState;
-    assert.equal(auth.isAuthenticated, false);
-    assert.equal(auth.user, null);
-    assert.equal(auth.session, null);
+  it("rejects expired and malformed expiry values", async () => {
+    for (const expiresAt of ["2000-01-01T00:00:00Z", "not-a-date", Number.NaN, Infinity]) {
+      const context: Record<string, unknown> = {};
+      const middleware = createAuthContextMiddleware({
+        adapter: fakeAdapter({ user: { id: "u1" }, expiresAt }),
+      });
+      await middleware(new Request("https://example.com"), context, async () => ok());
+      assert.equal((context.auth as NeutronAuthState).isAuthenticated, false);
+    }
   });
 
-  it("uses a custom contextKey when provided", async () => {
-    const session: AuthSession = { user: { id: "u1" } };
-    const adapter = fakeAdapter(session);
-    const mw = createAuthContextMiddleware({ adapter, contextKey: "myAuth" });
-
-    const ctx: Record<string, unknown> = {};
-    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
-
-    assert.equal(ctx["auth"], undefined);
-    const auth = ctx["myAuth"] as NeutronAuthState;
-    assert.equal(auth.isAuthenticated, true);
-  });
-
-  it("treats an expired session as unauthenticated even when it carries a user", async () => {
-    const session: AuthSession = {
-      user: { id: "u1" },
-      expiresAt: "2000-01-01T00:00:00Z",
-    };
-    const mw = createAuthContextMiddleware({ adapter: fakeAdapter(session) });
-    const ctx: Record<string, unknown> = {};
-    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
-    const auth = ctx["auth"] as NeutronAuthState;
-    assert.equal(auth.isAuthenticated, false);
-    assert.equal(auth.user, null);
-  });
-
-  it("authenticates a session whose expiry is in the future", async () => {
-    const session: AuthSession = {
-      user: { id: "u1" },
-      expiresAt: Date.now() + 60_000,
-    };
-    const mw = createAuthContextMiddleware({ adapter: fakeAdapter(session) });
-    const ctx: Record<string, unknown> = {};
-    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
-    const auth = ctx["auth"] as NeutronAuthState;
-    assert.equal(auth.isAuthenticated, true);
+  it("accepts future second, millisecond, string, and Date expiries", async () => {
+    const future = Date.now() + 60_000;
+    for (const expiresAt of [future, future / 1000, new Date(future).toISOString(), new Date(future)]) {
+      const context: Record<string, unknown> = {};
+      const middleware = createAuthContextMiddleware({
+        adapter: fakeAdapter({ user: { id: "u1" }, expiresAt }),
+      });
+      await middleware(new Request("https://example.com"), context, async () => ok());
+      assert.equal((context.auth as NeutronAuthState).isAuthenticated, true);
+    }
   });
 });
 
-describe("createProtectedRouteMiddleware redirect safety", () => {
-  it("redirects unauthenticated users to a relative path", async () => {
-    const mw = createProtectedRouteMiddleware({
-      adapter: fakeAdapter(null),
-      redirectTo: "/login",
-    });
-    const res = await mw(
+describe("protected routes", () => {
+  it("returns 401 without authenticated context", async () => {
+    const middleware = createProtectedRouteMiddleware();
+    const response = await middleware(
       new Request("https://example.com/private"),
       {},
-      async () => OK_RESPONSE()
+      async () => ok()
     );
-    assert.equal(res.status, 302);
-    assert.equal(res.headers.get("Location"), "/login");
-  });
-
-  it("never redirects to a cross-origin target (open-redirect guard)", async () => {
-    const mw = createProtectedRouteMiddleware({
-      adapter: fakeAdapter(null),
-      redirectTo: "https://evil.example/phish",
-    });
-    const res = await mw(
-      new Request("https://example.com/private"),
-      {},
-      async () => OK_RESPONSE()
-    );
-    assert.equal(res.status, 302);
-    assert.equal(res.headers.get("Location"), "/");
-  });
-
-  it("rejects protocol-relative redirect targets", async () => {
-    const mw = createProtectedRouteMiddleware({
-      adapter: fakeAdapter(null),
-      redirectTo: "//evil.example/phish",
-    });
-    const res = await mw(
-      new Request("https://example.com/private"),
-      {},
-      async () => OK_RESPONSE()
-    );
-    assert.equal(res.headers.get("Location"), "/");
-  });
-
-  it("calls next() and returns its response", async () => {
-    const adapter = fakeAdapter(null);
-    const mw = createAuthContextMiddleware({ adapter });
-    const ctx: Record<string, unknown> = {};
-
-    const response = await mw(
-      new Request("https://example.com"),
-      ctx,
-      async () => new Response("custom", { status: 201 })
-    );
-
-    assert.equal(response.status, 201);
-    assert.equal(await response.text(), "custom");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// createProtectedRouteMiddleware
-// ---------------------------------------------------------------------------
-
-describe("createProtectedRouteMiddleware", () => {
-  it("returns 401 when no auth state exists and no adapter is provided", async () => {
-    const mw = createProtectedRouteMiddleware();
-    const response = await mw(
-      new Request("https://example.com/secret"),
-      {},
-      async () => OK_RESPONSE()
-    );
-
     assert.equal(response.status, 401);
     assert.equal(await response.text(), "Unauthorized");
   });
 
-  it("returns 401 when auth context shows unauthenticated", async () => {
-    const mw = createProtectedRouteMiddleware();
-    const ctx: Record<string, unknown> = {
-      auth: {
-        adapter: "test",
-        session: null,
-        user: null,
-        isAuthenticated: false,
-      },
-    };
-
-    const response = await mw(
-      new Request("https://example.com/secret"),
-      ctx,
-      async () => OK_RESPONSE()
-    );
-
-    assert.equal(response.status, 401);
-  });
-
-  it("allows access when auth context shows authenticated", async () => {
-    const mw = createProtectedRouteMiddleware();
-    const ctx: Record<string, unknown> = {
-      auth: {
-        adapter: "test",
-        session: { user: { id: "u1" } },
-        user: { id: "u1" },
-        isAuthenticated: true,
-      },
-    };
-
-    const response = await mw(
-      new Request("https://example.com/secret"),
-      ctx,
-      async () => OK_RESPONSE()
-    );
-
-    assert.equal(response.status, 200);
-  });
-
-  it("fetches session via adapter when no existing auth context", async () => {
-    const session: AuthSession = { user: { id: "u1" } };
-    const adapter = fakeAdapter(session);
-    const mw = createProtectedRouteMiddleware({ adapter });
-    const ctx: Record<string, unknown> = {};
-
-    const response = await mw(
-      new Request("https://example.com/secret"),
-      ctx,
-      async () => OK_RESPONSE()
-    );
-
-    assert.equal(response.status, 200);
-    const auth = ctx["auth"] as NeutronAuthState;
-    assert.equal(auth.isAuthenticated, true);
-  });
-
-  it("redirects when redirectTo is provided and user is unauthenticated", async () => {
-    const mw = createProtectedRouteMiddleware({
-      redirectTo: "https://example.com/login",
+  it("resolves an adapter and allows an authenticated request", async () => {
+    const context: Record<string, unknown> = {};
+    const middleware = createProtectedRouteMiddleware({
+      adapter: fakeAdapter({ user: { id: "u1" } }),
     });
-    const response = await mw(
-      new Request("https://example.com/secret"),
-      {},
-      async () => OK_RESPONSE()
+    const response = await middleware(
+      new Request("https://example.com/private"),
+      context,
+      async () => new Response("allowed", { status: 201 })
     );
-
-    assert.equal(response.status, 302);
-    assert.ok(response.headers.get("Location")?.includes("/login"));
+    assert.equal(response.status, 201);
+    assert.equal((context.auth as NeutronAuthState).isAuthenticated, true);
   });
 
-  it("supports custom unauthorizedStatus", async () => {
-    const mw = createProtectedRouteMiddleware({ unauthorizedStatus: 403 });
-    const response = await mw(
-      new Request("https://example.com/secret"),
-      {},
-      async () => OK_RESPONSE()
-    );
-
+  it("uses a configured denial status", async () => {
+    const middleware = createProtectedRouteMiddleware({ unauthorizedStatus: 403 });
+    const response = await middleware(new Request("https://example.com/private"), {}, async () => ok());
     assert.equal(response.status, 403);
   });
+
+  it("allows relative and same-origin redirects", async () => {
+    for (const redirectTo of ["/login", "https://example.com/login?next=%2Fprivate"]) {
+      const middleware = createProtectedRouteMiddleware({ adapter: fakeAdapter(null), redirectTo });
+      const response = await middleware(
+        new Request("https://example.com/private"),
+        {},
+        async () => ok()
+      );
+      assert.equal(response.status, 302);
+      assert.match(response.headers.get("location") || "", /^\/login/);
+    }
+  });
+
+  it("rejects cross-origin, protocol-relative, and backslash redirects", async () => {
+    for (const redirectTo of ["https://evil.example/phish", "//evil.example/phish", "/\\evil.example"]) {
+      const middleware = createProtectedRouteMiddleware({ adapter: fakeAdapter(null), redirectTo });
+      const response = await middleware(
+        new Request("https://example.com/private"),
+        {},
+        async () => ok()
+      );
+      assert.equal(response.headers.get("location"), "/");
+    }
+  });
 });
 
-// ---------------------------------------------------------------------------
-// getAuthFromContext / requireAuth
-// ---------------------------------------------------------------------------
-
-describe("getAuthFromContext", () => {
-  it("returns null when context key is missing", () => {
+describe("context access", () => {
+  it("returns null for absent, non-object, and structurally invalid state", () => {
     assert.equal(getAuthFromContext({}), null);
+    assert.equal(getAuthFromContext({ auth: "invalid" }), null);
+    assert.equal(getAuthFromContext({ auth: { isAuthenticated: true } }), null);
   });
 
-  it("returns null when context value is not an object", () => {
-    assert.equal(getAuthFromContext({ auth: "not-an-object" }), null);
-  });
-
-  it("returns auth state when present", () => {
-    const authState: NeutronAuthState = {
-      adapter: "test",
-      session: null,
-      user: null,
-      isAuthenticated: false,
-    };
-    const result = getAuthFromContext({ auth: authState });
-    assert.deepEqual(result, authState);
-  });
-
-  it("uses custom context key", () => {
-    const authState: NeutronAuthState = {
-      adapter: "test",
-      session: null,
-      user: null,
-      isAuthenticated: false,
-    };
-    assert.equal(getAuthFromContext({ auth: authState }, "other"), null);
-    assert.deepEqual(getAuthFromContext({ other: authState }, "other"), authState);
-  });
-});
-
-describe("requireAuth", () => {
-  it("throws a 401 Response when not authenticated", () => {
-    try {
-      requireAuth({});
-      assert.fail("Expected a thrown Response");
-    } catch (err) {
-      assert.ok(err instanceof Response);
-      assert.equal((err as Response).status, 401);
-    }
-  });
-
-  it("throws a 401 Response when auth state has isAuthenticated=false", () => {
-    const ctx = {
+  it("derives state instead of trusting stored user or authentication flags", () => {
+    const state = getAuthFromContext({
       auth: {
-        adapter: "test",
+        adapter: "forged",
         session: null,
-        user: null,
-        isAuthenticated: false,
+        user: { id: "forged" },
+        isAuthenticated: true,
       },
-    };
-    try {
-      requireAuth(ctx);
-      assert.fail("Expected a thrown Response");
-    } catch (err) {
-      assert.ok(err instanceof Response);
-    }
+    });
+    assert.equal(state?.isAuthenticated, false);
+    assert.equal(state?.user, null);
   });
 
-  it("returns auth state when authenticated", () => {
-    const authState: NeutronAuthState = {
-      adapter: "test",
-      session: { user: { id: "u1" } },
-      user: { id: "u1" },
-      isAuthenticated: true,
-    };
-    const result = requireAuth({ auth: authState });
-    assert.equal(result.isAuthenticated, true);
-    assert.deepEqual(result.user, { id: "u1" });
+  it("uses custom keys and returns valid state", () => {
+    const session = { user: { id: "u1" } };
+    const state = getAuthFromContext({ identity: { adapter: "test", session } }, "identity");
+    assert.equal(state?.isAuthenticated, true);
+    assert.deepEqual(state?.user, { id: "u1" });
+  });
+
+  it("requireAuth rejects missing state and returns valid state", () => {
+    assert.throws(() => requireAuth({}), (error) => error instanceof Response && error.status === 401);
+    const state = requireAuth({ auth: { adapter: "test", session: { user: { id: "u1" } } } });
+    assert.equal(state.user?.id, "u1");
   });
 });
-
-// ---------------------------------------------------------------------------
-// createBetterAuthAdapter
-// ---------------------------------------------------------------------------
 
 describe("createBetterAuthAdapter", () => {
-  it("calls api.getSession when available", async () => {
-    const mockSession = { session: { user: { id: "ba1" } } };
-    const auth = {
-      api: {
-        getSession: mock.fn(async () => mockSession),
+  it("normalizes Better Auth's documented sibling shape and strips its token", async () => {
+    const expiresAt = new Date(Date.now() + 60_000);
+    const getSession = mock.fn(async (_args: BetterAuthGetSessionArgs) => ({
+      headers: new Headers(),
+      response: {
+        session: { id: "s1", userId: "ba1", token: "secret", expiresAt },
+        user: { id: "ba1", email: "better@example.com" },
       },
-    };
-    const adapter = createBetterAuthAdapter({ auth });
-
-    assert.equal(adapter.name, "better-auth");
+    }));
+    const adapter = createBetterAuthAdapter({ auth: { api: { getSession } } });
     const session = await adapter.getSession(new Request("https://example.com"));
 
-    assert.deepEqual(session, { user: { id: "ba1" } });
-    assert.equal(auth.api.getSession.mock.calls.length, 1);
+    assert.deepEqual(session, {
+      id: "s1",
+      userId: "ba1",
+      expiresAt,
+      user: { id: "ba1", email: "better@example.com" },
+    });
+    assert.equal(getSession.mock.calls[0]!.arguments[0].returnHeaders, true);
   });
 
-  it("falls back to auth.getSession when api.getSession is not available", async () => {
-    const mockSession = { session: { user: { id: "ba2" } } };
-    const auth = {
-      getSession: mock.fn(async () => mockSession),
-    };
-    const adapter = createBetterAuthAdapter({ auth });
-
+  it("passes cache options and can retain the token explicitly", async () => {
+    const getSession = mock.fn(async (_args: BetterAuthGetSessionArgs) => ({
+      headers: new Headers(),
+      response: {
+        session: { token: "secret", expiresAt: new Date(Date.now() + 60_000) },
+        user: { id: "ba2" },
+      },
+    }));
+    const adapter = createBetterAuthAdapter({
+      auth: { api: { getSession } },
+      disableCookieCache: true,
+      disableRefresh: true,
+      includeSessionToken: true,
+    });
     const session = await adapter.getSession(new Request("https://example.com"));
-    assert.deepEqual(session, { user: { id: "ba2" } });
+    assert.equal(session?.token, "secret");
+    assert.deepEqual(getSession.mock.calls[0]!.arguments[0].query, {
+      disableCookieCache: true,
+      disableRefresh: true,
+    });
   });
 
-  it("returns null when session data is null", async () => {
-    const auth = {
-      api: { getSession: async () => null },
-    };
+  it("returns null for null and malformed provider payloads", async () => {
+    for (const response of [null, {}, { session: {} }, { user: { id: "u1" } }]) {
+      const adapter = createBetterAuthAdapter({
+        auth: { api: { getSession: async () => ({ headers: new Headers(), response }) } },
+      });
+      assert.equal(await adapter.getSession(new Request("https://example.com")), null);
+    }
+  });
+
+  it("supports custom-session output through an explicit mapper", async () => {
+    const adapter = createBetterAuthAdapter({
+      auth: {
+        api: {
+          getSession: async () => ({
+            headers: new Headers(),
+            response: { identity: { id: "custom" }, validUntil: "2099-01-01" },
+          }),
+        },
+      },
+      mapSession(value) {
+        const custom = value as { identity: { id: string }; validUntil: string };
+        return { user: custom.identity, expiresAt: custom.validUntil };
+      },
+    });
+    assert.equal((await adapter.getSession(new Request("https://example.com")))?.user?.id, "custom");
+  });
+
+  it("performs Better Auth's deferred POST refresh when requested", async () => {
+    const handler = mock.fn(async (_request: Request) => Response.json({
+      session: { expiresAt: new Date(Date.now() + 120_000).toISOString() },
+      user: { id: "refreshed" },
+    }, {
+      headers: { "Set-Cookie": "session=new; Path=/; HttpOnly" },
+    }));
+    const adapter = createBetterAuthAdapter({
+      auth: {
+        api: {
+          getSession: async () => ({
+            headers: new Headers(),
+            response: {
+              session: { expiresAt: new Date(Date.now() + 10_000) },
+              user: { id: "old" },
+              needsRefresh: true,
+            },
+          }),
+        },
+        handler,
+      },
+      basePath: "/custom-auth",
+    });
+    const middleware = createAuthContextMiddleware({ adapter });
+    const context: Record<string, unknown> = {};
+    const response = await middleware(
+      new Request("https://example.com/private", { headers: { Cookie: "session=old" } }),
+      context,
+      async () => ok()
+    );
+    const refreshRequest = handler.mock.calls[0]!.arguments[0];
+    assert.equal(refreshRequest.method, "POST");
+    assert.equal(new URL(refreshRequest.url).pathname, "/custom-auth/get-session");
+    assert.equal(refreshRequest.headers.get("origin"), "https://example.com");
+    assert.equal((context.auth as NeutronAuthState).user?.id, "refreshed");
+    assert.match(response.headers.get("set-cookie") || "", /session=new/);
+  });
+
+  it("retains the deprecated top-level resolver without claiming it is Better Auth", async () => {
+    const adapter = createBetterAuthAdapter({
+      auth: { getSession: async () => ({ session: { user: { id: "legacy" } } }) },
+    });
+    assert.equal((await adapter.getSession(new Request("https://example.com")))?.user?.id, "legacy");
+  });
+
+  it("forwards refresh cookies on success", async () => {
+    const headers = new Headers();
+    headers.append("Set-Cookie", "session=refreshed; Path=/; HttpOnly");
+    const adapter = createBetterAuthAdapter({
+      auth: {
+        api: {
+          getSession: async () => ({
+            headers,
+            response: {
+              session: { expiresAt: new Date(Date.now() + 60_000) },
+              user: { id: "ba3" },
+            },
+          }),
+        },
+      },
+    });
+    const middleware = createAuthContextMiddleware({ adapter });
+    const response = await middleware(new Request("https://example.com"), {}, async () => ok());
+    assert.match(response.headers.get("set-cookie") || "", /session=refreshed/);
+  });
+
+  it("forwards cleanup cookies on denial", async () => {
+    const headers = new Headers();
+    headers.append("Set-Cookie", "session=; Path=/; Max-Age=0");
+    const adapter = createBetterAuthAdapter({
+      auth: { api: { getSession: async () => ({ headers, response: null }) } },
+    });
+    const middleware = createProtectedRouteMiddleware({ adapter, redirectTo: "/login" });
+    const response = await middleware(
+      new Request("https://example.com/private"),
+      {},
+      async () => ok()
+    );
+    assert.equal(response.status, 302);
+    assert.match(response.headers.get("set-cookie") || "", /Max-Age=0/);
+  });
+
+  it("authenticates through a real Better Auth instance", async () => {
+    const database = { user: [], session: [], account: [], verification: [] };
+    const auth = betterAuth({
+      database: memoryAdapter(database),
+      baseURL: "https://example.com",
+      secret: "test-secret-that-is-at-least-thirty-two-characters",
+      emailAndPassword: { enabled: true },
+    });
+    const signUp = await auth.handler(new Request("https://example.com/api/auth/sign-up/email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://example.com" },
+      body: JSON.stringify({
+        name: "Real User",
+        email: "real@example.com",
+        password: "long-enough-test-password",
+      }),
+    }));
+    assert.equal(signUp.status, 200);
+    const setCookies = signUp.headers.getSetCookie();
+    const cookie = setCookies.map((value) => value.split(";", 1)[0]).join("; ");
     const adapter = createBetterAuthAdapter({ auth });
-    const session = await adapter.getSession(new Request("https://example.com"));
-    assert.equal(session, null);
+    const session = await adapter.getSession(new Request("https://example.com/studio", {
+      headers: { Cookie: cookie },
+    }));
+    assert.equal(session?.user?.email, "real@example.com");
+    assert.equal(session?.token, undefined);
   });
 
-  it("uses custom name when provided", () => {
-    const auth = { api: { getSession: async () => null } };
-    const adapter = createBetterAuthAdapter({ auth, name: "my-better-auth" });
-    assert.equal(adapter.name, "my-better-auth");
+  it("refreshes a real deferred Better Auth session from a navigation request", async () => {
+    const database = { user: [], session: [], account: [], verification: [] };
+    const auth = betterAuth({
+      database: memoryAdapter(database),
+      baseURL: "https://example.com",
+      secret: "test-secret-that-is-at-least-thirty-two-characters",
+      emailAndPassword: { enabled: true },
+      session: { expiresIn: 3600, updateAge: 0, deferSessionRefresh: true },
+    });
+    const signUp = await auth.handler(new Request("https://example.com/api/auth/sign-up/email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://example.com" },
+      body: JSON.stringify({
+        name: "Deferred User",
+        email: "deferred@example.com",
+        password: "long-enough-test-password",
+      }),
+    }));
+    const cookie = signUp.headers.getSetCookie()
+      .map((value) => value.split(";", 1)[0])
+      .join("; ");
+    const adapter = createBetterAuthAdapter({ auth });
+    const context: Record<string, unknown> = {};
+    const middleware = createAuthContextMiddleware({ adapter });
+    const response = await middleware(new Request("https://example.com/studio", {
+      headers: { Cookie: cookie },
+    }), context, async () => ok());
+
+    assert.equal((context.auth as NeutronAuthState).user?.email, "deferred@example.com");
+    assert.ok(response.headers.getSetCookie().length > 0);
   });
 });
 
-// ---------------------------------------------------------------------------
-// createAuthJsAdapter
-// ---------------------------------------------------------------------------
-
 describe("createAuthJsAdapter", () => {
-  it("calls function-form auth directly", async () => {
-    const authFn = mock.fn(async () => ({ user: { id: "aj1", email: "aj@b.com" } }));
-    const adapter = createAuthJsAdapter({ auth: authFn });
-
-    assert.equal(adapter.name, "authjs");
+  it("normalizes an application-supplied direct Auth.js session", async () => {
+    const getSession = mock.fn(async () => ({
+      user: { id: "aj1", email: "aj@example.com" },
+      expires: "2099-01-01T00:00:00.000Z",
+    }));
+    const adapter = createAuthJsAdapter({ getSession });
     const session = await adapter.getSession(new Request("https://example.com"));
-    assert.deepEqual(session, { user: { id: "aj1", email: "aj@b.com" } });
-    assert.equal(authFn.mock.calls.length, 1);
+    assert.deepEqual(session, {
+      user: { id: "aj1", email: "aj@example.com" },
+      expires: "2099-01-01T00:00:00.000Z",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    assert.equal(getSession.mock.calls.length, 1);
   });
 
-  it("calls auth.auth when available", async () => {
-    const authObj = {
-      auth: mock.fn(async () => ({ session: { user: { id: "aj2" } } })),
-    };
-    const adapter = createAuthJsAdapter({ auth: authObj });
-
-    const session = await adapter.getSession(new Request("https://example.com"));
-    // normalizeSession extracts the nested .session
-    assert.deepEqual(session, { user: { id: "aj2" } });
+  it("rejects null, malformed data, and Response objects", async () => {
+    for (const value of [null, "invalid", {}, new Response(null)]) {
+      const adapter = createAuthJsAdapter({ getSession: async () => value });
+      assert.equal(await adapter.getSession(new Request("https://example.com")), null);
+    }
   });
 
-  it("calls auth.getSession as fallback", async () => {
-    const authObj = {
-      getSession: mock.fn(async () => ({ user: { id: "aj3" } })),
-    };
-    const adapter = createAuthJsAdapter({ auth: authObj });
-
+  it("does not unwrap an Auth.js custom field named session", async () => {
+    const adapter = createAuthJsAdapter({
+      getSession: async () => ({
+        user: { id: "aj2" },
+        expires: "2099-01-01T00:00:00.000Z",
+        session: { custom: true },
+      }),
+    });
     const session = await adapter.getSession(new Request("https://example.com"));
-    assert.deepEqual(session, { user: { id: "aj3" } });
+    assert.deepEqual(session?.session, { custom: true });
+    assert.equal(session?.user?.id, "aj2");
   });
 
-  it("returns null when no auth data is returned", async () => {
-    const authFn = async () => null;
-    const adapter = createAuthJsAdapter({ auth: authFn });
-
-    const session = await adapter.getSession(new Request("https://example.com"));
-    assert.equal(session, null);
+  it("forwards cookies from a response-aware Auth.js resolver", async () => {
+    const adapter = createAuthJsAdapter({
+      resolveSession: async () => ({
+        session: { user: { id: "aj3" }, expires: "2099-01-01T00:00:00.000Z" },
+        setCookie: ["authjs=rotated; Path=/; HttpOnly"],
+      }),
+    });
+    const middleware = createAuthContextMiddleware({ adapter });
+    const response = await middleware(new Request("https://example.com"), {}, async () => ok());
+    assert.match(response.headers.get("set-cookie") || "", /authjs=rotated/);
   });
 
-  it("returns null for non-object raw responses", async () => {
-    const authFn = async () => "not-an-object" as unknown;
-    const adapter = createAuthJsAdapter({ auth: authFn });
-
-    const session = await adapter.getSession(new Request("https://example.com"));
-    assert.equal(session, null);
+  it("extracts multiple cookies from an Auth.js core response", async () => {
+    const response = Response.json({
+      user: { id: "aj4", email: null, name: null },
+      expires: "2099-01-01T00:00:00.000Z",
+    });
+    response.headers.set(
+      "Set-Cookie",
+      "one=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT; Path=/, two=2; Path=/; HttpOnly"
+    );
+    Object.defineProperty(response.headers, "getSetCookie", { value: undefined });
+    const resolution = await authJsResolutionFromResponse(response);
+    assert.equal(resolution.setCookie?.length, 2);
+    assert.match(resolution.setCookie?.[0] || "", /^one=1/);
+    assert.match(resolution.setCookie?.[1] || "", /^two=2/);
   });
 
-  it("uses custom name when provided", () => {
-    const authFn = async () => null;
-    const adapter = createAuthJsAdapter({ auth: authFn, name: "my-authjs" });
-    assert.equal(adapter.name, "my-authjs");
+  it("retains the deprecated Auth.js factory input shape", async () => {
+    const adapter = createAuthJsAdapter({
+      auth: { getSession: async () => ({ user: { id: "legacy-authjs" } }) },
+    });
+    assert.equal((await adapter.getSession(new Request("https://example.com")))?.user?.id, "legacy-authjs");
   });
 });
