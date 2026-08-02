@@ -1,260 +1,224 @@
 /**
- * Incremental Prefetch with Layout Deduplication
- * Inspired by Next.js 16's smart prefetching
+ * Link prefetching: warm a navigation's payload before the click lands.
  *
- * - Only downloads missing parts not in cache
- * - Shared layouts download once
- * - Viewport-aware (cancels if link leaves viewport)
- * - Cache-aware (re-prefetches only uncached parts)
+ * A same-origin link is prefetched when it enters the viewport or on pointer
+ * intent (hover / touch-start / keyboard focus). The payload is stored in the
+ * shared prefetch cache, which is the one `handleNavigation` reads, so a click
+ * on a warmed link renders with **zero network**.
+ *
+ * ## What this replaced, and why none of it worked
+ *
+ * The previous implementation was built on three server features that do not
+ * exist. It sent `X-Neutron-Prefetch-Metadata` on a HEAD request and read
+ * `X-Neutron-Layout-Id` / `X-Neutron-Route-Id` off the response — the server
+ * sets neither, so every link resolved to the same `'default'` layout id. That
+ * made its `hasLayout` check true for every link after the first, which routed
+ * every later prefetch through an `X-Neutron-Skip-Layout` request the server
+ * also does not implement, and stored the result under a *different shape*
+ * from the first entry. Two requests per link, to produce data in an
+ * inconsistent format.
+ *
+ * None of which mattered, because it wrote to module-local Maps that nothing
+ * read, and nothing imported this module into the browser bundle in the first
+ * place — the auto-setup at the bottom of the file never ran.
+ *
+ * This version fetches exactly what a navigation fetches, in one request,
+ * stores it where a navigation looks, and is imported by the client runtime.
  */
 
-interface PrefetchMetadata {
-  layoutId: string;
-  routeId: string;
-  timestamp: number;
-}
+import { decodeLoaderDataPayload } from "./serialization.js";
+import { hasFreshPrefetch, storePrefetch } from "./prefetch-cache.js";
 
-interface PrefetchCache {
-  layouts: Map<string, any>;     // layoutId -> layout data
-  pages: Map<string, any>;       // url -> page data
-  metadata: Map<string, PrefetchMetadata>; // url -> metadata
-}
+export { clearPrefetchCache, clearPrefetchCacheForUrl } from "./prefetch-cache.js";
 
-const prefetchCache: PrefetchCache = {
-  layouts: new Map(),
-  pages: new Map(),
-  metadata: new Map(),
-};
+/** Links currently being warmed, so intent and viewport do not double-fetch. */
+const inFlight = new Map<string, AbortController>();
 
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const intersectionObserver = typeof window !== 'undefined'
-  ? new IntersectionObserver(handleIntersection, { rootMargin: '50px' })
-  : null;
+/** How long pointer intent waits before spending a request. */
+const HOVER_DELAY_MS = 65;
 
-const pendingPrefetches = new Map<string, AbortController>();
+const observed = new WeakSet<Element>();
+let intersectionObserver: IntersectionObserver | null = null;
+let installed = false;
+let hoverTimer: ReturnType<typeof setTimeout> | null = null;
 
-/**
- * Fetches page metadata to determine layout fingerprint
- */
-async function fetchPageMetadata(url: string): Promise<PrefetchMetadata | null> {
-  try {
-    const response = await fetch(url, {
-      method: 'HEAD',
-      headers: {
-        'X-Neutron-Prefetch-Metadata': 'true',
-      },
-    });
-
-    const layoutId = response.headers.get('X-Neutron-Layout-Id') || 'default';
-    const routeId = response.headers.get('X-Neutron-Route-Id') || url;
-
-    return {
-      layoutId,
-      routeId,
-      timestamp: Date.now(),
-    };
-  } catch {
-    return null;
-  }
+function currentUrl(): string {
+  return window.location.pathname + window.location.search;
 }
 
 /**
- * Incremental prefetch - only fetches what's not cached
+ * Whether prefetching is appropriate at all right now.
+ *
+ * Speculative requests are a cost someone else pays: on a metered or slow
+ * connection, warming links the user never clicks is worse than the latency it
+ * saves. Both signals are advisory and absent in some browsers, so the default
+ * when nothing is known is to prefetch.
  */
-export async function incrementalPrefetch(url: string, signal?: AbortSignal): Promise<void> {
-  // Check if we already have this page cached
-  const cached = prefetchCache.pages.get(url);
-  if (cached) {
-    const metadata = prefetchCache.metadata.get(url);
-    if (metadata && Date.now() - metadata.timestamp < CACHE_TTL) {
-      // Cache still valid
-      return;
+function prefetchAllowed(): boolean {
+  const connection = (
+    navigator as Navigator & {
+      connection?: { saveData?: boolean; effectiveType?: string };
     }
-  }
-
-  // Fetch page metadata
-  const metadata = await fetchPageMetadata(url);
-  if (!metadata || signal?.aborted) return;
-
-  const { layoutId } = metadata;
-
-  // Check if we have this layout cached
-  const hasLayout = prefetchCache.layouts.has(layoutId);
-
-  try {
-    if (hasLayout) {
-      // Only fetch page data (layout already cached)
-      const response = await fetch(url, {
-        headers: {
-          'Accept': 'application/json',
-          'X-Neutron-Data': 'true',
-          'X-Neutron-Skip-Layout': 'true', // Request only page data
-        },
-        signal,
-      });
-
-      if (signal?.aborted) return;
-
-      const pageData = await response.json();
-      prefetchCache.pages.set(url, { layout: layoutId, data: pageData });
-      prefetchCache.metadata.set(url, metadata);
-    } else {
-      // Fetch both layout and page data
-      const response = await fetch(url, {
-        headers: {
-          'Accept': 'application/json',
-          'X-Neutron-Data': 'true',
-        },
-        signal,
-      });
-
-      if (signal?.aborted) return;
-
-      const fullData = await response.json();
-
-      // Cache layout separately for reuse
-      if (fullData.layout) {
-        prefetchCache.layouts.set(layoutId, fullData.layout);
-      }
-
-      prefetchCache.pages.set(url, fullData);
-      prefetchCache.metadata.set(url, metadata);
-    }
-  } catch (error) {
-    if (!signal?.aborted) {
-      console.warn('[Neutron] Prefetch failed:', url, error);
-    }
-  }
+  ).connection;
+  if (!connection) return true;
+  if (connection.saveData) return false;
+  const type = connection.effectiveType;
+  return type !== "slow-2g" && type !== "2g";
 }
 
 /**
- * Get cached page data if available
+ * The prefetchable href for an anchor, or null.
+ *
+ * Deliberately conservative: anything that is not a plain same-origin document
+ * navigation is left alone. `data-neutron-prefetch="false"` opts a link out —
+ * the escape hatch for a link whose GET is not side-effect free.
  */
-export function getCachedPage(url: string): any {
-  const cached = prefetchCache.pages.get(url);
-  if (!cached) return null;
+function prefetchableHref(anchor: HTMLAnchorElement): string | null {
+  if (anchor.dataset.neutronPrefetch === "false") return null;
+  if (anchor.target && anchor.target !== "_self") return null;
+  if (anchor.hasAttribute("download")) return null;
+  if (anchor.origin !== window.location.origin) return null;
 
-  const metadata = prefetchCache.metadata.get(url);
-  if (metadata && Date.now() - metadata.timestamp < CACHE_TTL) {
-    return cached;
-  }
+  const protocol = anchor.protocol;
+  if (protocol !== "http:" && protocol !== "https:") return null;
 
-  // Cache expired, clean up
-  prefetchCache.pages.delete(url);
-  prefetchCache.metadata.delete(url);
-  return null;
+  const href = anchor.pathname + anchor.search;
+  // The page we are on needs no warming.
+  if (href === currentUrl()) return null;
+  return href;
 }
 
 /**
- * Clear prefetch cache
+ * Warm `url` unless it is already warm or in flight.
+ *
+ * Failures are silent by design. A prefetch is speculative: if it does not
+ * arrive, the click falls back to the normal fetch, which is exactly the
+ * behavior without any prefetching. Logging per failed speculative request
+ * turns a flaky network into console noise.
  */
-export function clearPrefetchCache(): void {
-  prefetchCache.layouts.clear();
-  prefetchCache.pages.clear();
-  prefetchCache.metadata.clear();
-}
-
-/**
- * Clear prefetch cache for specific URL
- */
-export function clearPrefetchCacheForUrl(url: string): void {
-  prefetchCache.pages.delete(url);
-  prefetchCache.metadata.delete(url);
-}
-
-/**
- * Intersection observer callback
- */
-function handleIntersection(entries: IntersectionObserverEntry[]) {
-  for (const entry of entries) {
-    const link = entry.target as HTMLAnchorElement;
-    const href = link.getAttribute('href');
-    if (!href) continue;
-
-    if (entry.isIntersecting) {
-      // Link entered viewport - start prefetch
-      startPrefetch(href);
-    } else {
-      // Link left viewport - cancel prefetch
-      cancelPrefetch(href);
-    }
-  }
-}
-
-/**
- * Start prefetching a URL
- */
-function startPrefetch(url: string): void {
-  // Don't prefetch if already in progress
-  if (pendingPrefetches.has(url)) return;
+export async function incrementalPrefetch(url: string): Promise<void> {
+  if (typeof window === "undefined") return;
+  if (!prefetchAllowed()) return;
+  if (hasFreshPrefetch(url) || inFlight.has(url)) return;
 
   const controller = new AbortController();
-  pendingPrefetches.set(url, controller);
-
-  incrementalPrefetch(url, controller.signal)
-    .finally(() => {
-      pendingPrefetches.delete(url);
+  inFlight.set(url, controller);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        "X-Neutron-Data": "true",
+        // Marks the request speculative so a server or proxy can treat it
+        // differently from a user-initiated navigation. Advisory only.
+        Purpose: "prefetch",
+      },
+      signal: controller.signal,
     });
+    if (!response.ok) return;
+    // A redirect means the destination is not what was linked. Warming the
+    // wrong URL would make the click render a page the server would not serve
+    // for it — including, behind auth middleware, one it would have refused.
+    if (response.redirected) return;
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) return;
+
+    storePrefetch(url, decodeLoaderDataPayload(await response.json()));
+  } catch {
+    // Aborted or offline: leave the URL unwarmed.
+  } finally {
+    inFlight.delete(url);
+  }
 }
 
-/**
- * Cancel prefetching a URL
- */
-function cancelPrefetch(url: string): void {
-  const controller = pendingPrefetches.get(url);
-  if (controller) {
-    controller.abort();
-    pendingPrefetches.delete(url);
+function handleIntersection(list: IntersectionObserverEntry[]): void {
+  for (const entry of list) {
+    if (!entry.isIntersecting) continue;
+    const anchor = entry.target as HTMLAnchorElement;
+    const href = prefetchableHref(anchor);
+    if (href) void incrementalPrefetch(href);
+    // One warm per link per page-view; the cache decides the rest.
+    intersectionObserver?.unobserve(anchor);
+  }
+}
+
+function onPointerIntent(event: Event): void {
+  const target = event.target;
+  const anchor = target instanceof Element ? target.closest("a") : null;
+  if (!anchor) return;
+  const href = prefetchableHref(anchor as HTMLAnchorElement);
+  if (!href) return;
+
+  if (hoverTimer) clearTimeout(hoverTimer);
+  // A short delay keeps a pointer crossing a nav bar from warming every link
+  // in it; real intent outlasts the sweep.
+  hoverTimer = setTimeout(() => void incrementalPrefetch(href), HOVER_DELAY_MS);
+}
+
+function cancelPointerIntent(): void {
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
   }
 }
 
 /**
- * Setup incremental prefetch for all links with data-neutron-prefetch attribute
+ * Install the prefetch triggers. Idempotent. Called by the client runtime, so
+ * apps do not need to call it.
  */
 export function setupIncrementalPrefetch(): void {
-  if (typeof window === 'undefined' || !intersectionObserver) return;
+  if (typeof window === "undefined" || installed) return;
+  installed = true;
 
-  // Observe all prefetch links
-  const links = document.querySelectorAll('a[data-neutron-prefetch="viewport"]');
-  links.forEach(link => {
-    intersectionObserver.observe(link);
+  // Capture phase, because a link inside a component that stops propagation
+  // would otherwise never be warmed.
+  document.addEventListener("pointerenter", onPointerIntent, true);
+  document.addEventListener("focusin", onPointerIntent, true);
+  document.addEventListener("pointerleave", cancelPointerIntent, true);
+  document.addEventListener("touchstart", onPointerIntent, {
+    capture: true,
+    passive: true,
   });
 
-  // Handle hover prefetch
-  const hoverLinks = document.querySelectorAll('a[data-neutron-prefetch="hover"]');
-  hoverLinks.forEach(link => {
-    link.addEventListener('mouseenter', () => {
-      const href = link.getAttribute('href');
-      if (href) startPrefetch(href);
+  if ("IntersectionObserver" in window) {
+    intersectionObserver = new IntersectionObserver(handleIntersection, {
+      rootMargin: "200px",
     });
-  });
-
-  // Handle immediate prefetch
-  const immediateLinks = document.querySelectorAll('a[data-neutron-prefetch="immediate"]');
-  immediateLinks.forEach(link => {
-    const href = link.getAttribute('href');
-    if (href) startPrefetch(href);
-  });
+    observeVisibleLinks();
+  }
 }
 
 /**
- * Cleanup - disconnect observer
+ * Observe same-origin links currently in the document.
+ *
+ * Called again after each navigation: a client-rendered page brings its own
+ * links, and an observer that only ever saw the first page's DOM would warm
+ * nothing from the second one onward.
  */
-export function cleanupIncrementalPrefetch(): void {
-  intersectionObserver?.disconnect();
-
-  // Cancel all pending prefetches
-  for (const controller of pendingPrefetches.values()) {
-    controller.abort();
-  }
-  pendingPrefetches.clear();
+export function observeVisibleLinks(): void {
+  if (!intersectionObserver) return;
+  document.querySelectorAll("a[href]").forEach((element) => {
+    if (observed.has(element)) return;
+    const anchor = element as HTMLAnchorElement;
+    if (!prefetchableHref(anchor)) return;
+    observed.add(element);
+    intersectionObserver?.observe(anchor);
+  });
 }
 
-// Auto-setup on load
-if (typeof window !== 'undefined') {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', setupIncrementalPrefetch);
-  } else {
-    setupIncrementalPrefetch();
-  }
+export function cleanupIncrementalPrefetch(): void {
+  document.removeEventListener("pointerenter", onPointerIntent, true);
+  document.removeEventListener("focusin", onPointerIntent, true);
+  document.removeEventListener("pointerleave", cancelPointerIntent, true);
+  intersectionObserver?.disconnect();
+  intersectionObserver = null;
+  cancelPointerIntent();
+  for (const controller of inFlight.values()) controller.abort();
+  inFlight.clear();
+  installed = false;
+}
+
+/** The payload warmed for `url`, without consuming it. */
+export function getCachedPage(url: string): unknown {
+  if (!hasFreshPrefetch(url)) return null;
+  return window.__NEUTRON_PREFETCH_CACHE__?.[url] ?? null;
 }

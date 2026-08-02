@@ -11,6 +11,11 @@ import { getCurrentPath, getCurrentSearch, subscribe, navigate } from "./navigat
 import type { RouteHref } from "../core/typed-routes.js";
 import { initIslands } from "./island-runtime.js";
 import { decodeLoaderDataPayload, readInitialLoaderData } from "./serialization.js";
+import { takePrefetch } from "./prefetch-cache.js";
+import {
+  observeVisibleLinks,
+  setupIncrementalPrefetch,
+} from "./incremental-prefetch.js";
 import { ClientErrorBoundary } from "./error-boundary.js";
 
 interface RouteModule {
@@ -146,6 +151,11 @@ export async function init() {
   subscribe((event) => {
     return handleNavigation(event.forceRevalidate === true);
   });
+
+  // Warm navigations before the click lands. This is what makes a same-origin
+  // navigation cost zero network: `handleNavigation` reads the cache this
+  // fills. Nothing imported this module before, so it had never run.
+  setupIncrementalPrefetch();
 
   // Global click interceptor — makes all same-origin <a> tags do SPA navigation.
   // Without this, only <Link> components would trigger SPA nav; raw <a> tags
@@ -367,6 +377,10 @@ function applyData(data: LoaderData): void {
 
   window.__NEUTRON_DATA__ = decoded;
   hydrateApp(decoded);
+  // The page that just rendered brings its own links; an observer that only
+  // ever saw the first page's DOM would warm nothing after the first
+  // navigation. Cheap: already-observed nodes are skipped.
+  observeVisibleLinks();
 }
 
 /**
@@ -506,22 +520,43 @@ async function handleNavigation(forceRevalidate: boolean = false) {
   currentUrl = nextUrl;
   await ensureRouteChainModules([...nextLayouts, route]);
 
-  const prefetched = window.__NEUTRON_PREFETCH_CACHE__?.[nextUrl];
-  if (prefetched && !forceRevalidate) {
-    // CSS should already be loaded during prefetch, but ensure it
+  const prefetched = forceRevalidate ? null : takePrefetch(nextUrl);
+  if (prefetched) {
+    // Claim this navigation before doing anything async. An in-flight fetch
+    // from a previous click is still holding the old request id, and it only
+    // discards its result when a NEWER id exists. Without these two lines it
+    // would land after this render and overwrite the page the user is now on
+    // with the data for the page they left.
+    if (activeNavigationController) {
+      activeNavigationController.abort();
+      activeNavigationController = null;
+    }
+    const requestId = ++latestNavigationRequestId;
+
+    // CSS should already be loaded from the prefetch, but a route whose
+    // stylesheet was evicted or never fetched still must not paint unstyled.
     const prefetchCss = (prefetched as Record<string, unknown>).__css__;
     if (Array.isArray(prefetchCss)) {
       try {
         await loadMissingStylesheets(prefetchCss as string[]);
       } catch {
-        // CSS timeout — fall back to full page load
+        // CSS timeout — fall back to full page load (guaranteed no FOUC)
         window.location.href = nextUrl;
         return;
       }
       delete (prefetched as Record<string, unknown>).__css__;
+      if (requestId !== latestNavigationRequestId) {
+        return;
+      }
     }
     const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, prefetched);
     applyData(merged);
+    // Same contract as the fetched path: a new page starts at the top. Leaving
+    // this out made a warmed navigation land mid-page, so whether scrolling
+    // worked depended on whether the link happened to be prefetched.
+    if (previousPathname !== pathname) {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    }
     return;
   }
 

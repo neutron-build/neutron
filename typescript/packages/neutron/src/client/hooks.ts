@@ -2,6 +2,7 @@ import { createContext } from "preact";
 import { useContext, useCallback, useMemo, useState, useEffect, useRef } from "preact/hooks";
 import { decodeLoaderDataPayload } from "./serialization.js";
 import { go, navigate } from "./navigate.js";
+import { storePrefetch } from "./prefetch-cache.js";
 import type { RouteHref } from "../core/typed-routes.js";
 import type { SerializeFrom } from "../core/types.js";
 
@@ -246,8 +247,18 @@ export function useSubmit() {
           }
 
           const currentUrl = window.location.pathname + window.location.search;
-          window.__NEUTRON_PREFETCH_CACHE__ = window.__NEUTRON_PREFETCH_CACHE__ || {};
-          window.__NEUTRON_PREFETCH_CACHE__[currentUrl] = data;
+          // Post-mutation data, so a navigation back to this URL in the next
+          // few seconds does not refetch what we already hold. It goes through
+          // the shared cache, which expires it and consumes it on read.
+          //
+          // This used to be written straight into
+          // `window.__NEUTRON_PREFETCH_CACHE__` with no expiry and no
+          // invalidation — and `handleNavigation` treats that object as a
+          // prefetch cache. Navigating away and back then re-served this exact
+          // snapshot with no network, forever: every later change made by
+          // anyone, including this user in another tab, stayed invisible until
+          // a hard reload.
+          storePrefetch(currentUrl, data);
           applyClientData(data);
         } else {
           window.dispatchEvent(new PopStateEvent("popstate"));
