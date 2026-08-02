@@ -11,6 +11,7 @@ import { h } from "preact";
 import type * as preact from "preact";
 
 import { escapeHtml } from "./escape.js";
+import { renderSpeculationRules } from "./speculation-rules.js";
 import { encodeSerializedPayloadAsJson, serializeForInlineScript } from "./serialization.js";
 import { assertRenderedFragment, decodeChunkStart } from "./fragment-guard.js";
 import {
@@ -379,12 +380,52 @@ ${buildBodyOpenTag(seo?.bodyAttrs)}
 <div id="app">`;
 }
 
+/**
+ * How much client runtime a document needs, derived from its route chain.
+ *
+ * This is derived rather than configured on purpose. The build already knows
+ * everything the decision needs — `mode` is declared per route, and whether a
+ * page is interactive is a fact about its source — so making the author restate
+ * it as a tier would just be a way to get it wrong.
+ *
+ * - `"none"`: no JS. An author-declared `hydrate: false` anywhere in the chain.
+ * - `"static"`: server-rendered HTML with browser-native navigation. No router,
+ *   so no click interception and no data fetch per navigation; speculation
+ *   rules make those navigations instant instead. Islands still hydrate.
+ * - `"full"`: the client router, for `mode: "app"` routes that need
+ *   client-side navigation state, loaders and actions.
+ *
+ * `hydrate: true` is the escape hatch that pulls a static route up to `"full"`
+ * — for a page that is served statically but wants client-side navigation to
+ * preserve scroll position, open menus or playing media across clicks. That is
+ * a genuine product preference and is the one thing here that is not derivable.
+ */
+export function resolveClientTier(
+  chain: Array<{ config: { mode: "static" | "app"; hydrate?: boolean } }>
+): "none" | "static" | "full" {
+  // An explicit opt-out anywhere in the chain wins over everything: a layout
+  // that declares it wants no JS must not have JS reintroduced by a child.
+  if (chain.some((route) => route.config.hydrate === false)) {
+    return "none";
+  }
+  // An explicit opt-in anywhere pulls the document up.
+  if (chain.some((route) => route.config.hydrate === true)) {
+    return "full";
+  }
+  // Otherwise the router ships only where a route actually needs it. This is
+  // the line that used to read `.every(hydrate !== false)`, which meant one
+  // un-annotated layout — the default state of every layout — forced the full
+  // router onto every page in the app, including purely static ones.
+  return chain.some((route) => route.config.mode === "app") ? "full" : "static";
+}
+
 function buildHtmlSuffix(
   loaderData: Record<string, unknown>,
   actionData?: unknown,
   clientEntryScriptSrc: string | null = null,
   includeClientRuntime: boolean = true,
-  nonce?: string
+  nonce?: string,
+  clientTier: "none" | "static" | "full" = "full"
 ): string {
   if (!includeClientRuntime) {
     return `</div>
@@ -409,9 +450,21 @@ function buildHtmlSuffix(
     ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"></script>`
     : "";
 
+  // A static-tier document ships no router, so nothing intercepts its links.
+  // Speculation rules make those browser-native navigations instant by
+  // prerendering the target — already painted when the click lands, which no
+  // client-side data prefetch can match. Emitted only for this tier: an
+  // app-tier page has the router, and prerendering pages it would have handled
+  // client-side would duplicate the work.
+  const speculation =
+    includeClientRuntime && clientTier === "static"
+      ? renderSpeculationRules({}, nonce)
+      : "";
+
   return `</div>
 ${dataScript}
 ${clientScript}
+${speculation}
 </body>
 </html>`;
 }
@@ -426,14 +479,16 @@ function wrapHtml(
   includeClientRuntime: boolean = true,
   nonce?: string,
   seo: SeoMetaInput | null = null,
-  stylesheetHrefs: string[] = []
+  stylesheetHrefs: string[] = [],
+  clientTier: "none" | "static" | "full" = "full"
 ): string {
   return `${buildHtmlPrefix(pathname, headHtml, seo, stylesheetHrefs)}${content}${buildHtmlSuffix(
     loaderData,
     actionData,
     clientEntryScriptSrc,
     includeClientRuntime,
-    nonce
+    nonce,
+    clientTier
   )}`;
 }
 
@@ -496,6 +551,8 @@ interface RenderAppRouteHtmlResponseArgs {
   clientEntryScriptSrc: string | null;
   stylesheetHrefs: string[];
   includeClientRuntime: boolean;
+  /** Which client runtime this document ships. See `resolveClientTier`. */
+  clientTier?: "none" | "static" | "full";
   headers: Headers;
   nonce?: string;
   /** Outermost layout/route file, named in the full-document guard error. */
@@ -526,7 +583,8 @@ async function renderAppRouteHtmlResponse(
       args.includeClientRuntime,
       args.nonce,
       args.seo ?? null,
-      args.stylesheetHrefs
+      args.stylesheetHrefs,
+      args.clientTier ?? "full"
     );
   };
 
@@ -546,7 +604,8 @@ async function renderAppRouteHtmlResponse(
     args.actionData,
     args.clientEntryScriptSrc,
     args.includeClientRuntime,
-    args.nonce
+    args.nonce,
+    args.clientTier ?? "full"
   );
 
   let reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -598,7 +657,8 @@ export async function renderAppRoute(
     globalMiddleware,
   } = opts;
   const allRoutes = [...match.layouts, match.route];
-  const includeClientRuntime = allRoutes.every((route) => route.config.hydrate !== false);
+  const clientTier = resolveClientTier(allRoutes);
+  const includeClientRuntime = clientTier !== "none";
   const middlewares: MiddlewareFn[] = [];
   if (globalMiddleware && globalMiddleware.length > 0) {
     middlewares.push(...globalMiddleware);
@@ -970,6 +1030,7 @@ export async function renderAppRoute(
         clientEntryScriptSrc,
         stylesheetHrefs,
         includeClientRuntime,
+        clientTier,
         headers: routeHeaders,
         // Outermost layout/route — the most likely author of a stray <html>.
         sourceFile: allRoutes[0]?.file,

@@ -59,6 +59,15 @@ export default function Home() {
     const html = fs.readFileSync(path.join(root, "out", "index.html"), "utf-8");
     expect(html).toContain('<html lang="en-CA">');
     expect(html).toContain('<body data-page="home">');
+
+    // A prerendered page ships no JS, so nothing in it can make its own links
+    // fast. Speculation rules hand that to the browser: it prerenders the next
+    // document on pointer intent, so the click paints with no round-trip and
+    // no framework code involved.
+    expect(html).toContain('<script type="speculationrules">');
+    expect(html).toContain('"eagerness":"moderate"');
+    // No client entry: this tier is genuinely zero-JS.
+    expect(html).not.toContain('type="module"');
   });
 
   it("defaults to lang=\"en\" and a bare <body> when head() sets no attrs", async () => {

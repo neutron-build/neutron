@@ -26,7 +26,10 @@ export type { PictureProps } from "./picture.js";
 export { ViewTransitions } from "./view-transitions.js";
 export { ScrollReveal } from "./scroll-reveal.js";
 export type { ScrollRevealProps } from "./scroll-reveal.js";
-export { init, registerRoutes } from "./hydrate.js";
+// `init`/`registerRoutes` come from the tier shim, not the router: importing
+// the router here would statically pull the navigation machinery into every
+// app entry and defeat the code split. See ./start.ts.
+export { init, registerRoutes, appNeedsRouter } from "./start.js";
 export { navigate, go, subscribe, getCurrentPath, getCurrentSearch } from "./navigate.js";
 export { initIslands } from "./island-runtime.js";
 export { route } from "../core/typed-routes.js";
