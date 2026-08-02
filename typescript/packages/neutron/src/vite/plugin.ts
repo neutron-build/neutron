@@ -1142,6 +1142,8 @@ export function generateRoutesModule(routes: Route[]): string {
     path: ${JSON.stringify(route.path)},
     parentId: ${route.parentId ? JSON.stringify(route.parentId) : "null"},
     isLayout: ${!!route.isLayout},
+    mode: ${JSON.stringify(route.config.mode)},
+    hasLoader: ${route.hasLoader !== false},
     load: () => import(${JSON.stringify(relativePath + "?" + CLIENT_ROUTE_QUERY)})
   }`;
   });

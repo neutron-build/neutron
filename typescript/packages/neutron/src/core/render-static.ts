@@ -15,6 +15,7 @@ import {
   type SeoMetaInput,
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
+import { renderSpeculationRules } from "./speculation-rules.js";
 import { resolvePreactSsr, importPreactSsr } from "./preact-ssr.js";
 
 export interface StaticRenderOptions {
@@ -226,6 +227,13 @@ function wrapHtml(
   headHtml: string = renderDocumentHead(routePath, null),
   seo: SeoMetaInput | null = null
 ): string {
+  // A prerendered page ships no JS at all, so nothing here can make its links
+  // fast — except the browser. Speculation rules let it prerender the next
+  // document on pointer intent, so a click paints immediately. This is the one
+  // tier where a client-side prefetcher is not an option, and it is also the
+  // tier where prerendering is safest: the pages are static by definition.
+  //
+  // No nonce: SSG runs no CSP-nonce middleware (see the render call site).
   return `<!DOCTYPE html>
 ${buildHtmlOpenTag(seo?.htmlAttrs)}
 <head>
@@ -233,6 +241,7 @@ ${headHtml}
 </head>
 ${buildBodyOpenTag(seo?.bodyAttrs)}
 <div id="app">${content}</div>
+${renderSpeculationRules()}
 </body>
 </html>`;
 }

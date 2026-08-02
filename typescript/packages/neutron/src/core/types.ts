@@ -19,6 +19,13 @@ export interface Route {
   pattern: RegExp;
   params: string[];
   config: RouteConfig;
+  /**
+   * Whether the route source exports a `loader`. Derived at discovery time,
+   * not declared: the client build strips `loader`, so this is the only way
+   * the browser can know a route needs server data. Absent means unknown,
+   * which callers must treat as "yes" — see `parseRouteFacts`.
+   */
+  hasLoader?: boolean;
   parentId: string | null;
   isLayout?: boolean;
 }

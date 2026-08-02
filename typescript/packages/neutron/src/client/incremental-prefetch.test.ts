@@ -53,7 +53,7 @@ describe("incrementalPrefetch", () => {
 
     await incrementalPrefetch("/engine");
 
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     const headers = init.headers as Record<string, string>;
     expect(headers["X-Neutron-Data"]).toBe("true");
     // Marks the request speculative so servers and proxies can tell it from a
