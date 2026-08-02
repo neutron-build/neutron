@@ -2,6 +2,7 @@ package neutronauth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -313,3 +314,288 @@ func TestSessionStoreInterface(t *testing.T) {
 	// Verify memoryStore satisfies SessionStore
 	var _ SessionStore = newMemoryStore()
 }
+
+// failingStore fails whichever operations are switched on, so the middleware's
+// behavior on a store outage is observable rather than inferred.
+type failingStore struct {
+	*memoryStore
+	failGet    error
+	failSet    error
+	failDelete error
+}
+
+func (f *failingStore) Get(ctx context.Context, id string) (map[string]any, error) {
+	if f.failGet != nil {
+		return nil, f.failGet
+	}
+	return f.memoryStore.Get(ctx, id)
+}
+
+func (f *failingStore) Set(ctx context.Context, id string, data map[string]any, ttl time.Duration) error {
+	if f.failSet != nil {
+		return f.failSet
+	}
+	return f.memoryStore.Set(ctx, id, data, ttl)
+}
+
+func (f *failingStore) Delete(ctx context.Context, id string) error {
+	if f.failDelete != nil {
+		return f.failDelete
+	}
+	return f.memoryStore.Delete(ctx, id)
+}
+
+// sessionCookie returns the session cookie the response set, or nil.
+func sessionCookie(t *testing.T, w *httptest.ResponseRecorder, name string) *http.Cookie {
+	t.Helper()
+	for _, c := range w.Result().Cookies() {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// GO-001. Regenerate exists to defeat session fixation, and the doc comment
+// says to call it after authentication. The cookie was written before the
+// handler ran, so rotating the ID inside the handler could never reach the
+// browser: the attacker-planted ID stayed valid and addressable, and the
+// authenticated data was saved under an ID the browser never sends.
+func TestSessionRegenerateRotatesCookieAndRetiresOldID(t *testing.T) {
+	store := newMemoryStore()
+	store.data["attacker-planted-id"] = map[string]any{}
+
+	mw := SessionMiddleware(store)
+	var newID string
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := SessionFromContext(r.Context())
+		s.Regenerate()
+		s.Set("user_id", 42)
+		if err := s.Save(r.Context()); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+		newID = s.ID
+		w.WriteHeader(200)
+	}))
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "attacker-planted-id"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	c := sessionCookie(t, w, "session_id")
+	if c == nil {
+		t.Fatal("no session cookie in response")
+	}
+	if c.Value == "attacker-planted-id" {
+		t.Error("cookie still carries the pre-authentication session ID; " +
+			"Regenerate did not rotate what the browser holds")
+	}
+	if c.Value != newID {
+		t.Errorf("cookie = %q, want the regenerated ID %q", c.Value, newID)
+	}
+	if _, ok := store.data["attacker-planted-id"]; ok {
+		t.Error("the pre-authentication session record still resolves")
+	}
+	if got := store.data[newID]["user_id"]; got != 42 {
+		t.Errorf("regenerated session data = %v, want user_id 42", got)
+	}
+}
+
+// The functional half of the same defect: with the cookie never rotated, the
+// next request addresses the old record and the login is silently lost.
+func TestSessionRegenerateSurvivesTheNextRequest(t *testing.T) {
+	store := newMemoryStore()
+	mw := SessionMiddleware(store)
+
+	login := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := SessionFromContext(r.Context())
+		s.Regenerate()
+		s.Set("user_id", 42)
+		_ = s.Save(r.Context())
+		w.WriteHeader(200)
+	}))
+	w1 := httptest.NewRecorder()
+	login.ServeHTTP(w1, httptest.NewRequest("GET", "/login", nil))
+	c := sessionCookie(t, w1, "session_id")
+	if c == nil {
+		t.Fatal("no session cookie after login")
+	}
+
+	var seen any
+	after := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = SessionFromContext(r.Context()).Get("user_id")
+		w.WriteHeader(200)
+	}))
+	r2 := httptest.NewRequest("GET", "/me", nil)
+	r2.AddCookie(c)
+	after.ServeHTTP(httptest.NewRecorder(), r2)
+
+	if seen != 42 {
+		t.Errorf("user_id after login = %v, want 42 — the authenticated session "+
+			"was written under an ID the browser never received", seen)
+	}
+}
+
+// GO-001, second acceptance criterion.
+func TestSessionDestroyExpiresCookie(t *testing.T) {
+	store := newMemoryStore()
+	store.data["live-session"] = map[string]any{"user": "Alice"}
+
+	mw := SessionMiddleware(store)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := SessionFromContext(r.Context()).Destroy(r.Context()); err != nil {
+			t.Fatalf("Destroy: %v", err)
+		}
+		w.WriteHeader(200)
+	}))
+
+	r := httptest.NewRequest("GET", "/logout", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "live-session"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	c := sessionCookie(t, w, "session_id")
+	if c == nil {
+		t.Fatal("no session cookie in response")
+	}
+	if c.MaxAge >= 0 {
+		t.Errorf("MaxAge = %d, want < 0 so the browser drops the cookie", c.MaxAge)
+	}
+	if c.Value != "" {
+		t.Errorf("cookie value = %q, want empty on destroy", c.Value)
+	}
+	if _, ok := store.data["live-session"]; ok {
+		t.Error("destroyed session still in storage")
+	}
+}
+
+// A destroyed session must not be resurrected by a later Save in the same
+// request — otherwise logout is undone by any handler that touches the session.
+func TestSessionDestroyIsNotUndoneBySave(t *testing.T) {
+	store := newMemoryStore()
+	store.data["live-session"] = map[string]any{"user": "Alice"}
+
+	mw := SessionMiddleware(store)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := SessionFromContext(r.Context())
+		_ = s.Destroy(r.Context())
+		s.Set("user", "Alice")
+		_ = s.Save(r.Context())
+		w.WriteHeader(200)
+	}))
+
+	r := httptest.NewRequest("GET", "/logout", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "live-session"})
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+
+	if len(store.data) != 0 {
+		t.Errorf("logout left %d session(s) in storage: %v", len(store.data), store.data)
+	}
+}
+
+// GO-002. A store outage read as "no session", which mints a fresh anonymous
+// session: every user appears logged out, and the failure is invisible.
+func TestSessionStoreReadFailureIsNotAnAnonymousSession(t *testing.T) {
+	store := &failingStore{memoryStore: newMemoryStore(), failGet: errStoreDown}
+
+	var handlerRan bool
+	mw := SessionMiddleware(store)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerRan = true
+		w.WriteHeader(200)
+	}))
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "real-session"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if handlerRan {
+		t.Error("handler ran with a fabricated anonymous session while the store was down")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 — a store outage must not read as a logged-out user", w.Code)
+	}
+	if c := sessionCookie(t, w, "session_id"); c != nil && c.Value != "" && c.Value != "real-session" {
+		t.Errorf("minted a new session ID (%q) during a store outage", c.Value)
+	}
+}
+
+// A missing session is not a failing store, and must still create one.
+func TestSessionMissingIsDistinctFromStoreDown(t *testing.T) {
+	store := &failingStore{memoryStore: newMemoryStore()}
+	mw := SessionMiddleware(store)
+
+	var ran bool
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ran = true
+		w.WriteHeader(200)
+	}))
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "no-such-id"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if !ran || w.Code != 200 {
+		t.Errorf("missing session must create a new one: ran=%v status=%d", ran, w.Code)
+	}
+}
+
+// The error handler is configurable, and a caller can choose to degrade.
+func TestSessionErrorHandlerOverride(t *testing.T) {
+	store := &failingStore{memoryStore: newMemoryStore(), failGet: errStoreDown}
+	var got error
+	mw := SessionMiddleware(store, WithSessionErrorHandler(
+		func(w http.ResponseWriter, _ *http.Request, err error) {
+			got = err
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("handler must not run when the error handler wrote a response")
+	}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "x"})
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 from the override", w.Code)
+	}
+	if !errors.Is(got, errStoreDown) {
+		t.Errorf("error handler got %v, want errStoreDown", got)
+	}
+}
+
+// A handler that never touches its session must not have it rewritten, so a
+// read-only request does not extend a session or churn the store.
+func TestSessionUntouchedIsNotRewritten(t *testing.T) {
+	store := newMemoryStore()
+	store.data["existing"] = map[string]any{"user": "Alice"}
+	writes := &countingStore{memoryStore: store}
+
+	mw := SessionMiddleware(writes)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "existing"})
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+
+	if writes.sets != 0 {
+		t.Errorf("store.Set called %d times for a read-only request, want 0", writes.sets)
+	}
+}
+
+type countingStore struct {
+	*memoryStore
+	sets int
+}
+
+func (c *countingStore) Set(ctx context.Context, id string, data map[string]any, ttl time.Duration) error {
+	c.sets++
+	return c.memoryStore.Set(ctx, id, data, ttl)
+}
+
+var errStoreDown = errors.New("session store unavailable")
