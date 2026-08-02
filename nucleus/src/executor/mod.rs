@@ -691,6 +691,38 @@ impl Executor {
     /// When `data_dir` is `Some`, multi-model stores (KV, Document, Graph) are
     /// opened with WAL-backed persistence and automatic cold-tier spilling.
     /// When `data_dir` is `None` (memory mode), all stores are in-memory only.
+    /// Open a durable specialty store, logging loudly if it fails.
+    ///
+    /// Every call site below used to be a bare `if let Ok(x) = open()`, which
+    /// discarded the error and silently left the executor holding the volatile
+    /// in-memory store it was constructed with. A permissions problem, a bad
+    /// path, or ENOSPC at startup therefore produced a server that accepted
+    /// writes to that model, acknowledged them, and lost them all on restart —
+    /// with nothing whatsoever in the log to say so. There are twelve of these
+    /// stores; the failure looked identical to normal operation in all twelve.
+    ///
+    /// This does not yet REFUSE to start, because that is a behaviour change
+    /// an operator should opt into. It makes the degradation visible, which is
+    /// the precondition for anything else.
+    fn open_durable<T, E: std::fmt::Display>(
+        model: &str,
+        dir: &std::path::Path,
+        opened: Result<T, E>,
+    ) -> Option<T> {
+        match opened {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(
+                    target: "nucleus::startup",
+                    "{model} store at {} failed to open: {e}. This model is now VOLATILE — \
+                     writes to it will be acknowledged and LOST on restart.",
+                    dir.display()
+                );
+                None
+            }
+        }
+    }
+
     pub fn new_with_persistence(
         catalog: Arc<Catalog>,
         storage: Arc<dyn StorageEngine>,
@@ -708,7 +740,7 @@ impl Executor {
             {
                 let kv_dir = dir.join("kv");
                 std::fs::create_dir_all(&kv_dir).ok();
-                if let Ok(kv) = crate::kv::KvStore::open(&kv_dir) {
+                if let Some(kv) = Self::open_durable("KV", &kv_dir, crate::kv::KvStore::open(&kv_dir)) {
                     exec.kv_store = Arc::new(kv);
                 }
             }
@@ -716,28 +748,36 @@ impl Executor {
             // Document store: WAL + cold tier
             let doc_dir = dir.join("doc");
             std::fs::create_dir_all(&doc_dir).ok();
-            if let Ok(doc) = crate::document::DocumentStore::open(&doc_dir) {
+            if let Some(doc) =
+                Self::open_durable("Document", &doc_dir, crate::document::DocumentStore::open(&doc_dir))
+            {
                 *exec.doc_store.write() = doc;
             }
 
             // Graph store: WAL + cold tier
             let graph_dir = dir.join("graph");
             std::fs::create_dir_all(&graph_dir).ok();
-            if let Ok(graph) = crate::graph::GraphStore::open(&graph_dir) {
+            if let Some(graph) =
+                Self::open_durable("Graph", &graph_dir, crate::graph::GraphStore::open(&graph_dir))
+            {
                 *exec.graph_store.write() = graph;
             }
 
             // FTS index: WAL-backed crash-recovery (open replays all logged operations)
             let fts_dir = dir.join("fts");
             std::fs::create_dir_all(&fts_dir).ok();
-            if let Ok(idx) = fts::InvertedIndex::open(&fts_dir) {
+            if let Some(idx) =
+                Self::open_durable("FTS", &fts_dir, fts::InvertedIndex::open(&fts_dir))
+            {
                 *exec.fts_index.write() = idx;
             }
 
             // Vector indexes: WAL + snapshot recovery
             let vec_dir = dir.join("vector");
             std::fs::create_dir_all(&vec_dir).ok();
-            if let Ok((wal, state)) = vector::VectorWal::open(&vec_dir) {
+            if let Some((wal, state)) =
+                Self::open_durable("Vector", &vec_dir, vector::VectorWal::open(&vec_dir))
+            {
                 // Load table/column/pk metadata from sidecar JSON. New format is
                 // a (table, column, pk_column) triple; fall back to the old
                 // (table, column) pair (which had no pk_column) for compatibility.
@@ -785,9 +825,13 @@ impl Executor {
             // TimeSeries store: WAL-backed crash-recovery
             let ts_dir = dir.join("timeseries");
             std::fs::create_dir_all(&ts_dir).ok();
-            if let Ok(ts) = crate::timeseries::TimeSeriesStore::open(
+            if let Some(ts) = Self::open_durable(
+                "TimeSeries",
                 &ts_dir,
-                crate::timeseries::BucketSize::Hour,
+                crate::timeseries::TimeSeriesStore::open(
+                    &ts_dir,
+                    crate::timeseries::BucketSize::Hour,
+                ),
             ) {
                 *exec.ts_store.write() = ts;
             }
@@ -795,14 +839,20 @@ impl Executor {
             // Blob store: WAL-backed crash-recovery
             let blob_dir = dir.join("blob");
             std::fs::create_dir_all(&blob_dir).ok();
-            if let Ok(blob) = crate::blob::BlobStore::open(&blob_dir) {
+            if let Some(blob) =
+                Self::open_durable("Blob", &blob_dir, crate::blob::BlobStore::open(&blob_dir))
+            {
                 *exec.blob_store.write() = blob;
             }
 
             // Datalog store: WAL-backed crash-recovery
             let datalog_dir = dir.join("datalog");
             std::fs::create_dir_all(&datalog_dir).ok();
-            if let Ok((wal, state)) = crate::datalog::DatalogWal::open(&datalog_dir) {
+            if let Some((wal, state)) = Self::open_durable(
+                "Datalog",
+                &datalog_dir,
+                crate::datalog::DatalogWal::open(&datalog_dir),
+            ) {
                 *exec.datalog_store.write() = crate::datalog::restore_from_wal(state);
                 exec.datalog_wal = Some(wal);
             }
@@ -810,14 +860,20 @@ impl Executor {
             // Columnar store: WAL-backed crash-recovery
             let col_dir = dir.join("columnar");
             std::fs::create_dir_all(&col_dir).ok();
-            if let Ok(col) = crate::columnar::ColumnarStore::open(&col_dir) {
+            if let Some(col) =
+                Self::open_durable("Columnar", &col_dir, crate::columnar::ColumnarStore::open(&col_dir))
+            {
                 *exec.columnar_store.write() = col;
             }
 
             // Streams: WAL-backed crash-recovery
             let streams_dir = dir.join("streams");
             std::fs::create_dir_all(&streams_dir).ok();
-            if let Ok((wal, state)) = crate::pubsub::streams_wal::StreamsWal::open(&streams_dir) {
+            if let Some((wal, state)) = Self::open_durable(
+                "Streams",
+                &streams_dir,
+                crate::pubsub::streams_wal::StreamsWal::open(&streams_dir),
+            ) {
                 let rebuilt = crate::pubsub::streams_wal::rebuild_streams(&state);
                 *exec.streams.write() = rebuilt;
                 exec.streams_wal = Some(wal);
@@ -828,7 +884,11 @@ impl Executor {
             {
                 let cdc_dir = dir.join("cdc");
                 std::fs::create_dir_all(&cdc_dir).ok();
-                if let Ok((wal, state)) = crate::reactive::cdc_wal::CdcWal::open(&cdc_dir) {
+                if let Some((wal, state)) = Self::open_durable(
+                    "CDC",
+                    &cdc_dir,
+                    crate::reactive::cdc_wal::CdcWal::open(&cdc_dir),
+                ) {
                     let rebuilt = crate::reactive::cdc_wal::rebuild_cdc_log(&state);
                     *exec.cdc_log.write() = rebuilt;
                     exec.cdc_wal = Some(wal);
@@ -838,7 +898,9 @@ impl Executor {
             // Geo R-tree: WAL-backed crash-recovery
             let geo_dir = dir.join("geo");
             std::fs::create_dir_all(&geo_dir).ok();
-            if let Ok((wal, _state)) = crate::geo::wal::GeoWal::open(&geo_dir) {
+            if let Some((wal, _state)) =
+                Self::open_durable("Geo", &geo_dir, crate::geo::wal::GeoWal::open(&geo_dir))
+            {
                 // R-tree rebuild is available via crate::geo::wal::rebuild_rtree(&state)
                 // when a GeoIndex is added to the executor. For now, store the WAL handle.
                 exec.geo_wal = Some(wal);
