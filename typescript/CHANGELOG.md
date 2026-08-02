@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [core 0.1.9, cli 0.1.6] - 2026-08-01
+
+### Fixed
+
+- **Production app routes could render without application CSS.** Static routes
+  linked Vite's emitted stylesheets, but the CLI discarded those URLs when it
+  generated the app-route runtime. Initial SSR documents therefore painted as
+  plain HTML, and navigation between static and app routes visibly flashed as
+  styles disappeared. The CLI now carries emitted CSS URLs into every runtime,
+  core SSR emits render-blocking stylesheet links, JSON navigation responses
+  expose the same URLs through `__css__`, and `neutron start` follows the same
+  contract.
+
 ## [core 0.1.8] - 2026-07-27
 
 ### Fixed
