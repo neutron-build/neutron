@@ -232,6 +232,11 @@ path = "src/bin/probe_serializable.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "probe_txn_atomicity"
+path = "src/bin/probe_txn_atomicity.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "probe_io_faults"
 path = "src/bin/probe_io_faults.rs"
 required-features = ["server"]
