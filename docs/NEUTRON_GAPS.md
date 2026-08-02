@@ -211,3 +211,64 @@ backoff can starve it indefinitely.
 `FRAMEWORK_CONTRACT.md` still does not mention isolation levels or the retry
 contract at all — it should, since it is the document every SDK is written
 against.
+
+---
+
+## Client navigation still pays a round-trip on a cold click (open)
+
+Fixed in `d76888e`: the prefetch subsystem never ran, wrote to a cache nothing
+read, served post-mutation data as a prefetch forever, and its cache-hit path
+could be overwritten by a stale in-flight fetch. With prefetch working, a link
+the user hovers or scrolls past is warm before the click, so the common case is
+now zero-network.
+
+**What is still true:** a *cold* click — a link never in the viewport, never
+hovered, chosen straight from the keyboard, or clicked within 65ms — still
+fetches, including for a `mode: "static"` route with no loader whose component
+is already in the bundle. On a high-RTT deployment that is 200-400ms of waiting
+for a payload whose only useful contents are `__head__` and `__css__`.
+
+**Why this is not a client-only fix.** The obvious change — "if the route is
+static, skip the fetch and render from the bundle" — is wrong three times over:
+
+1. **The client cannot tell.** `RouteInfo` in `client/hydrate.ts` is
+   `{id, path, module, load, parentId, isLayout}`. There is no `mode` and no
+   loader flag, and there cannot be one from the module: `stripServerOnlyRouteModule`
+   correctly removes `loader`/`action`/`middleware`/`headers` from the client
+   build, so every route looks loader-free in the browser. `mode` lives in
+   route config, server-side, and reaches the client only through
+   `generateManifestModule` — which `hydrate.ts` does not consume.
+2. **`<head>` would go stale.** `applyData` only touches the document head when
+   the payload carries `__head__`. Render with empty data and the previous
+   page's `<title>`, canonical and OG tags persist. Head is not necessarily a
+   build-time constant either: `resolveHeadDocument` takes `request`, `params`,
+   `context`, `loaderData` and the CSP nonce. For a docs or marketing site that
+   is an SEO regression worse than the latency it saves.
+3. **It would skip the only point where middleware runs during SPA navigation.**
+   A static route behind an auth middleware currently redirects through the
+   `!response.ok -> reload()` path. Bypass the fetch and the client renders
+   content the server would have refused. Not a server-side data leak — the
+   data still requires the server — but it is a visible-content bypass, and it
+   is exactly the kind of thing that must not be traded for latency.
+
+**What it would actually take**, in order:
+
+- Emit per-route `hasLoader` and `mode` into the client route table
+  (`generateRoutesModule`, `vite/plugin.ts`) — the discovery pass already
+  parses exports for stripping, so the information exists at build time.
+- Emit the rendered head for routes whose head is statically determinable, and
+  mark the ones that are not (head fn reading `request`/`context`) as
+  fetch-required.
+- Mark routes reachable by global or route middleware as fetch-required. This
+  is the hard one: global middleware can gate anything, so the safe default is
+  "any app with global middleware opts every route out" unless the middleware
+  declares a path matcher.
+- Only then: skip the fetch when the whole chain is loader-free, static,
+  statically-headed, and ungated, and the CSS is already loaded.
+
+**Measure before building it.** With prefetch working, the remaining exposure
+is only the cold-click case; the win may not justify four build-pipeline
+changes and a new class of "why is my head stale" bug. The comparison to beat
+is not Next.js — its App Router pays an RSC round-trip on the same navigation —
+but Astro, which for a static page does a full document load with zero JS and
+is very hard to beat on a cold click.
