@@ -257,17 +257,61 @@ impl Wal {
         let next_lsn = if file_len == 0 {
             1
         } else {
-            let (records, last_good_end) = read_wal_records_with_end(path).unwrap_or_default();
-            if last_good_end < file_len {
-                // Torn tail from a crash (or trailing garbage): repair it
-                // now so appends never land after invalid bytes.
-                tracing::warn!(
-                    "WAL: truncating {} bytes of invalid tail after last valid record (offset {last_good_end})",
-                    file_len - last_good_end
-                );
-                file.set_len(last_good_end)?;
+            // NOT `unwrap_or_default()`. That collapsed ANY scan error into
+            // "empty WAL, valid_end 0", and the truncation below then took the
+            // whole log to zero — logged as routine torn-tail repair. A
+            // transient open/read failure at startup was enough to destroy
+            // every acknowledged commit in the file.
+            let scan = scan_wal(path)?;
+            match scan.tail {
+                TailState::TornEof { valid_end } if valid_end < file_len => {
+                    // Ordinary crash mid-append: repair so subsequent appends
+                    // never land after invalid bytes.
+                    tracing::warn!(
+                        "WAL: truncating {} bytes of torn tail after last valid record (offset {valid_end})",
+                        file_len - valid_end
+                    );
+                    file.set_len(valid_end)?;
+                }
+                TailState::InteriorCorruption { offset, ref reason } => {
+                    // Quarantine BEFORE truncating. Truncating alone would
+                    // destroy the evidence; leaving the file intact is worse —
+                    // the writer would append after the corrupt region and
+                    // every subsequent scan would stop before those new
+                    // records, losing them silently. Copy the original aside,
+                    // then cut back to the valid prefix so the log stays
+                    // append-able.
+                    let quarantine = path.with_extension(format!("wal.corrupt-{offset}"));
+                    match std::fs::copy(path, &quarantine) {
+                        Ok(_) => tracing::error!(
+                            "WAL: interior corruption at offset {offset} ({reason}). \
+                             Recovered {} record(s) before it. Original preserved at {}; \
+                             truncating the live log to the valid prefix.",
+                            scan.records.len(),
+                            quarantine.display()
+                        ),
+                        Err(e) => {
+                            // Without a copy, truncating is unrecoverable data
+                            // destruction. Refuse.
+                            tracing::error!(
+                                "WAL: interior corruption at offset {offset} ({reason}), and the \
+                                 quarantine copy to {} failed: {e}. Refusing to truncate.",
+                                quarantine.display()
+                            );
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "WAL corruption at offset {offset} ({reason}); \
+                                     could not quarantine the file for repair: {e}"
+                                ),
+                            ));
+                        }
+                    }
+                    file.set_len(scan.valid_end)?;
+                }
+                _ => {}
             }
-            max_lsn(&records) + 1
+            max_lsn(&scan.records) + 1
         };
         file.seek(SeekFrom::End(0))?;
 
@@ -482,12 +526,102 @@ pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
 /// record. `Wal::open` truncates the file to that offset and appends from
 /// there — repairing a torn tail from a crash instead of leaving garbage
 /// that later replays report as corruption.
+/// Why a record failed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalCorruption {
+    /// CRC over the record's authenticated bytes did not match.
+    Crc { lsn: u64, stored: u32, computed: u32 },
+    /// Declared record length is impossible (zero, or shorter than a header).
+    BadLength { declared: u32 },
+}
+
+impl std::fmt::Display for WalCorruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Crc {
+                lsn,
+                stored,
+                computed,
+            } => write!(
+                f,
+                "CRC mismatch at LSN {lsn}: stored={stored:#x}, computed={computed:#x}"
+            ),
+            Self::BadLength { declared } => write!(f, "impossible record length {declared}"),
+        }
+    }
+}
+
+/// What the scan found where it stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailState {
+    /// Every byte parsed into a valid record.
+    Clean,
+    /// The final record is physically incomplete — the ordinary result of a
+    /// crash mid-append. Safe to truncate to `valid_end`.
+    TornEof { valid_end: u64 },
+    /// A record failed validation with more bytes after it. The log is not a
+    /// contiguous history from this point on. NEVER truncate on this.
+    InteriorCorruption { offset: u64, reason: WalCorruption },
+}
+
+/// The result of scanning a WAL file.
+///
+/// `records` is always the **valid prefix** — every record up to the point the
+/// scan stopped, and nothing after it. This is the invariant that matters: a
+/// reader must never assemble state from records that straddle a gap, because
+/// the missing record may be what makes the suffix meaningful (a COMMIT, or an
+/// earlier image of the same page).
+pub struct WalScan {
+    pub records: Vec<WalRecord>,
+    /// Byte offset just past the last fully validated record.
+    pub valid_end: u64,
+    pub tail: TailState,
+}
+
+/// Scan a WAL file into its valid prefix plus a classification of why the scan
+/// stopped.
+///
+/// Replaces the previous skip-and-continue behaviour, which logged a CRC
+/// mismatch, advanced by the declared length, and kept replaying. That made
+/// recovery a *selection* of records rather than an acknowledged prefix.
+/// Distinguishing a torn tail from interior corruption is what lets
+/// [`Wal::open`] repair the first and refuse to touch the second.
+pub fn scan_wal(path: &Path) -> std::io::Result<WalScan> {
+    let (records, valid_end, tail) = scan_inner(path)?;
+    Ok(WalScan {
+        records,
+        valid_end,
+        tail,
+    })
+}
+
+/// Read every record in the valid prefix, discarding tail classification.
+///
+/// Returns `(records, valid_end)`. Interior corruption is **not** an error here
+/// — the caller gets the prefix — but the records after the corruption are
+/// never included. Callers that must distinguish the cases use [`scan_wal`].
 pub fn read_wal_records_with_end(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64)> {
+    let (records, valid_end, _) = scan_inner(path)?;
+    Ok((records, valid_end))
+}
+
+fn scan_inner(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64, TailState)> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut records = Vec::new();
     let mut last_good_end: u64 = 0;
     let mut pos: u64 = 0;
+    let mut tail = TailState::Clean;
+
+    /// A validation failure at `pos` is a torn tail only when the record runs
+    /// to physical EOF; anything with bytes after it is interior corruption.
+    fn classify(pos: u64, record_end: u64, file_len: u64, reason: WalCorruption) -> TailState {
+        if record_end >= file_len {
+            TailState::TornEof { valid_end: pos }
+        } else {
+            TailState::InteriorCorruption { offset: pos, reason }
+        }
+    }
 
     while pos + 4 <= file_len {
         file.seek(SeekFrom::Start(pos))?;
@@ -499,8 +633,24 @@ pub fn read_wal_records_with_end(path: &Path) -> std::io::Result<(Vec<WalRecord>
         }
         let record_len = u32::from_le_bytes(len_buf) as usize;
 
-        if record_len == 0 || (pos + record_len as u64) > file_len {
-            break; // Truncated or corrupt
+        if record_len < RECORD_HEADER_SIZE + RECORD_CRC_SIZE {
+            // A length this small cannot describe a record. Zero is what a
+            // pre-allocated or partially written tail looks like.
+            tail = classify(
+                pos,
+                file_len,
+                file_len,
+                WalCorruption::BadLength {
+                    declared: record_len as u32,
+                },
+            );
+            break;
+        }
+        if (pos + record_len as u64) > file_len {
+            // Declared length overruns the file: the record was never fully
+            // written. This is the ordinary torn tail.
+            tail = TailState::TornEof { valid_end: pos };
+            break;
         }
 
         // Read record header
@@ -538,12 +688,25 @@ pub fn read_wal_records_with_end(path: &Path) -> std::io::Result<(Vec<WalRecord>
             if let Some(ref img) = page_image {
                 let computed = page_write_crc(lsn, txn_id, page_id, img.as_ref());
                 if computed != stored_crc {
+                    // Stop. Replaying past this would apply a page image whose
+                    // predecessor is missing — see `scan_wal`.
                     tracing::error!(
-                        "WAL CORRUPTION: CRC mismatch at LSN {lsn} (page write): stored={stored_crc:#x}, computed={computed:#x}. \
-                         Skipping record — data loss may have occurred."
+                        "WAL CORRUPTION: CRC mismatch at LSN {lsn} (page write) at offset {pos}: \
+                         stored={stored_crc:#x}, computed={computed:#x}. Stopping replay here; \
+                         {} record(s) recovered before it.",
+                        records.len()
                     );
-                    pos += record_len as u64;
-                    continue;
+                    tail = classify(
+                        pos,
+                        pos + record_len as u64,
+                        file_len,
+                        WalCorruption::Crc {
+                            lsn,
+                            stored: stored_crc,
+                            computed,
+                        },
+                    );
+                    break;
                 }
             }
         } else {
@@ -554,16 +717,26 @@ pub fn read_wal_records_with_end(path: &Path) -> std::io::Result<(Vec<WalRecord>
             crc_data[16] = record_type;
             let computed = crc32c::crc32c(&crc_data);
             if computed != stored_crc {
+                // Stop rather than skip. A control record carries transaction
+                // state; continuing past one means replaying records whose
+                // COMMIT/ABORT context was the thing that got lost.
                 tracing::error!(
-                    "WAL CORRUPTION: CRC mismatch at LSN {lsn} (control record): stored={stored_crc:#x}, computed={computed:#x}. \
-                     Skipping record — transaction state may be inconsistent."
+                    "WAL CORRUPTION: CRC mismatch at LSN {lsn} (control record) at offset {pos}: \
+                     stored={stored_crc:#x}, computed={computed:#x}. Stopping replay here; \
+                     {} record(s) recovered before it.",
+                    records.len()
                 );
-                // record_len is the full record size (it includes its own 4-byte
-                // length prefix — see RECORD_HEADER_SIZE), so advance by exactly
-                // record_len. Adding 4 here over-shot and misaligned every
-                // subsequent record, silently dropping the rest of the WAL.
-                pos += record_len as u64;
-                continue;
+                tail = classify(
+                    pos,
+                    pos + record_len as u64,
+                    file_len,
+                    WalCorruption::Crc {
+                        lsn,
+                        stored: stored_crc,
+                        computed,
+                    },
+                );
+                break;
             }
         }
 
@@ -579,7 +752,14 @@ pub fn read_wal_records_with_end(path: &Path) -> std::io::Result<(Vec<WalRecord>
         last_good_end = pos;
     }
 
-    Ok((records, last_good_end))
+    // Trailing bytes that never even reached a length prefix are a torn tail.
+    if matches!(tail, TailState::Clean) && last_good_end < file_len {
+        tail = TailState::TornEof {
+            valid_end: last_good_end,
+        };
+    }
+
+    Ok((records, last_good_end, tail))
 }
 
 /// Determine the maximum LSN in a set of WAL records.
@@ -1569,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_replay_continues_past_corrupt_control_record() {
+    fn wal_replay_stops_at_corrupt_control_record() {
         use std::io::{Seek, SeekFrom, Write};
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("corrupt.wal");
@@ -1593,17 +1773,103 @@ mod tests {
             f.sync_all().unwrap();
         }
 
-        // The first record is dropped (CRC mismatch) but the two that follow it
-        // must still be recovered — proving the skip realigned correctly.
+        // This test previously asserted the OPPOSITE — that records after the
+        // corrupt one still recover, "proving the skip realigned correctly".
+        // Realigning was the right fix for the misalignment bug, but skipping
+        // is the wrong policy: recovery then returns a SELECTION of records
+        // rather than an acknowledged prefix, and the missing record may be
+        // exactly what makes the suffix meaningful. Postgres stops at the
+        // first invalid record; so do we now.
+        let scan = scan_wal(&wal_path).unwrap();
+        assert!(
+            scan.records.is_empty(),
+            "replay must stop at the corrupt record, not skip past it"
+        );
+        assert_eq!(scan.valid_end, 0);
+        match scan.tail {
+            TailState::InteriorCorruption { offset, .. } => assert_eq!(offset, 0),
+            other => panic!("expected interior corruption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wal_torn_final_record_is_not_interior_corruption() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("torn.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(1).unwrap();
+            wal.log_commit(2).unwrap();
+            wal.sync().unwrap();
+        }
+        // A record whose declared length overruns the file: crash mid-append.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .unwrap();
+            f.write_all(&(CONTROL_RECORD_SIZE as u32).to_le_bytes())
+                .unwrap();
+            f.write_all(&[0xAB; 3]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let scan = scan_wal(&wal_path).unwrap();
+        assert_eq!(scan.records.len(), 2, "the valid prefix must survive");
+        assert!(
+            matches!(scan.tail, TailState::TornEof { .. }),
+            "a record running to physical EOF is a torn tail, not corruption: {:?}",
+            scan.tail
+        );
+    }
+
+    #[test]
+    fn wal_open_quarantines_interior_corruption_instead_of_zeroing() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("quarantine.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(1).unwrap();
+            wal.log_commit(2).unwrap();
+            wal.log_commit(3).unwrap();
+            wal.sync().unwrap();
+        }
+        // Corrupt the SECOND record, leaving a third after it.
+        let crc_off = (CONTROL_RECORD_SIZE * 2 - RECORD_CRC_SIZE) as u64;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(crc_off)).unwrap();
+            f.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let before_len = std::fs::metadata(&wal_path).unwrap().len();
+
+        // Reopening must keep the valid prefix and preserve the original.
+        // The bug this guards: `unwrap_or_default()` turned any scan failure
+        // into `(vec![], 0)`, and `0 < file_len` then truncated the log to
+        // zero under a message that read like routine tail repair.
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(4).unwrap();
+            wal.sync().unwrap();
+        }
         let records = read_wal_records(&wal_path).unwrap();
         assert_eq!(
-            records.len(),
-            2,
-            "records after a corrupt control record must still recover"
+            records.iter().map(|r| r.txn_id).collect::<Vec<_>>(),
+            vec![1, 4],
+            "the prefix before the corruption must survive and stay append-able"
         );
-        assert!(records.iter().all(|r| r.record_type == RECORD_COMMIT));
-        assert_eq!(records[0].txn_id, 2);
-        assert_eq!(records[1].txn_id, 3);
+        let quarantine = wal_path.with_extension(format!("wal.corrupt-{}", CONTROL_RECORD_SIZE));
+        let saved = std::fs::metadata(&quarantine).expect("original must be quarantined");
+        assert_eq!(
+            saved.len(),
+            before_len,
+            "quarantine must be a byte-exact copy of the corrupt log"
+        );
     }
 
     #[test]
