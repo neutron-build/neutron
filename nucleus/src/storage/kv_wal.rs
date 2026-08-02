@@ -27,17 +27,37 @@ use crate::types::Value;
 
 // ─── Entry type tags ──────────────────────────────────────────────────────────
 
+/// Set a value and KEEP whatever expiry the key already carries. This is what
+/// INCR-family mutators need — they rewrite the value and deliberately leave
+/// the TTL alone — and it is the only reason the preserve rule exists.
 const ENTRY_SET: u8 = 0x01;
 const ENTRY_DEL: u8 = 0x02;
 const ENTRY_EXPIRE: u8 = 0x03;
 const ENTRY_SNAPSHOT: u8 = 0x04;
+/// Set a value AND set its expiry to exactly the carried `Option`, in one
+/// record. Used by every path that *decides* an expiry (SET, SETNX).
+///
+/// A separate tag rather than a change to `ENTRY_SET` because the two mean
+/// different things on replay, and because old logs must keep replaying: SET
+/// with expiry used to be an `ENTRY_SET` followed by an independent
+/// `ENTRY_EXPIRE`, so a crash between the two appends replayed a key that was
+/// asked to be temporary as permanent — a leaked lock, lease, or secret that
+/// never expires. `SET k v` (no TTL) over a key that already had one had the
+/// mirror-image bug: the value was rewritten and the old TTL survived replay,
+/// so a key the live server reported as permanent disappeared after a restart.
+/// One record with an explicit `Option` closes both.
+const ENTRY_SET_TTL: u8 = 0x05;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 /// Operation type for batch WAL writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvWalOp {
+    /// Value only; the key keeps whatever expiry it already has.
     Set,
+    /// Value plus the expiry decided with it, as one record. A `None` ttl
+    /// means permanent and clears any expiry the key had.
+    SetExact,
     Delete,
     Expire,
 }
@@ -87,18 +107,27 @@ impl KvWal {
     /// Log a SET operation (key + value, no TTL change).
     pub fn log_set(&self, key: &str, val: &Value) -> io::Result<()> {
         let mut buf = Vec::new();
-        // entry tag
-        buf.push(ENTRY_SET);
-        // key
-        let kb = key.as_bytes();
-        buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
-        buf.extend_from_slice(kb);
-        // value
-        let mut val_buf = Vec::new();
-        encode_value(val, &mut val_buf);
-        buf.extend_from_slice(&(val_buf.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&val_buf);
+        encode_set(&mut buf, key, val);
+        let mut w = self.writer.lock();
+        w.write_all(&buf)?;
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
+    }
 
+    /// Log a SET that also decides the key's expiry, as ONE record.
+    ///
+    /// `expires_ms` is absolute milliseconds since the Unix epoch; `None` means
+    /// the key is permanent, and replay clears any expiry the key had. Callers
+    /// that mean "leave the TTL alone" want [`log_set`] instead.
+    pub fn log_set_with_expiry(
+        &self,
+        key: &str,
+        val: &Value,
+        expires_ms: Option<u64>,
+    ) -> io::Result<()> {
+        let mut buf = Vec::new();
+        encode_set_with_expiry(&mut buf, key, val, expires_ms);
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
         w.flush()?;
@@ -154,13 +183,14 @@ impl KvWal {
             match op {
                 KvWalOp::Set => {
                     let value = val.expect("log_batch: SET requires a value");
-                    buf.push(ENTRY_SET);
-                    buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(kb);
-                    let mut val_buf = Vec::new();
-                    encode_value(value, &mut val_buf);
-                    buf.extend_from_slice(&(val_buf.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(&val_buf);
+                    encode_set(&mut buf, key, value);
+                }
+                KvWalOp::SetExact => {
+                    let value = val.expect("log_batch: SET requires a value");
+                    // One record, for the same reason `log_set_with_expiry`
+                    // exists: a value and the expiry decided with it must not
+                    // be separable by a crash.
+                    encode_set_with_expiry(&mut buf, key, value, *ttl_ms);
                 }
                 KvWalOp::Delete => {
                     buf.push(ENTRY_DEL);
@@ -266,6 +296,42 @@ impl KvWal {
         self.syncer.mark_synced(mark);
         Ok(())
     }
+}
+
+// ─── Record encoding ─────────────────────────────────────────────────────────
+
+/// `ENTRY_SET`: tag, key (u32 len + bytes), value (u32 len + encoded).
+fn encode_set(buf: &mut Vec<u8>, key: &str, val: &Value) {
+    buf.push(ENTRY_SET);
+    encode_key_value(buf, key, val);
+}
+
+/// `ENTRY_SET_TTL`: the `ENTRY_SET` body followed by a presence byte and, when
+/// present, absolute expiry milliseconds — the same TTL shape the snapshot
+/// entry uses.
+fn encode_set_with_expiry(buf: &mut Vec<u8>, key: &str, val: &Value, expires_ms: Option<u64>) {
+    buf.push(ENTRY_SET_TTL);
+    encode_key_value(buf, key, val);
+    match expires_ms {
+        Some(ms) => {
+            buf.push(1);
+            buf.extend_from_slice(&ms.to_le_bytes());
+        }
+        None => {
+            buf.push(0);
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
+}
+
+fn encode_key_value(buf: &mut Vec<u8>, key: &str, val: &Value) {
+    let kb = key.as_bytes();
+    buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+    buf.extend_from_slice(kb);
+    let mut val_buf = Vec::new();
+    encode_value(val, &mut val_buf);
+    buf.extend_from_slice(&(val_buf.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&val_buf);
 }
 
 // ─── Value encoding ──────────────────────────────────────────────────────────
@@ -377,6 +443,35 @@ fn replay(data: &[u8]) -> KvWalState {
                 pos += val_len;
                 // Preserve existing TTL if key already exists
                 let ttl = store.get(&key).and_then(|(_, t)| *t);
+                store.insert(key, (val, ttl));
+            }
+            ENTRY_SET_TTL => {
+                let Some(key) = read_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(val_len) = read_u32(data, &mut pos) else {
+                    break;
+                };
+                let val_len = val_len as usize;
+                if pos + val_len > data.len() {
+                    break;
+                }
+                let mut vpos = pos;
+                let Some(val) = decode_value(data, &mut vpos) else {
+                    break;
+                };
+                pos += val_len;
+                let Some(&has_ttl) = data.get(pos) else {
+                    break;
+                };
+                pos += 1;
+                let Some(ttl_ms) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                // The expiry is whatever the writer decided, including "none":
+                // this record carries the whole decision, so there is nothing
+                // to preserve from an earlier one.
+                let ttl = if has_ttl != 0 { Some(ttl_ms) } else { None };
                 store.insert(key, (val, ttl));
             }
             ENTRY_DEL => {
@@ -821,6 +916,133 @@ mod tests {
         assert_eq!(z.1, Value::Int32(3));
         let w = state.items.iter().find(|(k, _, _)| k == "w").unwrap();
         assert_eq!(w.1, Value::Int64(99));
+    }
+
+    /// A key asked to be temporary must never replay as permanent, no matter
+    /// where the crash lands. Truncating the log at every byte offset models a
+    /// crash after every byte of the record.
+    ///
+    /// The old encoding could not pass this: SET-with-expiry was an
+    /// `ENTRY_SET` append followed by an independent `ENTRY_EXPIRE` append, so
+    /// every truncation inside that gap replayed the value with no TTL — a
+    /// lock or lease held forever. The next test pins that this is what the
+    /// two-record shape actually did.
+    #[test]
+    fn expiring_set_never_replays_as_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.wal");
+        let val = Value::Text("lease-holder-7".into());
+        let expiry = 9_000_000_000_000u64;
+
+        let (wal, _) = KvWal::open(dir.path()).unwrap();
+        wal.log_set_with_expiry("lock:a", &val, Some(expiry)).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        let full = std::fs::read(&path).unwrap();
+
+        for cut in 0..=full.len() {
+            let state = replay(&full[..cut]);
+            match state.items.iter().find(|(k, _, _)| k == "lock:a") {
+                // Not yet durable: the record was cut before it was complete.
+                None => {}
+                // Durable: the value and its expiry arrive together or not at all.
+                Some((_, v, ttl)) => {
+                    assert_eq!(v, &val, "truncated at {cut}: wrong value");
+                    assert_eq!(
+                        *ttl,
+                        Some(expiry),
+                        "truncated at {cut}: the key replayed WITHOUT its expiry — \
+                         a lease that outlives the process that took it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two-record shape this replaced, kept as evidence of what changed.
+    /// Old logs still hold these pairs, so the legacy tags must keep replaying,
+    /// and a cut between them still yields a permanent key — that is history,
+    /// not something a new append can produce.
+    #[test]
+    fn legacy_set_then_expire_still_replays_and_shows_the_old_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.wal");
+        let val = Value::Text("v".into());
+
+        let (wal, _) = KvWal::open(dir.path()).unwrap();
+        wal.log_set("k", &val).unwrap();
+        let after_set = std::fs::metadata(&path).unwrap().len() as usize;
+        wal.log_expire("k", 9_000_000_000_000).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+
+        let full = std::fs::read(&path).unwrap();
+        // Whole log: the pair replays, so existing on-disk logs keep working.
+        let state = replay(&full);
+        let (_, v, ttl) = state.items.iter().find(|(k, _, _)| k == "k").unwrap();
+        assert_eq!(v, &val);
+        assert_eq!(*ttl, Some(9_000_000_000_000));
+
+        // Cut in the gap: the value is durable and permanent. This is the
+        // defect, reproduced — and unreachable for anything written now.
+        let torn = replay(&full[..after_set]);
+        let (_, _, ttl) = torn.items.iter().find(|(k, _, _)| k == "k").unwrap();
+        assert_eq!(*ttl, None, "the old shape did lose the expiry");
+    }
+
+    /// `SET k v` with no TTL over a key that had one clears the expiry in
+    /// memory; replay has to agree, or a key the server reports as permanent
+    /// disappears after a restart.
+    #[test]
+    fn set_with_no_expiry_clears_an_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = KvWal::open(dir.path()).unwrap();
+        wal.log_set_with_expiry("k", &Value::Int32(1), Some(9_000_000_000_000))
+            .unwrap();
+        wal.log_set_with_expiry("k", &Value::Int32(2), None).unwrap();
+        drop(wal);
+
+        let (_wal2, state) = KvWal::open(dir.path()).unwrap();
+        let (_, v, ttl) = state.items.iter().find(|(k, _, _)| k == "k").unwrap();
+        assert_eq!(v, &Value::Int32(2));
+        assert_eq!(*ttl, None, "the expiry outlived the SET that replaced it");
+    }
+
+    /// `ENTRY_SET` still means "keep the expiry" — INCR depends on it.
+    #[test]
+    fn plain_set_preserves_an_existing_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = KvWal::open(dir.path()).unwrap();
+        wal.log_set_with_expiry("k", &Value::Int64(1), Some(9_000_000_000_000))
+            .unwrap();
+        wal.log_set("k", &Value::Int64(2)).unwrap();
+        drop(wal);
+
+        let (_wal2, state) = KvWal::open(dir.path()).unwrap();
+        let (_, v, ttl) = state.items.iter().find(|(k, _, _)| k == "k").unwrap();
+        assert_eq!(v, &Value::Int64(2));
+        assert_eq!(*ttl, Some(9_000_000_000_000));
+    }
+
+    /// A batched SET that carries an expiry is one record too.
+    #[test]
+    fn batched_set_exact_carries_its_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = KvWal::open(dir.path()).unwrap();
+        let a = Value::Int32(1);
+        let b = Value::Int32(2);
+        wal.log_batch(&[
+            (KvWalOp::SetExact, "a", Some(&a), Some(9_000_000_000_000)),
+            (KvWalOp::SetExact, "b", Some(&b), None),
+        ])
+        .unwrap();
+        drop(wal);
+
+        let (_wal2, state) = KvWal::open(dir.path()).unwrap();
+        let a = state.items.iter().find(|(k, _, _)| k == "a").unwrap();
+        assert_eq!(a.2, Some(9_000_000_000_000));
+        let b = state.items.iter().find(|(k, _, _)| k == "b").unwrap();
+        assert_eq!(b.2, None);
     }
 
     #[test]
