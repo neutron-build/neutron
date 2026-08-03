@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## [cli 0.2.1] - 2026-08-02
+
+### Fixed
+
+- **The built client entry could be a route chunk instead of the runtime.** The
+  build resolved it by globbing `assets/index-*.js`, sorting, and taking the
+  last match. Any project with `src/routes/index.tsx` — every project with a
+  homepage — emits a route chunk under exactly that name, so which file won was
+  decided by which content hash sorted higher.
+
+  When the route chunk won, the page's entire client runtime became that
+  route's stripped config module, e.g. `const o={mode:"app"};export{o as
+  config};` — 42 bytes, no router.
+
+  The failure was silent. Pages are server-rendered, so they still looked
+  correct and nothing errored; the app simply never hydrated. Nothing called
+  `markStaticLinks()`, so no anchor got `data-neutron-static`, so the app-tier
+  speculation rules scoped to that attribute matched nothing, and every
+  navigation was a cold full page load with neither prerender nor client-side
+  routing.
+
+  The entry is now resolved from Vite's build manifest, excluding any chunk the
+  manifest attributes to a route module. The filename glob remains as a fallback
+  for builds without a manifest, with the same exclusion applied.
+
+  **If you are on 0.2.0 or earlier, rebuild.** No source change is needed. To
+  check whether you were affected, look at the `<script type="module">` your
+  pages load: if it is a few dozen bytes, it was the wrong file.
+
 ## [core 0.2.0, cli 0.2.0] - 2026-08-02
 
 ### Breaking
