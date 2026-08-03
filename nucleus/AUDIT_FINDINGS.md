@@ -1,31 +1,36 @@
 # Nucleus — Audit Findings Log
 
-Running log for the audit/hardening effort described in `AUDIT_PLAN.md`.
-Severity order: correctness > memory-safety > security > durability > performance > quality.
+Findings log for the 2026-06 audit/hardening effort. Severity order:
+correctness > memory-safety > security > durability > performance > quality.
 
-## RESUME HERE (for a compacted or fresh session)
+**This is a record, not a work list.** For what to do next, read
+`_internal/START_HERE.md` → `_internal/OPEN_WORK.md`. This file previously opened
+with its own "RESUME HERE" block, which was one of several competing entry points
+and had gone stale in every particular — it named a branch that no longer exists
+locally, a test count that was wrong by ~600, two files that have since moved, and
+it flagged D-1 as security-critical work to do when D-1 is marked **fixed** in
+Phase B1 of this same document. Superseded 2026-08-02.
 
-- **Branch:** `audit/nucleus-correctness-phase2-3` (pushed to origin). Keep working here.
-- **Read first:** this file (fixed = F-005..F-028; "Deferred / verified-real" = the
-  remaining work with rationale) + `AUDIT_FINDINGS_RAW.json` (full detail for all 76
-  findings incl. the 24 medium + 8 low, plus the unsafe inventory).
-- **State:** build + 3603 lib tests + `clippy --all-targets -D warnings` + `cargo fmt`
-  all green. Verify each finding against real code before fixing — the audit agents had
-  false positives and one inverted finding (F-009). Add a regression test per fix. Stage
-  `nucleus/` only (the repo has unrelated `typescript/` changes; don't commit those).
-- **Suggested order:** (1) low-risk batch — the 24 medium + 8 low + `unsafe` SAFETY
-  comments; (2) the high deferred items that need signature changes (ZRANGE i64);
-  (3) **MVCC GC** — diff against `lean4/Nucleus/Nucleus/Proofs/MvccProofs.lean` BEFORE
-  touching; (4) feature-sized: RLS-to-authenticated-user wiring, WAL header-CRC format change.
-- **Dogfood-driven cluster (D-1..D-10), see "teploy-observe 2026-06" section below:**
-  product-blocking findings from a real consumer over pgwire — **D-1 (UPDATE no-op breaks
-  API-key revocation) is security-critical**. Source brief:
-  `_internal/NUCLEUS_AUDIT_FROM_TEPLOY_OBSERVE_2026-06.md`. These are verify-first (confirm
-  current engine semantics, some may already be fixed) then fix; each owes observe a one-line verdict.
-- **AFTER the engine is fully done:** audit/fix the surrounding tooling too — `studio/`,
-  the per-language ORMs/SDKs (`go/`, `ts/` neutron-data, `python/`, `rust/`, `zig/`,
-  `elixir/`, `julia/`), and anything depending on engine semantics changed here (new error
-  variants, DISTINCT ON error propagation, ON CONFLICT enforcement, etc.). Requested by Tyler.
+## How to read it
+
+- Fixed items are `F-005..F-038`; refuted items say so with evidence.
+- "Deferred / verified-real" is real remaining work, with the rationale for
+  deferring. Cross-check against `_internal/OPEN_WORK.md` before starting any of it.
+- `AUDIT_FINDINGS_RAW.json` (alongside this file) has full detail for all 76
+  findings including the 24 medium + 8 low and the `unsafe` inventory.
+- The D-cluster (D-1..D-10) came from teploy-observe dogfooding Nucleus over
+  pgwire. Its source brief is now `_internal/archive/NUCLEUS_AUDIT_FROM_TEPLOY_OBSERVE_2026-06.md`.
+
+## The lesson that generalises
+
+The audit agents produced false positives and one **inverted** finding (F-009) —
+a claim whose truth was the opposite of the code. Of the original set, 14 were
+refuted with evidence. So: verify every finding against real source before fixing
+it, and add a regression test per fix. A finding is a hypothesis.
+
+The follow-on work Tyler asked for — auditing the surrounding tooling (`studio/`,
+and the per-language ORMs/SDKs) against engine semantics changed here — is tracked
+in `_internal/OPEN_WORK.md`, not here.
 
 ## Phase 2+3 audit — summary (in progress)
 
