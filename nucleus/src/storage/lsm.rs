@@ -29,7 +29,9 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -128,23 +130,52 @@ impl BloomFilter {
 // SSTable (Sorted String Table)
 // ============================================================================
 
+/// Where an entry's value lives.
+///
+/// Values are held on disk once an SSTable is backed by a file, because an
+/// SSTable is the *cold* half of the store — the half that exists so data does
+/// not have to stay in memory. Keeping them resident made "evict to cold" move
+/// bytes from one in-RAM structure to another, which is how a 4.8 GB dataset
+/// stayed 4.8 GB resident after being fully evicted.
+#[derive(Debug, Clone)]
+enum ValueLoc {
+    /// Deletion marker.
+    Tombstone,
+    /// Byte range in the backing file.
+    Disk { offset: u64, len: u32 },
+    /// Held in memory: this SSTable has no backing file (in-memory LsmTree, or
+    /// freshly built from a memtable and not yet written).
+    Mem(Vec<u8>),
+}
+
 /// An immutable sorted run of key-value pairs.
+///
+/// Keys and a per-key value location stay in memory so a lookup is a bloom
+/// check plus a binary search; values are read from the backing file on demand.
+/// The resident cost is therefore proportional to key size and entry count, not
+/// to the data itself.
 #[derive(Debug, Clone)]
 pub struct SSTable {
-    /// Sorted entries: key -> value (None = tombstone/delete marker).
-    entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Sorted keys with the location of each value.
+    index: Vec<(Vec<u8>, ValueLoc)>,
     /// Bloom filter for fast negative lookups.
     bloom: BloomFilter,
     /// Level in the LSM tree (0 = most recent).
     pub level: usize,
     /// Sequence number for ordering within a level.
     pub seq: u64,
-    /// Byte size estimate.
+    /// Byte size estimate of the logical data (keys + values), not of resident
+    /// memory. Compaction thresholds are expressed against this.
     pub size_bytes: usize,
+    /// Backing file, once written. `None` means every value is `Mem`.
+    path: Option<PathBuf>,
 }
 
 impl SSTable {
     /// Build an SSTable from a sorted iterator of (key, value) pairs.
+    ///
+    /// Values start resident; [`SSTable::attach_file`] moves them to disk once
+    /// the table has been written.
     pub fn from_sorted(
         entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         level: usize,
@@ -153,43 +184,103 @@ impl SSTable {
     ) -> Self {
         let mut bloom = BloomFilter::new(entries.len().max(1), bits_per_key.max(1));
         let mut size_bytes = 0;
-        for (k, v) in &entries {
-            bloom.insert(k);
+        let mut index = Vec::with_capacity(entries.len());
+        for (k, v) in entries {
+            bloom.insert(&k);
             size_bytes += k.len() + v.as_ref().map_or(0, |v| v.len());
+            let loc = match v {
+                None => ValueLoc::Tombstone,
+                Some(bytes) => ValueLoc::Mem(bytes),
+            };
+            index.push((k, loc));
         }
         Self {
-            entries,
+            index,
             bloom,
             level,
             seq,
             size_bytes,
+            path: None,
         }
     }
 
     /// Point lookup using bloom filter + binary search.
-    pub fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
+    ///
+    /// `None` means "not in this table"; `Some(None)` is a tombstone.
+    pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
         if !self.bloom.may_contain(key) {
             return None; // Definitely not here.
         }
-        self.entries
+        let idx = self
+            .index
             .binary_search_by_key(&key, |(k, _)| k.as_slice())
-            .ok()
-            .map(|idx| self.entries[idx].1.as_deref())
+            .ok()?;
+        Some(self.read_value(&self.index[idx].1))
+    }
+
+    /// Read one value, from memory or from the backing file.
+    ///
+    /// A failed read yields `None` — the same shape as a tombstone. That is a
+    /// deliberate floor rather than a silent hole: the alternative is panicking
+    /// inside a point lookup, and the caller cannot distinguish a missing file
+    /// from a deleted key in any case. Callers that need to know a file is gone
+    /// should be checking the file, not a key.
+    fn read_value(&self, loc: &ValueLoc) -> Option<Vec<u8>> {
+        match loc {
+            ValueLoc::Tombstone => None,
+            ValueLoc::Mem(bytes) => Some(bytes.clone()),
+            ValueLoc::Disk { offset, len } => {
+                let path = self.path.as_ref()?;
+                let mut file = File::open(path).ok()?;
+                file.seek(SeekFrom::Start(*offset)).ok()?;
+                let mut buf = vec![0u8; *len as usize];
+                file.read_exact(&mut buf).ok()?;
+                Some(buf)
+            }
+        }
+    }
+
+    /// Point the table at its written file, releasing resident values.
+    ///
+    /// `offsets` must be the file offset of each entry's value payload, in
+    /// index order, and is ignored for tombstones.
+    fn attach_file(&mut self, path: PathBuf, offsets: &[(u64, u32)]) {
+        debug_assert_eq!(offsets.len(), self.index.len());
+        for ((_, loc), (offset, len)) in self.index.iter_mut().zip(offsets) {
+            if matches!(loc, ValueLoc::Tombstone) {
+                continue;
+            }
+            *loc = ValueLoc::Disk {
+                offset: *offset,
+                len: *len,
+            };
+        }
+        self.path = Some(path);
     }
 
     /// Number of entries.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.index.len()
     }
 
     /// Returns `true` if the SSTable contains no entries.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.index.is_empty()
     }
 
-    /// Iterate over all entries.
-    pub fn iter(&self) -> impl Iterator<Item = &(Vec<u8>, Option<Vec<u8>>)> {
-        self.entries.iter()
+    /// Iterate over all entries, reading values as it goes.
+    ///
+    /// Materialises one value at a time rather than the whole table, so
+    /// compaction of a disk-backed run costs one value of memory, not the run.
+    pub fn entries(&self) -> impl Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + '_ {
+        self.index
+            .iter()
+            .map(move |(k, loc)| (k.clone(), self.read_value(loc)))
+    }
+
+    /// Keys in sorted order, without touching the backing file.
+    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.index.iter().map(|(k, _)| k.as_slice())
     }
 }
 
@@ -260,28 +351,53 @@ impl LsmTree {
             .map(|d| d.join(Self::sst_filename(level, seq)))
     }
 
-    fn write_sst_to_disk(&self, sst: &SSTable) -> io::Result<()> {
+    /// Write an SSTable to disk and repoint it at the file.
+    ///
+    /// Streams rather than building the whole table in a buffer first, and
+    /// records each value's offset so the table can drop its resident copies:
+    /// after this returns, the run costs keys plus offsets in memory instead of
+    /// keys plus data.
+    fn write_sst_to_disk(&self, sst: &mut SSTable) -> io::Result<()> {
         let Some(path) = self.sst_path(sst.level, sst.seq) else {
             return Ok(());
         };
-        let mut buf = Vec::with_capacity(sst.size_bytes + 64);
-        buf.extend_from_slice(b"LSMS");
-        buf.push(sst.level as u8);
-        buf.extend_from_slice(&sst.seq.to_le_bytes());
-        buf.extend_from_slice(&(sst.entries.len() as u32).to_le_bytes());
-        for (k, v) in sst.iter() {
-            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            buf.extend_from_slice(k);
+        let file = File::create(&path)?;
+        let mut w = io::BufWriter::new(file);
+        let mut pos: u64 = 0;
+        let write = |w: &mut io::BufWriter<File>, bytes: &[u8], pos: &mut u64| -> io::Result<()> {
+            w.write_all(bytes)?;
+            *pos += bytes.len() as u64;
+            Ok(())
+        };
+
+        write(&mut w, b"LSMS", &mut pos)?;
+        write(&mut w, &[sst.level as u8], &mut pos)?;
+        write(&mut w, &sst.seq.to_le_bytes(), &mut pos)?;
+        write(&mut w, &(sst.len() as u32).to_le_bytes(), &mut pos)?;
+
+        let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(sst.len());
+        for (k, v) in sst.entries() {
+            write(&mut w, &(k.len() as u32).to_le_bytes(), &mut pos)?;
+            write(&mut w, &k, &mut pos)?;
             match v {
-                None => buf.push(0),
+                None => {
+                    write(&mut w, &[0u8], &mut pos)?;
+                    offsets.push((0, 0));
+                }
                 Some(val) => {
-                    buf.push(1);
-                    buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(val);
+                    write(&mut w, &[1u8], &mut pos)?;
+                    write(&mut w, &(val.len() as u32).to_le_bytes(), &mut pos)?;
+                    // Payload begins here — this is what a later read seeks to.
+                    offsets.push((pos, val.len() as u32));
+                    write(&mut w, &val, &mut pos)?;
                 }
             }
         }
-        std::fs::write(&path, &buf)
+        w.flush()?;
+        drop(w);
+
+        sst.attach_file(path, &offsets);
+        Ok(())
     }
 
     fn delete_sst_from_disk(&self, level: usize, seq: u64) {
@@ -365,9 +481,10 @@ impl LsmTree {
             std::mem::take(&mut self.memtable).into_iter().collect();
         let seq = self.next_seq;
         self.next_seq += 1;
-        let sst = SSTable::from_sorted(entries, 0, seq, self.config.bloom_bits_per_key);
-        // Write to disk before adding to in-memory levels (WAL semantics).
-        if let Err(e) = self.write_sst_to_disk(&sst) {
+        let mut sst = SSTable::from_sorted(entries, 0, seq, self.config.bloom_bits_per_key);
+        // Write to disk before adding to in-memory levels (WAL semantics). This
+        // also releases the resident values into file offsets.
+        if let Err(e) = self.write_sst_to_disk(&mut sst) {
             eprintln!(
                 "LSM: failed to write SSTable L{}/seq{} to disk: {e}",
                 sst.level, sst.seq
@@ -418,7 +535,7 @@ impl LsmTree {
         all_tables.sort_by_key(|t| t.seq);
 
         for table in &all_tables {
-            for (k, v) in table.iter() {
+            for (k, v) in table.entries() {
                 merged.insert(k.clone(), v.clone());
             }
         }
@@ -432,9 +549,9 @@ impl LsmTree {
 
         let seq = self.next_seq;
         self.next_seq += 1;
-        let sst = SSTable::from_sorted(entries, level + 1, seq, self.config.bloom_bits_per_key);
+        let mut sst = SSTable::from_sorted(entries, level + 1, seq, self.config.bloom_bits_per_key);
         // Write merged SSTable to disk first, then delete superseded files.
-        if let Err(e) = self.write_sst_to_disk(&sst) {
+        if let Err(e) = self.write_sst_to_disk(&mut sst) {
             eprintln!(
                 "LSM: failed to write compacted SSTable L{}/seq{} to disk: {e}",
                 sst.level, sst.seq
@@ -469,7 +586,7 @@ impl LsmTree {
         // Collect from SSTables (oldest first so newer overwrites).
         for level in self.levels.iter().rev() {
             for sst in level {
-                for (k, v) in sst.iter() {
+                for (k, v) in sst.entries() {
                     if k.as_slice() >= start && k.as_slice() < end {
                         merged.insert(k.clone(), v.clone());
                     }
@@ -522,70 +639,95 @@ impl LsmTree {
 // ============================================================================
 
 /// Read and parse an SSTable file.
+/// Load an SSTable's index without reading its values.
+///
+/// Scans the file recording each key and the byte range of its value. Values
+/// stay on disk and are fetched per lookup, so opening a store costs keys and
+/// offsets rather than the whole dataset — the difference between a cold tier
+/// that saves memory and one that merely persists it.
+///
+/// Reads through a buffered reader rather than slurping the file, so a large
+/// run does not have to be materialised just to be indexed.
 fn load_sst_file(path: &Path) -> io::Result<SSTable> {
-    let data = std::fs::read(path)?;
+    let file = File::open(path)?;
+    let mut r = io::BufReader::with_capacity(64 * 1024, file);
+    let mut pos: u64 = 0;
 
-    // Check magic.
-    if data.get(..4) != Some(b"LSMS") {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    pos += 4;
+    if &magic != b"LSMS" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "bad SSTable magic",
         ));
     }
-    let mut pos = 4usize;
 
-    let level = *data.get(pos).ok_or_else(eof)? as usize;
+    let mut one = [0u8; 1];
+    r.read_exact(&mut one)?;
     pos += 1;
+    let level = one[0] as usize;
 
-    let seq = read_u64_le(&data, &mut pos).ok_or_else(eof)?;
-    let n = read_u32_le(&data, &mut pos).ok_or_else(eof)? as usize;
+    let mut eight = [0u8; 8];
+    r.read_exact(&mut eight)?;
+    pos += 8;
+    let seq = u64::from_le_bytes(eight);
 
-    let mut entries = Vec::with_capacity(n);
+    let mut four = [0u8; 4];
+    r.read_exact(&mut four)?;
+    pos += 4;
+    let n = u32::from_le_bytes(four) as usize;
+
+    let mut index: Vec<(Vec<u8>, ValueLoc)> = Vec::with_capacity(n);
+    let mut bloom = BloomFilter::new(n.max(1), 10);
+    let mut size_bytes = 0usize;
+
     for _ in 0..n {
-        let key_len = read_u32_le(&data, &mut pos).ok_or_else(eof)? as usize;
-        if pos + key_len > data.len() {
-            return Err(eof());
-        }
-        let key = data[pos..pos + key_len].to_vec();
-        pos += key_len;
+        r.read_exact(&mut four)?;
+        pos += 4;
+        let key_len = u32::from_le_bytes(four) as usize;
+        let mut key = vec![0u8; key_len];
+        r.read_exact(&mut key)?;
+        pos += key_len as u64;
 
-        let kind = *data.get(pos).ok_or_else(eof)?;
+        r.read_exact(&mut one)?;
         pos += 1;
+        let kind = one[0];
 
-        let value = if kind == 1 {
-            let val_len = read_u32_le(&data, &mut pos).ok_or_else(eof)? as usize;
-            if pos + val_len > data.len() {
-                return Err(eof());
+        let loc = if kind == 1 {
+            r.read_exact(&mut four)?;
+            pos += 4;
+            let val_len = u32::from_le_bytes(four);
+            let offset = pos;
+            // Skip the payload rather than read it — this is the whole point.
+            io::copy(&mut r.by_ref().take(val_len as u64), &mut io::sink())?;
+            pos += val_len as u64;
+            size_bytes += val_len as usize;
+            ValueLoc::Disk {
+                offset,
+                len: val_len,
             }
-            let v = data[pos..pos + val_len].to_vec();
-            pos += val_len;
-            Some(v)
         } else {
-            None // tombstone
+            ValueLoc::Tombstone
         };
-        entries.push((key, value));
+
+        bloom.insert(&key);
+        size_bytes += key.len();
+        index.push((key, loc));
     }
 
-    Ok(SSTable::from_sorted(entries, level, seq, 10))
+    Ok(SSTable {
+        index,
+        bloom,
+        level,
+        seq,
+        size_bytes,
+        path: Some(path.to_path_buf()),
+    })
 }
 
-fn eof() -> io::Error {
-    io::Error::new(io::ErrorKind::UnexpectedEof, "truncated SSTable file")
-}
 
-fn read_u32_le(data: &[u8], pos: &mut usize) -> Option<u32> {
-    let b = data.get(*pos..*pos + 4)?;
-    *pos += 4;
-    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
 
-fn read_u64_le(data: &[u8], pos: &mut usize) -> Option<u64> {
-    let b = data.get(*pos..*pos + 8)?;
-    *pos += 8;
-    Some(u64::from_le_bytes([
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-    ]))
-}
 
 // ============================================================================
 // Tests
@@ -605,6 +747,69 @@ mod tests {
     }
 
     #[test]
+    // The property the cold tier exists for: after loading from disk, values are
+    // NOT resident. Previously `SSTable` held every value in a Vec, so evicting
+    // to "cold" moved bytes from one in-RAM structure to another and a fully
+    // evicted 4.8 GB dataset stayed 4.8 GB resident.
+    #[test]
+    fn loaded_sstable_holds_offsets_not_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
+        let big = vec![b'x'; 256 * 1024];
+        for i in 0..8 {
+            tree.put(format!("k{i}").into_bytes(), big.clone());
+        }
+        tree.force_flush();
+        drop(tree);
+
+        let reopened = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
+        let resident: usize = reopened
+            .levels
+            .iter()
+            .flatten()
+            .flat_map(|sst| sst.index.iter())
+            .map(|(k, loc)| match loc {
+                ValueLoc::Mem(v) => k.len() + v.len(),
+                _ => k.len(),
+            })
+            .sum();
+        // Keys only: 8 short keys, versus 2 MiB of values.
+        assert!(
+            resident < 4096,
+            "loaded SSTables must not hold values in memory, {resident} bytes resident"
+        );
+        // And the data is still readable.
+        for i in 0..8 {
+            assert_eq!(
+                reopened.get(format!("k{i}").as_bytes()),
+                Some(big.clone()),
+                "k{i} must read back from disk"
+            );
+        }
+    }
+
+    // Writing a table must release its resident values, not just copy them out.
+    #[test]
+    fn flushed_sstable_releases_resident_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
+        tree.put(b"a".to_vec(), vec![b'z'; 128 * 1024]);
+        tree.force_flush();
+
+        let mem_held: usize = tree
+            .levels
+            .iter()
+            .flatten()
+            .flat_map(|sst| sst.index.iter())
+            .filter_map(|(_, loc)| match loc {
+                ValueLoc::Mem(v) => Some(v.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(mem_held, 0, "values must move to disk on flush");
+        assert_eq!(tree.get(b"a"), Some(vec![b'z'; 128 * 1024]));
+    }
+
     fn bloom_filter_basic() {
         let mut bf = BloomFilter::new(100, 10);
         bf.insert(b"hello");
@@ -627,7 +832,7 @@ mod tests {
         assert_eq!(sst.len(), 3);
 
         // Found with value.
-        assert_eq!(sst.get(b"aaa"), Some(Some(b"111".as_slice())));
+        assert_eq!(sst.get(b"aaa"), Some(Some(b"111".to_vec())));
         // Found with tombstone.
         assert_eq!(sst.get(b"ccc"), Some(None));
         // Not found (bloom filter says no, or binary search misses).
@@ -877,15 +1082,15 @@ mod tests {
         buf.push(sst.level as u8);
         buf.extend_from_slice(&sst.seq.to_le_bytes());
         buf.extend_from_slice(&(sst.len() as u32).to_le_bytes());
-        for (k, v) in fake_sst.iter() {
+        for (k, v) in fake_sst.entries() {
             buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            buf.extend_from_slice(k);
+            buf.extend_from_slice(&k);
             match v {
                 None => buf.push(0),
                 Some(val) => {
                     buf.push(1);
                     buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(val);
+                    buf.extend_from_slice(&val);
                 }
             }
         }
@@ -899,8 +1104,8 @@ mod tests {
         // First entry: key=aaa, value=AAA
         assert_eq!(tree.get(b"aaa"), None); // empty tree
         // Verify the raw entries.
-        let e: Vec<_> = recovered.iter().collect();
-        assert_eq!(e[0].0, b"aaa");
+        let e: Vec<_> = recovered.entries().collect();
+        assert_eq!(e[0].0, b"aaa".to_vec());
         assert_eq!(e[0].1, Some(b"AAA".to_vec()));
         assert_eq!(e[1].1, None); // tombstone
     }
