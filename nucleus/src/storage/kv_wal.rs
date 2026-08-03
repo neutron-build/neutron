@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Write, Read, BufReader};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
@@ -88,8 +88,11 @@ impl KvWal {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("kv.wal");
         let state = if path.exists() {
-            let data = std::fs::read(&path)?;
-            replay(&data)
+            // Streamed, not slurped: `std::fs::read` here meant a 4.8 GB log
+            // cost 4.8 GB of buffer before a single key was parsed, on top of
+            // the map it was being parsed into.
+            let file = File::open(&path)?;
+            replay_reader(BufReader::with_capacity(256 * 1024, file))
         } else {
             KvWalState { items: Vec::new() }
         };
@@ -411,135 +414,199 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
 ///
 /// SNAPSHOT entries reset all state to their embedded snapshot, so only the
 /// *last* SNAPSHOT (and subsequent incremental entries) matter in practice.
-fn replay(data: &[u8]) -> KvWalState {
-    // key -> (value, optional_ttl_absolute_ms)
-    let mut store: HashMap<String, (Value, Option<u64>)> = HashMap::new();
-    let mut pos = 0usize;
+/// Parse one snapshot item: key, length-prefixed value, TTL flag + value.
+///
+/// Returns `None` when `data` does not yet hold the whole item, leaving `pos`
+/// for the caller to restore.
+fn parse_snapshot_item(data: &[u8], pos: &mut usize) -> Option<(String, Value, Option<u64>)> {
+    let key = read_string(data, pos)?;
+    let val_len = read_u32(data, pos)? as usize;
+    if *pos + val_len > data.len() {
+        return None;
+    }
+    let mut vpos = *pos;
+    let val = decode_value(data, &mut vpos)?;
+    *pos += val_len;
+    let has_ttl = *data.get(*pos)?;
+    *pos += 1;
+    let ttl_ms = read_u64(data, pos)?;
+    let ttl = if has_ttl != 0 { Some(ttl_ms) } else { None };
+    Some((key, val, ttl))
+}
 
-    while pos < data.len() {
-        let Some(&entry_type) = data.get(pos) else {
-            break;
+/// Outcome of trying to parse one top-level record.
+enum RecordStep {
+    /// A record was applied.
+    Applied,
+    /// A SNAPSHOT header was applied; this many items follow.
+    SnapshotHeader(u32),
+    /// `data` does not yet hold the whole record.
+    NeedMore,
+    /// Unknown entry type — replay cannot know how much to skip, so it stops.
+    Stop,
+}
+
+fn parse_record(
+    data: &[u8],
+    pos: &mut usize,
+    store: &mut HashMap<String, (Value, Option<u64>)>,
+) -> RecordStep {
+    let start = *pos;
+    let Some(&entry_type) = data.get(*pos) else {
+        return RecordStep::NeedMore;
+    };
+    *pos += 1;
+
+    macro_rules! need {
+        ($e:expr) => {
+            match $e {
+                Some(v) => v,
+                None => {
+                    *pos = start;
+                    return RecordStep::NeedMore;
+                }
+            }
         };
-        pos += 1;
+    }
 
-        match entry_type {
-            ENTRY_SET => {
-                // key
-                let Some(key) = read_string(data, &mut pos) else {
-                    break;
-                };
-                // value (length-prefixed)
-                let Some(val_len) = read_u32(data, &mut pos) else {
-                    break;
-                };
-                let val_len = val_len as usize;
-                if pos + val_len > data.len() {
-                    break;
-                }
-                let mut vpos = pos;
-                let Some(val) = decode_value(data, &mut vpos) else {
-                    break;
-                };
-                pos += val_len;
-                // Preserve existing TTL if key already exists
-                let ttl = store.get(&key).and_then(|(_, t)| *t);
-                store.insert(key, (val, ttl));
+    match entry_type {
+        ENTRY_SET => {
+            let key = need!(read_string(data, pos));
+            let val_len = need!(read_u32(data, pos)) as usize;
+            if *pos + val_len > data.len() {
+                *pos = start;
+                return RecordStep::NeedMore;
             }
-            ENTRY_SET_TTL => {
-                let Some(key) = read_string(data, &mut pos) else {
-                    break;
-                };
-                let Some(val_len) = read_u32(data, &mut pos) else {
-                    break;
-                };
-                let val_len = val_len as usize;
-                if pos + val_len > data.len() {
-                    break;
-                }
-                let mut vpos = pos;
-                let Some(val) = decode_value(data, &mut vpos) else {
-                    break;
-                };
-                pos += val_len;
-                let Some(&has_ttl) = data.get(pos) else {
-                    break;
-                };
-                pos += 1;
-                let Some(ttl_ms) = read_u64(data, &mut pos) else {
-                    break;
-                };
-                // The expiry is whatever the writer decided, including "none":
-                // this record carries the whole decision, so there is nothing
-                // to preserve from an earlier one.
-                let ttl = if has_ttl != 0 { Some(ttl_ms) } else { None };
-                store.insert(key, (val, ttl));
+            let mut vpos = *pos;
+            let val = need!(decode_value(data, &mut vpos));
+            *pos += val_len;
+            // Preserve any existing TTL: a plain SET does not decide expiry.
+            let ttl = store.get(&key).and_then(|(_, t)| *t);
+            store.insert(key, (val, ttl));
+            RecordStep::Applied
+        }
+        ENTRY_SET_TTL => {
+            let key = need!(read_string(data, pos));
+            let val_len = need!(read_u32(data, pos)) as usize;
+            if *pos + val_len > data.len() {
+                *pos = start;
+                return RecordStep::NeedMore;
             }
-            ENTRY_DEL => {
-                let Some(key) = read_string(data, &mut pos) else {
-                    break;
-                };
-                store.remove(&key);
+            let mut vpos = *pos;
+            let val = need!(decode_value(data, &mut vpos));
+            *pos += val_len;
+            let has_ttl = *need!(data.get(*pos));
+            *pos += 1;
+            let ttl_ms = need!(read_u64(data, pos));
+            // This record carries the whole expiry decision, including "none",
+            // so there is nothing to preserve from an earlier one.
+            let ttl = if has_ttl != 0 { Some(ttl_ms) } else { None };
+            store.insert(key, (val, ttl));
+            RecordStep::Applied
+        }
+        ENTRY_DEL => {
+            let key = need!(read_string(data, pos));
+            store.remove(&key);
+            RecordStep::Applied
+        }
+        ENTRY_EXPIRE => {
+            let key = need!(read_string(data, pos));
+            let ttl_ms = need!(read_u64(data, pos));
+            if let Some(entry) = store.get_mut(&key) {
+                entry.1 = Some(ttl_ms);
             }
-            ENTRY_EXPIRE => {
-                let Some(key) = read_string(data, &mut pos) else {
-                    break;
-                };
-                let Some(ttl_ms) = read_u64(data, &mut pos) else {
-                    break;
-                };
-                if let Some(entry) = store.get_mut(&key) {
-                    entry.1 = Some(ttl_ms);
-                }
-            }
-            ENTRY_SNAPSHOT => {
-                store.clear();
-                let Some(n_items) = read_u32(data, &mut pos) else {
-                    break;
-                };
-                let mut ok = true;
-                for _ in 0..n_items {
-                    // key
-                    let Some(key) = read_string(data, &mut pos) else {
-                        ok = false;
-                        break;
-                    };
-                    // value (length-prefixed)
-                    let Some(val_len) = read_u32(data, &mut pos) else {
-                        ok = false;
-                        break;
-                    };
-                    let val_len = val_len as usize;
-                    if pos + val_len > data.len() {
-                        ok = false;
-                        break;
+            RecordStep::Applied
+        }
+        ENTRY_SNAPSHOT => {
+            let n_items = need!(read_u32(data, pos));
+            // A SNAPSHOT supersedes everything before it.
+            store.clear();
+            RecordStep::SnapshotHeader(n_items)
+        }
+        _ => RecordStep::Stop,
+    }
+}
+
+/// Replay from an in-memory slice.
+///
+/// Test-only entry point onto the same parser — a second copy of a
+/// durability-critical format is a divergence waiting to happen, so the tests
+/// exercise the code that actually runs rather than a slice-shaped twin.
+#[cfg(test)]
+fn replay(data: &[u8]) -> KvWalState {
+    replay_reader(std::io::Cursor::new(data))
+}
+
+/// Replay the WAL from a reader, holding only a sliding window in memory.
+///
+/// The whole file used to be read into one `Vec<u8>` before parsing. That is
+/// fine for a small log and ruinous for a large one: a 4.8 GB KV WAL cost 4.8 GB
+/// of buffer *plus* the parsed map, so an instance that had grown could not be
+/// restarted within its own memory limit — the very situation a restart is
+/// supposed to resolve.
+///
+/// A SNAPSHOT is streamed item by item rather than treated as one record. That
+/// matters because a checkpointed log is a *single* SNAPSHOT containing every
+/// live key, so record-level streaming alone would still have buffered the
+/// entire file.
+///
+/// The window grows only to the largest single item, and truncated tails are
+/// tolerated exactly as before: replay stops at the last complete unit.
+fn replay_reader<R: Read>(mut reader: R) -> KvWalState {
+    const CHUNK: usize = 256 * 1024;
+    const COMPACT_THRESHOLD: usize = 1 << 20;
+
+    let mut store: HashMap<String, (Value, Option<u64>)> = HashMap::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    let mut snapshot_remaining: u32 = 0;
+    let mut eof = false;
+
+    loop {
+        // Make as much progress as the buffered bytes allow.
+        let stop = loop {
+            if snapshot_remaining > 0 {
+                let start = pos;
+                match parse_snapshot_item(&buf, &mut pos) {
+                    Some((k, v, t)) => {
+                        store.insert(k, (v, t));
+                        snapshot_remaining -= 1;
                     }
-                    let mut vpos = pos;
-                    let Some(val) = decode_value(data, &mut vpos) else {
-                        ok = false;
-                        break;
-                    };
-                    pos += val_len;
-                    // TTL
-                    let Some(&has_ttl) = data.get(pos) else {
-                        ok = false;
-                        break;
-                    };
-                    pos += 1;
-                    let Some(ttl_ms) = read_u64(data, &mut pos) else {
-                        ok = false;
-                        break;
-                    };
-                    let ttl = if has_ttl != 0 { Some(ttl_ms) } else { None };
-                    store.insert(key, (val, ttl));
+                    None => {
+                        pos = start;
+                        break false;
+                    }
                 }
-                if !ok {
-                    break;
+            } else {
+                match parse_record(&buf, &mut pos, &mut store) {
+                    RecordStep::Applied => {}
+                    RecordStep::SnapshotHeader(n) => snapshot_remaining = n,
+                    RecordStep::NeedMore => break false,
+                    RecordStep::Stop => break true,
                 }
             }
-            _ => {
-                // Unknown entry type — stop replay (can't know how much to skip).
-                break;
-            }
+        };
+        if stop || eof {
+            break;
+        }
+
+        // Drop the consumed prefix so the window tracks the largest item, not
+        // the file.
+        if pos == buf.len() {
+            buf.clear();
+            pos = 0;
+        } else if pos > COMPACT_THRESHOLD {
+            buf.drain(..pos);
+            pos = 0;
+        }
+
+        let mut chunk = vec![0u8; CHUNK];
+        match reader.read(&mut chunk) {
+            Ok(0) => eof = true,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // A read error mid-log is treated like a truncated tail: keep what
+            // replayed cleanly rather than discarding the whole store.
+            Err(_) => eof = true,
         }
     }
 
@@ -595,6 +662,70 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    // Replay reads the log in 256 KiB chunks. A value larger than one chunk must
+    // still round-trip: the window has to grow to hold the largest single item,
+    // and the parser must not mistake "not buffered yet" for "end of log".
+    #[test]
+    fn replays_value_larger_than_read_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "v".repeat(700 * 1024);
+        {
+            let (wal, _) = KvWal::open(dir.path()).unwrap();
+            wal.log_set("huge", &Value::Text(big.clone())).unwrap();
+            wal.log_set("after", &Value::Text("tail".into())).unwrap();
+        }
+        let (_, state) = KvWal::open(dir.path()).unwrap();
+        let map: HashMap<_, _> = state.items.iter().map(|(k, v, _)| (k.as_str(), v)).collect();
+        assert_eq!(map.get("huge"), Some(&&Value::Text(big)));
+        assert_eq!(map.get("after"), Some(&&Value::Text("tail".into())));
+    }
+
+    // A checkpointed log is ONE snapshot record holding every live key, so
+    // record-level streaming alone would still buffer the whole file. The
+    // snapshot has to be consumed item by item.
+    #[test]
+    fn replays_snapshot_spanning_many_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk = "s".repeat(8 * 1024);
+        let items: Vec<(String, Value, Option<u64>)> = (0..200)
+            .map(|i| (format!("k{i}"), Value::Text(format!("{chunk}{i}")), None))
+            .collect();
+        {
+            let (wal, _) = KvWal::open(dir.path()).unwrap();
+            wal.checkpoint(&items).unwrap();
+        }
+        let (_, state) = KvWal::open(dir.path()).unwrap();
+        assert_eq!(state.items.len(), 200, "every snapshot item must replay");
+        let map: HashMap<_, _> = state.items.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
+        assert_eq!(map.get("k0"), Some(&Value::Text(format!("{chunk}0"))));
+        assert_eq!(map.get("k199"), Some(&Value::Text(format!("{chunk}199"))));
+    }
+
+    // A torn tail is normal after a crash. Replay must keep every complete unit
+    // before it rather than discarding the log — and must not spin.
+    #[test]
+    fn truncated_snapshot_keeps_complete_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let items: Vec<(String, Value, Option<u64>)> = (0..50)
+            .map(|i| (format!("k{i}"), Value::Text("x".repeat(4096)), None))
+            .collect();
+        {
+            let (wal, _) = KvWal::open(dir.path()).unwrap();
+            wal.checkpoint(&items).unwrap();
+        }
+        let path = dir.path().join("kv.wal");
+        let full = std::fs::read(&path).unwrap();
+        // Cut mid-way through the item stream.
+        std::fs::write(&path, &full[..full.len() * 2 / 3]).unwrap();
+
+        let (_, state) = KvWal::open(dir.path()).unwrap();
+        assert!(
+            !state.items.is_empty() && state.items.len() < 50,
+            "expected a partial replay, got {} items",
+            state.items.len()
+        );
+    }
 
     #[test]
     fn group_sync_marks_clean_and_data_persists() {
