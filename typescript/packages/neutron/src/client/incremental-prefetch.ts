@@ -75,6 +75,11 @@ function prefetchAllowed(): boolean {
  */
 function prefetchableHref(anchor: HTMLAnchorElement): string | null {
   if (anchor.dataset.neutronPrefetch === "false") return null;
+  // The router marks links whose target is a static route, and the browser
+  // prerenders those from the speculation rules. Warming them here too would
+  // spend a second request to fill a cache the click will never read, because
+  // a static target is handed to the browser rather than to `handleNavigation`.
+  if (anchor.hasAttribute("data-neutron-static")) return null;
   if (anchor.target && anchor.target !== "_self") return null;
   if (anchor.hasAttribute("download")) return null;
   if (anchor.origin !== window.location.origin) return null;

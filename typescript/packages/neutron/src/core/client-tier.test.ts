@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 
 import { resolveClientTier } from "./render-app-route.js";
-import { renderSpeculationRules } from "./speculation-rules.js";
+import {
+  renderSpeculationRules,
+  renderStaticLinkSpeculationRules,
+} from "./speculation-rules.js";
 import { parseRouteFacts } from "./manifest.js";
 
 type R = { config: { mode: "static" | "app"; hydrate?: boolean } };
@@ -100,5 +103,27 @@ describe("renderSpeculationRules", () => {
     const html = renderSpeculationRules({ exclude: ["</script><script>alert(1)</script>"] });
     expect(html).not.toContain("</script><script>");
     expect(html.match(/<\/script>/g)).toHaveLength(1);
+  });
+});
+
+describe("renderStaticLinkSpeculationRules", () => {
+  // An app-tier document must not speculate app routes: prerendering one runs
+  // its loaders and middleware for a page nobody asked for. Scoping to the
+  // attribute the router applies is what prevents that.
+  it("only speculates links the router marked as static", () => {
+    const html = renderStaticLinkSpeculationRules();
+    const json = JSON.parse(html.replace(/^<script[^>]*>/, "").replace(/<\/script>$/, ""));
+    expect(json.prerender[0].where.and).toContainEqual({
+      selector_matches: "[data-neutron-static]",
+    });
+    expect(json.prerender[0].eagerness).toBe("moderate");
+  });
+
+  it("still honours the per-link opt-out", () => {
+    expect(renderStaticLinkSpeculationRules()).toContain("data-neutron-prefetch=false");
+  });
+
+  it("carries a CSP nonce", () => {
+    expect(renderStaticLinkSpeculationRules(undefined, "n0nce")).toContain('nonce="n0nce"');
   });
 });

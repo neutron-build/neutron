@@ -11,7 +11,10 @@ import { h } from "preact";
 import type * as preact from "preact";
 
 import { escapeHtml } from "./escape.js";
-import { renderSpeculationRules } from "./speculation-rules.js";
+import {
+  renderSpeculationRules,
+  renderStaticLinkSpeculationRules,
+} from "./speculation-rules.js";
 import { encodeSerializedPayloadAsJson, serializeForInlineScript } from "./serialization.js";
 import { assertRenderedFragment, decodeChunkStart } from "./fragment-guard.js";
 import {
@@ -456,10 +459,15 @@ function buildHtmlSuffix(
   // client-side data prefetch can match. Emitted only for this tier: an
   // app-tier page has the router, and prerendering pages it would have handled
   // client-side would duplicate the work.
-  const speculation =
-    includeClientRuntime && clientTier === "static"
+  // Static tier: every page is static, so every same-origin link is safe to
+  // prerender. App tier: only the links the router marks as pointing at a
+  // static route — prerendering an app route would run its loaders and
+  // middleware for a page nobody asked for.
+  const speculation = !includeClientRuntime
+    ? ""
+    : clientTier === "static"
       ? renderSpeculationRules({}, nonce)
-      : "";
+      : renderStaticLinkSpeculationRules(undefined, nonce);
 
   return `</div>
 ${dataScript}
