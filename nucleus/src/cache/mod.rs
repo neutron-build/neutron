@@ -1004,17 +1004,23 @@ impl crate::memory::Pressurable for crate::sparse::SparseIndex {
     }
 }
 
-/// Pressurable adapter for `KvStore` — sweeps expired entries on pressure.
+/// Pressurable adapter for `KvStore` — spills the largest entries to the cold
+/// tier under pressure.
+///
+/// Both methods previously assumed a flat 128 bytes per entry, which made this
+/// adapter actively harmful rather than merely imprecise: a store holding 32k
+/// values averaging 150 KB reported 4 MB of usage, so the allocator never
+/// selected it for reclamation, and `shrink_to` only swept *expired* entries, so
+/// even when called it freed nothing for a store whose entries carry no TTL.
+/// The result was a process pinned above its memory limit rejecting writes while
+/// running eviction twice a second, forever.
 impl crate::memory::Pressurable for crate::kv::KvStore {
     fn current_usage(&self) -> usize {
-        self.dbsize() * 128
+        self.estimated_memory_bytes()
     }
 
-    fn shrink_to(&mut self, _target: usize) -> usize {
-        let before = self.dbsize();
-        self.sweep_expired_full();
-        let after = self.dbsize();
-        before.saturating_sub(after) * 128
+    fn shrink_to(&mut self, target: usize) -> usize {
+        self.shrink_hot_to(target)
     }
 
     fn priority(&self) -> crate::memory::Priority {
