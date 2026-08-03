@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/ops",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Observability middleware for Neutron. Request tracing, health checks, and structured JSON logging.",
   "author": "Tyler",
   "license": "MIT",

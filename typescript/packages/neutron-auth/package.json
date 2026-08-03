@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/auth",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Authentication context and protected-route middleware for Neutron.",
   "author": "Tyler",
   "license": "MIT",

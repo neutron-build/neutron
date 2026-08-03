@@ -2,6 +2,68 @@
 
 All notable changes to this project are documented in this file.
 
+## [core 0.2.0, cli 0.2.0] - 2026-08-02
+
+### Breaking
+
+- **A `mode: "static"` route no longer hydrates its whole component tree.** It
+  ships no client router, so only islands become interactive. Previously the
+  router hydrated every route, so a component using hooks in a static page
+  worked; now it renders as HTML and stays inert.
+
+  This is why the minor version moved: `^0.1.x` will not pick it up.
+
+  **Migration.** The build now reports this for you, naming the file. Two fixes:
+  wrap the interactive component in `<Island>` (ships only that component's
+  code, and is why a static page can cost zero JS), or add `hydrate: true` to
+  the route's config to restore the old whole-tree hydration.
+
+### Added
+
+- **Static pages navigate instantly with no JavaScript.** Prerendered documents
+  and static-tier responses emit `<script type="speculationrules">`, so the
+  browser prerenders the next page on pointer intent — already painted when the
+  click lands, which no client-side prefetch can match. `eagerness: "moderate"`
+  rather than `eager` on purpose: prerendering executes the target page, and
+  eager speculation would turn one visitor with a dense nav bar into a dozen
+  server renders. `data-neutron-prefetch="false"` opts a link out of both this
+  and the JS prefetcher.
+- **A build-time check for interactivity that will not run**, described above.
+  Conservative: it skips any route declaring an island and stops at the project
+  boundary, because a heuristic that warns about correct code gets ignored.
+- **Link prefetching that works.** Viewport and pointer-intent warming of the
+  navigation payload, declining on `saveData` and 2g, skipping redirected
+  responses.
+
+### Fixed
+
+- **The prefetcher fetched into a cache nothing read.** `incremental-prefetch`
+  was imported by nothing, so it never ran — and it was built on three server
+  headers that do not exist (`X-Neutron-Prefetch-Metadata`,
+  `X-Neutron-Skip-Layout`, and a response `X-Neutron-Layout-Id`), so it could
+  not have worked if it had. It also wrote to module-local maps while
+  navigation read `window.__NEUTRON_PREFETCH_CACHE__`.
+- **Post-mutation data was served as a prefetch, forever.** `useSubmit` stored
+  its response under the current URL with no expiry and no invalidation, and
+  navigation treated that global as a prefetch cache. Navigating away and back
+  re-rendered the snapshot with no network, indefinitely — changes made
+  anywhere else, including by the same user in another tab, stayed invisible
+  until a hard reload. Entries now expire and are consumed on read.
+- **A stale in-flight fetch could overwrite a completed navigation.** The
+  cache-hit path neither aborted the active request nor claimed a new request
+  id, so a slow response for an abandoned page landed afterwards and applied
+  its data over the page the user was on. It also skipped the scroll reset the
+  fetched path performs.
+- **One un-annotated layout forced the router onto every page.** The client
+  runtime was gated on `every(route => route.config.hydrate !== false)`, and
+  `hydrate` is undefined on every route that does not set it — so a single
+  ordinary layout, the default state of every layout, pulled the full router
+  into purely static pages. Those pages then intercepted every link click and
+  turned it into a data fetch for data that did not exist.
+- **Static targets are no longer intercepted by the router.** A `mode: "static"`
+  route with a prebuilt file is already served without middleware, so a browser
+  navigation to it is both correct and cheaper than a client render.
+
 ## [core 0.1.9, cli 0.1.6] - 2026-08-01
 
 ### Fixed

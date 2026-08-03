@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/security",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Security middleware for Neutron. CSP, CSRF protection, rate limiting, and secure cookie defaults.",
   "author": "Tyler",
   "license": "MIT",

@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/core",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "The unified TypeScript web framework. Static sites with zero JS, app routes with Preact SSR, one router, deploy anywhere.",
   "author": "Tyler",
   "license": "MIT",
