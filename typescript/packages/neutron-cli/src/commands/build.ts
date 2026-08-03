@@ -22,6 +22,7 @@ import {
   buildBodyOpenTag,
   setActiveMarkdownConfig,
   assertRenderedFragment,
+  renderSpeculationRules,
 } from "@neutron-build/core";
 import type {
   NeutronConfig,
@@ -850,6 +851,7 @@ ${cssLinks}
 ${buildBodyOpenTag(seo?.bodyAttrs)}
 <div id="app">${content}</div>
 ${clientScript}
+${renderSpeculationRules()}
 </body>
 </html>`;
 }

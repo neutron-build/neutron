@@ -1,5 +1,9 @@
 export { createRouter } from "./core/router.js";
 export { discoverRoutes, parseRouteConfig } from "./core/manifest.js";
+export {
+  renderSpeculationRules,
+  renderStaticLinkSpeculationRules,
+} from "./core/speculation-rules.js";
 // renderStatic is a minimal standalone SSG (for tests); the production build is
 // neutron-cli/src/commands/build.ts. See the doc comment in render-static.ts.
 export { renderStatic, renderToString } from "./core/render-static.js";
