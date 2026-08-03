@@ -43,13 +43,22 @@ Tracked (release evidence):
   numbers. **Read before hunting a correctness bug** — most real bugs here were
   found by these, not by unit tests.
 
-Local-only (gitignored scratch; historical, NOT release evidence):
+- `PARITY-COMPARISON.md` -- Feature-by-feature against competing engines
+- `AUDIT_FINDINGS.md` (+ `AUDIT_FINDINGS_RAW.json`) -- 2026-06 audit findings
+  log. A **record, not a work list**: fixed / refuted / deferred with evidence.
+  What to do next lives in `_internal/OPEN_WORK.md`.
 
-- `PLAN.md` -- Vision and architecture principles
-- `STATUS.md` -- Informal current-state assessment (numbers go stale; trust
-  DATABASE_COMPLETION.md)
-- `NUCLEUS-ROADMAP.md`, `AUDIT-REPORT.md`, `TODO-NEXT.md`, `COMPETITOR-GAPS.md`,
-  `AUDIT_FINDINGS.md`, `M*_TEST_PLAN.md` -- older planning/audit scratch
+Those seven files are the whole of `nucleus/`'s root documentation, and each
+answers a different question. Adding an eighth is fine when it answers one none
+of them do. Adding a second status document, a second next-work list, or an
+undated audit snapshot is not — that is what produced the 18-file root this
+replaced (see `archive/README.md`).
+
+`archive/` -- superseded docs, **not a work list**. Verified-stale before being
+moved there: `AUDIT-REPORT.md`'s sampled criticals were 6-for-6 already fixed,
+`TODO-NEXT.md` was 21/21 complete, `NUCLEUS-AUDIT.md`'s open items were ~half
+stale with every count wrong, and `STATUS.md` held the most widely-copied wrong
+numbers. Its README records the evidence per file.
 
 Compatibility harnesses: `compat/orm/` (Drizzle/Prisma/SQLAlchemy end-to-end,
 `sh compat/orm/run.sh`); probes under `src/bin/` (`probe_soak --rows-target` for
