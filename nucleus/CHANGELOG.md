@@ -3,6 +3,17 @@
 Notable changes to the Nucleus engine. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.4] - 2026-08-03
+
+### Fixed
+
+- Release plumbing only, no engine changes. The v0.1.3 image is good — it was
+  the first to actually run on the runtime base — but its release job stopped
+  before signing because the new smoke test started the server on `0.0.0.0`
+  without `NUCLEUS_ALLOW_INSECURE_CLUSTER`, so Nucleus correctly refused a
+  non-loopback bind with no cluster token. The test tripped over the product
+  behaving properly. Fixed, so this release is signed and attested.
+
 ## [0.1.3] - 2026-08-03
 
 ### Fixed
