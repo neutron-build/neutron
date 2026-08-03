@@ -17,7 +17,7 @@ A complete, enterprise-grade CI/CD and operations infrastructure for safe Phase 
 |----------|---------|------|----------|
 | `binary_protocol.yml` | Wire changes | 8 min | Binary protocol tests + phase4 bench |
 | `analytics_optimization.yml` | Analytics changes | 10 min | Zone maps, GROUP BY, SIMD tests |
-| `full_regression.yml` | All nucleus changes | 45 min | 3,184 executor + 133 wire + compete |
+| `full_regression.yml` | All nucleus changes | 45 min | full executor suite + wire + compete |
 
 All workflows:
 - Block merge on failure

@@ -111,7 +111,7 @@ weighted fusion. Competitors have it as their flagship.
 
 | | Nucleus | HelixDB | Polygres |
 |---|---|---|---|
-| Status | Dev preview, ~2,611 tests | v3.0.8, 181 releases, GA cloud | Beta, SDK v0.1.0 |
+| Status | Dev preview, ~4,216 declared tests | v3.0.8, 181 releases, GA cloud | Beta, SDK v0.1.0 |
 | License | BSL 1.1 -> MIT (4 yr) | Apache-2.0 | Apache-2.0 (SDKs/ext) |
 | Auth | SCRAM roles + RLS | (cloud auth) | Postgres roles |
 

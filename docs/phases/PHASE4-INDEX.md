@@ -258,7 +258,7 @@ Before moving to Week 1:
 - [ ] All CI workflows passing
 - [ ] Health endpoint responding with valid JSON
 - [ ] Metrics endpoint returning >40 Prometheus metrics
-- [ ] All 3,184+ tests passing
+- [ ] Full test suite passing (no hardcoded count — see `nucleus/scripts/metrics.sh`)
 - [ ] Compete benchmark running successfully
 - [ ] Team trained on RUNBOOK.md
 

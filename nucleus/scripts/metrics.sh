@@ -87,6 +87,35 @@ else
     echo "OK: every integration ignore is categorized stress/scale"
 fi
 
+# The private ground-truth sheet is what docs/site/README claims are cited from,
+# so it has to be checked too. It went stale once while every doc kept quoting
+# it; that is the whole reason this block exists. It lives in the gitignored
+# _internal/ tree, so a fresh clone or CI checkout legitimately won't have it —
+# absence is skipped, not failed.
+TRUTH="$ROOT/../_internal/GROUND_TRUTH.md"
+if [ -f "$TRUTH" ]; then
+    echo "Checking ground-truth sheet..."
+    # Emphasis markers are stripped first so a cell may be written `**4216**`
+    # for readability without defeating the check.
+    TRUTH_PLAIN=$(tr -d '*' < "$TRUTH")
+    assert_truth_value() {
+        _label=$1
+        _actual=$2
+        if printf '%s' "$TRUTH_PLAIN" | grep -Fq "| $_actual |"; then
+            echo "OK: ground truth $_label=$_actual"
+        else
+            echo "FAIL: _internal/GROUND_TRUTH.md is stale — $_label should be $_actual" >&2
+            return 1
+        fi
+    }
+    assert_truth_value "LOC" "$LOC" || fail=1
+    assert_truth_value "unit tests" "$UNIT_DECLARED" || fail=1
+    assert_truth_value "modules" "$MODULES" || fail=1
+    assert_truth_value "rs files" "$RS_FILES" || fail=1
+else
+    echo "SKIP: _internal/GROUND_TRUTH.md not present (private, not in this checkout)"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "Current values:" >&2
     print_metrics >&2
