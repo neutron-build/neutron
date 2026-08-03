@@ -28,7 +28,7 @@ pub mod collections;
 #[cfg(feature = "server")]
 pub mod collections_wal;
 pub mod streams;
-pub mod tiered;
+pub mod codec;
 
 // ============================================================================
 // KV Entry
@@ -1413,7 +1413,7 @@ impl KvStore {
     fn cold_get_and_promote(&self, key: &str) -> Option<Arc<Value>> {
         let cold = self.cold.as_ref()?;
         let data = cold.lock().get(key.as_bytes())?;
-        let value = Arc::new(tiered::decode_value(&data));
+        let value = Arc::new(codec::decode_value(&data));
         // Promote to hot: write directly to the shard (bypass WAL — it's
         // already in the WAL from the original set).
         self.data.shard(key).data.write().insert(
@@ -1512,6 +1512,12 @@ impl KvStore {
                 if entry.expires_at.is_some() {
                     continue;
                 }
+                // The cold codec carries six type tags and falls back to text
+                // for anything else. Eviction must never silently change a
+                // value's type, so values it cannot represent stay resident.
+                if !codec::is_losslessly_encodable(&entry.value) {
+                    continue;
+                }
                 candidates.push((
                     key.len() + entry.value.approx_heap_size() + KV_ENTRY_OVERHEAD_BYTES,
                     key.clone(),
@@ -1533,7 +1539,7 @@ impl KvStore {
             }) else {
                 continue;
             };
-            let encoded = tiered::encode_value(&arc_value);
+            let encoded = codec::encode_value(&arc_value);
             cold.lock().put(key.as_bytes().to_vec(), encoded);
             self.data.shard(&key).data.write().remove(key.as_str());
             freed_bytes = freed_bytes.saturating_add(size);
@@ -3200,6 +3206,33 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
+    // Eviction must not change a value's type. The cold codec carries six tags
+    // and falls back to Display->Text for anything else, so a Bytea moved to
+    // cold would come back as text — a silent type change triggered by nothing
+    // more than memory pressure. Values it cannot represent stay resident.
+    #[test]
+    fn eviction_never_rewrites_a_value_it_cannot_encode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = KvStore::open(dir.path()).unwrap();
+        store.max_hot_bytes = 64 * 1024;
+
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        store.set("blob", Value::Bytea(payload.clone()), None);
+        // Plenty of encodable pressure alongside it.
+        for i in 0..32 {
+            store.set(&format!("t{i}"), Value::Text("q".repeat(8 * 1024)), None);
+        }
+
+        match store.get("blob") {
+            Some(v) => assert_eq!(
+                v,
+                Value::Bytea(payload),
+                "Bytea must survive eviction pressure unchanged"
+            ),
+            None => panic!("blob must not be dropped"),
+        }
+    }
+
     // The production failure this exists for. A store of ~32k keys holding
     // ~150 KB values each sits far under the 100k-entry cap while occupying
     // gigabytes. Eviction keyed on entry count never fired, the process pinned
