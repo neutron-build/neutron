@@ -717,6 +717,9 @@ mod tests {
     /// readings: read-only is latched and nothing else clears it. A panicking
     /// reading used to kill the spawned task silently, and the only recovery
     /// was a restart — the reported symptom this guards against.
+    // spawn_monitor is server-gated, so its tests must be too — otherwise the
+    // core-only build (`--no-default-features`) fails to compile them.
+    #[cfg(feature = "server")]
     #[tokio::test(start_paused = true)]
     async fn a_panicking_reading_does_not_stop_the_monitor() {
         let probe = FakeProbe::new(100 * GIB, 2 * GIB);
@@ -748,6 +751,7 @@ mod tests {
 
     /// Liveness is observable at all. Without a counter, "the monitor stopped"
     /// and "the disk is still full" look identical from outside.
+    #[cfg(feature = "server")]
     #[tokio::test(start_paused = true)]
     async fn the_monitor_reports_that_it_is_still_taking_readings() {
         let probe = FakeProbe::new(100 * GIB, 50 * GIB);
