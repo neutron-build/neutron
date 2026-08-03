@@ -39,6 +39,7 @@ import type {
 import { renderToString } from "preact-render-to-string";
 import { h } from "preact";
 import { createRequire } from "node:module";
+import { extractClientEntryScriptSrc } from "../client-entry.js";
 
 export async function build(): Promise<void> {
   const cwd = process.cwd();
@@ -185,6 +186,11 @@ export async function build(): Promise<void> {
         build: {
           outDir: outputDir,
           emptyOutDir: true,
+          // The manifest is how the client entry is identified. Without it the
+          // only signal is the emitted filename, and a route named `index`
+          // produces `assets/index-<hash>.js` — the exact shape of the real
+          // entry. See extractClientEntryScriptSrc.
+          manifest: true,
         },
       })
     );
@@ -234,6 +240,11 @@ export async function build(): Promise<void> {
             output: { assetFileNames: "assets/[name]-[hash][extname]" },
           },
           cssCodeSplit: false,
+          // This build imports every route to walk their CSS, so it emits a
+          // route chunk per route — including `assets/index-<hash>.js`. Without
+          // the manifest naming them, the client-entry resolver can pick one up
+          // and inject a stray route stub into pages that need no JS at all.
+          manifest: true,
         },
       })
     );
@@ -904,28 +915,6 @@ function extractIslandsEntryScriptSrc(outputDir: string): string | null {
   return `/assets/${candidates[candidates.length - 1]}`;
 }
 
-function extractClientEntryScriptSrc(outputDir: string): string | null {
-  const assetsDir = path.join(outputDir, "assets");
-  if (fs.existsSync(assetsDir)) {
-    const candidates = fs
-      .readdirSync(assetsDir)
-      .filter((name) => name.startsWith("index-") && name.endsWith(".js"))
-      .sort();
-
-    if (candidates.length > 0) {
-      return `/assets/${candidates[candidates.length - 1]}`;
-    }
-  }
-
-  const indexPath = path.join(outputDir, "index.html");
-  if (!fs.existsSync(indexPath)) {
-    return null;
-  }
-
-  const html = fs.readFileSync(indexPath, "utf-8");
-  const match = html.match(/<script[^>]*type="module"[^>]*src="([^"]+)"[^>]*><\/script>/i);
-  return match?.[1] || null;
-}
 
 function writeClientEntryMetadata(outputDir: string, src: string): void {
   const metadataPath = path.join(outputDir, ".neutron-client-entry.json");

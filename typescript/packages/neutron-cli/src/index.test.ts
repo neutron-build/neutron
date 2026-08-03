@@ -862,3 +862,94 @@ describe("config file candidates", () => {
     assert.equal(CONFIG_CANDIDATES.length, 4);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Client-entry resolution — imported from source, not mirrored.
+//
+// The rest of this file re-implements the functions it tests. That is exactly
+// how the bug below survived: a mirrored copy can pass while the real function
+// is broken. `client-entry.ts` was split out of build.ts (which imports vite at
+// load time) so the real implementation can be exercised here.
+// ---------------------------------------------------------------------------
+
+import { extractClientEntryScriptSrc } from "./client-entry.js";
+
+function scratchDir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "neutron-client-entry-"));
+}
+
+function writeManifest(dir: string, manifest: unknown): void {
+  const viteDir = path.join(dir, ".vite");
+  fs.mkdirSync(viteDir, { recursive: true });
+  fs.writeFileSync(path.join(viteDir, "manifest.json"), JSON.stringify(manifest));
+}
+
+describe("extractClientEntryScriptSrc", () => {
+  // The live failure this exists for. covely.io served
+  // `const o={mode:"app"};export{o as config};` — 42 bytes — as its entire
+  // client runtime, because `src/routes/index.tsx` emits `assets/index-<hash>.js`
+  // just like the real entry, and the old glob sorted and took the last one.
+  // The app never hydrated, no link was marked static, the speculation rules
+  // scoped to those marks matched nothing, and every navigation was a cold full
+  // page load. Nothing errored, because the page is server-rendered.
+  it("does not mistake a route chunk for the client entry", () => {
+    const dir = scratchDir();
+    fs.mkdirSync(path.join(dir, "assets"), { recursive: true });
+    // Hash chosen so the ROUTE chunk sorts last — what the old code returned.
+    fs.writeFileSync(path.join(dir, "assets/index-Aaaaaaaa.js"), "// real runtime");
+    fs.writeFileSync(path.join(dir, "assets/index-Zzzzzzzz.js"), "const o={mode:\"app\"};");
+    writeManifest(dir, {
+      "src/main.tsx": { file: "assets/index-Aaaaaaaa.js", isEntry: true },
+      "src/routes/index.tsx": { file: "assets/index-Zzzzzzzz.js", isEntry: true },
+    });
+
+    assert.equal(extractClientEntryScriptSrc(dir), "/assets/index-Aaaaaaaa.js");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("ignores a route chunk carrying the client-route query", () => {
+    const dir = scratchDir();
+    fs.mkdirSync(path.join(dir, "assets"), { recursive: true });
+    writeManifest(dir, {
+      "src/main.tsx": { file: "assets/index-real.js", isEntry: true },
+      "src/routes/index.tsx?neutron-client-route": {
+        file: "assets/index-zzzz.js",
+        isEntry: true,
+      },
+    });
+
+    assert.equal(extractClientEntryScriptSrc(dir), "/assets/index-real.js");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Without a manifest the glob is all there is, but it must still not return a
+  // chunk that no manifest vouched for as an entry when one is available.
+  it("falls back to the filename glob when no manifest exists", () => {
+    const dir = scratchDir();
+    fs.mkdirSync(path.join(dir, "assets"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "assets/index-abc123.js"), "// runtime");
+
+    assert.equal(extractClientEntryScriptSrc(dir), "/assets/index-abc123.js");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns null when there is nothing to load", () => {
+    const dir = scratchDir();
+    assert.equal(extractClientEntryScriptSrc(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // A non-JS entry (the html itself) must not be returned as a module script.
+  it("skips non-JS entries", () => {
+    const dir = scratchDir();
+    fs.mkdirSync(path.join(dir, "assets"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "assets/index-abc123.js"), "// runtime");
+    writeManifest(dir, {
+      "index.html": { file: "index.html", isEntry: true },
+      "src/main.tsx": { file: "assets/index-abc123.js", isEntry: true },
+    });
+
+    assert.equal(extractClientEntryScriptSrc(dir), "/assets/index-abc123.js");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
