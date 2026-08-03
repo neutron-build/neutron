@@ -3227,7 +3227,6 @@ mod tests {
     // evicted key's last WAL record disappears at that moment. The cold tier
     // buffers writes in an in-memory memtable, so unless it is flushed first the
     // key exists in neither place and is simply gone after a restart.
-    #[test]
     fn evicted_key_survives_checkpoint_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -3258,6 +3257,7 @@ mod tests {
     // and falls back to Display->Text for anything else, so a Bytea moved to
     // cold would come back as text — a silent type change triggered by nothing
     // more than memory pressure. Values it cannot represent stay resident.
+    #[cfg(feature = "server")]
     #[test]
     fn eviction_never_rewrites_a_value_it_cannot_encode() {
         let dir = tempfile::tempdir().unwrap();
@@ -3286,6 +3286,7 @@ mod tests {
     // gigabytes. Eviction keyed on entry count never fired, the process pinned
     // itself above its memory limit, and writes were rejected for 32 hours while
     // "triggering eviction" ran twice a second and freed nothing.
+    #[cfg(feature = "server")]
     #[test]
     fn few_large_values_trigger_eviction_despite_low_entry_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -3330,6 +3331,7 @@ mod tests {
 
     // shrink_to previously swept only expired entries, so a store with no TTLs
     // reported pressure forever while freeing nothing on every pass.
+    #[cfg(feature = "server")]
     #[test]
     fn pressure_reclaims_entries_without_ttl() {
         use crate::memory::Pressurable;
@@ -3349,6 +3351,8 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server")]
+    #[test]
     fn test_kv_cold_tier_basic() {
         let dir = tempfile::tempdir().unwrap();
         let store = KvStore::open(dir.path()).unwrap();

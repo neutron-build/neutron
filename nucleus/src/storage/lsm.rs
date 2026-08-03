@@ -751,7 +751,6 @@ mod tests {
     // NOT resident. Previously `SSTable` held every value in a Vec, so evicting
     // to "cold" moved bytes from one in-RAM structure to another and a fully
     // evicted 4.8 GB dataset stayed 4.8 GB resident.
-    #[test]
     fn loaded_sstable_holds_offsets_not_values() {
         let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
@@ -810,6 +809,7 @@ mod tests {
         assert_eq!(tree.get(b"a"), Some(vec![b'z'; 128 * 1024]));
     }
 
+    #[test]
     fn bloom_filter_basic() {
         let mut bf = BloomFilter::new(100, 10);
         bf.insert(b"hello");
