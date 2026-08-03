@@ -145,13 +145,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          # Pinned to 22.04, NOT ubuntu-latest. A glibc binary requires the
+          # version it was linked against or newer, and `ubuntu-latest` moved to
+          # 24.04 (glibc 2.39) while the runtime image is debian:bookworm-slim
+          # (2.36) — so the published container failed to start with
+          # "GLIBC_2.38 not found", and the standalone tarballs were equally
+          # unusable on Debian 12. Pinning the builder rather than bumping the
+          # base keeps the binaries runnable on older hosts, which matters for a
+          # database people self-host.
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             os: linux
             arch: amd64
             cross: false
 
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             os: linux
             arch: arm64
@@ -478,6 +486,30 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
             ${{ env.IMAGE }}:latest
+
+      # Nothing in this pipeline had ever RUN the published image. v0.1.2 built,
+      # pushed, signed and attested a container that could not start at all
+      # ("GLIBC_2.38 not found") because the binary was linked against a newer
+      # glibc than the runtime base provides. Every gate passed; the artefact
+      # was broken. Run it before signing it.
+      - name: Smoke-test the published image
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE}:${{ steps.version.outputs.version }}"
+          echo "Pulling and running $IMG (linux/amd64)"
+          docker run --rm --platform linux/amd64 --entrypoint nucleus "$IMG" version
+          # Start a server against a scratch dir and confirm it answers, so a
+          # binary that loads but cannot serve is caught too.
+          docker run -d --platform linux/amd64 --name smoke \
+            -e NUCLEUS_ALLOW_NO_AUTH=1 "$IMG" \
+            start --host 0.0.0.0 --port 5432 --data /tmp/smoke
+          for i in $(seq 1 30); do
+            if docker exec smoke nucleus status --host 127.0.0.1:5432 >/dev/null 2>&1; then
+              echo "server answered after ${i}s"; docker rm -f smoke >/dev/null; exit 0
+            fi
+            sleep 1
+          done
+          echo "image started but never answered a status probe"; docker logs smoke; docker rm -f smoke >/dev/null; exit 1
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
