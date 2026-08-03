@@ -79,3 +79,38 @@ export function renderSpeculationRules(
   const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
   return `<script type="speculationrules"${nonceAttr}>${json}</script>`;
 }
+
+/**
+ * Speculation rules for an app-tier document, scoped to links the router has
+ * marked as pointing at a static route.
+ *
+ * The static tier can speculate every same-origin link, because every page in
+ * it is static. An app-tier document cannot: prerendering an app route would
+ * run its loaders and its middleware for a page the user has not asked for.
+ *
+ * Scoping by selector rather than by href pattern keeps the server out of it.
+ * The router already holds `mode` per route (emitted into the route table), so
+ * it can mark the anchors itself and the rules never have to enumerate paths
+ * or be regenerated when routes change.
+ */
+export function renderStaticLinkSpeculationRules(
+  attribute: string = "data-neutron-static",
+  nonce?: string
+): string {
+  const rules = {
+    prerender: [
+      {
+        where: {
+          and: [
+            { selector_matches: `[${attribute}]` },
+            { not: { selector_matches: "[data-neutron-prefetch=false]" } },
+          ],
+        },
+        eagerness: "moderate",
+      },
+    ],
+  };
+  const json = JSON.stringify(rules).replace(/</g, "\\u003c");
+  const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
+  return `<script type="speculationrules"${nonceAttr}>${json}</script>`;
+}

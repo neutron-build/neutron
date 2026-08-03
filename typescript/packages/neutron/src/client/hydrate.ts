@@ -152,6 +152,7 @@ export async function init() {
   await ensureRouteChainModules([...layouts, route]);
   
   hydrateApp(data);
+  markStaticLinks();
   setNavigationState({ state: "idle" });
 
   window.addEventListener("neutron:data-updated", (event: Event) => {
@@ -197,6 +198,15 @@ export async function init() {
       return;
     }
 
+    // A static target is left to the browser. Intercepting it bought nothing:
+    // the fetch returned head and CSS for a page whose component was already
+    // in the bundle, and the prerender the speculation rules started on hover
+    // has the real document painted already. Not calling preventDefault is
+    // also what lets the browser ACTIVATE that prerender.
+    if (isBrowserNavigationTarget(anchor.pathname)) {
+      return;
+    }
+
     // Keep the hash so navigate() can preserve it and scroll on arrival for
     // cross-page anchor links (e.g. /about#team).
     const href = anchor.pathname + anchor.search + anchor.hash;
@@ -225,6 +235,44 @@ function findRoute(pathname: string): RouteInfo | null {
     }
   }
   return null;
+}
+
+/**
+ * Whether a same-origin path resolves to a route this router should NOT handle.
+ *
+ * A `mode: "static"` route is prerendered and served from `dist/` without
+ * middleware (`server/index.ts` returns the cached HTML before
+ * `renderAppRoute` runs, and global middleware is only invoked inside it), so
+ * a browser navigation to one is both correct and cheaper than a client
+ * render: the document is already painted by the time the click lands, because
+ * the speculation rules this tier emits prerender it.
+ *
+ * Unknown resolves to false — handle it in the router — so an older route
+ * table never silently turns SPA navigation into full page loads.
+ */
+function isBrowserNavigationTarget(pathname: string): boolean {
+  const route = findRoute(pathname);
+  if (!route) return false;
+  if (route.mode !== "static") return false;
+  return getLayoutChain(route).every((layout) => layout.mode === "static");
+}
+
+/**
+ * Tag anchors whose target is a static route.
+ *
+ * The speculation rules emitted for an app-tier document are scoped to this
+ * attribute, which is what keeps the browser from prerendering app routes and
+ * running their loaders and middleware for pages nobody asked for.
+ */
+function markStaticLinks(): void {
+  document.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((anchor) => {
+    if (anchor.origin !== window.location.origin) return;
+    if (isBrowserNavigationTarget(anchor.pathname)) {
+      anchor.setAttribute("data-neutron-static", "");
+    } else {
+      anchor.removeAttribute("data-neutron-static");
+    }
+  });
 }
 
 function matchPath(pattern: string, pathname: string): boolean {
@@ -394,6 +442,7 @@ function applyData(data: LoaderData): void {
   // ever saw the first page's DOM would warm nothing after the first
   // navigation. Cheap: already-observed nodes are skipped.
   observeVisibleLinks();
+  markStaticLinks();
 }
 
 /**
@@ -511,6 +560,15 @@ async function handleNavigation(forceRevalidate: boolean = false) {
   const route = findRoute(pathname);
   if (!route) {
     window.location.reload();
+    return;
+  }
+
+  // Programmatic navigate() and <Link>'s own onClick bypass the interceptor,
+  // so the static-target rule is enforced here too. `replace` rather than
+  // `assign`: navigate() already pushed this URL, and assigning would leave
+  // two history entries for one navigation.
+  if (isBrowserNavigationTarget(pathname)) {
+    window.location.replace(nextUrl);
     return;
   }
 
