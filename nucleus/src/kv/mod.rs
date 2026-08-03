@@ -1591,6 +1591,21 @@ impl KvStore {
         let Some(ref wal) = self.wal else {
             return Ok(());
         };
+        // Flush the cold tier BEFORE snapshotting, and never after.
+        //
+        // The snapshot below covers the hot tier only, and truncates the WAL to
+        // it — so a key that was evicted to cold is, at that instant, losing its
+        // last WAL record. `LsmTree::put` only buffers into an in-memory
+        // memtable until a size threshold is reached, so without this flush an
+        // evicted key can exist in neither the WAL nor on disk, and a crash
+        // loses it outright with nothing reporting a problem.
+        //
+        // Rare while eviction was keyed on entry count and almost never fired.
+        // Making eviction byte-aware made it routine, which is what turned this
+        // from theoretical into the ordering that has to hold.
+        if let Some(ref cold) = self.cold {
+            cold.lock().flush_memtable();
+        }
         let mut items = Vec::new();
         for shard in &self.data.shards {
             let data = shard.data.read();
@@ -3206,6 +3221,39 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
+    // An evicted key must survive a checkpoint + reopen.
+    //
+    // Checkpoint snapshots the hot tier and truncates the WAL to it, so an
+    // evicted key's last WAL record disappears at that moment. The cold tier
+    // buffers writes in an in-memory memtable, so unless it is flushed first the
+    // key exists in neither place and is simply gone after a restart.
+    #[test]
+    fn evicted_key_survives_checkpoint_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = KvStore::open(dir.path()).unwrap();
+            store.max_hot_bytes = 32 * 1024;
+            for i in 0..40 {
+                store.set(&format!("k{i}"), Value::Text("p".repeat(8 * 1024)), None);
+            }
+            // Something must actually have been pushed to cold, or this proves
+            // nothing about the ordering.
+            assert!(
+                store.dbsize_hot() < 40,
+                "precondition: eviction must have moved keys to cold"
+            );
+            store.checkpoint().unwrap();
+        }
+
+        let reopened = KvStore::open(dir.path()).unwrap();
+        for i in 0..40 {
+            assert!(
+                reopened.get(&format!("k{i}")).is_some(),
+                "k{i} was lost across checkpoint + reopen"
+            );
+        }
+    }
+
     // Eviction must not change a value's type. The cold codec carries six tags
     // and falls back to Display->Text for anything else, so a Bytea moved to
     // cold would come back as text — a silent type change triggered by nothing
