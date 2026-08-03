@@ -25,6 +25,10 @@ import {
   stripQueryFromId,
   stripServerOnlyRouteModule,
 } from "./server-only.js";
+import {
+  findStaticInteractivity,
+  formatStaticInteractivityWarning,
+} from "./static-interactivity-check.js";
 import { renderDocumentHead, mergeSeoMetaInput, buildHtmlOpenTag, buildBodyOpenTag } from "../core/seo.js";
 import type { SeoMetaInput } from "../core/seo.js";
 import type { NeutronRoutesConfig } from "../config.js";
@@ -172,6 +176,16 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     }
 
     state.islandIds = scanIslandIds(srcDir, rootDir);
+
+    // Static routes are not hydrated, so hooks outside an island silently do
+    // nothing at runtime. Surface it here, where the author can act on it.
+    const warning = formatStaticInteractivityWarning(
+      findStaticInteractivity(state.routes),
+      rootDir
+    );
+    if (warning) {
+      console.warn(warning);
+    }
 
     if (writeRouteTypes) {
       await prepareRouteTypes({
