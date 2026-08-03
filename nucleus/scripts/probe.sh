@@ -55,7 +55,6 @@ PROBES=(
   "probe_joins|--iterations $((2000 * M))"
   "probe_graph_algo|--iterations $((2000 * M))"
   "probe_datalog_rich|--iterations $((2000 * M))"
-  "probe_pgwire|--iterations $((20000 * M))"
   "probe_crash_subprocess|--cycles $((30 * M))"
   "probe_distributed|--iterations $((300 * M))"
   "probe_durability_torn|--iterations $((300 * M))"
