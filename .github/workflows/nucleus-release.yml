@@ -500,8 +500,11 @@ jobs:
           docker run --rm --platform linux/amd64 --entrypoint nucleus "$IMG" version
           # Start a server against a scratch dir and confirm it answers, so a
           # binary that loads but cannot serve is caught too.
+          # Same env the image is actually deployed with: a non-loopback bind
+          # is refused without a cluster token, which is correct behaviour and
+          # exactly what a smoke test must not trip over.
           docker run -d --platform linux/amd64 --name smoke \
-            -e NUCLEUS_ALLOW_NO_AUTH=1 "$IMG" \
+            -e NUCLEUS_ALLOW_NO_AUTH=1 -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 "$IMG" \
             start --host 0.0.0.0 --port 5432 --data /tmp/smoke
           for i in $(seq 1 30); do
             if docker exec smoke nucleus status --host 127.0.0.1:5432 >/dev/null 2>&1; then
