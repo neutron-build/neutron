@@ -272,3 +272,47 @@ changes and a new class of "why is my head stale" bug. The comparison to beat
 is not Next.js — its App Router pays an RSC round-trip on the same navigation —
 but Astro, which for a static page does a full document load with zero JS and
 is very hard to beat on a cold click.
+
+### Resolved: the cold-click round-trip (step 4)
+
+Closed in `78411c5`, in a different shape than specced above. Two corrections
+to the analysis in the preceding section:
+
+1. **The middleware-bypass objection was wrong.** `globalMiddleware` is never
+   registered as app-level middleware — it is only passed into
+   `renderAppRoute` — and the static-HTML cache hit at `server/index.ts:586`
+   returns before `renderAppRoute` runs. A static route with a prebuilt file is
+   already served with no middleware at all, so its content is already public
+   and there was nothing for a client shortcut to bypass.
+2. **Local rendering was not the fast option.** A prerendered document is
+   already painted when the click lands; a local render still has to run
+   Preact, apply the head and load CSS after it. So the build-time head, the
+   manifest CSS list and the stale-head risk were all cost for a slower result.
+
+The fix is therefore to NOT intercept static targets and let the browser
+prerender them — which needs none of the four build-pipeline changes listed
+above.
+
+## Static-route `middleware` does not run when a prebuilt file exists (open)
+
+Found while closing step 4, and not the same thing as the item above.
+
+`server/index.ts` serves `staticHtmlCache` for a GET whenever
+`isStaticRoute(match)` — and that check is `match.route.file.includes("_layout")
+|| match.route.config.mode === "static"`. It returns before `renderAppRoute`,
+which is the only place route `middleware` and `globalMiddleware` are invoked.
+
+So a route that declares both:
+
+    export const config = { mode: "static" };
+    export const middleware = requireAuth;
+
+is prerendered by SSG (`render-static.ts` only skips `mode !== "static"`) and
+then served from the prebuilt file with `requireAuth` never running. The author
+gets no error and no warning; the page is simply public.
+
+Options: refuse to prerender a static route that exports `middleware`, refuse
+to serve the cached file for one, or reject the combination at build time with
+a clear message. The last is probably right — the combination is more likely a
+misunderstanding than an intent, and silently downgrading either half is worse
+than failing the build.
