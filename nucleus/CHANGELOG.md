@@ -3,6 +3,26 @@
 Notable changes to the Nucleus engine. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.3] - 2026-08-03
+
+### Fixed
+
+- **The v0.1.2 release artefacts could not run.** Linux binaries were built on
+  `ubuntu-latest`, which had moved to 24.04 (glibc 2.39), while the runtime
+  image is `debian:bookworm-slim` (2.36) — so the published container exited
+  immediately with `GLIBC_2.38 not found`, and the standalone tarballs were
+  equally unusable on Debian 12. The Linux builders are now pinned to
+  ubuntu-22.04, which keeps the binaries runnable on older hosts rather than
+  only fixing the container.
+
+  Nothing in the pipeline had ever *run* the image: clippy, tests, SBOM,
+  signing and provenance all passed on a container that could not start,
+  because each inspects source or metadata rather than behaviour. The release
+  now smoke-tests the image — runs it, starts a server, waits for a status
+  probe — before signing it.
+
+  v0.1.2 is superseded; use this release. No engine changes.
+
 ## [0.1.2] - 2026-08-03
 
 The theme of this release is memory: an instance that had grown could exceed its
