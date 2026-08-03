@@ -128,6 +128,27 @@ impl ShardedMap {
 /// When opened with [`KvStore::open`] (disk mode), a cold LsmTree tier is
 /// automatically created for overflow storage.  In-memory mode (`new()`)
 /// has no cold tier.
+/// Per-entry bookkeeping overhead: the `KvEntry` struct, the map slot and the
+/// `Arc` header. Approximate, and small enough not to matter for large values —
+/// it exists so a store of many tiny keys is not accounted as near-zero.
+const KV_ENTRY_OVERHEAD_BYTES: usize = 64;
+
+/// Default hot-tier byte budget, overridable with `NUCLEUS_KV_MAX_HOT_MB`.
+///
+/// 1 GiB. Entries beyond this spill to the on-disk cold tier rather than being
+/// dropped, so the data is still readable — a cold hit is promoted back on
+/// access. Chosen to be generous for ordinary key/value use while still bounding
+/// a store that has accumulated large blobs.
+fn default_max_hot_bytes() -> usize {
+    const DEFAULT_MB: usize = 1024;
+    std::env::var("NUCLEUS_KV_MAX_HOT_MB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(DEFAULT_MB)
+        .saturating_mul(1024 * 1024)
+}
+
 pub struct KvStore {
     data: ShardedMap,
     #[cfg(feature = "server")]
@@ -137,6 +158,14 @@ pub struct KvStore {
     cold: Option<parking_lot::Mutex<crate::storage::lsm::LsmTree>>,
     /// Maximum entries in the hot (in-memory) tier before eviction to cold.
     max_hot_entries: usize,
+    /// Maximum bytes in the hot tier before eviction to cold.
+    ///
+    /// A count limit alone does not bound memory. A store of 32k keys holding
+    /// 150 KB values each sits far under a 100k-entry cap while occupying
+    /// several GB, which is exactly how a production instance ended up over its
+    /// memory limit rejecting writes with eviction never once triggering.
+    /// Whichever limit is reached first wins.
+    max_hot_bytes: usize,
     /// Global monotonic version counter, incremented on every write operation.
     /// Used by WATCH/EXEC optimistic locking in the RESP handler.
     global_version: std::sync::atomic::AtomicU64,
@@ -159,6 +188,7 @@ impl KvStore {
             collections: collections::ShardedCollections::new(),
             cold: None,
             max_hot_entries: 100_000,
+            max_hot_bytes: default_max_hot_bytes(),
             global_version: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -225,14 +255,26 @@ impl KvStore {
             .ok()
             .map(parking_lot::Mutex::new);
 
-        Ok(Self {
+        let store = Self {
             data: sharded,
             wal: Some(Arc::new(wal)),
             collections: col_state,
             cold,
             max_hot_entries: 100_000,
+            max_hot_bytes: default_max_hot_bytes(),
             global_version: std::sync::atomic::AtomicU64::new(0),
-        })
+        };
+        // Replay rebuilds the map directly rather than going through `set`, so
+        // nothing has checked the budgets yet. Without this, a store that grew
+        // past them before a restart comes back over the limit and stays there:
+        // eviction only runs on write, and writes are the first thing refused
+        // when the process is over its memory ceiling.
+        //
+        // Note this does not bound the *peak* during replay — the log is still
+        // materialised in full before we get here. Bounding that needs eviction
+        // interleaved into replay, which is a larger change.
+        store.maybe_evict();
+        Ok(store)
     }
 
     /// Return the current global version counter. Used by WATCH to snapshot
@@ -1386,36 +1428,135 @@ impl KvStore {
         Some(value)
     }
 
-    /// Evict non-TTL entries from the hot tier to the cold LsmTree when the
-    /// hot tier exceeds `max_hot_entries`.
-    fn maybe_evict(&self) {
-        if self.dbsize() <= self.max_hot_entries {
-            return;
+    /// Approximate bytes held by the hot (in-memory) tier.
+    ///
+    /// Walks the shards summing key and value footprints. O(entries), so it is
+    /// called on eviction checks and under memory pressure rather than on every
+    /// write. An incrementally maintained counter would be O(1), but it has to
+    /// be updated correctly on every one of the many mutation paths here
+    /// (SET/MSET/INCR/APPEND/SETRANGE/DEL/EXPIRE/sweep/rollback...) and silently
+    /// drifts the moment one is missed. A number that is occasionally expensive
+    /// beats a number that is quietly wrong.
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let now = Instant::now();
+        let mut total = 0usize;
+        for shard in &self.data.shards {
+            let data = shard.data.read();
+            for (key, entry) in data.iter() {
+                if entry.expires_at.is_some_and(|t| now >= t) {
+                    continue;
+                }
+                total = total
+                    .saturating_add(key.len())
+                    .saturating_add(entry.value.approx_heap_size())
+                    .saturating_add(KV_ENTRY_OVERHEAD_BYTES);
+            }
         }
-        let Some(ref cold) = self.cold else { return };
-        let eviction_batch = (self.max_hot_entries / 10).max(1);
-        let all_keys = self.keys("*");
-        let mut evicted = 0;
+        total
+    }
 
-        for key in &all_keys {
-            if evicted >= eviction_batch {
+    /// Evict non-TTL entries from the hot tier to the cold LsmTree when the hot
+    /// tier exceeds either its entry limit or its byte budget.
+    ///
+    /// Byte-awareness is the point. The original trigger was entry count alone,
+    /// so a store of 32k large values sat at several GB while reporting itself
+    /// comfortably under a 100k-entry cap and never evicted anything.
+    fn maybe_evict(&self) {
+        self.evict_to(self.max_hot_bytes, self.max_hot_entries);
+    }
+
+    /// Spill the largest non-TTL entries to the cold tier until the hot tier is
+    /// within both budgets. Returns the bytes freed.
+    ///
+    /// Budgets are parameters rather than fields so the memory allocator can aim
+    /// eviction at a tighter target under pressure without mutating shared
+    /// configuration.
+    fn evict_to(&self, byte_budget: usize, entry_budget: usize) -> usize {
+        let entries = self.dbsize();
+        let over_count = entries > entry_budget;
+        // Skip the O(n) walk when the cheap count check already decided it.
+        let bytes = if over_count {
+            usize::MAX
+        } else {
+            self.estimated_memory_bytes()
+        };
+        let over_bytes = bytes > byte_budget;
+        if !over_count && !over_bytes {
+            return 0;
+        }
+        let Some(ref cold) = self.cold else { return 0 };
+
+        // Aim slightly under the budget so a steady write stream does not
+        // re-trigger a full walk on every subsequent set.
+        let bytes_target = if over_bytes && bytes != usize::MAX {
+            bytes.saturating_sub(byte_budget - byte_budget / 10)
+        } else {
+            0
+        };
+        let entry_target = if over_count {
+            entries.saturating_sub(entry_budget).max(entry_budget / 10).max(1)
+        } else {
+            0
+        };
+
+        // Largest-first, so a byte target is met by moving a few big values
+        // rather than thousands of small ones — the small ones are also the
+        // cheapest to keep resident.
+        let mut candidates: Vec<(usize, String)> = Vec::new();
+        for shard in &self.data.shards {
+            let data = shard.data.read();
+            for (key, entry) in data.iter() {
+                // Only entries without a TTL: an expiring entry is reclaimed by
+                // the sweeper anyway, and the cold tier cannot represent its
+                // deadline.
+                if entry.expires_at.is_some() {
+                    continue;
+                }
+                candidates.push((
+                    key.len() + entry.value.approx_heap_size() + KV_ENTRY_OVERHEAD_BYTES,
+                    key.clone(),
+                ));
+            }
+        }
+        candidates.sort_unstable_by_key(|(size, _)| std::cmp::Reverse(*size));
+
+        let mut freed_bytes = 0usize;
+        let mut evicted = 0usize;
+        for (size, key) in candidates {
+            if freed_bytes >= bytes_target && evicted >= entry_target {
                 break;
             }
-            // Only evict entries without TTL (TTL = -1 means no expiry)
-            let ttl = self.ttl(key);
-            if ttl == -1
-                && let Some(arc_value) = {
-                    let shard = self.data.shard(key);
-                    let data = shard.data.read();
-                    data.get(key.as_str()).map(|e| Arc::clone(&e.value))
-                }
-            {
-                let encoded = tiered::encode_value(&arc_value);
-                cold.lock().put(key.as_bytes().to_vec(), encoded);
-                self.data.shard(key).data.write().remove(key.as_str());
-                evicted += 1;
-            }
+            let Some(arc_value) = ({
+                let shard = self.data.shard(&key);
+                let data = shard.data.read();
+                data.get(key.as_str()).map(|e| Arc::clone(&e.value))
+            }) else {
+                continue;
+            };
+            let encoded = tiered::encode_value(&arc_value);
+            cold.lock().put(key.as_bytes().to_vec(), encoded);
+            self.data.shard(&key).data.write().remove(key.as_str());
+            freed_bytes = freed_bytes.saturating_add(size);
+            evicted += 1;
         }
+        freed_bytes
+    }
+
+    /// Reclaim memory down to `target_bytes`, for the memory allocator's
+    /// pressure callback. Returns the bytes freed.
+    ///
+    /// The previous handler only swept *expired* entries, so a store whose
+    /// entries carry no TTL — the normal case for anything durable — reported
+    /// pressure forever while freeing precisely nothing on every pass.
+    pub fn shrink_hot_to(&self, target_bytes: usize) -> usize {
+        let before = self.estimated_memory_bytes();
+        self.sweep_expired_full();
+        let after_sweep = self.estimated_memory_bytes();
+        let swept = before.saturating_sub(after_sweep);
+        if after_sweep <= target_bytes {
+            return swept;
+        }
+        swept + self.evict_to(target_bytes, usize::MAX)
     }
 
     /// Whether this store has a cold tier (disk mode).
@@ -3059,6 +3200,74 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
+    // The production failure this exists for. A store of ~32k keys holding
+    // ~150 KB values each sits far under the 100k-entry cap while occupying
+    // gigabytes. Eviction keyed on entry count never fired, the process pinned
+    // itself above its memory limit, and writes were rejected for 32 hours while
+    // "triggering eviction" ran twice a second and freed nothing.
+    #[test]
+    fn few_large_values_trigger_eviction_despite_low_entry_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = KvStore::open(dir.path()).unwrap();
+        // Well under max_hot_entries (100k), well over the byte budget.
+        store.max_hot_bytes = 1 << 20; // 1 MiB
+        let blob = "x".repeat(64 * 1024); // 64 KiB each
+        for i in 0..64 {
+            store.set(&format!("srcmap:{i}"), Value::Text(blob.clone()), None);
+        }
+        assert!(
+            store.dbsize() < store.max_hot_entries,
+            "precondition: entry count must stay under the count cap"
+        );
+        assert!(
+            store.estimated_memory_bytes() <= store.max_hot_bytes * 2,
+            "hot tier should have been spilled toward its byte budget, got {} bytes",
+            store.estimated_memory_bytes()
+        );
+        // Spilled entries are still readable — they moved, they were not lost.
+        assert!(store.get("srcmap:0").is_some(), "evicted key must read back from cold");
+    }
+
+    // The allocator picks which subsystem to shrink from reported usage. A flat
+    // 128 bytes per entry under-reported a blob store by three orders of
+    // magnitude, so KV was never chosen no matter how much memory it held.
+    #[test]
+    fn reported_usage_reflects_value_size() {
+        let store = KvStore::new();
+        let blob = "y".repeat(100_000);
+        store.set("big", Value::Text(blob), None);
+        let usage = store.estimated_memory_bytes();
+        assert!(
+            usage >= 100_000,
+            "usage must account for the value itself, got {usage}"
+        );
+        assert!(
+            usage < 100_000 * 4,
+            "usage should not wildly overcount, got {usage}"
+        );
+    }
+
+    // shrink_to previously swept only expired entries, so a store with no TTLs
+    // reported pressure forever while freeing nothing on every pass.
+    #[test]
+    fn pressure_reclaims_entries_without_ttl() {
+        use crate::memory::Pressurable;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = KvStore::open(dir.path()).unwrap();
+        let blob = "z".repeat(32 * 1024);
+        for i in 0..64 {
+            store.set(&format!("k{i}"), Value::Text(blob.clone()), None);
+        }
+        let before = store.current_usage();
+        assert!(before > 1 << 20, "precondition: should hold >1 MiB");
+        let freed = store.shrink_to(256 * 1024);
+        assert!(freed > 0, "pressure must reclaim something when no entry has a TTL");
+        assert!(
+            store.current_usage() < before,
+            "usage must actually drop after a pressure callback"
+        );
+    }
+
     fn test_kv_cold_tier_basic() {
         let dir = tempfile::tempdir().unwrap();
         let store = KvStore::open(dir.path()).unwrap();

@@ -523,7 +523,56 @@ pub fn parse_vector_text(s: &str) -> Result<Vec<f32>, String> {
 // Type coercion and casting
 // ============================================================================
 
+/// Approximate heap footprint of a JSON document.
+///
+/// Walks the tree rather than serialising it: serialising to measure would
+/// allocate a copy of the very thing we are trying to avoid holding, and this
+/// runs while the process is already under memory pressure.
+fn approx_json_size(json: &serde_json::Value) -> usize {
+    match json {
+        serde_json::Value::Null | serde_json::Value::Bool(_) => 0,
+        serde_json::Value::Number(_) => std::mem::size_of::<f64>(),
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(items) => {
+            items.iter().map(approx_json_size).sum::<usize>() + items.len() * 8
+        }
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| k.len() + approx_json_size(v) + 16)
+            .sum(),
+    }
+}
+
 impl Value {
+    /// Approximate heap footprint of this value, in bytes.
+    ///
+    /// Used by memory accounting, which previously estimated a flat 128 bytes
+    /// per entry. That is fine for scalars and catastrophically wrong for the
+    /// blobs real workloads store: a KV store holding 32k source maps averaging
+    /// 150 KB reported 4 MB of usage while actually holding 4.8 GB, so the
+    /// allocator saw no reason to reclaim anything while the process sat over
+    /// its memory limit rejecting writes.
+    ///
+    /// Approximate on purpose. It counts the bytes owned on the heap plus the
+    /// size of the discriminant, and does not attempt to account for allocator
+    /// padding or capacity beyond length. Being within a few percent is enough
+    /// to make an eviction decision; being three orders of magnitude out is not.
+    pub fn approx_heap_size(&self) -> usize {
+        let inline = std::mem::size_of::<Value>();
+        inline
+            + match self {
+                Value::Text(s) | Value::Numeric(s) => s.len(),
+                Value::Bytea(b) => b.len(),
+                Value::Vector(v) => v.len() * std::mem::size_of::<f32>(),
+                Value::Array(items) => items
+                    .iter()
+                    .map(|item| item.approx_heap_size())
+                    .sum::<usize>(),
+                Value::Jsonb(json) => approx_json_size(json),
+                _ => 0,
+            }
+    }
+
     /// Coercing equality for single-column PK / eq predicates.
     ///
     /// Mirrors the executor's `compare_values` (the slow `WHERE` path) and
