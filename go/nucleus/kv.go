@@ -382,6 +382,32 @@ func (kv *KVModel) SRem(ctx context.Context, key, member string) (bool, error) {
 }
 
 // SMembers returns all members of a set.
+// Keys returns every non-expired key matching a glob pattern, sorted.
+//
+// `*` is the only wildcard, so `Keys(ctx, "srcmap:site-1:*")` enumerates one
+// prefix. Intended for administrative work — retention sweeps, operator
+// tooling, migrations — not for request paths: the engine walks the whole
+// keyspace and materialises every match, so cost scales with the store, not
+// with the number of hits.
+func (kv *KVModel) Keys(ctx context.Context, pattern string) ([]string, error) {
+	if err := kv.client.requireNucleus("KV.Keys"); err != nil {
+		return nil, err
+	}
+	var raw string
+	err := kv.pool.QueryRow(ctx, "SELECT KV_KEYS($1)", pattern).Scan(&raw)
+	if err != nil {
+		return nil, wrapErr("kv keys", err)
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, wrapErr("kv keys decode", err)
+	}
+	return out, nil
+}
+
 func (kv *KVModel) SMembers(ctx context.Context, key string) ([]string, error) {
 	if err := kv.client.requireNucleus("KV.SMembers"); err != nil {
 		return nil, err
