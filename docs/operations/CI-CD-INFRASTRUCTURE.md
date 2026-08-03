@@ -56,7 +56,7 @@ Runs:
 **File**: `.github/workflows/full_regression.yml`
 
 Runs nightly (or on-demand) on all nucleus changes:
-- All 3,184 executor tests
+- The full executor test suite (count changes every release — `sh nucleus/scripts/metrics.sh`)
 - All 133 wire/transport tests
 - All storage tests (buffer, compression, MVCC, transactions)
 - All data model tests (KV, vector, document, graph, FTS, geo, blob, streams, columnar, datalog, pubsub, timeseries)
