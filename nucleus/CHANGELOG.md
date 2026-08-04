@@ -40,6 +40,14 @@ Notable changes to the Nucleus engine. Format follows
   `probe_txn_atomicity`, which existed to demonstrate this bug, is now a
   passing gate.
 
+  Page attribution is per SESSION, not merely per window. The apply lock
+  serializes commits against each other but not against autocommit statements,
+  which bypass it, so a page another connection dirties inside the window is
+  left unattributed rather than being handed to the committing transaction —
+  otherwise a crash before that transaction committed would undo a write the
+  other connection was told succeeded. An unknown session attributes rather
+  than skipping, because a missing undo record is the worse failure.
+
 ## [0.1.6] - 2026-08-04
 
 The first release since v0.1.2 that carries engine changes; v0.1.3 through

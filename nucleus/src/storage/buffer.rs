@@ -455,6 +455,9 @@ impl LruKReplacer {
 // ============================================================================
 
 /// The buffer pool manager. Central point for all page access.
+/// See `BufferPool::applying_session`.
+const SESSION_UNKNOWN: u64 = u64::MAX;
+
 pub struct BufferPool {
     // SAFETY: UnsafeCell allows interior mutability for page frames.
     // Callers coordinate access via pin_count and frame latches (RwLock).
@@ -496,6 +499,13 @@ pub struct BufferPool {
     /// corrupted into pointing at itself, spinning a query at ~100% CPU
     /// forever. See `pin_if_present` and `get_free_frame`.
     eviction_lock: Mutex<()>,
+    /// Sentinel for "the applying transaction did not name a session", so
+    /// every page dirtied in its window is attributed to it.
+    ///
+    /// `u64::MAX` rather than 0: 0 is a real session id (the embedded/default
+    /// one), and using it here would make an embedded write indistinguishable
+    /// from an unknown owner.
+    applying_session: AtomicU64,
     /// The transaction currently applying its buffered writes, or 0 for none.
     ///
     /// Commit application is serialized (see `BufferedDiskEngine::commit_txn`),
@@ -559,19 +569,30 @@ impl BufferPool {
             wal_pending: Mutex::new(HashSet::new()),
             eviction_lock: Mutex::new(()),
             applying_txn: AtomicU64::new(0),
+            applying_session: AtomicU64::new(SESSION_UNKNOWN),
             txn_dirty: Mutex::new(HashSet::new()),
             undo_logged: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Open the commit-application window for `txn_id`.
+    /// Open the commit-application window for `txn_id`, owned by `session`.
     ///
-    /// Every page dirtied until [`BufferPool::end_page_txn`] is attributed to
-    /// this transaction, and any flush of one of those pages logs a
+    /// Pages dirtied by that session until [`BufferPool::end_page_txn`] are
+    /// attributed to this transaction, and any flush of one of them logs a
     /// before-image first. `txn_id` must be non-zero: 0 is the encoding for
     /// "committed state, redo unconditionally".
-    pub fn begin_page_txn(&self, txn_id: u64) {
+    ///
+    /// The session matters because the apply lock does not cover everything.
+    /// It serializes commits against each other, but an AUTOCOMMIT statement
+    /// takes `!is_in_txn()` in `buffered_engine` and goes straight to the inner
+    /// engine, so another connection can dirty a page inside this window.
+    /// Attributing that page here would hand another session's acknowledged
+    /// write to this transaction, and a crash before this transaction
+    /// committed would then undo it.
+    pub fn begin_page_txn(&self, txn_id: u64, session: Option<u64>) {
         debug_assert!(txn_id != 0, "txn 0 means 'no transaction' to recovery");
+        self.applying_session
+            .store(session.unwrap_or(SESSION_UNKNOWN), Ordering::Release);
         self.applying_txn.store(txn_id, Ordering::Release);
         self.txn_dirty.lock().clear();
         self.undo_logged.lock().clear();
@@ -616,11 +637,26 @@ impl BufferPool {
     }
 
     /// Note that `page_id` was dirtied, attributing it to the applying
-    /// transaction if there is one.
+    /// transaction unless it provably belongs to a different session.
+    ///
+    /// Fail-safe by construction: attribution is skipped ONLY when both this
+    /// write and the open window name a session and the two differ. An unknown
+    /// session attributes, because the cost of guessing wrong in that
+    /// direction is an unnecessary undo record, while guessing wrong the other
+    /// way is an uncommitted page with no way back — the bug this whole path
+    /// exists to remove.
     fn note_dirty_page(&self, page_id: u32) {
-        if self.applying_txn.load(Ordering::Acquire) != 0 {
-            self.txn_dirty.lock().insert(page_id);
+        if self.applying_txn.load(Ordering::Acquire) == 0 {
+            return;
         }
+        let owner = self.applying_session.load(Ordering::Acquire);
+        if owner != SESSION_UNKNOWN
+            && let Some(writer) = super::current_storage_session()
+            && writer != owner
+        {
+            return;
+        }
+        self.txn_dirty.lock().insert(page_id);
     }
 
     /// WAL-log a page image that is about to be written to disk (or forced),

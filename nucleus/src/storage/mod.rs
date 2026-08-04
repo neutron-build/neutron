@@ -85,6 +85,25 @@ pub fn get_storage_session_id() -> u64 {
     STORAGE_SESSION_ID_CELL.with(|c| c.get())
 }
 
+/// The current session, or `None` when it cannot be determined.
+///
+/// `None` means "unknown", NOT "no session", and callers must treat it that
+/// way. The buffer pool uses this to decide whether a dirtied page belongs to
+/// the transaction currently applying, and answering "different session" on a
+/// missing task-local would drop the page's undo record — silently restoring
+/// the torn-transaction bug for exactly the writes that run off-task.
+pub fn current_storage_session() -> Option<u64> {
+    #[cfg(feature = "server")]
+    {
+        STORAGE_SESSION_ID.try_with(|&id| id).ok()
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        // Embedded/core-only has no concurrent sessions to confuse.
+        None
+    }
+}
+
 /// Comparison operator for predicate-filtered fast aggregates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterOp {

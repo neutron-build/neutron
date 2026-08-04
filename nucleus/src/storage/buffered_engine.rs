@@ -929,7 +929,13 @@ impl StorageEngine for BufferedDiskEngine {
         // Transaction BODIES are untouched — only the window between COMMIT
         // and its acknowledgement is exclusive.
         let _apply = APPLY_LOCK.lock().await;
-        let page_txn = self.inner.begin_page_txn();
+        // The session that owns this window. Autocommit writes from OTHER
+        // connections bypass the lock above (they take `!is_in_txn()` and go
+        // straight to the inner engine), and attributing their pages here
+        // would let a crash undo a write another session was told succeeded.
+        let page_txn = self
+            .inner
+            .begin_page_txn(crate::storage::current_storage_session());
         let applied = self.apply_buffer(ops).await;
         // COMMIT is the durability point for the buffered ops just applied.
         // The executor's statement-level make_durable skipped them while the

@@ -3064,9 +3064,13 @@ impl DiskEngine {
     /// any of those pages that reach the data file early (buffer-pool eviction
     /// stealing a frame) get a before-image logged first. That is what lets
     /// recovery take back a transaction that was never acknowledged.
-    pub fn begin_page_txn(&self) -> u64 {
+    /// `session` names the connection whose writes belong to this transaction;
+    /// pages dirtied by any other session inside the window are not attributed
+    /// to it. Pass `None` only when there is genuinely no session to name —
+    /// see `BufferPool::begin_page_txn`.
+    pub fn begin_page_txn(&self, session: Option<u64>) -> u64 {
         let txn_id = self.next_txn_id.fetch_add(1, AtomicOrdering::SeqCst);
-        self.pool.begin_page_txn(txn_id);
+        self.pool.begin_page_txn(txn_id, session);
         txn_id
     }
 
@@ -7333,6 +7337,66 @@ mod wal_recovery_tests {
         );
     }
 
+    /// The apply lock serializes commits against each other, but NOT against
+    /// autocommit statements, which bypass it entirely. A page another session
+    /// dirties inside the window must therefore not be attributed to the
+    /// applying transaction — otherwise a crash before it committed would undo
+    /// a write that session was told succeeded.
+    #[tokio::test]
+    async fn another_sessions_write_is_not_attributed_to_the_applying_txn() {
+        use crate::storage::STORAGE_SESSION_ID;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("attrib.db");
+        let catalog = Arc::new(Catalog::new());
+        let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+        let pool = engine.buffer_pool();
+
+        // Two pages, allocated BEFORE the window opens so their own
+        // `new_page` dirtying is not what the assertions below observe.
+        let (page_a, frame_a) = pool.new_page().unwrap();
+        pool.unpin(frame_a);
+        let (page_b, frame_b) = pool.new_page().unwrap();
+        pool.unpin(frame_b);
+
+        // Session 1 opens a commit-application window.
+        let txn = engine.begin_page_txn(Some(1));
+        assert!(
+            !pool.page_txn_touched(),
+            "the window starts with nothing attributed"
+        );
+
+        // Session 2 dirties a page inside it, as an autocommit write would.
+        let other_page = STORAGE_SESSION_ID
+            .scope(2u64, async {
+                let frame = pool.fetch_page(page_a).unwrap();
+                pool.mark_dirty(frame);
+                pool.unpin(frame);
+                pool.page_txn_touched()
+            })
+            .await;
+        assert!(
+            !other_page,
+            "a page dirtied by session 2 must not be attributed to session 1's \
+             transaction — undoing it would destroy session 2's acknowledged write"
+        );
+        // The owning session's own write IS attributed, or nothing would be
+        // undoable and the test above would pass for the wrong reason.
+        STORAGE_SESSION_ID
+            .scope(1u64, async {
+                let frame = pool.fetch_page(page_b).unwrap();
+                pool.mark_dirty(frame);
+                pool.unpin(frame);
+            })
+            .await;
+        assert!(
+            pool.page_txn_touched(),
+            "the owning session's write must still be attributed"
+        );
+
+        engine.abort_page_txn(txn).unwrap();
+    }
+
     /// Transaction ids are minted from a counter that restarts at 1 on every
     /// open, so recovery must floor it above everything the WAL already
     /// mentions. Otherwise a fresh transaction inherits an old one's COMMIT
@@ -7355,7 +7419,7 @@ mod wal_recovery_tests {
 
         let catalog = Arc::new(Catalog::new());
         let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
-        let fresh = engine.begin_page_txn();
+        let fresh = engine.begin_page_txn(None);
         assert!(
             fresh > 500,
             "a fresh transaction id ({fresh}) must not collide with one the \
