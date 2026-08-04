@@ -159,7 +159,7 @@ impl AcceptHeader {
             .collect();
 
         // Sort by quality descending (stable sort preserves insertion order for ties)
-        ranges.sort_by(|a, b| b.quality.cmp(&a.quality));
+        ranges.sort_by_key(|r| std::cmp::Reverse(r.quality));
 
         AcceptHeader { ranges }
     }
