@@ -124,6 +124,27 @@ impl TxnBuffer {
         }
     }
 
+    /// Whether this transaction created `table` and has not since dropped it.
+    ///
+    /// Derived from the op log rather than kept as a set. `overlays` is
+    /// explicitly derived state, "rebuilt wholesale after a savepoint
+    /// truncate", and a separately-maintained set would have to be rebuilt in
+    /// that same place or quietly disagree after `ROLLBACK TO SAVEPOINT` —
+    /// reporting a table as still-created after the statement that created it
+    /// was rolled back. Deriving is correct by construction, and it only runs
+    /// on a read that already failed.
+    fn created_in_txn(&self, table: &str) -> bool {
+        let mut created = false;
+        for op in &self.ops {
+            match op {
+                BufferedOp::CreateTable { table: t } if t == table => created = true,
+                BufferedOp::DropTable { table: t } if t == table => created = false,
+                _ => {}
+            }
+        }
+        created
+    }
+
     fn take_pending_pos(&mut self) -> usize {
         let pos = self.next_pending;
         self.next_pending += 1;
@@ -529,7 +550,32 @@ impl BufferedDiskEngine {
         table: &str,
         site: usize,
     ) -> Result<Vec<(usize, Row)>, StorageError> {
-        let mut rows = self.inner.scan_physical(table).await?;
+        // A table created inside this transaction exists only in the buffer —
+        // `create_table` records an op and returns without touching the engine
+        // — so the engine correctly reports it missing. Treating that as an
+        // error made `BEGIN; CREATE TABLE t; INSERT INTO t ...; SELECT FROM t`
+        // fail with "table not found in storage", after the INSERT had already
+        // reported success. That is the standard shape of a migration, and it
+        // is why a migration runner (which wraps each migration in a
+        // transaction) could not create and populate a table.
+        //
+        // Only a table this transaction actually created is allowed to read as
+        // empty; any other failure still propagates, or a genuinely missing
+        // table would silently scan as empty.
+        let mut rows = match self.inner.scan_physical(table).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                let created = {
+                    let bufs = self.txn_bufs.read();
+                    bufs.get(&current_session_id())
+                        .is_some_and(|txn| txn.created_in_txn(table))
+                };
+                if !created {
+                    return Err(err);
+                }
+                Vec::new()
+            }
+        };
         crate::bench_hooks::record_overlay(site, rows.len());
 
         let bufs = self.txn_bufs.read();
@@ -1581,5 +1627,134 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, _) = setup(tmp.path().join("mvcc.db").as_path()).await;
         assert!(engine.supports_mvcc());
+    }
+
+    /// Register a table in the catalog the way the executor does before it
+    /// asks storage to create one.
+    async fn register_table(catalog: &Arc<Catalog>, name: &str) {
+        catalog
+            .create_table(TableDef {
+                name: name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        default_expr: None,
+                        id: 0,
+                        analyzer: None,
+                    },
+                    ColumnDef {
+                        name: "name".into(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        default_expr: None,
+                        id: 0,
+                        analyzer: None,
+                    },
+                ],
+                constraints: vec![],
+                append_only: false,
+                epoch: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    // `BEGIN; CREATE TABLE t; INSERT INTO t ...; SELECT FROM t` failed with
+    // "table not found in storage" — after the INSERT had already reported
+    // success. `create_table` records an op and returns without touching the
+    // engine, so the read went to an engine that had never heard of the table.
+    //
+    // This is the shape of every migration, and the Go migration runner wraps
+    // each migration in a transaction, so no migration could create and then
+    // populate a table. A fresh teploy-observe could not be deployed at all.
+    #[tokio::test]
+    async fn a_table_created_in_a_txn_is_readable_in_that_txn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup(tmp.path().join("ddl_visible.db").as_path()).await;
+        // The executor registers a new table in the catalog before asking
+        // storage to create it, and the inner engine resolves tables through
+        // the catalog. Doing the same here keeps the test on production's path
+        // rather than on one only this test can reach.
+        register_table(&catalog, "fresh").await;
+
+        engine.begin_txn().await.unwrap();
+        engine.create_table("fresh").await.unwrap();
+        engine.insert("fresh", row(1, "a")).await.unwrap();
+        engine.insert("fresh", row(2, "b")).await.unwrap();
+
+        let rows = engine.scan("fresh").await.expect(
+            "a table created in this transaction must be readable in it — \
+             this is what every migration does",
+        );
+        assert_eq!(rows.len(), 2);
+
+        engine.commit_txn().await.unwrap();
+        assert_eq!(
+            engine.scan("fresh").await.unwrap().len(),
+            2,
+            "the rows written into a table created in the same transaction did \
+             not survive COMMIT"
+        );
+    }
+
+    // The guard on the fix: only a table THIS transaction created may read as
+    // empty. Swallowing every scan error would turn a genuinely missing table
+    // into a silent empty result, which is the failure this codebase keeps
+    // finding — an operation that succeeds and reports nothing wrong.
+    #[tokio::test]
+    async fn a_table_that_was_never_created_still_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = setup(tmp.path().join("ddl_missing.db").as_path()).await;
+
+        engine.begin_txn().await.unwrap();
+        engine.insert("t", row(1, "x")).await.unwrap();
+
+        assert!(
+            engine.scan("never_existed").await.is_err(),
+            "a missing table must not read as empty just because a txn is open"
+        );
+    }
+
+    // Rolling the transaction back must take the table with it.
+    #[tokio::test]
+    async fn a_table_created_in_a_txn_does_not_survive_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = setup(tmp.path().join("ddl_rollback.db").as_path()).await;
+
+        engine.begin_txn().await.unwrap();
+        engine.create_table("gone").await.unwrap();
+        engine.insert("gone", row(1, "a")).await.unwrap();
+        assert_eq!(engine.scan("gone").await.unwrap().len(), 1);
+        engine.abort_txn().await.unwrap();
+
+        assert!(
+            engine.scan("gone").await.is_err(),
+            "an aborted CREATE TABLE left the table readable"
+        );
+    }
+
+    // Why `created_in_txn` is derived from the op log rather than cached: the
+    // overlays are rebuilt wholesale on a savepoint truncate, and a cached set
+    // would have to be rebuilt in the same place or report a table as still
+    // created after the statement creating it was rolled back.
+    #[tokio::test]
+    async fn rollback_to_savepoint_undoes_the_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = setup(tmp.path().join("ddl_savepoint.db").as_path()).await;
+
+        engine.begin_txn().await.unwrap();
+        engine.savepoint("sp").await.unwrap();
+        engine.create_table("temp_tbl").await.unwrap();
+        engine.insert("temp_tbl", row(1, "a")).await.unwrap();
+        assert_eq!(engine.scan("temp_tbl").await.unwrap().len(), 1);
+
+        engine.rollback_to_savepoint("sp").await.unwrap();
+
+        assert!(
+            engine.scan("temp_tbl").await.is_err(),
+            "ROLLBACK TO SAVEPOINT left a table the savepoint should have undone"
+        );
     }
 }
