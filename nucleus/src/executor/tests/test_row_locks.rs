@@ -45,3 +45,30 @@ async fn plain_for_update_is_still_accepted() {
     exec(&ex, "INSERT INTO joblocks_plain VALUES (1)").await;
     exec(&ex, "SELECT id FROM joblocks_plain FOR UPDATE").await;
 }
+
+// A partial index is not a hint: WHERE is what makes it partial. The predicate
+// was parsed and discarded, so the statement succeeded and built a FULL index
+// under the requested name — larger than asked for, and usable for queries the
+// partial index was never meant to serve, with nothing reporting the
+// substitution.
+#[tokio::test]
+async fn partial_index_is_refused_not_silently_widened() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE pidx (id INT, status TEXT)").await;
+
+    let err = ex
+        .execute("CREATE INDEX pidx_pending ON pidx (id) WHERE status = 'pending'")
+        .await
+        .expect_err("a partial index must not silently become a full index");
+    assert!(
+        err.to_string().contains("partial index"),
+        "the error must name what it refused, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn plain_index_still_builds() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE pidx_ok (id INT)").await;
+    exec(&ex, "CREATE INDEX pidx_ok_id ON pidx_ok (id)").await;
+}

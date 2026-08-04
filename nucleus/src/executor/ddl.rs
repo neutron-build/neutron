@@ -1552,6 +1552,24 @@ impl Executor {
             .unwrap_or_else(|| "unnamed_idx".to_string());
         let table_name = crate::sql::object_name_key(&create_index.table_name);
 
+        // A partial index is not a hint — `WHERE` is what makes it partial, and
+        // building the full index instead silently changes both its size and
+        // which queries the planner may legally use it for. Accepting the
+        // clause and ignoring it means the index exists, the statement
+        // succeeds, and nothing anywhere says it is not the index that was
+        // asked for. Refuse until the predicate is honoured.
+        if create_index.predicate.is_some() {
+            return Err(ExecError::Unsupported(
+                "partial indexes (CREATE INDEX ... WHERE) are not implemented. \
+                 The predicate was previously parsed and discarded, which built a \
+                 FULL index under the requested name — larger than intended, and \
+                 usable for queries the partial index was never meant to serve. \
+                 Create the index without a WHERE clause if a full index is \
+                 acceptable."
+                    .into(),
+            ));
+        }
+
         // Verify table exists and reject duplicate names before constructing
         // any live index state. Otherwise `IF NOT EXISTS` could overwrite an
         // existing in-memory index and only then discover the catalog entry.

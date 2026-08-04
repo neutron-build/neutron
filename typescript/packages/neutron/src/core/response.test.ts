@@ -51,15 +51,20 @@ describe("response helpers", () => {
     expect(isResponse(200)).toBe(false);
   });
 
-  it("notFound returns 404 with default body", async () => {
+  // These asserted the old contract, where notFound() returned the bare string
+  // "Not Found" with no content type — which is what browsers rendered as an
+  // unstyled page. It now returns an HTML document; the message is still the
+  // caller's, it is just no longer the entire response.
+  it("notFound returns 404 as an HTML document", async () => {
     const response = notFound();
     expect(response.status).toBe(404);
-    expect(await response.text()).toBe("Not Found");
+    expect(response.headers.get("Content-Type")).toContain("text/html");
+    expect(await response.text()).toMatch(/^<!doctype html>/i);
   });
 
-  it("notFound returns 404 with custom body", async () => {
+  it("notFound carries a custom message into the document", async () => {
     const response = notFound("Page not found");
     expect(response.status).toBe(404);
-    expect(await response.text()).toBe("Page not found");
+    expect(await response.text()).toContain("Page not found");
   });
 });
