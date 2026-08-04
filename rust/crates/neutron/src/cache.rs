@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode, header};
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
 
@@ -154,6 +154,7 @@ pub struct ResponseCache {
     store: Arc<CacheStore>,
     ttl: Duration,
     key_fn: Option<Arc<dyn Fn(&Request) -> String + Send + Sync>>,
+    public_prefixes: Vec<String>,
 }
 
 impl ResponseCache {
@@ -163,7 +164,26 @@ impl ResponseCache {
             store: Arc::new(CacheStore::new(1000)),
             ttl,
             key_fn: None,
+            public_prefixes: Vec::new(),
         }
+    }
+
+    /// Mark path prefixes whose response does not depend on who is asking, so
+    /// they stay cacheable even when the request carries a session cookie.
+    ///
+    /// Without this, the safe default disables the cache across any
+    /// application with a login, because the browser attaches the session
+    /// cookie to every request including ones for entirely public pages. The
+    /// opt-in is per-route because "this response is the same for everyone" is
+    /// a property of the route, known only to whoever wrote it.
+    pub fn public_routes<I, S>(mut self, prefixes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.public_prefixes
+            .extend(prefixes.into_iter().map(Into::into));
+        self
     }
 
     /// Set the maximum number of cache entries (default: 1000).
@@ -193,6 +213,46 @@ impl ResponseCache {
     }
 }
 
+/// Whether a request may be served from a cache shared by every visitor.
+///
+/// A request carrying `Authorization` or `Cookie` is not cacheable unless its
+/// route was declared public. This check did not exist: the default key was
+/// `METHOD:path?query` alone, so an application authenticating with a session
+/// cookie stored every personalised response under a key shared by all
+/// visitors and served it back to them.
+fn request_is_cacheable(req: &Request, public_prefixes: &[String]) -> bool {
+    let path = req.uri().path();
+    if public_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
+        return true;
+    }
+    !req.headers().contains_key(header::AUTHORIZATION) && !req.headers().contains_key(header::COOKIE)
+}
+
+/// Whether a response may be stored. An origin that sets a cookie, marks the
+/// response private, or says the body varies by caller is describing something
+/// that must not be handed to the next visitor — a replayed `Set-Cookie` would
+/// give them the first one's session.
+fn response_is_cacheable(headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::SET_COOKIE) {
+        return false;
+    }
+    if let Some(cc) = headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()) {
+        let cc = cc.to_ascii_lowercase();
+        if cc.contains("no-store") || cc.contains("private") {
+            return false;
+        }
+    }
+    for v in headers.get_all(header::VARY).iter() {
+        if let Ok(s) = v.to_str() {
+            let s = s.to_ascii_lowercase();
+            if s.contains("cookie") || s.contains("authorization") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn default_cache_key(req: &Request) -> String {
     let method = req.method().as_str();
     let path = req.uri().path();
@@ -215,10 +275,17 @@ impl MiddlewareTrait for ResponseCache {
         let store = Arc::clone(&self.store);
         let ttl = self.ttl;
         let key_fn = self.key_fn.clone();
+        let public_prefixes = self.public_prefixes.clone();
 
         Box::pin(async move {
             // Only cache GET and HEAD
             if !matches!(*req.method(), Method::GET | Method::HEAD) {
+                return next.run(req).await;
+            }
+
+            // A credential-bearing request is not served from, or stored in, a
+            // cache every visitor shares.
+            if !request_is_cacheable(&req, &public_prefixes) {
                 return next.run(req).await;
             }
 
@@ -343,6 +410,13 @@ impl MiddlewareTrait for ResponseCache {
 
             // Skip streaming responses
             if resp.body().is_streaming() {
+                finish(&store, &cache_key, &notify);
+                return resp;
+            }
+
+            // A response carrying per-caller state must not be stored, however
+            // anonymous the request that produced it looked.
+            if !response_is_cacheable(resp.headers()) {
                 finish(&store, &cache_key, &notify);
                 return resp;
             }
@@ -681,5 +755,100 @@ mod tests {
         assert_eq!(resp.header("x-cache").unwrap(), "HIT");
         assert_eq!(resp.header("content-type").unwrap(), "application/json");
         assert_eq!(resp.header("x-custom").unwrap(), "value");
+    }
+
+    // The cross-user leak. The default key was `METHOD:path?query` with no
+    // credential check at all, so an application authenticating with a session
+    // cookie stored every personalised response under a key shared by all
+    // visitors and served it back to them.
+    #[tokio::test]
+    async fn cookie_bearing_request_is_not_served_from_the_shared_cache() {
+        let cache = ResponseCache::new(Duration::from_secs(60));
+        let client = TestClient::new(
+            Router::new()
+                .middleware(cache)
+                .get("/account", |headers: HeaderMap| async move {
+                    let who = headers
+                        .get(header::COOKIE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("anonymous")
+                        .to_string();
+                    format!("hello {who}")
+                }),
+        );
+
+        let first = client.get("/account").header("cookie", "session=alice").send().await;
+        assert_eq!(first.text().await, "hello session=alice");
+
+        let second = client.get("/account").header("cookie", "session=bob").send().await;
+        assert_eq!(
+            second.text().await,
+            "hello session=bob",
+            "one user's authenticated response was served to another"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_bearing_request_is_not_cached() {
+        let cache = ResponseCache::new(Duration::from_secs(60));
+        let client = TestClient::new(
+            Router::new().middleware(cache).get("/me", || async { "secret" }),
+        );
+
+        client.get("/me").header("authorization", "Bearer a").send().await;
+        let second = client.get("/me").header("authorization", "Bearer b").send().await;
+        assert_ne!(second.header("x-cache"), Some("HIT"));
+    }
+
+    // The opt-in: a route whose body is identical for everyone stays cacheable
+    // even though the browser attaches a session cookie to it.
+    #[tokio::test]
+    async fn public_route_is_cached_despite_a_cookie() {
+        let cache = ResponseCache::new(Duration::from_secs(60)).public_routes(["/pricing"]);
+        let client = TestClient::new(
+            Router::new().middleware(cache).get("/pricing", || async { "same for all" }),
+        );
+
+        client.get("/pricing").header("cookie", "session=alice").send().await;
+        let second = client.get("/pricing").header("cookie", "session=bob").send().await;
+        assert_eq!(
+            second.header("x-cache"),
+            Some("HIT"),
+            "a route declared public was not cached for a cookie-bearing request"
+        );
+    }
+
+    // A stored Set-Cookie would be replayed to everyone who hits the entry,
+    // handing them the first visitor's session.
+    #[tokio::test]
+    async fn response_setting_a_cookie_is_not_cached() {
+        let cache = ResponseCache::new(Duration::from_secs(60));
+        let client = TestClient::new(Router::new().middleware(cache).get("/landing", || async {
+            let mut h = HeaderMap::new();
+            h.insert("set-cookie", "session=brand-new".parse().unwrap());
+            (StatusCode::OK, h, "welcome").into_response()
+        }));
+
+        client.get("/landing").send().await;
+        let second = client.get("/landing").send().await;
+        assert_ne!(
+            second.header("x-cache"),
+            Some("HIT"),
+            "a response setting a cookie was cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn vary_cookie_response_is_not_cached() {
+        let cache = ResponseCache::new(Duration::from_secs(60));
+        let client = TestClient::new(Router::new().middleware(cache).get("/varies", || async {
+            let mut h = HeaderMap::new();
+            h.insert("vary", "Cookie".parse().unwrap());
+            (StatusCode::OK, h, "depends").into_response()
+        }));
+
+        client.get("/varies").send().await;
+        let second = client.get("/varies").send().await;
+        assert_ne!(second.header("x-cache"), Some("HIT"));
     }
 }

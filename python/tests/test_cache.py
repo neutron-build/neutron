@@ -244,3 +244,121 @@ class TestCacheExports:
         from neutron.cache import TieredCache, HTTPCacheMiddleware
         assert TieredCache is not None
         assert HTTPCacheMiddleware is not None
+
+
+class TestHTTPCacheCredentialIsolation:
+    """The cross-user leak.
+
+    There was no credential check at all: the key was the path plus query
+    string, so an application authenticating with a session cookie stored every
+    personalised response under a key shared by all visitors and served it back
+    to them. Worse than the Go equivalent, which at least skipped
+    ``Authorization`` — this one also stored and replayed ``Set-Cookie``.
+    """
+
+    @staticmethod
+    def _app(cache, endpoint, **kwargs):
+        mw = HTTPCacheMiddleware(cache=cache, ttl=60, **kwargs).as_starlette_middleware()
+        return Starlette(routes=[Route("/account", endpoint)], middleware=[mw])
+
+    async def test_cookie_response_is_not_shared_between_users(self):
+        async def endpoint(request: Request) -> JSONResponse:
+            return JSONResponse({"user": request.headers.get("cookie", "anonymous")})
+
+        app = self._app(TieredCache(), endpoint)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.get("/account", headers={"cookie": "session=alice"})
+            assert first.json()["user"] == "session=alice"
+
+            second = await client.get("/account", headers={"cookie": "session=bob"})
+            assert second.json()["user"] == "session=bob", (
+                "one user's authenticated response was served to another"
+            )
+            assert second.headers.get("x-cache") != "HIT"
+
+    async def test_authorization_response_is_not_cached(self):
+        async def endpoint(request: Request) -> JSONResponse:
+            return JSONResponse({"token": request.headers.get("authorization", "")})
+
+        app = self._app(TieredCache(), endpoint)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get("/account", headers={"authorization": "Bearer a"})
+            second = await client.get("/account", headers={"authorization": "Bearer b"})
+            assert second.headers.get("x-cache") != "HIT"
+
+    async def test_anonymous_response_is_still_cached(self):
+        calls = 0
+
+        async def endpoint(request: Request) -> JSONResponse:
+            nonlocal calls
+            calls += 1
+            return JSONResponse({"n": calls})
+
+        app = self._app(TieredCache(), endpoint)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get("/account")
+            second = await client.get("/account")
+            assert second.headers.get("x-cache") == "HIT"
+        assert calls == 1
+
+    async def test_public_path_is_cached_despite_cookie(self):
+        calls = 0
+
+        async def endpoint(request: Request) -> JSONResponse:
+            nonlocal calls
+            calls += 1
+            return JSONResponse({"n": calls})
+
+        app = self._app(TieredCache(), endpoint, public_paths=["/account"])
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get("/account", headers={"cookie": "session=alice"})
+            second = await client.get("/account", headers={"cookie": "session=bob"})
+            assert second.headers.get("x-cache") == "HIT", (
+                "a route declared public was not cached for a cookie-bearing request"
+            )
+        assert calls == 1
+
+    async def test_set_cookie_response_is_not_cached(self):
+        """A replayed Set-Cookie hands one visitor's session to the next."""
+
+        async def endpoint(request: Request) -> JSONResponse:
+            resp = JSONResponse({"ok": True})
+            resp.set_cookie("session", "brand-new")
+            return resp
+
+        app = self._app(TieredCache(), endpoint)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get("/account")
+            second = await client.get("/account")
+            assert second.headers.get("x-cache") != "HIT", (
+                "a response setting a cookie was cached"
+            )
+
+    async def test_cache_control_private_is_not_cached(self):
+        async def endpoint(request: Request) -> JSONResponse:
+            return JSONResponse({"ok": True}, headers={"cache-control": "private, max-age=60"})
+
+        app = self._app(TieredCache(), endpoint)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get("/account")
+            second = await client.get("/account")
+            assert second.headers.get("x-cache") != "HIT"
+
+    async def test_vary_headers_separate_entries(self):
+        async def endpoint(request: Request) -> JSONResponse:
+            return JSONResponse({"lang": request.headers.get("accept-language", "")})
+
+        app = self._app(TieredCache(), endpoint, vary_headers=["accept-language"])
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get("/account", headers={"accept-language": "en"})
+            second = await client.get("/account", headers={"accept-language": "fr"})
+            assert second.json()["lang"] == "fr", (
+                "the vary header did not separate cache entries"
+            )
