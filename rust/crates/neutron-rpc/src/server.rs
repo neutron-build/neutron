@@ -187,10 +187,11 @@ mod tests {
         let framed   = frame_message(Bytes::from(req_body));
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/grpc".parse().unwrap());
-        let http_req = Request::new(Method::POST, "/".parse().unwrap(), headers, framed);
+        let mut http_req = Request::new(Method::POST, "/".parse().unwrap(), headers, framed);
 
         // Extract GrpcRequest manually and simulate the wrap_handler pipeline.
-        let GrpcRequest(bytes) = ok_or_panic(GrpcRequest::from_request(&http_req), "extract");
+        let GrpcRequest(bytes) =
+            ok_or_panic(GrpcRequest::from_request(&mut http_req).await, "extract");
 
         let req: Req  = Req::decode(&bytes).unwrap();
         let resp: Resp = greet(req).await.unwrap();
@@ -217,9 +218,10 @@ mod tests {
         let framed   = frame_message(Bytes::from(req_body));
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/grpc".parse().unwrap());
-        let http_req = Request::new(Method::POST, "/".parse().unwrap(), headers, framed);
+        let mut http_req = Request::new(Method::POST, "/".parse().unwrap(), headers, framed);
 
-        let GrpcRequest(bytes) = ok_or_panic(GrpcRequest::from_request(&http_req), "extract");
+        let GrpcRequest(bytes) =
+            ok_or_panic(GrpcRequest::from_request(&mut http_req).await, "extract");
         let req: Req    = Req::decode(&bytes).unwrap();
         let rpc_err     = always_fails(req).await.unwrap_err();
         let grpc_resp   = GrpcResponse::error(rpc_err.status, rpc_err.message);

@@ -48,6 +48,11 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
+        with:
+          # Every other workflow pins this. Without it the action looks for a
+          # `packageManager` key in a root package.json that does not exist,
+          # and the whole contract matrix fails before it runs a single check.
+          version: 9
 
       - name: Set up Node
         uses: actions/setup-node@v4
