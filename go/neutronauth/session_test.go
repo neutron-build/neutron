@@ -599,3 +599,81 @@ func (c *countingStore) Set(ctx context.Context, id string, data map[string]any,
 }
 
 var errStoreDown = errors.New("session store unavailable")
+
+// A panicking handler must still rotate its session. Recovery middleware sits
+// outside this one, so before the commit was deferred the panic unwound past
+// it: the new ID was never stored, the old one was never deleted, and the
+// browser kept a cookie for a session that had just been used to log in.
+func TestSessionRotatesEvenIfHandlerPanics(t *testing.T) {
+	store := newMemoryStore()
+	if err := store.Set(context.Background(), "old-id", map[string]any{"anon": true}, time.Hour); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	h := SessionMiddleware(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		SessionFromContext(r.Context()).Regenerate()
+		panic("handler exploded")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "session_id", Value: "old-id"})
+	rec := httptest.NewRecorder()
+
+	func() {
+		defer func() { _ = recover() }() // stand in for recovery middleware
+		h.ServeHTTP(rec, req)
+	}()
+
+	data, err := store.Get(context.Background(), "old-id")
+	if err != nil {
+		t.Fatalf("get old id: %v", err)
+	}
+	if data != nil {
+		t.Fatal("old session survived a panicking handler — fixation window left open")
+	}
+}
+
+// The commit-time error handler must never receive a ResponseWriter. At that
+// point the status is decided and the cookie is unwritten, so anything that
+// writes corrupts the response — the load-time default calls http.Error, which
+// would commit a 500 and silently drop the rotated cookie.
+func TestCommitErrorHandlerCannotCorruptTheResponse(t *testing.T) {
+	store := &failingStore{memoryStore: newMemoryStore(), failDelete: errStoreDown}
+	if err := store.Set(context.Background(), "old-id", map[string]any{}, time.Hour); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var reported error
+	var sawRequest bool
+	h := SessionMiddleware(store,
+		WithSessionCommitErrorHandler(func(r *http.Request, err error) {
+			reported = err
+			sawRequest = r != nil // the load-time path used to pass nil here
+		}),
+	)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		SessionFromContext(r.Context()).Regenerate()
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "session_id", Value: "old-id"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if reported == nil {
+		t.Fatal("a failed delete must be reported, not swallowed")
+	}
+	if !sawRequest {
+		t.Fatal("commit error handler must receive the real request, not nil")
+	}
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("status was rewritten by the error path: got %d, want %d", rec.Code, http.StatusTeapot)
+	}
+	if body := rec.Body.String(); body != "ok" {
+		t.Fatalf("body was corrupted by the error path: %q", body)
+	}
+	if len(rec.Result().Cookies()) == 0 {
+		t.Fatal("rotated cookie was dropped when the store errored")
+	}
+}

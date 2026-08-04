@@ -120,6 +120,11 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 			http.Error(w, "session store unavailable", http.StatusInternalServerError)
 		}
 	}
+	if o.onCommitError == nil {
+		// Silent by default: the response is already committed, so there is
+		// nothing safe to do in-band. Applications that care should set one.
+		o.onCommitError = func(*http.Request, error) {}
+	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -160,12 +165,20 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 			// here, before `next`, is what made Regenerate and Destroy unable
 			// to change what the browser holds.
 			sw := &sessionWriter{ResponseWriter: w, finalize: func() {
-				finalizeSession(r.Context(), w, sess, &o)
+				// WithoutCancel: a client that disconnects mid-response must
+				// not abort the store writes. Otherwise a dropped connection
+				// during login leaves the previous session ID undeleted and
+				// still valid — the fixation window this rotation exists to
+				// close.
+				finalizeSession(context.WithoutCancel(r.Context()), r, w, sess, &o)
 			}}
 			ctx := context.WithValue(r.Context(), ctxKeySession, sess)
+			// Deferred: a panicking handler still has to rotate or destroy its
+			// session. Recovery middleware sits outside this one, so without
+			// the defer the panic unwinds past commit and the old session
+			// stays valid.
+			defer sw.commit()
 			next.ServeHTTP(sw, r.WithContext(ctx))
-			// A handler that wrote nothing still needs its cookie.
-			sw.commit()
 		})
 	}
 }
@@ -176,14 +189,14 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 // Storage errors here cannot be returned to the caller — the status is already
 // decided — so they are reported through the error handler for observability
 // and the cookie is still written.
-func finalizeSession(ctx context.Context, w http.ResponseWriter, s *Session, o *sessionOpts) {
+func finalizeSession(ctx context.Context, r *http.Request, w http.ResponseWriter, s *Session, o *sessionOpts) {
 	switch {
 	case s.destroyed:
 		// Delete both ends: Destroy removed the current ID, but a handler that
 		// regenerated first would otherwise leave the original behind.
 		if s.originalID != "" && s.originalID != s.ID {
 			if err := s.store.Delete(ctx, s.originalID); err != nil {
-				o.onError(w, nil, err)
+				o.onCommitError(r, err)
 			}
 		}
 		http.SetCookie(w, sessionCookieFor(o, "", -1))
@@ -193,11 +206,11 @@ func finalizeSession(ctx context.Context, w http.ResponseWriter, s *Session, o *
 		// Rotation completes here so Regenerate alone is sufficient: the data
 		// moves to the new ID and the old record stops resolving.
 		if err := s.store.Set(ctx, s.ID, s.Data, s.ttl); err != nil {
-			o.onError(w, nil, err)
+			o.onCommitError(r, err)
 		}
 		if s.originalID != "" {
 			if err := s.store.Delete(ctx, s.originalID); err != nil {
-				o.onError(w, nil, err)
+				o.onCommitError(r, err)
 			}
 		}
 	}
@@ -285,6 +298,8 @@ type sessionOpts struct {
 	secure     bool
 	sameSite   http.SameSite
 	onError    func(http.ResponseWriter, *http.Request, error)
+	// Separate from onError on purpose — see WithSessionCommitErrorHandler.
+	onCommitError func(*http.Request, error)
 }
 
 func WithCookieName(name string) SessionOption {
@@ -299,10 +314,28 @@ func WithSecure(s bool) SessionOption {
 	return func(o *sessionOpts) { o.secure = s }
 }
 
-// WithSessionErrorHandler sets the handler invoked when the session store
-// fails. It owns the response; the downstream handler does not run.
+// WithSessionErrorHandler sets the handler invoked when the session store fails
+// while LOADING, before the downstream handler runs. It owns the response; the
+// downstream handler does not run.
 func WithSessionErrorHandler(fn func(http.ResponseWriter, *http.Request, error)) SessionOption {
 	return func(o *sessionOpts) { o.onError = fn }
+}
+
+// WithSessionCommitErrorHandler sets the handler invoked when the session store
+// fails while COMMITTING, after the handler has run.
+//
+// It deliberately receives no ResponseWriter. By that point the status is
+// already decided and the cookie has yet to be written, so anything that writes
+// to the response corrupts it — the default load-time handler calls
+// `http.Error`, which would commit a 500 and body and then silently drop the
+// rotated session cookie. Withholding the writer makes that mistake
+// unexpressible rather than merely documented.
+//
+// Use it for logging and alerting. A commit failure is not recoverable in-band,
+// but it is worth knowing about: a failed delete of the previous session ID
+// leaves that ID valid until it expires.
+func WithSessionCommitErrorHandler(fn func(*http.Request, error)) SessionOption {
+	return func(o *sessionOpts) { o.onCommitError = fn }
 }
 
 // NucleusSessionStore implements SessionStore using Nucleus KV.
