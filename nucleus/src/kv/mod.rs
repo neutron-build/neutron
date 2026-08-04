@@ -1667,6 +1667,12 @@ impl KvStore {
             {
                 bucket.retain(|k| k != key);
             }
+            // `single_match` fires only in the core-only build, where the
+            // None arm's body is entirely `server`-gated and cfg-strips to
+            // nothing. The arm is real with the server feature on, so
+            // rewriting this as `if let` would be wrong for the shipped
+            // configuration.
+            #[allow(clippy::single_match)]
             match snapshot.entries.get(key) {
                 Some(entry) => {
                     if let Some(exp) = entry.expires_at {

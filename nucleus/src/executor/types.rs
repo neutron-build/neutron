@@ -43,6 +43,9 @@ pub(crate) type ProjectedResult = Result<(Vec<(String, DataType)>, Vec<Row>), Ex
 /// A resolved streaming projection: the output columns (name + type) and, for a
 /// bare-column list, the source column indices to narrow each row to (`None` for
 /// a plain `*`, which needs no narrowing). Produced by `resolve_bare_projection`.
+// Only reachable from server-gated code; without this the core-only
+// clippy gate fails on dead_code.
+#[cfg(feature = "server")]
 pub(crate) type StreamProjection = (Vec<(String, DataType)>, Option<Vec<usize>>);
 
 /// Index predicate extraction: (equalities, range predicates, remaining expr).

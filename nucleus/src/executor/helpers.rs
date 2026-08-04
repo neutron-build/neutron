@@ -685,6 +685,9 @@ pub(super) fn cmp_sort_key(
 /// `(col_idx, desc, nulls_first)` key in order, first non-equal key decides.
 /// Combined with a stable sort/merge this reproduces the plan-path Sort arm's
 /// repeated per-key stable sort exactly.
+// Only reachable from server-gated code; without this the core-only
+// clippy gate fails on dead_code.
+#[cfg(feature = "server")]
 pub(super) fn cmp_row_sort_keys(a: &Row, b: &Row, keys: &[(usize, bool, bool)]) -> std::cmp::Ordering {
     for &(idx, desc, nulls_first) in keys {
         let va = a.get(idx).unwrap_or(&Value::Null);

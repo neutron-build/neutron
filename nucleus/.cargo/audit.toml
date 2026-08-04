@@ -1,0 +1,24 @@
+# cargo-audit configuration.
+#
+# `cargo audit` reads Cargo.lock, not the feature-resolved dependency graph, so
+# it reports crates that are recorded as optional dependencies of a dependency
+# and never actually compiled. Every entry below must be verified that way and
+# say how, because a suppression that stops being true is worse than the
+# warning it silenced.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0235 — rkyv 0.7.46, out-of-bounds reads on archives
+    # containing Rc/Arc.
+    #
+    # rkyv is an OPTIONAL dependency of rust_decimal and the feature is not
+    # enabled, so it is in the lockfile but never built. Verified, not assumed:
+    #
+    #   cargo tree -i rkyv --target all --all-features   # -> "nothing to print"
+    #
+    # Re-run that before trusting this line. If it ever prints a tree, the
+    # crate IS being compiled, this entry is hiding a real vulnerability, and
+    # the fix is to upgrade rust_decimal to a release using rkyv >= 0.8.17
+    # rather than to keep ignoring it.
+    "RUSTSEC-2026-0235",
+]

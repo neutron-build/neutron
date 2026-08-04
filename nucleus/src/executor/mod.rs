@@ -1878,6 +1878,9 @@ impl Executor {
     /// point-DELETE fast path to decline (the full path enforces referential
     /// integrity). Best-effort: if the sync catalog snapshot is unavailable,
     /// returns true so the safe full path runs.
+    // Only reachable from server-gated code; without this the core-only
+    // clippy gate fails on dead_code.
+    #[cfg(feature = "server")]
     fn table_is_fk_referenced(&self, table: &str) -> bool {
         let Some(tables) = self.catalog.list_tables_sync() else {
             return true;
@@ -1911,6 +1914,9 @@ impl Executor {
     /// handle (streaming producers that outlive the `execute` call) decline and let
     /// the materialized path run. `Weak::upgrade` also yields `None` if the executor
     /// is mid-drop, so a stream can never resurrect a dying executor.
+    // Only reachable from server-gated code; without this the core-only
+    // clippy gate fails on dead_code.
+    #[cfg(feature = "server")]
     pub(super) fn arc_self(&self) -> Option<Arc<Self>> {
         self.self_ref.get().and_then(std::sync::Weak::upgrade)
     }
@@ -2831,6 +2837,9 @@ impl Executor {
 
     /// Current session handle for capturing the cancel flag before entering
     /// rayon (worker threads can't read the task-local).
+    // Only reachable from server-gated code; without this the core-only
+    // clippy gate fails on dead_code.
+    #[cfg(feature = "server")]
     pub(super) fn current_session_for_cancel(&self) -> Arc<Session> {
         self.current_session()
     }
