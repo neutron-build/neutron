@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **`notFound()` returns an HTML document instead of bare text.** It previously
+  returned `new Response("Not Found")` with no content type, which browsers
+  rendered as two words on a white page — what every app shipped as its 404
+  unless the author noticed. The new default respects the reader's colour
+  scheme, places a short message inside the shell, passes a full document
+  through untouched, and escapes the message (a 404 often echoes part of the URL
+  that produced it).
+
+  **Migration:** any test asserting `await res.text() === "Not Found"` needs
+  updating to assert on status and content instead. Behaviour for callers
+  passing their own full document is unchanged.
+
+  This does NOT render through the app's layout chain. That needs a
+  `not-found.tsx` convention and the loader data those layouts expect; this
+  makes the default presentable and is not that feature.
+
+### Fixed
+
+- **A navigation across a deploy hung instead of recovering.** Hashed chunks plus
+  an emptied output directory mean an open tab's chunks stop existing the moment
+  a release ships; the dynamic import rejected, nothing caught it, and the
+  navigation never completed — the click did nothing, permanently. It now falls
+  back to a full navigation to the target URL, so the user lands where they
+  clicked rather than being bounced back.
+
 ## [cli 0.2.1] - 2026-08-02
 
 ### Fixed

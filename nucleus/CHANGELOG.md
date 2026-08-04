@@ -3,6 +3,36 @@
 Notable changes to the Nucleus engine. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed — three statements that used to succeed now error
+
+All three were accepted and silently not honoured. Erroring is the correction,
+but it means SQL that ran yesterday can fail today. Read this before upgrading.
+
+- **`SELECT ... FOR UPDATE SKIP LOCKED` / `NOWAIT` are refused.** The clause was
+  parsed into the AST and never read, so it was accepted and discarded — a job
+  queue claiming work with it handed the same row to every worker polling at
+  that moment, while looking entirely correct. Plain `FOR UPDATE`/`FOR SHARE`
+  still pass: they are advisory, and the isolation already provided is stronger
+  than dropping them would imply.
+
+  **Migration:** carry the guarantee in a predicate the write re-checks —
+  `UPDATE ... WHERE id = (SELECT ... LIMIT 1) AND status = 'pending'`. Two
+  workers may select the same row; only one UPDATE matches. This is what
+  `neutronjobs` now does, and it is correct on any backend.
+
+- **`CREATE INDEX ... WHERE` is refused.** The predicate was discarded and a
+  FULL index was built under the requested name — larger than asked for, and
+  usable by the planner for queries the partial index was never meant to serve.
+
+  **Migration:** drop the `WHERE` clause if a full index is acceptable. There is
+  no way to express a partial index until the predicate is honoured.
+
+- **Reminder for anyone reading a claim query:** `SKIP LOCKED` is a contention
+  optimisation, never a correctness guarantee. If safety can be expressed as a
+  predicate, express it there.
+
 ## [0.1.5] - 2026-08-04
 
 ### Fixed
