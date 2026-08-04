@@ -1,17 +1,34 @@
-# Production SIMD implementations and runtime dispatch (CPU feature guarded).
+# Files permitted to contain unsafe Rust. Every entry is reviewed; adding one
+# means someone read the SAFETY invariant, not that the check was noisy.
+#
+# Checked by scripts/check-unsafe.sh, which greps for `unsafe fn`,
+# `unsafe impl`, and `unsafe {`.
+
+# SIMD intrinsics — target-feature-gated, checked at runtime before dispatch.
 src/simd/aggregates.rs
 src/simd/avx2.rs
 src/simd/avx512.rs
 src/simd/mod.rs
 src/vector/mod.rs
 
-# Low-level buffer pool, io_uring, and the embedded executor's custom waker.
+# Low-level storage: frame memory in the buffer pool, io_uring submission,
+# and `fsync(2)` FFI for the weaker-than-F_FULLFSYNC sync mode.
 src/storage/buffer.rs
 src/storage/io_uring.rs
-src/executor/session.rs
+src/storage/wal.rs
 
-# Test/benchmark-only environment mutation, FFI, and corruption injection.
-src/bin/compete.rs
+# `libc::statvfs` FFI for the free-space watermark guard.
+src/ops/disk.rs
+
+# Misc reviewed call sites.
+src/executor/session.rs
 src/config/mod.rs
+
+# `std::env::set_var`, which is unsafe in edition 2024. All are in a test or
+# probe entry point, before any thread that could observe the environment
+# concurrently is spawned.
+src/bin/compete.rs
+src/bin/probe_index_coherence.rs
+src/bin/probe_soak.rs
 src/executor/tests/test_index.rs
 src/executor/tests/test_specialty_persistence.rs

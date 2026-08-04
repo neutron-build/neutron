@@ -7,7 +7,11 @@ actual="$(mktemp)"
 expected="$(mktemp)"
 trap 'rm -f "$actual" "$expected"' EXIT
 
-rg -l '^\s*(pub\s+)?unsafe fn|^\s*unsafe impl|\bunsafe\s*\{' src --glob '*.rs' \
+# grep, not rg: ripgrep is not installed on the CI runner, so this script
+# exited 127 (command not found) under `set -e` and the whole
+# dependency/license/unsafe job failed without ever running the check.
+grep -rlE '^[[:space:]]*(pub[[:space:]]+)?unsafe fn|^[[:space:]]*unsafe impl|unsafe[[:space:]]*\{' \
+  src --include='*.rs' \
   | sort >"$actual"
 sed -E 's/[[:space:]]+#.*$//; /^[[:space:]]*(#|$)/d' scripts/unsafe-allowlist.txt \
   | sort >"$expected"
