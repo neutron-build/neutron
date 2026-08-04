@@ -63,7 +63,13 @@ jobs:
 
       # Builds the TS SDK dist the conformance app boots from.
       - name: Build TypeScript SDK
-        run: pnpm install && pnpm build
+        # Packages only, as typescript-publish.yml does. A bare `pnpm build`
+        # also builds apps/ and examples/, which invoke the `neutron-ts` binary
+        # that does not exist until the core package is built and linked — so
+        # the whole matrix died on `neutron-ts: not found` before running a
+        # single contract check. The conformance app needs the SDK dist, and
+        # nothing else here does.
+        run: pnpm install && pnpm --filter "./packages/*" run build
         working-directory: typescript
 
       - name: Run conformance matrix
