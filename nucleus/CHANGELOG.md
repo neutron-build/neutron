@@ -5,6 +5,13 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-04
+
+The first release since v0.1.2 that carries engine changes; v0.1.3 through
+v0.1.5 were release plumbing. Two of the fixes below are data-loss or
+migration blockers, and the three changes above them can break SQL that ran
+before — read the Changed section before upgrading.
+
 ### Changed — three statements that used to succeed now error
 
 All three were accepted and silently not honoured. Erroring is the correction,
