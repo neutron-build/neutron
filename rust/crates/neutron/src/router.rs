@@ -1,6 +1,6 @@
 //! High-performance HTTP router powered by a compressed radix tree (matchit).
 //!
-//! Routes are registered with `:param` and `*` wildcard syntax. Internally
+//! Routes are registered with `:param` and `*` / `*name` wildcard syntax. Internally
 //! these are translated to matchit's `{param}` / `{*rest}` format for
 //! zero-allocation path matching.
 //!
@@ -214,7 +214,8 @@ fn wrap_handler_with_chain(
 // Path syntax conversion
 // ---------------------------------------------------------------------------
 
-/// Convert user-facing path syntax (`:param`, `*`) to matchit syntax (`{param}`, `{*rest}`).
+/// Convert user-facing path syntax (`:param`, `*`, `*name`) to matchit syntax
+/// (`{param}`, `{*rest}`, `{*name}`).
 #[cfg(feature = "openapi")]
 fn method_kind_to_str(kind: MethodKind) -> &'static str {
     match kind {
@@ -239,8 +240,18 @@ fn to_matchit_path(path: &str) -> String {
             continue;
         }
         result.push('/');
-        if segment == "*" {
-            result.push_str("{*rest}");
+        if let Some(name) = segment.strip_prefix('*') {
+            // `*` is an anonymous catch-all; `*name` captures under that name.
+            //
+            // A named catch-all used to fall through to the literal branch, so
+            // `/docs/*slug` registered a path segment spelled "*slug" and
+            // matched nothing a caller would ever send — silently, with no
+            // error at registration and no route at runtime. The TypeScript
+            // router has always accepted `*slug`, so the two SDKs disagreed on
+            // the same documented-looking syntax.
+            result.push_str("{*");
+            result.push_str(if name.is_empty() { "rest" } else { name });
+            result.push('}');
         } else if let Some(name) = segment.strip_prefix(':') {
             result.push('{');
             result.push_str(name);
@@ -2383,6 +2394,37 @@ mod tests {
     // route just hit the surviving one, so the mistake was invisible. Go's mux
     // panics on this and the TypeScript router throws at build; Rust was the
     // outlier that lost your route.
+    // A named catch-all used to fall through to the literal branch, so
+    // `/docs/*slug` registered a segment spelled "*slug" and matched nothing a
+    // caller would send — no error at registration, no route at runtime. The
+    // TypeScript router has always accepted this syntax.
+    #[test]
+    fn named_catch_all_is_a_wildcard_not_a_literal() {
+        assert_eq!(to_matchit_path("/docs/*slug"), "/docs/{*slug}");
+        assert_eq!(to_matchit_path("/files/*path"), "/files/{*path}");
+        // Bare `*` keeps its anonymous name.
+        assert_eq!(to_matchit_path("/assets/*"), "/assets/{*rest}");
+    }
+
+    // Two catch-alls under one prefix must stay distinct routes rather than
+    // collapsing onto a single shared parameter name.
+    #[tokio::test]
+    async fn distinct_named_catch_alls_do_not_collapse() {
+        let r = build(
+            Router::<()>::new()
+                .get("/docs/*slug", || async { "docs" })
+                .get("/files/*path", || async { "files" }),
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/docs/a/b").unwrap().handler).await,
+            "docs"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/files/x/y").unwrap().handler).await,
+            "files"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "registered twice on the same router")]
     fn duplicate_direct_registration_panics() {

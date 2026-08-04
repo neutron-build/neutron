@@ -169,8 +169,66 @@ export function json(data: unknown, status: number = 200): Response {
   });
 }
 
+/**
+ * A 404 response.
+ *
+ * Returns an HTML document rather than bare text. It used to return
+ * `new Response("Not Found")` with no content type, so a browser rendered the
+ * two words as plain text on a white page — every Neutron app shipped that as
+ * its 404 unless the author noticed and hand-rolled one.
+ *
+ * Pass `body` to supply your own HTML. Passing a full document (one starting
+ * with `<!doctype` or `<html`) sends it verbatim; anything else is placed
+ * inside the default shell, so `notFound("No such project")` stays a one-liner
+ * and still renders as a page.
+ *
+ * This is deliberately NOT the app's layout. Rendering a 404 through the layout
+ * chain needs a route convention (`not-found.tsx`) and the loader data the
+ * layouts expect, neither of which exists at the point a bare `notFound()` is
+ * returned. This makes the default presentable; it does not pretend to be the
+ * full feature.
+ */
 export function notFound(body?: string): Response {
-  return new Response(body ?? "Not Found", { status: 404 });
+  const trimmed = body?.trim() ?? "";
+  const isFullDocument = /^<(!doctype|html)\b/i.test(trimmed);
+  const html = isFullDocument ? trimmed : notFoundDocument(trimmed);
+  return new Response(html, {
+    status: 404,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+/** Minimal, dependency-free 404 shell that respects the reader's colour scheme. */
+function notFoundDocument(message: string): string {
+  const content = message || "This page could not be found.";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>404 — Not Found</title>
+<style>
+  :root { color-scheme: light dark }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; font: 16px/1.5 system-ui, sans-serif;
+    background: Canvas; color: CanvasText; text-align: center;
+  }
+  main { padding: 2rem }
+  h1 { margin: 0 0 .5rem; font-size: 3rem; font-weight: 600; letter-spacing: -.02em }
+  p { margin: 0; opacity: .7 }
+</style>
+</head>
+<body><main><h1>404</h1><p>${escapeHtml(content)}</p></main></body>
+</html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 export function isResponse(value: unknown): value is Response {
