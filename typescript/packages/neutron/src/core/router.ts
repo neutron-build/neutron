@@ -1,3 +1,4 @@
+import { findNotFoundRoute } from "./manifest.js";
 import type { Route, RouteMatch } from "./types.js";
 
 interface TrieNode {
@@ -26,6 +27,14 @@ export function createRouter() {
 
   function insert(route: Route): void {
     routes.push(route);
+
+    // A not-found page is reachable only through the 404 handler. Inserting it
+    // into the trie would put it at its directory's own path, where it would
+    // shadow that directory's index route with a "not found" page.
+    if (route.isNotFound) {
+      return;
+    }
+
     const segments = parsePath(route.path);
     let node = root;
 
@@ -69,6 +78,20 @@ export function createRouter() {
     };
   }
 
+  /**
+   * The `not-found.tsx` covering `urlPath`, as a match ready to render.
+   *
+   * Returned as a full `RouteMatch` — with its layout chain — because that is
+   * the entire reason the convention exists: `notFound()` can only produce a
+   * standalone document, so a 404 arrived with none of the app's chrome. This
+   * lets the 404 render through exactly the same path as any other page.
+   */
+  function matchNotFound(urlPath: string): RouteMatch | null {
+    const route = findNotFoundRoute(routes, urlPath);
+    if (!route) return null;
+    return { route, params: {}, layouts: getLayouts(route, routes) };
+  }
+
   function matchNode(
     node: TrieNode,
     segments: string[],
@@ -110,7 +133,7 @@ export function createRouter() {
     return [...routes];
   }
 
-  return { insert, match, getRoutes };
+  return { insert, match, matchNotFound, getRoutes };
 }
 
 type PathSegment =

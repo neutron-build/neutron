@@ -125,7 +125,9 @@ function validateRoutes(routes: Route[]): void {
   // Layouts are excluded: a layout legitimately shares its directory's path.
   const byShape = new Map<string, Route[]>();
   for (const route of routes) {
-    if (route.isLayout) continue;
+    // A not-found page shares its directory's path the way a layout does, and
+    // is never matched by URL, so it cannot collide with anything.
+    if (route.isLayout || route.isNotFound) continue;
     // Erase param names but keep any literal suffix, since that suffix is what
     // distinguishes /docs/*slug from /docs/*slug.md.
     const shape = route.path
@@ -159,6 +161,21 @@ function isLayoutFilename(fileName: string): boolean {
   return baseName === "_layout" && VALID_EXTENSIONS.includes(ext);
 }
 
+/**
+ * `not-found.tsx` is the 404 page for its directory's subtree.
+ *
+ * It is discovered like a route so it inherits a layout chain — that is the
+ * whole point of the convention, since `notFound()` alone can only return a
+ * standalone document with none of the app's chrome. It is then withheld from
+ * URL matching, because a file that renders "not found" must not itself be
+ * reachable at `/not-found`.
+ */
+function isNotFoundFilename(fileName: string): boolean {
+  const ext = path.extname(fileName);
+  const baseName = path.basename(fileName, ext);
+  return baseName === "not-found" && VALID_EXTENSIONS.includes(ext);
+}
+
 function createRoute(
   filePath: string,
   parentPath: string,
@@ -187,6 +204,25 @@ function createRoute(
     };
   }
 
+  // A not-found page belongs to its directory, not to a URL segment named
+  // after the file. Giving it the directory's path is what lets the 404
+  // handler pick the deepest one covering the request.
+  if (isNotFoundFilename(path.basename(filePath))) {
+    const routePath = parentPath || "/";
+    return {
+      id: `route:${relativePath}`,
+      path: routePath,
+      file: filePath,
+      pattern: new RegExp(`^${routePath === "/" ? "/" : routePath}$`),
+      params: [],
+      config,
+      hasLoader: derived.hasLoader,
+      parentId,
+      isLayout: false,
+      isNotFound: true,
+    };
+  }
+
   const routePath = fileToRoutePath(name, parentPath);
   const { pattern, params } = pathToRegExp(routePath);
 
@@ -201,6 +237,29 @@ function createRoute(
     parentId,
     isLayout: false,
   };
+}
+
+/**
+ * The not-found page covering `urlPath`: the deepest one whose directory is a
+ * prefix of the request.
+ *
+ * Deepest wins so a section can present its own 404 — a miss under `/admin`
+ * should look like the admin app, not like the marketing site — while the root
+ * page still catches everything else.
+ */
+export function findNotFoundRoute(routes: Route[], urlPath: string): Route | undefined {
+  let best: Route | undefined;
+  for (const route of routes) {
+    if (!route.isNotFound) continue;
+    const base = route.path === "/" ? "/" : route.path + "/";
+    const candidate = urlPath.endsWith("/") ? urlPath : urlPath + "/";
+    if (base === "/" || candidate.startsWith(base)) {
+      if (!best || route.path.length > best.path.length) {
+        best = route;
+      }
+    }
+  }
+  return best;
 }
 
 /**

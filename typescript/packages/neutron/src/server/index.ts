@@ -618,6 +618,50 @@ export async function createServer(
       }
 
       if (!match) {
+        // Render the app's own not-found page through its layout chain, so a
+        // 404 looks like the rest of the application rather than two words of
+        // plain text. Falls back to the bare response when the app has no
+        // `not-found.tsx`.
+        const notFoundMatch = ssrServer ? router.matchNotFound(effectivePathname) : null;
+        if (notFoundMatch) {
+          try {
+            const rendered = await handleAppRouteRequest(
+              c.req.raw,
+              notFoundMatch,
+              ssrServer!,
+              clientEntryScriptSrc,
+              stylesheetHrefs,
+              routeModuleCache,
+              loaderDataCacheStore,
+              requestTrace,
+              hooks,
+              globalMiddleware
+            );
+            // The page renders as a normal route, which makes it a 200. The
+            // status is the part that matters to crawlers and monitoring, so
+            // it is forced here rather than left to the route.
+            return finalize(
+              new Response(rendered.body, { status: 404, headers: rendered.headers }),
+              {
+                routeId: notFoundMatch.route.id,
+                routePath: notFoundMatch.route.path,
+                routeMode: notFoundMatch.route.config.mode,
+              }
+            );
+          } catch (error) {
+            // A broken not-found page must not turn a 404 into a 500 — that
+            // converts "page missing" into "site down" for every bad URL.
+            emitHook(hooks?.onError, {
+              requestId: requestTrace.requestId,
+              method: requestTrace.method,
+              pathname: requestTrace.pathname,
+              source: "render",
+              routeId: notFoundMatch.route.id,
+              routePath: notFoundMatch.route.path,
+              error: toError(error),
+            });
+          }
+        }
         return finalize(c.text("Not Found", 404));
       }
 
