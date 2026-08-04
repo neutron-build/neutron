@@ -208,6 +208,20 @@ pub struct WalConfig {
     pub segment_size_mb: usize,
     #[serde(default = "default_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
+    /// Seal and archive the active WAL segment after this many seconds, even
+    /// if it has not filled. `0` disables it. Only has an effect when
+    /// `NUCLEUS_WAL_ARCHIVE_DIR` is set.
+    ///
+    /// Without this, a segment reaches the archive only when it fills, so the
+    /// PITR recovery point is the last rollover rather than the last commit. At
+    /// the default 64 MiB segment a low-write database can go days between
+    /// rollovers, and every commit in the current segment is missing from the
+    /// archive. This bounds that exposure in wall-clock terms: it is the
+    /// recovery-point objective, and it defaults to a minute rather than to
+    /// `off` because anyone who has configured an archive at all has said they
+    /// want point-in-time recovery.
+    #[serde(default = "default_archive_timeout_secs")]
+    pub archive_timeout_secs: u64,
     #[serde(default = "default_group_commit_interval_us")]
     pub group_commit_interval_us: u64,
     /// How the WAL is forced to stable storage. One of:
@@ -247,6 +261,9 @@ fn default_segment_size_mb() -> usize {
 fn default_checkpoint_interval_secs() -> u64 {
     300
 }
+fn default_archive_timeout_secs() -> u64 {
+    60
+}
 fn default_group_commit_interval_us() -> u64 {
     1000
 }
@@ -263,6 +280,7 @@ impl Default for WalConfig {
             enabled: true,
             segment_size_mb: default_segment_size_mb(),
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
+            archive_timeout_secs: default_archive_timeout_secs(),
             group_commit_interval_us: default_group_commit_interval_us(),
             sync_mode: default_sync_mode(),
             synchronous_commit: default_synchronous_commit(),
@@ -662,6 +680,11 @@ impl NucleusConfig {
             && let Ok(n) = v.parse::<u64>()
         {
             self.wal.checkpoint_interval_secs = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.wal.archive_timeout_secs = n;
         }
         if let Ok(v) = env::var("NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US")
             && let Ok(n) = v.parse::<u64>()

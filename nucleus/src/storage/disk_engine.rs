@@ -826,6 +826,20 @@ impl DiskEngine {
             .map_err(|e| StorageError::Io(e.to_string()))
     }
 
+    /// Seal and archive the active WAL segment so a clean shutdown leaves
+    /// nothing that PITR cannot reach.
+    ///
+    /// WAL segments are otherwise archived only when they fill. That makes the
+    /// PITR recovery point the last rollover instead of the last commit, so a
+    /// planned stop — a deploy, a failover, a maintenance window — silently
+    /// drops every commit since the segment began. At the default 64 MiB
+    /// segment size that can be days of writes on a quiet database.
+    pub fn archive_active_wal(&self) -> Result<bool, StorageError> {
+        self.pool
+            .wal_archive_active()
+            .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
     /// Discard the in-memory effects of an open transaction (restore the
     /// committed directory / free-list snapshot and reload dirtied pages). Used
     /// on Drop to ensure an abandoned transaction's uncommitted writes are not

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -186,4 +187,89 @@ func TestAppLifecycle(t *testing.T) {
 	if !stopped {
 		t.Error("OnStop not called")
 	}
+}
+
+// The default routes used to be registered inside Run(), so a test driving
+// Handler() exercised a different route set than production — and /health,
+// /docs and /openapi.json, the routes most likely to be hit by a load balancer
+// or uptime check, were precisely the ones no test could reach.
+func TestHandlerServesDefaultRoutes(t *testing.T) {
+	app := New()
+
+	for _, path := range []string{"/health", "/openapi.json", "/docs"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		app.Handler().ServeHTTP(rec, req)
+		if rec.Code == http.StatusNotFound {
+			t.Errorf("%s is 404 through Handler(); tests cannot see what Run() serves", path)
+		}
+	}
+}
+
+// An application defining its own /health is ordinary. The framework default
+// must step aside rather than overwrite it or panic on startup.
+func TestApplicationHealthRouteWins(t *testing.T) {
+	app := New()
+	app.Router().HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTeapot {
+		t.Errorf("status = %d, want %d — the framework default replaced the app's own /health",
+			rec.Code, http.StatusTeapot)
+	}
+}
+
+func TestWithoutDefaultRoutes(t *testing.T) {
+	app := New(WithoutDefaultRoutes())
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 with default routes disabled", rec.Code)
+	}
+}
+
+// Build must be idempotent: Handler() calls it, and Run() calls it again.
+func TestBuildIsIdempotent(t *testing.T) {
+	app := New()
+	app.Build()
+	app.Build() // must not panic on a duplicate registration
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+// A collision panic has to name the two application lines in conflict. Every
+// registration funnels through one line in router.go, so the std ServeMux panic
+// points there twice and at neither of the files you need to open.
+func TestDuplicateRoutePanicNamesBothSites(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("registering the same route twice did not panic")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "app_test.go") {
+			t.Errorf("panic does not name the registering file, so it points at the "+
+				"framework instead of the conflict: %s", msg)
+		}
+		if strings.Count(msg, "app_test.go") < 2 {
+			t.Errorf("panic names only one of the two conflicting sites: %s", msg)
+		}
+	}()
+
+	app := New()
+	app.Router().HandleFunc("GET /dup", func(w http.ResponseWriter, r *http.Request) {})
+	app.Router().HandleFunc("GET /dup", func(w http.ResponseWriter, r *http.Request) {})
 }

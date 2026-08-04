@@ -1195,6 +1195,16 @@ impl BufferPool {
         self.wal.as_ref().map_or((0, 0), |w| w.wal_stats())
     }
 
+    /// Seal and archive the WAL segment currently being written. Returns
+    /// whether a segment was archived — `false` means there was nothing to do
+    /// or this backend has no archive, never that the tail is safe.
+    pub fn wal_archive_active(&self) -> Result<bool, BufferError> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.archive_active().map_err(BufferError::Io),
+            None => Ok(false),
+        }
+    }
+
     /// Log a COMMIT record to the WAL for the given transaction ID.
     pub fn wal_log_commit(&self, txn_id: u64) -> Result<u64, BufferError> {
         match self.wal.as_ref() {
