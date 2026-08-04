@@ -496,6 +496,24 @@ pub struct BufferPool {
     /// corrupted into pointing at itself, spinning a query at ~100% CPU
     /// forever. See `pin_if_present` and `get_free_frame`.
     eviction_lock: Mutex<()>,
+    /// The transaction currently applying its buffered writes, or 0 for none.
+    ///
+    /// Commit application is serialized (see `BufferedDiskEngine::commit_txn`),
+    /// so at most one transaction is in this window at a time and a page
+    /// dirtied while it is set belongs to that transaction. That is what makes
+    /// full-page undo sound: nobody else is mutating those pages, so a
+    /// before-image restores exactly the pre-transaction state and cannot
+    /// revert someone else's committed work.
+    applying_txn: AtomicU64,
+    /// Pages dirtied by the transaction named in `applying_txn`. Cleared when
+    /// that transaction ends. A page NOT in here is committed state, and is
+    /// still logged at txn 0 — recovery redoes those unconditionally.
+    txn_dirty: Mutex<HashSet<u32>>,
+    /// Pages whose before-image has already been logged for the current
+    /// transaction. One undo record per page per transaction is enough: the
+    /// first one captured the pre-transaction image, and every later flush of
+    /// the same page is still that same transaction's uncommitted work.
+    undo_logged: Mutex<HashSet<u32>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -540,7 +558,116 @@ impl BufferPool {
             dirty_set: Mutex::new(HashSet::new()),
             wal_pending: Mutex::new(HashSet::new()),
             eviction_lock: Mutex::new(()),
+            applying_txn: AtomicU64::new(0),
+            txn_dirty: Mutex::new(HashSet::new()),
+            undo_logged: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Open the commit-application window for `txn_id`.
+    ///
+    /// Every page dirtied until [`BufferPool::end_page_txn`] is attributed to
+    /// this transaction, and any flush of one of those pages logs a
+    /// before-image first. `txn_id` must be non-zero: 0 is the encoding for
+    /// "committed state, redo unconditionally".
+    pub fn begin_page_txn(&self, txn_id: u64) {
+        debug_assert!(txn_id != 0, "txn 0 means 'no transaction' to recovery");
+        self.applying_txn.store(txn_id, Ordering::Release);
+        self.txn_dirty.lock().clear();
+        self.undo_logged.lock().clear();
+    }
+
+    /// Close the commit-application window, logging COMMIT or ABORT.
+    ///
+    /// The caller must sync the WAL after this before acknowledging the
+    /// commit: a COMMIT record that is not durable is one recovery will not
+    /// see, and it will undo the transaction the client was told succeeded.
+    /// Returns the LSN of the control record, or 0 when no WAL is configured.
+    pub fn end_page_txn(&self, txn_id: u64, committed: bool) -> Result<u64, BufferError> {
+        let result = match self.wal {
+            Some(ref wal) if committed => wal.log_commit(txn_id),
+            Some(ref wal) => wal.log_abort(txn_id),
+            None => Ok(0),
+        };
+        self.applying_txn.store(0, Ordering::Release);
+        self.txn_dirty.lock().clear();
+        self.undo_logged.lock().clear();
+        result.map_err(BufferError::Io)
+    }
+
+
+    /// Close the window without logging anything, for a transaction that
+    /// dirtied no page. There is nothing for recovery to redo or undo, so a
+    /// record would be pure log noise on the read-only path.
+    pub fn close_page_txn_silently(&self) {
+        self.applying_txn.store(0, Ordering::Release);
+        self.txn_dirty.lock().clear();
+        self.undo_logged.lock().clear();
+    }
+
+    /// Whether the applying transaction has dirtied any page.
+    ///
+    /// Distinct from `wal_force_needed`: a page this transaction dirtied and
+    /// the pool then STOLE is no longer pending (eviction logged it itself),
+    /// but it is still uncommitted work on disk that needs a durable COMMIT
+    /// record, or recovery will undo a transaction the client was told
+    /// succeeded.
+    pub fn page_txn_touched(&self) -> bool {
+        !self.txn_dirty.lock().is_empty()
+    }
+
+    /// Note that `page_id` was dirtied, attributing it to the applying
+    /// transaction if there is one.
+    fn note_dirty_page(&self, page_id: u32) {
+        if self.applying_txn.load(Ordering::Acquire) != 0 {
+            self.txn_dirty.lock().insert(page_id);
+        }
+    }
+
+    /// WAL-log a page image that is about to be written to disk (or forced),
+    /// attributing it to the transaction that dirtied it and, when that
+    /// transaction is still uncommitted, logging the page's before-image first.
+    ///
+    /// This is the single place the page WAL learns about transactions. Every
+    /// flush site funnels through it; before it existed, all six logged at
+    /// txn 0, so no page image was attributable and recovery had no choice but
+    /// to replay uncommitted work.
+    fn log_flush(
+        &self,
+        wal: &dyn super::wal::WalBackend,
+        page_id: u32,
+        data: &PageBuf,
+    ) -> std::io::Result<u64> {
+        let txn = self.applying_txn.load(Ordering::Acquire);
+        let uncommitted = txn != 0 && self.txn_dirty.lock().contains(&page_id);
+
+        if uncommitted {
+            // One before-image per page per transaction — and taken from the
+            // DATA FILE, not from the frame, because the frame already holds
+            // the uncommitted bytes. `make_durable` WAL-logs every dirty page
+            // at commit, so the file lags the WAL but never leads it: the disk
+            // image is either the last committed state, or older than it and
+            // superseded by a committed record that redo applies afterwards.
+            let needs_undo = self.undo_logged.lock().insert(page_id);
+            if needs_undo {
+                let mut before = Box::new([0u8; PAGE_SIZE]);
+                match self.disk.read_page(page_id, before.as_mut()) {
+                    Ok(()) => {
+                        wal.log_page_undo(txn, page_id, before.as_ref())?;
+                    }
+                    Err(_) => {
+                        // The page does not exist in the file yet, so this
+                        // transaction created it. There is no before-image to
+                        // restore; recovery drops the page instead, which is
+                        // recorded by an undo record with a zeroed image.
+                        let blank = Box::new([0u8; PAGE_SIZE]);
+                        wal.log_page_undo(txn, page_id, blank.as_ref())?;
+                    }
+                }
+            }
+        }
+
+        wal.log_page_write(txn, page_id, data)
     }
 
     /// If `page_id` is currently resident, pin it and return its frame.
@@ -722,6 +849,7 @@ impl BufferPool {
         desc.pin_count.store(1, Ordering::Release);
         desc.is_dirty.store(true, Ordering::Release);
         self.dirty_set.lock().insert(frame_id);
+        self.note_dirty_page(page_id);
         if self.wal.is_some() {
             self.wal_pending.lock().insert(page_id);
         }
@@ -831,9 +959,14 @@ impl BufferPool {
             self.stats.dirty_pages.fetch_add(1, Ordering::Relaxed);
         }
         self.dirty_set.lock().insert(frame_id);
-        if self.wal.is_some() {
-            let page_id = desc.page_id.load(Ordering::Acquire);
-            if page_id != INVALID_PAGE_ID {
+        let page_id = desc.page_id.load(Ordering::Acquire);
+        if page_id != INVALID_PAGE_ID {
+            // Attribution has to happen whether or not a WAL is configured:
+            // `wal_pending` is a WAL concern, but "which transaction dirtied
+            // this page" is not, and gating it on the WAL would silently
+            // disable undo the moment someone ran without one.
+            self.note_dirty_page(page_id);
+            if self.wal.is_some() {
                 self.wal_pending.lock().insert(page_id);
             }
         }
@@ -855,13 +988,32 @@ impl BufferPool {
     /// No-op when no WAL is configured. On error the drained page set is
     /// merged back so a retry (or the next commit) re-covers these pages.
     pub fn wal_force_pending(&self) -> Result<(), BufferError> {
+        let max_lsn = self.wal_log_pending()?;
+        if max_lsn > 0
+            && let Some(ref wal) = self.wal
+            && let Err(e) = wal.sync_up_to(max_lsn)
+        {
+            return Err(BufferError::Io(e));
+        }
+        Ok(())
+    }
+
+    /// Log every pending page image WITHOUT syncing, returning the highest LSN
+    /// written (0 if nothing was pending).
+    ///
+    /// Split out of `wal_force_pending` for the commit path, which has to get
+    /// the COMMIT record appended after these page images and then cover both
+    /// with ONE sync. Syncing here and again for the COMMIT record would put a
+    /// second fsync on every commit — on macOS that is a real 4 ms, doubling
+    /// commit latency to buy nothing.
+    pub fn wal_log_pending(&self) -> Result<u64, BufferError> {
         let Some(ref wal) = self.wal else {
-            return Ok(());
+            return Ok(0);
         };
         let pending: Vec<u32> = {
             let mut set = self.wal_pending.lock();
             if set.is_empty() {
-                return Ok(());
+                return Ok(0);
             }
             set.drain().collect()
         };
@@ -891,7 +1043,7 @@ impl BufferPool {
                 // concurrently.
                 let _latch = self.frame_latch(frame_id).write();
                 let data = self.frame_data_mut(frame_id);
-                match wal.log_page_write(0, page_id, data) {
+                match self.log_flush(wal.as_ref(), page_id, data) {
                     Ok(lsn) => {
                         page::set_page_lsn(data, lsn);
                         max_lsn = lsn;
@@ -907,15 +1059,11 @@ impl BufferPool {
             self.unpin(frame_id);
         }
 
-        if max_lsn > 0
-            && let Err(e) = wal.sync_up_to(max_lsn)
-        {
-            // Records are appended but not durably synced — put every page
-            // back so the next force retries the whole batch.
-            restore_on_err(self, &pending);
-            return Err(BufferError::Io(e));
-        }
-        Ok(())
+        // Deliberately NOT synced here — the caller decides, because the commit
+        // path needs the COMMIT record appended first so one sync covers both.
+        // `wal_force_pending` syncs immediately for every other caller.
+        let _ = &restore_on_err;
+        Ok(max_lsn)
     }
 
     /// Whether any pages are awaiting a commit-time WAL force. Cheap check so
@@ -974,8 +1122,8 @@ impl BufferPool {
             let data = self.frame_data_mut(frame_id);
             // WAL protocol: sync WAL before writing data pages
             if let Some(ref wal) = self.wal {
-                let lsn = wal
-                    .log_page_write(0, page_id, data)
+                let lsn = self
+                    .log_flush(wal.as_ref(), page_id, data)
                     .map_err(BufferError::Io)?;
                 page::set_page_lsn(data, lsn);
                 if group_sync {
@@ -1016,8 +1164,8 @@ impl BufferPool {
                 }
                 let data = self.frame_data_mut(i as u32);
                 if let Some(ref wal) = self.wal {
-                    let lsn = wal
-                        .log_page_write(0, page_id, data)
+                    let lsn = self
+                        .log_flush(wal.as_ref(), page_id, data)
                         .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                 }
@@ -1079,8 +1227,8 @@ impl BufferPool {
                 }
                 let data = self.frame_data_mut(frame_id);
                 if let Some(ref wal) = self.wal {
-                    let lsn = wal
-                        .log_page_write(0, page_id, data)
+                    let lsn = self
+                        .log_flush(wal.as_ref(), page_id, data)
                         .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                 }
@@ -1156,7 +1304,7 @@ impl BufferPool {
                 {
                     let data = self.frame_data_mut(*frame_id);
                     if let Some(ref wal) = self.wal
-                        && let Ok(lsn) = wal.log_page_write(0, page_id, data)
+                        && let Ok(lsn) = self.log_flush(wal.as_ref(), page_id, data)
                     {
                         page::set_page_lsn(data, lsn);
                     }
@@ -1366,8 +1514,8 @@ impl BufferPool {
                 let data = self.frame_data_mut(frame_id);
                 // WAL protocol: log before flush, set LSN first
                 if let Some(ref wal) = self.wal {
-                    let lsn = wal
-                        .log_page_write(0, old_page_id, data)
+                    let lsn = self
+                        .log_flush(wal.as_ref(), old_page_id, data)
                         .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                 }

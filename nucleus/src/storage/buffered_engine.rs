@@ -30,6 +30,14 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+/// Serializes the window between COMMIT and its acknowledgement, so a
+/// transaction's page mutations never interleave with another's. See the
+/// comment at its only use in `commit_txn` for why full-page undo needs this.
+///
+/// Tokio's mutex, not parking_lot's: the guard is held across `apply_buffer`'s
+/// await points, and a parking_lot guard there would make the future !Send.
+static APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use super::disk_engine::DiskEngine;
 use super::{StorageEngine, StorageError, project_row};
 use crate::types::{Row, Value};
@@ -904,15 +912,47 @@ impl StorageEngine for BufferedDiskEngine {
                 }
             }
         };
+        // Commit application is SERIALIZED, and full-page undo is why.
+        //
+        // A transaction that dirties more pages than the buffer pool holds
+        // pushes its own uncommitted pages to the data file as the pool steals
+        // frames, so recovery needs a before-image to put them back. A
+        // before-image is a whole page, and a whole page is only safe to
+        // restore if nobody else wrote that page in the meantime — which
+        // `DiskEngine::insert` does not guarantee on its own, since it holds
+        // `tables` as a READ guard and two committing transactions can touch
+        // the same page.
+        //
+        // Measured cost of the lock: ~2.4% at 8 concurrent writers on large
+        // transactions, nothing measurable on small ones. The apply phase was
+        // already almost serial by its own internal locking (eviction lock,
+        // frame latches), so this mostly makes explicit what was already true.
+        // Transaction BODIES are untouched — only the window between COMMIT
+        // and its acknowledgement is exclusive.
+        let _apply = APPLY_LOCK.lock().await;
+        let page_txn = self.inner.begin_page_txn();
         let applied = self.apply_buffer(ops).await;
         // COMMIT is the durability point for the buffered ops just applied.
         // The executor's statement-level make_durable skipped them while the
         // transaction was open (writes were only in the in-memory buffer), so
         // force the WAL here before COMMIT is acked.
         let result = match applied {
-            Ok(()) => self.inner.make_durable().await,
-            Err(e) => Err(e),
+            Ok(()) => {
+                // Logs every dirty page, then the COMMIT record, then syncs
+                // once covering both — replacing the bare `make_durable`,
+                // which logged the pages but nothing saying they were a
+                // transaction, so recovery redid them either way.
+                self.inner.commit_page_txn(page_txn)
+            }
+            Err(e) => {
+                // The buffer is discarded, but pages this transaction already
+                // dirtied (or had stolen to disk) are not. Closing the window
+                // as aborted is what tells recovery to undo them.
+                let _ = self.inner.abort_page_txn(page_txn);
+                Err(e)
+            }
         };
+        drop(_apply);
         // Strict 2PL: locks are held until the transaction ENDS, which is here
         // — after the writes are applied and durable. Releasing any earlier
         // would let another transaction read a value this one might still fail

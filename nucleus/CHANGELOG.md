@@ -5,6 +5,41 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A crash mid-COMMIT could leave a transaction durable in part.** On the
+  paged engine, a transaction that dirties more pages than the buffer pool
+  holds pushes its own uncommitted pages into the data file as the pool steals
+  frames. The page WAL logged every image at transaction 0 and recovery
+  replayed all of them unconditionally, so nothing could tell a restart that a
+  run of page images belonged to a transaction that was never acknowledged.
+  Measured: 2 of 3 crash rounds torn at the shipped 32 MB pool, 8 of 8 at a
+  small one.
+
+  Recovery can now take those writes back:
+
+  - Page-WAL records carry the real transaction id instead of 0.
+  - Before an uncommitted page is written to the data file, its
+    pre-transaction image is logged first (a new `PAGE_UNDO` record). The
+    write-ahead rule applies to undo exactly as it does to redo.
+  - Recovery runs an analysis pass — a transaction with page writes and no
+    COMMIT record is a loser — then reconstructs each page from the latest
+    committed image, falling back to the before-image.
+  - COMMIT is logged after the page images it vouches for, and one sync covers
+    both. Read-only transactions still sync nothing.
+
+  **Commit application is now serialized**, which is what makes a whole-page
+  before-image safe to restore: two transactions could otherwise mutate the
+  same page, and a committed image with an uncommitted transaction's bytes
+  baked into it cannot be rolled back a page at a time. Measured cost ~2.4% at
+  8 concurrent writers on large transactions and nothing measurable on small
+  ones — the apply phase was already close to serial by its own internal
+  locking. Transaction bodies are unaffected; only the window between COMMIT
+  and its acknowledgement is exclusive.
+
+  `probe_txn_atomicity`, which existed to demonstrate this bug, is now a
+  passing gate.
+
 ## [0.1.6] - 2026-08-04
 
 The first release since v0.1.2 that carries engine changes; v0.1.3 through

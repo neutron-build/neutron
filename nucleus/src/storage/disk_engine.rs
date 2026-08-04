@@ -558,6 +558,7 @@ impl DiskEngine {
         // single-file WAL's content (truncate/rename), so the new backend
         // must start above every LSN already stamped on data pages.
         let mut lsn_floor: u64 = 0;
+        let mut txn_id_floor: u64 = 0;
         if !is_new {
             let single_file_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
             // A missing WAL is normal (first open after a clean create); any
@@ -582,6 +583,12 @@ impl DiskEngine {
             // legacy single file and every segment.
             records.sort_by_key(|r| r.lsn);
             lsn_floor = records.last().map(|r| r.lsn).unwrap_or(0);
+            // Transaction ids must not repeat across a restart. The counter
+            // resets to 1 on every open, so without this floor a fresh
+            // transaction 5 would inherit the COMMIT record of a previous
+            // run's transaction 5 — and recovery would treat its uncommitted
+            // pages as committed, which is the exact bug this work removes.
+            txn_id_floor = records.iter().map(|r| r.txn_id).max().unwrap_or(0);
             let recovered = Self::apply_wal_records(records, &mut disk, &mut initial_pages)?;
             if recovered > 0 {
                 tracing::info!("WAL recovery: replayed {recovered} page(s)");
@@ -729,7 +736,7 @@ impl DiskEngine {
             async_ops: None,
             txn_state: parking_lot::Mutex::new(None),
             dir_save_lock: parking_lot::Mutex::new(()),
-            next_txn_id: AtomicU64::new(1),
+            next_txn_id: AtomicU64::new(txn_id_floor + 1),
             projected_scans: AtomicU64::new(0),
         };
 
@@ -758,15 +765,88 @@ impl DiskEngine {
             return Ok(0);
         }
 
-        // Collect the latest page image for each page_id (last write wins).
-        // WAL records are in LSN order, so iterating forward gives us the latest.
-        let mut latest_pages: HashMap<u32, (u64, Box<PageBuf>)> = HashMap::new();
+        // ── Analysis ────────────────────────────────────────────────────────
+        // A transaction that wrote pages and has neither a COMMIT nor an ABORT
+        // record is a LOSER: it was in flight when the process died, so the
+        // client was never told it succeeded and none of its work may survive.
+        // Page writes at txn 0 are committed state (the pre-transaction WAL
+        // wrote everything that way) and are always redone.
+        let mut committed: HashSet<u64> = HashSet::new();
+        let mut ended: HashSet<u64> = HashSet::new();
         for record in &records {
-            if record.record_type == wal::RECORD_PAGE_WRITE
-                && let Some(ref img) = record.page_image
-            {
-                latest_pages.insert(record.page_id, (record.lsn, img.clone()));
+            match record.record_type {
+                wal::RECORD_COMMIT => {
+                    committed.insert(record.txn_id);
+                    ended.insert(record.txn_id);
+                }
+                wal::RECORD_ABORT => {
+                    ended.insert(record.txn_id);
+                }
+                _ => {}
             }
+        }
+        let is_loser = |txn: u64| txn != 0 && !committed.contains(&txn);
+
+        // ── Redo + undo, resolved per page ──────────────────────────────────
+        // For each page the log mentions, the correct final image is:
+        //
+        //   * the latest PAGE_WRITE from a non-loser — redo; else
+        //   * the earliest PAGE_UNDO from a loser — undo, the image from
+        //     before any loser touched the page; else
+        //   * whatever is on disk.
+        //
+        // One pass in LSN order settles both. `undone` keeps the FIRST undo
+        // image per page because that is the pre-transaction state; a later
+        // one would only be the same transaction's own later work.
+        let mut latest_pages: HashMap<u32, (u64, Box<PageBuf>)> = HashMap::new();
+        let mut undone: HashMap<u32, (u64, Box<PageBuf>)> = HashMap::new();
+        let mut touched_by_loser: HashSet<u32> = HashSet::new();
+        for record in &records {
+            let Some(ref img) = record.page_image else {
+                continue;
+            };
+            match record.record_type {
+                wal::RECORD_PAGE_WRITE => {
+                    if is_loser(record.txn_id) {
+                        touched_by_loser.insert(record.page_id);
+                    } else {
+                        latest_pages.insert(record.page_id, (record.lsn, img.clone()));
+                    }
+                }
+                wal::RECORD_PAGE_UNDO => {
+                    touched_by_loser.insert(record.page_id);
+                    undone
+                        .entry(record.page_id)
+                        .or_insert_with(|| (record.lsn, img.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        // A page a loser touched needs its non-loser image applied even when
+        // the on-disk LSN is HIGHER — the loser's own eviction stamped that
+        // higher LSN on the page as it wrote uncommitted bytes there, so the
+        // usual `wal_lsn > disk_lsn` staleness test would refuse to undo it.
+        let mut forced: HashSet<u32> = HashSet::new();
+        for page_id in &touched_by_loser {
+            if !latest_pages.contains_key(page_id)
+                && let Some((lsn, img)) = undone.remove(page_id)
+            {
+                latest_pages.insert(*page_id, (lsn, img));
+            }
+            forced.insert(*page_id);
+        }
+        if !touched_by_loser.is_empty() {
+            tracing::info!(
+                "WAL recovery: undoing {} page(s) from {} uncommitted transaction(s)",
+                touched_by_loser.len(),
+                records
+                    .iter()
+                    .filter(|r| wal::carries_page_image(r.record_type) && is_loser(r.txn_id))
+                    .map(|r| r.txn_id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+            );
         }
 
         let mut recovered = 0usize;
@@ -784,9 +864,17 @@ impl DiskEngine {
                 0 // Page doesn't exist on disk yet
             };
 
-            if wal_lsn > disk_lsn {
-                // WAL has a newer version — apply it
-                // Set the LSN and checksum to match what the flush would have done
+            if wal_lsn > disk_lsn || forced.contains(&page_id) {
+                // WAL has a newer version — apply it. `forced` overrides the
+                // staleness test for pages an uncommitted transaction wrote:
+                // there the on-disk LSN is the loser's own, so it is higher
+                // than the image we are restoring and means the opposite of
+                // what it usually means.
+                //
+                // The restored image keeps its ORIGINAL LSN rather than being
+                // re-stamped with the loser's: stamping the higher one would
+                // make the next recovery treat this page as newer than the
+                // records that legitimately describe it.
                 page::set_page_lsn(&mut page_image, wal_lsn);
                 page::write_checksum(&mut page_image);
                 disk.write_page(page_id, &page_image)
@@ -2965,6 +3053,66 @@ impl StorageEngine for DiskEngine {
 }
 
 impl DiskEngine {
+    /// Open a page-level transaction window and return its id.
+    ///
+    /// Everything the buffer pool dirties until [`DiskEngine::commit_page_txn`]
+    /// or [`DiskEngine::abort_page_txn`] is attributed to this transaction, and
+    /// any of those pages that reach the data file early (buffer-pool eviction
+    /// stealing a frame) get a before-image logged first. That is what lets
+    /// recovery take back a transaction that was never acknowledged.
+    pub fn begin_page_txn(&self) -> u64 {
+        let txn_id = self.next_txn_id.fetch_add(1, AtomicOrdering::SeqCst);
+        self.pool.begin_page_txn(txn_id);
+        txn_id
+    }
+
+    /// Close the window durably: log every dirty page image, then the COMMIT
+    /// record, then sync ONCE covering both.
+    ///
+    /// The order is the whole point. A COMMIT record that reached disk ahead of
+    /// the page images it vouches for would tell recovery to redo a
+    /// transaction whose pages are missing; a sync per step would put two
+    /// fsyncs on every commit.
+    pub fn commit_page_txn(&self, txn_id: u64) -> Result<(), StorageError> {
+        // A transaction that wrote nothing gets no records and no sync. This
+        // preserves `make_durable`'s gate: an explicit BEGIN/COMMIT around
+        // reads used to cost nothing, and making every COMMIT fsync would be a
+        // silent latency regression on read-only transactions.
+        let touched = self.pool.page_txn_touched();
+        if !touched && !self.pool.wal_force_needed() {
+            self.pool.close_page_txn_silently();
+            return Ok(());
+        }
+
+        // Meta page 0 carries the table directory and free list. Without this
+        // the replayed heap pages are orphans — same reason `make_durable`
+        // saves it first.
+        self.save_table_directory()?;
+        let pages_lsn = self
+            .pool
+            .wal_log_pending()
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let commit_lsn = self
+            .pool
+            .end_page_txn(txn_id, true)
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        self.pool
+            .wal_sync_up_to(commit_lsn.max(pages_lsn))
+            .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
+    /// Close the window as aborted.
+    ///
+    /// Not synced: the absence of a COMMIT record is already enough for
+    /// recovery to undo this transaction, so an ABORT record that fails to
+    /// reach disk changes nothing. It is logged for readability of the log.
+    pub fn abort_page_txn(&self, txn_id: u64) -> Result<(), StorageError> {
+        self.pool
+            .end_page_txn(txn_id, false)
+            .map(|_| ())
+            .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
     /// Create a B-tree index on a column of a table.
     ///
     /// Scans existing rows to populate the index, then maintains it on
@@ -7019,6 +7167,171 @@ mod wal_recovery_tests {
                 "pre-recovery segment {old} survived rotate + checkpoint pruning"
             );
         }
+    }
+
+    // ── Recovery undo (CAMPAIGN-02) ─────────────────────────────────────
+    //
+    // These craft WAL records directly, because the situation they describe —
+    // a page image on disk belonging to a transaction that was never
+    // acknowledged — is exactly what a `kill -9` mid-COMMIT produces and what
+    // no ordinary API call can reach. `probe_txn_atomicity` covers the real
+    // crash; these pin the decision table.
+
+    /// Read page `page_id`'s first byte through a freshly opened engine.
+    async fn marker_after_reopen(db_path: &std::path::Path, page_id: u32) -> u8 {
+        let catalog = Arc::new(Catalog::new());
+        let engine = DiskEngine::open_segmented(db_path, catalog, 64, 1).unwrap();
+        let pool = engine.buffer_pool();
+        let frame = pool.fetch_page(page_id).unwrap();
+        // The marker lives in the LAST byte: recovery stamps the LSN and
+        // checksum over the page HEADER, so a marker at byte 0 would be
+        // overwritten and every one of these tests would read 0.
+        let byte = pool.frame_data(frame)[PAGE_SIZE - 1];
+        pool.unpin(frame);
+        drop(engine);
+        byte
+    }
+
+    /// A transaction with page writes and no COMMIT record is a loser: its
+    /// pages must come back as they were before it ran.
+    #[tokio::test]
+    async fn an_unacknowledged_transaction_is_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("undo.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            drop(DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap());
+        }
+        {
+            let wal_dir = db_path.with_extension("wal.d");
+            let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
+            // Committed state: page 9 holds 0xAA.
+            seg.log_page_write(0, 9, &marker_page(0xAA)).unwrap();
+            // Transaction 7 overwrites it with 0xBB and the pool steals the
+            // page to disk, logging the before-image first. No COMMIT follows
+            // — the process died here.
+            seg.log_page_undo(7, 9, &marker_page(0xAA)).unwrap();
+            seg.log_page_write(7, 9, &marker_page(0xBB)).unwrap();
+            seg.sync().unwrap();
+        }
+
+        assert_eq!(
+            marker_after_reopen(&db_path, 9).await,
+            0xAA,
+            "an uncommitted page write must be rolled back to its before-image"
+        );
+    }
+
+    /// The same shape WITH a commit record must be kept. This is the half that
+    /// makes the test above meaningful — undoing everything would also pass it.
+    #[tokio::test]
+    async fn an_acknowledged_transaction_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("redo.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            drop(DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap());
+        }
+        {
+            let wal_dir = db_path.with_extension("wal.d");
+            let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
+            seg.log_page_write(0, 9, &marker_page(0xAA)).unwrap();
+            seg.log_page_undo(7, 9, &marker_page(0xAA)).unwrap();
+            seg.log_page_write(7, 9, &marker_page(0xBB)).unwrap();
+            seg.log_commit(7).unwrap();
+            seg.sync().unwrap();
+        }
+
+        assert_eq!(
+            marker_after_reopen(&db_path, 9).await,
+            0xBB,
+            "a committed transaction must be redone even though an undo record \
+             for the same page exists"
+        );
+    }
+
+    /// An explicit ABORT is treated exactly like a missing COMMIT.
+    #[tokio::test]
+    async fn an_aborted_transaction_is_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("abort.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            drop(DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap());
+        }
+        {
+            let wal_dir = db_path.with_extension("wal.d");
+            let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
+            seg.log_page_write(0, 9, &marker_page(0xAA)).unwrap();
+            seg.log_page_undo(7, 9, &marker_page(0xAA)).unwrap();
+            seg.log_page_write(7, 9, &marker_page(0xBB)).unwrap();
+            seg.log_abort(7).unwrap();
+            seg.sync().unwrap();
+        }
+
+        assert_eq!(marker_after_reopen(&db_path, 9).await, 0xAA);
+    }
+
+    /// Undo must not reach past a committed write that came AFTER the loser.
+    /// The loser's before-image is older than that commit, so restoring it
+    /// blindly would destroy acknowledged work.
+    #[tokio::test]
+    async fn undo_does_not_revert_a_later_committed_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("interleave.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            drop(DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap());
+        }
+        {
+            let wal_dir = db_path.with_extension("wal.d");
+            let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
+            seg.log_page_write(0, 9, &marker_page(0xAA)).unwrap();
+            // Loser writes and is stolen to disk.
+            seg.log_page_undo(7, 9, &marker_page(0xAA)).unwrap();
+            seg.log_page_write(7, 9, &marker_page(0xBB)).unwrap();
+            // A later transaction commits its own version of the same page.
+            seg.log_page_write(8, 9, &marker_page(0xCC)).unwrap();
+            seg.log_commit(8).unwrap();
+            seg.sync().unwrap();
+        }
+
+        assert_eq!(
+            marker_after_reopen(&db_path, 9).await,
+            0xCC,
+            "the latest COMMITTED image wins; undo must not restore an image \
+             older than an acknowledged write"
+        );
+    }
+
+    /// Transaction ids are minted from a counter that restarts at 1 on every
+    /// open, so recovery must floor it above everything the WAL already
+    /// mentions. Otherwise a fresh transaction inherits an old one's COMMIT
+    /// record and its uncommitted pages are replayed as committed.
+    #[tokio::test]
+    async fn transaction_ids_do_not_repeat_across_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("ids.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            drop(DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap());
+        }
+        {
+            let wal_dir = db_path.with_extension("wal.d");
+            let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
+            seg.log_page_write(500, 9, &marker_page(0xAA)).unwrap();
+            seg.log_commit(500).unwrap();
+            seg.sync().unwrap();
+        }
+
+        let catalog = Arc::new(Catalog::new());
+        let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+        let fresh = engine.begin_page_txn();
+        assert!(
+            fresh > 500,
+            "a fresh transaction id ({fresh}) must not collide with one the \
+             WAL already carries a COMMIT record for (500)"
+        );
     }
 
     /// After recovery disposes of WAL content, the fresh backend must mint

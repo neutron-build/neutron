@@ -31,6 +31,20 @@ pub const RECORD_PAGE_WRITE: u8 = 0;
 pub const RECORD_COMMIT: u8 = 1;
 pub const RECORD_ABORT: u8 = 2;
 pub const RECORD_CHECKPOINT: u8 = 3;
+/// A page's image from BEFORE an uncommitted transaction first modified it.
+///
+/// Written only on the steal path: the buffer pool evicting (or force-logging)
+/// a page that the transaction currently applying has dirtied. Without it,
+/// recovery has no way back — a redo-only page WAL can replay an uncommitted
+/// page image but cannot take it back, which is how a `kill -9` mid-COMMIT
+/// left a partial transaction durable. Carries a full page image, like
+/// RECORD_PAGE_WRITE.
+pub const RECORD_PAGE_UNDO: u8 = 4;
+
+/// Does this record type carry a full page image after its header?
+pub fn carries_page_image(record_type: u8) -> bool {
+    record_type == RECORD_PAGE_WRITE || record_type == RECORD_PAGE_UNDO
+}
 
 /// How the WAL should sync data to disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,10 +126,23 @@ const CONTROL_RECORD_SIZE: usize = RECORD_HEADER_SIZE + RECORD_CRC_SIZE;
 /// header — not just the page — means a corrupt page_id or txn_id is detected on
 /// replay instead of being silently applied to the wrong page / attributed to the
 /// wrong transaction. (Control records already CRC their header fields.)
-fn page_write_crc(lsn: u64, txn_id: u64, page_id: u32, page_image: &[u8]) -> u32 {
+///
+/// The record type is part of the authenticated bytes, so a RECORD_PAGE_UNDO
+/// whose type byte flipped to RECORD_PAGE_WRITE fails the CRC rather than
+/// being replayed as a redo — which would reinstate exactly the uncommitted
+/// image the undo record exists to remove. RECORD_PAGE_WRITE is 0, so page
+/// writes hash identically to before this became a parameter and the on-disk
+/// format is unchanged.
+fn page_image_crc(
+    lsn: u64,
+    txn_id: u64,
+    record_type: u8,
+    page_id: u32,
+    page_image: &[u8],
+) -> u32 {
     let mut crc = crc32c::crc32c(&lsn.to_le_bytes());
     crc = crc32c::crc32c_append(crc, &txn_id.to_le_bytes());
-    crc = crc32c::crc32c_append(crc, &[RECORD_PAGE_WRITE]);
+    crc = crc32c::crc32c_append(crc, &[record_type]);
     crc = crc32c::crc32c_append(crc, &page_id.to_le_bytes());
     crc32c::crc32c_append(crc, page_image)
 }
@@ -147,6 +174,20 @@ pub trait WalBackend: Send + Sync {
         txn_id: u64,
         page_id: u32,
         page_image: &PageBuf,
+    ) -> std::io::Result<u64>;
+
+    /// Log a page's pre-modification image so recovery can undo an
+    /// uncommitted write that reached the data file. See [`Wal::log_page_undo`].
+    ///
+    /// No default: a backend that silently dropped undo records would let a
+    /// caller believe an uncommitted page could be taken back when it could
+    /// not, which is the failure this whole path exists to remove. Every
+    /// backend states its answer.
+    fn log_page_undo(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        before_image: &PageBuf,
     ) -> std::io::Result<u64>;
     /// Force buffered WAL data to stable storage.
     fn sync(&self) -> std::io::Result<()>;
@@ -353,6 +394,32 @@ impl Wal {
         page_id: u32,
         page_image: &PageBuf,
     ) -> std::io::Result<u64> {
+        self.log_page_image(RECORD_PAGE_WRITE, txn_id, page_id, page_image)
+    }
+
+    /// Log a page's pre-modification image, so recovery can undo an
+    /// uncommitted write that eviction already pushed to the data file.
+    ///
+    /// Must be appended BEFORE the uncommitted image is written to disk — the
+    /// write-ahead rule applies to undo exactly as it does to redo, and in the
+    /// other order a crash between the two leaves the uncommitted bytes on
+    /// disk with nothing recording what they replaced.
+    pub fn log_page_undo(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        before_image: &PageBuf,
+    ) -> std::io::Result<u64> {
+        self.log_page_image(RECORD_PAGE_UNDO, txn_id, page_id, before_image)
+    }
+
+    fn log_page_image(
+        &self,
+        record_type: u8,
+        txn_id: u64,
+        page_id: u32,
+        page_image: &PageBuf,
+    ) -> std::io::Result<u64> {
         let mut writer = self.writer.lock();
         // LSN allocated under the writer lock: every LSN below next_lsn is
         // fully appended once the lock is held, so sync_covering() can report
@@ -363,12 +430,12 @@ impl Wal {
         writer.write_all(&record_len.to_le_bytes())?;
         writer.write_all(&lsn.to_le_bytes())?;
         writer.write_all(&txn_id.to_le_bytes())?;
-        writer.write_all(&[RECORD_PAGE_WRITE])?;
+        writer.write_all(&[record_type])?;
         writer.write_all(&page_id.to_le_bytes())?;
         writer.write_all(page_image)?;
 
-        // CRC over header (lsn/txn_id/type/page_id) + page image — see page_write_crc.
-        let crc = page_write_crc(lsn, txn_id, page_id, page_image);
+        // CRC over header (lsn/txn_id/type/page_id) + page image — see page_image_crc.
+        let crc = page_image_crc(lsn, txn_id, record_type, page_id, page_image);
         writer.write_all(&crc.to_le_bytes())?;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
@@ -454,6 +521,15 @@ impl WalBackend for Wal {
         page_image: &PageBuf,
     ) -> std::io::Result<u64> {
         Wal::log_page_write(self, txn_id, page_id, page_image)
+    }
+
+    fn log_page_undo(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        before_image: &PageBuf,
+    ) -> std::io::Result<u64> {
+        Wal::log_page_undo(self, txn_id, page_id, before_image)
     }
 
     fn sync(&self) -> std::io::Result<()> {
@@ -680,7 +756,7 @@ fn scan_inner(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64, TailState)> 
         let record_type = type_buf[0];
         let page_id = u32::from_le_bytes(pid_buf);
 
-        let page_image = if record_type == RECORD_PAGE_WRITE {
+        let page_image = if carries_page_image(record_type) {
             let mut img = Box::new([0u8; PAGE_SIZE]);
             file.read_exact(img.as_mut())?;
             Some(img)
@@ -693,11 +769,11 @@ fn scan_inner(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64, TailState)> 
         file.read_exact(&mut crc_buf)?;
         let stored_crc = u32::from_le_bytes(crc_buf);
 
-        if record_type == RECORD_PAGE_WRITE {
-            // For page writes, CRC is over the header (lsn/txn_id/type/page_id)
-            // plus the page image — see page_write_crc.
+        if carries_page_image(record_type) {
+            // For page-image records, CRC is over the header
+            // (lsn/txn_id/type/page_id) plus the page image — see page_image_crc.
             if let Some(ref img) = page_image {
-                let computed = page_write_crc(lsn, txn_id, page_id, img.as_ref());
+                let computed = page_image_crc(lsn, txn_id, record_type, page_id, img.as_ref());
                 if computed != stored_crc {
                     // Stop. Replaying past this would apply a page image whose
                     // predecessor is missing — see `scan_wal`.
@@ -957,6 +1033,26 @@ impl SegmentedWal {
         page_id: u32,
         page_image: &PageBuf,
     ) -> std::io::Result<u64> {
+        self.log_page_image(RECORD_PAGE_WRITE, txn_id, page_id, page_image)
+    }
+
+    /// Log a page's pre-modification image. See [`Wal::log_page_undo`].
+    pub fn log_page_undo(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        before_image: &PageBuf,
+    ) -> std::io::Result<u64> {
+        self.log_page_image(RECORD_PAGE_UNDO, txn_id, page_id, before_image)
+    }
+
+    fn log_page_image(
+        &self,
+        record_type: u8,
+        txn_id: u64,
+        page_id: u32,
+        page_image: &PageBuf,
+    ) -> std::io::Result<u64> {
         let mut active = self.active.lock();
         // LSN allocated under the segment lock — see Wal::log_page_write.
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
@@ -965,10 +1061,10 @@ impl SegmentedWal {
         active.writer.write_all(&record_len.to_le_bytes())?;
         active.writer.write_all(&lsn.to_le_bytes())?;
         active.writer.write_all(&txn_id.to_le_bytes())?;
-        active.writer.write_all(&[RECORD_PAGE_WRITE])?;
+        active.writer.write_all(&[record_type])?;
         active.writer.write_all(&page_id.to_le_bytes())?;
         active.writer.write_all(page_image)?;
-        let crc = page_write_crc(lsn, txn_id, page_id, page_image);
+        let crc = page_image_crc(lsn, txn_id, record_type, page_id, page_image);
         active.writer.write_all(&crc.to_le_bytes())?;
 
         active.bytes_written += record_len as u64;
@@ -1345,6 +1441,15 @@ impl WalBackend for SegmentedWal {
         SegmentedWal::log_page_write(self, txn_id, page_id, page_image)
     }
 
+    fn log_page_undo(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        before_image: &PageBuf,
+    ) -> std::io::Result<u64> {
+        SegmentedWal::log_page_undo(self, txn_id, page_id, before_image)
+    }
+
     fn sync(&self) -> std::io::Result<()> {
         SegmentedWal::sync(self)
     }
@@ -1695,6 +1800,70 @@ pub(crate) fn list_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Undo records (CAMPAIGN-02) ──────────────────────────────────────
+
+    #[test]
+    fn undo_record_roundtrips_with_its_page_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("undo.wal");
+        let wal = Wal::open(&wal_path).unwrap();
+
+        let before = [7u8; PAGE_SIZE];
+        let after = [9u8; PAGE_SIZE];
+        let undo_lsn = wal.log_page_undo(42, 3, &before).unwrap();
+        let write_lsn = wal.log_page_write(42, 3, &after).unwrap();
+        wal.sync().unwrap();
+
+        let records = read_wal_records(&wal_path).unwrap();
+        assert_eq!(records.len(), 2, "both records must survive the round trip");
+
+        assert_eq!(records[0].record_type, RECORD_PAGE_UNDO);
+        assert_eq!(records[0].lsn, undo_lsn);
+        assert_eq!(records[0].txn_id, 42);
+        assert_eq!(records[0].page_id, 3);
+        assert_eq!(
+            records[0].page_image.as_ref().expect("undo carries an image").as_ref(),
+            &before,
+            "the undo record must carry the BEFORE image, not the new one"
+        );
+
+        assert_eq!(records[1].record_type, RECORD_PAGE_WRITE);
+        assert_eq!(records[1].lsn, write_lsn);
+        assert_eq!(
+            records[1].page_image.as_ref().unwrap().as_ref(),
+            &after
+        );
+    }
+
+    /// The record type is inside the CRC, so an undo record cannot decay into
+    /// a redo record. If it could, a single flipped bit would reinstate
+    /// exactly the uncommitted page image the undo record exists to remove.
+    #[test]
+    fn an_undo_record_retyped_as_a_write_fails_its_crc() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("retype.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_page_undo(1, 5, &[3u8; PAGE_SIZE]).unwrap();
+            wal.sync().unwrap();
+        }
+
+        // The type byte sits after the 4-byte length, 8-byte LSN and 8-byte
+        // txn id — see the record layout in `log_page_image`.
+        const TYPE_OFFSET: u64 = 4 + 8 + 8;
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        assert_eq!(bytes[TYPE_OFFSET as usize], RECORD_PAGE_UNDO);
+        bytes[TYPE_OFFSET as usize] = RECORD_PAGE_WRITE;
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        let records = read_wal_records(&wal_path).unwrap();
+        assert!(
+            records.is_empty(),
+            "a retyped undo record must fail its CRC and stop replay, not be \
+             replayed as a redo; got {records:?}"
+        );
+    }
 
     // ── Single-file WAL tests ───────────────────────────────────────────
 

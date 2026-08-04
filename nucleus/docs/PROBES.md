@@ -109,16 +109,28 @@ crashes, hangs, and self-inconsistency rather than wrong answers.
 | `probe_blob` | Blob chunk-store differential **and** crash consistency. |
 | `probe_soak` | Sustained concurrent mixed-model load (T1.4 / M11). |
 
-### `probe_txn_atomicity` is expected to FAIL
+### `probe_txn_atomicity` is now a PASSING gate (was expected to fail)
 
-It is a **regression test for an open bug**, not a passing gate. It demonstrates
-that a crash mid-`COMMIT` leaves a partial transaction durable at the shipped
-32 MB pool size. The route is buffer-pool eviction writing uncommitted pages
-inline — not a WAL sync problem, which is why no audit finding named it.
+It was a regression test for an open bug: a crash mid-`COMMIT` left a partial
+transaction durable at the shipped 32 MB pool size, because buffer-pool
+eviction wrote uncommitted pages to the data file inline. Measured before the
+fix: 2 of 3 rounds torn at the shipped pool, 8 of 8 at a small one.
 
-Turning this green is the acceptance criterion for CAMPAIGN-02, and doing so
-needs UNDO, not merely transaction identity in the page WAL. Do not "fix" it by
-weakening the probe.
+CAMPAIGN-02 closed it — page-WAL records carry real transaction ids, the steal
+path logs a before-image, and recovery undoes any transaction with no COMMIT
+record. Both configurations are now clean, in both directions: no torn state,
+and a generation the child acknowledged is still there afterwards.
+
+**Treat a failure here as a real regression.** Run it after anything touching
+the buffer pool, the page WAL, or the commit path:
+
+```sh
+cargo run --release --features server --bin probe_txn_atomicity -- --rounds 3 --rows 400000 --pool 2048
+cargo run --release --features server --bin probe_txn_atomicity -- --rounds 8 --rows 60000  --pool 256
+```
+
+The second is the harsher one — a smaller pool steals more. Do not "fix" a
+failure by weakening the probe.
 
 ## Benchmarks
 
