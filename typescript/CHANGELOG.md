@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`not-found.tsx` renders a 404 through the app's layout chain.** A
+  `not-found.tsx` in the routes directory is discovered like any other route,
+  which is what gives it a layout chain, and the server renders it through the
+  same path a normal page takes before forcing the status to 404. One per
+  directory is allowed and the deepest one covering the request wins, so a miss
+  under `/admin` can look like the admin app rather than the marketing site.
+
+  Two things it deliberately does not do: it is withheld from URL matching, so
+  `/not-found` 404s like any other unknown path; and it takes its directory's
+  path without being inserted into the trie, so it cannot shadow that
+  directory's index route. A `not-found.tsx` that throws falls back to the
+  plain `notFound()` response rather than turning every bad URL into a 500.
+
+  Adding one is optional — an app without it keeps the standalone document
+  described below.
+
 ### Changed
 
 - **`notFound()` returns an HTML document instead of bare text.** It previously
@@ -18,9 +36,9 @@ All notable changes to this project are documented in this file.
   updating to assert on status and content instead. Behaviour for callers
   passing their own full document is unchanged.
 
-  This does NOT render through the app's layout chain. That needs a
-  `not-found.tsx` convention and the loader data those layouts expect; this
-  makes the default presentable and is not that feature.
+  This is the fallback for an app with no `not-found.tsx`; it does not render
+  through the layout chain. See the entry above for the route convention that
+  does.
 
 ### Fixed
 

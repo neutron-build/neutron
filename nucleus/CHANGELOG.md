@@ -33,6 +33,52 @@ but it means SQL that ran yesterday can fail today. Read this before upgrading.
   optimisation, never a correctness guarantee. If safety can be expressed as a
   predicate, express it there.
 
+### Fixed
+
+- **A table created inside a transaction was unreadable in that transaction.**
+
+  ```sql
+  BEGIN;
+  CREATE TABLE t (id INT);
+  INSERT INTO t VALUES (1);   -- reported "INSERT 0 1"
+  SELECT COUNT(*) FROM t;     -- ERROR: table 't' not found in storage
+  ```
+
+  `create_table` on the buffered disk engine recorded an op and returned
+  without touching the engine, so a read in the same transaction went to an
+  engine that had never heard of the table. The INSERT reporting success first
+  is what made it expensive: the failure surfaced a statement later, somewhere
+  else.
+
+  This is the shape of every migration, and a migration runner that wraps each
+  migration in a transaction — the correct thing to do — could not create and
+  then populate a table. `ALTER TABLE ... RENAME` is create-new/copy/drop-old
+  underneath and failed the same way, so a table rebuild failed too.
+
+  The fix is narrow because the gap was: DML already read its own writes
+  through the buffer overlay, and only a table existing solely in the buffer
+  had no base to overlay onto. A missing base now reads as empty *only* when
+  this transaction created that table, so a genuinely missing table still
+  errors rather than silently scanning as empty.
+
+- **PITR reported success while omitting the newest commits.** A WAL segment
+  reached the archive only when it FILLED, so the recovery point was the last
+  rollover rather than the last commit. At the default 64 MiB segment a
+  low-write database can run for days without rolling over, and none of it was
+  recoverable; a clean shutdown did not archive the tail either, so a planned
+  deploy or failover lost every commit since the segment began. Measured before
+  the fix: a restore that recovered 1 of 3 rows printed "PITR restore
+  complete".
+
+  `archive_active()` now seals and archives the segment being written — on
+  graceful shutdown, and on a timer set by `NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS`
+  (default 60s). **That timeout is the recovery-point objective**, and it
+  defaults on rather than off, because configuring an archive at all is a
+  statement that you want point-in-time recovery. Empty segments are skipped so
+  the timer cannot litter the archive. `restore-pitr` now reports the recovery
+  point in wall-clock time and states what is not in it; an LSN alone reads as
+  success.
+
 ## [0.1.5] - 2026-08-04
 
 ### Fixed
