@@ -203,7 +203,8 @@ fn row_literal(id: i64, val: i64) -> String {
 async fn create_indexes(o: &mut Oracle) {
     o.hot_only("CREATE INDEX t_val ON t (val)").await;
     o.hot_only("CREATE INDEX t_txt ON t (txt)").await;
-    o.hot_only("CREATE INDEX t_body ON t USING GIN (body)").await;
+    o.hot_only("CREATE INDEX t_body ON t USING GIN (body)")
+        .await;
     o.hot_only("CREATE INDEX t_v ON t USING hnsw (v)").await;
 }
 
@@ -214,8 +215,10 @@ async fn probe_all(o: &mut Oracle, rng: &mut Rng) {
     o.probe("SELECT * FROM t ORDER BY id").await;
     o.probe(&format!("SELECT id FROM t WHERE val = {k} ORDER BY id"))
         .await;
-    o.probe(&format!("SELECT id, txt FROM t WHERE val > {k} ORDER BY id"))
-        .await;
+    o.probe(&format!(
+        "SELECT id, txt FROM t WHERE val > {k} ORDER BY id"
+    ))
+    .await;
     o.probe(&format!(
         "SELECT id FROM t WHERE txt = 's{}' ORDER BY id",
         k % 7
@@ -366,14 +369,16 @@ async fn one_transition(o: &mut Oracle, rng: &mut Rng, next_id: &mut i64) {
             o.hot_only("DROP INDEX t_val").await;
             o.hot_only("DROP INDEX t_body").await;
             o.hot_only("CREATE INDEX t_val ON t (val)").await;
-            o.hot_only("CREATE INDEX t_body ON t USING GIN (body)").await;
+            o.hot_only("CREATE INDEX t_body ON t USING GIN (body)")
+                .await;
         }
         13 => {
             // Column DDL: add, rename there-and-back, drop.
             o.mutate("ALTER TABLE t ADD COLUMN extra INT").await;
             o.mutate("UPDATE t SET extra = val + 1").await;
             o.probe("SELECT id, extra FROM t ORDER BY id").await;
-            o.mutate("ALTER TABLE t RENAME COLUMN extra TO extra2").await;
+            o.mutate("ALTER TABLE t RENAME COLUMN extra TO extra2")
+                .await;
             o.probe("SELECT id, extra2 FROM t ORDER BY id").await;
             o.mutate("ALTER TABLE t DROP COLUMN extra2").await;
         }
@@ -513,7 +518,11 @@ async fn cache_oracle_precondition_every_transition_really_runs() {
     ] {
         match outcome_of(ex.execute(sql).await) {
             Outcome::Select { rows, .. } => {
-                assert_eq!(rows.len(), 1, "probe returned no rows, so it proves nothing: {sql}")
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "probe returned no rows, so it proves nothing: {sql}"
+                )
             }
             other => panic!("oracle probe is not answerable: {sql} -> {other:?}"),
         }
@@ -556,7 +565,8 @@ async fn copy_from_maintains_specialty_indexes() {
     // Named explicitly rather than only through the random probe set, so a
     // regression names the index that went stale.
     o.probe("SELECT id FROM t WHERE val = 1 ORDER BY id").await; // B-tree
-    o.probe("SELECT id FROM t WHERE txt = 's1' ORDER BY id").await; // B-tree on TEXT
+    o.probe("SELECT id FROM t WHERE txt = 's1' ORDER BY id")
+        .await; // B-tree on TEXT
     o.probe("SELECT id FROM t WHERE body @> '{\"k\": 1}' ORDER BY id")
         .await; // GIN
     o.probe("SELECT COUNT(*) FROM t").await;
@@ -580,7 +590,11 @@ async fn copy_from_maintains_specialty_indexes() {
 // is filtered, for every route a policy can be installed through.
 
 async fn setup_rls_fixture(ex: &Executor) -> u64 {
-    exec(ex, "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, body TEXT)").await;
+    exec(
+        ex,
+        "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, body TEXT)",
+    )
+    .await;
     exec(
         ex,
         "INSERT INTO docs VALUES (1, 'alice', 'a1'), (2, 'bob', 'b1'), (3, 'alice', 'a2')",
@@ -597,7 +611,10 @@ const DOCS_SELECT: &str = "SELECT id FROM docs ORDER BY id";
 const DOCS_COUNT: &str = "SELECT COUNT(*) FROM docs";
 
 async fn session_rows(ex: &Executor, sid: u64, sql: &str) -> Vec<Vec<Value>> {
-    let out = ex.execute_with_session(sid, sql).await.expect("query failed");
+    let out = ex
+        .execute_with_session(sid, sql)
+        .await
+        .expect("query failed");
     rows(&out[0]).clone()
 }
 
@@ -705,7 +722,12 @@ async fn policy_activation_invalidates_cached_rows_after_commit() {
 
     exec(&ex, "COMMIT").await;
 
-    assert_policy_enforced(&ex, sid, "policy DDL committed from an explicit transaction").await;
+    assert_policy_enforced(
+        &ex,
+        sid,
+        "policy DDL committed from an explicit transaction",
+    )
+    .await;
 }
 
 /// A rolled-back policy must leave neither an enforcing policy nor a cache

@@ -2674,7 +2674,11 @@ mod tests {
         run(&ex, "ROLLBACK").await;
 
         let res = run(&ex, "SELECT a FROM wide WHERE b > 0").await;
-        assert_eq!(rows(&res[0]).len(), 180, "rollback removed the buffered row");
+        assert_eq!(
+            rows(&res[0]).len(),
+            180,
+            "rollback removed the buffered row"
+        );
     }
 
     // Audit: ADD COLUMN on an INDEXED table (disk engine). The backfill's

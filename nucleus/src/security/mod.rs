@@ -262,9 +262,9 @@ impl RlsPredicate {
                 left || right
             }
             RlsPredicate::Not(inner) => inner.rename_column(column_id, new_name),
-            RlsPredicate::HasRole { .. }
-            | RlsPredicate::AlwaysTrue
-            | RlsPredicate::AlwaysFalse => false,
+            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
+                false
+            }
         }
     }
 
@@ -314,9 +314,8 @@ impl RlsPredicate {
                 b.bind_column_ids(resolve);
             }
             RlsPredicate::Not(inner) => inner.bind_column_ids(resolve),
-            RlsPredicate::HasRole { .. }
-            | RlsPredicate::AlwaysTrue
-            | RlsPredicate::AlwaysFalse => {}
+            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
+            }
         }
     }
 
@@ -340,9 +339,8 @@ impl RlsPredicate {
                 b.referenced_column_ids(out);
             }
             RlsPredicate::Not(inner) => inner.referenced_column_ids(out),
-            RlsPredicate::HasRole { .. }
-            | RlsPredicate::AlwaysTrue
-            | RlsPredicate::AlwaysFalse => {}
+            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
+            }
         }
     }
 
@@ -361,9 +359,8 @@ impl RlsPredicate {
                 b.referenced_column_names(out);
             }
             RlsPredicate::Not(inner) => inner.referenced_column_names(out),
-            RlsPredicate::HasRole { .. }
-            | RlsPredicate::AlwaysTrue
-            | RlsPredicate::AlwaysFalse => {}
+            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
+            }
         }
     }
 
@@ -1399,7 +1396,10 @@ mod tests {
             table: "orders".into(),
             command: PolicyCommand::All,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqTenant { column: "org_id".into(), column_id: 0 },
+            predicate: RlsPredicate::ColumnEqTenant {
+                column: "org_id".into(),
+                column_id: 0,
+            },
             check_predicate: None,
             permissive: true,
         });
@@ -1534,7 +1534,10 @@ mod tests {
             table: "docs".into(),
             command: PolicyCommand::Select,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqUser { column: "owner".into(), column_id: 0 },
+            predicate: RlsPredicate::ColumnEqUser {
+                column: "owner".into(),
+                column_id: 0,
+            },
             check_predicate: None,
             permissive: true,
         });
@@ -1545,8 +1548,11 @@ mod tests {
             table: "docs".into(),
             command: PolicyCommand::Select,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqStr { column: "status".into(),
-                value: "published".into(), column_id: 0 },
+            predicate: RlsPredicate::ColumnEqStr {
+                column: "status".into(),
+                value: "published".into(),
+                column_id: 0,
+            },
             check_predicate: None,
             permissive: false,
         });
@@ -1575,7 +1581,10 @@ mod tests {
             table: "items".into(),
             command: PolicyCommand::Select,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqTenant { column: "tenant".into(), column_id: 0 },
+            predicate: RlsPredicate::ColumnEqTenant {
+                column: "tenant".into(),
+                column_id: 0,
+            },
             check_predicate: None,
             permissive: true,
         });
@@ -1704,7 +1713,10 @@ mod tests {
             table: "orders".into(),
             command: PolicyCommand::All,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqTenant { column: "org_id".into(), column_id: 0 },
+            predicate: RlsPredicate::ColumnEqTenant {
+                column: "org_id".into(),
+                column_id: 0,
+            },
             check_predicate: None,
             permissive: true,
         });
@@ -1967,7 +1979,10 @@ mod masking_identity_tests {
         assert!(engine.rename_column("people", 7, "ssn", "national_id"));
         let policy = &engine.all_policies()[0];
         assert_eq!(policy.column, "national_id");
-        assert_eq!(policy.column_id, 7, "the id should be stamped while renaming");
+        assert_eq!(
+            policy.column_id, 7,
+            "the id should be stamped while renaming"
+        );
 
         // The escalation the id closes: recreate the old name. The mask must
         // stay on the column it was written for.

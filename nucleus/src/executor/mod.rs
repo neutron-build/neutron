@@ -114,20 +114,20 @@ mod join;
 mod logical_dump;
 #[cfg(feature = "server")]
 pub use logical_dump::open_persistent_executor;
+mod external_sort;
+mod hash_aggregate;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod meta_persistence;
 pub mod param_subst;
 mod policy;
 mod project;
-mod external_sort;
-mod hash_aggregate;
 mod query;
 pub(crate) mod row_batch;
 mod scalar_fns;
 mod scan_stream;
 mod schema_types;
-mod spill;
 mod session;
+mod spill;
 mod txn;
 mod types;
 
@@ -777,7 +777,9 @@ impl Executor {
             {
                 let kv_dir = dir.join("kv");
                 std::fs::create_dir_all(&kv_dir).ok();
-                if let Some(kv) = Self::open_durable("KV", &kv_dir, crate::kv::KvStore::open(&kv_dir)) {
+                if let Some(kv) =
+                    Self::open_durable("KV", &kv_dir, crate::kv::KvStore::open(&kv_dir))
+                {
                     exec.kv_store = Arc::new(kv);
                 }
             }
@@ -785,18 +787,22 @@ impl Executor {
             // Document store: WAL + cold tier
             let doc_dir = dir.join("doc");
             std::fs::create_dir_all(&doc_dir).ok();
-            if let Some(doc) =
-                Self::open_durable("Document", &doc_dir, crate::document::DocumentStore::open(&doc_dir))
-            {
+            if let Some(doc) = Self::open_durable(
+                "Document",
+                &doc_dir,
+                crate::document::DocumentStore::open(&doc_dir),
+            ) {
                 *exec.doc_store.write() = doc;
             }
 
             // Graph store: WAL + cold tier
             let graph_dir = dir.join("graph");
             std::fs::create_dir_all(&graph_dir).ok();
-            if let Some(graph) =
-                Self::open_durable("Graph", &graph_dir, crate::graph::GraphStore::open(&graph_dir))
-            {
+            if let Some(graph) = Self::open_durable(
+                "Graph",
+                &graph_dir,
+                crate::graph::GraphStore::open(&graph_dir),
+            ) {
                 *exec.graph_store.write() = graph;
             }
 
@@ -897,9 +903,11 @@ impl Executor {
             // Columnar store: WAL-backed crash-recovery
             let col_dir = dir.join("columnar");
             std::fs::create_dir_all(&col_dir).ok();
-            if let Some(col) =
-                Self::open_durable("Columnar", &col_dir, crate::columnar::ColumnarStore::open(&col_dir))
-            {
+            if let Some(col) = Self::open_durable(
+                "Columnar",
+                &col_dir,
+                crate::columnar::ColumnarStore::open(&col_dir),
+            ) {
                 *exec.columnar_store.write() = col;
             }
 
@@ -4142,9 +4150,7 @@ impl Executor {
         // The OLTP fast path bypasses `execute_statement`, so it needs its own
         // degraded-mode gate; otherwise a read-only server would still accept
         // single-row INSERT/UPDATE/DELETE.
-        if self.service.is_read_only()
-            && !matches!(cmd, SqlFastPathCommand::PointSelect { .. })
-        {
+        if self.service.is_read_only() && !matches!(cmd, SqlFastPathCommand::PointSelect { .. }) {
             let label = match cmd {
                 SqlFastPathCommand::SimpleInsert { .. } => "INSERT",
                 SqlFastPathCommand::PointUpdate { .. } => "UPDATE",
@@ -4578,7 +4584,9 @@ impl Executor {
             // serving database. This is that way.
             #[cfg(feature = "server")]
             if upper.starts_with("BACKUP DATABASE TO ") {
-                let rest = trimmed["BACKUP DATABASE TO ".len()..].trim().trim_end_matches(';');
+                let rest = trimmed["BACKUP DATABASE TO ".len()..]
+                    .trim()
+                    .trim_end_matches(';');
                 let force = rest.to_uppercase().ends_with(" FORCE");
                 let path_part = if force {
                     rest[..rest.len() - " FORCE".len()].trim()
@@ -4908,7 +4916,11 @@ impl Executor {
         for statement in statements {
             // Materialization boundary (see execute_statements_dispatch): a
             // replicated result must be materialized, never a lazy stream.
-            let r = self.execute_statement(statement).await?.materialize().await?;
+            let r = self
+                .execute_statement(statement)
+                .await?
+                .materialize()
+                .await?;
             results.push(r);
         }
         Ok(results)
@@ -4967,10 +4979,7 @@ impl Executor {
         // This runs FIRST so an aborted transaction reports 25P02 for every
         // statement, exactly as PostgreSQL does, rather than being masked by a
         // read-only refusal that would tell the client the wrong thing.
-        let is_txn_end = matches!(
-            &stmt,
-            Statement::Commit { .. } | Statement::Rollback { .. }
-        );
+        let is_txn_end = matches!(&stmt, Statement::Commit { .. } | Statement::Rollback { .. });
         {
             let session = self.current_session();
             let tx = session.txn_state.read().await;
@@ -5086,7 +5095,9 @@ impl Executor {
         // pressure. That case was observed in production — a retention job
         // failing with 53200 during exactly the pressure it existed to relieve.
         if is_dml_write
-            && self.reject_writes_on_memory_critical.load(Ordering::Relaxed)
+            && self
+                .reject_writes_on_memory_critical
+                .load(Ordering::Relaxed)
             && self.memory_critical.load(Ordering::Relaxed)
             && !matches!(&stmt, Statement::Delete(_) | Statement::Truncate(_))
         {
@@ -5853,7 +5864,13 @@ impl Executor {
             settings
                 .get("hnsw.ef_search")
                 .or_else(|| settings.get("hnsw_ef_search"))
-                .and_then(|v| v.trim().trim_matches('\'').trim_matches('"').parse::<usize>().ok())
+                .and_then(|v| {
+                    v.trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .parse::<usize>()
+                        .ok()
+                })
                 .map(|v| v.clamp(1, 65_536))
         };
 
@@ -6345,7 +6362,10 @@ impl Executor {
         // `search_scored` is conjunctive, the same rule `text_matches` applies,
         // so the candidate set is exactly the matching set for a current index.
         let hits = entry.index.search_scored(query, usize::MAX);
-        Some((entry.pk_column.clone(), hits.into_iter().map(|(id, _)| id).collect()))
+        Some((
+            entry.pk_column.clone(),
+            hits.into_iter().map(|(id, _)| id).collect(),
+        ))
     }
 
     /// An upper bound on the number of rows `query` can match on `column`,
@@ -6778,12 +6798,16 @@ impl Executor {
         match name.to_ascii_lowercase().as_str() {
             // Procedural-language handlers execute foreign code we do not run.
             "plpython3u" | "plpythonu" | "plperl" | "plperlu" | "plv8" | "plr" | "pltcl"
-            | "pltclu" => Some("procedural-language extensions are not supported: Nucleus does \
-                 not execute PL/Python, PL/Perl, PL/v8, PL/R, or PL/Tcl code"),
+            | "pltclu" => Some(
+                "procedural-language extensions are not supported: Nucleus does \
+                 not execute PL/Python, PL/Perl, PL/v8, PL/R, or PL/Tcl code",
+            ),
             // Foreign-data / cross-database links reach systems we cannot proxy.
             "postgres_fdw" | "dblink" | "file_fdw" | "mysql_fdw" | "oracle_fdw" | "tds_fdw" => {
-                Some("foreign-data-wrapper extensions are not supported: Nucleus cannot proxy \
-                 external data sources")
+                Some(
+                    "foreign-data-wrapper extensions are not supported: Nucleus cannot proxy \
+                 external data sources",
+                )
             }
             _ => None,
         }
@@ -7599,12 +7623,36 @@ impl Executor {
                     },
                 ];
                 let rows = vec![
-                    vec![Value::Int32(2), Value::Text("heap".into()), Value::Text("t".into())],
-                    vec![Value::Int32(403), Value::Text("btree".into()), Value::Text("i".into())],
-                    vec![Value::Int32(405), Value::Text("hash".into()), Value::Text("i".into())],
-                    vec![Value::Int32(783), Value::Text("gist".into()), Value::Text("i".into())],
-                    vec![Value::Int32(2742), Value::Text("gin".into()), Value::Text("i".into())],
-                    vec![Value::Int32(3580), Value::Text("brin".into()), Value::Text("i".into())],
+                    vec![
+                        Value::Int32(2),
+                        Value::Text("heap".into()),
+                        Value::Text("t".into()),
+                    ],
+                    vec![
+                        Value::Int32(403),
+                        Value::Text("btree".into()),
+                        Value::Text("i".into()),
+                    ],
+                    vec![
+                        Value::Int32(405),
+                        Value::Text("hash".into()),
+                        Value::Text("i".into()),
+                    ],
+                    vec![
+                        Value::Int32(783),
+                        Value::Text("gist".into()),
+                        Value::Text("i".into()),
+                    ],
+                    vec![
+                        Value::Int32(2742),
+                        Value::Text("gin".into()),
+                        Value::Text("i".into()),
+                    ],
+                    vec![
+                        Value::Int32(3580),
+                        Value::Text("brin".into()),
+                        Value::Text("i".into()),
+                    ],
                 ];
                 Ok(Some((cols, rows)))
             }
@@ -8134,7 +8182,8 @@ impl Executor {
                     .collect();
                 Ok(Some((cols, rows)))
             }
-            "information_schema.key_column_usage" | "information_schema.constraint_column_usage" => {
+            "information_schema.key_column_usage"
+            | "information_schema.constraint_column_usage" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = [
                     ("constraint_catalog", DataType::Text),

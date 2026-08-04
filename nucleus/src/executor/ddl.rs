@@ -910,7 +910,11 @@ impl Executor {
                         && let Some(eng) = self.table_engines.read().get(&table_name)
                         && let Some(col) = eng.as_columnar()
                     {
-                        col.register_merge_tree(&table_name, positional_key.clone(), strategy.clone());
+                        col.register_merge_tree(
+                            &table_name,
+                            positional_key.clone(),
+                            strategy.clone(),
+                        );
                     }
                     if positional_key.len() != order_by_cols.len() {
                         tracing::warn!(
@@ -1090,11 +1094,7 @@ impl Executor {
     }
 
     /// The analyzer declared on a column, or the engine default.
-    pub(super) async fn column_analyzer(
-        &self,
-        table: &str,
-        column: &str,
-    ) -> crate::fts::Analyzer {
+    pub(super) async fn column_analyzer(&self, table: &str, column: &str) -> crate::fts::Analyzer {
         let Some(def) = self.catalog.get_table(table).await else {
             return crate::fts::Analyzer::default();
         };
@@ -2270,7 +2270,7 @@ impl Executor {
                         // silently resolve to this new one — which is the
                         // rename-then-re-add attack with extra steps.
                         id: table_def.next_column_id(),
-                    analyzer: None,
+                        analyzer: None,
                     };
                     let mut updated = (*table_def).clone();
                     updated.columns.push(new_col);
@@ -2385,7 +2385,11 @@ impl Executor {
                                 } else {
                                     String::new()
                                 },
-                                if dependents.len() > 1 { "policies" } else { "policy" }
+                                if dependents.len() > 1 {
+                                    "policies"
+                                } else {
+                                    "policy"
+                                }
                             )));
                         }
                         {

@@ -762,9 +762,7 @@ pub(crate) struct RangeBound {
 
 /// If `expr` is a range comparison (`<`, `<=`, `>`, `>=`) on a column against a literal,
 /// return `(col_name, RangeBound)`.  Returns None for equality, LIKE, or other forms.
-pub(crate) fn extract_range_bound(
-    expr: &sqlparser::ast::Expr,
-) -> Option<(String, RangeBound)> {
+pub(crate) fn extract_range_bound(expr: &sqlparser::ast::Expr) -> Option<(String, RangeBound)> {
     use sqlparser::ast::BinaryOperator;
     if let sqlparser::ast::Expr::BinaryOp { left, op, right } = expr {
         // col op literal

@@ -489,7 +489,10 @@ fn main_impl() {
     let ex = probe.executor().clone();
 
     println!("Nucleus crash/panic fuzzer ({} functions)", FUNCS.len());
-    println!("seed={seed} iterations={iterations} engine={}", probe.label());
+    println!(
+        "seed={seed} iterations={iterations} engine={}",
+        probe.label()
+    );
     if !probe.covers_paged_storage() {
         println!(
             "NOTE: no paged storage under test — a panic reachable only through \

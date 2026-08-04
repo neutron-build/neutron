@@ -52,9 +52,9 @@ fn child_main(dir: &str) -> ! {
     // ERRORED line and can assert the failure surfaced.
     let mut saw_error = false;
     if rt
-        .block_on(db.execute(
-            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, m INTEGER NOT NULL)",
-        ))
+        .block_on(
+            db.execute("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, m INTEGER NOT NULL)"),
+        )
         .is_err()
     {
         saw_error = true;

@@ -906,8 +906,14 @@ async fn test_stream_writes_roll_back() {
     // The committed entry is still there: rollback reverted the transaction's
     // writes, not the stream.
     let kinds = stext(&ex, "SELECT STREAM_XRANGE('events', 0, 9999999999999, 100)").await;
-    assert!(kinds.contains("committed"), "rollback ate a committed entry: {kinds}");
-    assert!(!kinds.contains("aborted"), "rollback kept an aborted entry: {kinds}");
+    assert!(
+        kinds.contains("committed"),
+        "rollback ate a committed entry: {kinds}"
+    );
+    assert!(
+        !kinds.contains("aborted"),
+        "rollback kept an aborted entry: {kinds}"
+    );
 }
 
 /// A stream CREATED inside an aborted transaction must not survive it.
@@ -918,7 +924,10 @@ async fn test_a_stream_created_in_an_aborted_transaction_disappears() {
     exec(&ex, "SELECT STREAM_XADD('ephemeral', 'k', 'v')").await;
     exec(&ex, "ROLLBACK").await;
     let len = stext(&ex, "SELECT STREAM_XLEN('ephemeral')").await;
-    assert_eq!(len, "0", "the stream outlived the transaction that created it");
+    assert_eq!(
+        len, "0",
+        "the stream outlived the transaction that created it"
+    );
 }
 
 /// COMMIT keeps stream writes — the rollback path must not have made them
@@ -930,5 +939,8 @@ async fn test_committed_stream_writes_survive() {
     exec(&ex, "SELECT STREAM_XADD('events', 'kind', 'kept')").await;
     exec(&ex, "COMMIT").await;
     let kinds = stext(&ex, "SELECT STREAM_XRANGE('events', 0, 9999999999999, 100)").await;
-    assert!(kinds.contains("kept"), "COMMIT dropped a stream write: {kinds}");
+    assert!(
+        kinds.contains("kept"),
+        "COMMIT dropped a stream write: {kinds}"
+    );
 }

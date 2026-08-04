@@ -164,10 +164,19 @@ pub fn io_fault(name: &str) -> Option<std::io::Error> {
         std::env::var("NUCLEUS_IOFAULT_KIND").unwrap_or_else(|_| "full".to_string())
     });
     let (k, msg) = match kind.as_str() {
-        "perm" => (std::io::ErrorKind::PermissionDenied, "injected permission denied"),
-        "ro" => (std::io::ErrorKind::PermissionDenied, "injected read-only filesystem"),
+        "perm" => (
+            std::io::ErrorKind::PermissionDenied,
+            "injected permission denied",
+        ),
+        "ro" => (
+            std::io::ErrorKind::PermissionDenied,
+            "injected read-only filesystem",
+        ),
         "io" => (std::io::ErrorKind::Other, "injected I/O error"),
-        _ => (std::io::ErrorKind::StorageFull, "injected no space left on device"),
+        _ => (
+            std::io::ErrorKind::StorageFull,
+            "injected no space left on device",
+        ),
     };
     Some(std::io::Error::new(k, msg))
 }

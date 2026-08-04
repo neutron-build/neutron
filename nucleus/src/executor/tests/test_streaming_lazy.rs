@@ -19,7 +19,12 @@ fn arc_executor(dir: &std::path::Path) -> Arc<Executor> {
     let catalog = Arc::new(crate::catalog::Catalog::new());
     let storage: Arc<dyn crate::storage::StorageEngine> =
         Arc::new(crate::storage::MemoryEngine::new());
-    let ex = Arc::new(Executor::new_with_persistence(catalog, storage, None, Some(dir)));
+    let ex = Arc::new(Executor::new_with_persistence(
+        catalog,
+        storage,
+        None,
+        Some(dir),
+    ));
     ex.install_self_ref();
     ex
 }
@@ -61,7 +66,10 @@ async fn assert_lazy_matches(ex: &Executor, sid: u64, sql: &str) {
     assert!(streamed.is_stream(), "should stream lazily: {sql}");
     let (stream_cols, stream_rows) = drain(streamed).await;
 
-    assert_eq!(stream_cols, base_cols, "columns mismatch (up-front schema): {sql}");
+    assert_eq!(
+        stream_cols, base_cols,
+        "columns mismatch (up-front schema): {sql}"
+    );
     assert_eq!(
         as_multiset(&stream_rows),
         as_multiset(&base_rows),
@@ -132,10 +140,7 @@ async fn lazy_distinct_matches_and_streams() {
         .await
         .unwrap();
 
-    for sql in [
-        "SELECT DISTINCT k FROM d",
-        "SELECT DISTINCT k, name FROM d",
-    ] {
+    for sql in ["SELECT DISTINCT k FROM d", "SELECT DISTINCT k, name FROM d"] {
         assert_lazy_matches(&ex, sid, sql).await;
     }
     let leftover = std::fs::read_dir(dir.path().join("spill"))
@@ -145,12 +150,18 @@ async fn lazy_distinct_matches_and_streams() {
 }
 
 async fn seed_join(ex: &Executor, sid: u64, orders: usize, keys: i64) {
-    ex.execute_with_session(sid, "CREATE TABLE orders (oid BIGINT, cid BIGINT, opay TEXT)")
-        .await
-        .unwrap();
-    ex.execute_with_session(sid, "CREATE TABLE customers (cid BIGINT, name TEXT, cpay TEXT)")
-        .await
-        .unwrap();
+    ex.execute_with_session(
+        sid,
+        "CREATE TABLE orders (oid BIGINT, cid BIGINT, opay TEXT)",
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(
+        sid,
+        "CREATE TABLE customers (cid BIGINT, name TEXT, cpay TEXT)",
+    )
+    .await
+    .unwrap();
     let pad = "x".repeat(180);
     let mut ov = String::new();
     for i in 0..orders {
@@ -298,7 +309,11 @@ async fn materialized_distinct_order_by_limit_dedups_first() {
             _ => panic!("expected Int64"),
         })
         .collect();
-    assert_eq!(got, vec![0, 1, 2, 3, 4, 5], "DISTINCT must dedup before LIMIT");
+    assert_eq!(
+        got,
+        vec![0, 1, 2, 3, 4, 5],
+        "DISTINCT must dedup before LIMIT"
+    );
 
     // DISTINCT + LIMIT with no ORDER BY: still six DISTINCT values, not ≤6 raw rows.
     let (_, rows2) = drain(one_result(&ex, sid, "SELECT DISTINCT k FROM d LIMIT 6").await).await;
@@ -370,5 +385,8 @@ async fn lazy_join_oversized_key_errors_on_drain() {
     let leftover = std::fs::read_dir(dir.path().join("spill"))
         .map(|rd| rd.count())
         .unwrap_or(0);
-    assert_eq!(leftover, 0, "spill reclaimed even on the drain-time error path");
+    assert_eq!(
+        leftover, 0,
+        "spill reclaimed even on the drain-time error path"
+    );
 }

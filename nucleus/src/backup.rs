@@ -189,7 +189,11 @@ impl DataDirLock {
         if !path.exists() {
             return false;
         }
-        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&path) else {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        else {
             // Cannot even open it — assume in use rather than assume safe.
             return true;
         };
@@ -580,7 +584,9 @@ fn copy_wal_upto(src_dir: &Path, dst_dir: &Path, end_lsn: u64) -> io::Result<()>
 /// `BACKUP DATABASE TO '/var/lib/nucleus/data/backup'` is an easy thing to type,
 /// so it must fail clearly and immediately.
 fn reject_nested_destination(data_dir: &Path, output_dir: &Path) -> io::Result<()> {
-    let src = data_dir.canonicalize().unwrap_or_else(|_| data_dir.to_path_buf());
+    let src = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
     // The destination usually does not exist yet: canonicalize its nearest
     // existing ancestor, then re-attach the remainder.
     let mut probe = output_dir.to_path_buf();
@@ -784,7 +790,10 @@ pub fn verify_snapshot(input_dir: &Path, manifest: &BackupManifest) -> io::Resul
     let mut problems: Vec<String> = Vec::new();
     for got in &actual {
         match expected.get(got.path.as_str()) {
-            None => problems.push(format!("{}: present in snapshot but not in manifest", got.path)),
+            None => problems.push(format!(
+                "{}: present in snapshot but not in manifest",
+                got.path
+            )),
             Some(want) => {
                 if want.len != got.len {
                     problems.push(format!(
@@ -797,8 +806,7 @@ pub fn verify_snapshot(input_dir: &Path, manifest: &BackupManifest) -> io::Resul
             }
         }
     }
-    let seen: std::collections::HashSet<&str> =
-        actual.iter().map(|f| f.path.as_str()).collect();
+    let seen: std::collections::HashSet<&str> = actual.iter().map(|f| f.path.as_str()).collect();
     for want in &manifest.files {
         if !seen.contains(want.path.as_str()) {
             problems.push(format!("{}: missing from snapshot", want.path));
@@ -882,7 +890,12 @@ mod tests {
         // The three data files plus the identity file the backup established.
         let checksummed: std::collections::HashSet<&str> =
             m.files.iter().map(|f| f.path.as_str()).collect();
-        for rel in ["catalog.json", "wal/000001.wal", "storage/t.dat", DB_ID_NAME] {
+        for rel in [
+            "catalog.json",
+            "wal/000001.wal",
+            "storage/t.dat",
+            DB_ID_NAME,
+        ] {
             assert!(
                 checksummed.contains(rel),
                 "{rel} is missing from the manifest's checksums: {:?}",
@@ -1133,7 +1146,11 @@ mod tests {
             err.to_string().contains("refusing to restore"),
             "unexpected error: {err}"
         );
-        assert_eq!(before, dir_fingerprint(&b), "refusal damaged the destination");
+        assert_eq!(
+            before,
+            dir_fingerprint(&b),
+            "refusal damaged the destination"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1161,8 +1178,7 @@ mod tests {
         );
 
         // The explicit override still works, and records the caveat.
-        let m =
-            backup_data_dir_opts(&data, &root.join("snap"), false, "0.1.1", true).unwrap();
+        let m = backup_data_dir_opts(&data, &root.join("snap"), false, "0.1.1", true).unwrap();
         assert!(
             m.taken_while_in_use,
             "an override backup must be marked inconsistent in the manifest"
@@ -1205,7 +1221,9 @@ mod tests {
 
         let target = root.join("live");
         write(&target, "catalog.json", b"{}");
-        let lock = DataDirLock::acquire(&target).unwrap().expect("lock acquired");
+        let lock = DataDirLock::acquire(&target)
+            .unwrap()
+            .expect("lock acquired");
         let before = dir_fingerprint(&target);
         let err = restore_data_dir(&snap, &target, true, "0.1.1").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);

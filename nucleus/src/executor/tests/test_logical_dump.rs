@@ -31,7 +31,11 @@ async fn logical_dump_round_trips_data_across_types() {
     exec(&src, "INSERT INTO users VALUES (1, 'alice', 9.5, 'hi')").await;
     // Embedded single quote + a NULL column must survive the literal emitter.
     exec(&src, "INSERT INTO users VALUES (2, 'o''brien', 0.0, NULL)").await;
-    exec(&src, "INSERT INTO users VALUES (3, 'bob', -1.25, 'multi word')").await;
+    exec(
+        &src,
+        "INSERT INTO users VALUES (3, 'bob', -1.25, 'multi word')",
+    )
+    .await;
 
     let script = src.dump_logical().await.expect("dump");
 
@@ -102,13 +106,25 @@ async fn persistent_open_dump_restore_round_trip() {
 
     // Populate a persistent database, then drop it (flush to disk).
     {
-        let src = open_persistent_executor(src_dir.path()).await.expect("open src");
-        exec(&src, "CREATE TABLE acct (id INT PRIMARY KEY, owner TEXT NOT NULL, bal INT)").await;
-        exec(&src, "INSERT INTO acct VALUES (1, 'alice', 100), (2, 'bob', 250)").await;
+        let src = open_persistent_executor(src_dir.path())
+            .await
+            .expect("open src");
+        exec(
+            &src,
+            "CREATE TABLE acct (id INT PRIMARY KEY, owner TEXT NOT NULL, bal INT)",
+        )
+        .await;
+        exec(
+            &src,
+            "INSERT INTO acct VALUES (1, 'alice', 100), (2, 'bob', 250)",
+        )
+        .await;
     }
 
     // Reopen from disk — constraints must come back from catalog.json — and dump.
-    let reopened = open_persistent_executor(src_dir.path()).await.expect("reopen src");
+    let reopened = open_persistent_executor(src_dir.path())
+        .await
+        .expect("reopen src");
     let script = reopened.dump_logical().await.expect("dump");
     assert!(
         script.contains("PRIMARY KEY"),
@@ -116,7 +132,9 @@ async fn persistent_open_dump_restore_round_trip() {
     );
 
     // Restore into a fresh persistent instance and verify data + a live PK.
-    let dst = open_persistent_executor(dst_dir.path()).await.expect("open dst");
+    let dst = open_persistent_executor(dst_dir.path())
+        .await
+        .expect("open dst");
     dst.restore_logical(&script).await.expect("restore");
 
     let a = all_rows(&reopened, "SELECT id, owner, bal FROM acct ORDER BY id").await;
@@ -170,7 +188,11 @@ async fn build_full_database(ex: &Executor) {
     .await;
 
     // An explicitly created sequence, advanced past its start.
-    exec(ex, "CREATE SEQUENCE ticket_seq INCREMENT BY 5 START WITH 100").await;
+    exec(
+        ex,
+        "CREATE SEQUENCE ticket_seq INCREMENT BY 5 START WITH 100",
+    )
+    .await;
     exec(ex, "SELECT nextval('ticket_seq')").await; // → 100
     exec(ex, "SELECT nextval('ticket_seq')").await; // → 105
 
@@ -189,7 +211,11 @@ async fn build_full_database(ex: &Executor) {
     .await;
 
     // Privileges, then the security boundary itself.
-    exec(ex, "GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO alice, bob").await;
+    exec(
+        ex,
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO alice, bob",
+    )
+    .await;
     exec(ex, "GRANT SELECT ON org TO alice, bob").await;
     exec(
         ex,
@@ -263,7 +289,12 @@ async fn logical_dump_round_trips_roles_policies_sequences_views_and_functions()
         .await
         .expect("select owners as alice")
         .first()
-        .map(|r| rows(r).iter().filter_map(|row| row.first().cloned()).collect())
+        .map(|r| {
+            rows(r)
+                .iter()
+                .filter_map(|row| row.first().cloned())
+                .collect()
+        })
         .unwrap_or_default();
     assert_eq!(
         owners,
@@ -278,7 +309,10 @@ async fn logical_dump_round_trips_roles_policies_sequences_views_and_functions()
 
     // WITH CHECK still rejects a write that would escape the policy.
     let escape = dst
-        .execute_with_session(sid, "INSERT INTO docs (org_id, owner, body) VALUES (1, 'bob', 'x')")
+        .execute_with_session(
+            sid,
+            "INSERT INTO docs (org_id, owner, body) VALUES (1, 'bob', 'x')",
+        )
         .await;
     assert!(
         escape.is_err(),
@@ -452,7 +486,11 @@ async fn logical_dump_reports_what_it_cannot_express() {
     .expect("install mask");
 
     let gaps = src.logical_dump_gaps();
-    assert_eq!(gaps.len(), 1, "the column mask must be reported, got {gaps:?}");
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the column mask must be reported, got {gaps:?}"
+    );
     assert_eq!(gaps[0].kind, "masking_policy");
 }
 

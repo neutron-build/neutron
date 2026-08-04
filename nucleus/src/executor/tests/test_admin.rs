@@ -1059,11 +1059,19 @@ async fn test_create_extension_if_not_exists_idempotent() {
 async fn test_pg_extension_introspection() {
     let ex = test_executor();
     // A fresh cluster ships plpgsql, matching Postgres.
-    let sel = exec(&ex, "SELECT extname FROM pg_extension WHERE extname = 'plpgsql'").await;
+    let sel = exec(
+        &ex,
+        "SELECT extname FROM pg_extension WHERE extname = 'plpgsql'",
+    )
+    .await;
     assert_eq!(rows(&sel[0]).len(), 1);
 
     exec(&ex, "CREATE EXTENSION IF NOT EXISTS pg_trgm").await;
-    let sel = exec(&ex, "SELECT extname, extversion FROM pg_extension ORDER BY extname").await;
+    let sel = exec(
+        &ex,
+        "SELECT extname, extversion FROM pg_extension ORDER BY extname",
+    )
+    .await;
     let names: Vec<String> = rows(&sel[0])
         .iter()
         .map(|r| match &r[0] {
@@ -1138,7 +1146,11 @@ async fn test_psql_describe_table_pipeline() {
     )
     .await;
     let found = rows(&lookup[0]);
-    assert_eq!(found.len(), 1, "regex relation lookup must find dsc: {found:?}");
+    assert_eq!(
+        found.len(),
+        1,
+        "regex relation lookup must find dsc: {found:?}"
+    );
     let oid = match &found[0][0] {
         Value::Int32(n) => *n,
         other => panic!("expected int oid, got {other:?}"),
@@ -1157,7 +1169,11 @@ async fn test_psql_describe_table_pipeline() {
     let d = rows(&detail[0]);
     assert_eq!(d.len(), 1);
     assert_eq!(d[0][1], Value::Text("r".into()));
-    assert_eq!(d[0][2], Value::Bool(true), "PK table must report relhasindex");
+    assert_eq!(
+        d[0][2],
+        Value::Bool(true),
+        "PK table must report relhasindex"
+    );
 
     // Query 3: columns with format_type — vector renders with its dimension.
     let cols = exec(
@@ -1175,7 +1191,11 @@ async fn test_psql_describe_table_pipeline() {
     assert_eq!(c[0][1], Value::Text("integer".into()));
     assert_eq!(c[0][2], Value::Bool(true), "PK column is NOT NULL");
     assert_eq!(c[1][1], Value::Text("text".into()));
-    assert_eq!(c[2][1], Value::Text("vector(3)".into()), "vector typmod must render");
+    assert_eq!(
+        c[2][1],
+        Value::Text("vector(3)".into()),
+        "vector typmod must render"
+    );
 
     // Query 4: index listing — pg_get_indexdef synthesizes a real definition.
     let idx = exec(

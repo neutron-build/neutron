@@ -95,7 +95,8 @@ async fn start_nucleus_server(port: u16, engine: &str) {
         // A benchmark whose result is decided by the storage medium is not a
         // benchmark of the database.
         "disk" | "buffered-disk" => {
-            let dir = std::env::temp_dir().join(format!("nucleus-pgcompare-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("nucleus-pgcompare-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let disk = Arc::new(
                 nucleus::storage::DiskEngine::open(&dir.join("bench.db"), catalog.clone())

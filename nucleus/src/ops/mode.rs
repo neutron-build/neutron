@@ -11,7 +11,7 @@
 //! disk-triggered read-only state, and an operator-requested read-only is
 //! never silently cleared by a background task.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 

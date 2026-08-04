@@ -118,7 +118,11 @@ async fn run_delete(
     // shape that made this path quadratic before. Count it, do not assume.
     println!(
         "        overlay rebuilds: {}  rows materialised={ov_rows} ({:.0} rows per delete)",
-        if ov.is_empty() { "none".into() } else { ov.join(" ") },
+        if ov.is_empty() {
+            "none".into()
+        } else {
+            ov.join(" ")
+        },
         ov_rows as f64 / deletes as f64
     );
     let elapsed = t.elapsed().as_micros();

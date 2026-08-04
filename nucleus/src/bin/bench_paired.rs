@@ -14,8 +14,7 @@
 //! latency/throughput/recall numbers a human wants to eyeball.
 
 use nucleus::bench_paired::{
-    VectorDist, bench_fts, bench_fts_sql, bench_graph, bench_vector_dist,
-    bench_vector_scale_sweep,
+    VectorDist, bench_fts, bench_fts_sql, bench_graph, bench_vector_dist, bench_vector_scale_sweep,
 };
 
 /// `bench_paired fts-sql [docs] [queries]` — B5: full-text search through the
@@ -27,7 +26,10 @@ fn fts_sql_mode(docs: usize, queries: usize) {
         .expect("runtime");
     let r = rt.block_on(bench_fts_sql(docs, queries, 0xB5_F7_50));
     println!("\nB5 — full-text search over the SQL surface");
-    println!("  corpus              {} docs, {} queries", r.docs, r.queries);
+    println!(
+        "  corpus              {} docs, {} queries",
+        r.docs, r.queries
+    );
     println!("  CREATE INDEX        {:.1} ms", r.build_ms);
     println!();
     println!("                      indexed      scan   speedup   mean hits");
@@ -76,7 +78,10 @@ fn main() {
     // `bench_paired sweep [n] [dim] [k] [queries]` — one clustered build,
     // recall/min-recall across an ef sweep (scale-dip diagnosis).
     if args.get(1).map(String::as_str) == Some("sweep") {
-        let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let n: usize = args
+            .get(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_000);
         let dim: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
         let k: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
         let queries: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
@@ -86,7 +91,10 @@ fn main() {
     }
 
     if args.get(1).map(String::as_str) == Some("scale") {
-        let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let n: usize = args
+            .get(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_000);
         let dim: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
         let k: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
         let queries: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
@@ -142,7 +150,15 @@ fn main() {
             println!(
                 "  {:>9} {:>6} {:>4} {:>3} {:>7} {:>10.1} {:>11.1} {:>10.0} {:>9.3} {:>9.3}",
                 label,
-                r.n, r.dim, r.k, r.queries, r.hnsw_avg_us, r.brute_avg_us, r.qps, r.avg_recall, r.min_recall
+                r.n,
+                r.dim,
+                r.k,
+                r.queries,
+                r.hnsw_avg_us,
+                r.brute_avg_us,
+                r.qps,
+                r.avg_recall,
+                r.min_recall
             );
         }
     }
@@ -165,7 +181,10 @@ fn main() {
             if r.all_sets_exact { "YES" } else { "NO!" }
         );
         if !r.all_sets_exact {
-            eprintln!("  !! {} / {} queries diverged from reference", r.mismatches, r.queries);
+            eprintln!(
+                "  !! {} / {} queries diverged from reference",
+                r.mismatches, r.queries
+            );
         }
     }
 

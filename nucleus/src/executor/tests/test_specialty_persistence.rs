@@ -402,11 +402,7 @@ async fn test_fts_index_survives_restart() {
 
     {
         let ex = open_executor(dir.path()).await;
-        exec(
-            &ex,
-            "CREATE TABLE articles (id INT PRIMARY KEY, body TEXT)",
-        )
-        .await;
+        exec(&ex, "CREATE TABLE articles (id INT PRIMARY KEY, body TEXT)").await;
         exec(
             &ex,
             "INSERT INTO articles VALUES (1, 'machine learning pipelines')",
@@ -417,7 +413,11 @@ async fn test_fts_index_survives_restart() {
             "INSERT INTO articles VALUES (2, 'database storage engines')",
         )
         .await;
-        exec(&ex, "CREATE INDEX articles_fts ON articles USING FTS (body)").await;
+        exec(
+            &ex,
+            "CREATE INDEX articles_fts ON articles USING FTS (body)",
+        )
+        .await;
 
         let r = exec(
             &ex,

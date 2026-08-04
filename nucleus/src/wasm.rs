@@ -183,9 +183,9 @@ fn exec_result_to_js(r: ExecResult) -> JsResultRepr {
             message: None,
         },
         // The executor materializes results before they reach the WASM boundary.
-        ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => unreachable!(
-            "streams must be materialized before the WASM result adapter"
-        ),
+        ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => {
+            unreachable!("streams must be materialized before the WASM result adapter")
+        }
     }
 }
 

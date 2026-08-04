@@ -472,7 +472,9 @@ impl Executor {
             self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
             return match sub_result? {
                 ExecResult::Select { rows, .. } => Ok(Some(
-                    rows.into_iter().filter_map(|r| r.into_iter().next()).collect(),
+                    rows.into_iter()
+                        .filter_map(|r| r.into_iter().next())
+                        .collect(),
                 )),
                 _ => Ok(Some(Vec::new())),
             };
@@ -1776,9 +1778,7 @@ impl Executor {
             // ::regproc — function-name pseudo-type. Nucleus renders regproc
             // values as their text name already, so the cast is the identity
             // on text (prisma casts pg_type.typinput::regproc::text).
-            ast::DataType::Custom(name, _)
-                if name.to_string().eq_ignore_ascii_case("regproc") =>
-            {
+            ast::DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("regproc") => {
                 Ok(match &val {
                     Value::Text(_) | Value::Int32(_) | Value::Int64(_) => val,
                     _ => Value::Null,
@@ -1786,9 +1786,7 @@ impl Executor {
             }
             // '<type name>'::regtype — sqlparser has no first-class REGTYPE, so
             // it arrives as a custom type. Resolves to the type OID.
-            ast::DataType::Custom(name, _)
-                if name.to_string().eq_ignore_ascii_case("regtype") =>
-            {
+            ast::DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("regtype") => {
                 Ok(match &val {
                     Value::Text(s) => regtype_oid(s).map(Value::Int32).unwrap_or(Value::Null),
                     Value::Int32(_) => val,
@@ -1811,7 +1809,8 @@ impl Executor {
                 Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Text(val.to_string())),
             },
-            ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => match val {
+            ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => match val
+            {
                 Value::Null => Ok(Value::Null),
                 Value::Int32(_) => Ok(val),
                 Value::Int64(n) => i32::try_from(n)
@@ -2034,7 +2033,9 @@ impl Executor {
                         ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))
                     })?,
                     _ => {
-                        return Err(ExecError::Unsupported("cannot cast to SMALLINT".to_string()));
+                        return Err(ExecError::Unsupported(
+                            "cannot cast to SMALLINT".to_string(),
+                        ));
                     }
                 };
                 if (i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&n) {
@@ -2051,7 +2052,9 @@ impl Executor {
 /// PostgreSQL float8→int4 semantics: round half-to-even, error out of range.
 fn f64_to_i32(n: f64) -> Result<i32, ExecError> {
     if n.is_nan() || n.is_infinite() {
-        return Err(ExecError::Runtime("cannot cast non-finite to integer".into()));
+        return Err(ExecError::Runtime(
+            "cannot cast non-finite to integer".into(),
+        ));
     }
     let r = n.round_ties_even();
     if r >= i32::MIN as f64 && r <= i32::MAX as f64 {
@@ -2064,7 +2067,9 @@ fn f64_to_i32(n: f64) -> Result<i32, ExecError> {
 /// PostgreSQL float8→int8 semantics: round half-to-even, error out of range.
 fn f64_to_i64(n: f64) -> Result<i64, ExecError> {
     if n.is_nan() || n.is_infinite() {
-        return Err(ExecError::Runtime("cannot cast non-finite to bigint".into()));
+        return Err(ExecError::Runtime(
+            "cannot cast non-finite to bigint".into(),
+        ));
     }
     let r = n.round_ties_even();
     if r >= i64::MIN as f64 && r < 9_223_372_036_854_775_808.0 {
@@ -2130,7 +2135,11 @@ pub(super) fn regclass_oid(name: &str) -> Option<i32> {
 /// Covers the names ORM introspection actually passes; unknown names map to
 /// None (callers yield NULL, so comparisons degrade to no-match).
 pub(super) fn regtype_oid(name: &str) -> Option<i32> {
-    let n = name.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+    let n = name
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_lowercase();
     let n = n.strip_prefix("pg_catalog.").unwrap_or(&n);
     match n {
         "bool" | "boolean" => Some(16),
@@ -2179,7 +2188,11 @@ pub(super) fn parse_pg_array_literal(s: &str) -> Vec<Value> {
     let mut chars = inner.chars().peekable();
     let push = |cur: &mut String, was_quoted: bool, out: &mut Vec<Value>| {
         let raw = std::mem::take(cur);
-        let trimmed = if was_quoted { raw } else { raw.trim().to_string() };
+        let trimmed = if was_quoted {
+            raw
+        } else {
+            raw.trim().to_string()
+        };
         if trimmed.is_empty() && !was_quoted {
             return;
         }

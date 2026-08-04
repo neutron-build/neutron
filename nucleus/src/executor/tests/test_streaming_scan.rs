@@ -90,16 +90,16 @@ async fn unsupported_shapes_do_not_stream() {
     // (A WHERE predicate DOES stream, but only when an owning Arc self-ref is
     // installed — `test_executor` is by-value, so it declines here too.)
     for sql in [
-        "SELECT * FROM t WHERE id > 5",      // predicate — no self-ref ⇒ declines
+        "SELECT * FROM t WHERE id > 5", // predicate — no self-ref ⇒ declines
         "SELECT * FROM t ORDER BY id LIMIT 5", // sort + LIMIT (top-K fast path)
-        "SELECT * FROM t ORDER BY id + 1",   // computed sort key
-        "SELECT * FROM t ORDER BY 1",        // positional sort key
-        "SELECT DISTINCT * FROM t",          // distinct
-        "SELECT COUNT(*) FROM t",            // aggregate
+        "SELECT * FROM t ORDER BY id + 1", // computed sort key
+        "SELECT * FROM t ORDER BY 1",   // positional sort key
+        "SELECT DISTINCT * FROM t",     // distinct
+        "SELECT COUNT(*) FROM t",       // aggregate
         "SELECT * FROM t GROUP BY id, name", // group by
-        "SELECT id + 1 FROM t",              // computed projection
-        "SELECT t.id FROM t",                // qualified projection
-        "SELECT UPPER(name) FROM t",         // function projection
+        "SELECT id + 1 FROM t",         // computed projection
+        "SELECT t.id FROM t",           // qualified projection
+        "SELECT UPPER(name) FROM t",    // function projection
         "WITH c AS (SELECT * FROM t) SELECT * FROM c", // CTE
     ] {
         let r = one_result(&ex, sid, sql).await;
@@ -116,13 +116,13 @@ async fn projection_and_limit_match_materialized() {
     seed(&ex, sid, 3000).await;
 
     let cases = [
-        "SELECT id FROM t",             // single-column projection
-        "SELECT name, id FROM t",       // reordered projection
-        "SELECT id AS x, name FROM t",  // aliased projection
-        "SELECT * FROM t LIMIT 5",      // limit only
-        "SELECT * FROM t LIMIT 0",      // zero limit
-        "SELECT * FROM t OFFSET 2990",  // offset near end
-        "SELECT * FROM t LIMIT 5 OFFSET 3", // limit + offset
+        "SELECT id FROM t",                     // single-column projection
+        "SELECT name, id FROM t",               // reordered projection
+        "SELECT id AS x, name FROM t",          // aliased projection
+        "SELECT * FROM t LIMIT 5",              // limit only
+        "SELECT * FROM t LIMIT 0",              // zero limit
+        "SELECT * FROM t OFFSET 2990",          // offset near end
+        "SELECT * FROM t LIMIT 5 OFFSET 3",     // limit + offset
         "SELECT id FROM t LIMIT 4 OFFSET 2500", // projection + limit + offset crossing batches
     ];
     for sql in cases {
@@ -340,10 +340,10 @@ async fn streaming_order_by_matches_materialized() {
     let cases = [
         "SELECT * FROM s ORDER BY id",
         "SELECT * FROM s ORDER BY id DESC",
-        "SELECT * FROM s ORDER BY grp",            // dups + NULLs, ASC → NULLS LAST
-        "SELECT * FROM s ORDER BY grp DESC",       // dups + NULLs, DESC → NULLS FIRST
+        "SELECT * FROM s ORDER BY grp", // dups + NULLs, ASC → NULLS LAST
+        "SELECT * FROM s ORDER BY grp DESC", // dups + NULLs, DESC → NULLS FIRST
         "SELECT * FROM s ORDER BY grp NULLS FIRST", // explicit NULLS placement
-        "SELECT * FROM s ORDER BY grp, id",        // multi-key: stable within grp
+        "SELECT * FROM s ORDER BY grp, id", // multi-key: stable within grp
         "SELECT * FROM s ORDER BY grp DESC, id ASC",
         "SELECT name, id FROM s ORDER BY grp, id", // sort by non-projected column
         "SELECT id AS x FROM s ORDER BY id",       // aliased projection + source-col key
@@ -437,5 +437,8 @@ async fn streaming_order_by_spills_under_memory_limit_and_matches() {
     let spill_files = std::fs::read_dir(dir.path().join("spill"))
         .map(|rd| rd.count())
         .unwrap_or(0);
-    assert_eq!(spill_files, 0, "spill files must be reclaimed after the query");
+    assert_eq!(
+        spill_files, 0,
+        "spill files must be reclaimed after the query"
+    );
 }

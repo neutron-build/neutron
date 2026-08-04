@@ -80,7 +80,11 @@ fn assert_visible_ids(rows_out: &[Row], label: &str) {
         .collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids, vec![1, 3], "RLS LEAK via {label}: id set {ids:?} != alice's {{1,3}}");
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "RLS LEAK via {label}: id set {ids:?} != alice's {{1,3}}"
+    );
 }
 
 /// Run `sql` as alice; a surface that errors has failed closed (acceptable).
@@ -117,10 +121,22 @@ async fn rls_holds_across_scan_fast_paths_and_predicate_shapes() {
     exec(&ex, "CREATE INDEX docs_owner_idx ON docs (owner)").await;
 
     // Point lookup straight at the forbidden key (index scan fast path).
-    attack(&ex, sid, "index point lookup", "SELECT * FROM docs WHERE id = 2").await;
+    attack(
+        &ex,
+        sid,
+        "index point lookup",
+        "SELECT * FROM docs WHERE id = 2",
+    )
+    .await;
     // Index-only scan: the projection never touches a fingerprinted column,
     // so assert the id set directly.
-    let out = attack(&ex, sid, "index-only scan", "SELECT id FROM docs ORDER BY id").await;
+    let out = attack(
+        &ex,
+        sid,
+        "index-only scan",
+        "SELECT id FROM docs ORDER BY id",
+    )
+    .await;
     assert_visible_ids(&out, "index-only scan");
     // Predicate on the policy column itself, naming the other tenant.
     attack(
@@ -170,9 +186,13 @@ async fn rls_holds_across_aggregate_and_window_paths() {
     let sid = setup(&ex).await;
 
     // Aggregates must be computed over visible rows only.
-    let r = exec_session(&ex, sid, "SELECT COUNT(*), MAX(score), SUM(score) FROM docs")
-        .await
-        .unwrap();
+    let r = exec_session(
+        &ex,
+        sid,
+        "SELECT COUNT(*), MAX(score), SUM(score) FROM docs",
+    )
+    .await
+    .unwrap();
     let row = &rows(&r[0])[0];
     assert_eq!(row[0], Value::Int64(2), "COUNT leaked hidden rows");
     assert_ne!(row[1], Value::Int32(99), "MAX leaked hidden score");
@@ -346,7 +366,9 @@ async fn subqueries_execute_under_the_invoking_principal() {
 
     // The principal seen inside a subquery must be the session's, not the
     // bootstrap identity.
-    let r = exec_session(&ex, sid, "SELECT (SELECT CURRENT_USER)").await.unwrap();
+    let r = exec_session(&ex, sid, "SELECT (SELECT CURRENT_USER)")
+        .await
+        .unwrap();
     assert_eq!(
         scalar(&r[0]),
         &Value::Text("alice".into()),
@@ -379,13 +401,9 @@ async fn subqueries_execute_under_the_invoking_principal() {
         "EXISTS saw a row the policy hides"
     );
 
-    let r = exec_session(
-        &ex,
-        sid,
-        "SELECT 99 = ANY (SELECT score FROM docs)",
-    )
-    .await
-    .unwrap();
+    let r = exec_session(&ex, sid, "SELECT 99 = ANY (SELECT score FROM docs)")
+        .await
+        .unwrap();
     assert_ne!(
         scalar(&r[0]),
         &Value::Bool(true),
@@ -508,7 +526,10 @@ async fn rls_filters_every_copy_export_shape() {
     .await
     .unwrap();
     if let ExecResult::CopyOutBinary { row_count, .. } = &r[0] {
-        assert_eq!(*row_count, 0, "adversarial COPY(query) exported hidden rows");
+        assert_eq!(
+            *row_count, 0,
+            "adversarial COPY(query) exported hidden rows"
+        );
     }
 }
 
@@ -603,12 +624,7 @@ async fn rls_blocks_exfiltration_through_write_paths() {
 
     // COPY FROM must apply WITH CHECK: a row for another owner is rejected.
     let before = rows(&exec(&ex, "SELECT COUNT(*) FROM docs").await[0])[0][0].clone();
-    let _ = exec_session(
-        &ex,
-        sid,
-        "COPY docs FROM STDIN\n4\tbob\tinjected\t7\n\\.\n",
-    )
-    .await;
+    let _ = exec_session(&ex, sid, "COPY docs FROM STDIN\n4\tbob\tinjected\t7\n\\.\n").await;
     let after = rows(&exec(&ex, "SELECT COUNT(*) FROM docs").await[0])[0][0].clone();
     assert_eq!(before, after, "COPY FROM bypassed WITH CHECK");
 }
@@ -636,7 +652,11 @@ async fn rls_holds_through_views_caches_and_reused_plans() {
 
     // A materialized view stores rows without policy provenance: it must fail
     // closed for an RLS session rather than serve the superuser's snapshot.
-    exec(&ex, "CREATE MATERIALIZED VIEW docs_mv AS SELECT * FROM docs").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW docs_mv AS SELECT * FROM docs",
+    )
+    .await;
     match exec_session(&ex, sid, "SELECT * FROM docs_mv").await {
         Err(_) => {}
         Ok(res) => {
@@ -651,12 +671,24 @@ async fn rls_holds_through_views_caches_and_reused_plans() {
     // Warm the cache as the superuser, then re-read as alice: a cached
     // full-table result must not be served across principals.
     let _ = exec(&ex, "SELECT * FROM docs ORDER BY id").await;
-    attack(&ex, sid, "cache reuse after superuser read", "SELECT * FROM docs ORDER BY id").await;
+    attack(
+        &ex,
+        sid,
+        "cache reuse after superuser read",
+        "SELECT * FROM docs ORDER BY id",
+    )
+    .await;
 
     // Same statement text, executed repeatedly, must not warm a plan that
     // drops the policy filter on later runs.
     for _ in 0..5 {
-        attack(&ex, sid, "repeated plan reuse", "SELECT * FROM docs WHERE id = 2").await;
+        attack(
+            &ex,
+            sid,
+            "repeated plan reuse",
+            "SELECT * FROM docs WHERE id = 2",
+        )
+        .await;
     }
 }
 
@@ -759,7 +791,8 @@ async fn rls_does_not_leak_hidden_rows_through_diagnostics() {
     }
 
     // A plain EXPLAIN must not execute the query into its output either.
-    if let Ok(res) = exec_session(&ex, sid, "EXPLAIN SELECT * FROM docs WHERE owner = 'bob'").await {
+    if let Ok(res) = exec_session(&ex, sid, "EXPLAIN SELECT * FROM docs WHERE owner = 'bob'").await
+    {
         for item in &res {
             if let ExecResult::Select { rows, .. } = item {
                 let text: String = rows
@@ -799,10 +832,26 @@ async fn rls_holds_on_every_storage_engine() {
     let disk_catalog = Arc::new(Catalog::new());
     let disk = DiskEngine::open(&tmp.path().join("rls.db"), disk_catalog.clone()).unwrap();
     let engines: Vec<(&str, Arc<Catalog>, Arc<dyn StorageEngine>)> = vec![
-        ("memory", Arc::new(Catalog::new()), Arc::new(MemoryEngine::new())),
-        ("mvcc", Arc::new(Catalog::new()), Arc::new(MvccStorageAdapter::new())),
-        ("columnar", Arc::new(Catalog::new()), Arc::new(ColumnarStorageEngine::new())),
-        ("lsm", Arc::new(Catalog::new()), Arc::new(LsmStorageEngine::new())),
+        (
+            "memory",
+            Arc::new(Catalog::new()),
+            Arc::new(MemoryEngine::new()),
+        ),
+        (
+            "mvcc",
+            Arc::new(Catalog::new()),
+            Arc::new(MvccStorageAdapter::new()),
+        ),
+        (
+            "columnar",
+            Arc::new(Catalog::new()),
+            Arc::new(ColumnarStorageEngine::new()),
+        ),
+        (
+            "lsm",
+            Arc::new(Catalog::new()),
+            Arc::new(LsmStorageEngine::new()),
+        ),
         ("disk", disk_catalog, Arc::new(disk)),
     ];
 
@@ -813,9 +862,18 @@ async fn rls_holds_on_every_storage_engine() {
         for (label, sql) in [
             ("full scan", "SELECT * FROM docs"),
             ("point lookup", "SELECT * FROM docs WHERE id = 2"),
-            ("policy-column predicate", "SELECT * FROM docs WHERE owner = 'bob'"),
-            ("aggregate", "SELECT owner, COUNT(*) FROM docs GROUP BY owner"),
-            ("order by limit", "SELECT * FROM docs ORDER BY score DESC LIMIT 1"),
+            (
+                "policy-column predicate",
+                "SELECT * FROM docs WHERE owner = 'bob'",
+            ),
+            (
+                "aggregate",
+                "SELECT owner, COUNT(*) FROM docs GROUP BY owner",
+            ),
+            (
+                "order by limit",
+                "SELECT * FROM docs ORDER BY score DESC LIMIT 1",
+            ),
             ("correlated subquery", "SELECT (SELECT COUNT(*) FROM docs)"),
         ] {
             let scoped = format!("{name}/{label}");
@@ -823,7 +881,9 @@ async fn rls_holds_on_every_storage_engine() {
         }
 
         // COUNT must agree with the visible row set on every engine.
-        let r = exec_session(&ex, sid, "SELECT COUNT(*) FROM docs").await.unwrap();
+        let r = exec_session(&ex, sid, "SELECT COUNT(*) FROM docs")
+            .await
+            .unwrap();
         assert_eq!(
             scalar(&r[0]),
             &Value::Int64(2),
@@ -848,13 +908,7 @@ async fn constraint_and_cascade_paths_do_not_move_hidden_row_content() {
     // Inserting a duplicate of a HIDDEN key: PostgreSQL reveals existence via
     // the unique violation, and so does Nucleus. The error must not carry the
     // hidden row's contents.
-    match exec_session(
-        &ex,
-        sid,
-        "INSERT INTO docs VALUES (2, 'alice', 'probe', 1)",
-    )
-    .await
-    {
+    match exec_session(&ex, sid, "INSERT INTO docs VALUES (2, 'alice', 'probe', 1)").await {
         Err(e) => {
             let msg = e.to_string();
             assert!(
@@ -878,7 +932,11 @@ async fn constraint_and_cascade_paths_do_not_move_hidden_row_content() {
         "CREATE TABLE child (cid INT PRIMARY KEY, doc_id INT REFERENCES docs(id))",
     )
     .await;
-    exec(&ex, "GRANT SELECT, INSERT, UPDATE, DELETE ON child TO alice").await;
+    exec(
+        &ex,
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON child TO alice",
+    )
+    .await;
 
     // Referencing a hidden parent: allowed or denied, but must not echo the
     // parent's content back.
@@ -950,7 +1008,12 @@ async fn trigger_bodies_do_not_launder_protected_rows() {
     .await
     .is_ok();
 
-    let _ = exec_session(&ex, sid, "INSERT INTO audit SELECT id, owner, body FROM docs").await;
+    let _ = exec_session(
+        &ex,
+        sid,
+        "INSERT INTO audit SELECT id, owner, body FROM docs",
+    )
+    .await;
     let r = exec_session(&ex, sid, "SELECT * FROM audit").await.unwrap();
     assert!(
         !leaks(rows(&r[0])),

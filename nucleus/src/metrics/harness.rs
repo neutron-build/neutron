@@ -460,7 +460,7 @@ fn register_recovered(
                 nullable: true,
                 default_expr: None,
                 id: 0,
-                    analyzer: None,
+                analyzer: None,
             })
             .collect();
         let epoch = epochs.get(&name).copied().unwrap_or(0);
@@ -832,7 +832,9 @@ impl ProbeDb {
     /// True when the engine under test has paged storage, i.e. when the run
     /// covers `DiskEngine` at all.
     pub fn covers_paged_storage(&self) -> bool {
-        self.db.as_ref().is_some_and(|db| db.kind().has_buffer_pool())
+        self.db
+            .as_ref()
+            .is_some_and(|db| db.kind().has_buffer_pool())
     }
 }
 

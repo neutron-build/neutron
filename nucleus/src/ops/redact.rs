@@ -97,11 +97,7 @@ pub fn redact_connection_string(conn: &str) -> String {
     let Some(colon) = userinfo.find(':') else {
         return conn.to_string();
     };
-    format!(
-        "{scheme}{}:{REDACTED}{}",
-        &userinfo[..colon],
-        &rest[at..]
-    )
+    format!("{scheme}{}:{REDACTED}{}", &userinfo[..colon], &rest[at..])
 }
 
 /// Redact `password=...` in libpq keyword/value connection strings.

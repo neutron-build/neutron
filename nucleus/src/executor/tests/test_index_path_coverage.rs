@@ -182,11 +182,7 @@ async fn test_point_lookups_reach_the_index() {
     let ex = indexed_table().await;
 
     for (label, expected, sql) in [
-        (
-            "bigint equality",
-            1,
-            "SELECT id FROM a WHERE n = 1000040",
-        ),
+        ("bigint equality", 1, "SELECT id FROM a WHERE n = 1000040"),
         ("text equality", 1, "SELECT id FROM a WHERE s = 'k00042'"),
         (
             "timestamp equality",
@@ -453,7 +449,11 @@ async fn test_key_set_predicates_reach_the_index() {
     let ex = indexed_table().await;
 
     for (label, expected, sql) in [
-        ("single-element IN", 1, "SELECT id FROM a WHERE n IN (1000040)"),
+        (
+            "single-element IN",
+            1,
+            "SELECT id FROM a WHERE n IN (1000040)",
+        ),
         (
             "multi-element IN",
             3,
@@ -521,7 +521,11 @@ async fn test_key_set_probe_does_not_change_answers() {
             0,
             "SELECT id FROM a WHERE n IN (7, 8, 9)",
         ),
-        ("empty-ish IN with one miss", 0, "SELECT id FROM a WHERE n IN (0)"),
+        (
+            "empty-ish IN with one miss",
+            0,
+            "SELECT id FROM a WHERE n IN (0)",
+        ),
     ] {
         ex.clear_all_query_caches();
         let (_, matched) = scan_cost(&ex, sql).await;

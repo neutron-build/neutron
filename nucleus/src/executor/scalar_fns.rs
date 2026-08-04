@@ -83,10 +83,7 @@ impl Executor {
         // relational path does not already cover. Gating them denied the
         // PostgreSQL-compatible spelling of a plain expression under RLS.
         let specialty_surface = specialty_surface
-            && !matches!(
-                fname,
-                "TS_MATCH" | "TS_RANK" | "TS_HEADLINE" | "FTS_RANK"
-            );
+            && !matches!(fname, "TS_MATCH" | "TS_RANK" | "TS_HEADLINE" | "FTS_RANK");
         if specialty_surface && self.any_rls_active() {
             return Err(ExecError::PermissionDenied(format!(
                 "{fname} is unavailable while row-level security is active because this specialty-store surface has no policy-aware access path"
@@ -775,9 +772,7 @@ impl Executor {
                     }
                     Value::Numeric(t) => crate::types::parse_numeric(t)
                         .map(|d| {
-                            Value::Numeric(
-                                d.trunc_with_scale(decimals.max(0) as u32).to_string(),
-                            )
+                            Value::Numeric(d.trunc_with_scale(decimals.max(0) as u32).to_string())
                         })
                         .map_err(ExecError::Runtime),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
@@ -2232,8 +2227,7 @@ impl Executor {
                 {
                     let priv_upper = p.to_uppercase();
                     let priv_key = priv_upper.split_whitespace().next().unwrap_or(&priv_upper);
-                    let result =
-                        sync_block_on(self.check_privilege_for_role(user, t, priv_key));
+                    let result = sync_block_on(self.check_privilege_for_role(user, t, priv_key));
                     return Ok(Value::Bool(result));
                 }
                 let (table_name, privilege) = if args.len() >= 3 {
@@ -5957,7 +5951,8 @@ impl Executor {
         let ast::FunctionArguments::List(list) = &func.args else {
             return None;
         };
-        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = list.args.get(idx)? else {
+        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = list.args.get(idx)?
+        else {
             return None;
         };
         match expr {

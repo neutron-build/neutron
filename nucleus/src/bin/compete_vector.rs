@@ -118,7 +118,11 @@ fn summarize(
         min_recall,
         p50_us: percentile(&latencies_us, 0.50),
         p95_us: percentile(&latencies_us, 0.95),
-        qps: if mean_us > 0.0 { 1_000_000.0 / mean_us } else { 0.0 },
+        qps: if mean_us > 0.0 {
+            1_000_000.0 / mean_us
+        } else {
+            0.0
+        },
         zero_recall: failed.len(),
     }
 }
@@ -236,7 +240,9 @@ async fn bench_pgvector(
         }
     });
 
-    client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector").await?;
+    client
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS vector")
+        .await?;
     let version: String = client
         .query_one(
             "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
@@ -258,7 +264,9 @@ async fn bench_pgvector(
     rtt.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
     let rtt_p50 = percentile(&rtt, 0.50);
 
-    client.batch_execute("DROP TABLE IF EXISTS bench_vectors").await?;
+    client
+        .batch_execute("DROP TABLE IF EXISTS bench_vectors")
+        .await?;
     client
         .batch_execute(&format!(
             "CREATE TABLE bench_vectors (id BIGINT PRIMARY KEY, v vector({}))",
@@ -287,7 +295,9 @@ async fn bench_pgvector(
 
     let mut out = Vec::new();
     for &ef in &cfg.ef_search {
-        client.batch_execute("DROP INDEX IF EXISTS bench_vectors_hnsw").await?;
+        client
+            .batch_execute("DROP INDEX IF EXISTS bench_vectors_hnsw")
+            .await?;
         let t_build = Instant::now();
         client
             .batch_execute(&format!(
@@ -441,8 +451,15 @@ fn main() {
     for r in &results {
         println!(
             "{:<10} {:>10} {:>10.1} {:>9.3} {:>9.3} {:>8} {:>10.0} {:>10.0} {:>10.0}",
-            r.engine, r.ef_search, r.build_s, r.avg_recall, r.min_recall, r.zero_recall,
-            r.p50_us, r.p95_us, r.qps
+            r.engine,
+            r.ef_search,
+            r.build_s,
+            r.avg_recall,
+            r.min_recall,
+            r.zero_recall,
+            r.p50_us,
+            r.p95_us,
+            r.qps
         );
     }
     println!();

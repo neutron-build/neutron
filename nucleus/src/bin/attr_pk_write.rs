@@ -259,10 +259,22 @@ async fn main() {
     let us = |ms: f64| (ms * 1000.0) / rows as f64;
 
     println!("\nattribution (median, us/row)");
-    println!("  whole PK cost        full - none    : {:>6.1}", us(full - none));
-    println!("  uniqueness probe     full - noprobe : {:>6.1}", us(full - noprobe));
-    println!("  B-tree maintenance   noprobe - none : {:>6.1}", us(noprobe - none));
-    println!("  probe fixed overhead noidx - none   : {:>6.1}", us(noidx - none));
+    println!(
+        "  whole PK cost        full - none    : {:>6.1}",
+        us(full - none)
+    );
+    println!(
+        "  uniqueness probe     full - noprobe : {:>6.1}",
+        us(full - noprobe)
+    );
+    println!(
+        "  B-tree maintenance   noprobe - none : {:>6.1}",
+        us(noprobe - none)
+    );
+    println!(
+        "  probe fixed overhead noidx - none   : {:>6.1}",
+        us(noidx - none)
+    );
     println!(
         "  probe tree descent   remainder      : {:>6.1}",
         us((full - noprobe) - (noidx - none))

@@ -584,8 +584,13 @@ impl MvccMemoryEngine {
                     key: format!("{key:?}"),
                 });
             }
-            if self.has_committed_live_key(candidates, &tbl, &unique_col_sets[*cid], key, Some(old_version_idx))
-            {
+            if self.has_committed_live_key(
+                candidates,
+                &tbl,
+                &unique_col_sets[*cid],
+                key,
+                Some(old_version_idx),
+            ) {
                 return Err(MvccError::UniqueViolation {
                     table: table.to_string(),
                     key: format!("{key:?}"),
@@ -959,9 +964,9 @@ impl MvccStorageAdapter {
             indexes: parking_lot::RwLock::new(HashMap::new()),
             table_idx_names: parking_lot::RwLock::new(HashMap::new()),
             committed_counts: parking_lot::RwLock::new(HashMap::new()),
-                rewrites_active: std::sync::atomic::AtomicUsize::new(0),
-                writes_active: std::sync::atomic::AtomicUsize::new(0),
-                mutated_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            rewrites_active: std::sync::atomic::AtomicUsize::new(0),
+            writes_active: std::sync::atomic::AtomicUsize::new(0),
+            mutated_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             #[cfg(feature = "server")]
             wal: None,
         }
@@ -2516,7 +2521,9 @@ impl StorageEngine for MvccStorageAdapter {
                 .map_err(|_| StorageError::TransactionIdExhausted)?;
             let snap = read_txn.snapshot.clone();
             if let Some(n) = self.rebuild_indexes_for_table(table, &snap) {
-                self.committed_counts.write().insert(table.clone(), n as i64);
+                self.committed_counts
+                    .write()
+                    .insert(table.clone(), n as i64);
             }
             self.engine.txn_mgr().abort(&mut read_txn);
         }
@@ -5017,17 +5024,14 @@ impl MvccStorageAdapter {
                 continue;
             };
             let new_vidx = match unique {
-                Some(sets) => {
-                    self.engine
-                        .update_unique(
-                            table,
-                            txn_id,
-                            *version_idx,
-                            new_row.clone(),
-                            sets,
-                            Some(&self.unique_probe(table)),
-                        )
-                }
+                Some(sets) => self.engine.update_unique(
+                    table,
+                    txn_id,
+                    *version_idx,
+                    new_row.clone(),
+                    sets,
+                    Some(&self.unique_probe(table)),
+                ),
                 None => self
                     .engine
                     .update(table, *version_idx, txn_id, new_row.clone()),

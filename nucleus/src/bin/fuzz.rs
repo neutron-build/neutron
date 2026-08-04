@@ -761,7 +761,12 @@ fn open_nucleus(kind: Option<EngineKind>) -> Option<NucleusUnderTest> {
 /// and report whether they diverge. `None` if the candidate is structurally
 /// invalid (some op errors on either engine) — such a candidate is unusable for
 /// minimization. SELECTs in `ops` are run for side effects (cache priming).
-fn replay_diverges(ops: &[String], q: &str, ordered: bool, kind: Option<EngineKind>) -> Option<bool> {
+fn replay_diverges(
+    ops: &[String],
+    q: &str,
+    ordered: bool,
+    kind: Option<EngineKind>,
+) -> Option<bool> {
     let nut = open_nucleus(kind)?;
     let ex = nut.ex.clone();
     let sqlite = Connection::open_in_memory().ok()?;
@@ -852,7 +857,11 @@ fn main_impl() {
                     Some(k) => engine = Some(k),
                     None => {
                         let names: Vec<&str> = EngineKind::ALL.iter().map(|k| k.name()).collect();
-                        println!("unknown --engine {:?}; expected one of: {}", args[i], names.join(", "));
+                        println!(
+                            "unknown --engine {:?}; expected one of: {}",
+                            args[i],
+                            names.join(", ")
+                        );
                         std::process::exit(2);
                     }
                 }

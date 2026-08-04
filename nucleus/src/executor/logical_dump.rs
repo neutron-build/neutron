@@ -62,8 +62,9 @@ pub async fn open_persistent_executor(
     use crate::storage::{DiskEngine, StorageEngine};
     use std::sync::Arc;
 
-    std::fs::create_dir_all(data_dir)
-        .map_err(|e| ExecError::Runtime(format!("create data dir '{}': {e}", data_dir.display())))?;
+    std::fs::create_dir_all(data_dir).map_err(|e| {
+        ExecError::Runtime(format!("create data dir '{}': {e}", data_dir.display()))
+    })?;
     let catalog = Arc::new(crate::catalog::Catalog::new());
     let catalog_path = data_dir.join("catalog.json");
     // Best-effort: a fresh target directory has no catalog yet.
@@ -185,11 +186,7 @@ pub(super) fn render_create_table(def: &TableDef) -> String {
     for con in &def.constraints {
         items.push(render_constraint(con));
     }
-    format!(
-        "CREATE TABLE {} (\n  {}\n);",
-        def.name,
-        items.join(",\n  ")
-    )
+    format!("CREATE TABLE {} (\n  {}\n);", def.name, items.join(",\n  "))
 }
 
 /// Render `CREATE INDEX` DDL. Encrypted indexes (BTree + an `encryption_mode`
@@ -361,7 +358,9 @@ fn render_grants(role: &RoleDef) -> Vec<String> {
 /// accepts, so a dumped policy recompiles to the identical predicate.
 fn render_rls_predicate(p: &RlsPredicate) -> String {
     match p {
-        RlsPredicate::ColumnEqStr { column, value, .. } => format!("{column} = {}", quote_str(value)),
+        RlsPredicate::ColumnEqStr { column, value, .. } => {
+            format!("{column} = {}", quote_str(value))
+        }
         RlsPredicate::ColumnEqTenant { column, .. } => {
             format!("{column} = current_setting('nucleus.tenant_id')")
         }
@@ -816,7 +815,8 @@ impl super::Executor {
         let (mut rls_tables, mut policies) = {
             let security = self.security.read();
             let tables = security.rls.enabled_tables();
-            let policies: Vec<RlsPolicy> = security.rls.all_policies().into_iter().cloned().collect();
+            let policies: Vec<RlsPolicy> =
+                security.rls.all_policies().into_iter().cloned().collect();
             (tables, policies)
         };
         rls_tables.sort();
@@ -1034,24 +1034,15 @@ impl super::Executor {
         // describe what it restored.
         let _ = self.persist_catalog().await;
 
-        let coord = self
-            .storage
-            .as_backup_coordinator()
-            .ok_or_else(|| {
-                ExecError::Unsupported(
-                    "the active storage engine has no physical snapshot (only the \
+        let coord = self.storage.as_backup_coordinator().ok_or_else(|| {
+            ExecError::Unsupported(
+                "the active storage engine has no physical snapshot (only the \
                      disk engine does); use a logical dump instead"
-                        .into(),
-                )
-            })?;
+                    .into(),
+            )
+        })?;
 
-        crate::backup::backup_online(
-            &data_dir,
-            output,
-            force,
-            env!("CARGO_PKG_VERSION"),
-            coord,
-        )
-        .map_err(|e| ExecError::Runtime(format!("online backup failed: {e}")))
+        crate::backup::backup_online(&data_dir, output, force, env!("CARGO_PKG_VERSION"), coord)
+            .map_err(|e| ExecError::Runtime(format!("online backup failed: {e}")))
     }
 }

@@ -32,49 +32,49 @@ pub(super) fn scalar(result: &ExecResult) -> &Value {
     &r[0][0]
 }
 
+mod test_2pl_census; // R6: serializable anomaly census for the DISK engine (strict 2PL)
 mod test_admin;
-mod test_row_locks;
 mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_collections;
 mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
 mod test_ddl;
-mod test_durability_format; // M3: format rejection + full-state recovery
 mod test_dml;
+mod test_durability_format; // M3: format rejection + full-state recovery
 mod test_e2e_smoke; // End-to-end smoke tests exercising all Nucleus capabilities
 mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filtering
 mod test_fts_index; // Table-attached FTS: USING FTS, @@, BM25, hybrid RRF
 mod test_index;
 mod test_index_path_coverage; // which WHERE forms actually reach an index
-mod test_masking; // column masking is enforced, not merely declared
-mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross sessions
-mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
-mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_integration;
 mod test_join_plan_path; // which JOIN spellings actually reach the plan executor
 mod test_jsonb;
 mod test_logical_dump; // T2.1: logical (SQL-text) backup round-trip
+mod test_masking; // column masking is enforced, not merely declared
 mod test_memory_budget; // T1.2: query memory-budget enforcement (gating)
 mod test_meta_persistence;
 mod test_module_wiring;
 mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
+mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross sessions
+mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_query;
 mod test_read_only_mode; // M10: degraded read-only write admission
 mod test_rls;
 mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
+mod test_row_locks;
 mod test_scalar_fns;
 mod test_specialty_persistence;
 mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
 mod test_sql_wal_ack_durability; // R4: an acked autocommit SQL write is fsync-durable
-mod test_2pl_census; // R6: serializable anomaly census for the DISK engine (strict 2PL)
 mod test_ssi_census; // B1: end-to-end SSI anomaly census (gate for MVCC scan changes)
 mod test_streaming_aggregate; // Grace hash aggregation: bounded-memory GROUP BY with spill
-mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN with spill
 mod test_streaming_filter; // Phase 1.2 read-side: streaming WHERE filter (SIREAD-safe full scan)
+mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN with spill
 mod test_streaming_lazy; // Lazy per-partition/pair output emitters for the Grace operators
 mod test_streaming_metamorphic; // streaming ≡ materialized over random queries (transitive SQLite oracle)
 mod test_streaming_scan; // Phase 1.1: opt-in streaming scan (SET stream_results = on)
 mod test_table_engine_checkpoint; // R4: per-table engine WAL compaction is reachable, not just implemented
-mod test_txn_lazy_snapshot; // R8: BEGIN/SAVEPOINT do not clone the whole database
-mod test_txn; // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
+mod test_temporal_predicates; // mixed temporal literal/column comparisons
+mod test_txn;
+mod test_txn_lazy_snapshot; // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

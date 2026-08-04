@@ -1032,13 +1032,14 @@ async fn cmd_start(cfg: StartConfig) {
     };
     let cache_bytes = config.cache.max_memory_mb * 1024 * 1024;
     let store_dir = if memory { None } else { Some(data.as_path()) };
-    let mut executor_build = Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
-        .with_cache_size(cache_bytes)
-        .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
-        .with_metrics(metrics.clone())
-        .with_replication(replication.clone())
-        .with_conn_pool(conn_pool.clone())
-        .with_cluster(cluster.clone());
+    let mut executor_build =
+        Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
+            .with_cache_size(cache_bytes)
+            .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
+            .with_metrics(metrics.clone())
+            .with_replication(replication.clone())
+            .with_conn_pool(conn_pool.clone())
+            .with_cluster(cluster.clone());
     if let Some(enc) = spill_encryptor {
         // Encrypted deployment: spill runs must be ciphertext (fail-closed).
         executor_build = executor_build.with_spill_encryptor(enc);
@@ -1336,7 +1337,11 @@ async fn cmd_start(cfg: StartConfig) {
     };
     // A server with a data directory gets durable Raft state; memory mode has
     // nowhere to put it and is explicitly not restart-safe.
-    let raft_dir = if memory { None } else { Some(data.join("raft")) };
+    let raft_dir = if memory {
+        None
+    } else {
+        Some(data.join("raft"))
+    };
     let (raft_replicator, apply_rx) = nucleus::distributed::RaftReplicator::with_storage(
         node_id,
         initial_peers,
@@ -2492,9 +2497,15 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool, online: bool, allow_i
             println!("  Nucleus version: {}", manifest.nucleus_version);
             println!("  On-disk format:  v{}", manifest.format_version);
             println!("  Database id:     {}", manifest.database_id);
-            println!("  Files:           {} (BLAKE3 checksummed)", manifest.files.len());
+            println!(
+                "  Files:           {} (BLAKE3 checksummed)",
+                manifest.files.len()
+            );
             if manifest.online {
-                println!("  Consistency:     online, consistent through LSN {}", manifest.consistent_lsn);
+                println!(
+                    "  Consistency:     online, consistent through LSN {}",
+                    manifest.consistent_lsn
+                );
             } else if manifest.taken_while_in_use {
                 println!(
                     "  Consistency:     NONE — copied while the database was in use. \
@@ -2506,7 +2517,11 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool, online: bool, allow_i
             if manifest.encryption.encrypted {
                 println!(
                     "  At rest:         encrypted ({}) — restoring needs the same key",
-                    manifest.encryption.algorithm.as_deref().unwrap_or("unknown")
+                    manifest
+                        .encryption
+                        .algorithm
+                        .as_deref()
+                        .unwrap_or("unknown")
                 );
             }
             println!(
@@ -2587,15 +2602,13 @@ fn backup_online_via_engine(
         nucleus::storage::buffer::DEFAULT_POOL_SIZE,
         64,
     )
-    .map_err(
-        |e| {
-            std::io::Error::other(format!(
-                "could not open {} for an online backup: {e}. If this database is encrypted or \
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "could not open {} for an online backup: {e}. If this database is encrypted or \
                  compressed, take the backup without --online (the plain copy needs no key).",
-                db_path.display()
-            ))
-        },
-    )?;
+            db_path.display()
+        ))
+    })?;
     backup_online(data, output, force, version, &engine)
 }
 

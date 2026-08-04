@@ -76,19 +76,35 @@ async fn test_hnsw_ef_search_session_setting() {
 
     // pgvector spelling, small-but-valid ef.
     exec(&ex, "SET hnsw.ef_search = 4").await;
-    assert_eq!(top(&exec(&ex, knn).await), Some(1), "ef=4 must still find the exact NN");
+    assert_eq!(
+        top(&exec(&ex, knn).await),
+        Some(1),
+        "ef=4 must still find the exact NN"
+    );
 
     // Underscore spelling, generous ef.
     exec(&ex, "SET hnsw_ef_search = 256").await;
-    assert_eq!(top(&exec(&ex, knn).await), Some(1), "ef=256 must find the exact NN");
+    assert_eq!(
+        top(&exec(&ex, knn).await),
+        Some(1),
+        "ef=256 must find the exact NN"
+    );
 
     // Absurd value is clamped, not an error.
     exec(&ex, "SET hnsw.ef_search = 999999999").await;
-    assert_eq!(top(&exec(&ex, knn).await), Some(1), "huge ef must clamp and still work");
+    assert_eq!(
+        top(&exec(&ex, knn).await),
+        Some(1),
+        "huge ef must clamp and still work"
+    );
 
     // Non-numeric value is ignored (falls back to the configured default).
     exec(&ex, "SET hnsw.ef_search = 'not_a_number'").await;
-    assert_eq!(top(&exec(&ex, knn).await), Some(1), "bad ef must fall back, not break KNN");
+    assert_eq!(
+        top(&exec(&ex, knn).await),
+        Some(1),
+        "bad ef must fall back, not break KNN"
+    );
 }
 
 // ================================================================

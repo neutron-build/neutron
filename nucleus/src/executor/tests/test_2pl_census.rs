@@ -118,7 +118,10 @@ async fn write_skew_does_not_survive() {
         let r = async {
             ex.execute_with_session(s, BEGIN_SER).await?;
             let res = ex
-                .execute_with_session(s, &format!("SELECT balance FROM accounts WHERE id = {read_id}"))
+                .execute_with_session(
+                    s,
+                    &format!("SELECT balance FROM accounts WHERE id = {read_id}"),
+                )
                 .await?;
             let seen = match &res[0] {
                 ExecResult::Select { rows, .. } => match rows[0][0] {
@@ -208,7 +211,10 @@ async fn no_update_is_lost() {
                 };
                 ex.execute_with_session(
                     s,
-                    &format!("UPDATE accounts SET balance = {} WHERE id = 1", current + 10),
+                    &format!(
+                        "UPDATE accounts SET balance = {} WHERE id = 1",
+                        current + 10
+                    ),
                 )
                 .await?;
                 ex.execute_with_session(s, "COMMIT").await
@@ -639,7 +645,12 @@ async fn an_invalid_lock_timeout_is_refused() {
 async fn the_disk_engine_accepts_every_isolation_level() {
     let dir = tempfile::tempdir().unwrap();
     let ex = disk_executor(dir.path());
-    for level in ["SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED", "SNAPSHOT"] {
+    for level in [
+        "SERIALIZABLE",
+        "REPEATABLE READ",
+        "READ COMMITTED",
+        "SNAPSHOT",
+    ] {
         exec(&ex, &format!("BEGIN TRANSACTION ISOLATION LEVEL {level}")).await;
         exec(&ex, "ROLLBACK").await;
     }

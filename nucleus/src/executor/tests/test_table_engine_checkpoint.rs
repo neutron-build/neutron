@@ -24,10 +24,7 @@ async fn open_executor(dir: &Path) -> Executor {
 fn wal_len(dir: &Path, table: &str) -> u64 {
     let path = dir
         .join("columnar_engines")
-        .join(format!(
-            "{table}_{:08x}",
-            crc32c::crc32c(table.as_bytes())
-        ))
+        .join(format!("{table}_{:08x}", crc32c::crc32c(table.as_bytes())))
         .join("columnar.wal");
     std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
 }
@@ -36,7 +33,11 @@ fn wal_len(dir: &Path, table: &str) -> u64 {
 async fn columnar_engine_wal_grows_unbounded_without_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let ex = open_executor(dir.path()).await;
-    exec(&ex, "CREATE TABLE t (id INT, v INT) WITH (engine='columnar')").await;
+    exec(
+        &ex,
+        "CREATE TABLE t (id INT, v INT) WITH (engine='columnar')",
+    )
+    .await;
 
     let after_create = wal_len(dir.path(), "t");
     for i in 0..300 {
@@ -61,7 +62,11 @@ async fn columnar_engine_wal_grows_unbounded_without_checkpoint() {
 async fn checkpoint_table_engines_compacts_the_columnar_wal() {
     let dir = tempfile::tempdir().unwrap();
     let ex = open_executor(dir.path()).await;
-    exec(&ex, "CREATE TABLE t (id INT, v INT) WITH (engine='columnar')").await;
+    exec(
+        &ex,
+        "CREATE TABLE t (id INT, v INT) WITH (engine='columnar')",
+    )
+    .await;
     for i in 0..300 {
         exec(&ex, &format!("INSERT INTO t VALUES ({i}, {i})")).await;
     }
@@ -79,13 +84,11 @@ async fn checkpoint_table_engines_compacts_the_columnar_wal() {
     // And the data survives exactly — this is a compaction, not a truncation.
     let rows = exec(&ex, "SELECT COUNT(*) FROM t").await;
     let n = match &rows[0] {
-        crate::executor::ExecResult::Select { rows, .. } => {
-            match &rows[0][0] {
-                crate::types::Value::Int64(v) => *v,
-                crate::types::Value::Int32(v) => *v as i64,
-                other => panic!("unexpected count cell: {other:?}"),
-            }
-        }
+        crate::executor::ExecResult::Select { rows, .. } => match &rows[0][0] {
+            crate::types::Value::Int64(v) => *v,
+            crate::types::Value::Int32(v) => *v as i64,
+            other => panic!("unexpected count cell: {other:?}"),
+        },
         other => panic!("expected Select, got {other:?}"),
     };
     assert_eq!(n, 300, "checkpoint must not lose or duplicate rows");
@@ -96,7 +99,11 @@ async fn checkpoint_table_engines_recovers_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let ex = open_executor(dir.path()).await;
-        exec(&ex, "CREATE TABLE t (id INT, v INT) WITH (engine='columnar')").await;
+        exec(
+            &ex,
+            "CREATE TABLE t (id INT, v INT) WITH (engine='columnar')",
+        )
+        .await;
         for i in 0..50 {
             exec(&ex, &format!("INSERT INTO t VALUES ({i}, {i})")).await;
         }

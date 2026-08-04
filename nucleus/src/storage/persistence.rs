@@ -391,7 +391,7 @@ impl CatalogPersistence {
                         nullable: c.nullable,
                         default_expr: c.default_expr.clone(),
                         id: c.id,
-                    analyzer: None,
+                        analyzer: None,
                     })
                 })
                 .collect();
@@ -462,7 +462,7 @@ impl CatalogPersistence {
                         nullable: c.nullable,
                         default_expr: c.default_expr.clone(),
                         id: c.id,
-                    analyzer: None,
+                        analyzer: None,
                     })
                 })
                 .collect();
@@ -936,7 +936,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "email".into(),
@@ -944,7 +944,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -952,7 +952,7 @@ mod tests {
                         nullable: true,
                         default_expr: Some("true".into()),
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                 ],
                 constraints: vec![TableConstraint::PrimaryKey {
@@ -975,7 +975,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "amount".into(),
@@ -983,7 +983,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "tags".into(),
@@ -991,7 +991,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                 ],
                 constraints: vec![],
@@ -1461,7 +1461,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     }],
                     constraints: vec![],
                     append_only: false,

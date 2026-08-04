@@ -45,7 +45,11 @@ impl Rng {
         self.0
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
     /// Uniform f32 in [-1.0, 1.0).
     fn unit_f32(&mut self) -> f32 {
@@ -140,7 +144,13 @@ pub fn gen_query(rng: &mut Rng, dim: usize, dist: VectorDist, corpus: &[Vector])
 /// Build an HNSW index of `n` `dim`-vectors under the default (uniform)
 /// distribution, then run `queries` KNN probes timing the index path and, on
 /// the SAME query, computing recall@k against an exact brute-force scan.
-pub fn bench_vector(n: usize, dim: usize, k: usize, queries: usize, seed: u64) -> VectorBenchResult {
+pub fn bench_vector(
+    n: usize,
+    dim: usize,
+    k: usize,
+    queries: usize,
+    seed: u64,
+) -> VectorBenchResult {
     bench_vector_dist(n, dim, k, queries, seed, VectorDist::Uniform)
 }
 
@@ -205,7 +215,11 @@ pub fn bench_vector_dist(
         min_recall: recall_min,
         hnsw_avg_us,
         brute_avg_us: (brute_nanos as f64 / q) / 1000.0,
-        qps: if hnsw_avg_us > 0.0 { 1_000_000.0 / hnsw_avg_us } else { f64::INFINITY },
+        qps: if hnsw_avg_us > 0.0 {
+            1_000_000.0 / hnsw_avg_us
+        } else {
+            f64::INFINITY
+        },
     }
 }
 
@@ -232,12 +246,46 @@ pub struct FtsBenchResult {
 /// tokenize identically, so the check exercises the engine's posting-list
 /// union/dedup logic against the set-theoretic definition of an OR match.
 const VOCAB: &[&str] = &[
-    "quantum", "neural", "database", "vector", "kernel", "rust", "index",
-    "query", "storage", "graph", "tensor", "cluster", "protocol", "cipher",
-    "matrix", "photon", "lattice", "entropy", "gradient", "spectral",
-    "columnar", "raft", "consensus", "replica", "shard", "posting", "recall",
-    "traversal", "dijkstra", "inverted", "corpus", "throughput", "latency",
-    "engine", "planner", "executor", "wal", "checkpoint", "durable", "oracle",
+    "quantum",
+    "neural",
+    "database",
+    "vector",
+    "kernel",
+    "rust",
+    "index",
+    "query",
+    "storage",
+    "graph",
+    "tensor",
+    "cluster",
+    "protocol",
+    "cipher",
+    "matrix",
+    "photon",
+    "lattice",
+    "entropy",
+    "gradient",
+    "spectral",
+    "columnar",
+    "raft",
+    "consensus",
+    "replica",
+    "shard",
+    "posting",
+    "recall",
+    "traversal",
+    "dijkstra",
+    "inverted",
+    "corpus",
+    "throughput",
+    "latency",
+    "engine",
+    "planner",
+    "executor",
+    "wal",
+    "checkpoint",
+    "durable",
+    "oracle",
 ];
 
 fn random_doc(rng: &mut Rng, words: usize) -> String {
@@ -273,7 +321,10 @@ pub fn bench_vector_scale_sweep(n: usize, dim: usize, k: usize, queries: usize, 
     for (id, v) in corpus.iter().enumerate() {
         index.insert(id as u64, v.clone());
     }
-    println!("  build: {:.1}s for n={n} dim={dim} (clustered)", t0.elapsed().as_secs_f64());
+    println!(
+        "  build: {:.1}s for n={n} dim={dim} (clustered)",
+        t0.elapsed().as_secs_f64()
+    );
 
     let qs: Vec<Vector> = (0..queries)
         .map(|_| gen_query(&mut rng, dim, VectorDist::Clustered, &corpus))
@@ -283,7 +334,10 @@ pub fn bench_vector_scale_sweep(n: usize, dim: usize, k: usize, queries: usize, 
         .map(|q| exact_search(&reference, q, k, DistanceMetric::L2))
         .collect();
 
-    println!("   {:>5} {:>8} {:>8} {:>10}", "ef", "recall", "min_rec", "avg_us");
+    println!(
+        "   {:>5} {:>8} {:>8} {:>10}",
+        "ef", "recall", "min_rec", "avg_us"
+    );
     for &ef in &[64usize, 128, 256, 512, 1024] {
         let mut recall_sum = 0.0f64;
         let mut recall_min = 1.0f64;
@@ -359,7 +413,11 @@ pub fn bench_fts(docs: usize, queries: usize, seed: u64) -> FtsBenchResult {
         docs,
         queries,
         avg_query_us,
-        qps: if avg_query_us > 0.0 { 1_000_000.0 / avg_query_us } else { f64::INFINITY },
+        qps: if avg_query_us > 0.0 {
+            1_000_000.0 / avg_query_us
+        } else {
+            f64::INFINITY
+        },
         all_sets_exact: mismatches == 0,
         mismatches,
         avg_hits: hits_sum as f64 / q,
@@ -486,8 +544,11 @@ pub fn bench_graph(
             adj[from].push((to, w));
         }
     }
-    let idx_of: HashMap<u64, usize> =
-        node_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let idx_of: HashMap<u64, usize> = node_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
 
     let mut sp_nanos = 0u128;
     let mut sp_correct = 0usize;
@@ -559,11 +620,19 @@ pub fn bench_graph(
         edges: total_edges,
         queries,
         sp_avg_us,
-        sp_qps: if sp_avg_us > 0.0 { 1_000_000.0 / sp_avg_us } else { f64::INFINITY },
+        sp_qps: if sp_avg_us > 0.0 {
+            1_000_000.0 / sp_avg_us
+        } else {
+            f64::INFINITY
+        },
         sp_correct,
         sp_total: queries,
         dij_avg_us,
-        dij_qps: if dij_avg_us > 0.0 { 1_000_000.0 / dij_avg_us } else { f64::INFINITY },
+        dij_qps: if dij_avg_us > 0.0 {
+            1_000_000.0 / dij_avg_us
+        } else {
+            f64::INFINITY
+        },
         dij_correct,
         dij_total: queries,
         bfs_avg_us: (bfs_nanos as f64 / q) / 1000.0,
@@ -616,17 +685,24 @@ mod tests {
             };
             let mut index = HnswIndex::new(config);
             let corpus = gen_vectors(&mut rng, n, dim, VectorDist::Uniform);
-            let reference: Vec<(u64, Vector)> =
-                corpus.iter().enumerate().map(|(i, v)| (i as u64, v.clone())).collect();
+            let reference: Vec<(u64, Vector)> = corpus
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as u64, v.clone()))
+                .collect();
             for (id, v) in corpus.iter().enumerate() {
                 index.insert(id as u64, v.clone());
             }
 
-            let queries: Vec<Vector> =
-                (0..100).map(|_| gen_query(&mut rng, dim, VectorDist::Uniform, &corpus)).collect();
+            let queries: Vec<Vector> = (0..100)
+                .map(|_| gen_query(&mut rng, dim, VectorDist::Uniform, &corpus))
+                .collect();
 
             println!("\n== uniform n={n} dim={dim} k={k} (build ef_c=200) ==");
-            println!("   {:>5} {:>8} {:>10} {:>10}", "ef", "recall", "dist_ratio", "avg_us");
+            println!(
+                "   {:>5} {:>8} {:>10} {:>10}",
+                "ef", "recall", "dist_ratio", "avg_us"
+            );
             for &ef in &[16usize, 32, 64, 128, 256, 512, 1024] {
                 let mut recall_sum = 0.0f64;
                 let mut ratio_sum = 0.0f64;
@@ -675,7 +751,10 @@ mod tests {
             assert!(
                 r.avg_recall >= 0.85,
                 "seed {seed}: avg recall@{} = {:.3} below floor 0.85 (hnsw {:.1}us vs brute {:.1}us)",
-                r.k, r.avg_recall, r.hnsw_avg_us, r.brute_avg_us
+                r.k,
+                r.avg_recall,
+                r.hnsw_avg_us,
+                r.brute_avg_us
             );
             assert!(
                 r.min_recall >= 0.50,
@@ -704,7 +783,8 @@ mod tests {
                     r.avg_recall >= 0.98,
                     "seed {seed} n{n} d{dim}: clustered avg recall@{} = {:.3} below 0.98 — \
                      inter-cluster bridge edges are being starved (neighbour-selection regression)",
-                    r.k, r.avg_recall
+                    r.k,
+                    r.avg_recall
                 );
                 assert!(
                     r.min_recall >= 0.80,
@@ -728,7 +808,10 @@ mod tests {
                 r.mismatches, r.queries
             );
             // Guard against measuring throughput on empty result sets.
-            assert!(r.avg_hits > 1.0, "seed {seed}: corpus produced near-empty matches");
+            assert!(
+                r.avg_hits > 1.0,
+                "seed {seed}: corpus produced near-empty matches"
+            );
             assert!(r.avg_query_us > 0.0 && r.qps > 0.0);
         }
     }
@@ -740,19 +823,25 @@ mod tests {
         for seed in [3u64, 11, 777, 24680] {
             let r = bench_graph(400, 4, 60, seed);
             assert_eq!(
-                r.sp_correct, r.sp_total,
+                r.sp_correct,
+                r.sp_total,
                 "seed {seed}: {}/{} shortest-path (hops) queries wrong",
-                r.sp_total - r.sp_correct, r.sp_total
+                r.sp_total - r.sp_correct,
+                r.sp_total
             );
             assert_eq!(
-                r.dij_correct, r.dij_total,
+                r.dij_correct,
+                r.dij_total,
                 "seed {seed}: {}/{} Dijkstra (cost) queries wrong",
-                r.dij_total - r.dij_correct, r.dij_total
+                r.dij_total - r.dij_correct,
+                r.dij_total
             );
             assert_eq!(
-                r.bfs_correct, r.bfs_total,
+                r.bfs_correct,
+                r.bfs_total,
                 "seed {seed}: {}/{} BFS reachable-set queries wrong",
-                r.bfs_total - r.bfs_correct, r.bfs_total
+                r.bfs_total - r.bfs_correct,
+                r.bfs_total
             );
             assert!(r.sp_avg_us > 0.0 && r.dij_avg_us > 0.0 && r.bfs_avg_us > 0.0);
         }

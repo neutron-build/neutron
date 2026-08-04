@@ -160,10 +160,7 @@ pub fn restore_pitr(
     }
 
     // 5. Assemble a fresh WAL directory holding every record <= target_lsn.
-    let staging = out_data_dir.join(format!(
-        "{}.pitr-staging",
-        wal_dir_name.to_string_lossy()
-    ));
+    let staging = out_data_dir.join(format!("{}.pitr-staging", wal_dir_name.to_string_lossy()));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
     }
@@ -232,11 +229,10 @@ fn resolve_target_lsn(archive_dir: &Path, target: PitrTarget) -> io::Result<u64>
             let mut matched = false;
             for line in contents.lines() {
                 let mut it = line.split_whitespace();
-                let (_seg, _min, max, unix) =
-                    match (it.next(), it.next(), it.next(), it.next()) {
-                        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-                        _ => continue,
-                    };
+                let (_seg, _min, max, unix) = match (it.next(), it.next(), it.next(), it.next()) {
+                    (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                    _ => continue,
+                };
                 let (Ok(max_lsn), Ok(archived_unix)) = (max.parse::<u64>(), unix.parse::<u64>())
                 else {
                     continue;
@@ -294,7 +290,8 @@ mod tests {
         let w =
             SegmentedWal::open_with_archive(&wal_dir, 12_000, SyncMode::Fsync, &archive).unwrap();
         for i in 0..40u32 {
-            w.log_page_write(1, i, &page_with((i % 250) as u8 + 1)).unwrap();
+            w.log_page_write(1, i, &page_with((i % 250) as u8 + 1))
+                .unwrap();
         }
         w.sync().unwrap();
         // Several segments must exist in the archive, with matching index lines.
@@ -331,16 +328,22 @@ mod tests {
         w.truncate_before(last).unwrap();
         // Any segment number that existed and is now gone from the live dir must
         // be present in the archive.
-        let live: std::collections::HashSet<u64> =
-            wal::list_archive_segments(&wal_dir).unwrap().into_iter().collect();
-        let archived: std::collections::HashSet<u64> =
-            wal::list_archive_segments(&archive).unwrap().into_iter().collect();
-        assert!(!archived.is_empty(), "truncate should have archived segments");
+        let live: std::collections::HashSet<u64> = wal::list_archive_segments(&wal_dir)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let archived: std::collections::HashSet<u64> = wal::list_archive_segments(&archive)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(
+            !archived.is_empty(),
+            "truncate should have archived segments"
+        );
         // Every archived segment's records are recoverable: read them back.
         for s in &archived {
             if !live.contains(s) {
-                let recs =
-                    wal::read_wal_records(&wal::segment_file_path(&archive, *s)).unwrap();
+                let recs = wal::read_wal_records(&wal::segment_file_path(&archive, *s)).unwrap();
                 assert!(!recs.is_empty(), "archived segment {s} must be replayable");
             }
         }

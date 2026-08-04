@@ -81,12 +81,12 @@ async fn test_extension_survives_restart() {
     {
         let ex = open_executor(dir.path()).await;
         exec(&ex, "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"").await;
-        exec(&ex, "CREATE EXTENSION vector WITH SCHEMA public VERSION '0.7.0'").await;
-        let r = exec(
+        exec(
             &ex,
-            "SELECT extname FROM pg_extension ORDER BY extname",
+            "CREATE EXTENSION vector WITH SCHEMA public VERSION '0.7.0'",
         )
         .await;
+        let r = exec(&ex, "SELECT extname FROM pg_extension ORDER BY extname").await;
         // plpgsql (seed) + uuid-ossp + vector
         assert_eq!(rows(&r[0]).len(), 3);
     } // drop executor — simulate restart
@@ -114,7 +114,11 @@ async fn test_extension_survives_restart() {
         let ex = open_executor(dir.path()).await;
         let r = exec(&ex, "SELECT extname FROM pg_extension ORDER BY extname").await;
         let names: Vec<_> = rows(&r[0]).iter().map(|row| row[0].clone()).collect();
-        assert_eq!(names.len(), 2, "dropped extension must stay dropped: {names:?}");
+        assert_eq!(
+            names.len(),
+            2,
+            "dropped extension must stay dropped: {names:?}"
+        );
         assert!(!names.contains(&Value::Text("uuid-ossp".into())));
     }
 }

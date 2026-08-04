@@ -51,7 +51,10 @@ async fn main() {
     let txn = !args.iter().any(|a| a == "--autocommit");
 
     let dir = std::env::temp_dir().join(format!("nucleus-repro-{}", std::process::id()));
-    println!("rows={rows} mode={}", if txn { "txn" } else { "autocommit" });
+    println!(
+        "rows={rows} mode={}",
+        if txn { "txn" } else { "autocommit" }
+    );
 
     for &n in &[50usize, 400, 1000, 2000] {
         let ex = build(&dir, rows).await;

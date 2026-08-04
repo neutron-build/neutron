@@ -2895,7 +2895,11 @@ impl PartSlice {
 /// Compare the value at `idx` against `scalar`. `None` when the column and the
 /// scalar are different kinds, or the value is NULL — neither can be ordered,
 /// and a bound that cannot be compared must never narrow anything.
-fn coldata_cmp_scalar(col: &ColumnData, idx: usize, scalar: &ScalarValue) -> Option<std::cmp::Ordering> {
+fn coldata_cmp_scalar(
+    col: &ColumnData,
+    idx: usize,
+    scalar: &ScalarValue,
+) -> Option<std::cmp::Ordering> {
     match (col, scalar) {
         (ColumnData::Int64(v), ScalarValue::Int64(s)) => v.get(idx)?.as_ref().map(|x| x.cmp(s)),
         (ColumnData::Int32(v), ScalarValue::Int32(s)) => v.get(idx)?.as_ref().map(|x| x.cmp(s)),
@@ -3254,8 +3258,7 @@ impl MergeTree {
         // Remove highest-index first so the earlier indices stay valid.
         let mut sorted = indices.to_vec();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
-        let mut taken: Vec<MergeTreePart> =
-            sorted.iter().map(|&i| self.parts.remove(i)).collect();
+        let mut taken: Vec<MergeTreePart> = sorted.iter().map(|&i| self.parts.remove(i)).collect();
         // Fold smallest-first so each merge step carries as little as possible.
         taken.sort_by_key(|p| p.row_count);
         let mut acc = (*taken[0].data).clone();
@@ -3465,10 +3468,7 @@ impl MergeTree {
         predicate_col: &str,
         bounds: &[(CmpOp, ScalarValue)],
     ) -> Vec<PartSlice> {
-        let sorted_by_predicate = self
-            .primary_key
-            .first()
-            .is_some_and(|k| k == predicate_col);
+        let sorted_by_predicate = self.primary_key.first().is_some_and(|k| k == predicate_col);
 
         let narrow = |batch: std::sync::Arc<ColumnBatch>| -> PartSlice {
             let full = PartSlice {

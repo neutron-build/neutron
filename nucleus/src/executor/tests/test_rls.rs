@@ -354,7 +354,11 @@ async fn rename_table_carries_grants_with_it() {
     let result = exec_session(&ex, sid, "SELECT id FROM renamed_docs ORDER BY id")
         .await
         .expect("alice's GRANT did not follow the table across RENAME");
-    assert_eq!(rows(&result[0]).len(), 2, "alice should still see her 2 rows");
+    assert_eq!(
+        rows(&result[0]).len(),
+        2,
+        "alice should still see her 2 rows"
+    );
 }
 
 /// Renaming the column a policy reads must keep the policy on that COLUMN.

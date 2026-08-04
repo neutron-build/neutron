@@ -22,8 +22,16 @@ async fn seeded_with_mask(rule: crate::security::MaskingRule) -> (Executor, u64)
         "CREATE TABLE people (id INT PRIMARY KEY, name TEXT, ssn TEXT, age INT)",
     )
     .await;
-    exec(&ex, "INSERT INTO people VALUES (1, 'ada', '123-45-6789', 36)").await;
-    exec(&ex, "INSERT INTO people VALUES (2, 'bob', '987-65-4321', 41)").await;
+    exec(
+        &ex,
+        "INSERT INTO people VALUES (1, 'ada', '123-45-6789', 36)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO people VALUES (2, 'bob', '987-65-4321', 41)",
+    )
+    .await;
     exec(&ex, "CREATE ROLE analyst LOGIN PASSWORD 'analyst-secret'").await;
     exec(&ex, "GRANT SELECT ON people TO analyst").await;
 
@@ -54,10 +62,18 @@ fn cell(result: &ExecResult, row: usize, col: usize) -> String {
 #[tokio::test]
 async fn test_a_masked_column_is_masked() {
     let (ex, sid) = seeded_with_mask(crate::security::MaskingRule::Redact("***".into())).await;
-    let res = exec_session(&ex, sid, "SELECT id, name, ssn, age FROM people ORDER BY id")
-        .await
-        .expect("select");
-    assert_eq!(cell(&res[0], 0, 2), "***", "the SSN was returned in the clear");
+    let res = exec_session(
+        &ex,
+        sid,
+        "SELECT id, name, ssn, age FROM people ORDER BY id",
+    )
+    .await
+    .expect("select");
+    assert_eq!(
+        cell(&res[0], 0, 2),
+        "***",
+        "the SSN was returned in the clear"
+    );
     assert_eq!(cell(&res[0], 1, 2), "***");
     // Unmasked columns keep their value AND their type.
     assert_eq!(rows(&res[0])[0][0], Value::Int32(1));
@@ -109,7 +125,10 @@ async fn test_rule_shapes_apply() {
             },
             "6789",
         ),
-        (crate::security::MaskingRule::Redact("REDACTED".into()), "REDACTED"),
+        (
+            crate::security::MaskingRule::Redact("REDACTED".into()),
+            "REDACTED",
+        ),
     ] {
         let (ex, sid) = seeded_with_mask(rule).await;
         let res = exec_session(&ex, sid, "SELECT ssn FROM people ORDER BY id")

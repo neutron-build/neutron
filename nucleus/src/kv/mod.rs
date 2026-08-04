@@ -24,11 +24,11 @@ use parking_lot::RwLock;
 use crate::storage::kv_wal::{KvWal, KvWalOp};
 use crate::types::Value;
 
+pub mod codec;
 pub mod collections;
 #[cfg(feature = "server")]
 pub mod collections_wal;
 pub mod streams;
-pub mod codec;
 
 // ============================================================================
 // KV Entry
@@ -1494,7 +1494,10 @@ impl KvStore {
             0
         };
         let entry_target = if over_count {
-            entries.saturating_sub(entry_budget).max(entry_budget / 10).max(1)
+            entries
+                .saturating_sub(entry_budget)
+                .max(entry_budget / 10)
+                .max(1)
         } else {
             0
         };
@@ -2702,7 +2705,10 @@ mod tests {
         let store2 = KvStore::open(dir.path()).unwrap();
         assert_eq!(store2.get("hits"), Some(Value::Int64(2)));
         let ttl = store2.ttl("hits");
-        assert!(ttl > 3500 && ttl <= 3600, "TTL must survive INCR, got {ttl}");
+        assert!(
+            ttl > 3500 && ttl <= 3600,
+            "TTL must survive INCR, got {ttl}"
+        );
     }
 
     /// MSET stores permanent values; a key that had a TTL must not keep it.
@@ -3313,7 +3319,10 @@ mod tests {
             store.estimated_memory_bytes()
         );
         // Spilled entries are still readable — they moved, they were not lost.
-        assert!(store.get("srcmap:0").is_some(), "evicted key must read back from cold");
+        assert!(
+            store.get("srcmap:0").is_some(),
+            "evicted key must read back from cold"
+        );
     }
 
     // The allocator picks which subsystem to shrink from reported usage. A flat
@@ -3350,7 +3359,10 @@ mod tests {
         let before = store.current_usage();
         assert!(before > 1 << 20, "precondition: should hold >1 MiB");
         let freed = store.shrink_to(256 * 1024);
-        assert!(freed > 0, "pressure must reclaim something when no entry has a TTL");
+        assert!(
+            freed > 0,
+            "pressure must reclaim something when no entry has a TTL"
+        );
         assert!(
             store.current_usage() < before,
             "usage must actually drop after a pressure callback"

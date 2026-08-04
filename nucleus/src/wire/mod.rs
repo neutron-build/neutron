@@ -34,6 +34,7 @@ use pgwire::api::auth::{
     StartupHandler, finish_authentication, protocol_negotiation,
     save_startup_parameters_to_metadata,
 };
+use pgwire::api::cancel::CancelHandler;
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -47,10 +48,9 @@ use pgwire::api::{
     ClientInfo, ClientPortalStore, PgWireConnectionState, PgWireServerHandlers, Type,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::response::{CommandComplete, NotificationResponse};
-use pgwire::api::cancel::CancelHandler;
-use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::startup::{Authentication, PasswordMessageFamily, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
@@ -846,7 +846,11 @@ impl NucleusHandler {
                 // ("INSERT 0 2", "UPDATE 3"); DDL/utility tags are bare
                 // ("CREATE TABLE", "DISCARD ALL" — never "CREATE TABLE 0").
                 let counted = matches!(
-                    tag.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str(),
+                    tag.split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_uppercase()
+                        .as_str(),
                     "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "COPY" | "FETCH" | "MOVE" | "MERGE"
                 );
                 if counted {
@@ -916,7 +920,9 @@ impl NucleusHandler {
                                         let fmt =
                                             schema.get(i).map_or(FieldFormat::Text, |f| f.format());
                                         match col_types.get(i) {
-                                            Some(dt) => encode_value_typed(&mut encoder, value, dt, fmt)?,
+                                            Some(dt) => {
+                                                encode_value_typed(&mut encoder, value, dt, fmt)?
+                                            }
                                             None => encode_value(&mut encoder, value, fmt)?,
                                         }
                                     }
@@ -1403,7 +1409,9 @@ impl StartupHandler for NucleusHandler {
                 // TO STDOUT stream by default for it (bounded-memory export).
                 self.executor.mark_session_stream_capable(session_id);
                 let addr = client.socket_addr().to_string();
-                self.session_registry.write().insert(addr.clone(), session_id);
+                self.session_registry
+                    .write()
+                    .insert(addr.clone(), session_id);
 
                 // Issue the cancellation key sent in BackendKeyData (during
                 // finish_authentication) and register it so a later
@@ -1686,11 +1694,8 @@ impl SimpleQueryHandler for NucleusHandler {
             {
                 use pgwire::api::copy::send_copy_out_response;
                 bytes_estimate += data.len() as u64;
-                send_copy_out_response(
-                    client,
-                    CopyResponse::new(1, columns, vec![1; columns]),
-                )
-                .await?;
+                send_copy_out_response(client, CopyResponse::new(1, columns, vec![1; columns]))
+                    .await?;
                 const CHUNK_SIZE: usize = 65_536;
                 for chunk in data.chunks(CHUNK_SIZE) {
                     client
@@ -2140,13 +2145,16 @@ impl CopyHandler for NucleusHandler {
         let rows = if state.is_binary {
             // Resolve the target column types so each binary field can be
             // decoded into the text-literal form the INSERT path expects.
-            let all = self.executor.table_column_types(&state.table).ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "42P01".to_owned(),
-                    format!("relation \"{}\" does not exist", state.table),
-                )))
-            })?;
+            let all = self
+                .executor
+                .table_column_types(&state.table)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42P01".to_owned(),
+                        format!("relation \"{}\" does not exist", state.table),
+                    )))
+                })?;
             let types: Vec<DataType> = match &state.columns {
                 Some(cols) => cols
                     .iter()
@@ -2754,7 +2762,11 @@ impl CancelHandler for NucleusHandler {
         };
         match session {
             Some(session_id) => {
-                tracing::info!(pid = request.pid, session_id, "query cancel request accepted");
+                tracing::info!(
+                    pid = request.pid,
+                    session_id,
+                    "query cancel request accepted"
+                );
                 // Cooperative flag: long compute loops poll it (rayon filters,
                 // cartesian products) — this is what interrupts CPU-bound work.
                 self.executor.request_session_cancel(session_id);
@@ -2765,7 +2777,10 @@ impl CancelHandler for NucleusHandler {
                 }
             }
             None => {
-                tracing::debug!(pid = request.pid, "query cancel request ignored (key mismatch)");
+                tracing::debug!(
+                    pid = request.pid,
+                    "query cancel request ignored (key mismatch)"
+                );
             }
         }
     }
@@ -2955,8 +2970,22 @@ fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
             let h: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
             let s = format!(
                 "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
-                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12],
-                h[13], h[14], h[15]
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+                h[4],
+                h[5],
+                h[6],
+                h[7],
+                h[8],
+                h[9],
+                h[10],
+                h[11],
+                h[12],
+                h[13],
+                h[14],
+                h[15]
             );
             Some(DecodedParam::Text(s))
         }
@@ -3040,7 +3069,9 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
         let payload = &bytes[off..off + len];
         off += len;
         let rendered = match elem_oid {
-            16 => (payload == [1u8]).then(|| "t".to_string()).or(Some("f".to_string()))?,
+            16 => (payload == [1u8])
+                .then(|| "t".to_string())
+                .or(Some("f".to_string()))?,
             21 => i16::from_be_bytes(payload.try_into().ok()?).to_string(),
             23 => i32::from_be_bytes(payload.try_into().ok()?).to_string(),
             20 => i64::from_be_bytes(payload.try_into().ok()?).to_string(),
@@ -3053,8 +3084,22 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
                 let h: Vec<String> = payload.iter().map(|b| format!("{b:02x}")).collect();
                 format!(
                     "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
-                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11],
-                    h[12], h[13], h[14], h[15]
+                    h[0],
+                    h[1],
+                    h[2],
+                    h[3],
+                    h[4],
+                    h[5],
+                    h[6],
+                    h[7],
+                    h[8],
+                    h[9],
+                    h[10],
+                    h[11],
+                    h[12],
+                    h[13],
+                    h[14],
+                    h[15]
                 )
             }
             // text / varchar
@@ -3146,9 +3191,7 @@ fn decode_pg_param(
     // — previously these fell through to the fixed-width-integer catch-all and
     // were silently reinterpreted as integers (data corruption for binary-mode
     // drivers: tokio-postgres, pgx default, JDBC).
-    if is_binary
-        && let Some(decoded) = decode_binary_param_typed(type_hint.oid(), bytes)
-    {
+    if is_binary && let Some(decoded) = decode_binary_param_typed(type_hint.oid(), bytes) {
         return Some(decoded);
     }
     // Text-format bytea arrives as the '\x...' literal already; other text
@@ -3741,16 +3784,7 @@ fn walk_expr_for_params(
         // `x = ANY($1)` / `x = ALL($1)` — the parameter is an ARRAY of x's
         // element type. Without this, ParameterDescription said TEXT and
         // array-binding drivers (Prisma's quaint) refused to serialize.
-        Expr::AnyOp {
-            left,
-            right,
-            ..
-        }
-        | Expr::AllOp {
-            left,
-            right,
-            ..
-        } => {
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
             // The right side of ANY/ALL is definitionally an array, so even
             // when the element type can't be resolved (virtual catalogs are
             // not in the TableDef list) default to text[] rather than text.
@@ -4300,9 +4334,8 @@ fn parse_copy_binary_rows(
                 format!("binary COPY row has more fields than target columns ({nfields})")
             })?;
             let oid = data_type_to_pg(ty).oid();
-            let text = decode_copy_binary_field(oid, &data[pos..pos + len]).ok_or_else(|| {
-                format!("cannot decode binary COPY field of type {ty}")
-            })?;
+            let text = decode_copy_binary_field(oid, &data[pos..pos + len])
+                .ok_or_else(|| format!("cannot decode binary COPY field of type {ty}"))?;
             row.push(Some(text));
             pos += len;
         }
@@ -4337,7 +4370,11 @@ fn float_literal(f: f64) -> String {
     if f.is_nan() {
         "NaN".into()
     } else if f.is_infinite() {
-        if f < 0.0 { "-Infinity".into() } else { "Infinity".into() }
+        if f < 0.0 {
+            "-Infinity".into()
+        } else {
+            "Infinity".into()
+        }
     } else {
         f.to_string()
     }
@@ -5144,9 +5181,8 @@ mod tests {
             vec![Value::Int32(1), Value::Text("alice".into())],
             vec![Value::Int32(2), Value::Text("bob".into())],
         ];
-        let source = Box::new(
-            crate::executor::row_batch::MaterializedBatchIter::with_batch_size(rows, 1),
-        );
+        let source =
+            Box::new(crate::executor::row_batch::MaterializedBatchIter::with_batch_size(rows, 1));
         let result = ExecResult::SelectStream { columns, source };
         let response = NucleusHandler::build_response(result, None);
         assert!(response.is_ok());

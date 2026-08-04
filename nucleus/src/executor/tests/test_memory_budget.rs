@@ -46,8 +46,13 @@ async fn streaming_group_by_runs_under_tiny_budget() {
     let ex = test_executor();
     seed(&ex, BIG_ROWS).await;
     ex.set_query_memory_limit(TINY);
-    let r = ex.execute("SELECT grp, COUNT(*) FROM big GROUP BY grp").await;
-    assert!(r.is_ok(), "streaming GROUP BY should run under the budget, got {r:?}");
+    let r = ex
+        .execute("SELECT grp, COUNT(*) FROM big GROUP BY grp")
+        .await;
+    assert!(
+        r.is_ok(),
+        "streaming GROUP BY should run under the budget, got {r:?}"
+    );
 }
 
 #[tokio::test]
@@ -111,10 +116,18 @@ async fn small_query_under_tiny_budget_is_unaffected() {
     let ex = test_executor();
     seed(&ex, 3).await;
     ex.set_query_memory_limit(TINY);
-    let r = ex.execute("SELECT grp, COUNT(*) FROM big GROUP BY grp").await;
-    assert!(r.is_ok(), "small GROUP BY should run under the budget, got {r:?}");
+    let r = ex
+        .execute("SELECT grp, COUNT(*) FROM big GROUP BY grp")
+        .await;
+    assert!(
+        r.is_ok(),
+        "small GROUP BY should run under the budget, got {r:?}"
+    );
     let r = ex.execute("SELECT * FROM big ORDER BY payload").await;
-    assert!(r.is_ok(), "small ORDER BY should run under the budget, got {r:?}");
+    assert!(
+        r.is_ok(),
+        "small ORDER BY should run under the budget, got {r:?}"
+    );
 }
 
 // P0.3 — the previously-ungated set-operation and plan-path join buffers.
@@ -138,9 +151,7 @@ async fn cross_join_over_budget_rejects_cleanly() {
     let ex = test_executor();
     seed(&ex, BIG_ROWS).await;
     ex.set_query_memory_limit(TINY);
-    let r = ex
-        .execute("SELECT a.id FROM big a CROSS JOIN big b")
-        .await;
+    let r = ex.execute("SELECT a.id FROM big a CROSS JOIN big b").await;
     assert!(is_mem_exceeded(&r), "expected MemoryExceeded, got {r:?}");
 }
 

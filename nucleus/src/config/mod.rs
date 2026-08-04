@@ -1630,7 +1630,10 @@ port = 5555
         cfg.storage.page_size = 3;
         cfg.logging.format = "xml".to_string();
         let errs = errors_of(&cfg);
-        assert!(errs.len() >= 3, "expected all problems at once, got {errs:?}");
+        assert!(
+            errs.len() >= 3,
+            "expected all problems at once, got {errs:?}"
+        );
     }
 
     #[test]

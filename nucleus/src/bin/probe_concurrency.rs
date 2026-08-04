@@ -522,13 +522,7 @@ fn provides_transaction_isolation(kind: Option<EngineKind>) -> bool {
 }
 
 /// One complete scenario: fresh table, run all invariants with a mix of keys.
-fn run_scenario(
-    ex: Arc<Executor>,
-    seed: u64,
-    iter: usize,
-    v: &mut Violations,
-    snapshot_iso: bool,
-) {
+fn run_scenario(ex: Arc<Executor>, seed: u64, iter: usize, v: &mut Violations, snapshot_iso: bool) {
     let tbl = format!("cc_t_{iter}");
     let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
 
@@ -757,7 +751,9 @@ fn main_impl() {
     }
 
     if all_violations.total() == 0 && all_violations.panics == 0 {
-        println!("\nAll MVCC isolation invariants hold across {iterations} scenarios on {engine_label}.");
+        println!(
+            "\nAll MVCC isolation invariants hold across {iterations} scenarios on {engine_label}."
+        );
     } else {
         std::process::exit(1);
     }

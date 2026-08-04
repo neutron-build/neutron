@@ -241,10 +241,16 @@ impl Executor {
             normalized.as_str(),
             "current_user" | "session_user" | "current_user()"
         ) {
-            return Ok(RlsPredicate::ColumnEqUser { column, column_id: 0 });
+            return Ok(RlsPredicate::ColumnEqUser {
+                column,
+                column_id: 0,
+            });
         }
         if normalized.starts_with("current_setting(") && normalized.contains("nucleus.tenant_id") {
-            return Ok(RlsPredicate::ColumnEqTenant { column, column_id: 0 });
+            return Ok(RlsPredicate::ColumnEqTenant {
+                column,
+                column_id: 0,
+            });
         }
         if let Expr::Value(v) = value_expr {
             let value = match &v.value {
@@ -256,7 +262,11 @@ impl Executor {
                 ast::Value::Boolean(v) => v.to_string(),
                 _ => return Err(Self::unsupported_policy_expr(value_expr)),
             };
-            return Ok(RlsPredicate::ColumnEqStr { column, value, column_id: 0 });
+            return Ok(RlsPredicate::ColumnEqStr {
+                column,
+                value,
+                column_id: 0,
+            });
         }
         Err(Self::unsupported_policy_expr(value_expr))
     }

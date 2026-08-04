@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -308,8 +308,9 @@ impl DiskGuard {
             loop {
                 ticker.tick().await;
                 let guard = Arc::clone(&self);
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || guard.evaluate()));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    guard.evaluate()
+                }));
                 if result.is_err() {
                     let n = self.monitor_panics.fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::error!(
@@ -347,7 +348,8 @@ impl DiskGuard {
                 if changed {
                     tracing::error!("{detail}");
                 }
-                self.level.store(DiskLevel::Unknown.as_u8(), Ordering::SeqCst);
+                self.level
+                    .store(DiskLevel::Unknown.as_u8(), Ordering::SeqCst);
                 let obs = DiskObservation {
                     level: DiskLevel::Unknown,
                     space: None,
@@ -361,8 +363,8 @@ impl DiskGuard {
         };
 
         let free_pct = space.free_pct();
-        let critical =
-            free_pct < self.marks.readonly_free_pct || space.available_bytes < self.marks.min_free_bytes;
+        let critical = free_pct < self.marks.readonly_free_pct
+            || space.available_bytes < self.marks.min_free_bytes;
         let level = if critical {
             DiskLevel::Critical
         } else if free_pct < self.marks.warn_free_pct {
@@ -428,7 +430,8 @@ impl DiskGuard {
     /// watermark *and* the absolute floor, and only if the disk monitor is
     /// what caused the degradation in the first place.
     fn maybe_resume(&self, free_pct: f64, space: &SpaceInfo, detail: &str) {
-        if free_pct < self.marks.resume_free_pct || space.available_bytes < self.marks.min_free_bytes
+        if free_pct < self.marks.resume_free_pct
+            || space.available_bytes < self.marks.min_free_bytes
         {
             return;
         }

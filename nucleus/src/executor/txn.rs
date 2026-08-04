@@ -365,7 +365,8 @@ impl Executor {
             match txn.engine_savepoints.iter().rposition(|(n, _)| n == name) {
                 Some(pos) => {
                     let level = txn.engine_savepoints[pos].1.clone();
-                    let mut out: Vec<(String, Vec<crate::types::Row>)> = level.into_iter().collect();
+                    let mut out: Vec<(String, Vec<crate::types::Row>)> =
+                        level.into_iter().collect();
                     for (tbl, base) in txn.engine_snapshots.iter() {
                         if !out.iter().any(|(t, _)| t == tbl) {
                             out.push((tbl.clone(), base.clone()));

@@ -68,7 +68,7 @@ impl Conn {
         loop {
             let msg = self.read_msg().await;
             match msg.tag {
-                b'Z' => break,                                  // ReadyForQuery
+                b'Z' => break,                                   // ReadyForQuery
                 b'E' => panic!("startup failed: {}", err(&msg)), // ErrorResponse
                 _ => {}
             }
@@ -258,7 +258,8 @@ async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
 async fn wire_copy_loads_a_valid_payload() {
     let (port, server) = start_server().await;
     let mut c = Conn::connect(port).await;
-    c.exec("CREATE TABLE wok (id INT PRIMARY KEY, qty INT)").await;
+    c.exec("CREATE TABLE wok (id INT PRIMARY KEY, qty INT)")
+        .await;
 
     let tag = c
         .simple_copy_in("COPY wok FROM STDIN", "1\t10\n2\t20\n")
@@ -327,7 +328,8 @@ async fn wire_copy_is_atomic_past_the_old_chunk_boundary() {
 async fn wire_copy_rejects_a_self_duplicated_key_atomically() {
     let (port, server) = start_server().await;
     let mut c = Conn::connect(port).await;
-    c.exec("CREATE TABLE wd (id INT PRIMARY KEY, qty INT)").await;
+    c.exec("CREATE TABLE wd (id INT PRIMARY KEY, qty INT)")
+        .await;
 
     let bad = c
         .simple_copy_in("COPY wd FROM STDIN", "1\t10\n2\t20\n1\t30\n")
@@ -397,7 +399,8 @@ async fn wire_copy_csv_distinguishes_empty_from_quoted_empty() {
 async fn wire_copy_coerces_to_the_declared_column_type() {
     let (port, server) = start_server().await;
     let mut c = Conn::connect(port).await;
-    c.exec("CREATE TABLE wty (id INT PRIMARY KEY, d DATE)").await;
+    c.exec("CREATE TABLE wty (id INT PRIMARY KEY, d DATE)")
+        .await;
 
     c.simple_copy_in("COPY wty FROM STDIN", "1\t2024-03-26\n")
         .await

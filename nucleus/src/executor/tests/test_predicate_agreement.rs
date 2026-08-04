@@ -191,7 +191,11 @@ async fn ids_where_projection_is_true(ex: &Executor, predicate: &str) -> Option<
 
 async fn seed(case: &TypeCase) -> Executor {
     let ex = test_executor();
-    exec(&ex, &format!("CREATE TABLE p (id INT PRIMARY KEY, v {})", case.sql_type)).await;
+    exec(
+        &ex,
+        &format!("CREATE TABLE p (id INT PRIMARY KEY, v {})", case.sql_type),
+    )
+    .await;
     for (i, v) in case.values.iter().enumerate() {
         exec(&ex, &format!("INSERT INTO p VALUES ({}, {v})", i + 1)).await;
     }
@@ -217,8 +221,7 @@ async fn test_predicate_means_the_same_in_projection_and_filter() {
                     continue; // this spelling does not execute at all; not a disagreement
                 };
                 ex.clear_all_query_caches();
-                let Some(filtered) =
-                    ids(&ex, &format!("SELECT id FROM p WHERE {predicate}")).await
+                let Some(filtered) = ids(&ex, &format!("SELECT id FROM p WHERE {predicate}")).await
                 else {
                     panic!(
                         "{}: `WHERE {predicate}` failed while `SELECT ({predicate})` succeeded",

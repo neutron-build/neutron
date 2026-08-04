@@ -123,7 +123,11 @@ async fn a_transaction_never_reads_a_table_it_does_not_touch() {
     let res = exec(&ex, "SELECT v FROM hot WHERE id = 1").await;
     match &res[0] {
         crate::executor::ExecResult::Select { rows, .. } => {
-            assert_eq!(rows[0][0], crate::types::Value::Int32(1), "rollback lost the before-image")
+            assert_eq!(
+                rows[0][0],
+                crate::types::Value::Int32(1),
+                "rollback lost the before-image"
+            )
         }
         other => panic!("expected Select, got {other:?}"),
     }

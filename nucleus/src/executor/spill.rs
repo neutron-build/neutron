@@ -522,7 +522,11 @@ mod tests {
                 vec![
                     Value::Int64(i as i64),
                     Value::Text(format!("row-{i}")),
-                    if i % 3 == 0 { Value::Null } else { Value::Bool(true) },
+                    if i % 3 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Bool(true)
+                    },
                     Value::Array(vec![Value::Int32(i as i32), Value::Null]),
                 ]
             })

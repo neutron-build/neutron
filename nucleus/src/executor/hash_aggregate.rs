@@ -140,8 +140,12 @@ impl RowBatchIter for StreamingAggregateIter {
                 return Ok(None);
             };
             let executor = &self.executor;
-            let (select, cm, gbe, spill) =
-                (&self.select, &self.col_meta, &self.group_by_exprs, &self.spill);
+            let (select, cm, gbe, spill) = (
+                &self.select,
+                &self.col_meta,
+                &self.group_by_exprs,
+                &self.spill,
+            );
             let budget = self.budget;
             let (_cols, rows) = run_in_session(&self.session, self.sess_id, move || {
                 executor.aggregate_partition(select, cm, gbe, reader, bytes, budget, spill, 0)
@@ -171,9 +175,9 @@ impl RowBatchIter for StreamingDistinctIter {
             let Some((reader, bytes)) = self.parts.next() else {
                 return Ok(None);
             };
-            let rows = self
-                .executor
-                .distinct_partition(reader, bytes, self.budget, &self.spill, 0)?;
+            let rows =
+                self.executor
+                    .distinct_partition(reader, bytes, self.budget, &self.spill, 0)?;
             if rows.is_empty() {
                 continue;
             }
@@ -290,7 +294,9 @@ fn resolve_output_order_keys(
                 _ => return None,
             },
             // Output column by name/alias.
-            Expr::Identifier(id) => names.iter().position(|nm| nm.eq_ignore_ascii_case(&id.value))?,
+            Expr::Identifier(id) => names
+                .iter()
+                .position(|nm| nm.eq_ignore_ascii_case(&id.value))?,
             // A computed key (e.g. `ORDER BY COUNT(*)`) resolves iff it matches an
             // output column's stringified form (which is how such a column is named).
             other => {
@@ -1064,8 +1070,7 @@ impl Executor {
         };
 
         // Resolve both relations to (storage table name, output label, columns).
-        let Some((left_name, left_meta)) =
-            self.resolve_join_side(&select.from[0].relation).await?
+        let Some((left_name, left_meta)) = self.resolve_join_side(&select.from[0].relation).await?
         else {
             return Ok(None);
         };
@@ -1205,7 +1210,12 @@ impl Executor {
         if name.is_empty() {
             return Ok(None);
         }
-        if self.current_session().active_ctes.read().contains_key(&name) {
+        if self
+            .current_session()
+            .active_ctes
+            .read()
+            .contains_key(&name)
+        {
             return Ok(None);
         }
         if self.views.read().await.contains_key(&name)
@@ -1293,14 +1303,20 @@ impl Executor {
                 }
                 SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
                     let idx = self.resolve_column(combined_meta, None, &id.value).ok()?;
-                    columns.push((combined_meta[idx].name.clone(), combined_meta[idx].dtype.clone()));
+                    columns.push((
+                        combined_meta[idx].name.clone(),
+                        combined_meta[idx].dtype.clone(),
+                    ));
                     indices.push(idx);
                 }
                 SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
                     let idx = self
                         .resolve_column(combined_meta, Some(&parts[0].value), &parts[1].value)
                         .ok()?;
-                    columns.push((combined_meta[idx].name.clone(), combined_meta[idx].dtype.clone()));
+                    columns.push((
+                        combined_meta[idx].name.clone(),
+                        combined_meta[idx].dtype.clone(),
+                    ));
                     indices.push(idx);
                 }
                 SelectItem::ExprWithAlias {
@@ -1411,8 +1427,8 @@ impl Executor {
             let left_sub = self.repartition_reader(left, left_keys, seed, budget, ctx)?;
             let right_sub = self.repartition_reader(right, right_keys, seed, budget, ctx)?;
             return self.join_subpairs(
-                left_sub, right_sub, left_meta, right_meta, operator, left_keys, right_keys, budget,
-                ctx, depth,
+                left_sub, right_sub, left_meta, right_meta, operator, left_keys, right_keys,
+                budget, ctx, depth,
             );
         }
 
@@ -1563,7 +1579,13 @@ impl Executor {
             }
             let mut out = Vec::new();
             for (sub_reader, sub_bytes) in sub.finish().map_err(spill_to_exec_err)? {
-                out.extend(self.distinct_partition(sub_reader, sub_bytes, budget, ctx, depth + 1)?);
+                out.extend(self.distinct_partition(
+                    sub_reader,
+                    sub_bytes,
+                    budget,
+                    ctx,
+                    depth + 1,
+                )?);
             }
             Ok(out)
         }
@@ -1676,7 +1698,10 @@ mod tests {
     }
 
     fn key_row(k: i64, tag: i64) -> (Vec<Value>, Row) {
-        (vec![Value::Int64(k)], vec![Value::Int64(k), Value::Int64(tag)])
+        (
+            vec![Value::Int64(k)],
+            vec![Value::Int64(k), Value::Int64(tag)],
+        )
     }
 
     #[test]
@@ -1785,14 +1810,20 @@ mod tests {
         let mut left = Partitioner::new(&ctx(dir.path()), 0, 512);
         for i in 0..1000i64 {
             let cid = i % 37;
-            left.route_by_key(&[Value::Int64(cid)], vec![Value::Int64(i), Value::Int64(cid)])
-                .unwrap();
+            left.route_by_key(
+                &[Value::Int64(cid)],
+                vec![Value::Int64(i), Value::Int64(cid)],
+            )
+            .unwrap();
         }
         let dir2 = tempfile::tempdir().unwrap();
         let mut right = Partitioner::new(&ctx(dir2.path()), 0, 512);
         for cid in 0..37i64 {
             right
-                .route_by_key(&[Value::Int64(cid)], vec![Value::Int64(cid), Value::Int64(cid * 10)])
+                .route_by_key(
+                    &[Value::Int64(cid)],
+                    vec![Value::Int64(cid), Value::Int64(cid * 10)],
+                )
                 .unwrap();
         }
         // For each cid, the left slot it lands in must equal the right slot.
@@ -1837,7 +1868,11 @@ mod tests {
             .unwrap();
         let parts = p.finish_indexed().unwrap();
         assert_eq!(parts.len(), FANOUT, "index-preserving length is FANOUT");
-        assert_eq!(parts.iter().filter(|s| s.is_some()).count(), 1, "one occupied slot");
+        assert_eq!(
+            parts.iter().filter(|s| s.is_some()).count(),
+            1,
+            "one occupied slot"
+        );
     }
 
     #[test]

@@ -149,9 +149,16 @@ pub fn classify_function(name: &str) -> Volatility {
     let bare = upper.rsplit('.').next().unwrap_or(upper.as_str());
     match bare {
         // ── Wall clock ────────────────────────────────────────────────────────
-        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "CLOCK_TIMESTAMP"
-        | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" | "TIMEOFDAY" | "CURRENT_DATE"
-        | "CURRENT_TIME" | "LOCALTIME" => Volatility::Foldable,
+        "NOW"
+        | "CURRENT_TIMESTAMP"
+        | "LOCALTIMESTAMP"
+        | "CLOCK_TIMESTAMP"
+        | "STATEMENT_TIMESTAMP"
+        | "TRANSACTION_TIMESTAMP"
+        | "TIMEOFDAY"
+        | "CURRENT_DATE"
+        | "CURRENT_TIME"
+        | "LOCALTIME" => Volatility::Foldable,
 
         // ── Randomness ────────────────────────────────────────────────────────
         "RANDOM" | "RAND" | "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" | "UUID_GENERATE_V1" => {
@@ -165,7 +172,9 @@ pub fn classify_function(name: &str) -> Volatility {
         "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "CURRENT_SCHEMAS" => {
             Volatility::Unfoldable("resolves against the local catalog namespace")
         }
-        "CURRENT_SETTING" | "SET_CONFIG" => Volatility::Unfoldable("reads per-session configuration"),
+        "CURRENT_SETTING" | "SET_CONFIG" => {
+            Volatility::Unfoldable("reads per-session configuration")
+        }
         "VERSION" | "PG_BACKEND_PID" | "PG_POSTMASTER_START_TIME" | "PG_IS_IN_RECOVERY" => {
             Volatility::Unfoldable("reports per-process server state")
         }
@@ -194,14 +203,23 @@ pub fn classify_function(name: &str) -> Volatility {
         | "PG_GET_USERBYID"
         | "PG_GET_EXPR"
         | "OBJ_DESCRIPTION"
-        | "COL_DESCRIPTION" => Volatility::Unfoldable("depends on the local role and catalog state"),
+        | "COL_DESCRIPTION" => {
+            Volatility::Unfoldable("depends on the local role and catalog state")
+        }
 
         // ── Local resource telemetry ──────────────────────────────────────────
-        "MEM_USAGE" | "MEM_BUDGET" | "MEM_AVAILABLE" | "MEM_UTILIZATION" | "MEM_PRESSURE_EVENTS"
-        | "MEM_PEAK" | "MEM_STATS" => Volatility::Unfoldable("reports this node's memory counters"),
+        "MEM_USAGE"
+        | "MEM_BUDGET"
+        | "MEM_AVAILABLE"
+        | "MEM_UTILIZATION"
+        | "MEM_PRESSURE_EVENTS"
+        | "MEM_PEAK"
+        | "MEM_STATS" => Volatility::Unfoldable("reports this node's memory counters"),
 
         // ── Model inference ───────────────────────────────────────────────────
-        "EMBED" | "CLASSIFY" | "PREDICT" => Volatility::Unfoldable("invokes a locally loaded model"),
+        "EMBED" | "CLASSIFY" | "PREDICT" => {
+            Volatility::Unfoldable("invokes a locally loaded model")
+        }
 
         // ── Subscription side effects ─────────────────────────────────────────
         "SUBSCRIBE" | "UNSUBSCRIBE" | "SUBSCRIPTION_COUNT" => {
@@ -371,14 +389,17 @@ impl LeaderConstants {
         let upper = name.to_ascii_uppercase();
         let bare = upper.rsplit('.').next().unwrap_or(upper.as_str());
         let expr = match bare {
-            "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "CLOCK_TIMESTAMP"
-            | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" | "TIMEOFDAY" => {
-                Expr::TypedString(TypedString {
-                    data_type: DataType::Timestamp(None, TimezoneInfo::None),
-                    value: string_value(&self.timestamp),
-                    uses_odbc_syntax: false,
-                })
-            }
+            "NOW"
+            | "CURRENT_TIMESTAMP"
+            | "LOCALTIMESTAMP"
+            | "CLOCK_TIMESTAMP"
+            | "STATEMENT_TIMESTAMP"
+            | "TRANSACTION_TIMESTAMP"
+            | "TIMEOFDAY" => Expr::TypedString(TypedString {
+                data_type: DataType::Timestamp(None, TimezoneInfo::None),
+                value: string_value(&self.timestamp),
+                uses_odbc_syntax: false,
+            }),
             "CURRENT_DATE" => Expr::TypedString(TypedString {
                 data_type: DataType::Date,
                 value: string_value(&self.date),
@@ -439,7 +460,10 @@ mod tests {
     fn insert_with_now_replicates_identically() {
         let sql = "INSERT INTO events (at) VALUES (now())";
         let prepared = prepare_for_replication(sql).expect("now() must be foldable, not refused");
-        assert!(prepared.was_rewritten(), "now() must not go into the log raw");
+        assert!(
+            prepared.was_rewritten(),
+            "now() must not go into the log raw"
+        );
 
         let replicated = prepared.sql();
         assert!(
@@ -477,8 +501,9 @@ mod tests {
 
     #[test]
     fn random_and_uuid_fold_to_literals() {
-        let prepared = prepare_for_replication("INSERT INTO t (x, id) VALUES (random(), gen_random_uuid())")
-            .expect("clock/RNG volatility is foldable");
+        let prepared =
+            prepare_for_replication("INSERT INTO t (x, id) VALUES (random(), gen_random_uuid())")
+                .expect("clock/RNG volatility is foldable");
         let sql = prepared.sql().to_uppercase();
         assert!(!sql.contains("RANDOM("), "random() survived: {sql}");
         assert!(!sql.contains("GEN_RANDOM_UUID"), "uuid fn survived: {sql}");
@@ -675,8 +700,8 @@ mod tests {
     #[tokio::test]
     async fn session_dependent_sql_never_reaches_the_log() {
         let raw = "INSERT INTO audit (who) VALUES (current_user)";
-        let err = prepare_for_replication(raw)
-            .expect_err("current_user must be refused, not replicated");
+        let err =
+            prepare_for_replication(raw).expect_err("current_user must be refused, not replicated");
         assert!(
             err.function.to_uppercase().contains("CURRENT_USER"),
             "refusal must name the offending function, got: {err:?}"

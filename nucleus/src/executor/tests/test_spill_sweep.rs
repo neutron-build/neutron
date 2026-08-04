@@ -44,7 +44,13 @@ async fn startup_sweeps_orphan_spill_files_but_spares_others() {
     // Opening the executor runs the startup sweep.
     let _ex = open_executor(dir.path()).await;
 
-    assert!(!orphan_a.exists(), "orphan spill file A should be reclaimed");
-    assert!(!orphan_b.exists(), "orphan spill file B should be reclaimed");
+    assert!(
+        !orphan_a.exists(),
+        "orphan spill file A should be reclaimed"
+    );
+    assert!(
+        !orphan_b.exists(),
+        "orphan spill file B should be reclaimed"
+    );
     assert!(foreign.exists(), "foreign file must be left untouched");
 }

@@ -60,7 +60,11 @@ async fn test_at_at_is_conjunctive_without_an_index() {
 
     // Both terms must be present: doc 2 has "machine" and "learning" as
     // separate words, doc 3 has neither.
-    let mut hits = ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut hits = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     hits.sort_unstable();
     assert_eq!(hits, vec![1, 2, 4]);
 
@@ -108,10 +112,7 @@ async fn test_at_at_rejects_non_text_operands() {
         .execute("SELECT id FROM articles WHERE id @@ 'machine'")
         .await
         .expect_err("@@ on an integer column must be refused, not silently false");
-    assert!(
-        err.to_string().contains("@@"),
-        "unhelpful error: {err}"
-    );
+    assert!(err.to_string().contains("@@"), "unhelpful error: {err}");
 }
 
 // ============================================================================
@@ -201,7 +202,11 @@ async fn test_index_tracks_insert_update_delete() {
         "INSERT INTO articles VALUES (5, 'machine learning at the edge', 'tech')",
     )
     .await;
-    let mut after_insert = ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut after_insert = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     after_insert.sort_unstable();
     assert_eq!(after_insert, vec![1, 2, 4, 5]);
 
@@ -211,8 +216,11 @@ async fn test_index_tracks_insert_update_delete() {
         "UPDATE articles SET body = 'unrelated content entirely' WHERE id = 1",
     )
     .await;
-    let mut after_update =
-        ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut after_update = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     after_update.sort_unstable();
     assert_eq!(after_update, vec![2, 4, 5]);
 
@@ -222,13 +230,20 @@ async fn test_index_tracks_insert_update_delete() {
         "UPDATE articles SET body = 'machine learning restored' WHERE id = 1",
     )
     .await;
-    let mut restored = ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut restored = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     restored.sort_unstable();
     assert_eq!(restored, vec![1, 2, 4, 5]);
 
     exec(&ex, "DELETE FROM articles WHERE id = 4").await;
-    let mut after_delete =
-        ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut after_delete = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     after_delete.sort_unstable();
     assert_eq!(after_delete, vec![1, 2, 5]);
 
@@ -250,7 +265,11 @@ async fn test_rollback_does_not_strand_the_index() {
     exec(&ex, "DELETE FROM articles WHERE id = 1").await;
     exec(&ex, "ROLLBACK").await;
 
-    let mut after = ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut after = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     after.sort_unstable();
     assert_eq!(
         after,
@@ -266,8 +285,11 @@ async fn test_rollback_does_not_strand_the_index() {
     .await;
     exec(&ex, "ROLLBACK").await;
 
-    let mut after_insert =
-        ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut after_insert = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     after_insert.sort_unstable();
     assert_eq!(
         after_insert,
@@ -290,7 +312,11 @@ async fn test_uncommitted_rows_are_visible_to_the_predicate() {
         "INSERT INTO articles VALUES (7, 'machine learning in flight', 'tech')",
     )
     .await;
-    let mut during = ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut during = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     during.sort_unstable();
     assert_eq!(
         during,
@@ -299,14 +325,20 @@ async fn test_uncommitted_rows_are_visible_to_the_predicate() {
     );
 
     exec(&ex, "DELETE FROM articles WHERE id = 1").await;
-    let mut after_delete =
-        ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut after_delete = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     after_delete.sort_unstable();
     assert_eq!(after_delete, vec![2, 4, 7]);
 
     exec(&ex, "COMMIT").await;
-    let mut committed =
-        ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut committed = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     committed.sort_unstable();
     assert_eq!(committed, vec![2, 4, 7]);
 }
@@ -317,7 +349,11 @@ async fn test_index_built_over_existing_rows() {
     seeded(&ex).await;
     // Index created after the data, not before.
     exec(&ex, "CREATE INDEX ON articles USING FTS (body)").await;
-    let mut hits = ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut hits = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     hits.sort_unstable();
     assert_eq!(hits, vec![1, 2, 4]);
     // And scoring works, which means the corpus was populated too.
@@ -336,10 +372,18 @@ async fn test_index_built_over_existing_rows() {
 async fn test_dropping_the_index_leaves_the_operator_working() {
     let ex = test_executor();
     seeded(&ex).await;
-    exec(&ex, "CREATE INDEX articles_fts ON articles USING FTS (body)").await;
+    exec(
+        &ex,
+        "CREATE INDEX articles_fts ON articles USING FTS (body)",
+    )
+    .await;
     exec(&ex, "DROP INDEX articles_fts").await;
 
-    let mut hits = ids(&ex, "SELECT id FROM articles WHERE body @@ 'machine learning'").await;
+    let mut hits = ids(
+        &ex,
+        "SELECT id FROM articles WHERE body @@ 'machine learning'",
+    )
+    .await;
     hits.sort_unstable();
     assert_eq!(hits, vec![1, 2, 4]);
 
@@ -382,7 +426,11 @@ async fn test_fts_index_requires_a_stable_row_id() {
     );
     // The operator is still available on such a table — only the index is not.
     exec(&ex, "INSERT INTO notes VALUES ('machine learning notes')").await;
-    let hits = exec(&ex, "SELECT body FROM notes WHERE body @@ 'machine learning'").await;
+    let hits = exec(
+        &ex,
+        "SELECT body FROM notes WHERE body @@ 'machine learning'",
+    )
+    .await;
     assert_eq!(rows(&hits[0]).len(), 1);
 }
 
@@ -475,7 +523,10 @@ async fn test_at_at_and_bm25_respect_row_level_security() {
     ex.bind_authenticated_session(sid, "alice").await.unwrap();
 
     let results = ex
-        .execute_with_session(sid, "SELECT id, body FROM docs WHERE body @@ 'machine learning'")
+        .execute_with_session(
+            sid,
+            "SELECT id, body FROM docs WHERE body @@ 'machine learning'",
+        )
         .await
         .expect("@@ must remain available under RLS");
     let visible = rows(&results[0]);
@@ -518,7 +569,11 @@ async fn test_hybrid_rrf_over_one_table() {
     .await;
     for (id, body, vec) in [
         (1, "machine learning pipelines", "[1.0, 0.0, 0.0, 0.0]"),
-        (2, "deep learning for machine vision", "[0.9, 0.1, 0.0, 0.0]"),
+        (
+            2,
+            "deep learning for machine vision",
+            "[0.9, 0.1, 0.0, 0.0]",
+        ),
         (3, "database storage engines", "[0.0, 1.0, 0.0, 0.0]"),
         (4, "distributed consensus", "[0.0, 0.0, 1.0, 0.0]"),
     ] {
@@ -659,7 +714,11 @@ async fn test_analyzer_choice_is_observable() {
         (3, "INFO a record was written"),
         (4, "DEBUG routes recomputed"),
     ] {
-        exec(&english, &format!("INSERT INTO logs VALUES ({id}, '{line}')")).await;
+        exec(
+            &english,
+            &format!("INSERT INTO logs VALUES ({id}, '{line}')"),
+        )
+        .await;
     }
 
     // "routing" and "routes" stem together under english, not under simple.

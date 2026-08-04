@@ -62,18 +62,19 @@ pub(super) fn validate_grouped_projection(
     // ROLLUP / CUBE / GROUPING SETS make columns conditionally grouped — the
     // simple "must be a GROUP BY key" rule doesn't apply. Skip validation
     // entirely when any such construct is present (permissive).
-    let has_grouping_set = group_by.iter().any(|e| {
-        matches!(
-            e,
-            Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)
-        )
-    });
+    let has_grouping_set = group_by
+        .iter()
+        .any(|e| matches!(e, Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)));
     if has_grouping_set {
         return Ok(());
     }
 
     // GROUP BY key spellings, normalized (whitespace-insensitive, lowercased).
-    let norm = |e: &Expr| e.to_string().replace(char::is_whitespace, "").to_lowercase();
+    let norm = |e: &Expr| {
+        e.to_string()
+            .replace(char::is_whitespace, "")
+            .to_lowercase()
+    };
     let keys: HashSet<String> = group_by.iter().map(norm).collect();
     let has_group = !group_by.is_empty();
 
@@ -90,17 +91,36 @@ pub(super) fn validate_grouped_projection(
             return Ok(());
         }
         match expr {
-            Expr::Function(func) if super::helpers::contains_aggregate(expr) && func.over.is_none() => {
+            Expr::Function(func)
+                if super::helpers::contains_aggregate(expr) && func.over.is_none() =>
+            {
                 let name = func.name.to_string().to_uppercase();
                 // Must match `contains_aggregate`'s function list exactly, or a
                 // recognized-elsewhere aggregate (argMax etc.) is treated as a
                 // scalar wrapper and its column args wrongly demand GROUP BY.
                 let is_agg = matches!(
                     name.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
-                        | "JSON_AGG" | "BOOL_AND" | "BOOL_OR" | "EVERY" | "BIT_AND" | "BIT_OR"
-                        | "ARGMAX" | "ARG_MAX" | "ARGMIN" | "ARG_MIN"
-                        | "MEDIAN" | "QUANTILE" | "PERCENTILE_CONT" | "PERCENTILE_DISC"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "STRING_AGG"
+                        | "ARRAY_AGG"
+                        | "JSON_AGG"
+                        | "BOOL_AND"
+                        | "BOOL_OR"
+                        | "EVERY"
+                        | "BIT_AND"
+                        | "BIT_OR"
+                        | "ARGMAX"
+                        | "ARG_MAX"
+                        | "ARGMIN"
+                        | "ARG_MIN"
+                        | "MEDIAN"
+                        | "QUANTILE"
+                        | "PERCENTILE_CONT"
+                        | "PERCENTILE_DISC"
                 );
                 if is_agg {
                     if in_aggregate {
@@ -188,15 +208,15 @@ fn agg_column_type(val: &Value, expr: &Expr, col_meta: &[ColMeta]) -> DataType {
 /// then had no columns at all, so outer references like `alias.col` failed
 /// with "column does not exist" (SQLAlchemy's domain-reflection subquery over
 /// the empty pg_constraint hit exactly this).
-fn agg_static_columns(
-    projection: &[SelectItem],
-    col_meta: &[ColMeta],
-) -> Vec<(String, DataType)> {
+fn agg_static_columns(projection: &[SelectItem], col_meta: &[ColMeta]) -> Vec<(String, DataType)> {
     let mut cols = Vec::new();
     for item in projection {
         match item {
             SelectItem::UnnamedExpr(expr) => {
-                cols.push((crate::executor::helpers::default_output_name(expr), infer_expr_type(expr, col_meta)));
+                cols.push((
+                    crate::executor::helpers::default_output_name(expr),
+                    infer_expr_type(expr, col_meta),
+                ));
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 cols.push((alias.value.clone(), infer_expr_type(expr, col_meta)));
@@ -319,7 +339,10 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
+                        cols.push((
+                            crate::executor::helpers::default_output_name(expr),
+                            agg_column_type(&val, expr, col_meta),
+                        ));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -415,7 +438,10 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
+                        cols.push((
+                            crate::executor::helpers::default_output_name(expr),
+                            agg_column_type(&val, expr, col_meta),
+                        ));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -456,7 +482,10 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, &null_indices, col_meta)?;
-                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
+                        cols.push((
+                            crate::executor::helpers::default_output_name(expr),
+                            agg_column_type(&val, expr, col_meta),
+                        ));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -529,7 +558,10 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
+                        cols.push((
+                            crate::executor::helpers::default_output_name(expr),
+                            agg_column_type(&val, expr, col_meta),
+                        ));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -652,7 +684,10 @@ impl Executor {
                         SelectItem::UnnamedExpr(expr) => {
                             let val =
                                 self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                            cols.push((crate::executor::helpers::default_output_name(expr), agg_column_type(&val, expr, col_meta)));
+                            cols.push((
+                                crate::executor::helpers::default_output_name(expr),
+                                agg_column_type(&val, expr, col_meta),
+                            ));
                             row.push(val);
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {

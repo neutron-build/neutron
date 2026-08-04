@@ -716,7 +716,6 @@ impl TransactionManager {
         }
     }
 
-
     /// After an edge `reader -> writer` is added, doom whichever endpoint has
     /// just become a PIVOT (has both an incoming and an outgoing edge).
     ///
@@ -747,8 +746,7 @@ impl TransactionManager {
 
         // A pivot has BOTH. Read from the flags, not from the live edge set:
         // the edges of a purged transaction are gone, the flags are not.
-        let is_pivot =
-            |t: u64| in_conflict.contains(&t) && out_conflict.contains(&t);
+        let is_pivot = |t: u64| in_conflict.contains(&t) && out_conflict.contains(&t);
 
         let committed = self.committed.lock();
         let mut doomed = self.ssi_doomed.lock();

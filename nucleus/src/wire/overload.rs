@@ -150,13 +150,10 @@ mod tests {
         client.write_all(&80877103u32.to_be_bytes()).await.unwrap();
 
         let mut received = Vec::new();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            client.read_to_end(&mut received),
-        )
-        .await
-        .expect("server should reply and close, not hang")
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut received))
+            .await
+            .expect("server should reply and close, not hang")
+            .unwrap();
 
         let fields = parse_error_frame(&received);
         assert!(fields.contains(&(b'C', "53300".to_string())), "{fields:?}");

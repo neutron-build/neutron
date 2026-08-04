@@ -722,7 +722,10 @@ impl HnswIndex {
         // pruning strips every bridge and the node ends up locked to one cluster.
         let mut scored: Vec<Candidate> = neighbors
             .into_iter()
-            .map(|nid| Candidate { id: nid, dist: self.dist(nid, &vector) })
+            .map(|nid| Candidate {
+                id: nid,
+                dist: self.dist(nid, &vector),
+            })
             .collect();
         scored.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
         let pruned = self.select_neighbors_heuristic(&scored, max_conn);
@@ -755,7 +758,10 @@ impl HnswIndex {
     /// `search_ef` path) still wins in BOTH directions for callers choosing
     /// their own point on the recall/latency frontier.
     pub fn search(&self, query: &Vector, k: usize) -> Vec<(u64, f32)> {
-        let auto = self.config.ef_search.max((self.nodes.len() / 2048).min(512));
+        let auto = self
+            .config
+            .ef_search
+            .max((self.nodes.len() / 2048).min(512));
         self.search_ef(query, k, auto)
     }
 
@@ -807,7 +813,10 @@ impl HnswIndex {
         F: Fn(u64) -> bool,
     {
         // Same size-scaled default beam as `search` (see its doc comment).
-        let auto = self.config.ef_search.max((self.nodes.len() / 2048).min(512));
+        let auto = self
+            .config
+            .ef_search
+            .max((self.nodes.len() / 2048).min(512));
         self.search_filtered_ef(query, k, auto, filter)
     }
 

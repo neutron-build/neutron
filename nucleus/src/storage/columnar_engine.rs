@@ -428,7 +428,6 @@ fn batches_to_rows_projected<B: AsRef<ColumnBatch>>(
     projection: &[usize],
     limit: Option<usize>,
 ) -> Vec<Row> {
-
     let mut rows = Vec::new();
     for batch in batches {
         let batch = batch.as_ref();
@@ -1077,7 +1076,7 @@ impl StorageEngine for ColumnarStorageEngine {
         // subset could resurrect a superseded row. Take the unpruned path.
         if crate::columnar::replacing_config(table).is_some() {
             let read = batches_for_read(&store, table);
-        let batches = read.refs();
+            let batches = read.refs();
             return Ok(batches_to_rows_projected(&batches, projection, limit));
         }
         match store.batches_pruned_slices(table, col, &bounds) {
@@ -1085,7 +1084,7 @@ impl StorageEngine for ColumnarStorageEngine {
             // Not a MergeTree: no declared order, so no range-coherent parts.
             None => {
                 let read = batches_for_read(&store, table);
-        let batches = read.refs();
+                let batches = read.refs();
                 Ok(batches_to_rows_projected(&batches, projection, limit))
             }
         }
@@ -2132,14 +2131,22 @@ mod merge_tree_pruning_tests {
         eng.register_merge_tree("spans", vec!["1".into()], MergeStrategy::Default);
         eng.store_table_schema(
             "spans",
-            &[("id".into(), DataType::Int64), ("ts".into(), DataType::Int64)],
+            &[
+                ("id".into(), DataType::Int64),
+                ("ts".into(), DataType::Int64),
+            ],
         );
         // A part is cut when the write buffer flushes, so read between inserts
         // to force separate parts. Sizes differ so the size-tiered merge policy
         // does not immediately consolidate them into one.
         for (decade, n) in [(0i64, 4usize), (1, 9), (2, 20), (3, 45)] {
             let rows: Vec<Row> = (0..n as i64)
-                .map(|i| vec![Value::Int64(decade * 100 + i), Value::Int64(decade * 1000 + i)])
+                .map(|i| {
+                    vec![
+                        Value::Int64(decade * 100 + i),
+                        Value::Int64(decade * 1000 + i),
+                    ]
+                })
                 .collect();
             eng.insert_batch("spans", rows).await.unwrap();
             eng.scan("spans").await.unwrap();
@@ -2270,7 +2277,10 @@ mod intra_part_narrowing_tests {
         eng.register_merge_tree("spans", vec!["1".into()], MergeStrategy::Default);
         eng.store_table_schema(
             "spans",
-            &[("id".into(), DataType::Int64), ("ts".into(), DataType::Int64)],
+            &[
+                ("id".into(), DataType::Int64),
+                ("ts".into(), DataType::Int64),
+            ],
         );
         let rows: Vec<Row> = (0..5_000i64)
             .map(|i| vec![Value::Int64(i), Value::Int64(i * 10)])
@@ -2307,7 +2317,10 @@ mod intra_part_narrowing_tests {
             let Value::Int64(ts) = r[1] else {
                 panic!("expected ts")
             };
-            assert!((20_000..=20_100).contains(&ts), "row outside the window: {ts}");
+            assert!(
+                (20_000..=20_100).contains(&ts),
+                "row outside the window: {ts}"
+            );
         }
     }
 
@@ -2396,7 +2409,10 @@ mod intra_part_narrowing_tests {
         eng.register_merge_tree("t", vec!["1".into()], MergeStrategy::Default);
         eng.store_table_schema(
             "t",
-            &[("id".into(), DataType::Int64), ("k".into(), DataType::Int64)],
+            &[
+                ("id".into(), DataType::Int64),
+                ("k".into(), DataType::Int64),
+            ],
         );
         let rows: Vec<Row> = (0..50_000i64)
             .map(|i| vec![Value::Int64(i), Value::Int64(i)])

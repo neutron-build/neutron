@@ -43,12 +43,9 @@ async fn concurrent_sessions_never_read_another_sessions_table() {
             .await
             .unwrap();
         for i in 1..=ROWS {
-            ex.execute(&format!(
-                "INSERT INTO acct{t} VALUES ({i}, {})",
-                base_of(t)
-            ))
-            .await
-            .unwrap();
+            ex.execute(&format!("INSERT INTO acct{t} VALUES ({i}, {})", base_of(t)))
+                .await
+                .unwrap();
         }
     }
 
@@ -156,6 +153,9 @@ async fn wire_shaped_parse_then_execute_keeps_sessions_apart() {
 
     for h in handles {
         let (t, bad) = h.await.unwrap();
-        assert_eq!(bad, 0, "session for table {t} saw {bad} cross-session leaks");
+        assert_eq!(
+            bad, 0,
+            "session for table {t} saw {bad} cross-session leaks"
+        );
     }
 }

@@ -111,7 +111,10 @@ async fn streaming_aggregate_spills_and_matches_materialized() {
             let full_set: std::collections::HashSet<String> =
                 as_multiset(&full_rows).into_iter().collect();
             for r in &stream_rows {
-                assert!(full_set.contains(&format!("{r:?}")), "spurious group: {sql}");
+                assert!(
+                    full_set.contains(&format!("{r:?}")),
+                    "spurious group: {sql}"
+                );
             }
         } else {
             assert_eq!(
@@ -231,8 +234,8 @@ async fn streaming_aggregate_engages_only_when_warranted() {
     for sql in [
         "SELECT k, COUNT(*) FROM t WHERE v > 10 GROUP BY k", // predicate
         "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k + 1", // computed ORDER BY key (unresolvable)
-        "SELECT COUNT(*) FROM t",                            // no GROUP BY
-        "SELECT k, COUNT(*) FROM t GROUP BY ROLLUP(k)",      // grouping set
+        "SELECT COUNT(*) FROM t",                              // no GROUP BY
+        "SELECT k, COUNT(*) FROM t GROUP BY ROLLUP(k)",        // grouping set
     ] {
         ex.query_cache_invalidate_all();
         // Some of these would themselves exceed the tiny budget on the
@@ -276,7 +279,10 @@ async fn streaming_aggregate_order_by_matches() {
             .await
             .unwrap();
         let streamed = one_result(&ex, sid, sql).await;
-        assert!(streamed.is_stream(), "ORDER BY over aggregate output should stream: {sql}");
+        assert!(
+            streamed.is_stream(),
+            "ORDER BY over aggregate output should stream: {sql}"
+        );
         let (stream_cols, stream_rows) = drain(streamed).await;
 
         assert_eq!(stream_cols, base_cols, "columns mismatch: {sql}");
@@ -316,7 +322,10 @@ async fn streaming_distinct_order_by_matches() {
             .await
             .unwrap();
         let streamed = one_result(&ex, sid, sql).await;
-        assert!(streamed.is_stream(), "ORDER BY over DISTINCT output should stream: {sql}");
+        assert!(
+            streamed.is_stream(),
+            "ORDER BY over DISTINCT output should stream: {sql}"
+        );
         let (stream_cols, stream_rows) = drain(streamed).await;
 
         assert_eq!(stream_cols, base_cols, "columns mismatch: {sql}");
@@ -342,7 +351,10 @@ async fn no_spill_dir_keeps_group_by_materialized() {
         .unwrap();
     ex.set_query_memory_limit(1024); // budget set, but no spill dir configured
     let r = one_result(&ex, sid, "SELECT k, SUM(v) FROM t GROUP BY k").await;
-    assert!(!r.is_stream(), "no spill dir → must not stream the aggregate");
+    assert!(
+        !r.is_stream(),
+        "no spill dir → must not stream the aggregate"
+    );
     let (_, rows) = drain(r).await;
     assert_eq!(rows.len(), 2);
 }
@@ -416,7 +428,10 @@ async fn streaming_distinct_spills_and_matches_materialized() {
             let full_set: std::collections::HashSet<String> =
                 as_multiset(&full).into_iter().collect();
             for r in &stream_rows {
-                assert!(full_set.contains(&format!("{r:?}")), "spurious distinct row: {sql}");
+                assert!(
+                    full_set.contains(&format!("{r:?}")),
+                    "spurious distinct row: {sql}"
+                );
             }
         } else {
             assert_eq!(
@@ -461,13 +476,20 @@ async fn streaming_distinct_high_cardinality_recurses_and_matches() {
     let (stream_cols, stream_rows) = drain(streamed).await;
 
     assert_eq!(stream_cols, base_cols);
-    assert_eq!(stream_rows.len(), 1000, "all distinct rows present after recursion");
+    assert_eq!(
+        stream_rows.len(),
+        1000,
+        "all distinct rows present after recursion"
+    );
     assert_eq!(as_multiset(&stream_rows), as_multiset(&base_rows));
 
     let leftover = std::fs::read_dir(dir.path().join("spill"))
         .map(|rd| rd.count())
         .unwrap_or(0);
-    assert_eq!(leftover, 0, "spill files reclaimed after DISTINCT recursion");
+    assert_eq!(
+        leftover, 0,
+        "spill files reclaimed after DISTINCT recursion"
+    );
 }
 
 /// The streaming DISTINCT must decline shapes it does not handle (falling through
@@ -497,7 +519,7 @@ async fn streaming_distinct_engages_only_when_warranted() {
         "SELECT DISTINCT ON (k) k, name FROM d ORDER BY k", // DISTINCT ON
         "SELECT DISTINCT k FROM d WHERE k > 2",             // predicate
         "SELECT DISTINCT k + 1 FROM d",                     // computed projection
-        "SELECT DISTINCT k FROM d ORDER BY name",           // ORDER BY a non-output column (unresolvable)
+        "SELECT DISTINCT k FROM d ORDER BY name", // ORDER BY a non-output column (unresolvable)
     ] {
         ex.query_cache_invalidate_all();
         if let Ok(mut results) = ex.execute_with_session(sid, sql).await {

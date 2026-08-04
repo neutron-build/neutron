@@ -605,7 +605,9 @@ impl Executor {
             return None;
         }
         let (col_name, values) = self.find_in_list_conjunct(expr)?;
-        let col = meta.iter().find(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+        let col = meta
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&col_name))?;
 
         // Distinct, in the column's own type — `IN ('1', '1', 2)` must probe
         // twice, not three times, and `'1'` must probe as the column's type for
@@ -1318,11 +1320,14 @@ impl Executor {
             Expr::BinaryOp { left, right, .. } => {
                 Self::where_predicate_streamable(left) && Self::where_predicate_streamable(right)
             }
-            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr)
-            | Expr::IsNotNull(expr) | Expr::IsTrue(expr) | Expr::IsFalse(expr)
-            | Expr::IsNotTrue(expr) | Expr::IsNotFalse(expr) => {
-                Self::where_predicate_streamable(expr)
-            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::Nested(expr)
+            | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr)
+            | Expr::IsTrue(expr)
+            | Expr::IsFalse(expr)
+            | Expr::IsNotTrue(expr)
+            | Expr::IsNotFalse(expr) => Self::where_predicate_streamable(expr),
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -1658,11 +1663,7 @@ impl Executor {
 
     /// True when `expr` is an equality joining a column of `left` to a column
     /// of `right` — the condition a comma join leaves stranded in its WHERE.
-    fn bridges_relations(
-        expr: &Expr,
-        left: &HashSet<String>,
-        right: &HashSet<String>,
-    ) -> bool {
+    fn bridges_relations(expr: &Expr, left: &HashSet<String>, right: &HashSet<String>) -> bool {
         let Expr::BinaryOp {
             left: l,
             op: ast::BinaryOperator::Eq,
@@ -3029,7 +3030,11 @@ impl Executor {
                                     )
                                     .await?
                             }
-                            _ => storage.scan_projected(table, proj_indices, *scan_limit).await?,
+                            _ => {
+                                storage
+                                    .scan_projected(table, proj_indices, *scan_limit)
+                                    .await?
+                            }
                         };
                         self.metrics.rows_scanned.inc_by(rows.len() as u64);
                         self.metrics
@@ -3777,9 +3782,9 @@ impl Executor {
                                 upstream_dt.unwrap_or_else(|| infer_expr_type(&expr, &meta));
                             proj_meta.push(ColMeta {
                                 table: None,
-                                name: alias.map(str::to_string).unwrap_or_else(|| {
-                                    super::helpers::default_output_name(&expr)
-                                }),
+                                name: alias
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| super::helpers::default_output_name(&expr)),
                                 dtype,
                             });
                             proj_items.push(ProjItem::Expr(Box::new(expr)));
@@ -3882,8 +3887,9 @@ impl Executor {
                     // shape allows it. Falls through to the hash join otherwise.
                     if let Some(key) = hash_keys.first()
                         && hash_keys.len() == 1
-                        && let Some(joined) =
-                            self.try_plan_index_join(left, right, key, cte_tables).await?
+                        && let Some(joined) = self
+                            .try_plan_index_join(left, right, key, cte_tables)
+                            .await?
                     {
                         return Ok(joined);
                     }
@@ -4735,8 +4741,9 @@ impl Executor {
                         Ok(Value::Text(n.clone()))
                     }
                 }
-                ast::Value::SingleQuotedString(s)
-                | ast::Value::EscapedStringLiteral(s) => Ok(Value::Text(s.clone())),
+                ast::Value::SingleQuotedString(s) | ast::Value::EscapedStringLiteral(s) => {
+                    Ok(Value::Text(s.clone()))
+                }
                 ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
                 ast::Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
@@ -5590,8 +5597,8 @@ impl Executor {
             // ORDER BY so column-dropping fast paths keep the keys they need.
             // DISTINCT ON is unaffected: its first-row-per-key semantics require the
             // ORDER BY to run first, which the un-deferred path preserves.
-            let defer_distinct = matches!(&distinct_mode, Some(ast::Distinct::Distinct))
-                && limit_clause.is_some();
+            let defer_distinct =
+                matches!(&distinct_mode, Some(ast::Distinct::Distinct)) && limit_clause.is_some();
             let (deferred_order, deferred_limit) = if defer_distinct {
                 (order_by.take(), limit_clause.take())
             } else {
@@ -5693,12 +5700,11 @@ impl Executor {
                                         // ordinals correctly, so this also made
                                         // `SET stream_results = on` silently
                                         // change row order.
-                                        let resolved_expr =
-                                            Self::order_by_ordinal_to_source_expr(
-                                                &e.expr,
-                                                &projection,
-                                            )
-                                            .unwrap_or_else(|| e.expr.clone());
+                                        let resolved_expr = Self::order_by_ordinal_to_source_expr(
+                                            &e.expr,
+                                            &projection,
+                                        )
+                                        .unwrap_or_else(|| e.expr.clone());
                                         self.resolve_order_by_expr(
                                             &resolved_expr,
                                             &col_pairs,
@@ -6323,8 +6329,7 @@ impl Executor {
             index_name,
             std::ops::Bound::Included(low),
             std::ops::Bound::Included(high),
-        )
-        {
+        ) {
             return Some(rows);
         }
 
@@ -7079,10 +7084,9 @@ impl Executor {
             // equals it bitwise. A decimal literal parses as `Float64`, so
             // without this arm `v = 2.25` on a NUMERIC column reached the
             // storage fast paths as a float and matched nothing.
-            (
-                Value::Float64(_) | Value::Int32(_) | Value::Int64(_),
-                DataType::Numeric,
-            ) => val.cast(target).unwrap_or_else(|_| val.clone()),
+            (Value::Float64(_) | Value::Int32(_) | Value::Int64(_), DataType::Numeric) => {
+                val.cast(target).unwrap_or_else(|_| val.clone())
+            }
             _ => val.clone(),
         }
     }
@@ -8349,7 +8353,9 @@ impl Executor {
                     let arr = self.eval_row_expr(&arg, row, &col_meta)?;
                     for (i, elem) in srf_array_elements(&arr).into_iter().enumerate() {
                         let mut r = row.clone();
-                        r.push(Value::Jsonb(serde_json::json!({"x": elem, "n": i as i64 + 1})));
+                        r.push(Value::Jsonb(
+                            serde_json::json!({"x": elem, "n": i as i64 + 1}),
+                        ));
                         expanded.push(r);
                     }
                 }
@@ -8541,7 +8547,8 @@ impl Executor {
         let (mut col_meta, rows0) = self
             .load_table_factor_with_ctes(&first.relation, cte_tables, first_pushdown.as_ref())
             .await?;
-        let mut rows = self.apply_pushdown_for_factor(&first.relation, rows0, &col_meta, pushdown)?;
+        let mut rows =
+            self.apply_pushdown_for_factor(&first.relation, rows0, &col_meta, pushdown)?;
 
         for join in &first.joins {
             // Check for LATERAL derived table
@@ -9753,9 +9760,7 @@ impl Executor {
             match e {
                 // A typed literal (`TIMESTAMP '…'`) and an INTERVAL are values
                 // just as much as a bare number is.
-                Expr::Value(_) | Expr::TypedString(_) | Expr::Interval(_) => {
-                    ControlFlow::Break(())
-                }
+                Expr::Value(_) | Expr::TypedString(_) | Expr::Interval(_) => ControlFlow::Break(()),
                 _ => ControlFlow::Continue(()),
             }
         });
@@ -9842,9 +9847,7 @@ impl Executor {
             | planner::PlanNode::Limit { input, .. }
             | planner::PlanNode::Project { input, .. }
             | planner::PlanNode::HashAggregate { input, .. }
-            | planner::PlanNode::Aggregate { input, .. } => {
-                Self::collect_plan_tables(input, out)
-            }
+            | planner::PlanNode::Aggregate { input, .. } => Self::collect_plan_tables(input, out),
         }
     }
 
@@ -9878,8 +9881,7 @@ impl Executor {
         }
 
         let (left_preds, rest) = Self::partition_predicates_for_relation(preds, &left_tables);
-        let (right_preds, residual) =
-            Self::partition_predicates_for_relation(rest, &right_tables);
+        let (right_preds, residual) = Self::partition_predicates_for_relation(rest, &right_tables);
 
         let left_where = Self::combine_predicates(left_preds);
         let right_where = Self::combine_predicates(right_preds);
@@ -11080,9 +11082,7 @@ impl Executor {
                 }
                 ast::Value::SingleQuotedString(s)
                 | ast::Value::DoubleQuotedString(s)
-                | ast::Value::EscapedStringLiteral(s) => {
-                    Some(Value::Text(s.clone()))
-                }
+                | ast::Value::EscapedStringLiteral(s) => Some(Value::Text(s.clone())),
                 ast::Value::Boolean(b) => Some(Value::Bool(*b)),
                 ast::Value::Null => Some(Value::Null),
                 _ => None,

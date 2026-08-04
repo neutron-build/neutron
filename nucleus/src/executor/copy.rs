@@ -95,7 +95,9 @@ impl Executor {
             payload_rows.remove(0);
         }
 
-        let count = self.copy_insert_rows(&table_name, None, payload_rows).await?;
+        let count = self
+            .copy_insert_rows(&table_name, None, payload_rows)
+            .await?;
 
         // COPY FROM is a bulk write but is not a Statement::Insert, so it is not
         // covered by the is_dml_write invalidation in the statement dispatcher.
@@ -572,10 +574,7 @@ pub(crate) fn format_copy_body(rows: &[Row], is_csv: bool, delimiter: char) -> S
 
 /// Encode rows as a complete PostgreSQL binary-COPY payload
 /// (signature + per-tuple field data + trailer).
-pub(super) fn encode_copy_binary(
-    rows: &[Row],
-    types: &[DataType],
-) -> Result<Vec<u8>, ExecError> {
+pub(super) fn encode_copy_binary(rows: &[Row], types: &[DataType]) -> Result<Vec<u8>, ExecError> {
     let mut out = Vec::with_capacity(19 + rows.len() * (2 + types.len() * 8));
     out.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
     out.extend_from_slice(&0u32.to_be_bytes()); // flags
@@ -599,11 +598,8 @@ pub(super) fn encode_copy_binary(
 
 /// One value in PostgreSQL binary wire encoding, per the declared column type.
 fn encode_binary_field(v: &Value, ty: &DataType) -> Result<Vec<u8>, ExecError> {
-    let unsupported = || {
-        ExecError::Unsupported(format!(
-            "binary COPY does not support values of type {ty}"
-        ))
-    };
+    let unsupported =
+        || ExecError::Unsupported(format!("binary COPY does not support values of type {ty}"));
     Ok(match (v, ty) {
         (Value::Bool(b), _) => vec![*b as u8],
         (Value::Int32(n), DataType::Int64) => (*n as i64).to_be_bytes().to_vec(),
@@ -643,7 +639,11 @@ fn encode_binary_numeric(text: &str) -> Result<Vec<u8>, ExecError> {
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
     let (int_part, frac_part) = t.split_once('.').unwrap_or((t, ""));
-    if int_part.chars().chain(frac_part.chars()).any(|c| !c.is_ascii_digit()) {
+    if int_part
+        .chars()
+        .chain(frac_part.chars())
+        .any(|c| !c.is_ascii_digit())
+    {
         return Err(ExecError::Runtime(format!("invalid numeric value: {text}")));
     }
     let dscale = frac_part.len() as u16;

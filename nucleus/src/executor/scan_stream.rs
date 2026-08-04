@@ -331,7 +331,10 @@ mod tests {
         engine.create_table(table).await.unwrap();
         for i in 0..n {
             engine
-                .insert(table, vec![Value::Int64(i as i64), Value::Text(format!("v{i}"))])
+                .insert(
+                    table,
+                    vec![Value::Int64(i as i64), Value::Text(format!("v{i}"))],
+                )
                 .await
                 .unwrap();
         }
@@ -457,7 +460,10 @@ mod tests {
 
     #[tokio::test]
     async fn offset_only_no_limit() {
-        let src = Box::new(MaterializedBatchIter::with_batch_size(ints(&[1, 2, 3, 4]), 2));
+        let src = Box::new(MaterializedBatchIter::with_batch_size(
+            ints(&[1, 2, 3, 4]),
+            2,
+        ));
         let mut l = LimitBatchIter::new(src, 1, None);
         assert_eq!(l.collect().await.unwrap().len(), 3);
     }

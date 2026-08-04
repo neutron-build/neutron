@@ -153,16 +153,25 @@ impl Drop for TmpDir {
 #[derive(Debug)]
 enum Outcome {
     /// Every surviving row carries one generation. The atomic answer.
-    Clean { gnum: i64, rows: usize },
+    Clean {
+        gnum: i64,
+        rows: usize,
+    },
     /// Two or more generations coexist: a transaction was half-applied.
     Torn {
         counts: BTreeMap<i64, usize>,
         rows: usize,
     },
     /// A generation the child announced as committed is not what came back.
-    LostCommitted { printed: i64, recovered: i64 },
+    LostCommitted {
+        printed: i64,
+        recovered: i64,
+    },
     /// Row count changed. An UPDATE must not create or destroy rows.
-    RowCount { got: usize, want: usize },
+    RowCount {
+        got: usize,
+        want: usize,
+    },
     ReopenError(String),
     ReadError(String),
 }
@@ -201,10 +210,7 @@ fn verify(dir: &Path, pool_frames: usize, rows: usize, last_printed: i64) -> Out
         return Outcome::Torn { counts, rows: n };
     }
     if n != rows {
-        return Outcome::RowCount {
-            got: n,
-            want: rows,
-        };
+        return Outcome::RowCount { got: n, want: rows };
     }
     let gnum = counts.keys().copied().next().unwrap_or(-1);
     if gnum < last_printed {

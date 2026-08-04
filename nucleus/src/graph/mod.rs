@@ -733,7 +733,13 @@ impl GraphStore {
     /// compensating WAL record.
     fn reattach_edge(&mut self, edge: Edge) {
         if let Some(ref w) = self.wal {
-            let _ = w.log_add_edge(edge.id, edge.from, edge.to, &edge.edge_type, &edge.properties);
+            let _ = w.log_add_edge(
+                edge.id,
+                edge.from,
+                edge.to,
+                &edge.edge_type,
+                &edge.properties,
+            );
         }
         self.type_index
             .entry(edge.edge_type.clone())

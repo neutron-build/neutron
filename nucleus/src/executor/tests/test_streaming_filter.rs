@@ -17,7 +17,12 @@ fn arc_executor(dir: &std::path::Path) -> Arc<Executor> {
     let catalog = Arc::new(crate::catalog::Catalog::new());
     let storage: Arc<dyn crate::storage::StorageEngine> =
         Arc::new(crate::storage::MemoryEngine::new());
-    let ex = Arc::new(Executor::new_with_persistence(catalog, storage, None, Some(dir)));
+    let ex = Arc::new(Executor::new_with_persistence(
+        catalog,
+        storage,
+        None,
+        Some(dir),
+    ));
     ex.install_self_ref();
     ex
 }
@@ -180,7 +185,10 @@ async fn streaming_filter_with_limit() {
     let (_, rows) = drain(streamed).await;
     assert_eq!(rows.len(), 8, "LIMIT count");
     for r in &rows {
-        assert!(full_set.contains(&format!("{r:?}")), "spurious filtered row under LIMIT");
+        assert!(
+            full_set.contains(&format!("{r:?}")),
+            "spurious filtered row under LIMIT"
+        );
     }
 }
 

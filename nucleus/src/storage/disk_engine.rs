@@ -646,7 +646,9 @@ impl DiskEngine {
                 64 * 1024 * 1024 // 64 MB default
             });
             let seg = match &archive_dir {
-                Some(ad) => wal::SegmentedWal::open_with_archive(&wal_dir, max_bytes, sync_mode, ad),
+                Some(ad) => {
+                    wal::SegmentedWal::open_with_archive(&wal_dir, max_bytes, sync_mode, ad)
+                }
                 None => wal::SegmentedWal::open_with_sync_mode(&wal_dir, max_bytes, sync_mode),
             }
             .map_err(|e| StorageError::Io(format!("Segmented WAL open failed: {e}")))?;
@@ -1472,7 +1474,10 @@ impl DiskEngine {
                 );
                 continue;
             }
-            by_page.entry(page_id).or_default().push((slot_idx, payload));
+            by_page
+                .entry(page_id)
+                .or_default()
+                .push((slot_idx, payload));
         }
         Ok(by_page
             .into_iter()
@@ -2702,8 +2707,7 @@ impl StorageEngine for DiskEngine {
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
-        let targets: Vec<(usize, Option<Row>)> =
-            positions.iter().map(|&pos| (pos, None)).collect();
+        let targets: Vec<(usize, Option<Row>)> = positions.iter().map(|&pos| (pos, None)).collect();
         self.delete_at(table, targets)
     }
 
@@ -3610,7 +3614,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -3618,7 +3622,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                 ],
                 constraints: vec![],
@@ -3653,10 +3657,7 @@ mod tests {
             register_simple_table(&catalog, "t").await;
             engine.create_table("t").await.unwrap();
             for id in 0..400 {
-                engine
-                    .insert("t", simple_row(id, "seed"))
-                    .await
-                    .unwrap();
+                engine.insert("t", simple_row(id, "seed")).await.unwrap();
             }
             // Stamps fresh LSNs onto every dirty page.
             engine.flush().unwrap();
@@ -3974,7 +3975,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "label".into(),
@@ -3982,7 +3983,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "score".into(),
@@ -3990,7 +3991,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -3998,7 +3999,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                 ],
                 constraints: vec![],
@@ -5800,7 +5801,10 @@ mod tests {
                 engine
                     .insert(
                         "t",
-                        simple_row(inserted as i32, &format!("padpadpadpadpadpad_{inserted:06}")),
+                        simple_row(
+                            inserted as i32,
+                            &format!("padpadpadpadpadpad_{inserted:06}"),
+                        ),
                     )
                     .await
                     .unwrap();
@@ -6076,7 +6080,10 @@ mod tests {
             engine.insert("t", simple_row(i, &pad)).await.unwrap();
         }
         let full = engine.scan("t").await.unwrap();
-        assert!(engine.table_pages("t").unwrap().len() > 1, "need multiple pages");
+        assert!(
+            engine.table_pages("t").unwrap().len() > 1,
+            "need multiple pages"
+        );
         for n in [1usize, 7, 63, 64, 65, 300, 500] {
             let limited = engine.scan_limit("t", n).await.unwrap();
             assert_eq!(limited.len(), n.min(full.len()), "n={n}");
@@ -6120,7 +6127,7 @@ mod tests {
     // reappear, and rows at/before it must all be present.
     #[tokio::test]
     async fn pitr_restores_row_set_at_target_lsn() {
-        use crate::pitr::{restore_pitr, PitrTarget};
+        use crate::pitr::{PitrTarget, restore_pitr};
 
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("live");
@@ -6164,7 +6171,10 @@ mod tests {
             .unwrap();
             engine.create_table("t").await.unwrap();
             for i in 0..40 {
-                engine.insert("t", simple_row(i, &format!("a{i}"))).await.unwrap();
+                engine
+                    .insert("t", simple_row(i, &format!("a{i}")))
+                    .await
+                    .unwrap();
             }
             engine.checkpoint().unwrap();
             drop(engine);
@@ -6189,13 +6199,22 @@ mod tests {
             .unwrap();
             engine.create_table("t").await.unwrap();
             for i in 100..140 {
-                engine.insert("t", simple_row(i, &format!("b{i}"))).await.unwrap();
+                engine
+                    .insert("t", simple_row(i, &format!("b{i}")))
+                    .await
+                    .unwrap();
             }
             engine.checkpoint().unwrap();
             target_lsn = max_lsn_now(&live_wal_dir, &archive);
-            assert!(target_lsn > 0, "expected a non-zero target LSN after batch B");
+            assert!(
+                target_lsn > 0,
+                "expected a non-zero target LSN after batch B"
+            );
             for i in 200..240 {
-                engine.insert("t", simple_row(i, &format!("c{i}"))).await.unwrap();
+                engine
+                    .insert("t", simple_row(i, &format!("c{i}")))
+                    .await
+                    .unwrap();
             }
             engine.checkpoint().unwrap();
             drop(engine);
@@ -6252,7 +6271,10 @@ mod tests {
             assert!(ids.contains(&i), "row B{i} missing after PITR restore");
         }
         for i in 200..240 {
-            assert!(!ids.contains(&i), "row C{i} wrongly survived PITR to target");
+            assert!(
+                !ids.contains(&i),
+                "row C{i} wrongly survived PITR to target"
+            );
         }
     }
 
@@ -6448,8 +6470,7 @@ mod tests {
         assert!(!manifest.database_id.is_empty());
         assert!(!manifest.taken_while_in_use);
 
-        let live_ids: std::collections::HashSet<i32> =
-            inserted.lock().iter().copied().collect();
+        let live_ids: std::collections::HashSet<i32> = inserted.lock().iter().copied().collect();
         drop(engine);
 
         let restored = ids_after_restore(&snap, &tmp.path().join("restored")).await;
@@ -6517,7 +6538,8 @@ mod tests {
                 .unwrap();
             let slots = f.metadata().unwrap().len() / PAGE_SIZE as u64;
             assert!(slots >= 2, "test needs at least one non-meta page");
-            f.seek(SeekFrom::Start((slots - 1) * PAGE_SIZE as u64)).unwrap();
+            f.seek(SeekFrom::Start((slots - 1) * PAGE_SIZE as u64))
+                .unwrap();
             f.write_all(&[0xA5u8; 256]).unwrap();
             f.sync_all().unwrap();
             slots
@@ -6619,7 +6641,11 @@ mod tests {
         let rows = engine.scan("t").await.unwrap();
         let mut got = ids(&rows);
         got.sort_unstable();
-        assert_eq!(got, vec![2, 3, 4, 5], "stale position aliased a different row");
+        assert_eq!(
+            got,
+            vec![2, 3, 4, 5],
+            "stale position aliased a different row"
+        );
         assert!(
             rows.contains(&simple_row(3, "updated")),
             "update did not land on id=3: {rows:?}"
@@ -6813,7 +6839,10 @@ mod tests {
                     got.len(),
                     want_sorted.len()
                 );
-                assert_eq!(got, want_sorted, "concurrent same-page inserts corrupted rows");
+                assert_eq!(
+                    got, want_sorted,
+                    "concurrent same-page inserts corrupted rows"
+                );
             },
         )
         .await;

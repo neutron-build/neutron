@@ -375,8 +375,6 @@ impl BufferedDiskEngine {
         *self.metrics.write() = Some(metrics);
     }
 
-
-
     /// Whether this session is inside a SERIALIZABLE transaction, and therefore
     /// must take 2PL locks.
     ///
@@ -391,7 +389,8 @@ impl BufferedDiskEngine {
     /// Take a shared (read) lock on `table` if this is a serializable
     /// transaction. Called from every path that returns rows.
     async fn lock_read(&self, table: &str) -> Result<(), StorageError> {
-        self.lock(table, super::lock_manager::LockMode::Shared).await
+        self.lock(table, super::lock_manager::LockMode::Shared)
+            .await
     }
 
     /// Take an exclusive (write) lock on `table` if this is a serializable
@@ -1363,7 +1362,7 @@ mod tests {
                         nullable: false,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -1371,7 +1370,7 @@ mod tests {
                         nullable: true,
                         default_expr: None,
                         id: 0,
-                    analyzer: None,
+                        analyzer: None,
                     },
                 ],
                 constraints: vec![],
@@ -1434,8 +1433,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(ids.contains(&20) && ids.contains(&30), "committed rows visible: {ids:?}");
-        assert!(!ids.contains(&10), "orphaned buffered row must not be visible: {ids:?}");
+        assert!(
+            ids.contains(&20) && ids.contains(&30),
+            "committed rows visible: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&10),
+            "orphaned buffered row must not be visible: {ids:?}"
+        );
 
         // Disconnect cleanup releases session 1's orphan; a fresh BEGIN on the
         // same id succeeds and the orphaned row is gone for good.
@@ -1608,8 +1613,16 @@ mod tests {
 
         let view = engine.scan_physical("t").await.unwrap();
         assert_eq!(view.len(), 4, "buffered inserts must be visible in-txn");
-        let doomed = view.iter().find(|(_, r)| r[0] == Value::Int32(3)).unwrap().0;
-        let revised = view.iter().find(|(_, r)| r[0] == Value::Int32(4)).unwrap().0;
+        let doomed = view
+            .iter()
+            .find(|(_, r)| r[0] == Value::Int32(3))
+            .unwrap()
+            .0;
+        let revised = view
+            .iter()
+            .find(|(_, r)| r[0] == Value::Int32(4))
+            .unwrap()
+            .0;
 
         engine.delete("t", &[doomed]).await.unwrap();
         engine

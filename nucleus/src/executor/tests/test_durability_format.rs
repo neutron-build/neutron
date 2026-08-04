@@ -43,10 +43,7 @@ fn dir_fingerprint(dir: &std::path::Path) -> Vec<(String, u64, String)> {
 }
 
 /// Human-readable description of what changed between two fingerprints.
-fn describe_changes(
-    before: &[(String, u64, String)],
-    after: &[(String, u64, String)],
-) -> String {
+fn describe_changes(before: &[(String, u64, String)], after: &[(String, u64, String)]) -> String {
     let mut msgs = Vec::new();
     for (name, len, hash) in after {
         match before.iter().find(|(n, _, _)| n == name) {
@@ -104,12 +101,7 @@ async fn open_executor(dir: &std::path::Path) -> Executor {
         .ok();
     let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(engine);
-    let ex = Executor::new_with_persistence(
-        catalog,
-        storage,
-        Some(catalog_path),
-        Some(dir),
-    );
+    let ex = Executor::new_with_persistence(catalog, storage, Some(catalog_path), Some(dir));
     ex.load_meta().await;
     ex
 }
@@ -136,8 +128,7 @@ async fn a_future_on_disk_format_is_rejected_without_modifying_data() {
     // Stamp a format version from the future into the meta page.
     let mut bytes = std::fs::read(&db_path).unwrap();
     let future = page::DB_FORMAT_VERSION + 9;
-    bytes[page::META_DB_VERSION..page::META_DB_VERSION + 4]
-        .copy_from_slice(&future.to_le_bytes());
+    bytes[page::META_DB_VERSION..page::META_DB_VERSION + 4].copy_from_slice(&future.to_le_bytes());
     std::fs::write(&db_path, &bytes).unwrap();
 
     let before = dir_fingerprint(tmp.path());
@@ -241,7 +232,11 @@ async fn catalog_metadata_and_specialty_state_all_survive_reopen() {
     let ex = open_executor(tmp.path()).await;
 
     let r = exec(&ex, "SELECT COUNT(*) FROM docs").await;
-    assert_eq!(scalar(&r[0]), &Value::Int64(2), "rows did not survive reopen");
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Int64(2),
+        "rows did not survive reopen"
+    );
 
     // Constraints must come back, or a restart silently relaxes the schema.
     assert!(
@@ -272,7 +267,11 @@ async fn catalog_metadata_and_specialty_state_all_survive_reopen() {
 
     // View survived.
     let r = exec(&ex, "SELECT COUNT(*) FROM docs_v").await;
-    assert_eq!(scalar(&r[0]), &Value::Int64(3), "view did not survive reopen");
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Int64(3),
+        "view did not survive reopen"
+    );
 
     // Specialty index state: the vector column still answers a KNN query.
     let knn = ex

@@ -133,13 +133,7 @@ const CONTROL_RECORD_SIZE: usize = RECORD_HEADER_SIZE + RECORD_CRC_SIZE;
 /// image the undo record exists to remove. RECORD_PAGE_WRITE is 0, so page
 /// writes hash identically to before this became a parameter and the on-disk
 /// format is unchanged.
-fn page_image_crc(
-    lsn: u64,
-    txn_id: u64,
-    record_type: u8,
-    page_id: u32,
-    page_image: &[u8],
-) -> u32 {
+fn page_image_crc(lsn: u64, txn_id: u64, record_type: u8, page_id: u32, page_image: &[u8]) -> u32 {
     let mut crc = crc32c::crc32c(&lsn.to_le_bytes());
     crc = crc32c::crc32c_append(crc, &txn_id.to_le_bytes());
     crc = crc32c::crc32c_append(crc, &[record_type]);
@@ -617,7 +611,11 @@ pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalCorruption {
     /// CRC over the record's authenticated bytes did not match.
-    Crc { lsn: u64, stored: u32, computed: u32 },
+    Crc {
+        lsn: u64,
+        stored: u32,
+        computed: u32,
+    },
     /// Declared record length is impossible (zero, or shorter than a header).
     BadLength { declared: u32 },
 }
@@ -706,7 +704,10 @@ fn scan_inner(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64, TailState)> 
         if record_end >= file_len {
             TailState::TornEof { valid_end: pos }
         } else {
-            TailState::InteriorCorruption { offset: pos, reason }
+            TailState::InteriorCorruption {
+                offset: pos,
+                reason,
+            }
         }
     }
 
@@ -1823,17 +1824,18 @@ mod tests {
         assert_eq!(records[0].txn_id, 42);
         assert_eq!(records[0].page_id, 3);
         assert_eq!(
-            records[0].page_image.as_ref().expect("undo carries an image").as_ref(),
+            records[0]
+                .page_image
+                .as_ref()
+                .expect("undo carries an image")
+                .as_ref(),
             &before,
             "the undo record must carry the BEFORE image, not the new one"
         );
 
         assert_eq!(records[1].record_type, RECORD_PAGE_WRITE);
         assert_eq!(records[1].lsn, write_lsn);
-        assert_eq!(
-            records[1].page_image.as_ref().unwrap().as_ref(),
-            &after
-        );
+        assert_eq!(records[1].page_image.as_ref().unwrap().as_ref(), &after);
     }
 
     /// The record type is inside the CRC, so an undo record cannot decay into
@@ -2334,7 +2336,11 @@ mod tests {
         let wal = SegmentedWal::open(&dir.path().join("wal"), 20_000).unwrap();
         wal.pin_retention(50);
         wal.pin_retention(90);
-        assert_eq!(wal.retention_pin(), 50, "a later, higher pin must not raise the floor");
+        assert_eq!(
+            wal.retention_pin(),
+            50,
+            "a later, higher pin must not raise the floor"
+        );
         wal.pin_retention(20);
         assert_eq!(wal.retention_pin(), 20, "a lower pin must lower the floor");
         wal.unpin_retention();
@@ -2982,7 +2988,9 @@ mod archive_tests {
         wal.sync().unwrap();
 
         assert!(
-            list_archive_segments(&archive).unwrap_or_default().is_empty(),
+            list_archive_segments(&archive)
+                .unwrap_or_default()
+                .is_empty(),
             "a partial segment must not be archived on its own — if it were, \
              this test would not be measuring anything"
         );
@@ -2992,7 +3000,9 @@ mod archive_tests {
             "archive_active must report that it sealed a segment holding commits"
         );
         assert!(
-            !list_archive_segments(&archive).unwrap_or_default().is_empty(),
+            !list_archive_segments(&archive)
+                .unwrap_or_default()
+                .is_empty(),
             "committed records were left out of the archive, so PITR cannot reach them"
         );
 
@@ -3011,8 +3021,8 @@ mod archive_tests {
     fn archive_active_reports_false_without_an_archive() {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("t.wal.d");
-        let wal = SegmentedWal::open_with_sync_mode(&wal_dir, 64 * 1024 * 1024, SyncMode::None)
-            .unwrap();
+        let wal =
+            SegmentedWal::open_with_sync_mode(&wal_dir, 64 * 1024 * 1024, SyncMode::None).unwrap();
 
         let page = [7u8; PAGE_SIZE];
         wal.log_page_write(1, 1, &page).unwrap();

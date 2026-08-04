@@ -909,7 +909,11 @@ mod crash_safety_tests {
         drop(wal);
         let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
         let tbl = state.tables.get("t").expect("table survived");
-        assert_eq!(tbl.rows.len(), 5, "abandoned compaction lost committed rows");
+        assert_eq!(
+            tbl.rows.len(),
+            5,
+            "abandoned compaction lost committed rows"
+        );
         assert!(
             !staged.exists(),
             "stale staging file was left behind for a later compaction to trip over"

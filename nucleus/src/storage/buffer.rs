@@ -595,7 +595,6 @@ impl BufferPool {
         result.map_err(BufferError::Io)
     }
 
-
     /// Close the window without logging anything, for a transaction that
     /// dirtied no page. There is nothing for recovery to redo or undo, so a
     /// record would be pure log noise on the read-only path.

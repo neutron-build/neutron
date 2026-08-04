@@ -42,7 +42,12 @@ fn arc_executor(dir: &std::path::Path) -> Arc<Executor> {
     let catalog = Arc::new(crate::catalog::Catalog::new());
     let storage: Arc<dyn crate::storage::StorageEngine> =
         Arc::new(crate::storage::MvccStorageAdapter::new());
-    let ex = Arc::new(Executor::new_with_persistence(catalog, storage, None, Some(dir)));
+    let ex = Arc::new(Executor::new_with_persistence(
+        catalog,
+        storage,
+        None,
+        Some(dir),
+    ));
     ex.install_self_ref();
     ex
 }
@@ -53,9 +58,12 @@ const COLS: [&str; 5] = ["id", "a", "b", "g", "s"];
 const KEYS: [&str; 3] = ["a", "g", "id"]; // NOT NULL, usable as join/group keys
 
 async fn seed(ex: &Executor, sid: u64, rng: &mut Rng) {
-    ex.execute_with_session(sid, "CREATE TABLE t (id BIGINT, a BIGINT, b BIGINT, g BIGINT, s TEXT)")
-        .await
-        .unwrap();
+    ex.execute_with_session(
+        sid,
+        "CREATE TABLE t (id BIGINT, a BIGINT, b BIGINT, g BIGINT, s TEXT)",
+    )
+    .await
+    .unwrap();
     let n = 30 + rng.below(50);
     let card = 3 + rng.below(6); // distinct group/join key values
     let pad = "p".repeat(40);
@@ -117,7 +125,11 @@ fn gen_query(rng: &mut Rng) -> String {
             let proj = if rng.chance(35) {
                 "*".to_string()
             } else {
-                { let n = 1 + rng.below(3); pick_cols(rng, &COLS, n) }.join(", ")
+                {
+                    let n = 1 + rng.below(3);
+                    pick_cols(rng, &COLS, n)
+                }
+                .join(", ")
             };
             let w = if rng.chance(55) {
                 format!(" WHERE {}", predicate(rng))
@@ -129,7 +141,10 @@ fn gen_query(rng: &mut Rng) -> String {
             // materialized may pick different valid rows; not comparable as a
             // multiset. The streaming scan also declines ORDER BY + LIMIT anyway.)
             let order = if rng.chance(45) {
-                let keys = { let n = 1 + rng.below(2); pick_cols(rng, &KEYS, n) };
+                let keys = {
+                    let n = 1 + rng.below(2);
+                    pick_cols(rng, &KEYS, n)
+                };
                 let ob: Vec<String> = keys
                     .iter()
                     .map(|k| format!("{k} {}", if rng.chance(50) { "ASC" } else { "DESC" }))
@@ -148,7 +163,10 @@ fn gen_query(rng: &mut Rng) -> String {
         // (group keys are unique per row) — that is what makes LIMIT/OFFSET a
         // deterministic window comparable as a multiset.
         1 => {
-            let gcols = { let n = 1 + rng.below(2); pick_cols(rng, &["a", "g", "s"], n) };
+            let gcols = {
+                let n = 1 + rng.below(2);
+                pick_cols(rng, &["a", "g", "s"], n)
+            };
             let g = gcols.join(", ");
             let naggs = 1 + rng.below(3);
             let aggs: Vec<String> = (0..naggs)
@@ -194,7 +212,10 @@ fn gen_query(rng: &mut Rng) -> String {
         // projected (== deduped) columns is a total order, so LIMIT and OFFSET
         // both yield a deterministic, multiset-comparable window.
         2 => {
-            let cols = { let n = 1 + rng.below(3); pick_cols(rng, &COLS, n) };
+            let cols = {
+                let n = 1 + rng.below(3);
+                pick_cols(rng, &COLS, n)
+            };
             let c = cols.join(", ");
             let order = if rng.chance(55) {
                 let dir = if rng.chance(50) { "ASC" } else { "DESC" };
@@ -289,9 +310,15 @@ async fn range_with_strict_bound_and_order_by_is_exact() {
     }
     // Inclusive lower keeps a = 0 (56 rows) — the fast path stays correct there.
     ex.query_cache_invalidate_all();
-    let (_, incl) =
-        drain(one_result(&ex, sid, "SELECT g FROM t WHERE a >= 0 AND a <= 3 ORDER BY a DESC").await)
-            .await;
+    let (_, incl) = drain(
+        one_result(
+            &ex,
+            sid,
+            "SELECT g FROM t WHERE a >= 0 AND a <= 3 ORDER BY a DESC",
+        )
+        .await,
+    )
+    .await;
     assert_eq!(incl.len(), 56, "inclusive range includes a=0");
 }
 
@@ -303,7 +330,11 @@ async fn drain(result: ExecResult) -> (Vec<(String, crate::types::DataType)>, Ve
 }
 
 async fn one_result(ex: &Executor, sid: u64, sql: &str) -> ExecResult {
-    ex.execute_with_session(sid, sql).await.unwrap().pop().unwrap()
+    ex.execute_with_session(sid, sql)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -346,7 +377,8 @@ async fn streaming_equals_materialized_over_random_queries() {
                 .await
                 .unwrap();
             let result = ex.execute_with_session(sid, &sql).await;
-            let streamed_query = matches!(&result, Ok(rs) if rs.last().is_some_and(|r| r.is_stream()));
+            let streamed_query =
+                matches!(&result, Ok(rs) if rs.last().is_some_and(|r| r.is_stream()));
             let stream_rows = match result {
                 Ok(mut rs) => match rs.pop().unwrap().materialize().await {
                     Ok(ExecResult::Select { rows, .. }) => rows,

@@ -1427,8 +1427,7 @@ async fn shipping_executor(dir: &std::path::Path) -> Executor {
     use crate::storage::buffered_engine::BufferedDiskEngine;
     use crate::storage::disk_engine::DiskEngine;
     let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
-    let disk =
-        std::sync::Arc::new(DiskEngine::open(&dir.join("t.db"), catalog.clone()).unwrap());
+    let disk = std::sync::Arc::new(DiskEngine::open(&dir.join("t.db"), catalog.clone()).unwrap());
     let engine: std::sync::Arc<dyn crate::storage::StorageEngine> =
         std::sync::Arc::new(BufferedDiskEngine::new(disk));
     Executor::new(catalog, engine)
@@ -1460,7 +1459,11 @@ async fn test_rollback_reverts_per_table_engine_writes() {
     let ex = shipping_executor(dir.path()).await;
 
     for (label, clause) in PER_TABLE_ENGINES {
-        exec(&ex, &format!("CREATE TABLE {label} (id INT PRIMARY KEY, v INT) {clause}")).await;
+        exec(
+            &ex,
+            &format!("CREATE TABLE {label} (id INT PRIMARY KEY, v INT) {clause}"),
+        )
+        .await;
         exec(&ex, &format!("INSERT INTO {label} VALUES (1, 100)")).await;
 
         exec(&ex, "BEGIN").await;
@@ -1468,8 +1471,8 @@ async fn test_rollback_reverts_per_table_engine_writes() {
         exec(&ex, &format!("UPDATE {label} SET v = 999 WHERE id = 1")).await;
         exec(&ex, "ROLLBACK").await;
 
-        let after = rows(&exec(&ex, &format!("SELECT id, v FROM {label} ORDER BY id")).await[0])
-            .clone();
+        let after =
+            rows(&exec(&ex, &format!("SELECT id, v FROM {label} ORDER BY id")).await[0]).clone();
         assert_eq!(
             after,
             vec![vec![Value::Int32(1), Value::Int32(100)]],
@@ -1485,14 +1488,18 @@ async fn test_commit_keeps_per_table_engine_writes() {
     let ex = shipping_executor(dir.path()).await;
 
     for (label, clause) in PER_TABLE_ENGINES {
-        exec(&ex, &format!("CREATE TABLE {label} (id INT PRIMARY KEY, v INT) {clause}")).await;
+        exec(
+            &ex,
+            &format!("CREATE TABLE {label} (id INT PRIMARY KEY, v INT) {clause}"),
+        )
+        .await;
         exec(&ex, "BEGIN").await;
         exec(&ex, &format!("INSERT INTO {label} VALUES (1, 100)")).await;
         exec(&ex, &format!("INSERT INTO {label} VALUES (2, 200)")).await;
         exec(&ex, "COMMIT").await;
 
-        let after = rows(&exec(&ex, &format!("SELECT id, v FROM {label} ORDER BY id")).await[0])
-            .clone();
+        let after =
+            rows(&exec(&ex, &format!("SELECT id, v FROM {label} ORDER BY id")).await[0]).clone();
         assert_eq!(after.len(), 2, "{label}: COMMIT dropped the writes");
     }
 }
@@ -1508,7 +1515,11 @@ async fn test_savepoint_reverts_per_table_engine_writes_to_that_point() {
         let early = format!("{label}_early");
         let late = format!("{label}_late");
         for t in [&early, &late] {
-            exec(&ex, &format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT) {clause}")).await;
+            exec(
+                &ex,
+                &format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT) {clause}"),
+            )
+            .await;
             exec(&ex, &format!("INSERT INTO {t} VALUES (1, 100)")).await;
         }
 
@@ -1546,7 +1557,11 @@ async fn test_savepoint_reverts_per_table_engine_writes_to_that_point() {
 async fn test_begin_does_not_copy_untouched_per_table_engines() {
     let dir = tempfile::tempdir().unwrap();
     let ex = shipping_executor(dir.path()).await;
-    exec(&ex, "CREATE TABLE big (id INT PRIMARY KEY, v INT) WITH (engine='columnar')").await;
+    exec(
+        &ex,
+        "CREATE TABLE big (id INT PRIMARY KEY, v INT) WITH (engine='columnar')",
+    )
+    .await;
     exec(&ex, "CREATE TABLE small (id INT PRIMARY KEY, v INT)").await;
     for i in 0..2_000 {
         exec(&ex, &format!("INSERT INTO big VALUES ({i}, {i})")).await;

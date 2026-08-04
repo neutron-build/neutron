@@ -192,7 +192,11 @@ async fn replacing_mergetree_delete_via_pk_removes_all_physical_versions() {
     // when a later write triggers the merge that would have collapsed it, so
     // re-checking only after more writes is what actually rules that out.
     for v in 4..12 {
-        exec(&ex, &format!("INSERT INTO d (id, version) VALUES ('other{v}', {v})")).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO d (id, version) VALUES ('other{v}', {v})"),
+        )
+        .await;
     }
     let after = select_rows(&ex, "SELECT id FROM d WHERE id='rm'").await;
     assert!(

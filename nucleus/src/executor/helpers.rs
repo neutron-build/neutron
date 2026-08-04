@@ -626,10 +626,7 @@ pub(super) fn estimate_row_bytes(row: &Row) -> u64 {
         bytes += match v {
             Value::Null | Value::Bool(_) => 1,
             Value::Int32(_) | Value::Date(_) => 4,
-            Value::Int64(_)
-            | Value::Float64(_)
-            | Value::Timestamp(_)
-            | Value::TimestampTz(_) => 8,
+            Value::Int64(_) | Value::Float64(_) | Value::Timestamp(_) | Value::TimestampTz(_) => 8,
             Value::Text(s) => 24 + s.len() as u64,
             Value::Numeric(s) => 24 + s.len() as u64,
             Value::Uuid(_) => 16,
@@ -688,7 +685,11 @@ pub(super) fn cmp_sort_key(
 // Only reachable from server-gated code; without this the core-only
 // clippy gate fails on dead_code.
 #[cfg(feature = "server")]
-pub(super) fn cmp_row_sort_keys(a: &Row, b: &Row, keys: &[(usize, bool, bool)]) -> std::cmp::Ordering {
+pub(super) fn cmp_row_sort_keys(
+    a: &Row,
+    b: &Row,
+    keys: &[(usize, bool, bool)],
+) -> std::cmp::Ordering {
     for &(idx, desc, nulls_first) in keys {
         let va = a.get(idx).unwrap_or(&Value::Null);
         let vb = b.get(idx).unwrap_or(&Value::Null);

@@ -86,8 +86,9 @@ async fn build(rows: usize) -> (Arc<Executor>, Arc<dyn StorageEngine>) {
             if i > id {
                 u.push(',');
             }
-            let city = ["NYC", "LA", "CHI", "HOU", "PHX", "PHI", "SAN", "DEN", "BOS", "SEA"]
-                [i % 10];
+            let city = [
+                "NYC", "LA", "CHI", "HOU", "PHX", "PHI", "SAN", "DEN", "BOS", "SEA",
+            ][i % 10];
             u.push_str(&format!("({i},'user{i}',{},'{city}')", 20 + (i % 50)));
         }
         ex.execute(&u).await.expect("insert users");
@@ -234,14 +235,17 @@ async fn main() {
                 }
                 5 => {
                     let r = ex.execute(&full_sql).await.expect("cached");
-                    assert_eq!(row_count(&r[0]), expect_rows, "cached arm changed its answer");
+                    assert_eq!(
+                        row_count(&r[0]),
+                        expect_rows,
+                        "cached arm changed its answer"
+                    );
                 }
                 2 => {
                     let mut hits = 0usize;
                     for k in &keys {
-                        if let Ok(Some(rows)) = storage
-                            .index_lookup("bench_users", &pk_index, k)
-                            .await
+                        if let Ok(Some(rows)) =
+                            storage.index_lookup("bench_users", &pk_index, k).await
                         {
                             hits += rows.len();
                         }
@@ -253,7 +257,11 @@ async fn main() {
                 }
                 _ => {
                     let r = ex.execute_prepared(&handle, &[]).await.expect("prepared");
-                    assert_eq!(row_count(&r), expect_rows, "prepared arm changed its answer");
+                    assert_eq!(
+                        row_count(&r),
+                        expect_rows,
+                        "prepared arm changed its answer"
+                    );
                 }
             }
             let us = t.elapsed().as_micros();
@@ -336,9 +344,7 @@ async fn main() {
     };
     let (f, o, p) = (med(&full), med(&outer), med(&probes));
     let rest = f - o - p;
-    println!(
-        "\n  full {f:.0} us = outer {o:.0} + probes {p:.0} + assembly/projection {rest:.0}"
-    );
+    println!("\n  full {f:.0} us = outer {o:.0} + probes {p:.0} + assembly/projection {rest:.0}");
     println!(
         "  per returned row ({expect_rows}): full {:.2} us, assembly {:.2} us",
         f / expect_rows as f64,

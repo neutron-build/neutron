@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write, Read, BufReader};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
@@ -676,7 +676,11 @@ mod tests {
             wal.log_set("after", &Value::Text("tail".into())).unwrap();
         }
         let (_, state) = KvWal::open(dir.path()).unwrap();
-        let map: HashMap<_, _> = state.items.iter().map(|(k, v, _)| (k.as_str(), v)).collect();
+        let map: HashMap<_, _> = state
+            .items
+            .iter()
+            .map(|(k, v, _)| (k.as_str(), v))
+            .collect();
         assert_eq!(map.get("huge"), Some(&&Value::Text(big)));
         assert_eq!(map.get("after"), Some(&&Value::Text("tail".into())));
     }
@@ -697,7 +701,11 @@ mod tests {
         }
         let (_, state) = KvWal::open(dir.path()).unwrap();
         assert_eq!(state.items.len(), 200, "every snapshot item must replay");
-        let map: HashMap<_, _> = state.items.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
+        let map: HashMap<_, _> = state
+            .items
+            .iter()
+            .map(|(k, v, _)| (k.clone(), v.clone()))
+            .collect();
         assert_eq!(map.get("k0"), Some(&Value::Text(format!("{chunk}0"))));
         assert_eq!(map.get("k199"), Some(&Value::Text(format!("{chunk}199"))));
     }
@@ -1066,7 +1074,8 @@ mod tests {
         let expiry = 9_000_000_000_000u64;
 
         let (wal, _) = KvWal::open(dir.path()).unwrap();
-        wal.log_set_with_expiry("lock:a", &val, Some(expiry)).unwrap();
+        wal.log_set_with_expiry("lock:a", &val, Some(expiry))
+            .unwrap();
         wal.sync().unwrap();
         drop(wal);
         let full = std::fs::read(&path).unwrap();
@@ -1130,7 +1139,8 @@ mod tests {
         let (wal, _) = KvWal::open(dir.path()).unwrap();
         wal.log_set_with_expiry("k", &Value::Int32(1), Some(9_000_000_000_000))
             .unwrap();
-        wal.log_set_with_expiry("k", &Value::Int32(2), None).unwrap();
+        wal.log_set_with_expiry("k", &Value::Int32(2), None)
+            .unwrap();
         drop(wal);
 
         let (_wal2, state) = KvWal::open(dir.path()).unwrap();

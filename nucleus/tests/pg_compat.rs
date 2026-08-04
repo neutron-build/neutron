@@ -1144,7 +1144,7 @@ async fn text_literal_coercion_with_simple_protocol_via_pgx_shape() {
 mod binary_params {
     use super::*;
     use bytes::BytesMut;
-    use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
+    use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 
     /// Sends exact raw bytes as a BINARY-format parameter for any declared
     /// type — lets the test drive precise driver wire encodings without
@@ -1199,8 +1199,8 @@ mod binary_params {
         let ts_us: i64 = 8851 * 86_400_000_000 + 45_296_789_012;
         let date_days: i32 = 8851;
         let uuid_bytes: [u8; 16] = [
-            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
-            0x44, 0x00, 0x00,
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
         ];
         let bytea_bytes: Vec<u8> = vec![0x00, 0xde, 0xad, 0xbe, 0xef];
         // numeric 12345.6789: ndigits=3 weight=1 sign=+ dscale=4 [1,2345,6789]
@@ -1310,8 +1310,14 @@ async fn prisma_namespaces_query_shape() {
     let client = connect(port).await;
 
     for (label, sql) in [
-        ("plain", "SELECT nspname FROM pg_namespace WHERE nspname = ANY ( $1 )"),
-        ("alias", "SELECT namespace.nspname as namespace_name FROM pg_namespace as namespace WHERE namespace.nspname = ANY ( $1 )"),
+        (
+            "plain",
+            "SELECT nspname FROM pg_namespace WHERE nspname = ANY ( $1 )",
+        ),
+        (
+            "alias",
+            "SELECT namespace.nspname as namespace_name FROM pg_namespace as namespace WHERE namespace.nspname = ANY ( $1 )",
+        ),
         (
             "orderby",
             "SELECT namespace.nspname as namespace_name FROM pg_namespace as namespace WHERE namespace.nspname = ANY ( $1 ) ORDER BY namespace_name",

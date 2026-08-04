@@ -348,7 +348,9 @@ async fn disconnect_mid_transaction_reverts_cross_model_writes() {
             }
         }
         assert_eq!(
-            scalar(&observer, "SELECT graph_node_count()").await.as_deref(),
+            scalar(&observer, "SELECT graph_node_count()")
+                .await
+                .as_deref(),
             Some("0"),
             "graph node from an abandoned transaction survived the disconnect"
         );
@@ -401,7 +403,9 @@ async fn rollback_to_savepoint_reverts_cross_model_writes() {
     run(&client, "COMMIT").await;
 
     assert_eq!(
-        scalar(&client, "SELECT kv_get('after_sp')").await.as_deref(),
+        scalar(&client, "SELECT kv_get('after_sp')")
+            .await
+            .as_deref(),
         None,
         "KV write made after the savepoint survived ROLLBACK TO SAVEPOINT"
     );
@@ -457,8 +461,5 @@ async fn commit_keeps_cross_model_writes_under_concurrent_rollback() {
         Some("1"),
         "a concurrent ROLLBACK destroyed a committed time-series point"
     );
-    assert_eq!(
-        scalar(&b, "SELECT kv_get('a_only')").await.as_deref(),
-        None
-    );
+    assert_eq!(scalar(&b, "SELECT kv_get('a_only')").await.as_deref(), None);
 }

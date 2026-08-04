@@ -65,12 +65,8 @@ async fn test_timestamp_literal_against_timestamptz_column() {
 
         // One-sided bounds: the shape that goes through the synthetic-sentinel
         // range in `try_storage_fast_scan`.
-        assert_where_agrees_with_projection(
-            &ex,
-            &format!("tstz >= TIMESTAMP '{BEFORE}'"),
-            label,
-        )
-        .await;
+        assert_where_agrees_with_projection(&ex, &format!("tstz >= TIMESTAMP '{BEFORE}'"), label)
+            .await;
         assert_where_agrees_with_projection(&ex, &format!("tstz > TIMESTAMP '{BEFORE}'"), label)
             .await;
         assert_where_agrees_with_projection(&ex, &format!("tstz <= TIMESTAMP '{AFTER}'"), label)

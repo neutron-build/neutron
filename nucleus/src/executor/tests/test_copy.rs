@@ -52,18 +52,18 @@ fn sqlparser_copy_payload_is_a_flat_field_list() {
     // A non-tab delimiter is not tokenizer-significant, so entries stay whole lines.
     assert_eq!(
         payload("COPY t FROM STDIN WITH (DELIMITER '|');\n1|a\n2|b\n\\."),
-        vec![
-            Some(String::new()),
-            Some("1|a".into()),
-            Some("2|b".into()),
-        ]
+        vec![Some(String::new()), Some("1|a".into()), Some("2|b".into()),]
     );
 }
 
 #[tokio::test]
 async fn copy_from_stdin_text_reconstructs_rows() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, qty INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, qty INT)",
+    )
+    .await;
     let out = exec(
         &ex,
         "COPY t FROM STDIN;\n1\talice\t10\n2\tbob\t20\n3\tcarol\t30\n\\.",
@@ -81,9 +81,17 @@ async fn copy_from_stdin_text_reconstructs_rows() {
     assert_eq!(
         rows(&got[0]),
         &vec![
-            vec![Value::Int32(1), Value::Text("alice".into()), Value::Int32(10)],
+            vec![
+                Value::Int32(1),
+                Value::Text("alice".into()),
+                Value::Int32(10)
+            ],
             vec![Value::Int32(2), Value::Text("bob".into()), Value::Int32(20)],
-            vec![Value::Int32(3), Value::Text("carol".into()), Value::Int32(30)],
+            vec![
+                Value::Int32(3),
+                Value::Text("carol".into()),
+                Value::Int32(30)
+            ],
         ],
         "each payload line must become exactly one row with its fields in place"
     );
@@ -192,7 +200,11 @@ async fn copy_from_csv_distinguishes_empty_from_quoted_empty() {
 #[tokio::test]
 async fn copy_from_enforces_not_null() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE n (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
+    exec(
+        &ex,
+        "CREATE TABLE n (id INT PRIMARY KEY, name TEXT NOT NULL)",
+    )
+    .await;
 
     let bad = ex.execute("COPY n FROM STDIN;\n1\t\\N\n\\.").await;
     assert!(bad.is_err(), "COPY accepted NULL in a NOT NULL column");
@@ -211,7 +223,10 @@ async fn copy_from_enforces_check_constraints() {
     .await;
 
     let bad = ex.execute("COPY ck FROM STDIN;\n1\t-5\n\\.").await;
-    assert!(bad.is_err(), "COPY accepted a row violating CHECK (qty > 0)");
+    assert!(
+        bad.is_err(),
+        "COPY accepted a row violating CHECK (qty > 0)"
+    );
 
     let got = exec(&ex, "SELECT COUNT(*) FROM ck").await;
     assert_eq!(scalar(&got[0]), &Value::Int64(0));
@@ -302,7 +317,9 @@ async fn copy_from_coerces_fields_to_the_declared_column_type() {
     );
 
     // A field that cannot be the declared type is an error, not a silent Text.
-    let bad = ex.execute("COPY ty FROM STDIN;\n3\tnot-a-date\t\\N\t\\N\t\\N\n\\.").await;
+    let bad = ex
+        .execute("COPY ty FROM STDIN;\n3\tnot-a-date\t\\N\t\\N\t\\N\n\\.")
+        .await;
     assert!(bad.is_err(), "COPY stored an unparseable DATE as text");
 }
 

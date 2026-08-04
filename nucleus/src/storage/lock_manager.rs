@@ -371,7 +371,10 @@ mod tests {
         lm.acquire(1, "t", LockMode::Exclusive).await.unwrap();
         // txn 2 is younger and conflicts → dies rather than waiting forever.
         let r = lm.acquire(2, "t", LockMode::Shared).await;
-        assert!(r.is_err(), "younger reader must die against an older writer");
+        assert!(
+            r.is_err(),
+            "younger reader must die against an older writer"
+        );
     }
 
     #[tokio::test]
@@ -387,7 +390,10 @@ mod tests {
         // Give the waiter a chance to block, then release.
         tokio::task::yield_now().await;
         lm.release_all(1);
-        assert!(waiter.await.unwrap().is_ok(), "older waiter must be granted");
+        assert!(
+            waiter.await.unwrap().is_ok(),
+            "older waiter must be granted"
+        );
     }
 
     #[tokio::test]
@@ -417,7 +423,11 @@ mod tests {
         lm.acquire(1, "t", LockMode::Exclusive).await.unwrap();
         assert_eq!(lm.locked_tables(), 1);
         lm.release_all(1);
-        assert_eq!(lm.locked_tables(), 0, "released locks must not leak entries");
+        assert_eq!(
+            lm.locked_tables(),
+            0,
+            "released locks must not leak entries"
+        );
         assert!(!lm.holds_any(1));
     }
 

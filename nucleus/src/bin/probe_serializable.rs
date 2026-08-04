@@ -187,7 +187,9 @@ async fn main() {
     };
     let rounds: usize = arg("--rounds", "300").parse().unwrap();
     let per_round: usize = arg("--txns", "4").parse().unwrap();
-    let seed: u64 = arg("--seed", "0x2545F4914F6CDD1D").parse().unwrap_or(0x2545_F491_4F6C_DD1D);
+    let seed: u64 = arg("--seed", "0x2545F4914F6CDD1D")
+        .parse()
+        .unwrap_or(0x2545_F491_4F6C_DD1D);
     let engine_kind = arg("--engine", "buffered-disk");
     // `--isolation read-committed` is the oracle's own control: the same
     // workload at a level that is NOT serializable must produce violations. An
@@ -235,9 +237,12 @@ async fn main() {
                 .await
                 .unwrap();
             for i in 1..=ACCOUNTS {
-                ex.execute(&format!("INSERT INTO acct{t} VALUES ({i}, {})", initial_of(t)))
-                    .await
-                    .unwrap();
+                ex.execute(&format!(
+                    "INSERT INTO acct{t} VALUES ({i}, {})",
+                    initial_of(t)
+                ))
+                .await
+                .unwrap();
             }
         }
 
@@ -324,7 +329,11 @@ async fn main() {
         // serial history.
         let mut matched = false;
         for order in &orders {
-            let seq: Vec<usize> = order.iter().copied().filter(|i| committed.contains(i)).collect();
+            let seq: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|i| committed.contains(i))
+                .collect();
             if seq.len() != committed.len() {
                 continue;
             }

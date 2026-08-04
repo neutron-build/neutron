@@ -1954,17 +1954,13 @@ impl TimeSeriesStore {
                 Some(series) => {
                     if let Some(ref wal) = self.wal {
                         wal.log_create_series(name, self.partition_size);
-                        let points: Vec<WalPoint> = (0..series
-                            .timestamps
-                            .len())
+                        let points: Vec<WalPoint> = (0..series.timestamps.len())
                             .map(|i| {
                                 let tags: Vec<(String, String)> = series
                                     .tag_columns
                                     .iter()
                                     .filter_map(|(k, col)| {
-                                        col.get(i)
-                                            .and_then(|v| v.clone())
-                                            .map(|v| (k.clone(), v))
+                                        col.get(i).and_then(|v| v.clone()).map(|v| (k.clone(), v))
                                     })
                                     .collect();
                                 (series.timestamps[i], series.values[i], tags)

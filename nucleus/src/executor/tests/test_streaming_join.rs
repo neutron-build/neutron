@@ -42,20 +42,19 @@ fn as_multiset(rows: &[Row]) -> Vec<String> {
 /// Choosing the key ranges to overlap only partially yields unmatched rows on
 /// BOTH sides (so the outer joins are exercised for real), and the padded payloads
 /// make the working set dwarf a small budget.
-async fn seed(
-    ex: &Executor,
-    sid: u64,
-    n: usize,
-    order_keys: i64,
-    cust_lo: i64,
-    cust_hi: i64,
-) {
-    ex.execute_with_session(sid, "CREATE TABLE orders (oid BIGINT, cid BIGINT, opay TEXT)")
-        .await
-        .unwrap();
-    ex.execute_with_session(sid, "CREATE TABLE customers (cid BIGINT, name TEXT, cpay TEXT)")
-        .await
-        .unwrap();
+async fn seed(ex: &Executor, sid: u64, n: usize, order_keys: i64, cust_lo: i64, cust_hi: i64) {
+    ex.execute_with_session(
+        sid,
+        "CREATE TABLE orders (oid BIGINT, cid BIGINT, opay TEXT)",
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(
+        sid,
+        "CREATE TABLE customers (cid BIGINT, name TEXT, cpay TEXT)",
+    )
+    .await
+    .unwrap();
     let pad = "x".repeat(180);
 
     let mut ovals = String::new();
@@ -155,8 +154,7 @@ async fn streaming_join_limit_keeps_real_rows() {
     seed(&ex, sid, 3000, 45, 5, 50).await;
 
     let full_sql = "SELECT o.oid, c.name FROM orders o JOIN customers c ON o.cid = c.cid";
-    let limit_sql =
-        "SELECT o.oid, c.name FROM orders o JOIN customers c ON o.cid = c.cid LIMIT 9";
+    let limit_sql = "SELECT o.oid, c.name FROM orders o JOIN customers c ON o.cid = c.cid LIMIT 9";
 
     ex.set_query_memory_limit(0);
     ex.execute_with_session(sid, "SET stream_results = off")
@@ -176,7 +174,10 @@ async fn streaming_join_limit_keeps_real_rows() {
     let (_, rows) = drain(streamed).await;
     assert_eq!(rows.len(), 9, "LIMIT row count");
     for r in &rows {
-        assert!(full_set.contains(&format!("{r:?}")), "spurious joined row under LIMIT");
+        assert!(
+            full_set.contains(&format!("{r:?}")),
+            "spurious joined row under LIMIT"
+        );
     }
 }
 
@@ -198,7 +199,11 @@ async fn streaming_join_high_cardinality_recurses_and_matches() {
         .await
         .unwrap();
     let (base_cols, base_rows) = drain(one_result(&ex, sid, sql).await).await;
-    assert_eq!(base_rows.len(), 4000, "sanity: every order matches its customer");
+    assert_eq!(
+        base_rows.len(),
+        4000,
+        "sanity: every order matches its customer"
+    );
 
     ex.query_cache_invalidate_all();
     ex.set_query_memory_limit(8 * 1024); // tiny → first-level pairs still overflow
@@ -210,7 +215,11 @@ async fn streaming_join_high_cardinality_recurses_and_matches() {
     let (stream_cols, stream_rows) = drain(streamed).await;
 
     assert_eq!(stream_cols, base_cols);
-    assert_eq!(stream_rows.len(), 4000, "all joined rows present after recursion");
+    assert_eq!(
+        stream_rows.len(),
+        4000,
+        "all joined rows present after recursion"
+    );
     assert_eq!(as_multiset(&stream_rows), as_multiset(&base_rows));
 
     let leftover = std::fs::read_dir(dir.path().join("spill"))

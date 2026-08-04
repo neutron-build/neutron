@@ -340,9 +340,7 @@ pub fn pg_float_text(n: f64) -> String {
 pub fn parse_date(value: &str) -> Result<i32, String> {
     let value = value.trim();
     let value = match value.split_once(char::is_whitespace) {
-        Some((date, zone))
-            if zone.starts_with(['+', '-']) && split_zone_suffix(zone).is_ok() =>
-        {
+        Some((date, zone)) if zone.starts_with(['+', '-']) && split_zone_suffix(zone).is_ok() => {
             date
         }
         Some(_) => return Err(format!("invalid date value: {value}")),
@@ -401,7 +399,8 @@ fn split_zone_suffix(time: &str) -> Result<(&str, Option<i64>), String> {
         if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()) {
             return Err(format!("invalid time zone offset: {zone}"));
         }
-        s.parse::<i64>().map_err(|_| format!("invalid time zone offset: {zone}"))
+        s.parse::<i64>()
+            .map_err(|_| format!("invalid time zone offset: {zone}"))
     };
     let (hours, minutes, seconds) = match fields.as_slice() {
         [hhmm] if hhmm.len() == 4 => (parse_field(&hhmm[..2])?, parse_field(&hhmm[2..])?, 0),
@@ -719,9 +718,7 @@ impl Value {
             (Value::Text(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
             (Value::Text(s), DataType::Date) => parse_date(s).map(Value::Date),
             (Value::Text(s), DataType::Timestamp) => parse_timestamp(s).map(Value::Timestamp),
-            (Value::Text(s), DataType::TimestampTz) => {
-                parse_timestamptz(s).map(Value::TimestampTz)
-            }
+            (Value::Text(s), DataType::TimestampTz) => parse_timestamptz(s).map(Value::TimestampTz),
             (Value::Text(s), DataType::Uuid) => parse_uuid(s).map(Value::Uuid),
             (Value::Text(s), DataType::Bytea) => parse_bytea_text(s).map(Value::Bytea),
             (Value::Text(s), DataType::Jsonb) => serde_json::from_str(s)
@@ -1065,9 +1062,7 @@ impl Ord for Value {
             // WHERE/JOIN/ORDER mixing the two.
             (Value::Numeric(a), Value::Int32(b)) => cmp_numeric_int(a, i64::from(*b)),
             (Value::Numeric(a), Value::Int64(b)) => cmp_numeric_int(a, *b),
-            (Value::Int32(a), Value::Numeric(b)) => {
-                cmp_numeric_int(b, i64::from(*a)).reverse()
-            }
+            (Value::Int32(a), Value::Numeric(b)) => cmp_numeric_int(b, i64::from(*a)).reverse(),
             (Value::Int64(a), Value::Numeric(b)) => cmp_numeric_int(b, *a).reverse(),
             // Numeric vs float: compare in f64 (float is already inexact, so
             // this matches PostgreSQL's numeric→float8 promotion for mixed
@@ -1222,7 +1217,10 @@ mod tests {
     #[test]
     fn bytea_text_hex_form_decodes() {
         // Postgres standard hex form — also what Value::Bytea Display emits.
-        assert_eq!(parse_bytea_text("\\x00deadbeef").unwrap(), vec![0x00, 0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            parse_bytea_text("\\x00deadbeef").unwrap(),
+            vec![0x00, 0xde, 0xad, 0xbe, 0xef]
+        );
         assert_eq!(parse_bytea_text("\\x").unwrap(), Vec::<u8>::new());
         // Display → cast round-trip is exact.
         let original = Value::Bytea(vec![1, 2, 250, 255]);

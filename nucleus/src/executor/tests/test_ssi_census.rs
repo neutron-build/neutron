@@ -75,10 +75,7 @@ async fn write_skew_is_detected() {
     let c1 = ex.execute_with_session(t1, "COMMIT").await;
     let c2 = ex.execute_with_session(t2, "COMMIT").await;
 
-    assert!(
-        c1.is_ok(),
-        "first committer should win, got {c1:?}"
-    );
+    assert!(c1.is_ok(), "first committer should win, got {c1:?}");
     assert!(
         is_serialization_failure(&c2),
         "second committer must abort with a serialization failure, got {c2:?}"
@@ -148,8 +145,12 @@ async fn disjoint_tables_both_commit_no_false_positive() {
     ex.execute_with_session(t1, BEGIN_SER).await.unwrap();
     ex.execute_with_session(t2, BEGIN_SER).await.unwrap();
 
-    ex.execute_with_session(t1, "SELECT v FROM a").await.unwrap();
-    ex.execute_with_session(t2, "SELECT v FROM b").await.unwrap();
+    ex.execute_with_session(t1, "SELECT v FROM a")
+        .await
+        .unwrap();
+    ex.execute_with_session(t2, "SELECT v FROM b")
+        .await
+        .unwrap();
     ex.execute_with_session(t1, "UPDATE a SET v = 1 WHERE id = 1")
         .await
         .unwrap();
@@ -273,13 +274,19 @@ async fn lost_update_same_row_is_prevented() {
     ex.execute_with_session(t2, "SELECT balance FROM accounts WHERE id = 1")
         .await
         .unwrap();
-    ex.execute_with_session(t1, "UPDATE accounts SET balance = balance + 10 WHERE id = 1")
-        .await
-        .unwrap();
+    ex.execute_with_session(
+        t1,
+        "UPDATE accounts SET balance = balance + 10 WHERE id = 1",
+    )
+    .await
+    .unwrap();
     // T2's write to the same row may conflict at write time or at commit; accept
     // either, but the net effect must not be a silently lost update.
     let w2 = ex
-        .execute_with_session(t2, "UPDATE accounts SET balance = balance + 20 WHERE id = 1")
+        .execute_with_session(
+            t2,
+            "UPDATE accounts SET balance = balance + 20 WHERE id = 1",
+        )
         .await;
 
     let c1 = ex.execute_with_session(t1, "COMMIT").await;
@@ -365,7 +372,12 @@ async fn test_the_mvcc_engine_still_accepts_serializable() {
     let storage: std::sync::Arc<dyn crate::storage::StorageEngine> =
         std::sync::Arc::new(crate::storage::MvccStorageAdapter::new());
     let ex = Executor::new(catalog, storage);
-    for level in ["SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED", "SNAPSHOT"] {
+    for level in [
+        "SERIALIZABLE",
+        "REPEATABLE READ",
+        "READ COMMITTED",
+        "SNAPSHOT",
+    ] {
         exec(&ex, &format!("BEGIN TRANSACTION ISOLATION LEVEL {level}")).await;
         exec(&ex, "ROLLBACK").await;
     }

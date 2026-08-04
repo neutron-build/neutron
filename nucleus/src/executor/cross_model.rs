@@ -315,8 +315,7 @@ impl Executor {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
         let Some(cm) = guard.as_mut() else { return };
-        cm.fts_ops
-            .push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
+        cm.fts_ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
     }
 
     /// Capture a document's FTS posting state before it is removed.
@@ -338,7 +337,11 @@ impl Executor {
     /// compensating records into its own WAL as part of the restore, so a crash
     /// after a successful `ROLLBACK` cannot resurrect the reverted writes on
     /// replay (datalog excepted — it has no live WAL to compensate).
-    pub(super) fn cross_model_revert(&self, level: CrossModelLevel, fts_ops: Vec<crate::fts::FtsUndoOp>) {
+    pub(super) fn cross_model_revert(
+        &self,
+        level: CrossModelLevel,
+        fts_ops: Vec<crate::fts::FtsUndoOp>,
+    ) {
         if let Some(ref snap) = level.kv {
             self.kv_store.txn_restore_scoped(snap, &level.kv_touched);
         }

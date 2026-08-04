@@ -95,10 +95,7 @@ impl ExternalSortIter {
 
     /// Drain the input into sorted runs and construct the merger. Called once.
     async fn build(&mut self) -> Result<(), ExecError> {
-        let mut input = self
-            .input
-            .take()
-            .expect("build called once, input present");
+        let mut input = self.input.take().expect("build called once, input present");
         let spill_enabled = self.run_budget_bytes > 0 && self.spill.is_some();
 
         let mut buffer: Vec<Row> = Vec::new();
@@ -170,9 +167,9 @@ impl RowBatchIter for ExternalSortIter {
 fn spill_to_exec_err(e: super::spill::SpillError) -> ExecError {
     use super::spill::SpillError;
     match e {
-        SpillError::DiskBudgetExceeded { .. } => ExecError::MemoryExceeded(format!(
-            "sort spill exceeded the disk budget: {e}"
-        )),
+        SpillError::DiskBudgetExceeded { .. } => {
+            ExecError::MemoryExceeded(format!("sort spill exceeded the disk budget: {e}"))
+        }
         SpillError::EncryptionRequired => ExecError::MemoryExceeded(
             "cannot spill an encrypted-source sort without an encryptor configured".into(),
         ),
@@ -382,7 +379,13 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_sort_matches_reference() {
-        let rows = vec![row(3, "c"), row(1, "a"), row(2, "b"), row(1, "z"), row(2, "a")];
+        let rows = vec![
+            row(3, "c"),
+            row(1, "a"),
+            row(2, "b"),
+            row(1, "z"),
+            row(2, "a"),
+        ];
         let keys = vec![(0usize, false, false)];
         let got = run_sort(rows.clone(), keys.clone(), 0, None, 2).await;
         assert_eq!(got, reference_sort(rows, &keys));
@@ -425,7 +428,10 @@ mod tests {
         assert_eq!(got, reference_sort(rows, &keys));
         // Runs were spilled and cleaned up: nothing left in the dir.
         let leftover = std::fs::read_dir(dir.path()).unwrap().count();
-        assert_eq!(leftover, 0, "spill files must be cleaned up after the merge");
+        assert_eq!(
+            leftover, 0,
+            "spill files must be cleaned up after the merge"
+        );
     }
 
     #[tokio::test]

@@ -220,7 +220,10 @@ fn main() {
             .filter(|id| !sql_ids.contains(id))
             .collect();
         if !orphans.is_empty() {
-            println!("{label}: {} orphaned specialty write(s) — expected, harmless", orphans.len());
+            println!(
+                "{label}: {} orphaned specialty write(s) — expected, harmless",
+                orphans.len()
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -247,7 +247,10 @@ mod tests {
     fn mutating_scalar_function_lists_are_sorted_for_binary_search() {
         let mut sorted = MUTATING_SCALAR_FNS;
         sorted.sort_unstable();
-        assert_eq!(sorted, MUTATING_SCALAR_FNS, "MUTATING_SCALAR_FNS must be sorted");
+        assert_eq!(
+            sorted, MUTATING_SCALAR_FNS,
+            "MUTATING_SCALAR_FNS must be sorted"
+        );
         let mut sorted_extra = MUTATING_SCALAR_FNS_EXTRA;
         sorted_extra.sort_unstable();
         assert_eq!(sorted_extra, MUTATING_SCALAR_FNS_EXTRA);
@@ -256,16 +259,38 @@ mod tests {
     #[test]
     fn specialty_write_functions_are_recognised() {
         for f in [
-            "KV_SET", "KV_DEL", "KV_INCR", "DOC_INSERT", "GRAPH_ADD_NODE", "FTS_INDEX",
-            "TS_INSERT", "VECTOR_INSERT", "VECTOR_DELETE", "BLOB_STORE", "STREAM_XADD",
-            "VERSION_COMMIT", "VERSION_BRANCH", "CYPHER",
+            "KV_SET",
+            "KV_DEL",
+            "KV_INCR",
+            "DOC_INSERT",
+            "GRAPH_ADD_NODE",
+            "FTS_INDEX",
+            "TS_INSERT",
+            "VECTOR_INSERT",
+            "VECTOR_DELETE",
+            "BLOB_STORE",
+            "STREAM_XADD",
+            "VERSION_COMMIT",
+            "VERSION_BRANCH",
+            "CYPHER",
         ] {
             assert!(scalar_fn_mutates(f), "{f} should be a write");
         }
         for f in [
-            "KV_GET", "KV_EXISTS", "KV_TTL", "DOC_GET", "GRAPH_NEIGHBORS", "FTS_SEARCH",
-            "TS_LAST", "VECTOR_SEARCH", "BLOB_GET", "STREAM_XREAD", "UPPER", "COUNT",
-            "CDC_READ", "COLUMNAR_SUM",
+            "KV_GET",
+            "KV_EXISTS",
+            "KV_TTL",
+            "DOC_GET",
+            "GRAPH_NEIGHBORS",
+            "FTS_SEARCH",
+            "TS_LAST",
+            "VECTOR_SEARCH",
+            "BLOB_GET",
+            "STREAM_XREAD",
+            "UPPER",
+            "COUNT",
+            "CDC_READ",
+            "COLUMNAR_SUM",
         ] {
             assert!(!scalar_fn_mutates(f), "{f} should be a read");
         }

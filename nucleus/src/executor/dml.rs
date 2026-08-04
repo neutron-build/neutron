@@ -791,10 +791,7 @@ impl Executor {
                             (id.value.clone(), dt.unwrap_or(DataType::Text))
                         }
                         Expr::CompoundIdentifier(parts) => {
-                            let col = parts
-                                .last()
-                                .map(|p| p.value.clone())
-                                .unwrap_or_default();
+                            let col = parts.last().map(|p| p.value.clone()).unwrap_or_default();
                             let dt = col_meta
                                 .iter()
                                 .find(|c| c.name == col)
@@ -994,8 +991,11 @@ impl Executor {
 
                 // Scan fallback: used for UPDATE path or when no index is registered.
                 if existing_rows.is_none() {
-                    existing_rows =
-                        Some(self.storage_for(table_name).scan_physical(table_name).await?);
+                    existing_rows = Some(
+                        self.storage_for(table_name)
+                            .scan_physical(table_name)
+                            .await?,
+                    );
                 }
                 let rows = existing_rows.as_ref().unwrap();
                 for (row_idx, existing) in rows.iter().map(|(p, r)| (*p, r)) {
@@ -1028,8 +1028,11 @@ impl Executor {
                 continue;
             }
             if existing_rows.is_none() {
-                existing_rows =
-                        Some(self.storage_for(table_name).scan_physical(table_name).await?);
+                existing_rows = Some(
+                    self.storage_for(table_name)
+                        .scan_physical(table_name)
+                        .await?,
+                );
             }
             let rows = existing_rows.as_ref().unwrap();
             for (row_idx, existing) in rows.iter().map(|(p, r)| (*p, r)) {
@@ -1690,10 +1693,7 @@ impl Executor {
                                             let targets: Vec<(usize, Row)> = matching_positions
                                                 .iter()
                                                 .map(|&pos| {
-                                                    (
-                                                        child_positions[pos],
-                                                        child_rows[pos].clone(),
-                                                    )
+                                                    (child_positions[pos], child_rows[pos].clone())
                                                 })
                                                 .collect();
                                             child_storage
@@ -2344,9 +2344,7 @@ impl Executor {
                     other => ExecError::Storage(other),
                 })?
         } else {
-            storage
-                .update_if_unchanged(&table_name, &verified)
-                .await?
+            storage.update_if_unchanged(&table_name, &verified).await?
         };
 
         // Rebuild zone map stats — column values may have changed, making
