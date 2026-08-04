@@ -28,6 +28,10 @@ type routeRecord struct {
 	InType  reflect.Type
 	OutType reflect.Type
 	Options routeOptions
+	// Untyped marks a route registered through Handle/HandleFunc/Mount rather
+	// than the typed helpers. It appears in Routes() but is withheld from
+	// OpenAPI, which has no schema for it.
+	Untyped bool
 }
 
 // RouteOption customizes per-route metadata (used for OpenAPI).
@@ -92,10 +96,45 @@ func (r *Router) Mount(prefix string, handler http.Handler) {
 }
 
 // Handle registers a raw http.Handler for the given pattern.
+//
+// The pattern may carry a method, as `net/http` allows ("GET /x"). A group
+// prefix has to be spliced between the method and the path, not pasted onto the
+// front: `Group("/api").HandleFunc("GET /x", h)` used to build "/apiGET /x" and
+// panic with `invalid method "/apiGET"`. Only the typed Get/Post helpers got
+// this right, and nothing tested the untyped path.
 func (r *Router) Handle(pattern string, handler http.Handler) {
-	fullPattern := r.prefix + pattern
+	fullPattern := joinPattern(r.prefix, pattern)
 	wrapped := applyMiddleware(handler, r.middleware)
 	r.mux.Handle(fullPattern, wrapped)
+
+	// Record it. Previously only the typed path did, so an app registering
+	// through Handle/HandleFunc got an empty Routes() and an empty
+	// /openapi.json with nothing reporting why.
+	if r.routes != nil {
+		method, path := splitPattern(pattern)
+		*r.routes = append(*r.routes, routeRecord{
+			Method:  method,
+			Pattern: r.prefix + path,
+			Untyped: true,
+		})
+	}
+}
+
+// splitPattern separates an optional leading method from the path.
+func splitPattern(pattern string) (method, path string) {
+	if m, p, found := strings.Cut(pattern, " "); found {
+		return m, p
+	}
+	return "", pattern
+}
+
+// joinPattern applies a group prefix to a possibly method-qualified pattern.
+func joinPattern(prefix, pattern string) string {
+	method, path := splitPattern(pattern)
+	if method == "" {
+		return prefix + path
+	}
+	return method + " " + prefix + path
 }
 
 // HandleFunc registers a raw http.HandlerFunc for the given pattern.
