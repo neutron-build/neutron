@@ -265,6 +265,14 @@ fn to_matchit_path(path: &str) -> String {
 struct PendingRoute {
     method: MethodKind,
     handler: BoxedHandler,
+    /// True when this route arrived from `nest`/`merge` rather than being
+    /// registered directly on this router.
+    ///
+    /// Overriding across a nest boundary is intentional and documented — a
+    /// sub-router is allowed to win. Registering the same method and path twice
+    /// on ONE router is a mistake, and used to be silently accepted: the first
+    /// handler was dropped with nothing reporting it.
+    from_nest: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +397,7 @@ impl<S> Router<S> {
         self.pending
             .entry(matchit_path)
             .or_default()
-            .push(PendingRoute { method, handler: boxed });
+            .push(PendingRoute { method, handler: boxed, from_nest: false });
         #[cfg(feature = "openapi")]
         self.registered_routes
             .push((method_kind_to_str(method).to_string(), path.to_string()));
@@ -472,7 +480,7 @@ impl<S> Router<S> {
                 self.pending
                     .entry(matchit_path.clone())
                     .or_default()
-                    .push(PendingRoute { method: kind, handler: forwarding });
+                    .push(PendingRoute { method: kind, handler: forwarding, from_nest: true });
                 #[cfg(feature = "openapi")]
                 self.registered_routes
                     .push((method_kind_to_str(kind).to_string(), path.to_string()));
@@ -523,7 +531,7 @@ impl<S> Router<S> {
             self.pending
                 .entry(matchit_path.clone())
                 .or_default()
-                .push(PendingRoute { method: kind, handler });
+                .push(PendingRoute { method: kind, handler, from_nest: false });
             #[cfg(feature = "openapi")]
             self.registered_routes
                 .push((method_kind_to_str(kind).to_string(), path.to_string()));
@@ -562,7 +570,7 @@ impl<S> Router<S> {
             self.pending
                 .entry(matchit_path.clone())
                 .or_default()
-                .push(PendingRoute { method: kind, handler: forwarding });
+                .push(PendingRoute { method: kind, handler: forwarding, from_nest: true });
             #[cfg(feature = "openapi")]
             self.registered_routes
                 .push((method_kind_to_str(kind).to_string(), path.to_string()));
@@ -816,7 +824,28 @@ impl<S> Router<S> {
 
         for (path, routes) in pending {
             let mut method_map = MethodMap::default();
+            // Tracks which methods were claimed by a route registered directly
+            // on this router, so a second direct registration can be caught.
+            let mut claimed_directly = [false; METHOD_COUNT];
             for route in routes {
+                let slot = route.method as usize;
+                // Registering the same method and path twice on one router
+                // silently dropped the first handler: no panic, no warning, and
+                // a test that exercised the lost route simply hit the other one.
+                // Overriding ACROSS a nest boundary stays allowed — a
+                // sub-router winning is intentional and documented.
+                if claimed_directly[slot] && !route.from_nest {
+                    panic!(
+                        "duplicate route: {:?} {} is registered twice on the same router. \
+                         The second registration would silently replace the first. \
+                         If an override is intended, register the replacement in a \
+                         nested or merged router.",
+                        route.method, path
+                    );
+                }
+                if !route.from_nest {
+                    claimed_directly[slot] = true;
+                }
                 method_map.insert(route.method, route.handler);
             }
             if method_map.has_any() {
@@ -865,13 +894,20 @@ impl<S> Router<S> {
                         .map(|route| PendingRoute {
                             method: route.method,
                             handler: wrap_handler_with_chain(route.handler, &sub_middlewares),
+                            from_nest: true,
                         })
                         .collect()
                 } else {
                     routes
                 };
 
-                self.pending.entry(full_path).or_default().extend(routes);
+                self.pending
+                    .entry(full_path)
+                    .or_default()
+                    .extend(routes.into_iter().map(|mut r| {
+                        r.from_nest = true;
+                        r
+                    }));
             }
 
             // Merge sub fallback
@@ -2339,6 +2375,38 @@ mod tests {
         assert_eq!(
             body_of(r.resolve(&Method::GET, "/api/v1/health").unwrap().handler).await,
             "ok"
+        );
+    }
+
+    // Registering the same method and path twice on one router silently dropped
+    // the first handler — no panic, no warning. A test that exercised the lost
+    // route just hit the surviving one, so the mistake was invisible. Go's mux
+    // panics on this and the TypeScript router throws at build; Rust was the
+    // outlier that lost your route.
+    #[test]
+    #[should_panic(expected = "registered twice on the same router")]
+    fn duplicate_direct_registration_panics() {
+        let r = Router::<()>::new()
+            .get("/dup", || async { "first" })
+            .get("/dup", || async { "second" });
+        build(r);
+    }
+
+    // Same path, different methods is not a duplicate.
+    #[tokio::test]
+    async fn same_path_different_methods_is_fine() {
+        let r = build(
+            Router::<()>::new()
+                .get("/thing", || async { "got" })
+                .post("/thing", || async { "posted" }),
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/thing").unwrap().handler).await,
+            "got"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::POST, "/thing").unwrap().handler).await,
+            "posted"
         );
     }
 
