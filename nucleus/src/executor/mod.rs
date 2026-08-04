@@ -528,6 +528,43 @@ pub struct Executor {
     policy_gen: AtomicU64,
 }
 
+/// Refuse row-locking clauses the engine does not honour.
+///
+/// `FOR UPDATE ... SKIP LOCKED` is how essentially every SQL job queue claims
+/// work — it is the clause that stops two workers taking the same row. The
+/// parser accepts it into `Query::locks` and the executor has never read that
+/// field, so the clause was silently discarded: the query still returned the
+/// row, the application still looked correct, and the queue handed each job to
+/// as many workers as happened to poll at the same moment. A guarantee that is
+/// accepted and then dropped is worse than one that was never offered, because
+/// nothing anywhere reports its absence.
+///
+/// `NOWAIT` is refused for the same reason — it asks to fail rather than block,
+/// and silently blocking instead inverts the caller's intent.
+///
+/// Plain `FOR UPDATE`/`FOR SHARE` are allowed through: they are advisory
+/// pessimistic hints, and the isolation the engine already provides is a
+/// stronger guarantee than ignoring them would imply.
+fn reject_unsupported_row_locks(query: &ast::Query) -> Result<(), ExecError> {
+    for lock in &query.locks {
+        if let Some(nonblock) = &lock.nonblock {
+            let clause = match nonblock {
+                ast::NonBlock::SkipLocked => "SKIP LOCKED",
+                ast::NonBlock::Nowait => "NOWAIT",
+            };
+            return Err(ExecError::Unsupported(format!(
+                "{clause} is not implemented. It was previously parsed and ignored, \
+                 which silently removed the guarantee the clause exists to provide \
+                 — a claim query using it would hand the same row to concurrent \
+                 workers. Serialize the claim with an explicit transaction at \
+                 SERIALIZABLE isolation, or use a single-claimer design, until \
+                 row-level lock skipping is supported."
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Executor {
     pub fn new(catalog: Arc<Catalog>, storage: Arc<dyn StorageEngine>) -> Self {
         // Create default superuser role
@@ -5076,6 +5113,16 @@ impl Executor {
 
         let result = match stmt {
             Statement::Query(query) => {
+                // A row-locking clause changes what a query GUARANTEES, not just
+                // how fast it runs, so accepting one that is not implemented is
+                // not a harmless omission. `SELECT ... FOR UPDATE SKIP LOCKED`
+                // is how every job queue claims work: it is the thing that stops
+                // two workers taking the same row. Parsed-and-ignored, the query
+                // still returns the row, the app still looks correct, and the
+                // queue delivers each job to as many workers as happen to poll
+                // together. Refuse it instead.
+                reject_unsupported_row_locks(&query)?;
+
                 // Streaming scan (Phase 1.1, opt-in via SET stream_results = on):
                 // for a bare `SELECT * FROM <base table>` hand back a lazy
                 // SelectStream the pgwire path streams row-by-row. Decided HERE at

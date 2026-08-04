@@ -287,3 +287,45 @@ func TestNotFoundAndMethodNotAllowedAreProblemJSON(t *testing.T) {
 		}
 	})
 }
+
+// Group prefixes have to be spliced between the method and the path. Pasting
+// them onto the front produced "/apiGET /x", which the mux rejects with
+// `invalid method "/apiGET"` — a startup panic that only the untyped
+// registration path could reach, and nothing tested it.
+func TestGroupWithMethodQualifiedPattern(t *testing.T) {
+	app := New()
+	g := app.Router().Group("/api")
+	g.HandleFunc("GET /widgets", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/widgets", nil)
+	rec := httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("grouped HandleFunc route not reachable: got %d", rec.Code)
+	}
+}
+
+// Routes() only ever recorded the typed helpers, so an app registering through
+// HandleFunc — which is most of them — got an empty route table with nothing
+// reporting why. There is then nothing to assert on in a test, which is the
+// gap that let a route collision reach production.
+func TestRoutesIncludesUntypedRegistrations(t *testing.T) {
+	app := New()
+	r := app.Router()
+	r.HandleFunc("GET /alpha", func(w http.ResponseWriter, r *http.Request) {})
+	r.Group("/api").HandleFunc("POST /beta", func(w http.ResponseWriter, r *http.Request) {})
+
+	got := map[string]string{}
+	for _, ri := range r.Routes() {
+		got[ri.Pattern] = ri.Method
+	}
+	if got["/alpha"] != "GET" {
+		t.Fatalf("untyped route missing from Routes(): %+v", got)
+	}
+	if got["/api/beta"] != "POST" {
+		t.Fatalf("grouped untyped route missing or wrong prefix: %+v", got)
+	}
+}

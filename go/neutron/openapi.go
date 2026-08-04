@@ -9,11 +9,11 @@ import (
 
 // OpenAPISpec represents an OpenAPI 3.1 specification.
 type OpenAPISpec struct {
-	OpenAPI    string                    `json:"openapi"`
-	Info       OpenAPIInfo               `json:"info"`
+	OpenAPI    string                     `json:"openapi"`
+	Info       OpenAPIInfo                `json:"info"`
 	Paths      map[string]OpenAPIPathItem `json:"paths"`
-	Components *OpenAPIComponents        `json:"components,omitempty"`
-	Security   []SecurityRequirement     `json:"security,omitempty"`
+	Components *OpenAPIComponents         `json:"components,omitempty"`
+	Security   []SecurityRequirement      `json:"security,omitempty"`
 }
 
 type OpenAPIInfo struct {
@@ -36,14 +36,14 @@ type OpenAPIOperation struct {
 }
 
 type OpenAPIParameter struct {
-	Name     string        `json:"name"`
-	In       string        `json:"in"` // path, query, header
-	Required bool          `json:"required,omitempty"`
+	Name     string         `json:"name"`
+	In       string         `json:"in"` // path, query, header
+	Required bool           `json:"required,omitempty"`
 	Schema   *OpenAPISchema `json:"schema"`
 }
 
 type OpenAPIRequestBody struct {
-	Required bool                       `json:"required,omitempty"`
+	Required bool                        `json:"required,omitempty"`
 	Content  map[string]OpenAPIMediaType `json:"content"`
 }
 
@@ -52,18 +52,18 @@ type OpenAPIMediaType struct {
 }
 
 type OpenAPIResponse struct {
-	Description string                     `json:"description"`
+	Description string                      `json:"description"`
 	Content     map[string]OpenAPIMediaType `json:"content,omitempty"`
 }
 
 type OpenAPIComponents struct {
-	Schemas         map[string]*OpenAPISchema   `json:"schemas,omitempty"`
-	SecuritySchemes map[string]*SecurityScheme   `json:"securitySchemes,omitempty"`
+	Schemas         map[string]*OpenAPISchema  `json:"schemas,omitempty"`
+	SecuritySchemes map[string]*SecurityScheme `json:"securitySchemes,omitempty"`
 }
 
 // SecurityScheme describes an OpenAPI 3.1 security scheme.
 type SecurityScheme struct {
-	Type             string      `json:"type"`                       // apiKey, http, oauth2, openIdConnect
+	Type             string      `json:"type"` // apiKey, http, oauth2, openIdConnect
 	Description      string      `json:"description,omitempty"`
 	Name             string      `json:"name,omitempty"`             // required for apiKey
 	In               string      `json:"in,omitempty"`               // required for apiKey: query, header, cookie
@@ -182,6 +182,13 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 	}
 
 	for _, route := range routes {
+		// Untyped routes (Handle/HandleFunc/Mount) carry no request or response
+		// schema, so they cannot be described. They are recorded for Routes()
+		// and route-table inspection, but publishing them here would fill the
+		// spec with entries that document nothing.
+		if route.Untyped {
+			continue
+		}
 		method := strings.ToLower(route.Method)
 		pattern := route.Pattern
 
