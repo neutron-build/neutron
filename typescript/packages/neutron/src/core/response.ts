@@ -182,11 +182,15 @@ export function json(data: unknown, status: number = 200): Response {
  * inside the default shell, so `notFound("No such project")` stays a one-liner
  * and still renders as a page.
  *
- * This is deliberately NOT the app's layout. Rendering a 404 through the layout
- * chain needs a route convention (`not-found.tsx`) and the loader data the
- * layouts expect, neither of which exists at the point a bare `notFound()` is
- * returned. This makes the default presentable; it does not pretend to be the
- * full feature.
+ * This is deliberately NOT the app's layout: at the point a bare `notFound()`
+ * is returned there is no layout chain and no loader data to render one with.
+ * It is the standalone fallback.
+ *
+ * To render a 404 through the app's layouts, add a `not-found.tsx` to your
+ * routes directory. The server renders it like any other route — with its
+ * layout chain — and forces the status to 404. One per directory is allowed,
+ * and the deepest one covering the request wins, so a section can present its
+ * own 404. This function remains the fallback when no such file exists.
  */
 export function notFound(body?: string): Response {
   const trimmed = body?.trim() ?? "";

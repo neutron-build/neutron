@@ -28,6 +28,13 @@ export interface Route {
   hasLoader?: boolean;
   parentId: string | null;
   isLayout?: boolean;
+  /**
+   * A `not-found.tsx` — the page rendered when nothing in this directory's
+   * subtree matched. It is never matched by URL (`/not-found` must 404 like
+   * any other unknown path) and is reached only by the 404 handler, which
+   * renders it through its own layout chain like any other route.
+   */
+  isNotFound?: boolean;
 }
 
 export interface RouteMatch {
