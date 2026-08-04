@@ -26,6 +26,12 @@ type App struct {
 	openapi        *OpenAPISpec
 	oaInfo         OpenAPIInfo
 	nucleusChecker NucleusChecker
+	// built records that Build() has already registered the default routes, so
+	// Run() and Handler() can both call it without registering them twice.
+	built bool
+	// disableDefaultRoutes suppresses every framework-supplied route
+	// (/openapi.json, /docs, /health) rather than just the docs pair.
+	disableDefaultRoutes bool
 	// disableDefaultDocs suppresses the built-in GET /docs (Swagger UI) route.
 	// Callers can mount Swagger UI themselves at a different path.
 	disableDefaultDocs bool
@@ -37,6 +43,16 @@ type Option func(*App)
 // WithConfig sets the application configuration.
 func WithConfig(cfg *Config) Option {
 	return func(a *App) { a.config = cfg }
+}
+
+// WithoutDefaultRoutes suppresses every framework-supplied route
+// (/openapi.json, /docs, /docs/, /health).
+//
+// Defining any of them yourself already takes precedence without this — it is
+// for the case where the route should not exist at all, such as an internal
+// service that must not expose its schema.
+func WithoutDefaultRoutes() Option {
+	return func(a *App) { a.disableDefaultRoutes = true }
 }
 
 // WithMiddleware adds global middleware applied to all routes.
@@ -112,8 +128,37 @@ func (a *App) OpenAPI() *OpenAPISpec {
 	return a.openapi
 }
 
-// Handler returns the root http.Handler with all global middleware applied.
+// Build registers the framework's default routes (/openapi.json, /docs,
+// /health). It is idempotent, and both Run and Handler call it.
+//
+// These used to be registered inside Run, which meant the handler a test
+// exercised through Handler() served a different set of routes than the one
+// production served through Run() — the four routes most likely to be probed by
+// a load balancer or an uptime check were exactly the ones no test could see.
+//
+// A route the application already registered is left alone rather than
+// overwritten or treated as a collision: defining your own /health is normal,
+// and a framework default should yield to it silently rather than panic on
+// startup.
+func (a *App) Build() {
+	if a.built || a.disableDefaultRoutes {
+		return
+	}
+	a.built = true
+
+	a.router.handleIfAbsent("GET /openapi.json", OpenAPIJSON(a.OpenAPI()))
+	if !a.disableDefaultDocs {
+		a.router.handleIfAbsent("GET /docs", SwaggerUI(a.OpenAPI()))
+		a.router.handleIfAbsent("GET /docs/", SwaggerUI(a.OpenAPI()))
+	}
+	a.registerHealthCheck()
+}
+
+// Handler returns the root http.Handler with all global middleware applied,
+// including the framework's default routes — so a test drives the same routes
+// production does.
 func (a *App) Handler() http.Handler {
+	a.Build()
 	var h http.Handler = a.router
 	for i := len(a.middleware) - 1; i >= 0; i-- {
 		h = a.middleware[i](h)
@@ -127,13 +172,7 @@ func (a *App) Run(addr string) error {
 		addr = a.config.Server.Addr
 	}
 
-	// Register default routes
-	a.router.mux.Handle("GET /openapi.json", OpenAPIJSON(a.OpenAPI()))
-	if !a.disableDefaultDocs {
-		a.router.mux.Handle("GET /docs", SwaggerUI(a.OpenAPI()))
-		a.router.mux.Handle("GET /docs/", SwaggerUI(a.OpenAPI()))
-	}
-	a.registerHealthCheck()
+	a.Build()
 
 	// Start lifecycle hooks
 	ctx := context.Background()
@@ -185,7 +224,7 @@ func (a *App) Run(addr string) error {
 }
 
 func (a *App) registerHealthCheck() {
-	a.router.mux.Handle("GET /health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	a.router.handleIfAbsent("GET /health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
 			"status":  "ok",
 			"version": a.oaInfo.Version,

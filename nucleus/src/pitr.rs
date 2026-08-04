@@ -49,6 +49,37 @@ pub struct PitrReport {
     pub restored_lsn: u64,
     /// Number of WAL segments written into the reconstructed WAL directory.
     pub segments_written: usize,
+    /// Wall-clock time (Unix seconds) at which the newest replayed segment was
+    /// archived, when the archive index records it.
+    ///
+    /// An LSN does not tell an operator what they got back. This is the only
+    /// number in the report that answers the question actually being asked
+    /// during a recovery — "how much did we lose?" — so it is reported even
+    /// though replay itself does not need it.
+    pub recovery_point_unix: Option<u64>,
+}
+
+/// Archive time of the newest segment whose records are at or below `lsn`.
+///
+/// Read from the archive index, which is advisory: a missing or partial index
+/// costs the wall-clock report, never recoverability.
+fn recovery_point_of(archive_dir: &Path, lsn: u64) -> Option<u64> {
+    let contents = std::fs::read_to_string(archive_dir.join(wal::ARCHIVE_INDEX_NAME)).ok()?;
+    let mut best: Option<(u64, u64)> = None;
+    for line in contents.lines() {
+        let mut it = line.split_whitespace();
+        let (_seg, _min, max, unix) = match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => continue,
+        };
+        let (Ok(max_lsn), Ok(archived_unix)) = (max.parse::<u64>(), unix.parse::<u64>()) else {
+            continue;
+        };
+        if max_lsn <= lsn && best.is_none_or(|(bl, _)| max_lsn >= bl) {
+            best = Some((max_lsn, archived_unix));
+        }
+    }
+    best.map(|(_, unix)| unix)
 }
 
 /// Restore a database to a point in time.
@@ -175,6 +206,7 @@ pub fn restore_pitr(
         target_lsn,
         restored_lsn,
         segments_written: (seq - 1) as usize,
+        recovery_point_unix: recovery_point_of(archive_dir, restored_lsn),
     })
 }
 

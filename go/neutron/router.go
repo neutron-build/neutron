@@ -6,8 +6,58 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strings"
 )
+
+// frameworkPkg is this package's import path, used to walk past framework
+// frames when attributing a route registration to application code.
+const frameworkPkg = "github.com/neutron-dev/neutron-go/neutron."
+
+// callerSite names the application line that registered a route.
+//
+// Every registration funnels through one line inside this file, so the panic
+// std ServeMux raises on a duplicate points at the router twice and never at
+// either of the two application files actually in conflict — which is the only
+// thing you need to know to fix it. Walking out to the first non-framework
+// frame recovers that, and walking (rather than counting frames) keeps it
+// correct whether the caller used Handle, HandleFunc, or a typed helper, each
+// of which sits at a different depth.
+func callerSite() string {
+	var pcs [24]uintptr
+	n := runtime.Callers(2, pcs[:])
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		f, more := frames.Next()
+		// A test in this package is application code for this purpose;
+		// otherwise the framework's own tests could never see their own site.
+		outside := f.Function != "" && !strings.HasPrefix(f.Function, frameworkPkg)
+		if outside || strings.HasSuffix(f.File, "_test.go") {
+			return fmt.Sprintf("%s:%d", f.File, f.Line)
+		}
+		if !more {
+			return "unknown location"
+		}
+	}
+}
+
+// claimPattern records where a mux pattern was registered, and reports both
+// sites if it is registered twice.
+//
+// The check has to happen before the mux sees the pattern: ServeMux panics on
+// a duplicate itself, and once it does, the better message can no longer be
+// produced.
+func (r *Router) claimPattern(fullPattern string) {
+	site := callerSite()
+	if r.sites != nil {
+		if prev, taken := (*r.sites)[fullPattern]; taken {
+			panic(fmt.Sprintf(
+				"neutron: route %q registered twice\n  first: %s\n  again: %s",
+				fullPattern, prev, site))
+		}
+		(*r.sites)[fullPattern] = site
+	}
+}
 
 // Router wraps Go 1.22+ net/http.ServeMux with composable route groups and
 // middleware support.
@@ -19,6 +69,10 @@ type Router struct {
 	// pointer so OpenAPI sees every registered endpoint regardless of where it
 	// was registered.
 	routes *[]routeRecord
+	// sites maps a mux pattern to the application line that registered it,
+	// shared across the router tree the same way routes is. It exists only to
+	// make a collision panic name the two files in conflict.
+	sites *map[string]string
 }
 
 // routeRecord stores metadata about a registered route for OpenAPI.
@@ -68,9 +122,11 @@ func WithOperationID(id string) RouteOption {
 // newRouter creates a root router.
 func newRouter() *Router {
 	var routes []routeRecord
+	sites := map[string]string{}
 	return &Router{
 		mux:    http.NewServeMux(),
 		routes: &routes,
+		sites:  &sites,
 	}
 }
 
@@ -82,6 +138,7 @@ func (r *Router) Group(prefix string, mw ...Middleware) *Router {
 		prefix:     r.prefix + prefix,
 		middleware: append(r.middleware[:len(r.middleware):len(r.middleware)], mw...),
 		routes:     r.routes, // pointer-shared across the whole tree
+		sites:      r.sites,  // same, so a collision across two groups is caught
 	}
 }
 
@@ -89,6 +146,8 @@ func (r *Router) Group(prefix string, mw ...Middleware) *Router {
 // handlers or sub-routers.
 func (r *Router) Mount(prefix string, handler http.Handler) {
 	fullPrefix := r.prefix + prefix
+	r.claimPattern(fullPrefix + "/")
+	r.claimPattern(fullPrefix)
 	// Strip prefix before passing to the handler
 	r.mux.Handle(fullPrefix+"/", http.StripPrefix(fullPrefix, handler))
 	// Also handle exact prefix match
@@ -104,6 +163,7 @@ func (r *Router) Mount(prefix string, handler http.Handler) {
 // this right, and nothing tested the untyped path.
 func (r *Router) Handle(pattern string, handler http.Handler) {
 	fullPattern := joinPattern(r.prefix, pattern)
+	r.claimPattern(fullPattern)
 	wrapped := applyMiddleware(handler, r.middleware)
 	r.mux.Handle(fullPattern, wrapped)
 
@@ -118,6 +178,26 @@ func (r *Router) Handle(pattern string, handler http.Handler) {
 			Untyped: true,
 		})
 	}
+}
+
+// handleIfAbsent registers a framework-supplied default route unless the
+// application has already claimed that exact pattern. Reports whether it
+// registered anything.
+//
+// Yielding is the right default for a framework route: an application defining
+// its own /health is ordinary, and the alternatives are both worse than
+// stepping aside — overwriting silently replaces the application's handler with
+// the framework's, and treating it as a collision turns a reasonable app into
+// one that panics on startup.
+func (r *Router) handleIfAbsent(pattern string, handler http.Handler) bool {
+	fullPattern := joinPattern(r.prefix, pattern)
+	if r.sites != nil {
+		if _, taken := (*r.sites)[fullPattern]; taken {
+			return false
+		}
+	}
+	r.Handle(pattern, handler)
+	return true
 }
 
 // splitPattern separates an optional leading method from the path.
@@ -145,6 +225,7 @@ func (r *Router) HandleFunc(pattern string, handler http.HandlerFunc) {
 // register adds a route with full metadata tracking.
 func (r *Router) register(method, pattern string, handler http.Handler, inType, outType reflect.Type, opts routeOptions) {
 	fullPattern := method + " " + r.prefix + pattern
+	r.claimPattern(fullPattern)
 	wrapped := applyMiddleware(handler, r.middleware)
 	r.mux.Handle(fullPattern, wrapped)
 

@@ -195,6 +195,17 @@ pub trait WalBackend: Send + Sync {
     fn rotate(&self) -> std::io::Result<()> {
         Ok(())
     }
+    /// Seal and archive the segment being written, so everything committed so
+    /// far is recoverable from the WAL archive alone. Returns whether a segment
+    /// was actually archived.
+    ///
+    /// The default is `Ok(false)` and that is the honest answer here rather
+    /// than a stub: only the segmented backend has an archive at all, and PITR
+    /// is documented as segmented-only. A backend that cannot archive must say
+    /// so — reporting `true` would let a caller believe the tail was preserved.
+    fn archive_active(&self) -> std::io::Result<bool> {
+        Ok(false)
+    }
     /// The next LSN this backend will assign. `0` when the backend does not
     /// track LSNs.
     fn current_lsn(&self) -> u64 {
@@ -1026,6 +1037,33 @@ impl SegmentedWal {
         self.rotate_inner(&mut active)
     }
 
+    /// Seal and archive the segment currently being written, so everything
+    /// committed up to now is recoverable from the archive alone.
+    ///
+    /// Segments are otherwise archived only when they fill up, which makes the
+    /// PITR recovery point the last *rollover* rather than the last commit. At
+    /// the default 64 MiB segment a low-write database can run for days without
+    /// rolling over, and every one of those commits is missing from the archive
+    /// — including across a clean shutdown, where nothing was lost and nothing
+    /// crashed. Worse, `restore-pitr` replays what it has and reports success,
+    /// so the gap is invisible exactly when someone is relying on it.
+    ///
+    /// Returns `Ok(true)` if a segment was sealed and archived, `Ok(false)` if
+    /// there was nothing to do (no archive configured, or the active segment is
+    /// empty). Rotating an empty segment is skipped deliberately: called on a
+    /// timer it would otherwise litter the archive with empty files.
+    pub fn archive_active(&self) -> std::io::Result<bool> {
+        if self.archive_dir.is_none() {
+            return Ok(false);
+        }
+        let mut active = self.active.lock();
+        if active.bytes_written == 0 {
+            return Ok(false);
+        }
+        self.rotate_inner(&mut active)?;
+        Ok(true)
+    }
+
     /// Copy a sealed segment into the archive directory (idempotent) and record
     /// its LSN range + archive time in the archive index. This is the PITR
     /// durability primitive: a segment that has been archived can be replayed
@@ -1309,6 +1347,10 @@ impl WalBackend for SegmentedWal {
 
     fn sync(&self) -> std::io::Result<()> {
         SegmentedWal::sync(self)
+    }
+
+    fn archive_active(&self) -> std::io::Result<bool> {
+        SegmentedWal::archive_active(self)
     }
 
     fn wal_stats(&self) -> (u64, u64) {
@@ -2741,5 +2783,72 @@ mod group_commit_tests {
         assert_eq!(err.to_string(), "disk gone");
         // A later successful sync still works and covers.
         gc.sync_up_to(1, || Ok(5)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+
+    // A segment that has not filled is not in the archive, so everything
+    // committed into it is unreachable by PITR. That is the whole gap: at the
+    // default 64 MiB a quiet database can go days without a rollover, and
+    // `restore-pitr` replays what it has and reports success either way, so the
+    // loss only shows up during an actual recovery. `archive_active` is what a
+    // clean shutdown and the archive timeout call to close it.
+    #[test]
+    fn archive_active_seals_a_partial_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("t.wal.d");
+        let archive = dir.path().join("archive");
+
+        // A segment far larger than what gets written, so nothing rotates.
+        let wal =
+            SegmentedWal::open_with_archive(&wal_dir, 64 * 1024 * 1024, SyncMode::None, &archive)
+                .unwrap();
+
+        let page = [7u8; PAGE_SIZE];
+        wal.log_page_write(1, 1, &page).unwrap();
+        wal.log_commit(1).unwrap();
+        wal.sync().unwrap();
+
+        assert!(
+            list_archive_segments(&archive).unwrap_or_default().is_empty(),
+            "a partial segment must not be archived on its own — if it were, \
+             this test would not be measuring anything"
+        );
+
+        assert!(
+            wal.archive_active().unwrap(),
+            "archive_active must report that it sealed a segment holding commits"
+        );
+        assert!(
+            !list_archive_segments(&archive).unwrap_or_default().is_empty(),
+            "committed records were left out of the archive, so PITR cannot reach them"
+        );
+
+        // Idempotent: with nothing newly written there is nothing to seal, and
+        // saying so keeps a timer from filling the archive with empty segments.
+        assert!(
+            !wal.archive_active().unwrap(),
+            "an empty active segment must not be archived"
+        );
+    }
+
+    // Without an archive configured there is nothing to archive to, and the
+    // answer must be `false` rather than an optimistic `true`: a caller uses
+    // this to decide whether the tail is safe.
+    #[test]
+    fn archive_active_reports_false_without_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("t.wal.d");
+        let wal = SegmentedWal::open_with_sync_mode(&wal_dir, 64 * 1024 * 1024, SyncMode::None)
+            .unwrap();
+
+        let page = [7u8; PAGE_SIZE];
+        wal.log_page_write(1, 1, &page).unwrap();
+        wal.sync().unwrap();
+
+        assert!(!wal.archive_active().unwrap());
     }
 }

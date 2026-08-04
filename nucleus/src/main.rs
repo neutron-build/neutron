@@ -1467,6 +1467,46 @@ async fn cmd_start(cfg: StartConfig) {
         nucleus::background::Priority::Normal,
         std::time::Duration::from_secs(5),
     );
+    // WAL archive timeout: seal and archive the active segment on a timer so
+    // the point-in-time recovery window is bounded by wall-clock rather than by
+    // write volume.
+    //
+    // A segment otherwise reaches the archive only when it fills. At the
+    // default 64 MiB that makes the recovery point the last rollover, so a
+    // quiet database can accumulate days of commits that `restore-pitr` cannot
+    // reach — and it reports success regardless, so the gap only surfaces
+    // during an actual recovery. Only spawned when an archive is configured,
+    // since without one there is nothing to archive to.
+    let archive_timeout_secs = config.wal.archive_timeout_secs;
+    if archive_timeout_secs > 0
+        && std::env::var("NUCLEUS_WAL_ARCHIVE_DIR").is_ok_and(|v| !v.is_empty())
+        && let Some(engine) = disk_engine.clone()
+    {
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(archive_timeout_secs));
+            // The first tick fires immediately; skip it so startup does not
+            // archive an empty segment.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let engine = engine.clone();
+                match tokio::task::spawn_blocking(move || engine.archive_active_wal()).await {
+                    Ok(Ok(true)) => {
+                        tracing::debug!("WAL archive timeout: sealed and archived active segment")
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(e)) => tracing::warn!("WAL archive timeout failed: {e}"),
+                    Err(e) => tracing::warn!("WAL archive timeout task panicked: {e}"),
+                }
+            }
+        });
+        tracing::info!(
+            "WAL archive timeout: active segment archived every {archive_timeout_secs}s \
+             (recovery-point objective)"
+        );
+    }
+
     // Idle-in-transaction sweep (T1.3): roll back transactions left open and
     // idle past the configured timeout so their MVCC snapshots are released and
     // GC can advance. Only spawned when enabled (timeout > 0), so the default
@@ -1940,10 +1980,34 @@ async fn cmd_start(cfg: StartConfig) {
         // hundred ms; doing it inline on a tokio worker has been observed
         // to stall the runtime drop sequence under load.
         if let Some(engine) = disk_for_shutdown {
-            let flush_result = tokio::task::spawn_blocking(move || engine.flush()).await;
+            let flush_result = tokio::task::spawn_blocking(move || {
+                let flushed = engine.flush();
+                // Seal and archive the active WAL segment on the way out.
+                // Segments are otherwise archived only when they fill, which
+                // makes the PITR recovery point the last rollover rather than
+                // the last commit — so a clean, planned shutdown would leave
+                // every commit since the segment began unreachable by
+                // restore-pitr, which would then report success anyway.
+                let archived = engine.archive_active_wal();
+                (flushed, archived)
+            })
+            .await;
             match flush_result {
-                Ok(Ok(())) => tracing::info!("Data flushed to disk successfully"),
-                Ok(Err(e)) => tracing::error!("Failed to flush data on shutdown: {e}"),
+                Ok((flushed, archived)) => {
+                    match flushed {
+                        Ok(()) => tracing::info!("Data flushed to disk successfully"),
+                        Err(e) => tracing::error!("Failed to flush data on shutdown: {e}"),
+                    }
+                    match archived {
+                        Ok(true) => tracing::info!("Active WAL segment archived for PITR"),
+                        Ok(false) => {}
+                        Err(e) => tracing::error!(
+                            "Failed to archive the active WAL segment on shutdown: {e}. \
+                             Point-in-time recovery can only reach the last completed \
+                             segment; commits after it are not in the archive."
+                        ),
+                    }
+                }
                 Err(e) => tracing::error!("Flush task panicked: {e}"),
             }
         }
@@ -2580,6 +2644,32 @@ fn cmd_restore_pitr(
                     report.restored_lsn, report.target_lsn
                 );
             }
+            // State the recovery point in wall-clock terms, and say plainly
+            // what is not in it. An LSN alone reads as success: the operator
+            // has no way to tell that commits made after the last segment was
+            // archived are simply absent, and this is being read during an
+            // incident, when a silent gap is most expensive.
+            match report.recovery_point_unix {
+                Some(unix) => {
+                    let when = chrono::DateTime::from_timestamp(unix as i64, 0)
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| format!("unix {unix}"));
+                    println!(
+                        "  Recovery point: {when} — commits after this are NOT in the archive"
+                    );
+                }
+                None => {
+                    println!(
+                        "  Recovery point: unknown (archive index missing or unreadable). \
+                         Commits made after the last segment was archived are NOT included."
+                    );
+                }
+            }
+            println!(
+                "  A segment reaches the archive when it fills, on the archive timeout \
+                 (NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS), or at a clean shutdown. Anything \
+                 written after the last such point was never archived and cannot be replayed."
+            );
             println!("  Start with: nucleus start --data {}", data.display());
         }
         Err(e) => {
