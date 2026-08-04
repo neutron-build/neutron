@@ -12,6 +12,34 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 )
 
+// claimJobSQL claims one pending job.
+//
+// Correctness comes from the `status = 'pending'` predicate on the UPDATE
+// itself, not from row locking: two workers may select the same id, only one
+// UPDATE matches, and the loser affects zero rows and polls again. That holds
+// on any backend.
+//
+// It deliberately omits `FOR UPDATE SKIP LOCKED`. The clause reduces contention
+// but cannot carry correctness here, because it is not universally implemented
+// — Nucleus, this SDK's own database, parsed and silently discarded it, so a
+// claim depending on it would have handed one job to every worker polling at
+// that moment while looking entirely correct.
+//
+// The cost is contention: with many workers, losers burn a round trip. The
+// answer to that is batching or a backend-specific fast path, never borrowing a
+// correctness guarantee from an optional clause.
+const claimJobSQL = `UPDATE _neutron_jobs
+			SET status = 'running', attempts = attempts + 1, updated_at = NOW()
+			WHERE id = (
+				SELECT id FROM _neutron_jobs
+				WHERE job_type = $1 AND status = 'pending' AND run_at <= NOW()
+				AND (deadline IS NULL OR deadline > NOW())
+				ORDER BY run_at
+				LIMIT 1
+			)
+			AND status = 'pending'
+			RETURNING id, payload, attempts, max_retry, backoff_ms`
+
 // Queue provides a persistent job queue backed by Nucleus/PostgreSQL.
 type Queue struct {
 	client *nucleus.Client
@@ -142,21 +170,34 @@ func (q *Queue) Process(ctx context.Context, jobType string, handler func(ctx co
 		default:
 		}
 
-		// Fetch next job using advisory lock
-		sql := `UPDATE _neutron_jobs
-			SET status = 'running', attempts = attempts + 1, updated_at = NOW()
-			WHERE id = (
-				SELECT id FROM _neutron_jobs
-				WHERE job_type = $1 AND status = 'pending' AND run_at <= NOW()
-				AND (deadline IS NULL OR deadline > NOW())
-				ORDER BY run_at
-				LIMIT 1
-				FOR UPDATE SKIP LOCKED
-			)
-			RETURNING id, payload, attempts, max_retry, backoff_ms`
+		// Claim one job.
+		//
+		// Correctness comes from the `status = 'pending'` predicate on the
+		// UPDATE itself, not from row locking. Two workers may select the same
+		// id concurrently; only one UPDATE matches, the other affects zero rows
+		// and polls again. That holds on any backend.
+		//
+		// This deliberately does NOT use `FOR UPDATE SKIP LOCKED`. That clause
+		// reduces contention but cannot be relied on for correctness here,
+		// because it is not universally implemented — Nucleus, this SDK's own
+		// database, parsed and silently discarded it, so a claim that depended
+		// on it would have handed the same job to every worker polling at that
+		// moment while looking entirely correct. Nucleus now refuses the clause
+		// outright rather than lying about it, which would have broken this
+		// query had it stayed.
+		//
+		// The cost is contention: under many workers, losers burn a round trip.
+		// The fix for that is batching or a backend-specific fast path, not a
+		// correctness guarantee borrowed from an optional clause.
+		sql := claimJobSQL
 
 		rows, err := q.client.Pool().Query(ctx, sql, jobType)
 		if err != nil {
+			// Log it. Swallowed, a schema that was never migrated or a
+			// permissions problem stops the worker processing anything at all
+			// while emitting nothing — the queue looks idle rather than broken,
+			// which is the hardest failure to notice.
+			q.logger.Error("job claim query failed", "job_type", jobType, "err", err)
 			time.Sleep(time.Second)
 			continue
 		}
