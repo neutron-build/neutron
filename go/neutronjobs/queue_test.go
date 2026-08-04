@@ -1,6 +1,7 @@
 package neutronjobs
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -176,5 +177,26 @@ func TestRetryBackoffCalculation(t *testing.T) {
 	retryDelay3 := time.Duration(backoffMs*3) * time.Millisecond
 	if retryDelay3 != 3*time.Second {
 		t.Errorf("attempt 3 delay = %v, want 3s", retryDelay3)
+	}
+}
+
+// The claim must not depend on FOR UPDATE SKIP LOCKED for correctness.
+//
+// That clause is optional: Nucleus — this SDK's own database — parsed and
+// silently discarded it, so a claim relying on it handed the same job to every
+// worker polling at that moment while looking correct. Safety has to come from
+// the UPDATE re-checking status, which holds on any backend.
+//
+// This asserts the query itself rather than running it, because the package has
+// no DB-backed test harness. Weak, but it is the difference between catching a
+// silent regression here and not.
+func TestClaimDoesNotRelyOnRowLocking(t *testing.T) {
+	sql := claimJobSQL
+
+	if strings.Contains(sql, "SKIP LOCKED") {
+		t.Error("claim must not depend on SKIP LOCKED — it is not honoured on every backend")
+	}
+	if !strings.Contains(sql, "AND status = 'pending'") {
+		t.Error("claim UPDATE must re-check status so only one worker can win the row")
 	}
 }
