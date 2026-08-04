@@ -589,7 +589,24 @@ async function handleNavigation(forceRevalidate: boolean = false) {
   currentRoute = route;
   layouts = nextLayouts;
   currentUrl = nextUrl;
-  await ensureRouteChainModules([...nextLayouts, route]);
+  try {
+    await ensureRouteChainModules([...nextLayouts, route]);
+  } catch (error) {
+    // A deploy replaces every hashed chunk and the old ones stop existing, so a
+    // tab open across a release asks for a file that is gone and the import
+    // rejects. Nothing caught that, so the navigation simply never finished:
+    // the click did nothing, forever, with no error the user could act on.
+    //
+    // A full navigation to the same URL is the recovery — it fetches the new
+    // document, which references the chunks that now exist. Deliberately
+    // `assign` to the target rather than `reload`, so the user still lands
+    // where they clicked instead of being bounced back to the page they left.
+    if (typeof console !== "undefined") {
+      console.warn("neutron: route chunk failed to load, falling back to a full navigation", error);
+    }
+    window.location.assign(nextUrl);
+    return;
+  }
 
   const prefetched = forceRevalidate ? null : takePrefetch(nextUrl);
   if (prefetched) {
