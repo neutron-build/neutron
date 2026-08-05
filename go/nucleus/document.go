@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -53,8 +54,13 @@ func applyDocOpts(opts []DocOption) docOpts {
 	return o
 }
 
-// Insert stores a document and returns its ID.
-func (d *DocumentModel) Insert(ctx context.Context, _ string, doc any) (int64, error) {
+// Insert stores a document in a collection and returns its ID.
+//
+// An empty collection is the default (unnamed) one, which is where documents
+// written before collections existed live. A named collection isolates the
+// document: only calls naming the same collection can read, update or delete
+// it.
+func (d *DocumentModel) Insert(ctx context.Context, collection string, doc any) (int64, error) {
 	if err := d.client.requireNucleus("Document.Insert"); err != nil {
 		return 0, err
 	}
@@ -63,19 +69,33 @@ func (d *DocumentModel) Insert(ctx context.Context, _ string, doc any) (int64, e
 		return 0, fmt.Errorf("nucleus: doc marshal: %w", err)
 	}
 	var id int64
-	err = d.pool.QueryRow(ctx, "SELECT DOC_INSERT($1)", string(data)).Scan(&id)
+	if collection == "" {
+		// The one-argument form, so a client that names no collection still
+		// works against a server that predates them.
+		err = d.pool.QueryRow(ctx, "SELECT DOC_INSERT($1)", string(data)).Scan(&id)
+	} else {
+		err = d.pool.QueryRow(ctx, "SELECT DOC_INSERT($1, $2)", collection, string(data)).Scan(&id)
+	}
 	return id, wrapErr("doc insert", err)
 }
 
-// Get retrieves a document by ID.
+// Get retrieves a document by ID from the default collection.
+//
+// A document in a NAMED collection is reported as absent — use GetIn. That is
+// the isolation: holding an id is not enough to read across a collection
+// boundary.
 func (d *DocumentModel) Get(ctx context.Context, id int64) (map[string]any, error) {
+	return d.GetIn(ctx, "", id)
+}
+
+// GetIn retrieves a document by ID from a specific collection.
+func (d *DocumentModel) GetIn(ctx context.Context, collection string, id int64) (map[string]any, error) {
 	if err := d.client.requireNucleus("Document.Get"); err != nil {
 		return nil, err
 	}
-	var raw *string
-	err := d.pool.QueryRow(ctx, "SELECT DOC_GET($1)", id).Scan(&raw)
+	raw, err := d.rawDoc(ctx, collection, id)
 	if err != nil {
-		return nil, wrapErr("doc get", err)
+		return nil, err
 	}
 	if raw == nil {
 		return nil, nil
@@ -87,16 +107,41 @@ func (d *DocumentModel) Get(ctx context.Context, id int64) (map[string]any, erro
 	return result, nil
 }
 
+// rawDoc fetches a document's JSON text, scoped to a collection.
+//
+// An empty collection uses the one-argument call, so a client that never names
+// one keeps working against a server that predates collections; naming one uses
+// the two-argument call, which such a server rejects outright rather than
+// silently ignoring the scope.
+func (d *DocumentModel) rawDoc(ctx context.Context, collection string, id int64) (*string, error) {
+	var raw *string
+	var err error
+	if collection == "" {
+		err = d.pool.QueryRow(ctx, "SELECT DOC_GET($1)", docID(id)).Scan(&raw)
+	} else {
+		err = d.pool.QueryRow(ctx, "SELECT DOC_GET($1, $2)", collection, docID(id)).Scan(&raw)
+	}
+	if err != nil {
+		return nil, wrapErr("doc get", err)
+	}
+	return raw, nil
+}
+
 // DocGetTyped retrieves a document by ID and unmarshals into T.
 func DocGetTyped[T any](ctx context.Context, d *DocumentModel, id int64) (T, error) {
+	return DocGetTypedIn[T](ctx, d, "", id)
+}
+
+// DocGetTypedIn retrieves a document by ID from a collection and unmarshals
+// into T.
+func DocGetTypedIn[T any](ctx context.Context, d *DocumentModel, collection string, id int64) (T, error) {
 	var result T
 	if err := d.client.requireNucleus("Document.GetTyped"); err != nil {
 		return result, err
 	}
-	var raw *string
-	err := d.pool.QueryRow(ctx, "SELECT DOC_GET($1)", id).Scan(&raw)
+	raw, err := d.rawDoc(ctx, collection, id)
 	if err != nil {
-		return result, wrapErr("doc get", err)
+		return result, err
 	}
 	if raw == nil {
 		return result, fmt.Errorf("nucleus: doc %d not found", id)
@@ -109,6 +154,12 @@ func DocGetTyped[T any](ctx context.Context, d *DocumentModel, id int64) (T, err
 
 // QueryDocs queries documents matching a JSON query and returns matching IDs.
 func (d *DocumentModel) QueryDocs(ctx context.Context, filter map[string]any) ([]int64, error) {
+	return d.QueryDocsIn(ctx, "", filter)
+}
+
+// QueryDocsIn queries one collection and returns the matching IDs. Matches in
+// other collections are not returned.
+func (d *DocumentModel) QueryDocsIn(ctx context.Context, collection string, filter map[string]any) ([]int64, error) {
 	if err := d.client.requireNucleus("Document.QueryDocs"); err != nil {
 		return nil, err
 	}
@@ -117,7 +168,11 @@ func (d *DocumentModel) QueryDocs(ctx context.Context, filter map[string]any) ([
 		return nil, fmt.Errorf("nucleus: doc query marshal: %w", err)
 	}
 	var raw string
-	err = d.pool.QueryRow(ctx, "SELECT DOC_QUERY($1)", string(q)).Scan(&raw)
+	if collection == "" {
+		err = d.pool.QueryRow(ctx, "SELECT DOC_QUERY($1)", string(q)).Scan(&raw)
+	} else {
+		err = d.pool.QueryRow(ctx, "SELECT DOC_QUERY($1, $2)", collection, string(q)).Scan(&raw)
+	}
 	if err != nil {
 		return nil, wrapErr("doc query", err)
 	}
@@ -140,32 +195,85 @@ func (d *DocumentModel) QueryDocs(ctx context.Context, filter map[string]any) ([
 	return ids, nil
 }
 
-// Path extracts a nested value from a document using a key path.
+// Path extracts a nested value from a document in the default collection.
 func (d *DocumentModel) Path(ctx context.Context, id int64, keys ...string) (*string, error) {
+	return d.PathIn(ctx, "", id, keys...)
+}
+
+// PathIn extracts a nested value from a document in a specific collection.
+//
+// Calling with no keys is refused rather than sent: the engine requires at
+// least one, and building the call without one produced a malformed statement
+// (a trailing comma) that surfaced as a syntax error naming nothing useful.
+func (d *DocumentModel) PathIn(ctx context.Context, collection string, id int64, keys ...string) (*string, error) {
 	if err := d.client.requireNucleus("Document.Path"); err != nil {
 		return nil, err
 	}
-	args := make([]any, 0, 1+len(keys))
-	args = append(args, id)
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("nucleus: doc path requires at least one key")
+	}
+	// The scoped form is a distinct FUNCTION, not an extra argument: the key
+	// tail is variadic, so a leading collection could not be told apart from a
+	// leading id.
+	args := make([]any, 0, 2+len(keys))
+	fn, base := "DOC_PATH", 2
+	if collection != "" {
+		fn, base = "DOC_PATH_IN", 3
+		args = append(args, collection)
+	}
+	args = append(args, docID(id))
 	placeholders := make([]string, len(keys))
 	for i, k := range keys {
 		args = append(args, k)
-		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		placeholders[i] = fmt.Sprintf("$%d", i+base)
 	}
-	q := fmt.Sprintf("SELECT DOC_PATH($1, %s)", strings.Join(placeholders, ", "))
+	idArg := "$1"
+	if collection != "" {
+		idArg = "$1, $2"
+	}
+	q := fmt.Sprintf("SELECT %s(%s, %s)", fn, idArg, strings.Join(placeholders, ", "))
 	var val *string
 	err := d.pool.QueryRow(ctx, q, args...).Scan(&val)
 	return val, wrapErr("doc path", err)
 }
 
-// Count returns the total number of documents.
+// Count returns the number of documents in the default collection.
 func (d *DocumentModel) Count(ctx context.Context) (int64, error) {
+	return d.CountIn(ctx, "")
+}
+
+// CountIn returns the number of documents in a specific collection.
+func (d *DocumentModel) CountIn(ctx context.Context, collection string) (int64, error) {
 	if err := d.client.requireNucleus("Document.Count"); err != nil {
 		return 0, err
 	}
 	var n int64
-	err := d.pool.QueryRow(ctx, "SELECT DOC_COUNT()").Scan(&n)
+	var err error
+	if collection == "" {
+		err = d.pool.QueryRow(ctx, "SELECT DOC_COUNT()").Scan(&n)
+	} else {
+		err = d.pool.QueryRow(ctx, "SELECT DOC_COUNT($1)", collection).Scan(&n)
+	}
 	return n, wrapErr("doc count", err)
+}
+
+// docID renders a document id the way the engine expects it to arrive over
+// pgwire.
+//
+// Nucleus reports a parameter whose type it cannot infer as TEXT, and the
+// document functions take their id in a position it does not infer. pgx then
+// refuses to encode an int64 into a TEXT parameter ("cannot find encode plan"),
+// so passing the id as a number made every DOC_GET/DOC_UPDATE/DOC_DELETE/
+// DOC_PATH call fail outright — Document.Get has never worked against a live
+// Nucleus over the wire. The engine parses a text-encoded integer id for
+// exactly this reason (see `val_to_u64`), so sending the digits is the
+// supported encoding, not a workaround.
+//
+// The underlying gap is the engine's parameter-type inference, which is not
+// function-signature aware; fixing it there would let every SDK send a native
+// integer.
+func docID(id int64) string {
+	return strconv.FormatInt(id, 10)
 }
 
 // applyProjection filters a document to only include specified fields.
@@ -187,14 +295,14 @@ func applyProjection(doc map[string]any, fields []string) map[string]any {
 func (d *DocumentModel) Find(ctx context.Context, collection string, filter map[string]any, opts ...DocOption) ([]map[string]any, error) {
 	o := applyDocOpts(opts)
 
-	ids, err := d.QueryDocs(ctx, filter)
+	ids, err := d.QueryDocsIn(ctx, collection, filter)
 	if err != nil {
 		return nil, err
 	}
 
 	var results []map[string]any
 	for _, id := range ids {
-		doc, err := d.Get(ctx, id)
+		doc, err := d.GetIn(ctx, collection, id)
 		if err != nil {
 			return nil, err
 		}
@@ -244,14 +352,14 @@ func (d *DocumentModel) Find(ctx context.Context, collection string, filter map[
 func FindTyped[T any](ctx context.Context, d *DocumentModel, collection string, filter map[string]any, opts ...DocOption) ([]T, error) {
 	o := applyDocOpts(opts)
 
-	ids, err := d.QueryDocs(ctx, filter)
+	ids, err := d.QueryDocsIn(ctx, collection, filter)
 	if err != nil {
 		return nil, err
 	}
 
 	var results []T
 	for _, id := range ids {
-		item, err := DocGetTyped[T](ctx, d, id)
+		item, err := DocGetTypedIn[T](ctx, d, collection, id)
 		if err != nil {
 			continue // skip missing docs
 		}
@@ -305,7 +413,7 @@ func (d *DocumentModel) Update(ctx context.Context, collection string, filter ma
 	if err := d.client.requireNucleus("Document.Update"); err != nil {
 		return 0, err
 	}
-	ids, err := d.QueryDocs(ctx, filter)
+	ids, err := d.QueryDocsIn(ctx, collection, filter)
 	if err != nil {
 		return 0, err
 	}
@@ -316,7 +424,7 @@ func (d *DocumentModel) Update(ctx context.Context, collection string, filter ma
 	var count int64
 	for _, id := range ids {
 		// Get current doc
-		doc, err := d.Get(ctx, id)
+		doc, err := d.GetIn(ctx, collection, id)
 		if err != nil {
 			return count, err
 		}
@@ -333,7 +441,11 @@ func (d *DocumentModel) Update(ctx context.Context, collection string, filter ma
 			return count, fmt.Errorf("nucleus: doc marshal: %w", err)
 		}
 		var ok bool
-		err = d.pool.QueryRow(ctx, "SELECT DOC_UPDATE($1, $2)", id, string(data)).Scan(&ok)
+		if collection == "" {
+			err = d.pool.QueryRow(ctx, "SELECT DOC_UPDATE($1, $2)", docID(id), string(data)).Scan(&ok)
+		} else {
+			err = d.pool.QueryRow(ctx, "SELECT DOC_UPDATE($1, $2, $3)", collection, docID(id), string(data)).Scan(&ok)
+		}
 		if err != nil {
 			return count, wrapErr("doc update", err)
 		}
@@ -350,7 +462,7 @@ func (d *DocumentModel) Delete(ctx context.Context, collection string, filter ma
 	if err := d.client.requireNucleus("Document.Delete"); err != nil {
 		return 0, err
 	}
-	ids, err := d.QueryDocs(ctx, filter)
+	ids, err := d.QueryDocsIn(ctx, collection, filter)
 	if err != nil {
 		return 0, err
 	}
@@ -361,7 +473,12 @@ func (d *DocumentModel) Delete(ctx context.Context, collection string, filter ma
 	var count int64
 	for _, id := range ids {
 		var ok bool
-		err := d.pool.QueryRow(ctx, "SELECT DOC_DELETE($1)", id).Scan(&ok)
+		var err error
+		if collection == "" {
+			err = d.pool.QueryRow(ctx, "SELECT DOC_DELETE($1)", docID(id)).Scan(&ok)
+		} else {
+			err = d.pool.QueryRow(ctx, "SELECT DOC_DELETE($1, $2)", collection, docID(id)).Scan(&ok)
+		}
 		if err != nil {
 			return count, wrapErr("doc delete", err)
 		}
