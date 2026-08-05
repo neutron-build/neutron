@@ -4151,8 +4151,24 @@ impl Executor {
             // ================================================================
             "DOC_INSERT" => {
                 // doc_insert(json_text) → document ID
-                require_args(fname, &args, 1)?;
-                let json_text = match &args[0] {
+                // doc_insert(collection, json_text) → document ID
+                //
+                // The two-argument form places the document in a named
+                // collection; the one-argument form uses the default (unnamed)
+                // one, which is where every document written before collections
+                // existed lives. Distinguishing on arity keeps every existing
+                // caller working unchanged.
+                if args.len() != 1 && args.len() != 2 {
+                    return Err(ExecError::Unsupported(
+                        "DOC_INSERT requires (json) or (collection, json)".into(),
+                    ));
+                }
+                let (collection, json_arg) = if args.len() == 2 {
+                    (doc_collection_arg(&args[0], "DOC_INSERT")?, &args[1])
+                } else {
+                    (String::new(), &args[0])
+                };
+                let json_text = match json_arg {
                     Value::Text(s) => s.clone(),
                     Value::Null => return Ok(Value::Null),
                     other => other.to_string(),
@@ -4163,7 +4179,7 @@ impl Executor {
                     let mut store = self.doc_store.write();
                     self.cross_model_before_doc(&store);
                     store.clear_touched();
-                    let id = store.insert(jv);
+                    let id = store.insert_in(&collection, jv);
                     let touched = store.take_touched();
                     drop(store);
                     self.cross_model_after_doc(touched);
@@ -4174,12 +4190,28 @@ impl Executor {
             "DOC_UPDATE" => {
                 // doc_update(id, json_text) → bool. Replaces the document in
                 // place (preserving its id) when it exists; false otherwise.
+                // doc_update(collection, id, json_text) → bool, scoped to a
+                // collection: a document in another one is reported absent, so
+                // one collection can never overwrite another's document.
                 // The document store has no SQL-exposed mutation otherwise —
                 // clients previously (and wrongly) tried `UPDATE documents`,
                 // a relation that does not exist.
-                require_args(fname, &args, 2)?;
-                let id = val_to_u64(&args[0], "DOC_UPDATE id")?;
-                let json_text = match &args[1] {
+                if args.len() != 2 && args.len() != 3 {
+                    return Err(ExecError::Unsupported(
+                        "DOC_UPDATE requires (id, json) or (collection, id, json)".into(),
+                    ));
+                }
+                let (collection, id_arg, json_arg) = if args.len() == 3 {
+                    (
+                        doc_collection_arg(&args[0], "DOC_UPDATE")?,
+                        &args[1],
+                        &args[2],
+                    )
+                } else {
+                    (String::new(), &args[0], &args[1])
+                };
+                let id = val_to_u64(id_arg, "DOC_UPDATE id")?;
+                let json_text = match json_arg {
                     Value::Text(s) => s.clone(),
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
@@ -4187,12 +4219,12 @@ impl Executor {
                 let jv = parse_json_to_doc(&json_text)
                     .map_err(|e| ExecError::Unsupported(format!("DOC_UPDATE invalid JSON: {e}")))?;
                 let mut store = self.doc_store.write();
-                if store.get(id).is_none() {
+                if store.get_in(&collection, id).is_none() {
                     return Ok(Value::Bool(false));
                 }
                 self.cross_model_before_doc(&store);
                 store.clear_touched();
-                store.insert_with_id(id, jv);
+                store.insert_with_id_in(id, &collection, jv);
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_doc(touched);
@@ -4200,12 +4232,22 @@ impl Executor {
             }
             "DOC_DELETE" => {
                 // doc_delete(id) → bool (true if the document existed).
-                require_args(fname, &args, 1)?;
-                let id = val_to_u64(&args[0], "DOC_DELETE id")?;
+                // doc_delete(collection, id) → bool, scoped to a collection.
+                if args.is_empty() || args.len() > 2 {
+                    return Err(ExecError::Unsupported(
+                        "DOC_DELETE requires (id) or (collection, id)".into(),
+                    ));
+                }
+                let (collection, id_arg) = if args.len() == 2 {
+                    (doc_collection_arg(&args[0], "DOC_DELETE")?, &args[1])
+                } else {
+                    (String::new(), &args[0])
+                };
+                let id = val_to_u64(id_arg, "DOC_DELETE id")?;
                 let mut store = self.doc_store.write();
                 self.cross_model_before_doc(&store);
                 store.clear_touched();
-                let removed = store.delete(id);
+                let removed = store.delete_in(&collection, id);
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_doc(touched);
@@ -4213,18 +4255,40 @@ impl Executor {
             }
             "DOC_GET" => {
                 // doc_get(id) → JSON text or NULL
-                require_args(fname, &args, 1)?;
-                let id = val_to_u64(&args[0], "DOC_GET id")?;
+                // doc_get(collection, id) → JSON text or NULL, scoped: a
+                // document in another collection reads as absent.
+                if args.is_empty() || args.len() > 2 {
+                    return Err(ExecError::Unsupported(
+                        "DOC_GET requires (id) or (collection, id)".into(),
+                    ));
+                }
+                let (collection, id_arg) = if args.len() == 2 {
+                    (doc_collection_arg(&args[0], "DOC_GET")?, &args[1])
+                } else {
+                    (String::new(), &args[0])
+                };
+                let id = val_to_u64(id_arg, "DOC_GET id")?;
                 let store = self.doc_store.read();
-                match store.get(id) {
+                match store.get_in(&collection, id) {
                     Some(jv) => Ok(Value::Text(jv.to_json_string())),
                     None => Ok(Value::Null),
                 }
             }
             "DOC_QUERY" => {
                 // doc_query(json_query) → comma-separated IDs of matching docs (@> containment)
-                require_args(fname, &args, 1)?;
-                let json_text = match &args[0] {
+                // doc_query(collection, json_query) → the same, restricted to
+                // one collection.
+                if args.is_empty() || args.len() > 2 {
+                    return Err(ExecError::Unsupported(
+                        "DOC_QUERY requires (json) or (collection, json)".into(),
+                    ));
+                }
+                let (collection, json_arg) = if args.len() == 2 {
+                    (doc_collection_arg(&args[0], "DOC_QUERY")?, &args[1])
+                } else {
+                    (String::new(), &args[0])
+                };
+                let json_text = match json_arg {
                     Value::Text(s) => s.clone(),
                     Value::Null => return Ok(Value::Null),
                     other => other.to_string(),
@@ -4232,20 +4296,41 @@ impl Executor {
                 let query = parse_json_to_doc(&json_text)
                     .map_err(|e| ExecError::Unsupported(format!("DOC_QUERY invalid JSON: {e}")))?;
                 let store = self.doc_store.read();
-                let mut ids = store.query_contains(&query);
+                let mut ids = store.query_contains_in(&collection, &query);
                 ids.sort();
                 let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
                 Ok(Value::Text(id_strs.join(",")))
             }
-            "DOC_PATH" => {
+            "DOC_PATH" | "DOC_PATH_IN" => {
                 // doc_path(id, path_key1, path_key2, ...) → JSON value at path, or NULL
-                if args.len() < 2 {
+                // doc_path_in(collection, id, key1, ...) → the same, scoped.
+                //
+                // A separate NAME rather than the arity overload the other
+                // DOC_* functions use, because the path tail is variadic:
+                // `DOC_PATH('users', 1, 'name')` and `DOC_PATH(1, 'a', 'b')`
+                // have the same shape, and over pgwire an id can arrive as
+                // text, so no rule could tell a collection from an id without
+                // guessing. Guessing wrong would read another collection's
+                // document, which is the whole thing this must not do.
+                let scoped = fname == "DOC_PATH_IN";
+                let min = if scoped { 3 } else { 2 };
+                if args.len() < min {
                     return Err(ExecError::Unsupported(
-                        "DOC_PATH requires (id, key1, key2, ...)".into(),
+                        if scoped {
+                            "DOC_PATH_IN requires (collection, id, key1, key2, ...)"
+                        } else {
+                            "DOC_PATH requires (id, key1, key2, ...)"
+                        }
+                        .into(),
                     ));
                 }
-                let id = val_to_u64(&args[0], "DOC_PATH id")?;
-                let path: Vec<String> = args[1..]
+                let (collection, rest) = if scoped {
+                    (doc_collection_arg(&args[0], "DOC_PATH_IN")?, &args[1..])
+                } else {
+                    (String::new(), &args[..])
+                };
+                let id = val_to_u64(&rest[0], "DOC_PATH id")?;
+                let path: Vec<String> = rest[1..]
                     .iter()
                     .map(|a| match a {
                         Value::Text(s) => s.clone(),
@@ -4254,7 +4339,7 @@ impl Executor {
                     .collect();
                 let path_refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 let store = self.doc_store.read();
-                match store.get(id) {
+                match store.get_in(&collection, id) {
                     Some(doc) => match doc.get_path(&path_refs) {
                         Some(val) => Ok(Value::Text(val.to_json_string())),
                         None => Ok(Value::Null),
@@ -4263,8 +4348,24 @@ impl Executor {
                 }
             }
             "DOC_COUNT" => {
-                // doc_count() → total number of documents
-                let count = self.doc_store.read().len();
+                // doc_count() → documents in the default collection
+                // doc_count(collection) → documents in that collection
+                //
+                // Note the zero-argument form counts the DEFAULT collection,
+                // not every document: a count that silently spanned collections
+                // would report other tenants' rows to a caller that cannot read
+                // them.
+                if args.len() > 1 {
+                    return Err(ExecError::Unsupported(
+                        "DOC_COUNT requires () or (collection)".into(),
+                    ));
+                }
+                let collection = if args.len() == 1 {
+                    doc_collection_arg(&args[0], "DOC_COUNT")?
+                } else {
+                    String::new()
+                };
+                let count = self.doc_store.read().len_in(&collection);
                 Ok(Value::Int64(count as i64))
             }
 

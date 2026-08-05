@@ -854,6 +854,24 @@ pub(super) fn val_to_u64(v: &Value, context: &str) -> Result<u64, ExecError> {
     }
 }
 
+/// Extract a document-store collection name from a `DOC_*` argument.
+///
+/// NULL and the empty string both mean the default (unnamed) collection, so a
+/// caller that passes an unset parameter lands where the collection-less API
+/// has always written rather than in a collection literally named "null".
+/// A non-text value is refused instead of being stringified: silently accepting
+/// `DOC_GET(1, 2)` as collection "1" would route the read somewhere the caller
+/// did not name.
+pub(super) fn doc_collection_arg(v: &Value, context: &str) -> Result<String, ExecError> {
+    match v {
+        Value::Null => Ok(String::new()),
+        Value::Text(s) => Ok(s.clone()),
+        other => Err(ExecError::Unsupported(format!(
+            "{context}: collection must be a string, got {other:?}"
+        ))),
+    }
+}
+
 /// Encode bytes as a lowercase hex string.
 pub(super) fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()

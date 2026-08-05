@@ -40,6 +40,7 @@ mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
 mod test_ddl;
 mod test_dml;
+mod test_doc_collections; // GO-055: `collection` must isolate, not decorate
 mod test_durability_format; // M3: format rejection + full-state recovery
 mod test_e2e_smoke; // End-to-end smoke tests exercising all Nucleus capabilities
 mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filtering

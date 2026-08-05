@@ -462,6 +462,15 @@ pub struct DocumentStore {
     /// Document ids mutated since the last `clear_touched` — the transaction
     /// write-set the executor drains under the same write guard.
     txn_touched: HashSet<u64>,
+    /// Collection each document belongs to, for documents in a NAMED one.
+    ///
+    /// Absence means the default (unnamed) collection, so this map costs
+    /// nothing for a store that never uses collections — which is every store
+    /// that existed before they did. Kept beside the documents rather than
+    /// inside the JSON so a collection can never collide with a user's own key,
+    /// never appear in `@>` containment results, and never come back out of
+    /// `DOC_GET`.
+    collections: HashMap<u64, String>,
 }
 
 impl Default for DocumentStore {
@@ -480,6 +489,7 @@ impl DocumentStore {
             cold: None,
             max_hot_docs: usize::MAX,
             txn_touched: HashSet::new(),
+            collections: HashMap::new(),
         }
     }
 
@@ -518,7 +528,11 @@ impl DocumentStore {
             cold,
             max_hot_docs: 50_000,
             txn_touched: HashSet::new(),
+            collections: HashMap::new(),
         };
+        for (doc_id, coll) in state.collections {
+            store.collections.insert(doc_id, coll);
+        }
         // Restore documents from WAL state.
         for (doc_id, jsonb) in state.docs {
             if let Some(jv) = jsonb_decode(&jsonb) {
@@ -539,13 +553,40 @@ impl DocumentStore {
     /// In disk mode, triggers eviction to the cold tier if the hot tier exceeds
     /// `max_hot_docs`.
     pub fn insert(&mut self, doc: JsonValue) -> u64 {
+        self.insert_in("", doc)
+    }
+
+    /// The collection a document belongs to — `""` for the default one.
+    pub fn collection_of(&self, id: u64) -> &str {
+        self.collections.get(&id).map(String::as_str).unwrap_or("")
+    }
+
+    /// Whether a document is visible to an operation scoped to `collection`.
+    ///
+    /// Scoping is exact: a document belongs to one collection, and an operation
+    /// naming a collection sees only that one. The default collection is not a
+    /// parent of the named ones — otherwise a caller could reach another
+    /// tenant's documents by passing the value the old, collection-less API
+    /// used, which is the isolation this exists to provide.
+    fn in_collection(&self, id: u64, collection: &str) -> bool {
+        self.collection_of(id) == collection
+    }
+
+    /// Insert a document into `collection` and return its assigned ID.
+    ///
+    /// An empty `collection` is the default one, which is where every document
+    /// written through the collection-less API lives.
+    pub fn insert_in(&mut self, collection: &str, doc: JsonValue) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         if let Some(ref wal) = self.wal {
             let bytes = jsonb_encode(&doc);
-            if let Err(e) = wal.log_insert(id, &bytes) {
+            if let Err(e) = wal.log_insert_in(id, collection, &bytes) {
                 eprintln!("document WAL: failed to log insert {id}: {e}");
             }
+        }
+        if !collection.is_empty() {
+            self.collections.insert(id, collection.to_string());
         }
         self.gin.insert(id, &doc);
         self.docs.insert(id, doc);
@@ -559,11 +600,23 @@ impl DocumentStore {
     /// Insert a document with a specific ID. Replaces any existing document
     /// at that ID.
     pub fn insert_with_id(&mut self, id: u64, doc: JsonValue) {
+        let coll = self.collection_of(id).to_string();
+        self.insert_with_id_in(id, &coll, doc);
+    }
+
+    /// [`insert_with_id`](Self::insert_with_id) placing the document in
+    /// `collection`.
+    pub fn insert_with_id_in(&mut self, id: u64, collection: &str, doc: JsonValue) {
         if let Some(ref wal) = self.wal {
             let bytes = jsonb_encode(&doc);
-            if let Err(e) = wal.log_insert(id, &bytes) {
+            if let Err(e) = wal.log_insert_in(id, collection, &bytes) {
                 eprintln!("document WAL: failed to log insert_with_id {id}: {e}");
             }
+        }
+        if collection.is_empty() {
+            self.collections.remove(&id);
+        } else {
+            self.collections.insert(id, collection.to_string());
         }
         if let Some(old) = self.docs.get(&id) {
             self.gin.remove(id, &old.clone());
@@ -581,6 +634,23 @@ impl DocumentStore {
     /// Returns `true` if the document existed and was removed (from hot or
     /// cold tier), `false` if the ID was not found.
     pub fn delete(&mut self, id: u64) -> bool {
+        self.collections.remove(&id);
+        self.delete_inner(id)
+    }
+
+    /// Delete `id` only if it belongs to `collection`.
+    ///
+    /// A document in another collection is reported as absent — the caller must
+    /// not be able to learn that an id exists elsewhere, let alone remove it.
+    pub fn delete_in(&mut self, collection: &str, id: u64) -> bool {
+        if !self.in_collection(id, collection) {
+            return false;
+        }
+        self.collections.remove(&id);
+        self.delete_inner(id)
+    }
+
+    fn delete_inner(&mut self, id: u64) -> bool {
         if let Some(old) = self.docs.remove(&id) {
             if let Some(ref wal) = self.wal
                 && let Err(e) = wal.log_delete(id)
@@ -615,6 +685,14 @@ impl DocumentStore {
     /// For cold-tier fallback with promotion, use [`get_promoting`] which
     /// requires `&mut self`.
     pub fn get(&self, id: u64) -> Option<&JsonValue> {
+        self.docs.get(&id)
+    }
+
+    /// Get a document by ID, only if it belongs to `collection`.
+    pub fn get_in(&self, collection: &str, id: u64) -> Option<&JsonValue> {
+        if !self.in_collection(id, collection) {
+            return None;
+        }
         self.docs.get(&id)
     }
 
@@ -689,6 +767,22 @@ impl DocumentStore {
             .into_iter()
             .filter(|id| self.docs.get(id).is_some_and(|doc| doc.contains(query)))
             .collect()
+    }
+
+    /// [`query_contains`](Self::query_contains) restricted to `collection`.
+    pub fn query_contains_in(&self, collection: &str, query: &JsonValue) -> Vec<u64> {
+        self.query_contains(query)
+            .into_iter()
+            .filter(|&id| self.in_collection(id, collection))
+            .collect()
+    }
+
+    /// Number of documents in `collection`.
+    pub fn len_in(&self, collection: &str) -> usize {
+        self.docs
+            .keys()
+            .filter(|&&id| self.in_collection(id, collection))
+            .count()
     }
 
     /// Query documents using the GIN index alone (no verification pass).
@@ -928,6 +1022,7 @@ impl DocumentStore {
             docs: self.docs.clone(),
             gin: self.gin.clone(),
             next_id: self.next_id,
+            collections: self.collections.clone(),
         }
     }
 
@@ -940,7 +1035,19 @@ impl DocumentStore {
     pub fn txn_restore_scoped(&mut self, snap: &DocTxnSnapshot, touched: &HashSet<u64>) {
         for id in touched {
             match snap.docs.get(id) {
-                Some(doc) => self.insert_with_id(*id, doc.clone()),
+                // Restore the collection the document had before this
+                // transaction, not the one it has now: a rollback that put the
+                // body back but left a moved document in its new collection
+                // would leave it visible to the wrong caller.
+                Some(doc) => {
+                    let coll = snap
+                        .collections
+                        .get(id)
+                        .map(String::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    self.insert_with_id_in(*id, &coll, doc.clone());
+                }
                 None => {
                     self.delete(*id);
                 }
@@ -956,6 +1063,7 @@ impl DocumentStore {
         self.docs = snap.docs;
         self.gin = snap.gin;
         self.next_id = snap.next_id;
+        self.collections = snap.collections;
     }
 
     /// Checkpoint the WAL: write the current hot-tier state as a single
@@ -976,7 +1084,7 @@ impl DocumentStore {
                 .iter()
                 .map(|(id, doc)| (*id, jsonb_encode(doc)))
                 .collect();
-            wal.checkpoint(&docs)?;
+            wal.checkpoint_in(&docs, &self.collections)?;
         }
         Ok(())
     }
@@ -1036,6 +1144,7 @@ pub struct DocTxnSnapshot {
     docs: HashMap<u64, JsonValue>,
     gin: GinIndex,
     next_id: u64,
+    collections: HashMap<u64, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2050,6 +2159,65 @@ mod tests {
         let store2 = DocumentStore::open(dir.path()).unwrap();
         assert_eq!(store2.len(), 1);
         assert_eq!(store2.get(1), Some(&big_doc));
+    }
+
+    /// A collection is part of a document's durable identity, not a runtime
+    /// label. If it were lost on restart every document would fall back into
+    /// the default collection — turning the isolation off at the next reboot,
+    /// silently, with the data still there.
+    #[test]
+    fn collections_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, legacy) = {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            let a = store.insert_in("tenant_a", json_obj(vec![("v", JsonValue::Number(1.0))]));
+            let b = store.insert_in("tenant_b", json_obj(vec![("v", JsonValue::Number(2.0))]));
+            let legacy = store.insert(json_obj(vec![("v", JsonValue::Number(3.0))]));
+            (a, b, legacy)
+        };
+
+        let store = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(store.collection_of(a), "tenant_a");
+        assert_eq!(store.collection_of(b), "tenant_b");
+        assert_eq!(store.collection_of(legacy), "");
+        assert!(store.get_in("tenant_a", a).is_some());
+        assert!(
+            store.get_in("tenant_a", b).is_none(),
+            "isolation did not survive the reopen"
+        );
+        assert_eq!(store.len_in("tenant_a"), 1);
+        assert_eq!(store.len_in(""), 1);
+    }
+
+    /// A checkpoint rewrites the log as a single snapshot. The snapshot has to
+    /// carry collections too, or checkpointing — which happens on its own
+    /// schedule — would quietly erase them.
+    #[test]
+    fn collections_survive_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            let id = store.insert_in("tenant_a", json_obj(vec![("v", JsonValue::Number(1.0))]));
+            store.checkpoint().unwrap();
+            id
+        };
+        let store = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.collection_of(id),
+            "tenant_a",
+            "the checkpoint snapshot dropped the collection"
+        );
+    }
+
+    /// A delete frees the collection entry too — otherwise a later document
+    /// reusing the id would inherit a collection nobody assigned it.
+    #[test]
+    fn deleting_a_document_forgets_its_collection() {
+        let mut store = DocumentStore::new();
+        let id = store.insert_in("tenant_a", json_obj(vec![("v", JsonValue::Number(1.0))]));
+        assert!(store.delete_in("tenant_a", id));
+        assert_eq!(store.collection_of(id), "");
+        assert_eq!(store.len_in("tenant_a"), 0);
     }
 
     #[test]
