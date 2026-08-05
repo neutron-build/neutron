@@ -411,9 +411,11 @@ pub fn backup_data_dir_opts(
             io::ErrorKind::ResourceBusy,
             format!(
                 "{} is open by a running Nucleus instance. A plain directory copy of a live \
-                 database is a TORN snapshot — it may not restore at all. Take the backup \
-                 through the running instance (online backup), stop the instance, or pass the \
-                 explicit in-use override to accept an inconsistent copy.",
+                 database is a TORN snapshot — it may not restore at all. To back up a serving \
+                 database, have the server snapshot itself: connect and run \
+                 `BACKUP DATABASE TO '<path>'` (superuser; destination outside the data \
+                 directory). Otherwise stop the instance, or pass the explicit in-use override \
+                 to accept an inconsistent copy.",
                 data_dir.display()
             ),
         ));

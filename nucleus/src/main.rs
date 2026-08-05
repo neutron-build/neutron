@@ -2578,9 +2578,11 @@ fn backup_online_via_engine(
                 std::io::ErrorKind::ResourceBusy,
                 format!(
                     "{} is open by a running Nucleus instance. A snapshot taken from outside \
-                     that instance would be TORN. Stop the server and re-run, or pass \
-                     --allow-in-use to accept an inconsistent copy (it is recorded as \
-                     inconsistent in the manifest).",
+                     that instance would be TORN. To back up a serving database, have the \
+                     server snapshot itself: connect and run `BACKUP DATABASE TO '<path>'` \
+                     (superuser; destination outside the data directory). Otherwise stop the \
+                     server and re-run, or pass --allow-in-use to accept an inconsistent copy \
+                     (it is recorded as inconsistent in the manifest).",
                     data.display()
                 ),
             ));
