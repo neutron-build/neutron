@@ -456,11 +456,139 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Data-directory writability preflight
+// ---------------------------------------------------------------------------
+
+/// Confirm this process can actually write to the data directory.
+///
+/// Checked by writing and removing a probe file rather than by reading mode
+/// bits: ownership, supplementary groups, ACLs, read-only mounts and
+/// root-squashed NFS all decide the answer, and only an actual write consults
+/// all of them.
+pub fn ensure_data_dir_writable(data_dir: &Path) -> std::io::Result<()> {
+    let probe = data_dir.join(".nucleus-writable-probe");
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe)
+        .map(|_| ());
+    // Remove on success or failure — a probe left behind after a crash must
+    // never be what makes the next start fail.
+    let _ = std::fs::remove_file(&probe);
+    result
+}
+
+/// An operator-facing explanation for a data directory this process cannot
+/// write, naming the exact command that fixes it.
+///
+/// This exists because the failure it describes is otherwise close to
+/// undiagnosable from the outside. The container image has run as uid 10001
+/// since v0.1.2; images up to v0.1.1 ran as root. Upgrading across that
+/// boundary leaves a data directory owned by root that the new process cannot
+/// open, and the engine's response was to panic inside the storage open — exit
+/// 101, no mention of permissions, restarted forever by the orchestrator. The
+/// fix is one `chown`, so the error has to say so.
+pub fn data_dir_permission_help(data_dir: &Path, err: &std::io::Error) -> String {
+    let owner = directory_owner(data_dir);
+    let mut msg = format!(
+        "FATAL: cannot write to the data directory {}: {err}\n",
+        data_dir.display()
+    );
+    if let Some((uid, gid)) = owner {
+        msg.push_str(&format!(
+            "  The directory is owned by uid {uid}, gid {gid}.\n"
+        ));
+    }
+    msg.push_str(
+        "\n\
+         The most common cause is an upgrade across the non-root switch. The Nucleus\n\
+         image has run as uid 10001 since v0.1.2; v0.1.0 and v0.1.1 ran as root, and\n\
+         nothing re-owns an existing data directory on upgrade. The new process then\n\
+         cannot open a directory its predecessor created.\n\
+         \n\
+         Fix it by giving the directory to the user the container runs as:\n\
+         \n\
+         \x20   # host bind-mount\n\
+         \x20   chown -R 10001:10001 <path-on-host>\n\
+         \n\
+         \x20   # docker named volume (--entrypoint, because the image's is `nucleus`)\n\
+         \x20   docker run --rm -u 0 --entrypoint chown -v <volume>:/data \\\n\
+         \x20       ghcr.io/neutron-build/nucleus:latest -R 10001:10001 /data\n\
+         \n\
+         Substitute your own uid:gid if you override the image's user. If you\n\
+         deliberately run as root, pass --user 0:0 instead.\n",
+    );
+    msg
+}
+
+/// Owning uid/gid of a directory, when the platform reports them.
+fn directory_owner(path: &Path) -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).ok()?;
+        Some((md.uid(), md.gid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::executor::ExecError;
     use crate::ops::mode::ServiceMode;
+
+    #[test]
+    fn a_writable_data_dir_passes_and_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_data_dir_writable(tmp.path()).expect("a fresh temp dir must be writable");
+        // The probe must not survive: a leftover file is one more thing to
+        // explain, and on a read-only remount it would be undeletable.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the writability probe left files behind: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn an_unwritable_data_dir_is_detected() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("locked");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+            let err = match ensure_data_dir_writable(&dir) {
+                Err(e) => e,
+                // Running as root, or a filesystem that ignores mode bits —
+                // the check would pass and prove nothing either way.
+                Ok(()) => {
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+                    return;
+                }
+            };
+            let help = data_dir_permission_help(&dir, &err);
+            // The message earns its place only if it names the fix.
+            assert!(help.contains("chown -R 10001:10001"), "{help}");
+            assert!(help.contains("v0.1.2"), "{help}");
+            assert!(help.contains(&dir.display().to_string()), "{help}");
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
 
     /// Probe whose readings the test drives directly.
     #[derive(Debug)]

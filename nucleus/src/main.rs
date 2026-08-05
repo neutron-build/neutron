@@ -748,8 +748,28 @@ async fn cmd_start(cfg: StartConfig) {
     } else {
         // Ensure data directory exists
         if !data.exists() {
-            std::fs::create_dir_all(&data).expect("failed to create data directory");
+            if let Err(e) = std::fs::create_dir_all(&data) {
+                eprintln!(
+                    "{}",
+                    nucleus::ops::disk::data_dir_permission_help(&data, &e)
+                );
+                std::process::exit(1);
+            }
             tracing::info!("Created data directory: {}", data.display());
+        }
+
+        // Confirm we can write here BEFORE opening anything. Without this the
+        // first failure was a panic inside the storage open — exit 101 with no
+        // mention of permissions, which an orchestrator turns into a silent
+        // restart loop. The common cause is an upgrade from an image that ran
+        // as root (v0.1.1 and earlier) to one that runs as uid 10001 (v0.1.2+)
+        // over a data directory nothing re-owned.
+        if let Err(e) = nucleus::ops::disk::ensure_data_dir_writable(&data) {
+            eprintln!(
+                "{}",
+                nucleus::ops::disk::data_dir_permission_help(&data, &e)
+            );
+            std::process::exit(1);
         }
 
         // Announce that this directory is live. `nucleus backup` observes this

@@ -7,6 +7,26 @@ Notable changes to the Nucleus engine. Format follows
 
 ### Fixed
 
+- **An upgrade from a pre-v0.1.2 container image crash-looped instead of
+  saying why.** The image has run as uid 10001 since v0.1.2 (the M12 hardening
+  pass); v0.1.0 and v0.1.1 ran as root. Nothing re-owns an existing data
+  directory on upgrade, so the new process could not open a directory its
+  predecessor created. The `chown` in the Dockerfile runs at BUILD time and
+  therefore only covers a volume that is still empty on first use.
+
+  The failure surfaced as a panic inside the storage open — exit 101, with no
+  mention of permissions — which an orchestrator turns into an endless restart
+  loop. Startup now checks that the data directory is writable *before* opening
+  anything and exits 1 with the exact `chown` command for both a bind-mount and
+  a named volume.
+
+  **This was never announced.** It is a breaking operational change that
+  shipped in v0.1.2 with no note in this changelog and none in the upgrade
+  runbook, which is where an operator looks before upgrading. Both now carry
+  it. Any deployment still on v0.1.1 or earlier needs the `chown` at upgrade
+  time; a deployment whose data directory happened to be recreated escaped it
+  by luck, not design.
+
 - **A crash mid-COMMIT could leave a transaction durable in part.** On the
   paged engine, a transaction that dirties more pages than the buffer pool
   holds pushes its own uncommitted pages into the data file as the pool steals

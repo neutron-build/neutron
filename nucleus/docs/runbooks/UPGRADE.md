@@ -30,6 +30,41 @@ So:
 Read the release notes for the target version. If they do not state the
 `format_version`, assume it changed and take the logical dump.
 
+## 1a. Container images: check who owns the data directory
+
+**Applies to every upgrade crossing v0.1.1 → v0.1.2 or later.** Skip only if
+you already run v0.1.2+.
+
+The image runs as **uid 10001** from v0.1.2 onward. v0.1.0 and v0.1.1 ran as
+root. Nothing re-owns the data directory on upgrade, and the `chown` in the
+Dockerfile happens at build time — it covers a named volume only while that
+volume is still empty. So a directory written by the old image is owned by
+root, and the new process cannot open it.
+
+Left unhandled this is a restart loop, not a clean failure: before this was
+caught the engine panicked inside the storage open (exit 101, no mention of
+permissions) and the orchestrator restarted it forever. Current builds refuse
+to start with the fix printed, but the work below is still yours to do.
+
+```bash
+# Host bind-mount: re-own before starting the new image.
+chown -R 10001:10001 /var/lib/nucleus
+
+# Docker named volume: --entrypoint, because the image's entrypoint is `nucleus`.
+docker run --rm -u 0 --entrypoint chown -v nucleus-data:/data \
+    ghcr.io/neutron-build/nucleus:latest -R 10001:10001 /data
+
+# Confirm.
+docker run --rm -v nucleus-data:/data ghcr.io/neutron-build/nucleus:latest \
+    status --host 127.0.0.1:5432 || true
+```
+
+On Kubernetes, `deploy/k3s/nucleus.yaml` already sets `runAsUser: 10001` and
+`fsGroup: 10001`; `fsGroup` re-owns the volume for you on most CSI drivers, but
+it does **not** apply to a `hostPath` volume — chown those by hand.
+
+Substitute your own uid:gid if you override the image's user.
+
 ## 2. Pre-flight
 
 ```bash
