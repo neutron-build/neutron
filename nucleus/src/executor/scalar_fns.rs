@@ -2088,6 +2088,19 @@ impl Executor {
 
             // -- PostgreSQL system/catalog functions --
             "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),
+            // asyncpg runs `SELECT pg_advisory_unlock_all()` as part of the
+            // reset it issues when a connection goes back to the pool. Without
+            // this, RELEASING a pooled connection raised — so every Python
+            // client using a pool (the default) broke on the second query, not
+            // the first, which is a confusing place to discover it.
+            //
+            // Returning true is honest rather than a stub: Nucleus has no
+            // advisory locks at all — `pg_advisory_lock` does not exist, so a
+            // session cannot be holding one — and the function's guarantee is
+            // "this session now holds no advisory locks", which is true of all
+            // zero of them. If advisory locks are ever implemented, this must
+            // release them instead of reporting success.
+            "PG_ADVISORY_UNLOCK_ALL" => Ok(Value::Bool(true)),
             "CURRENT_SETTING" => {
                 // current_setting(name [, missing_ok]) — session overrides
                 // first, then the same static defaults SHOW reports. Prisma's
@@ -6211,6 +6224,17 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         "FTS_DOC_COUNT" | "FTS_TERM_COUNT" => DataType::Int64,
         "FTS_MATCH" => DataType::Bool,
         "BM25" => DataType::Float64,
+        // Document reads, for the same reason as the FTS entries above and
+        // found the same way — by running a real client against a real server.
+        // A probe of `SELECT DOC_GET($1)` fails inside the function (an
+        // unbound placeholder is not an id), so Describe reported ZERO columns
+        // while Execute returned one. asyncpg enforces that strictly, so every
+        // document read from the Python client raised
+        // "the number of columns in the result row (1) is different from what
+        // was described (0)" — meaning `Document.get`/`get_path` had never
+        // worked over pgwire from Python at all.
+        "DOC_GET" | "DOC_PATH" | "DOC_PATH_IN" | "DOC_QUERY" => DataType::Text,
+        "DOC_COUNT" => DataType::Int64,
         _ => return None,
     };
     Some(dt)
