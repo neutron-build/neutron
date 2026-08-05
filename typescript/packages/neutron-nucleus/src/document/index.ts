@@ -29,6 +29,13 @@ export interface DocFindOptions {
 export interface DocumentModel {
   /** Insert a document. Returns the generated document ID. */
   insert(collection: string, doc: Record<string, unknown>): Promise<number>;
+  /** Get a document by id from a specific collection (absent if it belongs to another). */
+  getIn(collection: string, id: number): Promise<Record<string, unknown> | null>;
+  getTypedIn<T>(collection: string, id: number): Promise<T | null>;
+  /** Query one collection; matches in others are not returned. */
+  queryDocsIn(collection: string, filter: Record<string, unknown>): Promise<number[]>;
+  pathIn(collection: string, id: number, ...keys: string[]): Promise<string | null>;
+  countIn(collection: string): Promise<number>;
 
   /** Get a document by ID. Returns `null` if not found. */
   get(id: number): Promise<Record<string, unknown> | null>;
@@ -75,30 +82,76 @@ class DocumentModelImpl implements DocumentModel {
     requireNucleus(this.features, 'Document');
   }
 
-  async insert(_collection: string, doc: Record<string, unknown>): Promise<number> {
+  /**
+   * Render a document id the way the engine expects it over pgwire.
+   *
+   * Nucleus reports a parameter whose type it cannot infer as TEXT, and a
+   * driver then refuses to bind a number to it. The engine parses a
+   * text-encoded integer id for exactly this reason, so sending the digits is
+   * the supported encoding, not a workaround.
+   */
+  private static id(id: number): string {
+    return String(id);
+  }
+
+  async insert(collection: string, doc: Record<string, unknown>): Promise<number> {
     this.require();
     const data = JSON.stringify(doc);
-    return (await this.transport.fetchval<number>('SELECT DOC_INSERT($1)', [data])) ?? 0;
+    // The one-argument form when no collection is named, so this still works
+    // against a server that predates collections.
+    const [sql, args] = collection
+      ? ['SELECT DOC_INSERT($1, $2)', [collection, data]]
+      : ['SELECT DOC_INSERT($1)', [data]];
+    return (await this.transport.fetchval<number>(sql, args)) ?? 0;
+  }
+
+  /** Fetch a document's JSON text, scoped to a collection. */
+  private async rawDoc(collection: string, id: number): Promise<string | null> {
+    const [sql, args] = collection
+      ? ['SELECT DOC_GET($1, $2)', [collection, DocumentModelImpl.id(id)]]
+      : ['SELECT DOC_GET($1)', [DocumentModelImpl.id(id)]];
+    return this.transport.fetchval<string>(sql, args);
   }
 
   async get(id: number): Promise<Record<string, unknown> | null> {
+    return this.getIn('', id);
+  }
+
+  /**
+   * Get a document by id from a specific collection. A document in another
+   * collection reads as absent — holding an id is not enough to read across a
+   * collection boundary.
+   */
+  async getIn(collection: string, id: number): Promise<Record<string, unknown> | null> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT DOC_GET($1)', [id]);
+    const raw = await this.rawDoc(collection, id);
     if (raw === null) return null;
     return JSON.parse(raw) as Record<string, unknown>;
   }
 
   async getTyped<T>(id: number): Promise<T | null> {
+    return this.getTypedIn<T>('', id);
+  }
+
+  async getTypedIn<T>(collection: string, id: number): Promise<T | null> {
     this.require();
-    const raw = await this.transport.fetchval<string>('SELECT DOC_GET($1)', [id]);
+    const raw = await this.rawDoc(collection, id);
     if (raw === null) return null;
     return JSON.parse(raw) as T;
   }
 
   async queryDocs(filter: Record<string, unknown>): Promise<number[]> {
+    return this.queryDocsIn('', filter);
+  }
+
+  /** Query one collection. Matches in other collections are not returned. */
+  async queryDocsIn(collection: string, filter: Record<string, unknown>): Promise<number[]> {
     this.require();
     const q = JSON.stringify(filter);
-    const raw = await this.transport.fetchval<string>('SELECT DOC_QUERY($1)', [q]);
+    const [sql, args] = collection
+      ? ['SELECT DOC_QUERY($1, $2)', [collection, q]]
+      : ['SELECT DOC_QUERY($1)', [q]];
+    const raw = await this.transport.fetchval<string>(sql, args);
     if (!raw) return [];
     return raw
       .split(',')
@@ -109,15 +162,45 @@ class DocumentModelImpl implements DocumentModel {
   }
 
   async path(id: number, ...keys: string[]): Promise<string | null> {
+    return this.pathIn('', id, ...keys);
+  }
+
+  /**
+   * Extract a nested value from a document in a specific collection.
+   *
+   * The scoped form is a distinct FUNCTION rather than an extra argument: the
+   * key tail is variadic, so a leading collection could not be told apart from
+   * a leading id.
+   */
+  async pathIn(collection: string, id: number, ...keys: string[]): Promise<string | null> {
     this.require();
-    const placeholders = keys.map((_, i) => `$${i + 2}`).join(', ');
-    const sql = `SELECT DOC_PATH($1, ${placeholders})`;
-    return this.transport.fetchval<string>(sql, [id, ...keys]);
+    if (keys.length === 0) {
+      // Sending this built `DOC_PATH($1, )` — a malformed statement whose
+      // error named nothing useful.
+      throw new Error('document path requires at least one key');
+    }
+    const base = collection ? 3 : 2;
+    const placeholders = keys.map((_, i) => `$${i + base}`).join(', ');
+    const head = collection ? '$1, $2' : '$1';
+    const fn = collection ? 'DOC_PATH_IN' : 'DOC_PATH';
+    const sql = `SELECT ${fn}(${head}, ${placeholders})`;
+    const args = collection
+      ? [collection, DocumentModelImpl.id(id), ...keys]
+      : [DocumentModelImpl.id(id), ...keys];
+    return this.transport.fetchval<string>(sql, args);
   }
 
   async count(): Promise<number> {
+    return this.countIn('');
+  }
+
+  /** Number of documents in a specific collection. */
+  async countIn(collection: string): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT DOC_COUNT()')) ?? 0;
+    const [sql, args] = collection
+      ? ['SELECT DOC_COUNT($1)', [collection]]
+      : ['SELECT DOC_COUNT()', []];
+    return (await this.transport.fetchval<number>(sql, args)) ?? 0;
   }
 
   async find(
@@ -125,11 +208,11 @@ class DocumentModelImpl implements DocumentModel {
     filter: Record<string, unknown>,
     opts: DocFindOptions = {},
   ): Promise<Record<string, unknown>[]> {
-    const ids = await this.queryDocs(filter);
+    const ids = await this.queryDocsIn(collection, filter);
     let results: Record<string, unknown>[] = [];
 
     for (const id of ids) {
-      const doc = await this.get(id);
+      const doc = await this.getIn(collection, id);
       if (doc) results.push(doc);
     }
 
@@ -174,11 +257,11 @@ class DocumentModelImpl implements DocumentModel {
     filter: Record<string, unknown>,
     opts: DocFindOptions = {},
   ): Promise<T[]> {
-    const ids = await this.queryDocs(filter);
+    const ids = await this.queryDocsIn(collection, filter);
     let results: T[] = [];
 
     for (const id of ids) {
-      const item = await this.getTyped<T>(id);
+      const item = await this.getTypedIn<T>(collection, id);
       if (item !== null) results.push(item);
     }
 
@@ -202,18 +285,21 @@ class DocumentModelImpl implements DocumentModel {
     update: Record<string, unknown>,
   ): Promise<number> {
     this.require();
-    const ids = await this.queryDocs(filter);
+    const ids = await this.queryDocsIn(collection, filter);
     let count = 0;
 
     for (const id of ids) {
-      const doc = await this.get(id);
+      const doc = await this.getIn(collection, id);
       if (!doc) continue;
       Object.assign(doc, update);
       const data = JSON.stringify(doc);
       // DOC_UPDATE replaces the document in place (preserving id). The old
       // `UPDATE documents ...` targeted a relation that does not exist — the
       // document store is a specialty store reached only via DOC_* functions.
-      const ok = await this.transport.fetchval<boolean>('SELECT DOC_UPDATE($1, $2)', [id, data]);
+      const [sql, args] = collection
+        ? ['SELECT DOC_UPDATE($1, $2, $3)', [collection, DocumentModelImpl.id(id), data]]
+        : ['SELECT DOC_UPDATE($1, $2)', [DocumentModelImpl.id(id), data]];
+      const ok = await this.transport.fetchval<boolean>(sql, args);
       if (ok) count++;
     }
 
@@ -222,12 +308,15 @@ class DocumentModelImpl implements DocumentModel {
 
   async delete(collection: string, filter: Record<string, unknown>): Promise<number> {
     this.require();
-    const ids = await this.queryDocs(filter);
+    const ids = await this.queryDocsIn(collection, filter);
     let count = 0;
 
     for (const id of ids) {
       // DOC_DELETE, not `DELETE FROM documents` (no such relation).
-      const ok = await this.transport.fetchval<boolean>('SELECT DOC_DELETE($1)', [id]);
+      const [sql, args] = collection
+        ? ['SELECT DOC_DELETE($1, $2)', [collection, DocumentModelImpl.id(id)]]
+        : ['SELECT DOC_DELETE($1)', [DocumentModelImpl.id(id)]];
+      const ok = await this.transport.fetchval<boolean>(sql, args);
       if (ok) count++;
     }
 

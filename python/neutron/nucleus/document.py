@@ -13,6 +13,17 @@ from neutron.nucleus.client import Features
 T = TypeVar("T", bound=BaseModel)
 
 
+def _doc_id(doc_id: int) -> str:
+    """Render a document id the way the engine expects it over pgwire.
+
+    Nucleus reports a parameter whose type it cannot infer as TEXT, and a
+    driver then refuses to bind an integer to it. The engine parses a
+    text-encoded integer id for exactly this reason, so sending the digits is
+    the supported encoding, not a workaround.
+    """
+    return str(doc_id)
+
+
 def _parse_ids(raw: str | None) -> list[int]:
     """Robustly parse a comma-separated list of integer IDs."""
     if not raw:
@@ -35,6 +46,20 @@ class DocumentModel:
 
         doc_id = await db.document.insert("users", {"name": "Alice", "age": 30})
         doc = await db.document.find_one("users", {"name": "Alice"})
+
+    Collections are enforced by the ENGINE. This client used to implement them
+    itself, by writing a reserved ``_collection`` key into the document and
+    filtering on it — which collided with any user field of that name, leaked
+    the key back out of ``get``, and left ``get``/``count`` unscoped so they
+    reported across every collection. It also disagreed with the other SDKs
+    about what a collection is: a document written here was invisible to a Go
+    or TypeScript caller naming the same collection.
+
+    **Migration:** documents written by an older version of this client carry
+    ``_collection`` in their body and live in the engine's default collection.
+    They are not visible to ``find("<name>", ...)`` after this change. Re-insert
+    them under the collection they belong to, or read them back with the
+    default collection and the key still present.
     """
 
     def __init__(self, executor: Executor, features: Features) -> None:
@@ -47,17 +72,36 @@ class DocumentModel:
     async def insert(
         self, collection: str, doc: dict[str, Any] | BaseModel
     ) -> str:
-        """Insert a document, return its ID."""
+        """Insert a document into ``collection``, return its ID."""
         self._require()
         if isinstance(doc, BaseModel):
             doc_json = doc.model_dump_json()
         else:
             doc_json = json.dumps(doc)
 
-        # Wrap with collection metadata
-        wrapped = json.dumps({"_collection": collection, **json.loads(doc_json)})
-        doc_id = await self._exec.fetchval("SELECT DOC_INSERT($1)", wrapped)
+        # The one-argument form when no collection is named, so this still
+        # works against a server that predates collections.
+        if collection:
+            doc_id = await self._exec.fetchval(
+                "SELECT DOC_INSERT($1, $2)", collection, doc_json
+            )
+        else:
+            doc_id = await self._exec.fetchval("SELECT DOC_INSERT($1)", doc_json)
         return str(doc_id)
+
+    async def _raw_doc(self, collection: str, doc_id: int) -> str | None:
+        """Fetch a document's JSON text, scoped to a collection."""
+        if collection:
+            return cast(
+                "str | None",
+                await self._exec.fetchval(
+                    "SELECT DOC_GET($1, $2)", collection, _doc_id(doc_id)
+                ),
+            )
+        return cast(
+            "str | None",
+            await self._exec.fetchval("SELECT DOC_GET($1)", _doc_id(doc_id)),
+        )
 
     async def _find_with_ids(
         self,
@@ -68,18 +112,21 @@ class DocumentModel:
         skip: int = 0,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Return (id, doc) pairs for documents matching the filter."""
-        query = json.dumps({"_collection": collection, **filter})
-        raw = await self._exec.fetchval("SELECT DOC_QUERY($1)", query)
+        query = json.dumps(filter)
+        if collection:
+            raw = await self._exec.fetchval(
+                "SELECT DOC_QUERY($1, $2)", collection, query
+            )
+        else:
+            raw = await self._exec.fetchval("SELECT DOC_QUERY($1)", query)
         ids = _parse_ids(raw)
         ids = ids[skip : skip + limit]
 
         results: list[tuple[int, dict[str, Any]]] = []
         for doc_id in ids:
-            doc_json = await self._exec.fetchval("SELECT DOC_GET($1)", doc_id)
+            doc_json = await self._raw_doc(collection, doc_id)
             if doc_json is not None:
-                doc = json.loads(doc_json)
-                doc.pop("_collection", None)
-                results.append((doc_id, doc))
+                results.append((doc_id, json.loads(doc_json)))
         return results
 
     async def find_one(
@@ -127,24 +174,61 @@ class DocumentModel:
         return [model.model_validate(d) for d in docs]
 
     async def get(self, doc_id: int) -> dict[str, Any] | None:
-        """Get a document by ID."""
+        """Get a document by ID from the default collection."""
+        return await self.get_in("", doc_id)
+
+    async def get_in(self, collection: str, doc_id: int) -> dict[str, Any] | None:
+        """Get a document by ID from ``collection``.
+
+        A document in another collection reads as absent — holding an id is not
+        enough to read across a collection boundary.
+        """
         self._require()
-        raw = await self._exec.fetchval("SELECT DOC_GET($1)", doc_id)
+        raw = await self._raw_doc(collection, doc_id)
         if raw is None:
             return None
         return cast("dict[str, Any] | None", json.loads(raw))
 
     async def get_path(self, doc_id: int, *keys: str) -> Any:
-        """Extract a value at a nested path from a document."""
+        """Extract a value at a nested path from a default-collection document."""
+        return await self.get_path_in("", doc_id, *keys)
+
+    async def get_path_in(self, collection: str, doc_id: int, *keys: str) -> Any:
+        """Extract a value at a nested path from a document in ``collection``.
+
+        The scoped form is a distinct FUNCTION rather than an extra argument:
+        the key tail is variadic, so a leading collection could not be told
+        apart from a leading id.
+        """
         self._require()
-        placeholders = ", ".join(f"${i + 2}" for i in range(len(keys)))
+        if not keys:
+            # Sending this built `DOC_PATH($1, )` — a malformed statement whose
+            # error named nothing useful.
+            raise ValueError("document path requires at least one key")
+        base = 3 if collection else 2
+        placeholders = ", ".join(f"${i + base}" for i in range(len(keys)))
+        if collection:
+            return await self._exec.fetchval(
+                f"SELECT DOC_PATH_IN($1, $2, {placeholders})",
+                collection,
+                _doc_id(doc_id),
+                *keys,
+            )
         return await self._exec.fetchval(
-            f"SELECT DOC_PATH($1, {placeholders})", doc_id, *keys
+            f"SELECT DOC_PATH($1, {placeholders})", _doc_id(doc_id), *keys
         )
 
     async def count(self) -> int:
-        """Count all documents."""
+        """Count documents in the default collection."""
+        return await self.count_in("")
+
+    async def count_in(self, collection: str) -> int:
+        """Count documents in ``collection``."""
         self._require()
+        if collection:
+            return cast(
+                "int", await self._exec.fetchval("SELECT DOC_COUNT($1)", collection)
+            )
         return cast("int", await self._exec.fetchval("SELECT DOC_COUNT()"))
 
     async def update(
@@ -157,10 +241,18 @@ class DocumentModel:
         for doc_id, existing_doc in pairs:
             # Partial update: merge only the provided fields
             merged = {**existing_doc, **update}
-            merged["_collection"] = collection
-            ok = await self._exec.fetchval(
-                "SELECT DOC_UPDATE($1, $2)", doc_id, json.dumps(merged)
-            )
+            body = json.dumps(merged)
+            if collection:
+                ok = await self._exec.fetchval(
+                    "SELECT DOC_UPDATE($1, $2, $3)",
+                    collection,
+                    _doc_id(doc_id),
+                    body,
+                )
+            else:
+                ok = await self._exec.fetchval(
+                    "SELECT DOC_UPDATE($1, $2)", _doc_id(doc_id), body
+                )
             if ok:
                 count += 1
         return count
@@ -170,12 +262,24 @@ class DocumentModel:
     ) -> int:
         """Delete matching documents. Returns count of deleted docs."""
         self._require()
-        query = json.dumps({"_collection": collection, **filter})
-        raw = await self._exec.fetchval("SELECT DOC_QUERY($1)", query)
+        query = json.dumps(filter)
+        if collection:
+            raw = await self._exec.fetchval(
+                "SELECT DOC_QUERY($1, $2)", collection, query
+            )
+        else:
+            raw = await self._exec.fetchval("SELECT DOC_QUERY($1)", query)
         ids = _parse_ids(raw)
         deleted = 0
         for doc_id in ids:
-            ok = await self._exec.fetchval("SELECT DOC_DELETE($1)", doc_id)
+            if collection:
+                ok = await self._exec.fetchval(
+                    "SELECT DOC_DELETE($1, $2)", collection, _doc_id(doc_id)
+                )
+            else:
+                ok = await self._exec.fetchval(
+                    "SELECT DOC_DELETE($1)", _doc_id(doc_id)
+                )
             if ok:
                 deleted += 1
         return deleted

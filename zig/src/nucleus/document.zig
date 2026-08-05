@@ -51,6 +51,70 @@ pub const DocumentModel = struct {
         return std.fmt.bufPrint(buf, "SELECT DOC_COUNT()", .{}) catch return error.BufferTooShort;
     }
 
+    // ── Collections ──────────────────────────────────────────────
+    //
+    // A document belongs to exactly one collection, and an operation naming a
+    // collection sees only that one — a document elsewhere reads as absent
+    // rather than erroring, so an id cannot probe across the boundary. The
+    // collection-less builders above address the default (unnamed) collection,
+    // which is where every document written before collections existed lives.
+    //
+    // These builders interpolate rather than bind, like the rest of this file,
+    // so a collection name carrying a quote would change the statement's
+    // meaning. Such a name is refused instead of escaped: Nucleus collection
+    // names are identifiers, and refusing is the behaviour that cannot be
+    // subtly wrong.
+
+    pub fn validateCollection(collection: []const u8) !void {
+        for (collection) |c| {
+            if (c == '\'' or c == '\\' or c == 0) return error.InvalidCollectionName;
+        }
+    }
+
+    pub fn insertInSql(collection: []const u8, json: []const u8, buf: []u8) ![]const u8 {
+        try validateCollection(collection);
+        return std.fmt.bufPrint(buf, "SELECT DOC_INSERT('{s}', '{s}')", .{ collection, json }) catch return error.BufferTooShort;
+    }
+
+    pub fn getInSql(collection: []const u8, id: u64, buf: []u8) ![]const u8 {
+        try validateCollection(collection);
+        return std.fmt.bufPrint(buf, "SELECT DOC_GET('{s}', {d})", .{ collection, id }) catch return error.BufferTooShort;
+    }
+
+    pub fn updateInSql(collection: []const u8, id: u64, json: []const u8, buf: []u8) ![]const u8 {
+        try validateCollection(collection);
+        return std.fmt.bufPrint(buf, "SELECT DOC_UPDATE('{s}', {d}, '{s}')", .{ collection, id, json }) catch return error.BufferTooShort;
+    }
+
+    pub fn deleteInSql(collection: []const u8, id: u64, buf: []u8) ![]const u8 {
+        try validateCollection(collection);
+        return std.fmt.bufPrint(buf, "SELECT DOC_DELETE('{s}', {d})", .{ collection, id }) catch return error.BufferTooShort;
+    }
+
+    pub fn queryInSql(collection: []const u8, json_query: []const u8, buf: []u8) ![]const u8 {
+        try validateCollection(collection);
+        return std.fmt.bufPrint(buf, "SELECT DOC_QUERY('{s}', '{s}')", .{ collection, json_query }) catch return error.BufferTooShort;
+    }
+
+    /// A distinct FUNCTION rather than an extra argument: the key tail is
+    /// variadic, so a leading collection could not be told apart from an id.
+    pub fn pathInSql(collection: []const u8, id: u64, keys: []const []const u8, buf: []u8) ![]const u8 {
+        try validateCollection(collection);
+        var stream = std.io.fixedBufferStream(buf);
+        const writer = stream.writer();
+        writer.print("SELECT DOC_PATH_IN('{s}', {d}", .{ collection, id }) catch return error.BufferTooShort;
+        for (keys) |key| {
+            writer.print(", '{s}'", .{key}) catch return error.BufferTooShort;
+        }
+        writer.writeAll(")") catch return error.BufferTooShort;
+        return stream.getWritten();
+    }
+
+    pub fn countInSql(collection: []const u8, buf: []u8) ![]const u8 {
+        try validateCollection(collection);
+        return std.fmt.bufPrint(buf, "SELECT DOC_COUNT('{s}')", .{collection}) catch return error.BufferTooShort;
+    }
+
     // ── Execution methods ────────────────────────────────────────
 
     pub fn docInsert(self: DocumentModel, json: []const u8) !?[]const u8 {
@@ -80,6 +144,38 @@ pub const DocumentModel = struct {
     pub fn docQuery(self: DocumentModel, json_query: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try querySql(json_query, &buf);
+        return try self.client.execute(sql);
+    }
+
+    // ── Collection-scoped execution ──────────────────────────────
+
+    pub fn docInsertIn(self: DocumentModel, collection: []const u8, json: []const u8) !?[]const u8 {
+        var buf: [4096]u8 = undefined;
+        const sql = try insertInSql(collection, json, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn getIn(self: DocumentModel, collection: []const u8, id: u64) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try getInSql(collection, id, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn updateIn(self: DocumentModel, collection: []const u8, id: u64, json: []const u8) !?[]const u8 {
+        var buf: [4096]u8 = undefined;
+        const sql = try updateInSql(collection, id, json, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn deleteIn(self: DocumentModel, collection: []const u8, id: u64) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try deleteInSql(collection, id, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn docQueryIn(self: DocumentModel, collection: []const u8, json_query: []const u8) !?[]const u8 {
+        var buf: [4096]u8 = undefined;
+        const sql = try queryInSql(collection, json_query, &buf);
         return try self.client.execute(sql);
     }
 
