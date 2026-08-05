@@ -255,6 +255,16 @@ fn set_next_page(pg: &mut PageBuf, next: u32) {
 // resolved a position before awaiting therefore use `update_if_unchanged` /
 // `delete_if_unchanged`, which re-check the tuple's identity at write time.
 
+/// One unit of deferred index maintenance: an entry to unindex, or one to
+/// index, naming the tuple address it points at.
+///
+/// Deferred because `indexes` (L3) is never taken under a frame latch (L6).
+/// Applied in batches by [`DiskEngine::index_apply_ops`].
+enum IndexOp {
+    Remove(u32, u16, Row),
+    Add(u32, u16, Row),
+}
+
 /// Bits of a packed position reserved for the slot index (`slot_idx: u16`).
 const POS_SLOT_BITS: u32 = 16;
 const POS_SLOT_MASK: usize = (1 << POS_SLOT_BITS) - 1;
@@ -1593,11 +1603,10 @@ impl DiskEngine {
 
         // Deferred index maintenance, same rule as `delete_at`: `indexes` (L3)
         // is never taken under a frame latch (L6). An entry here is either the
-        // old row to unindex, the new row to index, or both.
-        enum IndexOp {
-            Remove(u32, u16, Row),
-            Add(u32, u16, Row),
-        }
+        // old row to unindex, the new row to index, or both. See
+        // [`DiskEngine::index_apply_ops`] for why the batch is applied under a
+        // single lock acquisition rather than one op at a time.
+        //
         // Rows that outgrew their page and must be placed elsewhere. Deferred
         // for the same reason: `insert_sync` fetches other pages, and rule (A)
         // forbids fetching a page while latched.
@@ -1679,14 +1688,7 @@ impl DiskEngine {
                     index_ops.push(IndexOp::Add(new_page_id, new_slot_idx, new_row));
                 }
             }
-            for op in index_ops.drain(..) {
-                match op {
-                    IndexOp::Remove(pid, slot, row) => self.index_delete(table, pid, slot, &row),
-                    IndexOp::Add(pid, slot, row) => {
-                        self.index_insert(table, pid, slot, &row)?;
-                    }
-                }
-            }
+            self.index_apply_ops(table, &mut index_ops)?;
         }
 
         Ok(count)
@@ -3339,6 +3341,71 @@ impl DiskEngine {
 
     /// Maintain indexes after an insert — called with the page and slot where the
     /// row was inserted, plus the row data.
+    /// Apply a batch of deferred index operations under ONE `indexes`
+    /// acquisition, draining the batch.
+    ///
+    /// The single acquisition is the point. An update contributes a
+    /// `Remove(old)` + `Add(new)` pair for the same tuple, and taking the lock
+    /// per operation lets two updaters of one row interleave as
+    /// Remove/Remove/Add/Add — the second Remove finds the entry already gone
+    /// and no-ops, then both Adds land, leaving two index entries for a single
+    /// heap row. Every `WHERE key = ?` lookup then returns that row twice and
+    /// `count(*)` doubles it, until a restart rebuilds the index. Holding the
+    /// lock across the pair makes each updater's maintenance atomic with
+    /// respect to the others, so the final entry count matches the heap.
+    ///
+    /// This orders index maintenance consistently, but it does not tie it to
+    /// the page mutation itself — that would need `indexes` under a frame
+    /// latch, which the lock hierarchy forbids. When two updaters change an
+    /// *indexed* column, the pairs can still apply in the opposite order to
+    /// the page writes and strand a stale entry for the superseded key. That
+    /// entry names a row whose key no longer matches, and the lookup path
+    /// rechecks the key against the fetched row, so it yields no rows rather
+    /// than a wrong one.
+    fn index_apply_ops(&self, table: &str, ops: &mut Vec<IndexOp>) -> Result<(), StorageError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        // Benchmark attribution only — see `crate::bench_hooks`.
+        let skip_insert = crate::bench_hooks::skip_index_insert();
+        let skip_delete = crate::bench_hooks::skip_index_delete();
+
+        let mut indexes = self.indexes.write();
+        for op in ops.drain(..) {
+            match op {
+                IndexOp::Remove(page_id, slot_idx, row) => {
+                    if skip_delete {
+                        continue;
+                    }
+                    for (idx_name, idx) in indexes.iter() {
+                        if idx.table == table && idx.col_idx < row.len() {
+                            let key = serialize_index_key(&row[idx.col_idx]);
+                            let rid = RowId { page_id, slot_idx };
+                            if let Err(e) = idx.btree.delete(&key, rid) {
+                                tracing::error!("Index delete failed for {idx_name}: {e}");
+                            }
+                        }
+                    }
+                }
+                IndexOp::Add(page_id, slot_idx, row) => {
+                    if skip_insert {
+                        continue;
+                    }
+                    for (idx_name, idx) in indexes.iter_mut() {
+                        if idx.table == table && idx.col_idx < row.len() {
+                            let key = serialize_index_key(&row[idx.col_idx]);
+                            let rid = RowId { page_id, slot_idx };
+                            idx.btree.insert(&key, rid).map_err(|e| {
+                                StorageError::Io(format!("Index insert failed for {idx_name}: {e}"))
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn index_insert(
         &self,
         table: &str,
@@ -3839,6 +3906,75 @@ mod tests {
         assert_eq!(rows[0], simple_row(0, "original_0"));
         assert_eq!(rows[1], simple_row(99, "updated"));
         assert_eq!(rows[2], simple_row(2, "original_2"));
+    }
+
+    /// Two sessions updating the same row must not leave two index entries
+    /// pointing at it.
+    ///
+    /// `update_at` defers index maintenance until after the frame latch drops
+    /// (rule: `indexes` (L3) is never taken under a frame latch (L6)), so each
+    /// updater carries a `Remove(old)` + `Add(new)` pair applied afterwards.
+    /// Applying those pairs one op at a time lets two updaters interleave as
+    /// Remove/Remove/Add/Add: the second Remove finds the entry already gone
+    /// and no-ops, then both Adds land. The heap still holds one row, but the
+    /// index holds two entries for it, so every `WHERE key = ?` lookup returns
+    /// the row twice and `count(*)` doubles it.
+    ///
+    /// Found against a live server over pgwire: 4 sessions running
+    /// `UPDATE t SET n = n + 1 WHERE id = 1` reproduced it 5 runs out of 5.
+    /// A restart rebuilds the index and hides it, so it is a wrong answer for
+    /// as long as the process lives.
+    #[test]
+    fn concurrent_updates_do_not_duplicate_an_index_entry() {
+        // Real threads, not async tasks: the race is between two updaters
+        // running the deferred maintenance at the same time.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = rt.block_on(setup_engine(tmp.path()));
+        rt.block_on(register_simple_table(&catalog, "t"));
+        rt.block_on(engine.create_table("t")).unwrap();
+        rt.block_on(engine.insert("t", simple_row(1, "00000000")))
+            .unwrap();
+        rt.block_on(engine.create_index("t", "idx_t_id", 0))
+            .unwrap();
+
+        let engine = Arc::new(engine);
+        let pos = rt.block_on(at(&engine, "t", &[0]))[0];
+
+        let workers: Vec<_> = (0..4)
+            .map(|w| {
+                let e = engine.clone();
+                std::thread::spawn(move || {
+                    for i in 0..200 {
+                        // Fixed-width payload so every update fits its slot and
+                        // the row keeps its address — the same shape as a
+                        // counter increment, which is how this was found.
+                        let row = simple_row(1, &format!("{:04}{:04}", w, i));
+                        let _ = e.update_at("t", vec![(pos, None, row)]);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+
+        // One row went in and none was added, so one row must come out.
+        let rows = rt.block_on(engine.scan("t")).unwrap();
+        assert_eq!(rows.len(), 1, "the heap must still hold exactly one row");
+
+        // Therefore an index lookup on its key must yield exactly one row.
+        let found = rt
+            .block_on(engine.index_lookup("t", "idx_t_id", &Value::Int32(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "index lookup returned {} rows for a single heap row — the index \
+             holds duplicate entries for one tuple address",
+            found.len()
+        );
     }
 
     // ── 6. drop_table ─────────────────────────────────────────────
