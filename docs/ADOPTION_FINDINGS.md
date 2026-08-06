@@ -295,6 +295,17 @@ state that `-- DOWN` is documentation-only.
 Workaround for adopters: treat `-- DOWN` as human-readable notes; rely on DB
 backups (`pg_dump`) for rollback, as Omni Analyst does.
 
+**Resolved (2026-08-06):** `Migrator.rollback(migrations, target_version)` and
+`rollback_dir(dir, target_version)` landed in `nucleus/migrate.py`. They walk
+applied migrations above `target_version` newest-first, running each `down` and
+deleting its `_neutron_migrations` row in one transaction (schema and record can
+never disagree). A migration with an empty `down` raises `ValueError` rather
+than skip -- skipping would leave its changes present while later rows are
+removed. The `-- DOWN` sections across both repos are now operational. A CLI
+surface (`neutron migrate:down`) is deferred: the CLI's `migrate` command uses
+`NucleusClient.migrate`, a separate path; wiring rollback through it is a
+follow-up.
+
 ---
 
 ## Roadmap note — a real React runtime is not recommended

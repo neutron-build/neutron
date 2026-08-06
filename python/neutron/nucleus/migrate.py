@@ -49,6 +49,48 @@ class Migrator:
         migrations = _load_from_dir(migrations_dir)
         return await self.run_migrations(migrations)
 
+    async def rollback(self, migrations: list[Migration], target_version: int) -> list[str]:
+        """Roll back applied migrations above ``target_version``, newest first.
+
+        For each applied migration with version > target, runs its ``down`` SQL
+        and removes its ``_neutron_migrations`` row in one transaction, so the
+        schema and the record of what is applied can never disagree. A
+        migration whose ``down`` is empty cannot be reversed: rather than skip
+        it (which would leave later migrations rolled back while this one's
+        changes linger), the rollback raises ``ValueError`` naming the version.
+        An operator who hits that must add a DOWN section or restore a backup --
+        the alternative is a silently-inconsistent schema.
+
+        No-op (returns ``[]``) when nothing above ``target_version`` is applied.
+        """
+        await self._ensure_table()
+        applied = await self.get_applied()
+        results: list[str] = []
+
+        for m in sorted(migrations, key=lambda x: x.version, reverse=True):
+            if m.version <= target_version or m.version not in applied:
+                continue
+            if not m.down:
+                raise ValueError(
+                    f"migration {m.version}_{m.name} has no DOWN section; "
+                    f"cannot roll back without a backup restore"
+                )
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(m.down)
+                    await conn.execute(
+                        "DELETE FROM _neutron_migrations WHERE version = $1",
+                        m.version,
+                    )
+            results.append(f"Rolled back: {m.version}_{m.name}")
+
+        return results
+
+    async def rollback_dir(self, migrations_dir: str, target_version: int) -> list[str]:
+        """Roll back to ``target_version`` from a migrations directory."""
+        migrations = _load_from_dir(migrations_dir)
+        return await self.rollback(migrations, target_version)
+
     async def run_migrations(self, migrations: list[Migration]) -> list[str]:
         """Run a list of Migration objects, skipping already-applied ones."""
         await self._ensure_table()

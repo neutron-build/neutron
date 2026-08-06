@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -1155,6 +1156,120 @@ class TestMigration:
 
             migrations = _load_from_dir(tmpdir)
             assert len(migrations) == 0
+
+
+class _FakeConn:
+    """In-memory stand-in for an asyncpg connection: records execute() calls and
+    tracks the set of applied versions so Migrator.rollback can be tested
+    without a database."""
+
+    def __init__(self):
+        self.applied: set[int] = set()
+        self.executed: list = []  # log of ("down", sql) / ("delete", version)
+
+    async def execute(self, sql: str, *args):
+        s = sql.strip()
+        if s.startswith("DELETE FROM _neutron_migrations"):
+            self.applied.discard(args[0])
+            self.executed.append(("delete", args[0]))
+        elif s.startswith("CREATE TABLE IF NOT EXISTS"):
+            pass  # _ensure_table
+        else:
+            self.executed.append(("down", sql))
+
+    async def fetch(self, sql: str):
+        return [{"version": v} for v in self.applied]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def transaction(self):
+        @asynccontextmanager
+        async def _tx():
+            yield
+
+        return _tx()
+
+
+class _FakePool:
+    def __init__(self):
+        self._conn = _FakeConn()
+
+    def acquire(self):
+        return self._conn
+
+
+class TestRollback:
+    async def test_rolls_back_newest_first_and_removes_rows(self):
+        from neutron.nucleus.migrate import Migration, Migrator
+
+        pool = _FakePool()
+        pool._conn.applied = {1, 2, 3}
+        migrations = [
+            Migration(1, "a", "up1", "down1"),
+            Migration(2, "b", "up2", "down2"),
+            Migration(3, "c", "up3", "down3"),
+        ]
+
+        results = await Migrator(pool).rollback(migrations, target_version=1)
+
+        # 3 then 2 rolled back (descending); 1 kept.
+        assert results == ["Rolled back: 3_c", "Rolled back: 2_b"]
+        assert pool._conn.applied == {1}
+        # DOWN ran newest-first, each followed by its row delete.
+        downs = [e for e in pool._conn.executed if e[0] == "down"]
+        assert downs == [("down", "down3"), ("down", "down2")]
+
+    async def test_noop_when_nothing_above_target_applied(self):
+        from neutron.nucleus.migrate import Migration, Migrator
+
+        pool = _FakePool()
+        pool._conn.applied = {1, 2}
+        migrations = [Migration(1, "a", "up1", "down1"), Migration(2, "b", "up2", "down2")]
+
+        results = await Migrator(pool).rollback(migrations, target_version=5)
+        assert results == []
+        assert pool._conn.applied == {1, 2}  # untouched
+
+    async def test_raises_on_migration_with_no_down_rather_than_skip(self):
+        # The load-bearing correctness property: a migration with no DOWN
+        # cannot be reversed. Skipping it and rolling back earlier migrations
+        # would leave this one's schema changes present while its row (and
+        # later rows) are removed -- the schema and _neutron_migrations would
+        # silently disagree. Refuse the whole rollback instead.
+        from neutron.nucleus.migrate import Migration, Migrator
+
+        pool = _FakePool()
+        pool._conn.applied = {1, 2}
+        migrations = [
+            Migration(1, "a", "up1", "down1"),
+            Migration(2, "b", "up2", ""),  # no DOWN
+        ]
+
+        with pytest.raises(ValueError, match="no DOWN section"):
+            await Migrator(pool).rollback(migrations, target_version=1)
+        # Nothing was rolled back before the failure (2 is the newest, so the
+        # raise fires on the first iteration -- applied set unchanged).
+        assert pool._conn.applied == {1, 2}
+
+    async def test_skips_migrations_that_are_not_applied(self):
+        from neutron.nucleus.migrate import Migration, Migrator
+
+        pool = _FakePool()
+        pool._conn.applied = {1, 3}  # 2 was never applied
+        migrations = [
+            Migration(1, "a", "up1", "down1"),
+            Migration(2, "b", "up2", "down2"),
+            Migration(3, "c", "up3", "down3"),
+        ]
+
+        results = await Migrator(pool).rollback(migrations, target_version=1)
+        # Only 3 rolls back; 2 is skipped (not applied); 1 kept.
+        assert results == ["Rolled back: 3_c"]
+        assert pool._conn.applied == {1}
 
 
 # ============================================================
