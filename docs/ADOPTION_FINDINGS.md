@@ -264,6 +264,39 @@ fixtures instead.
 
 ---
 
+## N-010 — `Migrator` parses `-- DOWN` sections but can never run them
+**Python · MED · `SPEC-GAP`**
+
+`neutron.nucleus.migrate.Migrator` loads each `NNN_name.sql` file and splits it
+on `-- DOWN` into `Migration.up` and `Migration.down` (`migrate.py:88-94`), and
+the docstring on `migrate()` even says *"Optionally include a `-- DOWN` marker
+to separate up/down SQL."* But **there is no `rollback` / `downgrade` method on
+`Migrator`** — only `migrate()` and `run_migrations()`, and both run `up`
+exclusively (`run_migrations` executes `m.up`; `m.down` is never referenced
+outside the loader). The `Migration.down` field is dead.
+
+Observed in Omni Analyst v2 (the dogfood): ~10 of 29 migration files carry a
+populated `-- DOWN` section (`DROP TABLE ...`, `DROP INDEX ...`), written in good
+faith because the loader's split invites them. They look operational and are
+not. An adopter who rolls a migration forward expecting the documented down path
+exists has no rollback — only `pg_restore` from a backup.
+
+This is a `SPEC-GAP` rather than `REAL-BUG` because nothing *breaks*; the gap is
+that an advertised capability (the `-- DOWN` marker, named in the public
+docstring) has no supporting API.
+
+Fix: add `Migrator.rollback(target_version)` — load migrations, for each applied
+version above `target` in descending order, run `down` inside a transaction and
+delete the `_neutron_migrations` row. Pair with a `neutron migrate:down` CLI
+surface. Until then, `Migration.down` should either be removed (so the loader
+stops implying a capability that isn't there) or the docstring corrected to
+state that `-- DOWN` is documentation-only.
+
+Workaround for adopters: treat `-- DOWN` as human-readable notes; rely on DB
+backups (`pg_dump`) for rollback, as Omni Analyst does.
+
+---
+
 ## Roadmap note — a real React runtime is not recommended
 
 Recorded because the question recurs and the reasoning is easy to lose.
