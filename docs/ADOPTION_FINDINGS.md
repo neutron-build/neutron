@@ -340,6 +340,56 @@ here is the tested list. If you need React internals or RSC, use Next.*
 
 ---
 
+## N-011 — `useLocation` silently returns `/` during SSR; no `RouterContext` provider on the server
+**TypeScript / routing · HIGH · `REAL-BUG`**
+
+`useLocation()` reads `RouterContext` (`client/hooks.js:65-68`). That provider is
+mounted **only** in the client hydrate path — `client/hydrate.js:226` wraps the
+tree in `RouterContext.Provider`. The server renderer (`core/render-app-route.js`)
+never mounts it: it composes layouts with
+`h(layoutModule.default, { data: loaderData[layoutRoute.id] }, element)` and no
+router provider anywhere in the chain.
+
+So on the server every consumer falls through to the `createContext` default,
+which is `{ routeId: "", pathname: "/", search: "", params: {} }`
+(`client/hooks.js:19-23`). `useLocation().pathname` is therefore **always `"/"`
+during SSR**, on every route, with no warning.
+
+The failure is silent and direction-dependent, which is what makes it costly: a
+layout that branches on pathname renders the *home-route* branch server-side and
+the correct branch after hydration. Reproduction from Omni Analyst v2 — a layout
+that renders bare chrome on `/login`:
+
+```tsx
+const { pathname } = useLocation();
+const isPublic = pathname === "/login";
+if (isPublic) return <main>{children}</main>;   // never taken on the server
+return <><TopNav/><StatusRail/>{children}</>;   // always taken instead
+```
+
+`curl /login` returned the full nine-link application nav plus the status rail,
+which then vanished on hydration. The same defect makes `useSearchParams` (same
+context, `hooks.js:69-72`) return an empty `URLSearchParams` server-side.
+
+`useParams` is unaffected in practice only because route params are also threaded
+through `loaderData`; anything reading them from context alone has the same hole.
+
+Fix: mount `RouterContext.Provider` in `renderAppRoute` around the composed
+element, with the values it already has — it computes the matched route, the
+pathname and the params to run loaders, so nothing new needs deriving. That makes
+the hook isomorphic and removes the class of bug entirely.
+
+Failing that, the hooks should throw (or warn loudly) when read without a
+provider, rather than returning a plausible-looking default. A wrong `"/"` is
+worse than a crash because it renders successfully.
+
+Workaround for adopters: give the layout a `loader` that returns
+`new URL(request.url).pathname` and prefer it over the hook when
+`typeof window === "undefined"`. This is what Omni Analyst v2 now does
+(`ui/src/routes/_layout.tsx`).
+
+---
+
 ## Not filed
 
 Candidates investigated and dropped, recorded so they are not re-raised:
