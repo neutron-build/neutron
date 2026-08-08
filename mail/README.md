@@ -129,7 +129,7 @@ recency, which is the right default for mail anyway.
 
 One caveat worth knowing: Nucleus's English stemmer currently stems singular
 and plural forms of many nouns differently, so searching "folder" will not find
-"folders". See `docs/NEUTRON_GAPS.md`.
+"folders". See `docs/ADOPTION_FINDINGS.md`, A-014.
 
 ## Before serving Gmail users
 
