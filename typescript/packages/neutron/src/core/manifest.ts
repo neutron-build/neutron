@@ -199,6 +199,7 @@ function createRoute(
       params: [],
       config,
       hasLoader: derived.hasLoader,
+      hasMiddleware: derived.hasMiddleware,
       parentId,
       isLayout: true,
     };
@@ -217,6 +218,7 @@ function createRoute(
       params: [],
       config,
       hasLoader: derived.hasLoader,
+      hasMiddleware: derived.hasMiddleware,
       parentId,
       isLayout: false,
       isNotFound: true,
@@ -234,6 +236,7 @@ function createRoute(
     params,
     config,
     hasLoader: derived.hasLoader,
+    hasMiddleware: derived.hasMiddleware,
     parentId,
     isLayout: false,
   };
@@ -272,6 +275,13 @@ export function findNotFoundRoute(routes: Route[], urlPath: string): Route | und
  */
 export interface RouteFacts {
   hasLoader: boolean;
+  /**
+   * Whether the route source exports `middleware`. The static-serving path
+   * needs this before it decides to answer from a prebuilt file: serving one
+   * skips `renderAppRoute`, which is the only place middleware runs, so a
+   * gated route would be served ungated. See A-020.
+   */
+  hasMiddleware: boolean;
 }
 
 /**
@@ -287,15 +297,24 @@ export function parseRouteFacts(fileContent: string): RouteFacts {
     /export\s+(?:async\s+)?(?:function|const|let|var)\s+loader\b/.test(fileContent);
   // `export { loader }` and `export { x as loader }`, including re-exports.
   const named = /export\s*\{[^}]*\bloader\b[^}]*\}/.test(fileContent);
-  return { hasLoader: declared || named };
+  // Same two shapes for `middleware`. Conservative in the same direction and
+  // for a stronger reason: a false positive costs a static route its prebuilt
+  // fast path, a false negative serves a gated page to anyone.
+  const middlewareDeclared =
+    /export\s+(?:async\s+)?(?:function|const|let|var)\s+middleware\b/.test(fileContent);
+  const middlewareNamed = /export\s*\{[^}]*\bmiddleware\b[^}]*\}/.test(fileContent);
+  return {
+    hasLoader: declared || named,
+    hasMiddleware: middlewareDeclared || middlewareNamed,
+  };
 }
 
 function readRouteFacts(filePath: string): RouteFacts {
   try {
     return parseRouteFacts(fs.readFileSync(filePath, "utf-8"));
   } catch {
-    // Unreadable source: assume the heavier path.
-    return { hasLoader: true };
+    // Unreadable source: assume the heavier path, and assume gated.
+    return { hasLoader: true, hasMiddleware: true };
   }
 }
 

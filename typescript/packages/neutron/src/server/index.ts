@@ -581,16 +581,34 @@ export async function createServer(
       // boot, including index.html -> "/") used to short-circuit BEFORE the
       // router, so an app route at "/" — e.g. an auth-gated home — was
       // silently shadowed by the built shell and its loader never ran.
-      const staticAllowed = !match || isStaticRoute(match);
+      // A gated route may never answer from a prebuilt file: that path returns
+      // before renderAppRoute, the only place its middleware runs. Falling
+      // through re-renders it, which is slower and correct. A-020.
+      const gated = match ? routeChainIsGated(match) : false;
+      const staticAllowed = !match || (isStaticRoute(match) && !gated);
+
+      // Global middleware is a different case and does not disqualify the fast
+      // path, because it can be run right here. It is never registered as
+      // app-level middleware — it is only passed into renderAppRoute — so
+      // before this it did not run for static hits at all. Now it runs, and a
+      // response it returns (a redirect, a 403) wins over the prebuilt file.
+      const serveStatic = async (respond: () => Response): Promise<Response> => {
+        if (globalMiddleware.length === 0) {
+          return respond();
+        }
+        return runMiddlewareChain(globalMiddleware, c.req.raw, {}, async () => respond());
+      };
 
       if ((method === "GET" || method === "HEAD") && staticAllowed) {
         const cached = staticHtmlCache.get(effectivePathname);
         if (cached) {
-          const response = createStaticHtmlResponse(
-            cached,
-            c.req.raw,
-            method,
-            staticRouteHeaders.get(effectivePathname)
+          const response = await serveStatic(() =>
+            createStaticHtmlResponse(
+              cached,
+              c.req.raw,
+              method,
+              staticRouteHeaders.get(effectivePathname)
+            )
           );
           return finalize(response, {
             routePath: effectivePathname,
@@ -604,11 +622,13 @@ export async function createServer(
         if (html !== null) {
           const entry = createStaticHtmlEntry(html);
           staticHtmlCache.set(effectivePathname, entry);
-          const response = createStaticHtmlResponse(
-            entry,
-            c.req.raw,
-            method,
-            staticRouteHeaders.get(effectivePathname)
+          const response = await serveStatic(() =>
+            createStaticHtmlResponse(
+              entry,
+              c.req.raw,
+              method,
+              staticRouteHeaders.get(effectivePathname)
+            )
           );
           return finalize(response, {
             routePath: effectivePathname,
@@ -665,7 +685,18 @@ export async function createServer(
         return finalize(c.text("Not Found", 404));
       }
 
-      if (match.route.file.includes("_layout") || (match.route.config.mode !== "app" && !isJsonRequest(c.req.raw))) {
+      // A non-app route that reached here was not answered from dist, and
+      // normally that is a 404 — a static route is meant to come off disk.
+      // A GATED one is the exception: it got here precisely because it must not
+      // be served from disk, and 404ing it would turn "this page is protected"
+      // into "this page does not exist". Render it through the app path so its
+      // middleware actually runs and decides. `neutron build` refuses to
+      // produce this combination at all (render-static.ts), so in practice this
+      // is reached only with a dist built before the gate was added. A-020.
+      if (
+        match.route.file.includes("_layout") ||
+        (match.route.config.mode !== "app" && !isJsonRequest(c.req.raw) && !gated)
+      ) {
         return finalize(c.text("Not Found", 404), {
           routeId: match.route.id,
           routePath: match.route.path,
@@ -913,6 +944,23 @@ function isStaticRoute(match: RouteMatch): boolean {
     return true;
   }
   return match.route.config.mode === "static";
+}
+
+/**
+ * Whether anything in the matched chain gates the request with `middleware`.
+ *
+ * Serving a prebuilt file returns before `renderAppRoute`, which is the only
+ * place route and layout middleware run — so a `mode: "static"` route that
+ * exports `middleware` was prerendered by SSG and then served from disk with
+ * its gate never running. No error, no warning; the page was simply public.
+ * A-020.
+ *
+ * Layouts count: `renderAppRoute` collects middleware from every route in
+ * `[...match.layouts, match.route]`, so an auth gate on a parent layout covers
+ * a static child. `undefined` counts as gated — see `Route.hasMiddleware`.
+ */
+function routeChainIsGated(match: RouteMatch): boolean {
+  return [...match.layouts, match.route].some((route) => route.hasMiddleware !== false);
 }
 
 // Load an optional global middleware from <rootDir>/src/middleware.ts (or

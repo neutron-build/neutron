@@ -70,14 +70,51 @@ Statuses verified against source on 2026-08-08.
 | A-017 | `target/debug` grows without bound | Repo | LOW | `SPEC-GAP` | **OPEN** |
 | A-018 | No SDK client retried a serialization failure (40001) | All SDKs | HIGH | `SPEC-GAP` | FIXED `6fd69e8`, `13d5cfd`, `f6b22b4` |
 | A-019 | Client navigation paid a round-trip on a cold click | TS routing | MED | `SPEC-GAP` | FIXED `78411c5` |
-| A-020 | Static-route `middleware` never runs when a prebuilt file exists | TS routing | HIGH | `REAL-BUG` | **OPEN** |
+| A-020 | Static-route `middleware` never runs when a prebuilt file exists | TS routing | HIGH | `REAL-BUG` | FIXED |
 | A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | **OPEN** |
+| A-022 | A pure-static app never loads `src/middleware.ts` at all | TS routing | MED | `REAL-BUG` | **OPEN** |
 
-Open: A-007, A-014, A-017, A-020, A-021, plus A-015 partial and A-009 deferred.
+Open: A-007, A-014, A-017, A-021, A-022, plus A-015 partial and A-009 deferred.
 
 ---
 
 # Open
+
+## A-022 — a pure-static app never loads `src/middleware.ts`, so global middleware silently does nothing
+**TypeScript / routing · MEDIUM · `REAL-BUG` · OPEN**
+
+Found while writing the A-020 request-side tests, which failed for this reason
+before the fixtures were made realistic.
+
+`createServer` starts the SSR runtime only when some route is `mode: "app"`:
+
+```ts
+const hasAppRoutes = routes.some(
+  (route) => !route.file.includes("_layout") && route.config.mode === "app"
+);
+const ssrServer = hasAppRoutes ? await createSsrServer(...) : null;
+const globalMiddleware = hasAppRoutes && ssrServer
+  ? await loadGlobalMiddleware(ssrServer, resolvedRootDir)
+  : [];
+```
+
+Global middleware is loaded *through* that runtime, so an app whose routes are
+all `mode: "static"` gets `globalMiddleware = []`. The author's
+`src/middleware.ts` is never imported, never runs, and never warns. Adding a
+single `mode: "app"` route makes it start working, which is a confusing thing
+to discover.
+
+The security-relevant reading: in a pure-static app there is **no runtime that
+can evaluate a gate at all**. That is why A-020's build-time guard carries the
+weight rather than its request-time half — refusing to prerender a gated route
+is the only protection available in that configuration.
+
+Fix options, roughly in order of preference: load `src/middleware.ts` whenever
+it exists rather than only when app routes do (it needs a module runtime, so
+this means starting one for a static-only app that has the file); or, at
+minimum, warn loudly at boot when `src/middleware.ts` is present but no runtime
+was started, so the no-op is visible. Silently ignoring a file the framework
+documents as "runs on every request" is the part that has to go.
 
 ## A-021 — `useNavigation()` throws `window is not defined` during SSR
 **TypeScript / routing · MEDIUM · `REAL-BUG` · OPEN**
@@ -113,32 +150,6 @@ Fix: guard the read (`typeof window === "undefined"` → fall back to the contex
 value, which is now correct on the server) and let the existing
 `neutron:navigation` effect take over on the client. `"idle"` is the honest
 server answer — there is no navigation in flight during SSR.
-
-## A-020 — static-route `middleware` does not run when a prebuilt file exists
-**TypeScript / routing + static adapter · HIGH · `REAL-BUG` · OPEN**
-
-Found while closing A-019, and not the same thing as that item.
-
-`server/index.ts` serves `staticHtmlCache` for a GET whenever
-`isStaticRoute(match)` — and that check (`server/index.ts:911`) is still
-`match.route.file.includes("_layout") || match.route.config.mode === "static"`.
-It returns at line 587, before `renderAppRoute`, which is the only place route
-`middleware` and `globalMiddleware` are invoked.
-
-So a route that declares both:
-
-    export const config = { mode: "static" };
-    export const middleware = requireAuth;
-
-is prerendered by SSG (`render-static.ts` only skips `mode !== "static"`) and
-then served from the prebuilt file with `requireAuth` never running. The author
-gets no error and no warning; the page is simply public.
-
-Options: refuse to prerender a static route that exports `middleware`, refuse
-to serve the cached file for one, or reject the combination at build time with
-a clear message. The last is probably right — the combination is more likely a
-misunderstanding than an intent, and silently downgrading either half is worse
-than failing the build.
 
 ## A-014 — English stemmer: singular and plural of the same noun never match
 **Nucleus / FTS · HIGH · `REAL-BUG` · OPEN**
@@ -576,6 +587,75 @@ symptom: `pathname` `/`, params `(none)`.
 
 **Not fixed by this, tracked as A-021:** `useNavigation()` still throws
 `window is not defined` during SSR — it ignores the context on first read.
+
+## A-020 — static-route `middleware` does not run when a prebuilt file exists
+**TypeScript / routing + static adapter · HIGH · `REAL-BUG` · FIXED**
+
+Found while closing A-019, and not the same thing as that item.
+
+`server/index.ts` serves `staticHtmlCache` for a GET whenever
+`isStaticRoute(match)` — and that check (`server/index.ts:911`) is still
+`match.route.file.includes("_layout") || match.route.config.mode === "static"`.
+It returns at line 587, before `renderAppRoute`, which is the only place route
+`middleware` and `globalMiddleware` are invoked.
+
+So a route that declares both:
+
+    export const config = { mode: "static" };
+    export const middleware = requireAuth;
+
+is prerendered by SSG (`render-static.ts` only skips `mode !== "static"`) and
+then served from the prebuilt file with `requireAuth` never running. The author
+gets no error and no warning; the page is simply public.
+
+Options: refuse to prerender a static route that exports `middleware`, refuse
+to serve the cached file for one, or reject the combination at build time with
+a clear message. The last is probably right — the combination is more likely a
+misunderstanding than an intent, and silently downgrading either half is worse
+than failing the build.
+
+**Resolved 2026-08-08**, in two halves, because one alone does not close it.
+
+**Build time is the real fix.** `renderStatic` now refuses to prerender a
+`mode: "static"` route gated by `middleware` — its own or any layout's — and
+fails the build naming each route and the file that gates it. Prerendering-but-
+not-serving or serving-but-not-prerendering each silently discard half of what
+the route asked for, and the half discarded here is an access gate; the
+combination is far likelier a misunderstanding than an intent, so it is said
+out loud once rather than guessed at per request.
+
+**Request time is defence in depth**, for a dist built before the gate existed.
+`staticAllowed` now also requires that nothing in the matched chain is gated.
+A gated route that falls through is *rendered through the app path* rather than
+404'd — 404 would turn "this page is protected" into "this page does not
+exist" — so its middleware runs and decides.
+
+Supporting change: `parseRouteFacts` derives `hasMiddleware` alongside
+`hasLoader`, since `stripServerOnlyRouteModule` removes `middleware` from the
+client build and the fact is otherwise unknowable. Detection is conservative in
+the same direction as `hasLoader` and for a stronger reason — a false positive
+costs a route its fast path, a false negative serves a gated page to anyone.
+The two consumers use deliberately different defaults: `=== true` at build time
+(the flag is always populated there, and failing a build on a guess is worse
+than not failing it) and `!== false` at request time (unknown means the route
+table came from somewhere that derived no facts, and serving a maybe-gated page
+is worse than losing a fast path).
+
+**Global middleware now runs on static hits.** It is never registered as
+app-level middleware — only passed into `renderAppRoute` — so before this it
+did not run for a prebuilt file at all. It does not disqualify the fast path,
+because it can simply be run there: a response it returns (a redirect, a 403)
+wins over the file, and `next()` serves the file as before.
+
+Guarded by `core/static-middleware-bypass.test.ts` (6, build side) and
+`server/static-gated-route.e2e.test.ts` (4, request side, real `createServer`).
+Reverting either guard fails its tests. Verified no false positives against the
+267-page `apps/site` build and the playground's two middleware routes.
+
+**Found while testing, filed as A-022:** in a pure-static app the SSR runtime
+never starts, so `src/middleware.ts` is never loaded and global middleware
+silently does nothing. That is also why the build-time half carries the weight
+here — a pure-static app has no runtime to evaluate a gate with.
 
 ## A-012 — Rust Nucleus client had no table-attached FTS
 **Rust SDK · MEDIUM · `SPEC-GAP` · FIXED**

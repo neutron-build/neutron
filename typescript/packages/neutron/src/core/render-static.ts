@@ -93,6 +93,49 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
 
   const moduleCache = new Map<string, RouteModule>();
 
+  // `mode: "static"` and `middleware` are contradictory, and the contradiction
+  // used to resolve silently in favour of the wrong one: SSG prerendered the
+  // route, the server answered from the prebuilt file, and the file is served
+  // before renderAppRoute — the only place middleware runs. The author got no
+  // error and no warning; the page was simply public. A-020.
+  //
+  // Failing the build is the honest resolution. Prerendering-but-not-serving
+  // or serving-but-not-prerendering each silently discard half of what the
+  // route asked for, and the half discarded here is an access gate. The
+  // combination is far more likely a misunderstanding than an intent, so it
+  // should be said out loud once at build time rather than guessed at on every
+  // request.
+  // `=== true` here, but `!== false` on the serving path, and the asymmetry is
+  // deliberate. Here the flag is always populated (discoverRoutes just read
+  // every file), so unknown means synthesized, and failing a build on a guess
+  // is worse than not failing it. There, unknown means the route table came
+  // from somewhere that did not derive facts, and serving a page that might be
+  // gated is worse than losing a fast path.
+  const gated = pageRoutes
+    .filter((route) => route.config.mode === "static")
+    .map((route) => ({
+      route,
+      gate: [...getLayoutChain(route), route].find((r) => r.hasMiddleware === true),
+    }))
+    .filter((entry) => entry.gate !== undefined);
+
+  if (gated.length > 0) {
+    const detail = gated
+      .map(({ route, gate }) =>
+        gate!.id === route.id
+          ? `  ${route.path} — ${route.file} exports \`middleware\``
+          : `  ${route.path} — its layout ${gate!.file} exports \`middleware\``
+      )
+      .join("\n");
+    throw new Error(
+      `Cannot prerender ${gated.length} route(s) that are gated by middleware:\n${detail}\n\n` +
+        "A prerendered file is served before any middleware runs, so these pages " +
+        "would be public. Either drop `config = { mode: \"static\" }` so the route " +
+        "renders per request with its gate, or remove the middleware if the page " +
+        "is genuinely public."
+    );
+  }
+
   for (const pageRoute of pageRoutes) {
     if (pageRoute.config.mode !== "static") {
       console.log(`  Skipping ${pageRoute.path} (app route)`);

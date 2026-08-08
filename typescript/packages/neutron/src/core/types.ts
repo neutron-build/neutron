@@ -26,6 +26,15 @@ export interface Route {
    * which callers must treat as "yes" — see `parseRouteFacts`.
    */
   hasLoader?: boolean;
+  /**
+   * Whether the route source exports `middleware`. Derived at discovery time
+   * like `hasLoader`, and read by the static-serving path: answering from a
+   * prebuilt file returns before `renderAppRoute`, the only place middleware
+   * runs, so a gated route served that way is served ungated. Absent means
+   * unknown, which callers must treat as "yes" — a route wrongly kept off the
+   * static fast path is slow, one wrongly put on it is public. See A-020.
+   */
+  hasMiddleware?: boolean;
   parentId: string | null;
   isLayout?: boolean;
   /**
