@@ -61,7 +61,7 @@ Statuses verified against source on 2026-08-08.
 | A-008 | `/health` reports `disconnected` for a healthy Postgres | Python | MED | `REAL-BUG` | FIXED `a5f66d5` |
 | A-009 | Editable install exposes a top-level `tests` package | Python | LOW | `REAL-BUG` | **DEFERRED** |
 | A-010 | `Migrator` parses `-- DOWN` but can never run it | Python | MED | `SPEC-GAP` | FIXED `a7a7d86` |
-| A-011 | `useLocation` silently returns `/` during SSR | TS routing | HIGH | `REAL-BUG` | **OPEN** |
+| A-011 | `useLocation` silently returns `/` during SSR | TS routing | HIGH | `REAL-BUG` | FIXED |
 | A-012 | Rust Nucleus client had no table-attached FTS | Rust SDK | MED | `SPEC-GAP` | FIXED |
 | A-013 | `neutron-oauth` could not redeem a refresh token | Rust SDK | HIGH | `REAL-BUG` | FIXED `c06d027` |
 | A-014 | English stemmer: singular and plural never match | Nucleus FTS | HIGH | `REAL-BUG` | **OPEN** |
@@ -71,60 +71,48 @@ Statuses verified against source on 2026-08-08.
 | A-018 | No SDK client retried a serialization failure (40001) | All SDKs | HIGH | `SPEC-GAP` | FIXED `6fd69e8`, `13d5cfd`, `f6b22b4` |
 | A-019 | Client navigation paid a round-trip on a cold click | TS routing | MED | `SPEC-GAP` | FIXED `78411c5` |
 | A-020 | Static-route `middleware` never runs when a prebuilt file exists | TS routing | HIGH | `REAL-BUG` | **OPEN** |
+| A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | **OPEN** |
 
-Open: A-007, A-011, A-014, A-017, A-020, plus A-015 partial and A-009 deferred.
+Open: A-007, A-014, A-017, A-020, A-021, plus A-015 partial and A-009 deferred.
 
 ---
 
 # Open
 
-## A-011 — `useLocation` silently returns `/` during SSR; no `RouterContext` provider on the server
-**TypeScript / routing · HIGH · `REAL-BUG` · OPEN**
+## A-021 — `useNavigation()` throws `window is not defined` during SSR
+**TypeScript / routing · MEDIUM · `REAL-BUG` · OPEN**
 
-`useLocation()` reads `RouterContext` (`client/hooks.js:65-68`). That provider is
-mounted **only** in the client hydrate path — `client/hydrate.js:226` wraps the
-tree in `RouterContext.Provider`. The server renderer (`core/render-app-route.js`)
-never mounts it: it composes layouts with
-`h(layoutModule.default, { data: loaderData[layoutRoute.id] }, element)` and no
-router provider anywhere in the chain.
+Found while fixing A-011, and not the same defect: this one is loud, which is
+why it ranks below A-011 despite making the hook unusable outright.
 
-So on the server every consumer falls through to the `createContext` default,
-which is `{ routeId: "", pathname: "/", search: "", params: {} }`
-(`client/hooks.js:19-23`). `useLocation().pathname` is therefore **always `"/"`
-during SSR**, on every route, with no warning.
+`useNavigation` seeds its state from `readNavigationState()`
+(`client/hooks.ts`), which reads `window.__NEUTRON_NAVIGATION_STATE__` with no
+environment guard, inside a `useState` initializer that therefore runs on the
+server:
 
-The failure is silent and direction-dependent, which is what makes it costly: a
-layout that branches on pathname renders the *home-route* branch server-side and
-the correct branch after hydration. Reproduction from Omni Analyst v2 — a layout
-that renders bare chrome on `/login`:
-
-```tsx
-const { pathname } = useLocation();
-const isPublic = pathname === "/login";
-if (isPublic) return <main>{children}</main>;   // never taken on the server
-return <><TopNav/><StatusRail/>{children}</>;   // always taken instead
+```ts
+const [state, setState] = useState<NavigationState>(() => readNavigationState());
 ```
 
-`curl /login` returned the full nine-link application nav plus the status rail,
-which then vanished on hydration. The same defect makes `useSearchParams` (same
-context, `hooks.js:69-72`) return an empty `URLSearchParams` server-side.
+Reproduction — `renderToString` of any component calling the hook:
 
-`useParams` is unaffected in practice only because route params are also threaded
-through `loaderData`; anything reading them from context alone has the same hole.
+```
+ReferenceError: window is not defined
+```
 
-Fix: mount `RouterContext.Provider` in `renderAppRoute` around the composed
-element, with the values it already has — it computes the matched route, the
-pathname and the params to run loaders, so nothing new needs deriving. That makes
-the hook isomorphic and removes the class of bug entirely.
+So `useNavigation` cannot appear in a server-rendered component at all. A
+pending-state spinner, the most ordinary use of the hook, has to be pushed into
+an island or guarded by hand.
 
-Failing that, the hooks should throw (or warn loudly) when read without a
-provider, rather than returning a plausible-looking default. A wrong `"/"` is
-worse than a crash because it renders successfully.
+Note that A-011's fix does **not** address this. The server now mounts
+`NavigationContext` with `{ state: "idle" }`, but `useNavigation` ignores the
+context on first read and calls `readNavigationState()` unconditionally, so the
+provider is currently inert for this hook.
 
-Workaround for adopters: give the layout a `loader` that returns
-`new URL(request.url).pathname` and prefer it over the hook when
-`typeof window === "undefined"`. This is what Omni Analyst v2 now does
-(`ui/src/routes/_layout.tsx`).
+Fix: guard the read (`typeof window === "undefined"` → fall back to the context
+value, which is now correct on the server) and let the existing
+`neutron:navigation` effect take over on the client. `"idle"` is the honest
+server answer — there is no navigation in flight during SSR.
 
 ## A-020 — static-route `middleware` does not run when a prebuilt file exists
 **TypeScript / routing + static adapter · HIGH · `REAL-BUG` · OPEN**
@@ -506,6 +494,88 @@ removed. The `-- DOWN` sections across both repos are now operational.
 
 **Follow-up still open:** a CLI surface (`neutron migrate:down`) is deferred —
 the CLI's `migrate` command uses `NucleusClient.migrate`, a separate path.
+
+## A-011 — `useLocation` silently returned `/` during SSR; no `RouterContext` provider on the server
+**TypeScript / routing · HIGH · `REAL-BUG` · FIXED**
+
+`useLocation()` reads `RouterContext` (`client/hooks.js:65-68`). That provider is
+mounted **only** in the client hydrate path — `client/hydrate.js:226` wraps the
+tree in `RouterContext.Provider`. The server renderer (`core/render-app-route.js`)
+never mounts it: it composes layouts with
+`h(layoutModule.default, { data: loaderData[layoutRoute.id] }, element)` and no
+router provider anywhere in the chain.
+
+So on the server every consumer falls through to the `createContext` default,
+which is `{ routeId: "", pathname: "/", search: "", params: {} }`
+(`client/hooks.js:19-23`). `useLocation().pathname` is therefore **always `"/"`
+during SSR**, on every route, with no warning.
+
+The failure is silent and direction-dependent, which is what makes it costly: a
+layout that branches on pathname renders the *home-route* branch server-side and
+the correct branch after hydration. Reproduction from Omni Analyst v2 — a layout
+that renders bare chrome on `/login`:
+
+```tsx
+const { pathname } = useLocation();
+const isPublic = pathname === "/login";
+if (isPublic) return <main>{children}</main>;   // never taken on the server
+return <><TopNav/><StatusRail/>{children}</>;   // always taken instead
+```
+
+`curl /login` returned the full nine-link application nav plus the status rail,
+which then vanished on hydration. The same defect makes `useSearchParams` (same
+context, `hooks.js:69-72`) return an empty `URLSearchParams` server-side.
+
+`useParams` is unaffected in practice only because route params are also threaded
+through `loaderData`; anything reading them from context alone has the same hole.
+
+Fix: mount `RouterContext.Provider` in `renderAppRoute` around the composed
+element, with the values it already has — it computes the matched route, the
+pathname and the params to run loaders, so nothing new needs deriving. That makes
+the hook isomorphic and removes the class of bug entirely.
+
+Failing that, the hooks should throw (or warn loudly) when read without a
+provider, rather than returning a plausible-looking default. A wrong `"/"` is
+worse than a crash because it renders successfully.
+
+Workaround for adopters: give the layout a `loader` that returns
+`new URL(request.url).pathname` and prefer it over the hook when
+`typeof window === "undefined"`. This is what Omni Analyst v2 now does
+(`ui/src/routes/_layout.tsx`).
+
+**Resolved 2026-08-08.** Both server renderers now mount the same four
+providers the client hydrate path mounts — `RouterContext`, `LoaderContext`,
+`ActionDataContext`, `NavigationContext` — in the same order, via
+`core/router-providers.ts`. Every value was already computed to run loaders and
+resolve the head; nothing new is derived.
+
+Three things about the fix worth carrying forward:
+
+- **The SSG path had the same hole and was not in the original report.**
+  `core/render-static.ts` composed its element with no providers either, so
+  every prerendered page baked `pathname: "/"` into the file on disk. For a
+  static marketing site — the case the finding came from — that is the more
+  likely failure of the two.
+- **`h` is passed in rather than imported.** `render-static.ts` resolves its
+  Preact graph at runtime through `importPreactSsr` (app copy first) so app
+  components and the renderer share one `options` object. Creating the provider
+  vnodes with the statically imported `h` would have split the graph again —
+  the `reading '__H'` crash `9bfdf54` fixed — and, worse here, a context whose
+  Provider and consumer come from different Preact instances silently returns
+  the default, which is exactly the bug being fixed.
+- **The contexts moved to `client/contexts.ts`.** They were defined in
+  `client/hooks.ts`, which imports the navigation machinery and the prefetch
+  cache; the server has no use for either. `hooks.ts` re-exports the same
+  objects, so the public surface is unchanged and — asserted by a test —
+  identity is preserved, since two `createContext` calls produce two unrelated
+  contexts.
+
+Guarded by `core/router-providers.test.ts` (7 tests), which drives real
+`renderAppRoute` responses. Reverting the wrap makes it fail with the reported
+symptom: `pathname` `/`, params `(none)`.
+
+**Not fixed by this, tracked as A-021:** `useNavigation()` still throws
+`window is not defined` during SSR — it ignores the context on first read.
 
 ## A-012 — Rust Nucleus client had no table-attached FTS
 **Rust SDK · MEDIUM · `SPEC-GAP` · FIXED**

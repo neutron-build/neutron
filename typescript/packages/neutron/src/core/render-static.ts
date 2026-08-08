@@ -15,6 +15,7 @@ import {
   type SeoMetaInput,
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
+import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderSpeculationRules } from "./speculation-rules.js";
 import { resolvePreactSsr, importPreactSsr } from "./preact-ssr.js";
 
@@ -164,6 +165,24 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
           element = h(layoutModule.default as any, {}, element);
         }
       }
+
+      // Same providers the request-serving renderer and the client mount, for
+      // the same reason: without them useLocation reports "/" for every
+      // prerendered page and a pathname-branching layout bakes the home-route
+      // branch into every file on disk. A-011.
+      //
+      // `params` is empty here because this renderer does not expand
+      // getStaticPaths — see the note at the top of the file. An empty object
+      // is what the page component is already handed as a prop, so context and
+      // props agree; when param expansion lands, both take the real params.
+      element = withRouterProviders(h as CreateElement, element, {
+        routeId: pageRoute.id,
+        pathname: pageRoute.path,
+        search: "",
+        params: {},
+        loaderData: loaderData !== undefined ? { [pageRoute.id]: loaderData } : {},
+        actionData: undefined,
+      });
 
       const html = renderToString(element);
       // The rendered output is mounted inside the shell's `<div id="app">`

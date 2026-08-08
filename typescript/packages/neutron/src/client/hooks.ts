@@ -1,5 +1,12 @@
-import { createContext } from "preact";
 import { useContext, useCallback, useMemo, useState, useEffect, useRef } from "preact/hooks";
+import {
+  LoaderContext,
+  ActionDataContext,
+  NavigationContext,
+  RouterContext,
+  MatchesContext,
+} from "./contexts.js";
+import type { LoaderData, NavigationState, RouterState, UIMatch } from "./contexts.js";
 import { decodeLoaderDataPayload } from "./serialization.js";
 import { go, navigate } from "./navigate.js";
 import { storePrefetch } from "./prefetch-cache.js";
@@ -19,43 +26,7 @@ function applyClientData(data: unknown): void {
   window.dispatchEvent(new CustomEvent("neutron:data-updated", { detail: data }));
 }
 
-export interface LoaderData {
-  [routeId: string]: unknown;
-}
-
-export interface NavigationState {
-  state: "idle" | "loading" | "submitting";
-  formData?: FormData;
-  formAction?: string;
-  formMethod?: string;
-  location?: string;
-}
-
-export interface RouterState {
-  routeId: string;
-  pathname: string;
-  search: string;
-  params: Record<string, string>;
-}
-
-export interface UIMatch {
-  id: string;
-  pathname: string;
-  params: Record<string, string>;
-  data: unknown;
-  handle?: unknown;
-}
-
-const LoaderContext = createContext<LoaderData>({});
-const ActionDataContext = createContext<unknown>(undefined);
-const NavigationContext = createContext<NavigationState>({ state: "idle" });
-const RouterContext = createContext<RouterState>({
-  routeId: "",
-  pathname: "/",
-  search: "",
-  params: {},
-});
-const MatchesContext = createContext<UIMatch[]>([]);
+export type { LoaderData, NavigationState, RouterState, UIMatch } from "./contexts.js";
 
 export function useLoaderData<T = unknown>(): SerializeFrom<T> {
   const data = useContext(LoaderContext);

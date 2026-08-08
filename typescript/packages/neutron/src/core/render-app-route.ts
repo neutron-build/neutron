@@ -25,6 +25,7 @@ import {
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
+import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderToString } from "preact-render-to-string";
 import type {
   Route,
@@ -1023,6 +1024,20 @@ export async function renderAppRoute(
           );
         }
       }
+
+      // Mount the router contexts the client mounts, so useLocation/useParams/
+      // useSearchParams/useLoaderData read the same values on both sides. Every
+      // value here is already computed above to run loaders and resolve the
+      // head — nothing new is derived. A-011.
+      element = withRouterProviders(h as CreateElement, element, {
+        routeId: match.route.id,
+        pathname,
+        search: new URL(request.url).search,
+        params: match.params,
+        loaderData,
+        actionData,
+      });
+
       // Awaited so a synchronous compose failure (e.g. the full-document guard)
       // is caught here and routed through the render error boundary, rather than
       // escaping to the generic request-level handler. Streaming body errors
