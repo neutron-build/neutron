@@ -4,7 +4,18 @@ import { renderToString } from "preact-render-to-string";
 
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { RouterContext } from "../client/contexts.js";
-import { useLocation, useParams, useSearchParams, useLoaderData } from "../client/hooks.js";
+import {
+  useLocation,
+  useParams,
+  useSearchParams,
+  useLoaderData,
+  useActionData,
+  useNavigation,
+  useNavigate,
+  useSubmit,
+  useRevalidator,
+  useMatches,
+} from "../client/hooks.js";
 import { renderAppRoute } from "./render-app-route.js";
 import type { Route, RouteMatch, RouteModule } from "./types.js";
 import type { NeutronLoaderCacheStore } from "../server/cache-store.js";
@@ -150,6 +161,74 @@ describe("renderAppRoute mounts the router contexts", () => {
     expect(html).toContain('<span id="search">?q=neutron</span>');
     expect(html).toContain('<span id="q">neutron</span>');
     expect(html).toContain('<span id="slug">hello</span>');
+  });
+});
+
+describe("the router hooks are all safe to call during SSR (A-021)", () => {
+  // useNavigation seeded useState from readNavigationState(), which reads
+  // `window` with no guard — and a useState initializer runs on the server, so
+  // the hook threw `window is not defined` and could not appear in any
+  // server-rendered component. A pending-state spinner, its most ordinary use,
+  // had to be pushed into an island.
+  it("useNavigation renders instead of throwing, and reports idle", () => {
+    function NavProbe() {
+      const nav = useNavigation();
+      return h("span", { id: "nav" }, nav.state);
+    }
+
+    const html = renderToString(
+      withRouterProviders(h as CreateElement, h(NavProbe, null), {
+        routeId: "index",
+        pathname: "/",
+        search: "",
+        params: {},
+        loaderData: {},
+        actionData: undefined,
+      })
+    );
+
+    expect(html).toContain('<span id="nav">idle</span>');
+  });
+
+  it("useNavigation is idle without a provider too, rather than throwing", () => {
+    function NavProbe() {
+      const nav = useNavigation();
+      return h("span", { id: "nav" }, nav.state);
+    }
+    expect(renderToString(h(NavProbe, null))).toContain('<span id="nav">idle</span>');
+  });
+
+  // The whole surface, so a new hook that reads `window` at render time is
+  // caught here rather than by an adopter. Effects are not a concern: they do
+  // not run during SSR.
+  it("every exported router hook renders on the server", () => {
+    const calls: Array<[string, () => unknown]> = [
+      ["useLoaderData", () => useLoaderData()],
+      ["useActionData", () => useActionData()],
+      ["useNavigation", () => useNavigation()],
+      ["useNavigate", () => useNavigate()],
+      ["useSubmit", () => useSubmit()],
+      ["useParams", () => useParams()],
+      ["useLocation", () => useLocation()],
+      ["useSearchParams", () => useSearchParams()],
+      ["useRevalidator", () => useRevalidator()],
+      ["useMatches", () => useMatches()],
+    ];
+
+    const threw: string[] = [];
+    for (const [name, call] of calls) {
+      function Probe() {
+        call();
+        return h("i", null, name);
+      }
+      try {
+        renderToString(h(Probe, null));
+      } catch (error) {
+        threw.push(`${name}: ${String(error)}`);
+      }
+    }
+
+    expect(threw).toEqual([]);
   });
 });
 

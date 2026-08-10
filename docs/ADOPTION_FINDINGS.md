@@ -71,85 +71,14 @@ Statuses verified against source on 2026-08-08.
 | A-018 | No SDK client retried a serialization failure (40001) | All SDKs | HIGH | `SPEC-GAP` | FIXED `6fd69e8`, `13d5cfd`, `f6b22b4` |
 | A-019 | Client navigation paid a round-trip on a cold click | TS routing | MED | `SPEC-GAP` | FIXED `78411c5` |
 | A-020 | Static-route `middleware` never runs when a prebuilt file exists | TS routing | HIGH | `REAL-BUG` | FIXED |
-| A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | **OPEN** |
-| A-022 | A pure-static app never loads `src/middleware.ts` at all | TS routing | MED | `REAL-BUG` | **OPEN** |
+| A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | FIXED |
+| A-022 | A pure-static app never loads `src/middleware.ts` at all | TS routing | MED | `REAL-BUG` | FIXED |
 
-Open: A-007, A-014, A-017, A-021, A-022, plus A-015 partial and A-009 deferred.
+Open: A-007, A-014, A-017, plus A-015 partial and A-009 deferred.
 
 ---
 
 # Open
-
-## A-022 — a pure-static app never loads `src/middleware.ts`, so global middleware silently does nothing
-**TypeScript / routing · MEDIUM · `REAL-BUG` · OPEN**
-
-Found while writing the A-020 request-side tests, which failed for this reason
-before the fixtures were made realistic.
-
-`createServer` starts the SSR runtime only when some route is `mode: "app"`:
-
-```ts
-const hasAppRoutes = routes.some(
-  (route) => !route.file.includes("_layout") && route.config.mode === "app"
-);
-const ssrServer = hasAppRoutes ? await createSsrServer(...) : null;
-const globalMiddleware = hasAppRoutes && ssrServer
-  ? await loadGlobalMiddleware(ssrServer, resolvedRootDir)
-  : [];
-```
-
-Global middleware is loaded *through* that runtime, so an app whose routes are
-all `mode: "static"` gets `globalMiddleware = []`. The author's
-`src/middleware.ts` is never imported, never runs, and never warns. Adding a
-single `mode: "app"` route makes it start working, which is a confusing thing
-to discover.
-
-The security-relevant reading: in a pure-static app there is **no runtime that
-can evaluate a gate at all**. That is why A-020's build-time guard carries the
-weight rather than its request-time half — refusing to prerender a gated route
-is the only protection available in that configuration.
-
-Fix options, roughly in order of preference: load `src/middleware.ts` whenever
-it exists rather than only when app routes do (it needs a module runtime, so
-this means starting one for a static-only app that has the file); or, at
-minimum, warn loudly at boot when `src/middleware.ts` is present but no runtime
-was started, so the no-op is visible. Silently ignoring a file the framework
-documents as "runs on every request" is the part that has to go.
-
-## A-021 — `useNavigation()` throws `window is not defined` during SSR
-**TypeScript / routing · MEDIUM · `REAL-BUG` · OPEN**
-
-Found while fixing A-011, and not the same defect: this one is loud, which is
-why it ranks below A-011 despite making the hook unusable outright.
-
-`useNavigation` seeds its state from `readNavigationState()`
-(`client/hooks.ts`), which reads `window.__NEUTRON_NAVIGATION_STATE__` with no
-environment guard, inside a `useState` initializer that therefore runs on the
-server:
-
-```ts
-const [state, setState] = useState<NavigationState>(() => readNavigationState());
-```
-
-Reproduction — `renderToString` of any component calling the hook:
-
-```
-ReferenceError: window is not defined
-```
-
-So `useNavigation` cannot appear in a server-rendered component at all. A
-pending-state spinner, the most ordinary use of the hook, has to be pushed into
-an island or guarded by hand.
-
-Note that A-011's fix does **not** address this. The server now mounts
-`NavigationContext` with `{ state: "idle" }`, but `useNavigation` ignores the
-context on first read and calls `readNavigationState()` unconditionally, so the
-provider is currently inert for this hook.
-
-Fix: guard the read (`typeof window === "undefined"` → fall back to the context
-value, which is now correct on the server) and let the existing
-`neutron:navigation` effect take over on the client. `"idle"` is the honest
-server answer — there is no navigation in flight during SSR.
 
 ## A-014 — English stemmer: singular and plural of the same noun never match
 **Nucleus / FTS · HIGH · `REAL-BUG` · OPEN**
@@ -656,6 +585,113 @@ Reverting either guard fails its tests. Verified no false positives against the
 never starts, so `src/middleware.ts` is never loaded and global middleware
 silently does nothing. That is also why the build-time half carries the weight
 here — a pure-static app has no runtime to evaluate a gate with.
+
+## A-022 — a pure-static app never loads `src/middleware.ts`, so global middleware silently does nothing
+**TypeScript / routing · MEDIUM · `REAL-BUG` · FIXED**
+
+Found while writing the A-020 request-side tests, which failed for this reason
+before the fixtures were made realistic.
+
+`createServer` starts the SSR runtime only when some route is `mode: "app"`:
+
+```ts
+const hasAppRoutes = routes.some(
+  (route) => !route.file.includes("_layout") && route.config.mode === "app"
+);
+const ssrServer = hasAppRoutes ? await createSsrServer(...) : null;
+const globalMiddleware = hasAppRoutes && ssrServer
+  ? await loadGlobalMiddleware(ssrServer, resolvedRootDir)
+  : [];
+```
+
+Global middleware is loaded *through* that runtime, so an app whose routes are
+all `mode: "static"` gets `globalMiddleware = []`. The author's
+`src/middleware.ts` is never imported, never runs, and never warns. Adding a
+single `mode: "app"` route makes it start working, which is a confusing thing
+to discover.
+
+The security-relevant reading: in a pure-static app there is **no runtime that
+can evaluate a gate at all**. That is why A-020's build-time guard carries the
+weight rather than its request-time half — refusing to prerender a gated route
+is the only protection available in that configuration.
+
+Fix options, roughly in order of preference: load `src/middleware.ts` whenever
+it exists rather than only when app routes do (it needs a module runtime, so
+this means starting one for a static-only app that has the file); or, at
+minimum, warn loudly at boot when `src/middleware.ts` is present but no runtime
+was started, so the no-op is visible. Silently ignoring a file the framework
+documents as "runs on every request" is the part that has to go.
+
+**Resolved 2026-08-10.** The decision to start an SSR runtime was
+`hasAppRoutes` alone; it is now `hasAppRoutes || a global middleware file
+exists`. The file is located with a plain `fs.existsSync` check
+(`findGlobalMiddlewareFile`), which needs no runtime, so its presence can
+inform the decision to create one. `loadGlobalMiddleware` now takes the
+resolved path instead of re-walking the candidate list.
+
+A static-only app with **no** middleware file is unchanged and still starts no
+runtime — the presence of the file is what changes the decision, so nobody pays
+for a runtime they have no use for.
+
+Two silent failures became loud: a middleware file present while the runtime
+could not start now warns that it will **not** run and that requests are served
+without it, and a file whose export is missing entirely now warns rather than
+only a malformed one warning.
+
+Guarded by `server/global-middleware-static-app.e2e.test.ts` (3 tests, real
+`createServer`, every route `mode: "static"`). Reverting the runtime condition
+fails the first.
+
+## A-021 — `useNavigation()` throws `window is not defined` during SSR
+**TypeScript / routing · MEDIUM · `REAL-BUG` · FIXED**
+
+Found while fixing A-011, and not the same defect: this one is loud, which is
+why it ranks below A-011 despite making the hook unusable outright.
+
+`useNavigation` seeds its state from `readNavigationState()`
+(`client/hooks.ts`), which reads `window.__NEUTRON_NAVIGATION_STATE__` with no
+environment guard, inside a `useState` initializer that therefore runs on the
+server:
+
+```ts
+const [state, setState] = useState<NavigationState>(() => readNavigationState());
+```
+
+Reproduction — `renderToString` of any component calling the hook:
+
+```
+ReferenceError: window is not defined
+```
+
+So `useNavigation` cannot appear in a server-rendered component at all. A
+pending-state spinner, the most ordinary use of the hook, has to be pushed into
+an island or guarded by hand.
+
+Note that A-011's fix does **not** address this. The server now mounts
+`NavigationContext` with `{ state: "idle" }`, but `useNavigation` ignores the
+context on first read and calls `readNavigationState()` unconditionally, so the
+provider is currently inert for this hook.
+
+Fix: guard the read (`typeof window === "undefined"` → fall back to the context
+value, which is now correct on the server) and let the existing
+`neutron:navigation` effect take over on the client. `"idle"` is the honest
+server answer — there is no navigation in flight during SSR.
+
+**Resolved 2026-08-10.** The `useState` initializer now falls back to the
+context value when `typeof window === "undefined"` instead of calling
+`readNavigationState()` unconditionally. The context is the right server answer
+anyway: navigation is a client concept, nothing is in flight during a render,
+and A-011 made the server mount `NavigationContext` as `"idle"` — so the
+provider that was inert for this hook is now what feeds it.
+
+The effect that subscribes to `neutron:navigation` needed no guard; effects do
+not run during SSR.
+
+**Checked the whole surface rather than only the reported hook.** All thirteen
+exported router hooks were rendered server-side; `useNavigation` was the only
+one that threw, so there was no sibling defect to fix. `router-providers.test.ts`
+now pins that as a standing assertion, so a new hook reading `window` at render
+time is caught here rather than by an adopter.
 
 ## A-012 — Rust Nucleus client had no table-attached FTS
 **Rust SDK · MEDIUM · `SPEC-GAP` · FIXED**

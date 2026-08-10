@@ -345,17 +345,36 @@ export async function createServer(
   const hasAppRoutes = routes.some(
     (route) => !route.file.includes("_layout") && route.config.mode === "app"
   );
-  const ssrServer = hasAppRoutes
+  // Global middleware is loaded THROUGH the SSR runtime, so the runtime has to
+  // exist for it to run at all. Deciding to start one on `hasAppRoutes` alone
+  // meant an app whose routes are all `mode: "static"` silently never loaded
+  // its src/middleware.ts — the file was not imported, did not run, and did not
+  // warn, and adding one app route made it start working. A-022.
+  //
+  // The file is found with a plain fs check, which needs no runtime, so its
+  // presence can be part of the decision to start one.
+  const globalMiddlewareFile = isSsr ? findGlobalMiddlewareFile(resolvedRootDir) : null;
+  const needsSsrRuntime = hasAppRoutes || globalMiddlewareFile !== null;
+  const ssrServer = needsSsrRuntime
     ? await createSsrServer(resolvedRootDir, resolvedRoutesDir, runtime)
     : null;
-  // Global middleware: an optional src/middleware.ts (default export = a
-  // MiddlewareFn) runs OUTERMOST, before any per-route middleware, on every
-  // app-route request. Loaded once at startup through the same SSR runtime as
-  // routes so it shares the module graph (hooks, aliases). Absent file = none.
+  // An optional src/middleware.ts (default export = a MiddlewareFn) runs
+  // OUTERMOST, before any per-route middleware. Loaded once at startup through
+  // the same SSR runtime as routes so it shares the module graph (hooks,
+  // aliases). Absent file = none.
   const globalMiddleware: MiddlewareFn[] =
-    hasAppRoutes && ssrServer
-      ? await loadGlobalMiddleware(ssrServer, resolvedRootDir)
+    globalMiddlewareFile && ssrServer
+      ? await loadGlobalMiddleware(ssrServer, globalMiddlewareFile)
       : [];
+
+  if (globalMiddlewareFile && !ssrServer) {
+    // Never fail silently here: the file documents itself as running on every
+    // request, and a gate that does not run is worse than one that is absent.
+    console.warn(
+      `Global middleware ${path.relative(resolvedRootDir, globalMiddlewareFile)} was found but ` +
+        "the SSR runtime could not be started, so it will NOT run. Requests are served without it."
+    );
+  }
   const routeModuleCache = new Map<string, Promise<RouteModule>>();
   const appResponseCacheStore =
     cache?.app || createMemoryAppCacheStore();
@@ -966,40 +985,57 @@ function routeChainIsGated(match: RouteMatch): boolean {
 // Load an optional global middleware from <rootDir>/src/middleware.ts (or
 // .js/.tsx). Returns its default export if it is a function, else null. A
 // present-but-malformed file warns and is ignored rather than crashing boot.
-async function loadGlobalMiddleware(
-  ssrServer: SsrServer,
-  rootDir: string
-): Promise<MiddlewareFn[]> {
-  const candidates = [
-    "src/middleware.ts",
-    "src/middleware.tsx",
-    "src/middleware.js",
-    "src/middleware.mjs",
-  ];
-  for (const rel of candidates) {
+const GLOBAL_MIDDLEWARE_CANDIDATES = [
+  "src/middleware.ts",
+  "src/middleware.tsx",
+  "src/middleware.js",
+  "src/middleware.mjs",
+];
+
+/**
+ * Absolute path of the app's global middleware file, or null.
+ *
+ * Split out from {@link loadGlobalMiddleware} because the answer is needed
+ * BEFORE the SSR runtime is created — its presence is part of deciding whether
+ * to create one at all. A plain fs check, so it costs nothing at boot. A-022.
+ */
+function findGlobalMiddlewareFile(rootDir: string): string | null {
+  for (const rel of GLOBAL_MIDDLEWARE_CANDIDATES) {
     const abs = path.join(rootDir, rel);
-    if (!fs.existsSync(abs)) continue;
-    try {
-      const mod = (await ssrServer.ssrLoadModule(abs)) as {
-        default?: unknown;
-        middleware?: unknown;
-      };
-      // Documented form: `export const middleware: MiddlewareFn[]`. Also
-      // accept a single function (default or named) for ergonomics.
-      const exported = mod.middleware ?? mod.default;
-      const list = normalizeMiddlewareExport(exported);
-      if (list.length === 0 && exported !== undefined) {
-        console.warn(
-          `Global middleware ${rel}: export is neither a function nor an array of functions — ignoring.`
-        );
-      }
-      return list;
-    } catch (error) {
-      console.warn(`Failed to load global middleware ${rel}: ${String(error)}`);
-      return [];
+    if (fs.existsSync(abs)) {
+      return abs;
     }
   }
-  return [];
+  return null;
+}
+
+async function loadGlobalMiddleware(
+  ssrServer: SsrServer,
+  absolutePath: string
+): Promise<MiddlewareFn[]> {
+  try {
+    const mod = (await ssrServer.ssrLoadModule(absolutePath)) as {
+      default?: unknown;
+      middleware?: unknown;
+    };
+    // Documented form: `export const middleware: MiddlewareFn[]`. Also
+    // accept a single function (default or named) for ergonomics.
+    const exported = mod.middleware ?? mod.default;
+    const list = normalizeMiddlewareExport(exported);
+    if (list.length === 0) {
+      console.warn(
+        exported === undefined
+          ? `Global middleware ${path.basename(absolutePath)}: no \`middleware\` or default export — ignoring.`
+          : `Global middleware ${path.basename(absolutePath)}: export is neither a function nor an array of functions — ignoring.`
+      );
+    }
+    return list;
+  } catch (error) {
+    console.warn(
+      `Failed to load global middleware ${path.basename(absolutePath)}: ${String(error)}`
+    );
+    return [];
+  }
 }
 
 function normalizeMiddlewareExport(exported: unknown): MiddlewareFn[] {

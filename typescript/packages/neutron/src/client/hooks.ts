@@ -45,7 +45,18 @@ export function useActionData<T = unknown>(): SerializeFrom<T> | undefined {
 
 export function useNavigation(): NavigationState {
   const contextState = useContext(NavigationContext);
-  const [state, setState] = useState<NavigationState>(() => readNavigationState());
+  // Seeded from the context on the server. `readNavigationState` reads
+  // `window`, and a `useState` initializer runs during SSR too, so calling it
+  // unconditionally threw `window is not defined` and made the hook unusable
+  // in any server-rendered component — a pending-state spinner, its most
+  // ordinary use, had to be pushed into an island. A-021.
+  //
+  // The context value is the right server answer anyway: navigation is a
+  // client concept, and the server renderer mounts NavigationContext as
+  // "idle" because nothing is in flight during a render.
+  const [state, setState] = useState<NavigationState>(() =>
+    typeof window === "undefined" ? contextState : readNavigationState()
+  );
 
   useEffect(() => {
     const handleNavigation = (event: Event) => {
