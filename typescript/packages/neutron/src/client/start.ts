@@ -93,5 +93,14 @@ export async function init(): Promise<void> {
   // Static tier: no router, no click interception, no per-navigation fetch.
   // Islands are the only interactivity a static page can declare, and they
   // hydrate from their own manifest, each lazily importing just its component.
-  initIslands();
+  //
+  // The manifest has to be handed over explicitly. This tier deliberately skips
+  // the full-tree client render, so nothing populates the component registry
+  // that hydrateIsland consults first; the manifest is the only route left to
+  // an island's chunk. Calling initIslands() bare left it undefined and every
+  // island on a fully-static app failed to resolve — silently, because a
+  // missing component only warns after its retries are exhausted.
+  // @ts-expect-error virtual module resolved by the neutron Vite plugin
+  const { islands } = await import("virtual:neutron-islands");
+  initIslands(islands as Record<string, () => Promise<unknown>>);
 }

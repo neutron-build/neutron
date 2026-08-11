@@ -203,6 +203,19 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     // already-lowered `h(Island, { component: X })` form.
     enforce: "pre",
 
+    // The client runtime imports `virtual:neutron-islands`, which only this
+    // plugin can resolve. Vite's dep optimizer pre-bundles bare-specifier
+    // imports with esbuild, which runs outside the plugin pipeline and fails
+    // the whole dev server on the unresolvable id. Excluding the runtime keeps
+    // it on Vite's own resolver, where the virtual module exists.
+    config() {
+      return {
+        optimizeDeps: {
+          exclude: ["@neutron-build/core"],
+        },
+      };
+    },
+
     async configResolved(config) {
       isBuild = config.command === "build";
       await refreshRoutes();
