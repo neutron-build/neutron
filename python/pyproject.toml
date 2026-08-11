@@ -50,14 +50,23 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["neutron"]
-# N-009 note: hatchling's default editable mode writes a .pth containing the
-# project root, so tests/ -- and any future sibling directory -- is importable
-# in the consuming application and shadows its own module of that name.
-# dev-mode-exact = true fixes that, but it emits an `editables` redirector that
-# the consuming venv must have installed, and without it neutron stops
-# importing altogether. That is a worse failure than the shadowing, so the fix
-# needs either `editables` declared as a runtime dependency or tests/ moved out
-# of the project root. Left as-is deliberately rather than half-applied.
+# A-009. Hatchling's DEFAULT editable mode writes a .pth containing the project
+# ROOT, so `tests/` -- and any future sibling of `neutron/` -- becomes importable
+# in the consuming application and can shadow its own module of that name.
+# Confirmed: from a venv with `pip install -e <this>`, `import tests` resolved to
+# Neutron's own tests package.
+#
+# dev-mode-exact writes an `import _editable_impl_neutron_py` shim instead, which
+# maps the package exactly and exposes nothing else. This was previously deferred
+# on the belief that the shim requires `editables` in the consuming venv and that
+# neutron would stop importing without it. Measured: hatchling declares
+# `editables` as a dependency OF THE EDITABLE INSTALL, so pip pulls it in
+# automatically (editables 0.6 appeared unprompted). Verified in a clean venv --
+# `neutron` imports, `import tests` raises ModuleNotFoundError.
+#
+# The one case that would still bite is an editable install done with --no-deps,
+# where the shim's dependency is skipped.
+dev-mode-exact = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

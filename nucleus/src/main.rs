@@ -67,6 +67,14 @@ enum Commands {
         #[arg(short, long, default_value = "nucleus_data")]
         data: PathBuf,
 
+        /// Path to a nucleus.toml config file. Defaults to <data-dir>/nucleus.toml.
+        /// Use this to keep configuration outside the data directory, or to point
+        /// one binary at different configs. A path given here must exist —
+        /// startup fails rather than silently falling back to defaults, because
+        /// a config that is silently ignored is worse than one that is absent.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+
         /// Use in-memory storage (no persistence). Useful for testing.
         #[arg(long)]
         memory: bool,
@@ -323,6 +331,7 @@ struct StartConfig {
     port: u16,
     host: String,
     data: PathBuf,
+    config: Option<PathBuf>,
     memory: bool,
     join: Option<String>,
     region: Option<String>,
@@ -356,6 +365,7 @@ async fn main() {
             port,
             host,
             data,
+            config,
             memory,
             join,
             region,
@@ -379,6 +389,7 @@ async fn main() {
                 port,
                 host,
                 data,
+                config,
                 memory,
                 join,
                 region,
@@ -456,6 +467,7 @@ async fn main() {
                 port: 5432,
                 host: "127.0.0.1".into(),
                 data: PathBuf::from("nucleus_data"),
+                config: None,
                 memory: false,
                 join: None,
                 region: None,
@@ -507,14 +519,29 @@ async fn cmd_start(cfg: StartConfig) {
         s3_port,
         otlp_endpoint,
         max_memory,
+        config,
     } = cfg;
-    // Load config early so we can use logging.level for tracing
-    let config_path = data.join("nucleus.toml");
+    // Load config early so we can use logging.level for tracing.
+    //
+    // An explicit --config is REQUIRED to load: if the operator named a file,
+    // silently falling back to defaults would apply a configuration they did
+    // not ask for, and the symptom (a setting that "does nothing") is the
+    // hardest kind to diagnose. The implicit <data>/nucleus.toml stays
+    // best-effort, since not having one is the normal case.
+    let explicit_config = config.is_some();
+    let config_path = config.unwrap_or_else(|| data.join("nucleus.toml"));
     let mut config = match NucleusConfig::load(&config_path) {
         Ok(cfg) => {
             // `NucleusConfig::load` already overlays NUCLEUS_* env vars.
             eprintln!("Loaded config from {}", config_path.display());
             cfg
+        }
+        Err(e) if explicit_config => {
+            eprintln!(
+                "error: could not load config file {}: {e}",
+                config_path.display()
+            );
+            std::process::exit(1);
         }
         Err(_) => {
             let mut cfg = NucleusConfig::default();

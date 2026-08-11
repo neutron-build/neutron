@@ -59,22 +59,22 @@ Statuses verified against source on 2026-08-08.
 | A-006 | No public way to get rendered markdown as a string | TS content | MED | `SPEC-GAP` | FIXED `4d9b0b0` |
 | A-007 | react-compat is the first adopter question and the answer is a hedge | TS docs | HIGH | `DOC-GAP` | **OPEN** |
 | A-008 | `/health` reports `disconnected` for a healthy Postgres | Python | MED | `REAL-BUG` | FIXED `a5f66d5` |
-| A-009 | Editable install exposes a top-level `tests` package | Python | LOW | `REAL-BUG` | **DEFERRED** |
+| A-009 | Editable install exposes a top-level `tests` package | Python | LOW | `REAL-BUG` | FIXED |
 | A-010 | `Migrator` parses `-- DOWN` but can never run it | Python | MED | `SPEC-GAP` | FIXED `a7a7d86` |
 | A-011 | `useLocation` silently returns `/` during SSR | TS routing | HIGH | `REAL-BUG` | FIXED |
 | A-012 | Rust Nucleus client had no table-attached FTS | Rust SDK | MED | `SPEC-GAP` | FIXED |
 | A-013 | `neutron-oauth` could not redeem a refresh token | Rust SDK | HIGH | `REAL-BUG` | FIXED `c06d027` |
 | A-014 | English stemmer: singular and plural never match | Nucleus FTS | HIGH | `REAL-BUG` | FIXED |
-| A-015 | `nucleus start` has no `--config` flag | Nucleus CLI | LOW | `SPEC-GAP` | **PART** |
+| A-015 | `nucleus start` has no `--config` flag | Nucleus CLI | LOW | `SPEC-GAP` | FIXED |
 | A-016 | Self-referential symlink in the repo root | Repo | LOW | `REAL-BUG` | FIXED |
-| A-017 | `target/debug` grows without bound | Repo | LOW | `SPEC-GAP` | **OPEN** |
+| A-017 | `target/debug` grows without bound | Repo | LOW | `SPEC-GAP` | FIXED |
 | A-018 | No SDK client retried a serialization failure (40001) | All SDKs | HIGH | `SPEC-GAP` | FIXED `6fd69e8`, `13d5cfd`, `f6b22b4` |
 | A-019 | Client navigation paid a round-trip on a cold click | TS routing | MED | `SPEC-GAP` | FIXED `78411c5` |
 | A-020 | Static-route `middleware` never runs when a prebuilt file exists | TS routing | HIGH | `REAL-BUG` | FIXED |
 | A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | FIXED |
 | A-022 | A pure-static app never loads `src/middleware.ts` at all | TS routing | MED | `REAL-BUG` | FIXED |
 
-Open: A-007, A-017, plus A-015 partial and A-009 deferred.
+Open: A-007.
 
 ---
 
@@ -112,93 +112,6 @@ react-day-picker, react-force-graph.
 That turns the weakest page in the docs into a differentiator — nobody publishes
 this — at a fraction of the cost of a second runtime. See the roadmap note below
 for why a second runtime is not recommended.
-
-## A-017 — `target/debug` grows without bound
-**Repo hygiene · LOW · `SPEC-GAP` · OPEN**
-
-`nucleus/target/debug` had reached **60 GB** — every profile, every dependency,
-incremental artifacts, and a separate test binary per `probe_*`, `fuzz`,
-`bench`, `compete`, and `stress` target. Nothing is wrong with it as such, but
-nothing prunes it either, and it silently became the largest thing on the disk.
-
-Worth either a documented `cargo clean` cadence or a CI job that reports it.
-Both `nucleus/target` and `rust/target` were cleared manually on 2026-08-07
-(7 GB), which is the second time this has been handled by hand.
-
-## A-015 — `nucleus start` has no `--config` flag
-**Nucleus / CLI · LOW · `SPEC-GAP` · PART**
-
-`src/config/mod.rs` has `Config::load(path)` and `from_toml`, and the config
-struct covers real knobs — `disk_readonly_free_pct`, `disk_min_free_mb`,
-`buffer_pool_size_mb`. The original finding was that `nucleus start` exposed
-none of it and never read a config file, so the only way to change a documented
-setting was to edit source and rebuild.
-
-**How this was hit:** the dev machine's disk fell below the 3% watermark and
-Nucleus correctly went read-only. The documented fix is "raise
-`storage.disk_readonly_free_pct`", and there was no way to do that. Worked
-around with `--memory`, which meant the store integration suite validated the
-executor but never the disk storage path.
-
-**Partially resolved.** `main.rs:512` now loads `<data-dir>/nucleus.toml` at
-startup and `NucleusConfig::load` overlays `NUCLEUS_*` env vars, so a documented
-setting is reachable without a rebuild. What remains is the flag itself: there
-is no `--config <path>`, so the file must live at that one derived location and
-one server cannot be pointed at an arbitrary config. Small, and only matters for
-automation that wants config outside the data directory.
-
-## A-009 — the editable install exposes a top-level `tests` package
-**Python · LOW · `REAL-BUG` · DEFERRED (deliberate, see below)**
-
-Installing the Python tier from a path checkout —
-
-```toml
-[tool.uv.sources]
-neutron-py = { path = "../Neutron/python", editable = true }
-```
-
-— puts Neutron's own `python/tests/` on `sys.path` as a top-level `tests`
-module. A consuming application with the conventional `tests/` directory then
-finds Neutron's:
-
-```
-tests/test_skeleton.py:7: in <module>
-    from tests.conftest import TEST_DATABASE_URL
-E   ImportError: cannot import name 'TEST_DATABASE_URL' from 'tests.conftest'
-    (/…/Neutron/python/tests/conftest.py)
-```
-
-The app's own `tests/conftest.py` is shadowed. Editable path installs are the
-normal setup for anyone dogfooding or contributing, so this is hit early.
-
-Cause — and it is *not* the wheel's package set, which is correctly scoped to
-`packages = ["neutron"]`. Hatchling's default editable mode writes a `.pth`
-containing the **project root**:
-
-```
-$ cat .venv/lib/python3.12/site-packages/_editable_impl_neutron_py.pth
-/Users/…/Neutron/python
-
-$ python -c "import tests; print(tests.__file__)"
-/Users/…/Neutron/python/tests/__init__.py
-```
-
-So every top-level directory next to `neutron/` — currently `tests/`, and
-anything added later — becomes importable in the consuming app. `packages`
-governs the built wheel; it does not constrain the editable path entry.
-
-**Deferred, not forgotten.** The obvious fix — `dev-mode-exact = true` under
-`[tool.hatch.build.targets.wheel]` — emits an `editables` redirector that the
-consuming venv must have installed, and without it `neutron` stops importing
-altogether. That is a worse failure than the shadowing, so it was left as-is
-rather than half-applied; the reasoning is recorded in `python/pyproject.toml`
-next to the setting. Closing it needs either `editables` declared as a runtime
-dependency or `tests/` moved out of the project root.
-
-Workaround for adopters: don't import across your own `tests` package; use
-fixtures instead.
-
----
 
 # Fixed
 
@@ -736,6 +649,126 @@ stores stemmed terms, so any English index built before this must be dropped and
 recreated or its stored terms will disagree with incoming queries — silently,
 returning fewer rows. There is no `REINDEX` statement, so it is a drop and
 create. Non-English indexes are unaffected.
+
+## A-017 — `target/debug` grows without bound
+**Repo hygiene · LOW · `SPEC-GAP` · FIXED**
+
+`nucleus/target/debug` had reached **60 GB** — every profile, every dependency,
+incremental artifacts, and a separate test binary per `probe_*`, `fuzz`,
+`bench`, `compete`, and `stress` target. Nothing is wrong with it as such, but
+nothing prunes it either, and it silently became the largest thing on the disk.
+
+Worth either a documented `cargo clean` cadence or a CI job that reports it.
+Both `nucleus/target` and `rust/target` were cleared manually on 2026-08-07
+(7 GB), which is the second time this has been handled by hand.
+
+**Resolved 2026-08-11.** `nucleus/scripts/report-build-size.sh` prints each
+target directory with a per-profile breakdown and fails past a 25 GB total
+(`CEILING_GB` overrides). It runs in the Nucleus workflow right after the build,
+so growth is visible in every log rather than discovered as a full disk. The
+cadence half is written into `nucleus/CLAUDE.md`. Measured at the time of the
+fix: 11.7 GB total, already back up from the manual 7 GB clear four days
+earlier, which is the point.
+
+## A-015 — `nucleus start` has no `--config` flag
+**Nucleus / CLI · LOW · `SPEC-GAP` · FIXED**
+
+`src/config/mod.rs` has `Config::load(path)` and `from_toml`, and the config
+struct covers real knobs — `disk_readonly_free_pct`, `disk_min_free_mb`,
+`buffer_pool_size_mb`. The original finding was that `nucleus start` exposed
+none of it and never read a config file, so the only way to change a documented
+setting was to edit source and rebuild.
+
+**How this was hit:** the dev machine's disk fell below the 3% watermark and
+Nucleus correctly went read-only. The documented fix is "raise
+`storage.disk_readonly_free_pct`", and there was no way to do that. Worked
+around with `--memory`, which meant the store integration suite validated the
+executor but never the disk storage path.
+
+**Partially resolved.** `main.rs:512` now loads `<data-dir>/nucleus.toml` at
+startup and `NucleusConfig::load` overlays `NUCLEUS_*` env vars, so a documented
+setting is reachable without a rebuild. What remains is the flag itself: there
+is no `--config <path>`, so the file must live at that one derived location and
+one server cannot be pointed at an arbitrary config. Small, and only matters for
+automation that wants config outside the data directory.
+
+**Resolved 2026-08-11.** `nucleus start --config <path>` is wired through
+`StartConfig` to the load site. An explicit path that cannot be loaded is a
+hard error with a non-zero exit, deliberately: falling back to defaults would
+apply a configuration the operator did not ask for, and "my setting does
+nothing" is the hardest symptom to diagnose. The implicit
+`<data-dir>/nucleus.toml` stays best-effort, since having no config file is the
+normal case. Verified both paths against a live server -- a config outside the
+data directory loads and is logged, a missing one exits 1 with the path named.
+
+## A-009 — the editable install exposes a top-level `tests` package
+**Python · LOW · `REAL-BUG` · FIXED**
+
+Installing the Python tier from a path checkout —
+
+```toml
+[tool.uv.sources]
+neutron-py = { path = "../Neutron/python", editable = true }
+```
+
+— puts Neutron's own `python/tests/` on `sys.path` as a top-level `tests`
+module. A consuming application with the conventional `tests/` directory then
+finds Neutron's:
+
+```
+tests/test_skeleton.py:7: in <module>
+    from tests.conftest import TEST_DATABASE_URL
+E   ImportError: cannot import name 'TEST_DATABASE_URL' from 'tests.conftest'
+    (/…/Neutron/python/tests/conftest.py)
+```
+
+The app's own `tests/conftest.py` is shadowed. Editable path installs are the
+normal setup for anyone dogfooding or contributing, so this is hit early.
+
+Cause — and it is *not* the wheel's package set, which is correctly scoped to
+`packages = ["neutron"]`. Hatchling's default editable mode writes a `.pth`
+containing the **project root**:
+
+```
+$ cat .venv/lib/python3.12/site-packages/_editable_impl_neutron_py.pth
+/Users/…/Neutron/python
+
+$ python -c "import tests; print(tests.__file__)"
+/Users/…/Neutron/python/tests/__init__.py
+```
+
+So every top-level directory next to `neutron/` — currently `tests/`, and
+anything added later — becomes importable in the consuming app. `packages`
+governs the built wheel; it does not constrain the editable path entry.
+
+**Deferred, not forgotten.** The obvious fix — `dev-mode-exact = true` under
+`[tool.hatch.build.targets.wheel]` — emits an `editables` redirector that the
+consuming venv must have installed, and without it `neutron` stops importing
+altogether. That is a worse failure than the shadowing, so it was left as-is
+rather than half-applied; the reasoning is recorded in `python/pyproject.toml`
+next to the setting. Closing it needs either `editables` declared as a runtime
+dependency or `tests/` moved out of the project root.
+
+Workaround for adopters: don't import across your own `tests` package; use
+fixtures instead.
+
+---
+
+**Resolved 2026-08-11, and the reason it was deferred did not hold.** The
+deferral said `dev-mode-exact = true` "emits an `editables` redirector that the
+consuming venv must have installed, and without it neutron stops importing
+altogether". Measured instead of assumed: hatchling declares `editables` as a
+dependency OF THE EDITABLE INSTALL, so pip resolves it automatically --
+`editables 0.6` appeared unprompted in a clean venv that had never heard of it.
+
+Verified end to end. Before: from a venv with `pip install -e python/`,
+`import tests` resolved to `/…/Neutron/python/tests/__init__.py`. After:
+`neutron` imports normally and `import tests` raises `ModuleNotFoundError`.
+The repo's own suite is unaffected (479 passed, 10 skipped).
+
+The one case that would still bite is an editable install done with
+`--no-deps`, where the shim's dependency is skipped. Recorded in
+`pyproject.toml` next to the setting.
 
 ## A-012 — Rust Nucleus client had no table-attached FTS
 **Rust SDK · MEDIUM · `SPEC-GAP` · FIXED**

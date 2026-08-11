@@ -42,6 +42,13 @@ jobs:
         run: cargo build
         working-directory: nucleus
 
+      # Reports target/ sizes on every run so growth is visible in the log, and
+      # fails past a ceiling. Nothing prunes target/; nucleus/target/debug once
+      # reached 60 GB and took a machine to zero bytes free. A-017.
+      - name: Report cargo target sizes
+        run: sh scripts/report-build-size.sh
+        working-directory: nucleus
+
       - name: Test (lib only — skips slow stress tests)
         run: cargo test --lib -q
         working-directory: nucleus

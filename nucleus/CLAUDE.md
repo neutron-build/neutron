@@ -72,4 +72,16 @@ cargo test --lib     # run all tests (~3.8k)
 cargo clippy         # lint
 sh scripts/metrics.sh         # print current metrics
 sh scripts/metrics.sh --check # validate docs match code
+sh scripts/report-build-size.sh   # target/ sizes; fails past a 25 GB total
 ```
+
+### Keep an eye on `target/`
+
+Nothing prunes it. `nucleus/target/debug` reached **60 GB** once and took a
+machine to zero bytes free — a separate test binary per `probe_*`, `fuzz`,
+`bench`, `compete` and `stress` target, times every profile, plus incremental
+artifacts. It has been cleared by hand twice. `report-build-size.sh` runs in CI
+on every nucleus build and prints the per-profile breakdown, so growth shows up
+in the log rather than as a full disk; `cargo clean` in the offending directory
+is the fix, and raising `CEILING_GB` is the answer only when the new size is
+genuinely normal.
