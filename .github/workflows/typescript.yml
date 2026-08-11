@@ -75,5 +75,16 @@ jobs:
           cache-dependency-path: typescript/pnpm-lock.yaml
       - run: pnpm install
         working-directory: typescript
+
+      # Build before typechecking. Workspace packages resolve through their
+      # published entry points (`types: dist/index.d.ts`), so on a fresh
+      # checkout `@neutron-build/ai` and `@neutron-build/nucleus` do not exist
+      # as far as tsc is concerned and neutron-workflow fails with TS2307. It
+      # passes locally only because a previous build left dist/ behind — the
+      # same shape as the neutron-ts bin symlink that install could not create.
+      # This was recorded as "blocked on publishing to npm"; it is not.
+      - run: pnpm build
+        working-directory: typescript
+
       - run: pnpm typecheck
         working-directory: typescript
