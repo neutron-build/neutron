@@ -2790,7 +2790,11 @@ impl StorageEngine for DiskEngine {
         let updates: Vec<(usize, Option<Expected>, Row)> = updates
             .iter()
             .map(|(pos, expected, new_row)| {
-                (*pos, Some(Expected::Identity(expected.clone())), new_row.clone())
+                (
+                    *pos,
+                    Some(Expected::Identity(expected.clone())),
+                    new_row.clone(),
+                )
             })
             .collect();
         self.update_at(table, updates).map(|applied| applied.len())
@@ -2806,7 +2810,11 @@ impl StorageEngine for DiskEngine {
         let updates: Vec<(usize, Option<Expected>, Row)> = updates
             .iter()
             .map(|(pos, expected, new_row)| {
-                (*pos, Some(Expected::Value(expected.clone())), new_row.clone())
+                (
+                    *pos,
+                    Some(Expected::Value(expected.clone())),
+                    new_row.clone(),
+                )
             })
             .collect();
         self.update_at(table, updates)

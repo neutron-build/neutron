@@ -2087,11 +2087,8 @@ impl Executor {
                 let Some(current) = fresh.get(&pos) else {
                     continue;
                 };
-                if !self.rls_allows_row(
-                    table_name,
-                    crate::security::PolicyCommand::Update,
-                    current,
-                ) {
+                if !self.rls_allows_row(table_name, crate::security::PolicyCommand::Update, current)
+                {
                     continue;
                 }
                 // The new value may have moved the row out of the predicate.

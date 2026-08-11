@@ -91,7 +91,8 @@ async fn increments_are_not_lost(create: &str) {
     // The stronger assertion, and the one that fails on the original bug: the
     // engine acknowledged N increments, so N increments must have happened.
     assert_eq!(
-        counter, acknowledged as i64,
+        counter,
+        acknowledged as i64,
         "{acknowledged} increments were acknowledged with `UPDATE 1` but the counter \
          reached {counter} — {} acknowledged writes were overwritten by a concurrent \
          session and silently discarded",
