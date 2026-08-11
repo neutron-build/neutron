@@ -1,0 +1,15 @@
+# Elixir sources are checked in with LF endings.
+#
+# 27 files under elixir/ were committed with CRLF. Elixir 1.20's formatter
+# tolerates that; the 1.15 the CI gate pins does not, and reported all 26 of
+# them (every one that .formatter.exs globs) as unformatted -- so
+# `mix format --check-formatted` could not pass on CI and did pass locally, on
+# the same bytes.
+#
+# Scoped deliberately. CRLF is repo-wide -- hundreds of tracked files across Go,
+# TypeScript, Python, Zig, Julia, Quint and the docs -- but no other gate
+# enforces line endings, and `* text=auto` would renormalize the whole tree on
+# everyone's next checkout. Widening this is a separate decision, not a
+# side effect of greening a gate.
+*.ex  text eol=lf
+*.exs text eol=lf
