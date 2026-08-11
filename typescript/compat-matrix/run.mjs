@@ -15,9 +15,10 @@
 // Usage:
 //   node run.mjs           # run, print, exit non-zero if a PASS regressed
 //   node run.mjs --write   # also rewrite ../docs/react-compat-matrix.md
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import process from "node:process";
 
 import { renderToString } from "preact-render-to-string";
@@ -25,6 +26,42 @@ import { renderToString } from "preact-render-to-string";
 import { CASES } from "./libraries.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+// Assert the substitution before measuring anything.
+//
+// The libraries reach preact through the file: shims; this harness renders with
+// its own preact. If those are two different copies, every hooks-using library
+// fails with "Cannot read properties of undefined (reading '__H')" and the
+// matrix reports a wall of ecosystem incompatibility that is entirely an
+// artifact of the harness. That is not hypothetical: the first published matrix
+// said 12/13 because this machine happened to have a matching preact hoisted,
+// while a clean install resolved the shims to a different version and scored
+// 1/13. A version number in a report is worth less than the identity check, so
+// do the identity check.
+function assertOnePreact() {
+  const require = createRequire(import.meta.url);
+  const versionAt = (p) => JSON.parse(readFileSync(join(p, "package.json"), "utf-8")).version;
+
+  // Resolve the way each side actually does at runtime: the shims resolve from
+  // their real location in the virtual store, not from ./shims.
+  const shimEntry = realpathSync(require.resolve("react"));
+  const shimPreact = realpathSync(createRequire(shimEntry).resolve("preact/package.json"));
+  const oursPreact = realpathSync(require.resolve("preact/package.json"));
+
+  if (shimPreact === oursPreact) return versionAt(dirname(oursPreact));
+
+  console.error("The compat shims and this harness are using different copies of preact.");
+  console.error(`  harness : ${versionAt(dirname(oursPreact))}  ${dirname(oursPreact)}`);
+  console.error(`  shims   : ${versionAt(dirname(shimPreact))}  ${dirname(shimPreact)}`);
+  console.error("");
+  console.error("Every hooks-based library will fail with `__H` of undefined, and none of");
+  console.error("those failures says anything about preact/compat. Both package.json files");
+  console.error("under compat-matrix/shims pin preact exactly for this reason -- check that");
+  console.error("the pin still matches compat-matrix/package.json, then reinstall.");
+  process.exit(2);
+}
+
+const PREACT_VERSION = assertOnePreact();
 const DOC_PATH = join(HERE, "..", "docs", "react-compat-matrix.md");
 const BASELINE_PATH = join(HERE, "baseline.json");
 const WRITE = process.argv.includes("--write");

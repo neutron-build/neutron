@@ -2,6 +2,10 @@
   "name": "react-compat-shim",
   "version": "0.0.0",
   "private": true,
+  "comment": "preact is declared, and pinned exact, on purpose. Without it this package resolved preact by walking up into pnpm's hidden hoist directory (node_modules/.pnpm/node_modules), whose contents depend on install history: a clean install put 10.28.3 there while this workspace renders with 10.25.4, which is two preact instances and every hook throwing on __H. Exact so a caret can never drift the shim off the version the harness renders with.",
+  "dependencies": {
+    "preact": "10.25.4"
+  },
   "main": "./index.cjs",
   "module": "./index.mjs",
   "exports": {

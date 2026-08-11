@@ -2,6 +2,10 @@
   "name": "react-dom-compat-shim",
   "version": "0.0.0",
   "private": true,
+  "comment": "See shims/react/package.json -- preact is declared and pinned here for the same reason.",
+  "dependencies": {
+    "preact": "10.25.4"
+  },
   "main": "./index.cjs",
   "module": "./index.mjs",
   "exports": {
