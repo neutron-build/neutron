@@ -1,0 +1,15 @@
+{
+  "radix-dialog": "PASS",
+  "radix-tabs": "PASS",
+  "radix-tooltip": "PASS",
+  "radix-popover": "PASS",
+  "radix-dropdown-menu": "PASS",
+  "radix-select": "PASS",
+  "tanstack-query": "PASS",
+  "tanstack-table": "PASS",
+  "react-hook-form": "PASS",
+  "framer-motion": "PASS",
+  "recharts": "FAIL",
+  "react-day-picker": "PASS",
+  "react-syntax-highlighter": "PASS"
+}

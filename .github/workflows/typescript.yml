@@ -50,6 +50,16 @@ jobs:
         run: node scripts/render-guards.mjs
         working-directory: typescript
 
+      # Both of these existed as scripts and neither ran in CI, while
+      # docs/react-compat.md claimed the dual-runtime lane was covered. A-007.
+      - name: Dual-runtime smoke (preact + react-compat)
+        run: pnpm run ci:runtime-compat
+        working-directory: typescript
+
+      - name: React ecosystem compatibility matrix
+        run: pnpm run ci:compat-matrix
+        working-directory: typescript
+
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest

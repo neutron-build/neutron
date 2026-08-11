@@ -2,3 +2,5 @@ packages:
   - "packages/*"
   - "apps/*"
   - "examples/*"
+  # Ecosystem compatibility harness (A-007). Never published.
+  - "compat-matrix"

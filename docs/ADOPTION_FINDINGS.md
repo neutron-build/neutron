@@ -57,7 +57,7 @@ Statuses verified against source on 2026-08-08.
 | A-004 | No 404 / not-found convention | TS routing | MED | `SPEC-GAP` | FIXED `68df2c6` |
 | A-005 | Docs import paths do not match the published package | TS docs | LOW | `DOC-GAP` | FIXED `4d9b0b0` |
 | A-006 | No public way to get rendered markdown as a string | TS content | MED | `SPEC-GAP` | FIXED `4d9b0b0` |
-| A-007 | react-compat is the first adopter question and the answer is a hedge | TS docs | HIGH | `DOC-GAP` | **OPEN** |
+| A-007 | react-compat is the first adopter question and the answer is a hedge | TS docs | HIGH | `DOC-GAP` | FIXED |
 | A-008 | `/health` reports `disconnected` for a healthy Postgres | Python | MED | `REAL-BUG` | FIXED `a5f66d5` |
 | A-009 | Editable install exposes a top-level `tests` package | Python | LOW | `REAL-BUG` | FIXED |
 | A-010 | `Migrator` parses `-- DOWN` but can never run it | Python | MED | `SPEC-GAP` | FIXED `a7a7d86` |
@@ -74,44 +74,15 @@ Statuses verified against source on 2026-08-08.
 | A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | FIXED |
 | A-022 | A pure-static app never loads `src/middleware.ts` at all | TS routing | MED | `REAL-BUG` | FIXED |
 
-Open: A-007.
+Open: none. Every finding filed so far is closed.
 
 ---
 
 # Open
 
-## A-007 — react-compat is the first question adopters ask, and the answer is a hedge
-**TypeScript / docs + positioning · HIGH · `DOC-GAP` · OPEN**
-
-`src/config.ts:4` defines exactly two runtimes:
-
-```ts
-export type NeutronRuntime = "preact" | "react-compat";
-```
-
-`react-compat` aliases `react`, `react-dom` and the JSX runtimes to Preact
-equivalents (`config.ts:137-152`). React is not a dependency of the framework
-and no config hook can swap the renderer. That design is defensible.
-
-The gap is that `docs/react-compat.md` answers the highest-stakes adoption
-question with *"usually works — verify per package in app context."* That moves
-all compatibility risk onto the evaluator, at evaluation time, on their own
-codebase — and they are typically holding a Radix-heavy React app when they ask.
-
-CI already runs a dual-runtime lane (`pnpm run ci:runtime-compat`) against
-`@neutron/playground`. That proves the **framework** works in both modes. It
-proves nothing about the **ecosystem**, which is what is actually being asked.
-
-**Suggested:** extend that existing lane into a published compatibility matrix —
-mount the top ~30 React libraries under `preact/compat` and report pass/fail per
-package per version. Hard end of the distribution first: Radix primitives
-(dialog, select, popover, dropdown-menu, tooltip, tabs), framer-motion, TanStack
-Query and Table, react-hook-form, recharts, nivo, react-syntax-highlighter,
-react-day-picker, react-force-graph.
-
-That turns the weakest page in the docs into a differentiator — nobody publishes
-this — at a fraction of the cost of a second runtime. See the roadmap note below
-for why a second runtime is not recommended.
+Nothing. Every finding filed so far has been closed — which is a statement about
+this list's coverage, not about the framework being finished. The way to change
+that is to build something on Neutron and write down what got in the way.
 
 # Fixed
 
@@ -769,6 +740,74 @@ The repo's own suite is unaffected (479 passed, 10 skipped).
 The one case that would still bite is an editable install done with
 `--no-deps`, where the shim's dependency is skipped. Recorded in
 `pyproject.toml` next to the setting.
+
+## A-007 — react-compat is the first question adopters ask, and the answer is a hedge
+**TypeScript / docs + positioning · HIGH · `DOC-GAP` · FIXED**
+
+`src/config.ts:4` defines exactly two runtimes:
+
+```ts
+export type NeutronRuntime = "preact" | "react-compat";
+```
+
+`react-compat` aliases `react`, `react-dom` and the JSX runtimes to Preact
+equivalents (`config.ts:137-152`). React is not a dependency of the framework
+and no config hook can swap the renderer. That design is defensible.
+
+The gap is that `docs/react-compat.md` answers the highest-stakes adoption
+question with *"usually works — verify per package in app context."* That moves
+all compatibility risk onto the evaluator, at evaluation time, on their own
+codebase — and they are typically holding a Radix-heavy React app when they ask.
+
+CI already runs a dual-runtime lane (`pnpm run ci:runtime-compat`) against
+`@neutron/playground`. That proves the **framework** works in both modes. It
+proves nothing about the **ecosystem**, which is what is actually being asked.
+
+**Suggested:** extend that existing lane into a published compatibility matrix —
+mount the top ~30 React libraries under `preact/compat` and report pass/fail per
+package per version. Hard end of the distribution first: Radix primitives
+(dialog, select, popover, dropdown-menu, tooltip, tabs), framer-motion, TanStack
+Query and Table, react-hook-form, recharts, nivo, react-syntax-highlighter,
+react-day-picker, react-force-graph.
+
+That turns the weakest page in the docs into a differentiator — nobody publishes
+this — at a fraction of the cost of a second runtime. See the roadmap note below
+for why a second runtime is not recommended.
+
+**Resolved 2026-08-11.** `docs/react-compat-matrix.md` is generated by mounting
+the real packages under `preact/compat` and server-rendering them
+(`typescript/compat-matrix`). `react`, `react-dom` and the JSX runtimes resolve
+through `file:` shims to `preact/compat` — the same substitution the Vite build
+makes for `runtime: "react-compat"` — because Node has no alias mechanism.
+
+**12 of 13 render**, covering the hard end first: all six Radix primitives
+(dialog, dropdown-menu, popover, select, tabs, tooltip), TanStack Query and
+Table, react-hook-form, framer-motion, react-day-picker and
+react-syntax-highlighter.
+
+**recharts is the one that does not**, and the matrix says why rather than just
+"no": it invokes its axis components outside an active render to read their
+configuration (`useChartWidth` -> `useContext` from `XAxisImpl`) and Preact's
+hooks require a current component. The workaround — render charts client-only,
+as an island — is in the row.
+
+A row says yes only if the render produced the markup it should. Empty output
+counts as a failure, because that is how a compat problem usually hides; the
+harness caught exactly that on its first run, though that one turned out to be
+the harness's own fault (a Radix `Portal` subtree has no server output under
+React either) and the case was corrected rather than the result reported.
+
+The hedge this finding was about is gone from `docs/react-compat.md`: the row
+that read *"Usually works — verify per package in app context"* now points at
+the matrix.
+
+**The premise of the finding was also wrong in one respect, and that is fixed
+too.** It said "CI already runs a dual-runtime lane... That proves the framework
+works in both modes". It does not: `ci:runtime-compat` existed as a script that
+**no workflow ever invoked**, while `docs/react-compat.md` claimed it as CI
+coverage. It passes — it had simply never been wired. Both it and the new
+`ci:compat-matrix` now run on every TypeScript workflow build, and the matrix
+lane fails if a library that previously rendered stops rendering.
 
 ## A-012 — Rust Nucleus client had no table-attached FTS
 **Rust SDK · MEDIUM · `SPEC-GAP` · FIXED**
