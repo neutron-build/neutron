@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Report the size of the cargo target directories, and fail if one crosses a
 # ceiling.
 #
@@ -17,7 +17,11 @@
 #   sh scripts/report-build-size.sh            # report, fail past the ceiling
 #   CEILING_GB=40 sh scripts/report-build-size.sh
 #   sh scripts/report-build-size.sh --report-only
-set -euo pipefail
+#
+# Every documented invocation runs this under `sh`, which on Ubuntu is dash, so
+# it stays POSIX: `set -o pipefail` is a bashism and dash exits 2 on it, which
+# is how this failed the nucleus gate the first time it ran in CI.
+set -eu
 
 CEILING_GB="${CEILING_GB:-25}"
 REPORT_ONLY=0
