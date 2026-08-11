@@ -869,6 +869,28 @@ impl StorageEngine for BufferedDiskEngine {
         self.inner.update_if_value_unchanged(table, updates).await
     }
 
+    async fn update_unique_if_value_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+        unique_col_sets: &[Vec<usize>],
+    ) -> Result<Vec<usize>, StorageError> {
+        self.lock_write(table).await?;
+        if self.is_in_txn() {
+            // In a transaction, as with the non-unique path: buffered writes are
+            // replayed at COMMIT, so nothing has moved underneath them yet.
+            let plain: Vec<(usize, Row)> = updates
+                .iter()
+                .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
+                .collect();
+            self.update(table, &plain).await?;
+            return Ok(updates.iter().map(|(pos, _, _)| *pos).collect());
+        }
+        self.inner
+            .update_unique_if_value_unchanged(table, updates, unique_col_sets)
+            .await
+    }
+
     async fn delete_if_unchanged(
         &self,
         table: &str,

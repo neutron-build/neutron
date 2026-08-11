@@ -2800,6 +2800,22 @@ impl StorageEngine for DiskEngine {
         self.update_at(table, updates).map(|applied| applied.len())
     }
 
+    /// The value-checked form of the unique path.
+    ///
+    /// This engine does not override `update_unique` — the trait default sends
+    /// it straight to `update_if_unchanged` — so the value-checked form is
+    /// likewise just `update_if_value_unchanged`. Spelled out rather than left
+    /// to the default because the default reports every position as written,
+    /// which would silently switch this path back to losing writes.
+    async fn update_unique_if_value_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+        _unique_col_sets: &[Vec<usize>],
+    ) -> Result<Vec<usize>, StorageError> {
+        self.update_if_value_unchanged(table, updates).await
+    }
+
     /// Apply each write only if the tuple still holds exactly the values the
     /// caller read. See [`StorageEngine::update_if_value_unchanged`].
     async fn update_if_value_unchanged(

@@ -333,6 +333,28 @@ pub trait StorageEngine: Send + Sync {
         self.update(table, &plain).await
     }
 
+    /// [`update_unique`](Self::update_unique) with the value check of
+    /// [`update_if_value_unchanged`](Self::update_if_value_unchanged).
+    ///
+    /// An UPDATE that changes a PRIMARY KEY or UNIQUE column goes through
+    /// `update_unique`, and it inherits the same lost-update problem: a
+    /// concurrent session can change a different column of the same row between
+    /// this statement's read and its write, and the identity check — which
+    /// compares key columns — does not notice.
+    ///
+    /// Default: delegate to `update_unique` and report every position as
+    /// written, which is exactly today's behaviour. Only an engine that can say
+    /// WHICH rows it refused should claim any of them did.
+    async fn update_unique_if_value_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+        unique_col_sets: &[Vec<usize>],
+    ) -> Result<Vec<usize>, StorageError> {
+        self.update_unique(table, updates, unique_col_sets).await?;
+        Ok(updates.iter().map(|(pos, _, _)| *pos).collect())
+    }
+
     /// Apply each write only if the row still holds exactly the values the
     /// caller read, and report the positions that were written.
     ///

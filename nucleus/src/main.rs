@@ -2296,7 +2296,15 @@ async fn cmd_start(cfg: StartConfig) {
         let peer_addr_str = peer_addr.to_string();
         metrics_ref.active_connections.inc();
         connection_tasks.spawn(async move {
-            if let Err(e) = pgwire::tokio::process_socket(socket, tls_ref, server_ref).await {
+            // Not pgwire's own `process_socket`: that one ignores Terminate and
+            // never closes the socket, so a client waiting for the close waits
+            // forever and this task's cleanup below never runs. See
+            // `wire::process_socket_closing_on_terminate` — it goes away when
+            // pgwire reaches 0.40.1.
+            if let Err(e) =
+                nucleus::wire::process_socket_closing_on_terminate(socket, tls_ref, server_ref)
+                    .await
+            {
                 tracing::error!("Connection error from {peer_addr}: {e}");
             }
             // Clean up the per-connection session state.

@@ -2037,6 +2037,7 @@ impl Executor {
         col_meta: &[ColMeta],
         selection: Option<&ast::Expr>,
         checks: ConstraintChecks,
+        unique_col_sets: Option<&[Vec<usize>]>,
     ) -> Result<usize, ExecError> {
         // Contention is resolved by re-reading, so an attempt only repeats when
         // some other session committed in the window — it is progress, not a
@@ -2046,9 +2047,20 @@ impl Executor {
 
         let mut applied_total = 0usize;
         for attempt in 0..MAX_ATTEMPTS {
-            let applied = storage
-                .update_if_value_unchanged(table_name, &pending)
-                .await?;
+            let applied = match unique_col_sets {
+                // A statement changing a PK/UNIQUE column needs the uniqueness
+                // enforced on the new values as well as the value check.
+                Some(sets) => {
+                    storage
+                        .update_unique_if_value_unchanged(table_name, &pending, sets)
+                        .await?
+                }
+                None => {
+                    storage
+                        .update_if_value_unchanged(table_name, &pending)
+                        .await?
+                }
+            };
             applied_total += applied.len();
             if applied.len() == pending.len() {
                 return Ok(applied_total);
@@ -2459,17 +2471,36 @@ impl Executor {
                     })
                     .collect()
             };
-            storage
-                .update_unique(&table_name, &verified, &unique_col_sets)
-                .await
-                .map_err(|e| match e {
-                    crate::storage::StorageError::UniqueViolation(m) => {
-                        ExecError::ConstraintViolation(format!(
-                            "duplicate key value violates unique constraint: {m}"
-                        ))
-                    }
-                    other => ExecError::Storage(other),
-                })?
+            // Same read-modify-write retry as the plain path. This branch is
+            // taken when the statement changes a PRIMARY KEY or UNIQUE column,
+            // and it lost writes the same way: a concurrent session changing a
+            // DIFFERENT column of the same row is invisible to a check that
+            // compares key columns.
+            self.update_with_rmw_retry(
+                storage.as_ref(),
+                &table_name,
+                &table_def,
+                verified,
+                &assign_targets,
+                &col_meta,
+                update.selection.as_ref(),
+                ConstraintChecks {
+                    fk: check_fk,
+                    unique: check_unique,
+                    check: has_check_constraints,
+                    enum_cols: has_enum_columns,
+                },
+                Some(&unique_col_sets),
+            )
+            .await
+            .map_err(|e| match e {
+                ExecError::Storage(crate::storage::StorageError::UniqueViolation(m)) => {
+                    ExecError::ConstraintViolation(format!(
+                        "duplicate key value violates unique constraint: {m}"
+                    ))
+                }
+                other => other,
+            })?
         } else {
             self.update_with_rmw_retry(
                 storage.as_ref(),
@@ -2485,6 +2516,7 @@ impl Executor {
                     check: has_check_constraints,
                     enum_cols: has_enum_columns,
                 },
+                None,
             )
             .await?
         };

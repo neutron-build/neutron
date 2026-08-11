@@ -3289,12 +3289,52 @@ fn decode_pg_param(
                 }))
             }
         }
+        // Textual types. Their BINARY encoding is simply the raw UTF-8 bytes,
+        // with no header and no length prefix.
+        //
+        // These have to be listed explicitly, ahead of the catch-all below,
+        // because that catch-all guesses an integer from the payload LENGTH —
+        // and a string of 2, 4 or 8 bytes is indistinguishable from an int2,
+        // int4 or int8 by that rule. It silently stored `'abcd'` as
+        // `1633837924` and `'abcdefgh'` as `7017280452245743464`, then answered
+        // `WHERE s = $1` against the mangled value, and rewrote the column that
+        // way on UPDATE. No error at any point.
+        //
+        // This is not an exotic path: Nucleus advertises VARCHAR (1043) for
+        // every TEXT column and TEXT (25) as the inference default, and asyncpg
+        // — which the Python SDK depends on — binds parameters in binary by
+        // default, as do tokio-postgres, sqlx and Postgrex.
+        //
+        // char, name, text, unknown, bpchar, varchar.
+        18 | 19 | 25 | 114 | 1042 | 1043 => Some(DecodedParam::Text(match str::from_utf8(bytes) {
+            Ok(s) => s.to_owned(),
+            Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+        })),
+        // JSONB's binary encoding is a one-byte version header (always 1)
+        // followed by the JSON text. Passing the header through produced
+        // "unexpected JSONB format: 49" for `{"a":1}` and an outright parse
+        // failure for longer documents, so binary JSONB never worked at all.
+        3802 if is_binary => {
+            let body = match bytes.split_first() {
+                Some((1, rest)) => rest,
+                // Unknown version: hand the bytes on rather than silently
+                // dropping a byte that turned out not to be a header.
+                _ => bytes,
+            };
+            Some(DecodedParam::Text(
+                String::from_utf8_lossy(body).into_owned(),
+            ))
+        }
         _ => {
             // Unknown OID. A text-format value is UTF-8 and decodes losslessly.
             // A binary-format value is NOT UTF-8 — from_utf8_lossy would mangle
             // it. Undeclared binary params are overwhelmingly fixed-width
             // integers (drivers send float/date/timestamp with their OID), so
             // decode the standard int widths; fall back to text otherwise.
+            //
+            // Only genuinely unknown OIDs reach here now. Every textual type is
+            // handled above, which is what keeps this length guess from eating
+            // strings.
             if is_binary {
                 match bytes.len() {
                     2 => Some(DecodedParam::Numeric(
@@ -3998,6 +4038,23 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value, fmt: FieldFormat) -
         }
         Value::Float64(n) => encoder.encode_field(&Some(*n)),
         Value::Text(s) => encoder.encode_field(&Some(s.as_str())),
+        // BINARY jsonb is a one-byte version header (always 1) followed by the
+        // JSON text; TEXT format is the JSON alone. Sending the text under a
+        // binary field made asyncpg read `{` as the version and raise
+        // "unexpected JSONB format: 123", so a JSONB column could not be read
+        // at all by any client that asks for binary results — asyncpg, which
+        // the Python SDK depends on, does by default.
+        //
+        // Written as raw bytes rather than a string with a leading U+0001:
+        // that would encode to the same byte, but silently, and only because
+        // UTF-8 happens to agree.
+        Value::Jsonb(v) if matches!(fmt, FieldFormat::Binary) => {
+            let json = v.to_string();
+            let mut buf = Vec::with_capacity(json.len() + 1);
+            buf.push(1u8);
+            buf.extend_from_slice(json.as_bytes());
+            encoder.encode_field(&Some(buf.as_slice()))
+        }
         Value::Jsonb(v) => encoder.encode_field(&Some(v.to_string().as_str())),
         // In TEXT format, temporal values render via Nucleus's Display, which
         // matches PostgreSQL's text form — most importantly it OMITS a
@@ -4529,6 +4586,128 @@ fn unescape_copy_text(s: &str) -> String {
         }
     }
     result
+}
+
+// ============================================================================
+// Connection loop
+// ============================================================================
+
+/// `pgwire::tokio::process_socket`, plus closing the socket when the client
+/// says it is leaving.
+///
+/// **Delete this and go back to `pgwire::tokio::process_socket` when the pgwire
+/// dependency reaches 0.40.1 or later**, which fixes this upstream
+/// (pgwire #438, "Close socket when client sends Termination", released
+/// 2026-06-06, naming asyncpg as the reporter).
+///
+/// The bug: in pgwire 0.36 `process_message` dispatches frontend messages and
+/// ends in a `_ => {}` catch-all that silently swallows `Terminate`, and the
+/// connection loop only exits when the stream yields `None` — that is, on EOF.
+/// So a client that sends Terminate and waits for the close, which is exactly
+/// what a well-behaved client does, waits forever: PostgreSQL replies to
+/// Terminate with nothing at all and simply closes the socket.
+///
+/// Measured against a virgin connection that ran no queries: PostgreSQL 17
+/// closes in 0.001 s, Nucleus never closes. `asyncpg.Connection.close()` hangs
+/// until the caller's own timeout fires, which is why `NucleusClient.close()`
+/// in the Python SDK hangs; `terminate()` returns instantly because it is a
+/// unilateral socket close.
+///
+/// The cost is not only the client-side hang. `process_socket` never returning
+/// means the per-connection cleanup after it in `main.rs` never runs, so the
+/// `max_connections` slot, the `active_connections` metric, the core-router
+/// count and the drain coordinator's in-flight guard are all pinned for as
+/// long as the abandoned socket stays open — and a shutdown with such
+/// connections parked waits out the whole drain deadline.
+///
+/// This is otherwise a faithful copy of the upstream loop (0.36.3,
+/// `src/tokio/server.rs:522-596`). Keep it that way: the only intended
+/// difference is the `Terminate` arm.
+#[cfg(feature = "server")]
+pub async fn process_socket_closing_on_terminate<H>(
+    tcp_socket: tokio::net::TcpStream,
+    tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    handlers: H,
+) -> Result<(), std::io::Error>
+where
+    H: pgwire::api::PgWireServerHandlers,
+{
+    use futures::SinkExt;
+    use pgwire::api::{ErrorHandler, PgWireConnectionState};
+    use pgwire::messages::PgWireFrontendMessage;
+    use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
+
+    // Upstream's STARTUP_TIMEOUT_MILLIS is private; same value.
+    const STARTUP_TIMEOUT_MILLIS: u64 = 60_000;
+
+    let startup_timeout =
+        tokio::time::sleep(std::time::Duration::from_millis(STARTUP_TIMEOUT_MILLIS));
+    tokio::pin!(startup_timeout);
+
+    let socket = tokio::select! {
+        _ = &mut startup_timeout => return Ok(()),
+        socket = negotiate_tls(tcp_socket, tls_acceptor) => socket?,
+    };
+    // No TLS acceptor configured but the client attempted direct TLS.
+    let Some(mut socket) = socket else {
+        return Ok(());
+    };
+
+    let startup_handler = handlers.startup_handler();
+    let simple_query_handler = handlers.simple_query_handler();
+    let extended_query_handler = handlers.extended_query_handler();
+    let copy_handler = handlers.copy_handler();
+    let cancel_handler = handlers.cancel_handler();
+    let error_handler = handlers.error_handler();
+
+    let socket = &mut socket;
+    loop {
+        let msg = if matches!(
+            socket.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        ) {
+            tokio::select! {
+                _ = &mut startup_timeout => None,
+                msg = socket.next() => msg,
+            }
+        } else {
+            socket.next().await
+        };
+
+        if let Some(Ok(msg)) = msg {
+            // ── The one line that differs from upstream ──────────────────
+            // Close rather than merely break: flush anything still buffered
+            // for this client before the FIN, then leave the loop so the
+            // caller's cleanup runs.
+            if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
+                let _ = socket.close().await;
+                break;
+            }
+
+            let is_extended_query = match socket.state() {
+                PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
+                _ => msg.is_extended_query(),
+            };
+            if let Err(mut e) = process_message(
+                msg,
+                socket,
+                startup_handler.clone(),
+                simple_query_handler.clone(),
+                extended_query_handler.clone(),
+                copy_handler.clone(),
+                cancel_handler.clone(),
+            )
+            .await
+            {
+                error_handler.on_error(socket, &mut e);
+                process_error(socket, e, is_extended_query).await?;
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
