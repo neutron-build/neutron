@@ -86,12 +86,24 @@ defmodule Neutron.Realtime.Socket do
   end
 
   def handle_info({:channel_reply, topic, payload}, state) do
-    msg = Jason.encode!(%{topic: topic, event: "phx_reply", payload: %{status: "ok", response: payload}})
+    msg =
+      Jason.encode!(%{
+        topic: topic,
+        event: "phx_reply",
+        payload: %{status: "ok", response: payload}
+      })
+
     {:push, {:text, msg}, state}
   end
 
   def handle_info({:channel_error, topic, payload}, state) do
-    msg = Jason.encode!(%{topic: topic, event: "phx_reply", payload: %{status: "error", response: payload}})
+    msg =
+      Jason.encode!(%{
+        topic: topic,
+        event: "phx_reply",
+        payload: %{status: "error", response: payload}
+      })
+
     {:push, {:text, msg}, state}
   end
 
@@ -124,11 +136,12 @@ defmodule Neutron.Realtime.Socket do
   defp handle_event(topic, "phx_join", payload, state) do
     case find_channel(topic, state.channels) do
       nil ->
-        reply = Jason.encode!(%{
-          topic: topic,
-          event: "phx_reply",
-          payload: %{status: "error", response: %{reason: "no channel for topic"}}
-        })
+        reply =
+          Jason.encode!(%{
+            topic: topic,
+            event: "phx_reply",
+            payload: %{status: "error", response: %{reason: "no channel for topic"}}
+          })
 
         {:push, {:text, reply}, state}
 
@@ -144,8 +157,7 @@ defmodule Neutron.Realtime.Socket do
           try do
             DynamicSupervisor.start_child(
               Neutron.Realtime.Supervisor,
-              {channel_module,
-               topic: topic, params: payload, transport_pid: self()}
+              {channel_module, topic: topic, params: payload, transport_pid: self()}
             )
           rescue
             e -> {:error, Exception.message(e)}
@@ -157,31 +169,34 @@ defmodule Neutron.Realtime.Socket do
           {:ok, pid} ->
             joined = Map.put(state.joined, topic, pid)
 
-            reply = Jason.encode!(%{
-              topic: topic,
-              event: "phx_reply",
-              payload: %{status: "ok", response: %{}}
-            })
+            reply =
+              Jason.encode!(%{
+                topic: topic,
+                event: "phx_reply",
+                payload: %{status: "ok", response: %{}}
+              })
 
             {:push, {:text, reply}, %{state | joined: joined}}
 
           {:error, {:join_rejected, reason}} ->
-            reply = Jason.encode!(%{
-              topic: topic,
-              event: "phx_reply",
-              payload: %{status: "error", response: reason}
-            })
+            reply =
+              Jason.encode!(%{
+                topic: topic,
+                event: "phx_reply",
+                payload: %{status: "error", response: reason}
+              })
 
             {:push, {:text, reply}, state}
 
           {:error, reason} ->
             Logger.error("Channel join failed: #{inspect(reason)}")
 
-            reply = Jason.encode!(%{
-              topic: topic,
-              event: "phx_reply",
-              payload: %{status: "error", response: %{reason: "join failed"}}
-            })
+            reply =
+              Jason.encode!(%{
+                topic: topic,
+                event: "phx_reply",
+                payload: %{status: "error", response: %{reason: "join failed"}}
+              })
 
             {:push, {:text, reply}, state}
         end
@@ -196,11 +211,12 @@ defmodule Neutron.Realtime.Socket do
       {pid, joined} ->
         if Process.alive?(pid), do: GenServer.stop(pid, :normal)
 
-        reply = Jason.encode!(%{
-          topic: topic,
-          event: "phx_reply",
-          payload: %{status: "ok", response: %{}}
-        })
+        reply =
+          Jason.encode!(%{
+            topic: topic,
+            event: "phx_reply",
+            payload: %{status: "ok", response: %{}}
+          })
 
         {:push, {:text, reply}, %{state | joined: joined}}
     end
@@ -209,11 +225,12 @@ defmodule Neutron.Realtime.Socket do
   defp handle_event(topic, event, payload, state) do
     case Map.get(state.joined, topic) do
       nil ->
-        reply = Jason.encode!(%{
-          topic: topic,
-          event: "phx_reply",
-          payload: %{status: "error", response: %{reason: "not joined"}}
-        })
+        reply =
+          Jason.encode!(%{
+            topic: topic,
+            event: "phx_reply",
+            payload: %{status: "error", response: %{reason: "not joined"}}
+          })
 
         {:push, {:text, reply}, state}
 

@@ -189,8 +189,8 @@ defmodule Neutron.MiddlewareExtendedTest do
   describe "Neutron.Middleware (the assembled pipeline)" do
     defmodule PipelineRouter do
       use Plug.Router
-      plug :match
-      plug :dispatch
+      plug(:match)
+      plug(:dispatch)
 
       get "/ping" do
         send_resp(conn, 200, "pong")
@@ -244,8 +244,8 @@ defmodule Neutron.MiddlewareExtendedTest do
   describe "Neutron.Middleware.Dispatch" do
     defmodule TestRouter do
       use Plug.Router
-      plug :match
-      plug :dispatch
+      plug(:match)
+      plug(:dispatch)
 
       get "/hello" do
         send_resp(conn, 200, "world")

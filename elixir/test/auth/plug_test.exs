@@ -54,7 +54,10 @@ defmodule Neutron.Auth.PlugTest do
         |> AuthPlug.call(opts)
 
       refute conn.halted
-      assert conn.assigns[:current_user]["user_id"] == 42 || conn.assigns[:current_user][:user_id] == 42
+
+      assert conn.assigns[:current_user]["user_id"] == 42 ||
+               conn.assigns[:current_user][:user_id] == 42
+
       assert conn.assigns[:auth_token] == token
     end
 

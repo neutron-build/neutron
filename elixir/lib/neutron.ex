@@ -77,9 +77,7 @@ defmodule Neutron do
     router = Keyword.fetch!(opts, :router)
 
     plug =
-      {Neutron.Middleware,
-       router: router,
-       nucleus: Keyword.get(opts, :nucleus)}
+      {Neutron.Middleware, router: router, nucleus: Keyword.get(opts, :nucleus)}
 
     %{
       id: __MODULE__,

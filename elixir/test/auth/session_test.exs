@@ -193,11 +193,15 @@ defmodule Neutron.Auth.SessionSweeperTest do
     {:ok, pid} = SessionSweeper.start_link(name: :"sweeper_#{System.unique_integer([:positive])}")
 
     # Insert an expired session
-    :ets.insert(:neutron_sessions, {"expired-1", %{
-      data: %{user_id: 1},
-      created_at: 0,
-      expires_at: 0
-    }})
+    :ets.insert(
+      :neutron_sessions,
+      {"expired-1",
+       %{
+         data: %{user_id: 1},
+         created_at: 0,
+         expires_at: 0
+       }}
+    )
 
     # Send sweep manually
     send(pid, :sweep)

@@ -28,7 +28,6 @@ defmodule Neutron.Cache do
   """
 
   use GenServer
-  require Logger
 
   @ets_table :neutron_cache
   @kv_prefix "neutron:cache:"
@@ -255,13 +254,17 @@ defmodule Neutron.Cache do
       _pid ->
         try do
           case Nucleus.Models.KV.get(Nucleus.Client, "#{@kv_prefix}#{key}") do
-            {:ok, nil} -> :miss
+            {:ok, nil} ->
+              :miss
+
             {:ok, json} ->
               case Jason.decode(json) do
                 {:ok, value} -> {:ok, value}
                 _ -> :miss
               end
-            _ -> :miss
+
+            _ ->
+              :miss
           end
         rescue
           _ -> :miss

@@ -9,7 +9,10 @@ defmodule Neutron.MiddlewareTest do
         |> Neutron.Middleware.RequestId.call([])
 
       [request_id] = get_resp_header(conn, "x-request-id")
-      assert request_id =~ ~r/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+      assert request_id =~
+               ~r/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
       assert conn.assigns[:request_id] == request_id
     end
 

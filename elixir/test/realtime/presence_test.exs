@@ -15,14 +15,31 @@ defmodule Neutron.Realtime.PresenceExpandedTest do
 
     # Start a fresh Presence server
     case Process.whereis(Presence) do
-      nil -> :ok
-      pid -> GenServer.stop(pid)
+      nil ->
+        :ok
+
+      # Same race as the on_exit below: `whereis` can hand back a pid that is
+      # already exiting, and the stop then kills the test rather than the server.
+      pid ->
+        try do
+          GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
     end
 
     {:ok, pid} = Presence.start_link([])
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      # `Process.alive?` is a check, not a guarantee: the process can exit between
+      # it and the stop call, and `GenServer.stop` then exits the TEST with
+      # `:noproc`. That raced the whole suite -- a different test failed on each
+      # run, always in teardown, never in the assertion it was named for.
+      try do
+        if Process.alive?(pid), do: GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
     end)
 
     :ok

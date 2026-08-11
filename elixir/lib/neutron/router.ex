@@ -83,8 +83,8 @@ defmodule Neutron.Router do
   defmacro scope(prefix, do: block) do
     quote do
       # Store the current scope prefix
-      @neutron_scope_prefix (Module.get_attribute(__MODULE__, :neutron_scope_prefix, "") <>
-                               unquote(prefix))
+      @neutron_scope_prefix Module.get_attribute(__MODULE__, :neutron_scope_prefix, "") <>
+                              unquote(prefix)
 
       unquote(rewrite_routes(block, prefix))
 
@@ -119,7 +119,8 @@ defmodule Neutron.Router do
   defp rewrite_routes({:__block__, meta, statements}, prefix) do
     rewritten =
       Enum.map(statements, fn
-        {method, m, [path | rest]} when method in [:get, :post, :put, :patch, :delete, :options] ->
+        {method, m, [path | rest]}
+        when method in [:get, :post, :put, :patch, :delete, :options] ->
           new_path =
             quote do
               unquote(prefix) <> unquote(path)

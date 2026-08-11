@@ -23,7 +23,6 @@ defmodule Neutron.Realtime.Presence do
   """
 
   use GenServer
-  require Logger
 
   @table :neutron_presence
   @heartbeat_interval 30_000

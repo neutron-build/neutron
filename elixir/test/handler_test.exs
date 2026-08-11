@@ -36,11 +36,12 @@ defmodule Neutron.HandlerTest do
 
     @impl true
     def handle(_conn, _params) do
-      {:ok, %{
-        status: 201,
-        body: %{created: true},
-        headers: [{"x-custom", "value"}]
-      }}
+      {:ok,
+       %{
+         status: 201,
+         body: %{created: true},
+         headers: [{"x-custom", "value"}]
+       }}
     end
   end
 

@@ -85,17 +85,19 @@ defmodule Neutron.CacheTest do
     test "returns cached value if present" do
       Cache.put("fetch_key", "cached")
 
-      result = Cache.fetch("fetch_key", fn ->
-        {:ok, "computed"}
-      end)
+      result =
+        Cache.fetch("fetch_key", fn ->
+          {:ok, "computed"}
+        end)
 
       assert {:ok, "cached"} = result
     end
 
     test "computes and caches value if not present" do
-      result = Cache.fetch("compute_key", fn ->
-        {:ok, "computed_value"}
-      end)
+      result =
+        Cache.fetch("compute_key", fn ->
+          {:ok, "computed_value"}
+        end)
 
       assert {:ok, "computed_value"} = result
       # Should now be cached
@@ -103,18 +105,23 @@ defmodule Neutron.CacheTest do
     end
 
     test "passes through compute errors without caching" do
-      result = Cache.fetch("error_key", fn ->
-        {:error, :db_down}
-      end)
+      result =
+        Cache.fetch("error_key", fn ->
+          {:error, :db_down}
+        end)
 
       assert {:error, :db_down} = result
       assert {:error, :not_found} = Cache.get("error_key")
     end
 
     test "respects TTL option" do
-      Cache.fetch("ttl_fetch", fn ->
-        {:ok, "value"}
-      end, ttl: 60)
+      Cache.fetch(
+        "ttl_fetch",
+        fn ->
+          {:ok, "value"}
+        end,
+        ttl: 60
+      )
 
       [{_, _, expires_at}] = :ets.lookup(:neutron_cache, "ttl_fetch")
       assert is_integer(expires_at)

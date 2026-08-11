@@ -6,8 +6,17 @@ defmodule Neutron.Jobs.QueueTest do
   setup do
     # Start a fresh job queue for each test
     case Process.whereis(Queue) do
-      nil -> :ok
-      pid -> GenServer.stop(pid)
+      nil ->
+        :ok
+
+      # Same race as the on_exit below: `whereis` can hand back a pid that is
+      # already exiting, and the stop then kills the test rather than the server.
+      pid ->
+        try do
+          GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
     end
 
     # Start TaskSupervisor if not running
@@ -17,8 +26,17 @@ defmodule Neutron.Jobs.QueueTest do
     end
 
     {:ok, pid} = Queue.start_link([])
+
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      # `Process.alive?` is a check, not a guarantee: the process can exit between
+      # it and the stop call, and `GenServer.stop` then exits the TEST with
+      # `:noproc`. That raced the whole suite -- a different test failed on each
+      # run, always in teardown, never in the assertion it was named for.
+      try do
+        if Process.alive?(pid), do: GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
     end)
 
     :ok
@@ -196,8 +214,8 @@ defmodule Neutron.Jobs.WorkerTest do
 
   test "defines the perform/1 callback" do
     # `function_exported?/3` is false for a module that is not loaded yet.
-      Code.ensure_loaded(Neutron.TestWorker)
-      assert function_exported?(Neutron.TestWorker, :perform, 1)
+    Code.ensure_loaded(Neutron.TestWorker)
+    assert function_exported?(Neutron.TestWorker, :perform, 1)
   end
 
   test "worker performs successfully" do

@@ -107,11 +107,12 @@ defmodule Neutron.Realtime.SocketTest do
       {:ok, state} = Socket.init(%{channels: %{"room:*" => SomeModule}})
       # The find_channel function is private, but we can test it through
       # a phx_join event that attempts channel lookup
-      msg = Jason.encode!(%{
-        "topic" => "room:lobby",
-        "event" => "phx_join",
-        "payload" => %{}
-      })
+      msg =
+        Jason.encode!(%{
+          "topic" => "room:lobby",
+          "event" => "phx_join",
+          "payload" => %{}
+        })
 
       # This will fail because DynamicSupervisor isn't running,
       # but it will show that the pattern matched (not "no channel for topic")
@@ -127,11 +128,13 @@ defmodule Neutron.Realtime.SocketTest do
 
     test "returns error for unmatched topic" do
       {:ok, state} = Socket.init(%{channels: %{"chat:*" => SomeModule}})
-      msg = Jason.encode!(%{
-        "topic" => "room:lobby",
-        "event" => "phx_join",
-        "payload" => %{}
-      })
+
+      msg =
+        Jason.encode!(%{
+          "topic" => "room:lobby",
+          "event" => "phx_join",
+          "payload" => %{}
+        })
 
       result = Socket.handle_in({msg, opcode: :text}, state)
       assert {:push, {:text, reply}, _state} = result
@@ -155,6 +158,7 @@ defmodule Neutron.Realtime.ChannelBroadcastTest do
       case Process.whereis(Neutron.Realtime.Registry) do
         nil ->
           {:ok, _} = Registry.start_link(keys: :duplicate, name: Neutron.Realtime.Registry)
+
         _ ->
           :ok
       end
@@ -181,6 +185,7 @@ defmodule Neutron.Realtime.ChannelBroadcastTest do
       case Process.whereis(Neutron.Realtime.Registry) do
         nil ->
           {:ok, _} = Registry.start_link(keys: :duplicate, name: Neutron.Realtime.Registry)
+
         _ ->
           :ok
       end
@@ -216,20 +221,38 @@ defmodule Neutron.Realtime.PresenceTest do
     case Process.whereis(Neutron.Realtime.Registry) do
       nil ->
         {:ok, _} = Registry.start_link(keys: :duplicate, name: Neutron.Realtime.Registry)
+
       _ ->
         :ok
     end
 
     # Start a fresh Presence server
     case Process.whereis(Presence) do
-      nil -> :ok
-      pid -> GenServer.stop(pid)
+      nil ->
+        :ok
+
+      # Same race as the on_exit below: `whereis` can hand back a pid that is
+      # already exiting, and the stop then kills the test rather than the server.
+      pid ->
+        try do
+          GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
     end
 
     {:ok, pid} = Presence.start_link([])
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      # `Process.alive?` is a check, not a guarantee: the process can exit between
+      # it and the stop call, and `GenServer.stop` then exits the TEST with
+      # `:noproc`. That raced the whole suite -- a different test failed on each
+      # run, always in teardown, never in the assertion it was named for.
+      try do
+        if Process.alive?(pid), do: GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
     end)
 
     :ok
@@ -332,12 +355,14 @@ defmodule Neutron.Realtime.PresenceTest do
       topic = "room:monitor:#{System.unique_integer()}"
 
       # Spawn a process that tracks itself
-      pid = spawn(fn ->
-        Presence.track(topic, "temp_user", %{name: "Temp"})
-        receive do
-          :stop -> :ok
-        end
-      end)
+      pid =
+        spawn(fn ->
+          Presence.track(topic, "temp_user", %{name: "Temp"})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
 
       Process.sleep(50)
       assert Presence.count(topic) == 1

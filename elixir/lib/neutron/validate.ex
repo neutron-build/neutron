@@ -159,8 +159,13 @@ defmodule Neutron.Validate do
     key = to_string(field)
 
     case Map.get(v.data, key) do
-      nil -> v
-      val -> if val in values, do: v, else: add_error(v, key, "must be one of: #{inspect(values)}", val)
+      nil ->
+        v
+
+      val ->
+        if val in values,
+          do: v,
+          else: add_error(v, key, "must be one of: #{inspect(values)}", val)
     end
   end
 

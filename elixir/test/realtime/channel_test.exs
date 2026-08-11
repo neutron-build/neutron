@@ -200,7 +200,15 @@ defmodule Neutron.Realtime.ChannelTest do
         )
 
       on_exit(fn ->
-        if Process.alive?(pid), do: GenServer.stop(pid, :normal)
+        # `Process.alive?` is a check, not a guarantee: the process can exit between
+        # it and the stop call, and `GenServer.stop` then exits the TEST with
+        # `:noproc`. That raced the whole suite -- a different test failed on each
+        # run, always in teardown, never in the assertion it was named for.
+        try do
+          if Process.alive?(pid), do: GenServer.stop(pid, :normal)
+        catch
+          :exit, _ -> :ok
+        end
       end)
 
       {:ok, pid: pid, topic: topic}
@@ -403,13 +411,27 @@ defmodule Neutron.Realtime.ChannelTest do
 
   describe "assign/3" do
     test "sets a key-value pair in socket assigns" do
-      socket = %{assigns: %{}, topic: "t", transport_pid: self(), channel: AcceptChannel, serializer: Jason}
+      socket = %{
+        assigns: %{},
+        topic: "t",
+        transport_pid: self(),
+        channel: AcceptChannel,
+        serializer: Jason
+      }
+
       updated = AcceptChannel.assign(socket, :user_id, 42)
       assert updated.assigns.user_id == 42
     end
 
     test "overwrites existing assign" do
-      socket = %{assigns: %{name: "old"}, topic: "t", transport_pid: self(), channel: AcceptChannel, serializer: Jason}
+      socket = %{
+        assigns: %{name: "old"},
+        topic: "t",
+        transport_pid: self(),
+        channel: AcceptChannel,
+        serializer: Jason
+      }
+
       updated = AcceptChannel.assign(socket, :name, "new")
       assert updated.assigns.name == "new"
     end

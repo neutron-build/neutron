@@ -80,7 +80,8 @@ defmodule Nucleus.Repo do
   end
 
   @doc "Inserts a row and returns the result."
-  @spec insert(Nucleus.Client.t(), String.t(), map()) :: {:ok, Postgrex.Result.t()} | {:error, term()}
+  @spec insert(Nucleus.Client.t(), String.t(), map()) ::
+          {:ok, Postgrex.Result.t()} | {:error, term()}
   def insert(client, table, data) when is_map(data) do
     unless valid_identifier?(table), do: raise(ArgumentError, "Invalid table name: #{table}")
 
@@ -160,7 +161,12 @@ defmodule Nucleus.Repo do
 
   # --- Internal ---
 
-  defp build_where([], _start_idx \\ 1), do: {"", []}
+  # The default lives on a header rather than on the first clause: declaring it
+  # on one clause of a multi-clause function is ambiguous about which arity the
+  # default belongs to, which is why Elixir warns.
+  defp build_where(conditions, start_idx \\ 1)
+
+  defp build_where([], _start_idx), do: {"", []}
 
   defp build_where(conditions, start_idx) when is_list(conditions) do
     {clauses, params, _idx} =

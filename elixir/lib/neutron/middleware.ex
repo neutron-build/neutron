@@ -1,4 +1,3 @@
-
 # =============================================================================
 # Layer 1: Request ID
 # =============================================================================
@@ -272,30 +271,31 @@ defmodule Neutron.Middleware.Timeout do
 
     # Spawn a watcher that will terminate the request handler on timeout.
     # If the request completes in time, register_before_send kills the watcher.
-    watcher = spawn(fn ->
-      ref = Process.monitor(caller)
+    watcher =
+      spawn(fn ->
+        ref = Process.monitor(caller)
 
-      receive do
-        {:DOWN, ^ref, :process, ^caller, _} ->
-          # Request handler exited before timeout — nothing to do.
-          :ok
-      after
-        timeout_ms ->
-          Logger.warning("Request timeout after #{timeout_ms}ms",
-            path: conn.request_path,
-            method: conn.method,
-            request_id: conn.assigns[:request_id]
-          )
+        receive do
+          {:DOWN, ^ref, :process, ^caller, _} ->
+            # Request handler exited before timeout — nothing to do.
+            :ok
+        after
+          timeout_ms ->
+            Logger.warning("Request timeout after #{timeout_ms}ms",
+              path: conn.request_path,
+              method: conn.method,
+              request_id: conn.assigns[:request_id]
+            )
 
-          :telemetry.execute(
-            [:neutron, :request, :timeout],
-            %{timeout_ms: timeout_ms},
-            %{method: conn.method, path: conn.request_path}
-          )
+            :telemetry.execute(
+              [:neutron, :request, :timeout],
+              %{timeout_ms: timeout_ms},
+              %{method: conn.method, path: conn.request_path}
+            )
 
-          Process.exit(caller, :kill)
-      end
-    end)
+            Process.exit(caller, :kill)
+        end
+      end)
 
     conn
     |> Plug.Conn.assign(:request_deadline, deadline)
@@ -361,7 +361,11 @@ defmodule Neutron.Middleware.OTel do
       trace_id: trace_id
     }
 
-    :telemetry.execute([:neutron, :request, :start], %{system_time: System.system_time()}, metadata)
+    :telemetry.execute(
+      [:neutron, :request, :start],
+      %{system_time: System.system_time()},
+      metadata
+    )
 
     conn
     |> Plug.Conn.put_resp_header("x-trace-id", trace_id)
@@ -390,7 +394,7 @@ defmodule Neutron.Middleware.Dispatch do
   @behaviour Plug
 
   # Deliberately does NOT validate `:router` here: the router arrives at
-  # RUNTIME, forwarded from `Neutron.Middleware`'s `builder_opts()`, so there
+  # RUNTIME, forwarded by `Neutron.Middleware`'s `copy_opts_to_assign`, so there
   # is nothing to validate when `init/1` runs. A genuinely absent router still
   # raises from `call/2`.
   @impl true
@@ -398,7 +402,16 @@ defmodule Neutron.Middleware.Dispatch do
 
   @impl true
   def call(conn, opts) do
-    router = Keyword.fetch!(opts, :router)
+    # Options passed directly win, so mounting this plug on its own still works;
+    # inside the Neutron pipeline they arrive in the assign instead, because a
+    # bare `plug` is initialised at compile time with `[]`.
+    runtime_opts = Map.get(conn.assigns, :neutron_pipeline_opts, [])
+
+    router =
+      Keyword.get_lazy(opts, :router, fn ->
+        Keyword.fetch!(List.wrap(runtime_opts), :router)
+      end)
+
     router.call(conn, router.init([]))
   end
 end
@@ -423,13 +436,33 @@ defmodule Neutron.ETS.Manager do
 
   @impl true
   def init(_) do
-    :ets.new(:neutron_rate_limit, [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
-    :ets.new(:neutron_cache, [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
-    :ets.new(:neutron_sessions, [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
+    :ets.new(:neutron_rate_limit, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
+    :ets.new(:neutron_cache, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
+    :ets.new(:neutron_sessions, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
     {:ok, %{}}
   end
 end
-
 
 # =============================================================================
 # Layer 10 pipeline — defined LAST, deliberately.
@@ -461,36 +494,42 @@ defmodule Neutron.Middleware do
   Each layer can be configured individually.
   """
 
-  use Plug.Builder
+  # `copy_opts_to_assign` is the supported replacement for the deprecated
+  # `builder_opts()`. It does the same load-bearing job: `Plug.Builder` resolves
+  # a bare `plug Mod` at COMPILE time by calling `Mod.init([])`, so the
+  # pipeline's own RUNTIME options never reach the plug. Dispatch needs
+  # `:router`, which `Neutron.child_spec/1` supplies at runtime. This copies the
+  # runtime options into `conn.assigns.neutron_pipeline_opts`, where Dispatch
+  # reads them.
+  use Plug.Builder, copy_opts_to_assign: :neutron_pipeline_opts
   require Logger
 
   # Layer 1: Request ID
-  plug Neutron.Middleware.RequestId
+  plug(Neutron.Middleware.RequestId)
   # Layer 2: Logger
-  plug Neutron.Middleware.RequestLogger
+  plug(Neutron.Middleware.RequestLogger)
   # Layer 3: Recovery (exception handler)
-  plug Neutron.Middleware.Recovery
+  plug(Neutron.Middleware.Recovery)
   # Layer 4: CORS
-  plug Neutron.Middleware.Cors
+  plug(Neutron.Middleware.Cors)
   # Layer 5: Compression
-  plug Plug.Head
+  plug(Plug.Head)
   # Layer 6: Rate Limiting
-  plug Neutron.Middleware.RateLimit
+  plug(Neutron.Middleware.RateLimit)
   # Layer 8: Request Timeout
-  plug Neutron.Middleware.Timeout
+  plug(Neutron.Middleware.Timeout)
   # Layer 9: OTel tracing
-  plug Neutron.Middleware.OTel
+  plug(Neutron.Middleware.OTel)
   # Layer 10: Router dispatch (calls into user's router).
   #
-  # `builder_opts()` is load-bearing. `Plug.Builder` resolves a bare `plug Mod`
-  # at COMPILE time by calling `Mod.init([])`, and the pipeline's own runtime
-  # options are never handed to it. Dispatch therefore received `[]` on every
-  # request and raised `KeyError` on `:router` — for the exact plug
-  # `Neutron.child_spec/1` gives Bandit, so every request through an assembled
-  # server 500'd. `builder_opts()` forwards the options passed to
-  # `Neutron.Middleware.call/2` (where `child_spec/1` puts `:router`) down to
-  # this plug.
-  plug Neutron.Middleware.Dispatch, builder_opts()
+  # Forwarding the pipeline's runtime options to this plug is load-bearing: a
+  # bare `plug Mod` is resolved at COMPILE time via `Mod.init([])`, so without
+  # forwarding Dispatch received `[]` on every request and raised `KeyError` on
+  # `:router` — for the exact plug `Neutron.child_spec/1` gives Bandit, so every
+  # request through an assembled server 500'd. The forwarding now happens via
+  # `copy_opts_to_assign` on `use Plug.Builder` above (`builder_opts()` is
+  # deprecated); Dispatch reads `:router` out of that assign.
+  plug(Neutron.Middleware.Dispatch)
 
   @doc false
   def init(opts) do

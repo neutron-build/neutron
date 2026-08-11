@@ -89,9 +89,11 @@ defmodule Neutron.OpenAPITest do
     end
 
     test "accepts custom servers" do
-      spec = OpenAPI.generate(TestRouter,
-        servers: [%{"url" => "https://api.example.com"}]
-      )
+      spec =
+        OpenAPI.generate(TestRouter,
+          servers: [%{"url" => "https://api.example.com"}]
+        )
+
       assert hd(spec["servers"])["url"] == "https://api.example.com"
     end
 
