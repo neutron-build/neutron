@@ -18,7 +18,13 @@ defmodule Neutron.Error do
       }
   """
 
-  @derive Jason.Encoder
+  # No `@derive Jason.Encoder` here: the explicit `defimpl` at the bottom of this
+  # file defines the same module, so the two were a duplicate definition of
+  # `Jason.Encoder.Neutron.Error`. The defimpl won silently and the derive only
+  # produced a "redefining module" warning — which fails CI under
+  # `--warnings-as-errors`. The defimpl is the one to keep: it goes through
+  # `to_map/1`, so a nil `instance`/`errors` is omitted rather than serialized
+  # as JSON null, which is what RFC 7807 asks for and what `send_error/2` sends.
   defstruct [:type, :title, :status, :detail, :instance, :errors]
 
   @type validation_error :: %{

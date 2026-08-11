@@ -32,6 +32,17 @@ jobs:
           key: elixir-${{ hashFiles('elixir/mix.lock') }}
           restore-keys: elixir-
 
+      # The cache keeps compiled DEPENDENCIES, which is the slow part. It must
+      # not keep a build of this project: `restore-keys: elixir-` matches an
+      # older cache whenever mix.lock is unchanged, so `_build/*/lib/neutron`
+      # arrives holding beams from a different revision of the source. Mix then
+      # recompiles those files with the stale modules already loaded, which is
+      # the "redefining module" warning that fails --warnings-as-errors here and
+      # never reproduces on a clean checkout.
+      - name: Drop any cached build of this project
+        working-directory: elixir
+        run: rm -rf _build/*/lib/neutron
+
       - name: Install dependencies
         working-directory: elixir
         run: mix deps.get
