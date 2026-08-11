@@ -19,7 +19,7 @@
   ],
   "type": "module",
   "bin": {
-    "neutron-ts": "./dist/index.js"
+    "neutron-ts": "./bin/neutron-ts.mjs"
   },
   "exports": {
     ".": {
@@ -28,6 +28,7 @@
     }
   },
   "files": [
+    "bin",
     "dist",
     "!dist/**/*.test.*"
   ],

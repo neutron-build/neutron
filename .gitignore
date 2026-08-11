@@ -128,6 +128,10 @@ mojo/specs/
 # Site build output (source is tracked, dist is not)
 typescript/apps/site/dist/
 typescript/apps/site/.neutron/
+# Same for the playground: .neutron/runtime/entry.node.ts is emitted by
+# `neutron-ts build`, so a tracked copy goes stale the moment the codegen
+# changes and dirties the tree on every build.
+typescript/apps/playground/.neutron/
 
 # Claude internal
 .claude/

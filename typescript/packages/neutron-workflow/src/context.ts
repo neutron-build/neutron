@@ -198,11 +198,17 @@ export class ReplayContext implements WorkflowContext {
       return await Promise.race([
         Promise.resolve().then(fn),
         new Promise<never>((_resolve, reject) => {
+          // Deliberately NOT unref'd. An unref'd timer does not keep the event
+          // loop alive, and a hung step is the case where this timer is the
+          // only thing left pending — so the loop drained and the timeout could
+          // never fire, leaving the run suspended forever instead of failing.
+          // That is precisely the situation a step timeout exists for.
+          // The `finally` below clears the timer as soon as the race settles,
+          // so a normal step never holds the loop open either way.
           timer = setTimeout(
             () => reject(new WorkflowError(problemFromStatus(500, `Timed out after ${String(timeout)}.`))),
             ms,
           );
-          timer.unref?.();
         }),
       ]);
     } finally {

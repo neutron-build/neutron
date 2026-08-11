@@ -1,14 +1,14 @@
 {
   "htmlHashes": {
-    "about/index.html": "7fb5f06f54d2ddfd800dcc87483155c82ff678aa99565731f940b8caaf9201a2",
-    "blog/getting-started/index.html": "8a6ab9dc0b486ad1a0d0094d3d325804d2b57b2115671e31a9e30b9f6cf59c55",
-    "blog/index.html": "75d09e003430f7ebcb9ac9965367335c35846afe5ecb840b6c8d2fd15ee70bf9",
-    "blog/loaders-explained/index.html": "560dd88ebaa15667890f5e459772b6c7d362e3b6b6ddc1d56d6b91aa1a2d2711",
-    "blog/static-vs-app-routes/index.html": "3b2d0ad5a693f6b973dd260ca0e0188c73e2b40f0eabcba39c2b746901d421fb",
-    "error-demo/index.html": "0f10a7e170ec51f791102d692de93db86683f04760e3a59ec94478743f310445",
-    "index.html": "b93cd6ea00087a80cd4e7b67054af934ae23acc9f6decf36534c9089abc12a09",
-    "islands/index.html": "535c9a357710039a3f07e1de36f2d4747b5d0312ea67ae625eb883bf606c587f",
-    "login/index.html": "be73d459210a5470eb5947afad0d994a3bfcf98c33c5ccf5d2bea8e15809ce52"
+    "about/index.html": "51a5e602dfe804c23e9ea1cc44724dd5e425acc5103d4d08dbd12a3268a3e252",
+    "blog/getting-started/index.html": "fcd69d240b110c21fc70e1d87ffcf1f1cd18a407d34b6a0267a86ca881c56c93",
+    "blog/index.html": "171d5449ccac9d491d34b2026f0fc1b23b50541183204a0297dc289a011a6bc1",
+    "blog/loaders-explained/index.html": "fc4c1964be70d65d95980f1581848c1435c5f30814b2b3aa4e29d3cad638405e",
+    "blog/static-vs-app-routes/index.html": "2daef8be5903c4d88e56139763da4abb81f847355d93b87dd72d7f56bd93c288",
+    "error-demo/index.html": "9211d7929c0f36dce2c6b644be209baeafea59222ef77d8852a630df3749317a",
+    "index.html": "e71ecbb7fae9a8878fb893c1047ab386f241fd82f8e37c36cee6508d0d9722ba",
+    "islands/index.html": "0df2ec60a60b1cee0fe426c695e0ccc947c7470db1a8ce7edab6ae843c2a9b1f",
+    "login/index.html": "f03c13512609ff42b5b9be32cfc0bf5868ec26152b6bcf612c254f3929fd9bd3"
   },
-  "serverBundleGzBytes": 35814
+  "serverBundleGzBytes": 42658
 }
