@@ -2006,6 +2006,136 @@ impl Executor {
         }
     }
 
+    /// Write the rows an UPDATE resolved, re-reading and re-evaluating any that
+    /// another session changed underneath us instead of writing over it.
+    ///
+    /// `UPDATE t SET n = n + 1 WHERE id = 1` computes its new value from the
+    /// value it read. Between that read and the write the statement awaits —
+    /// triggers, RLS, constraints, derived-index maintenance — and another
+    /// session can commit its own increment in that window. Writing anyway
+    /// discards it: measured at 4 sessions x 100 increments landing 380-392 of
+    /// 400, with all 400 statements reporting `UPDATE 1`. Under `read
+    /// committed`, which is the default here as in PostgreSQL, that is exactly
+    /// what must not happen — PostgreSQL blocks on the row lock and then
+    /// re-evaluates against the row the winner committed.
+    ///
+    /// This is the re-evaluation half of that, optimistically: the storage
+    /// engine refuses a write whose row no longer holds the values that were
+    /// read, names the positions it refused, and this re-reads exactly those,
+    /// re-checks the predicate against the new value, recomputes the
+    /// assignments from it and tries again. A row that a concurrent statement
+    /// deleted, or moved out of the WHERE clause, drops out of the statement
+    /// rather than being resurrected.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_with_rmw_retry(
+        &self,
+        storage: &dyn crate::storage::StorageEngine,
+        table_name: &str,
+        table_def: &crate::catalog::TableDef,
+        mut pending: Vec<(usize, Row, Row)>,
+        assign_targets: &[(usize, &ast::Expr)],
+        col_meta: &[ColMeta],
+        selection: Option<&ast::Expr>,
+        checks: ConstraintChecks,
+    ) -> Result<usize, ExecError> {
+        // Contention is resolved by re-reading, so an attempt only repeats when
+        // some other session committed in the window — it is progress, not a
+        // spin. The bound exists so a pathological workload fails loudly rather
+        // than looping forever.
+        const MAX_ATTEMPTS: usize = 100;
+
+        let mut applied_total = 0usize;
+        for attempt in 0..MAX_ATTEMPTS {
+            let applied = storage
+                .update_if_value_unchanged(table_name, &pending)
+                .await?;
+            applied_total += applied.len();
+            if applied.len() == pending.len() {
+                return Ok(applied_total);
+            }
+
+            let landed: HashSet<usize> = applied.into_iter().collect();
+            let conflicted: Vec<usize> = pending
+                .iter()
+                .map(|(pos, _, _)| *pos)
+                .filter(|pos| !landed.contains(pos))
+                .collect();
+
+            self.metrics
+                .update_rmw_retries
+                .inc_by(conflicted.len() as u64);
+            tracing::debug!(
+                target: "nucleus::executor",
+                table = table_name,
+                attempt,
+                conflicted = conflicted.len(),
+                "UPDATE lost a row to a concurrent write; re-reading and re-evaluating"
+            );
+
+            // Re-read from storage rather than from anything cached: the whole
+            // point is to see what the other session committed.
+            let fresh: std::collections::HashMap<usize, Row> = storage
+                .scan_physical(table_name)
+                .await?
+                .into_iter()
+                .collect();
+
+            let mut next = Vec::with_capacity(conflicted.len());
+            for pos in conflicted {
+                // Gone: another session deleted it. It is no longer a row this
+                // statement affects.
+                let Some(current) = fresh.get(&pos) else {
+                    continue;
+                };
+                if !self.rls_allows_row(
+                    table_name,
+                    crate::security::PolicyCommand::Update,
+                    current,
+                ) {
+                    continue;
+                }
+                // The new value may have moved the row out of the predicate.
+                if let Some(expr) = selection
+                    && !self.eval_where(expr, current, col_meta)?
+                {
+                    continue;
+                }
+
+                let mut new_row = current.clone();
+                for (col_idx, val_expr) in assign_targets {
+                    let mut value = self.eval_row_expr(val_expr, current, col_meta)?;
+                    coerce_value_for_write(
+                        &mut value,
+                        &table_def.columns[*col_idx],
+                        self.session_time_zone()?,
+                    )?;
+                    new_row[*col_idx] = value;
+                }
+
+                self.enforce_rls_new_row(
+                    table_name,
+                    crate::security::PolicyCommand::Update,
+                    &new_row,
+                )?;
+                self.enforce_constraints(table_name, table_def, &new_row, Some(pos), checks)
+                    .await?;
+
+                next.push((pos, current.clone(), new_row));
+            }
+
+            if next.is_empty() {
+                return Ok(applied_total);
+            }
+            pending = next;
+        }
+
+        Err(ExecError::Runtime(format!(
+            "UPDATE on {table_name} could not complete: {} row(s) were changed by another \
+             session on each of {MAX_ATTEMPTS} attempts. Retry the statement.",
+            pending.len()
+        )))
+    }
+
     pub(super) async fn execute_update(
         &self,
         update: ast::Update,
@@ -2344,7 +2474,22 @@ impl Executor {
                     other => ExecError::Storage(other),
                 })?
         } else {
-            storage.update_if_unchanged(&table_name, &verified).await?
+            self.update_with_rmw_retry(
+                storage.as_ref(),
+                &table_name,
+                &table_def,
+                verified,
+                &assign_targets,
+                &col_meta,
+                update.selection.as_ref(),
+                ConstraintChecks {
+                    fk: check_fk,
+                    unique: check_unique,
+                    check: has_check_constraints,
+                    enum_cols: has_enum_columns,
+                },
+            )
+            .await?
         };
 
         // Rebuild zone map stats — column values may have changed, making

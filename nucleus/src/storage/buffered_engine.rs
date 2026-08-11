@@ -847,6 +847,28 @@ impl StorageEngine for BufferedDiskEngine {
         self.inner.update_if_unchanged(table, updates).await
     }
 
+    async fn update_if_value_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<Vec<usize>, StorageError> {
+        self.lock_write(table).await?;
+        if self.is_in_txn() {
+            // Same reasoning as `update_if_unchanged` above: buffered writes are
+            // this session's alone and are replayed at COMMIT, so nothing has
+            // moved underneath them yet and there is no race to report. Claiming
+            // a conflict here would send the executor into a re-read that sees
+            // the transaction's own uncommitted value.
+            let plain: Vec<(usize, Row)> = updates
+                .iter()
+                .map(|(pos, _read, new_row)| (*pos, new_row.clone()))
+                .collect();
+            self.update(table, &plain).await?;
+            return Ok(updates.iter().map(|(pos, _, _)| *pos).collect());
+        }
+        self.inner.update_if_value_unchanged(table, updates).await
+    }
+
     async fn delete_if_unchanged(
         &self,
         table: &str,

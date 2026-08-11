@@ -222,6 +222,13 @@ pub struct MetricsRegistry {
     pub queries_update: Counter,
     pub queries_delete: Counter,
     pub rows_scanned: Counter,
+    /// Rows an UPDATE had to re-read and re-evaluate because another session
+    /// changed them between this statement's read and its write.
+    ///
+    /// Zero on an uncontended workload. Non-zero means concurrent writers are
+    /// hitting the same rows — which used to be invisible, because the losing
+    /// write was applied on top of the winner and still reported `UPDATE 1`.
+    pub update_rmw_retries: Counter,
     /// Column values materialized by table scans — `rows × width`.
     ///
     /// `rows_scanned` alone cannot see the difference between reading two
@@ -320,6 +327,10 @@ impl MetricsRegistry {
             queries_update: Counter::new("nucleus_queries_update_total", "Total UPDATE queries"),
             queries_delete: Counter::new("nucleus_queries_delete_total", "Total DELETE queries"),
             rows_scanned: Counter::new("nucleus_rows_scanned_total", "Total rows scanned"),
+            update_rmw_retries: Counter::new(
+                "nucleus_update_rmw_retries_total",
+                "Rows an UPDATE re-read and re-evaluated after losing a race to a concurrent write",
+            ),
             values_scanned: Counter::new(
                 "nucleus_values_scanned_total",
                 "Total column values materialized by table scans",
@@ -469,6 +480,7 @@ impl MetricsRegistry {
         render_counter(&mut out, &self.queries_update);
         render_counter(&mut out, &self.queries_delete);
         render_counter(&mut out, &self.rows_scanned);
+        render_counter(&mut out, &self.update_rmw_retries);
         render_counter(&mut out, &self.values_scanned);
         render_counter(&mut out, &self.rows_returned);
         render_counter(&mut out, &self.index_join_attempts);
@@ -554,6 +566,7 @@ impl MetricsRegistry {
         add_counter(&mut rows, &self.queries_update);
         add_counter(&mut rows, &self.queries_delete);
         add_counter(&mut rows, &self.rows_scanned);
+        add_counter(&mut rows, &self.update_rmw_retries);
         add_counter(&mut rows, &self.values_scanned);
         add_counter(&mut rows, &self.rows_returned);
         add_counter(&mut rows, &self.index_join_attempts);
@@ -801,13 +814,13 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 28 counters + 8 gauges + 1 uptime + 2 histograms = 39.
+        // 29 counters + 8 gauges + 1 uptime + 2 histograms = 40.
         // The count is asserted deliberately: `as_rows` is SHOW METRICS, and a
         // metric added to the registry but not to the render/rows lists is
         // silently invisible to every operator — the same declared-but-unwired
         // shape as the rest of this engine. Update this number ONLY alongside
         // adding the metric to both `render_prometheus` and `as_rows`.
-        assert_eq!(rows.len(), 39);
+        assert_eq!(rows.len(), 40);
 
         // Check a counter row
         let qt = rows

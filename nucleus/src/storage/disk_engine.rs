@@ -290,6 +290,34 @@ fn decode_row_pos(pos: usize) -> (u32, u16) {
 /// Mutation targets grouped by the page holding them: `(page_id, [(slot, T)])`.
 type PageGrouped<T> = Vec<(u32, Vec<(u16, T)>)>;
 
+/// What a caller asserts about the tuple it resolved earlier, checked under the
+/// frame latch immediately before the write lands.
+///
+/// The two are not interchangeable, and conflating them is how concurrent
+/// UPDATEs silently lost writes:
+///
+/// - `Identity` asks "is this address still the row I read?", comparing primary
+///   key columns (or, with no primary key, every column). It exists because a
+///   position is a physical address, and a concurrent DELETE + INSERT can hand
+///   that slot to a different row while the statement is awaiting triggers, RLS
+///   and constraint checks. It is the right question for a DELETE, and for
+///   replaying a transaction buffer at COMMIT.
+///
+/// - `Value` asks "does this address still hold the values I read?". It is the
+///   right question for a statement-level read-modify-write such as
+///   `SET n = n + 1`, where the new value was computed from the old one. Under
+///   `Identity` that check passes trivially — the primary key is exactly what
+///   such a statement does not change — so two sessions would both read n=5,
+///   both compute 6, and both write it, with the second silently erasing the
+///   first while reporting `UPDATE 1`.
+#[derive(Clone, Debug)]
+pub(crate) enum Expected {
+    /// Still the same row (primary key columns, or all columns with no PK).
+    Identity(Row),
+    /// Still holding exactly these values.
+    Value(Row),
+}
+
 impl Drop for DiskEngine {
     /// Flush all dirty pages and save the table directory on drop (clean shutdown).
     fn drop(&mut self) {
@@ -1580,19 +1608,26 @@ impl DiskEngine {
 
     /// Update tuples at stable row addresses, with the same identity re-check
     /// as [`Self::delete_at`].
+    /// Returns the positions actually written, not just how many. A caller
+    /// doing a read-modify-write has to know *which* of its rows lost the race
+    /// so it can re-read and re-evaluate exactly those; a bare count cannot
+    /// distinguish "row 3 conflicted" from "row 7 did", and retrying the wrong
+    /// one would apply an increment twice.
     fn update_at(
         &self,
         table: &str,
-        updates: Vec<(usize, Option<Row>, Row)>,
-    ) -> Result<usize, StorageError> {
+        updates: Vec<(usize, Option<Expected>, Row)>,
+    ) -> Result<Vec<usize>, StorageError> {
         let col_types = self.col_types(table)?;
         let has_indexes = {
             let indexes = self.indexes.read();
             indexes.values().any(|idx| idx.table == table)
         };
-        let verifying = updates.iter().any(|(_, expected, _)| expected.is_some());
+        let verifying = updates
+            .iter()
+            .any(|(_, expected, _)| matches!(expected, Some(Expected::Identity(_))));
         let identity = verifying.then(|| self.identity_cols(table)).flatten();
-        let mut count = 0usize;
+        let mut applied: Vec<usize> = Vec::new();
 
         let grouped = self.group_by_page(
             table,
@@ -1637,10 +1672,15 @@ impl DiskEngine {
                     let len = entry.length() as usize;
                     let current = tuple::deserialize_row(&pg[off..off + len], &col_types);
                     if let Some(expected) = &expected {
-                        match &current {
-                            Some(row)
-                                if Self::same_row_identity(expected, row, identity.as_ref()) => {}
-                            _ => continue,
+                        let holds = match (&current, expected) {
+                            (Some(row), Expected::Identity(e)) => {
+                                Self::same_row_identity(e, row, identity.as_ref())
+                            }
+                            (Some(row), Expected::Value(e)) => e == row,
+                            (None, _) => false,
+                        };
+                        if !holds {
+                            continue;
                         }
                     }
                     if has_indexes && let Some(row) = current {
@@ -1656,7 +1696,7 @@ impl DiskEngine {
                         }
                         pg.set_dirty();
                         dirty = true;
-                        count += 1;
+                        applied.push(encode_row_pos(page_id, slot_idx));
                         continue;
                     }
 
@@ -1667,16 +1707,21 @@ impl DiskEngine {
                     page::delete_tuple(&mut pg, slot_idx);
                     pg.set_dirty();
                     dirty = true;
+                    // Report the position the CALLER gave us, not where the row
+                    // ended up. The caller is reconciling this against its own
+                    // target list; telling it about an address it never asked
+                    // about would read as "your row conflicted" and earn a retry
+                    // that applies the write a second time.
                     if let Some(new_slot_idx) = page::insert_tuple(&mut pg, &new_data) {
                         if has_indexes {
                             index_ops.push(IndexOp::Add(page_id, new_slot_idx, new_row));
                         }
-                        count += 1;
+                        applied.push(encode_row_pos(page_id, slot_idx));
                         continue;
                     }
                     // No room left on this page — place it after the latch drops.
                     relocate.push((new_data, new_row));
-                    count += 1;
+                    applied.push(encode_row_pos(page_id, slot_idx));
                 }
             }
             if dirty {
@@ -1691,7 +1736,7 @@ impl DiskEngine {
             self.index_apply_ops(table, &mut index_ops)?;
         }
 
-        Ok(count)
+        Ok(applied)
     }
 
     /// Every live tuple of a table paired with its stable row address, in scan
@@ -2728,11 +2773,11 @@ impl StorageEngine for DiskEngine {
     }
 
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
-        let updates: Vec<(usize, Option<Row>, Row)> = updates
+        let updates: Vec<(usize, Option<Expected>, Row)> = updates
             .iter()
             .map(|(pos, new_row)| (*pos, None, new_row.clone()))
             .collect();
-        self.update_at(table, updates)
+        self.update_at(table, updates).map(|applied| applied.len())
     }
 
     /// Update rows the caller read earlier, applying each only if the tuple at
@@ -2742,9 +2787,27 @@ impl StorageEngine for DiskEngine {
         table: &str,
         updates: &[(usize, Row, Row)],
     ) -> Result<usize, StorageError> {
-        let updates: Vec<(usize, Option<Row>, Row)> = updates
+        let updates: Vec<(usize, Option<Expected>, Row)> = updates
             .iter()
-            .map(|(pos, expected, new_row)| (*pos, Some(expected.clone()), new_row.clone()))
+            .map(|(pos, expected, new_row)| {
+                (*pos, Some(Expected::Identity(expected.clone())), new_row.clone())
+            })
+            .collect();
+        self.update_at(table, updates).map(|applied| applied.len())
+    }
+
+    /// Apply each write only if the tuple still holds exactly the values the
+    /// caller read. See [`StorageEngine::update_if_value_unchanged`].
+    async fn update_if_value_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<Vec<usize>, StorageError> {
+        let updates: Vec<(usize, Option<Expected>, Row)> = updates
+            .iter()
+            .map(|(pos, expected, new_row)| {
+                (*pos, Some(Expected::Value(expected.clone())), new_row.clone())
+            })
             .collect();
         self.update_at(table, updates)
     }

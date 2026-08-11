@@ -333,6 +333,32 @@ pub trait StorageEngine: Send + Sync {
         self.update(table, &plain).await
     }
 
+    /// Apply each write only if the row still holds exactly the values the
+    /// caller read, and report the positions that were written.
+    ///
+    /// This is the check a statement-level read-modify-write needs.
+    /// [`update_if_unchanged`](Self::update_if_unchanged) asks whether the
+    /// address still holds the same ROW, comparing primary key columns — which
+    /// is what `UPDATE t SET n = n + 1 WHERE id = 1` leaves alone, so that
+    /// check passes even when another session has already changed `n` since
+    /// this statement read it. Both writes then land, the second erasing the
+    /// first, and both report `UPDATE 1`. Measured at 4 sessions x 100
+    /// increments landing 380-392 of 400, every statement acknowledged.
+    ///
+    /// The default applies everything and reports every position as written,
+    /// which is the pre-existing behaviour: an engine that cannot say which
+    /// individual rows lost a race must not claim one did. A caller that
+    /// re-evaluated and retried a row that had in fact been written would apply
+    /// the increment twice, so an imprecise answer here is worse than none.
+    async fn update_if_value_unchanged(
+        &self,
+        table: &str,
+        updates: &[(usize, Row, Row)],
+    ) -> Result<Vec<usize>, StorageError> {
+        self.update_if_unchanged(table, updates).await?;
+        Ok(updates.iter().map(|(pos, _, _)| *pos).collect())
+    }
+
     /// Delete counterpart of [`update_if_unchanged`](Self::update_if_unchanged):
     /// `(position, row the caller read)`.
     ///
