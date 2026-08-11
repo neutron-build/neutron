@@ -50,120 +50,13 @@ impl Rng {
 
 // ─── Reference oracle: same tokenizer + inverted-index as Nucleus FTS ─────────
 
-fn is_stopword(w: &str) -> bool {
-    matches!(
-        w,
-        "a" | "an"
-            | "the"
-            | "is"
-            | "are"
-            | "was"
-            | "were"
-            | "be"
-            | "been"
-            | "being"
-            | "have"
-            | "has"
-            | "had"
-            | "do"
-            | "does"
-            | "did"
-            | "will"
-            | "would"
-            | "could"
-            | "should"
-            | "may"
-            | "might"
-            | "shall"
-            | "can"
-            | "to"
-            | "of"
-            | "in"
-            | "for"
-            | "on"
-            | "with"
-            | "at"
-            | "by"
-            | "from"
-            | "as"
-            | "into"
-            | "through"
-            | "during"
-            | "before"
-            | "after"
-            | "and"
-            | "but"
-            | "or"
-            | "not"
-            | "no"
-            | "if"
-            | "then"
-            | "than"
-            | "so"
-            | "that"
-            | "this"
-            | "it"
-            | "its"
-            | "i"
-            | "me"
-            | "my"
-            | "we"
-            | "our"
-            | "you"
-            | "your"
-            | "he"
-            | "him"
-            | "his"
-            | "she"
-            | "her"
-            | "they"
-            | "them"
-            | "their"
-            | "what"
-            | "which"
-            | "who"
-            | "whom"
-    )
-}
-
-/// Porter English stemmer — exact copy of Nucleus's `stem()`.
-fn stem(word: &str) -> String {
-    let mut w = word.to_string();
-    if w.ends_with("ies") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-        w.push('y');
-    } else if w.ends_with("sses") {
-        w.truncate(w.len() - 2);
-    } else if (w.ends_with("ness") || w.ends_with("ment")) && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("tion") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-        w.push('t');
-    } else if w.ends_with("ation") && w.len() > 6 {
-        w.truncate(w.len() - 5);
-    } else if w.ends_with("ing") && w.len() > 5 {
-        w.truncate(w.len() - 3);
-        let doubled_consonant = {
-            let mut rev = w.chars().rev();
-            match (rev.next(), rev.next()) {
-                (Some(a), Some(b)) => {
-                    a == b && matches!(a, 'b' | 'd' | 'g' | 'l' | 'm' | 'n' | 'p' | 'r' | 't')
-                }
-                _ => false,
-            }
-        };
-        if doubled_consonant && w.len() > 3 {
-            w.pop();
-        }
-    } else if (w.ends_with("ed") || w.ends_with("ly") || w.ends_with("er")) && w.len() > 4 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("est") && w.len() > 5 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with('s') && !w.ends_with("ss") && w.len() > 3 {
-        w.pop();
-    }
-    w
-}
+// The oracle uses the ENGINE's own stopword list and stemmer rather than a
+// copy of them. It used to carry a hand-transcribed duplicate labelled
+// "exact copy of Nucleus's stem()", which is a promise nothing enforced: a
+// differential fuzzer whose oracle drifts from the engine either stops
+// finding real divergences or invents fake ones. Importing removes the
+// possibility. A-014.
+use nucleus::fts::{is_stopword, stem};
 
 /// Tokenize text: same logic as Nucleus's tokenize().
 fn tokenize(text: &str) -> Vec<String> {

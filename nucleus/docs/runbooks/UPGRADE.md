@@ -30,6 +30,34 @@ So:
 Read the release notes for the target version. If they do not state the
 `format_version`, assume it changed and take the logical dump.
 
+## 1b. FTS indexes need rebuilding when the English stemmer changes
+
+**Applies to any upgrade crossing the A-014 stemmer fix.**
+
+An FTS index stores **stemmed** terms, and queries are stemmed with the same
+rules before lookup. Change the rules and the two sides disagree: the index
+holds terms produced by the old stemmer while queries produce new ones, so
+affected searches silently return fewer rows — no error, no warning.
+
+The A-014 fix changed English stems for the whole `-er` noun class (`number`
+now stems to `number`, not `numb`), for `-eed`/`-ed` (`seed` stays `seed`), and
+for short `-ly` words (`reply` stays `reply`). Any English FTS index built
+before it must be rebuilt.
+
+There is **no `REINDEX` statement and no CLI repair command** (see
+`DATABASE_COMPLETION.md`), so rebuilding means dropping and recreating the
+index:
+
+```sql
+DROP INDEX <name>;
+CREATE INDEX <name> ON <table> USING FTS (<column>);
+```
+
+Do it in the maintenance window, before reopening to traffic — an index that is
+half old-stem and half new-stem is worse than either, because which rows a
+query finds then depends on when they were written. Non-English indexes are
+unaffected; the other language stemmers did not change.
+
 ## 1a. Container images: check who owns the data directory
 
 **Applies to every upgrade crossing v0.1.1 → v0.1.2 or later.** Skip only if

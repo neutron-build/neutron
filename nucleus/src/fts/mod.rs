@@ -125,7 +125,7 @@ pub fn tokenize_with(text: &str, analyzer: Analyzer) -> Vec<Token> {
 }
 
 /// Common English stopwords.
-fn is_stopword(word: &str) -> bool {
+pub fn is_stopword(word: &str) -> bool {
     matches!(
         word,
         "a" | "an"
@@ -340,28 +340,110 @@ fn stem_portuguese(word: &str) -> String {
     w
 }
 
+/// Porter's consonant/vowel flags for a word, one pass, left to right.
+///
+/// A letter is a consonant unless it is a,e,i,o,u — or a `y` whose preceding
+/// letter is a consonant (so the `y` in "syzygy" is a vowel, the one in "toy"
+/// is not). The flag for `y` therefore depends on the flag before it, which is
+/// why this is computed as a prefix scan rather than per character.
+fn consonant_flags(chars: &[char]) -> Vec<bool> {
+    let mut flags: Vec<bool> = Vec::with_capacity(chars.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let is_consonant = match c {
+            'a' | 'e' | 'i' | 'o' | 'u' => false,
+            'y' => i == 0 || !flags[i - 1],
+            _ => true,
+        };
+        flags.push(is_consonant);
+    }
+    flags
+}
+
+/// Porter's *m*: how many vowel-then-consonant sequences a stem contains.
+///
+/// This is the measure that decides whether a suffix is safe to strip. The
+/// point is that it counts syllable-ish structure rather than characters: the
+/// old rules gated on `len()`, which cannot tell "custom" (m=2, a real stem
+/// that can lose its -er) from "numb" (m=1, which cannot).
+fn measure(stem: &str) -> usize {
+    let chars: Vec<char> = stem.chars().collect();
+    let flags = consonant_flags(&chars);
+    let mut m = 0;
+    let mut i = 0;
+
+    while i < flags.len() && flags[i] {
+        i += 1; // leading consonants are not part of any VC pair
+    }
+    while i < flags.len() {
+        while i < flags.len() && !flags[i] {
+            i += 1;
+        }
+        if i >= flags.len() {
+            break;
+        }
+        m += 1; // a vowel run followed by a consonant run completes one VC
+        while i < flags.len() && flags[i] {
+            i += 1;
+        }
+    }
+    m
+}
+
+/// Porter's `*v*`: does the stem contain a vowel at all.
+fn contains_vowel(stem: &str) -> bool {
+    let chars: Vec<char> = stem.chars().collect();
+    consonant_flags(&chars)
+        .iter()
+        .any(|&is_consonant| !is_consonant)
+}
+
 /// Simplified Porter stemmer for English.
 /// Handles common suffixes: -ing, -tion, -ed, -ly, -ness, -er, -est, -ies, -s.
+///
+/// Two properties matter here, and the original had neither.
+///
+/// **Steps run in sequence, not as one if/else chain.** Porter strips the
+/// plural first and *then* considers the other suffixes, so "customers" and
+/// "customer" both reach "custom". A single chain stops at the first match, so
+/// "customers" stopped at "customer" while "customer" went on to "custom" and
+/// the two forms of one noun never matched.
+///
+/// **Suffix rules are gated on `measure`, not on `len()`.** The `-er` rule is
+/// meant for comparatives ("faster"), but a bare length check applied it to
+/// every word of five or more characters ending in -er — an enormous set of
+/// ordinary English nouns: user, server, folder, order, member, header,
+/// provider, filter, owner, number, partner, manager. "numbers" stemmed to
+/// "number" and "number" stemmed to "numb", so a search for one never found the
+/// other. See A-014 in docs/ADOPTION_FINDINGS.md.
 pub fn stem(word: &str) -> String {
     let mut w = word.to_string();
+    if w.len() <= 2 {
+        return w;
+    }
 
-    // Step 1: Plurals / -ed / -ing
+    // Step 1a — plurals.
     if w.ends_with("ies") && w.len() > 4 {
         w.truncate(w.len() - 3);
         w.push('y');
     } else if w.ends_with("sses") {
         w.truncate(w.len() - 2);
-    } else if (w.ends_with("ness") || w.ends_with("ment")) && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("tion") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-        w.push('t');
-    } else if w.ends_with("ation") && w.len() > 6 {
-        w.truncate(w.len() - 5);
-    } else if w.ends_with("ing") && w.len() > 5 {
+    } else if w.ends_with('s') && !w.ends_with("ss") && w.len() > 3 {
+        w.pop();
+    }
+
+    // Step 1b — -eed / -ed / -ing.
+    if w.ends_with("eed") {
+        // (m>0) EED -> EE. Keeps "seed" whole ("s" has m=0) while "agreed"
+        // becomes "agree". The old rule stripped a bare -ed and made it "se".
+        if measure(&w[..w.len() - 3]) > 0 {
+            w.truncate(w.len() - 1);
+        }
+    } else if w.ends_with("ed") && contains_vowel(&w[..w.len() - 2]) {
+        w.truncate(w.len() - 2);
+    } else if w.ends_with("ing") && contains_vowel(&w[..w.len() - 3]) {
         w.truncate(w.len() - 3);
-        // Undo consonant-doubling (e.g. "running" -> "runn" -> "run"), but ONLY
-        // when the last two characters are actually a doubled consonant. The old
+        // Undo consonant-doubling ("running" -> "runn" -> "run"), but ONLY when
+        // the last two characters really are a doubled consonant. The original
         // predicate (`c == last char`) was a tautology and stripped a consonant
         // after every -ing ("eating" -> "ea" instead of "eat").
         let doubled_consonant = {
@@ -376,12 +458,34 @@ pub fn stem(word: &str) -> String {
         if doubled_consonant && w.len() > 3 {
             w.pop();
         }
-    } else if (w.ends_with("ed") || w.ends_with("ly") || w.ends_with("er")) && w.len() > 4 {
+    }
+
+    // Step 2/3 — derivational suffixes, gated on m > 0. `ation` is tested
+    // before `tion` because it ends with it.
+    if w.ends_with("ation") && measure(&w[..w.len() - 5]) > 0 {
+        w.truncate(w.len() - 5);
+    } else if w.ends_with("tion") && measure(&w[..w.len() - 4]) > 0 {
+        w.truncate(w.len() - 4);
+        w.push('t');
+    } else if (w.ends_with("ness") || w.ends_with("ment")) && measure(&w[..w.len() - 4]) > 0 {
+        w.truncate(w.len() - 4);
+    } else if w.ends_with("ly") && w.len() > 5 && measure(&w[..w.len() - 2]) > 0 {
+        // Porter has no bare -ly rule; this keeps one for recall on adverbs but
+        // needs the length floor too, because measure alone cannot tell
+        // "happily" (strip -> "happi") from "reply" (must not become "rep").
+        w.truncate(w.len() - 2);
+    }
+
+    // Step 4 — the comparative -er, gated on m > 1 as Porter gates it. This is
+    // the rule the whole fix is about.
+    if w.ends_with("er") && measure(&w[..w.len() - 2]) > 1 {
         w.truncate(w.len() - 2);
     } else if w.ends_with("est") && w.len() > 5 {
+        // Deliberately left on a length check. -est has no plural counterpart,
+        // so it produces no singular/plural mismatch: "interest" and
+        // "interests" both reach "inter". Tightening it would cost recall
+        // ("fastest" would stop matching "fast") to fix nothing observed.
         w.truncate(w.len() - 3);
-    } else if w.ends_with('s') && !w.ends_with("ss") && w.len() > 3 {
-        w.pop();
     }
 
     w
@@ -2750,6 +2854,139 @@ mod tests {
         assert_eq!(stem("happily"), "happi");
         assert_eq!(stem("cities"), "city");
         assert_eq!(stem("passes"), "pass");
+    }
+
+    /// A-014. The `-er` rule fired before the plural rule could be reached for
+    /// the singular form, so the two forms of one noun stemmed to different
+    /// terms and a search for one never found the other. The affected set is
+    /// not exotic — it is most agent nouns in English.
+    #[test]
+    fn singular_and_plural_of_one_noun_stem_alike() {
+        for singular in [
+            "number",
+            "user",
+            "server",
+            "folder",
+            "order",
+            "customer",
+            "member",
+            "header",
+            "provider",
+            "filter",
+            "owner",
+            "partner",
+            "manager",
+            "container",
+            "reader",
+            "writer",
+            "buffer",
+            "cluster",
+            "parameter",
+        ] {
+            let plural = format!("{singular}s");
+            assert_eq!(
+                stem(singular),
+                stem(&plural),
+                "'{singular}' and '{plural}' must stem alike"
+            );
+        }
+    }
+
+    /// The specific regression from the report, spelled out: "number" must not
+    /// collapse into "numb", which is a different word that also indexes.
+    #[test]
+    fn short_agent_nouns_keep_their_er() {
+        assert_eq!(stem("number"), "number");
+        assert_eq!(stem("numbers"), "number");
+        assert_ne!(stem("number"), stem("numb"));
+
+        assert_eq!(stem("user"), "user");
+        assert_eq!(stem("folder"), "folder");
+        assert_eq!(stem("order"), "order");
+    }
+
+    /// -er is still stripped where the stem can carry it: Porter's m>1.
+    #[test]
+    fn longer_stems_still_lose_their_er() {
+        assert_eq!(stem("customer"), "custom");
+        assert_eq!(stem("customers"), "custom");
+        assert_eq!(stem("provider"), "provid");
+        assert_eq!(stem("providers"), "provid");
+    }
+
+    /// The sibling rules called out in the same report. `-ed` was stripped from
+    /// any word of five or more characters, so "seed" became "se"; `-ly` from
+    /// any of five or more, so "reply" became "rep".
+    #[test]
+    fn ed_and_ly_no_longer_eat_short_words() {
+        assert_eq!(stem("seed"), "seed");
+        assert_eq!(stem("seeds"), "seed");
+        assert_eq!(stem("agreed"), "agree");
+
+        assert_eq!(stem("reply"), "reply");
+        assert_eq!(stem("quickly"), "quick");
+
+        // Words that are not a stem plus a suffix stay whole.
+        assert_eq!(stem("bed"), "bed");
+        assert_eq!(stem("red"), "red");
+        assert_eq!(stem("sing"), "sing");
+        assert_eq!(stem("king"), "king");
+        assert_eq!(stem("bring"), "bring");
+    }
+
+    /// Steps run in sequence, so a plural reaches the same stem its singular
+    /// does. A single if/else chain stopped at the first matching rule, which
+    /// is what made the two forms diverge in the first place.
+    #[test]
+    fn plural_is_stripped_before_the_later_rules_run() {
+        assert_eq!(stem("customers"), stem("customer"));
+        assert_eq!(stem("cities"), stem("city"));
+        assert_eq!(stem("passes"), stem("pass"));
+        assert_eq!(stem("interests"), stem("interest"));
+    }
+
+    /// Stemming is idempotent: a stored term re-stemmed must not move again, or
+    /// a query would drift away from what the index holds.
+    #[test]
+    fn stemming_is_idempotent() {
+        for word in [
+            "running",
+            "played",
+            "happily",
+            "cities",
+            "passes",
+            "number",
+            "numbers",
+            "customer",
+            "customers",
+            "seed",
+            "agreed",
+            "reply",
+            "quickly",
+            "nationalization",
+            "eating",
+            "interest",
+            "fastest",
+            "provider",
+        ] {
+            let once = stem(word);
+            assert_eq!(stem(&once), once, "stem('{word}') = '{once}' is not stable");
+        }
+    }
+
+    #[test]
+    fn measure_counts_vowel_consonant_sequences() {
+        assert_eq!(measure(""), 0);
+        assert_eq!(measure("tr"), 0);
+        assert_eq!(measure("ee"), 0);
+        assert_eq!(measure("tree"), 0);
+        assert_eq!(measure("trouble"), 1);
+        assert_eq!(measure("oats"), 1);
+        assert_eq!(measure("numb"), 1);
+        assert_eq!(measure("custom"), 2);
+        assert_eq!(measure("troubles"), 2);
+        // `y` after a consonant is a vowel, so "syzygy" is not all-consonant.
+        assert!(measure("syzygy") > 0);
     }
 
     #[test]

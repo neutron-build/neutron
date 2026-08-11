@@ -370,23 +370,25 @@ func TestIntegrationSearchMatchesOnWordsNotSubstrings(t *testing.T) {
 		t.Error(`searching "numbers" matched "Renumbered"; that is substring behaviour, not term matching`)
 	}
 
-	// Characterisation test for a known Nucleus stemmer bug, not an
-	// endorsement of the behaviour. The English stemmer applies its rules
-	// as a mutually exclusive chain, so "numbers" takes the plural rule and
-	// stems to "number", while "number" takes the -er comparative rule and
-	// stems to "numb". Singular and plural of the same noun therefore never
-	// match. See docs/NEUTRON_GAPS.md.
-	//
-	// When that is fixed this assertion will fail. That is the point: invert
-	// it then, and delete this comment.
+	// Singular finds plural. This assertion used to be inverted: it pinned a
+	// Nucleus stemmer bug where the rules ran as a mutually exclusive chain, so
+	// "numbers" took the plural rule and stemmed to "number" while "number"
+	// took the -er comparative rule and stemmed to "numb" — the two forms of
+	// one noun never matched. Fixed in the engine (A-014,
+	// docs/ADOPTION_FINDINGS.md); the rules now run in sequence and -er is
+	// gated on Porter's measure rather than a bare length check.
 	singular, err := s.Search(ctx, acct, "number", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var singularFound bool
 	for _, h := range singular {
 		if h.Subject == "Quarterly numbers" {
-			t.Error("the stemmer bug appears to be fixed — invert this assertion and update NEUTRON_GAPS.md")
+			singularFound = true
 		}
+	}
+	if !singularFound {
+		t.Error(`searching "number" did not find "Quarterly numbers"; singular and plural must stem alike`)
 	}
 }
 

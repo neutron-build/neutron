@@ -64,7 +64,7 @@ Statuses verified against source on 2026-08-08.
 | A-011 | `useLocation` silently returns `/` during SSR | TS routing | HIGH | `REAL-BUG` | FIXED |
 | A-012 | Rust Nucleus client had no table-attached FTS | Rust SDK | MED | `SPEC-GAP` | FIXED |
 | A-013 | `neutron-oauth` could not redeem a refresh token | Rust SDK | HIGH | `REAL-BUG` | FIXED `c06d027` |
-| A-014 | English stemmer: singular and plural never match | Nucleus FTS | HIGH | `REAL-BUG` | **OPEN** |
+| A-014 | English stemmer: singular and plural never match | Nucleus FTS | HIGH | `REAL-BUG` | FIXED |
 | A-015 | `nucleus start` has no `--config` flag | Nucleus CLI | LOW | `SPEC-GAP` | **PART** |
 | A-016 | Self-referential symlink in the repo root | Repo | LOW | `REAL-BUG` | FIXED |
 | A-017 | `target/debug` grows without bound | Repo | LOW | `SPEC-GAP` | **OPEN** |
@@ -74,55 +74,11 @@ Statuses verified against source on 2026-08-08.
 | A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | FIXED |
 | A-022 | A pure-static app never loads `src/middleware.ts` at all | TS routing | MED | `REAL-BUG` | FIXED |
 
-Open: A-007, A-014, A-017, plus A-015 partial and A-009 deferred.
+Open: A-007, A-017, plus A-015 partial and A-009 deferred.
 
 ---
 
 # Open
-
-## A-014 — English stemmer: singular and plural of the same noun never match
-**Nucleus / FTS · HIGH · `REAL-BUG` · OPEN**
-
-**Where:** `nucleus/src/fts/mod.rs`, `pub fn stem` (the `-ed`/`-ly`/`-er`
-branch is still at line 379 as described).
-
-The stemmer applies its rules as a mutually exclusive if/else chain, and the
-`-er` comparative rule fires before the plural rule can be reached for the
-singular form:
-
-```
-"numbers" -> ends with 's'  -> plural rule  -> "number"
-"number"  -> ends with "er" -> -er rule     -> "numb"
-```
-
-So the two forms of one noun stem to different terms and never match each
-other. Reproduced directly over the wire:
-
-```sql
-CREATE TABLE t (id BIGINT PRIMARY KEY, body TEXT);
-INSERT INTO t VALUES (1, 'Quarterly numbers'), (2, 'the number four');
-
-SELECT id FROM t WHERE body @@ 'numbers';  -- {1}      correct
-SELECT id FROM t WHERE body @@ 'number';   -- {2}      misses row 1
-SELECT id FROM t WHERE body @@ 'numb';     -- {2}      proves "number" -> "numb"
-```
-
-The `-er` rule is meant for comparatives ("faster" -> "fast") but is applied to
-every word of five or more characters ending in `-er`, which is an enormous set
-of ordinary English nouns: **user, server, folder, order, customer, member,
-header, provider, filter, owner, number, partner, manager**. For mail search
-alone that breaks folder/folders, order/orders, customer/customers.
-
-The `-ly`, `-ed`, and `-est` rules in the same branch have the same shape and
-are worth auditing together (`-ed`: "seed" -> "se"; `-ly`: "reply" -> "rep").
-
-A real Porter/Snowball implementation applies measure conditions (only strip a
-suffix when the remaining stem has enough syllables) rather than a bare length
-check. Either adopt `rust-stemmers`, or gate each rule on a measure function.
-
-**Worked around** in `mail/store.go` with a characterisation test
-(`TestIntegrationSearchMatchesOnWordsNotSubstrings`) that pins current
-behaviour and fails loudly once this is fixed.
 
 ## A-007 — react-compat is the first question adopters ask, and the answer is a hedge
 **TypeScript / docs + positioning · HIGH · `DOC-GAP` · OPEN**
@@ -692,6 +648,94 @@ exported router hooks were rendered server-side; `useNavigation` was the only
 one that threw, so there was no sibling defect to fix. `router-providers.test.ts`
 now pins that as a standing assertion, so a new hook reading `window` at render
 time is caught here rather than by an adopter.
+
+## A-014 — English stemmer: singular and plural of the same noun never match
+**Nucleus / FTS · HIGH · `REAL-BUG` · FIXED**
+
+**Where:** `nucleus/src/fts/mod.rs`, `pub fn stem` (the `-ed`/`-ly`/`-er`
+branch is still at line 379 as described).
+
+The stemmer applies its rules as a mutually exclusive if/else chain, and the
+`-er` comparative rule fires before the plural rule can be reached for the
+singular form:
+
+```
+"numbers" -> ends with 's'  -> plural rule  -> "number"
+"number"  -> ends with "er" -> -er rule     -> "numb"
+```
+
+So the two forms of one noun stem to different terms and never match each
+other. Reproduced directly over the wire:
+
+```sql
+CREATE TABLE t (id BIGINT PRIMARY KEY, body TEXT);
+INSERT INTO t VALUES (1, 'Quarterly numbers'), (2, 'the number four');
+
+SELECT id FROM t WHERE body @@ 'numbers';  -- {1}      correct
+SELECT id FROM t WHERE body @@ 'number';   -- {2}      misses row 1
+SELECT id FROM t WHERE body @@ 'numb';     -- {2}      proves "number" -> "numb"
+```
+
+The `-er` rule is meant for comparatives ("faster" -> "fast") but is applied to
+every word of five or more characters ending in `-er`, which is an enormous set
+of ordinary English nouns: **user, server, folder, order, customer, member,
+header, provider, filter, owner, number, partner, manager**. For mail search
+alone that breaks folder/folders, order/orders, customer/customers.
+
+The `-ly`, `-ed`, and `-est` rules in the same branch have the same shape and
+are worth auditing together (`-ed`: "seed" -> "se"; `-ly`: "reply" -> "rep").
+
+A real Porter/Snowball implementation applies measure conditions (only strip a
+suffix when the remaining stem has enough syllables) rather than a bare length
+check. Either adopt `rust-stemmers`, or gate each rule on a measure function.
+
+**Worked around** in `mail/store.go` with a characterisation test
+(`TestIntegrationSearchMatchesOnWordsNotSubstrings`) that pins current
+behaviour and fails loudly once this is fixed.
+
+**Resolved 2026-08-11.** Two changes, and the first is the actual root cause.
+
+**The steps now run in sequence rather than as one if/else chain.** Porter
+strips the plural first and *then* considers the other suffixes, so "customers"
+and "customer" both reach "custom". A single chain stops at the first matching
+rule, which is exactly why the two forms diverged: "numbers" stopped at the
+plural rule while "number" went on to the `-er` rule.
+
+**Suffix rules are gated on Porter's measure, not on `len()`.** `measure()` and
+`contains_vowel()` implement Porter's *m* and *v* over proper consonant flags
+(the `y` in "syzygy" is a vowel, the one in "toy" is not). `-er` is gated on
+`m > 1` as Porter gates it, so "numb" (m=1) keeps its -er while "custom" (m=2)
+loses it. `-ed` is gated on *v* with the `(m>0) EED -> EE` rule ahead of it, so
+"seed" stays whole and "agreed" becomes "agree". `-ly` keeps a length floor as
+well, because measure alone cannot separate "happily" from "reply".
+
+`-est` was deliberately left on a length check. It has no plural counterpart, so
+it produces no singular/plural mismatch — "interest" and "interests" both reach
+"inter" — and tightening it would cost recall ("fastest" would stop matching
+"fast") to fix nothing observed.
+
+Verified end to end, not just in unit tests. The report's exact SQL now returns
+`{1,2}` for `@@ 'number'` (was `{2}`) and `{}` for `@@ 'numb'` (was `{2}`,
+which is what proved the mis-stem). `probe_fts` ran 150,000 operations against
+its reference oracle with 0 divergences, and the mail connector's integration
+suite passes against a live server.
+
+**The workaround it forced is now inverted.** `mail/store_integration_test.go`
+carried a characterisation test asserting the buggy behaviour, with a comment
+saying to invert it when the bug was fixed. Done — it now asserts that
+searching "number" finds "Quarterly numbers".
+
+**`probe_fts` no longer keeps its own copy of the stemmer.** Its oracle carried
+a hand-transcribed duplicate labelled "exact copy of Nucleus's `stem()`" — a
+promise nothing enforced. A differential fuzzer whose oracle drifts from the
+engine either stops finding real divergences or invents fake ones, so the 115
+duplicated lines were deleted and it imports `nucleus::fts::{is_stopword, stem}`.
+
+**Operational consequence, written up in the upgrade runbook.** An FTS index
+stores stemmed terms, so any English index built before this must be dropped and
+recreated or its stored terms will disagree with incoming queries — silently,
+returning fewer rows. There is no `REINDEX` statement, so it is a drop and
+create. Non-English indexes are unaffected.
 
 ## A-012 — Rust Nucleus client had no table-attached FTS
 **Rust SDK · MEDIUM · `SPEC-GAP` · FIXED**
