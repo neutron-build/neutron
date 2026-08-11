@@ -28,6 +28,7 @@ timer.
 ## The gate — run before claiming a change is safe
 
 ```sh
+cargo fmt --check                                  # FIRST — see below
 cargo test --lib --features server
 cargo clippy --all-targets --features server
 cargo check --lib --no-default-features            # core-only build still compiles
@@ -39,6 +40,15 @@ cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 
 cargo run --release --features server --bin probe_engines
 cargo run --release --features server --bin probe_index_coherence
 ```
+
+**`cargo fmt --check` is first because it runs first in CI.** It was missing
+from this list while sitting in the release checklist, and on 2026-08-11 it cost
+a full CI cycle on the N22 fix: both **Nucleus Database Engine** and **Full
+Regression Tests** have a Format step ahead of everything else, so two
+hand-formatted closures failed the gates *before a single test ran*. Every
+probe below had been run locally and proved nothing about those two runs. A
+formatting failure is the cheapest possible red — and it masks the whole gate
+behind it.
 
 **The `--engine buffered-disk` line is not optional.** The default `mvcc` engine
 has no paged storage, so a default-engine fuzz run covers nothing `DiskEngine`
