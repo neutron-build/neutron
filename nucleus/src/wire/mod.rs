@@ -3872,7 +3872,8 @@ fn walk_expr_for_params(
                 "GRAPH_ADD_EDGE" | "GRAPH_SHORTEST_PATH" => &[Type::INT8, Type::INT8],
                 "GRAPH_DELETE_NODE" | "GRAPH_DELETE_EDGE" | "GRAPH_NEIGHBORS" => &[Type::INT8],
                 "FTS_REMOVE" | "FTS_MATCH" => &[Type::INT8],
-                "TS_INSERT" => &[Type::TEXT, Type::INT8],
+                // ts_insert(series, timestamp_ms, value) — the value is a float.
+                "TS_INSERT" => &[Type::TEXT, Type::INT8, Type::FLOAT8],
                 "TS_RANGE_COUNT" | "TS_RANGE_AVG" => &[Type::TEXT, Type::INT8, Type::INT8],
                 "TS_RETENTION" => &[Type::INT8],
                 "CDC_READ" => &[Type::INT8, Type::INT8],
@@ -3887,6 +3888,25 @@ fn walk_expr_for_params(
                 "KV_EXPIRE" => &[Type::TEXT, Type::INT8],
                 "KV_CEXPIRE" => &[Type::TEXT, Type::TEXT, Type::INT8],
                 "UNSUBSCRIBE" => &[Type::INT8],
+
+                // Numeric arguments that are NOT parsed through `val_to_u64`
+                // but coerced inline (`match &args[N] { Value::Int64(..) => ..`),
+                // so deriving this table from `val_to_u64` alone missed them.
+                // Each was found by the live Python SDK suite, which is the
+                // point of having one: `kv.lrange(key, 0, -1)` and
+                // `ts.write(m, points)` failed at bind with "expected str, got
+                // int" / "got float" while their mocked tests passed.
+                //
+                // Signatures are from each function's own doc comment:
+                // kv_lrange(key,start,stop), kv_lindex(key,index),
+                // kv_zrange(key,start,stop), kv_zrangebyscore(key,min,max),
+                // kv_zadd(key,score,member), ts_insert(series,ts_ms,value).
+                "KV_LRANGE" | "KV_ZRANGE" => &[Type::TEXT, Type::INT8, Type::INT8],
+                "KV_LINDEX" => &[Type::TEXT, Type::INT8],
+                "KV_ZRANGEBYSCORE" => &[Type::TEXT, Type::FLOAT8, Type::FLOAT8],
+                "KV_ZADD" => &[Type::TEXT, Type::FLOAT8, Type::TEXT],
+                // time_bucket(bucket_millis, ts)
+                "TIME_BUCKET" => &[Type::INT8, Type::INT8],
                 _ => &[],
             };
             if let sqlparser::ast::FunctionArguments::List(list) = &func.args {

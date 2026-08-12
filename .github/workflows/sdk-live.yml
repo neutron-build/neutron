@@ -1,0 +1,103 @@
+name: SDK vs live Nucleus
+
+# The gate that did not exist, and whose absence is the single biggest source
+# of "this SDK method has never worked" findings in this repo.
+#
+# On 2026-08-11 a manual sweep found that Document.get, Graph.neighbors,
+# Graph.shortest_path, CDC.read, TimeSeries.range_count/range_avg,
+# Streams.xrange/xread, Blob.get/meta, Datalog.query and the KV range reads had
+# NEVER worked over pgwire from Python -- while every one of them had a green
+# test, because `test_nucleus_models.py` says in its own first line that it is
+# "mocked -- no real DB required". A mock proves the client builds the SQL the
+# test expects. It cannot know the server describes that statement with zero
+# result columns, or types a parameter as TEXT that the client binds as an int.
+#
+# The engine's own testing is not the gap: 4,200+ unit tests, a differential
+# fuzzer at zero divergences against SQLite, 49 probes. Every one of those bugs
+# lived at the client boundary, where nothing looked.
+#
+# So this builds the real server, starts it, and runs the SDK against it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/**"
+      - "python/**"
+      - ".github/workflows/sdk-live.yml"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - "python/**"
+      - ".github/workflows/sdk-live.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  python:
+    name: Python SDK vs live Nucleus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: Build nucleus
+        working-directory: nucleus
+        run: cargo build --release --bin nucleus --features server
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the Python SDK
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Start Nucleus
+        working-directory: nucleus
+        run: |
+          mkdir -p /tmp/nucleus-live
+          ./target/release/nucleus start --data /tmp/nucleus-live --port 5433 \
+            > /tmp/nucleus-live/server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5433 -q 2>/dev/null; then break; fi
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p 5433 || (cat /tmp/nucleus-live/server.log; exit 1)
+
+      # `-p no:randomly` keeps the order stable; the suite creates uniquely
+      # named keys per test so it does not depend on ordering, but a stable
+      # order makes a failure reproducible from the log.
+      - name: Run the live SDK suite
+        working-directory: python
+        env:
+          NEUTRON_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5433/postgres
+        run: pytest tests/test_nucleus_live.py -v
+
+      # A suite that silently skips is the same as no suite -- which is exactly
+      # how the Python live tests came to never run. Fail loudly instead.
+      - name: Assert the suite actually ran
+        working-directory: python
+        env:
+          NEUTRON_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5433/postgres
+        run: |
+          out=$(pytest tests/test_nucleus_live.py -q 2>&1 | tail -3)
+          echo "$out"
+          if echo "$out" | grep -qE "skipped|no tests ran"; then
+            echo "::error::The live SDK suite skipped. It is only meaningful when it runs."
+            exit 1
+          fi
+
+      - name: Server log
+        if: always()
+        run: tail -50 /tmp/nucleus-live/server.log || true
