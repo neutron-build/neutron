@@ -1617,6 +1617,30 @@ mod tests {
         Vector::new((0..dim).map(|_| rng.r#gen::<f32>()).collect())
     }
 
+    /// A deterministic vector generator, for the tests that assert a RECALL
+    /// FLOOR rather than a correctness property.
+    ///
+    /// Approximate-nearest-neighbour recall is a statistic over the data, so
+    /// with `thread_rng` those tests are a dice roll against their own
+    /// threshold. `ivfflat_recall` was measured failing 4 runs in 200 — about
+    /// 2% — and duly took the Full Regression gate red on an unrelated commit.
+    /// A gate that fails at random is worse than no gate: this repo has already
+    /// had workflows sit red for over a week because red stopped meaning
+    /// anything.
+    ///
+    /// Seeding does not weaken the assertion. The floor still has to hold for
+    /// this data, and the data is a fixed sample of the same distribution; what
+    /// it removes is the test's ability to disagree with itself between two
+    /// runs of identical code. If a future change genuinely degrades recall,
+    /// the seeded run fails and stays failed.
+    fn seeded_vecs(dim: usize, n: usize, seed: u64) -> Vec<Vector> {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(seed);
+        (0..n)
+            .map(|_| Vector::new((0..dim).map(|_| rng.r#gen::<f32>()).collect()))
+            .collect()
+    }
+
     #[test]
     fn l2_distance_test() {
         let a = Vector::new(vec![1.0, 0.0, 0.0]);
@@ -1833,14 +1857,22 @@ mod tests {
         };
         let mut index = HnswIndex::new(config);
 
-        for i in 0..n {
-            let v = rand_vec(dim);
+        // Seeded for the same reason as `ivfflat_recall`: a recall floor over
+        // random data is a dice roll against its own threshold. This one has
+        // not been seen to fail — it measured 0 in 200 — but it is built
+        // exactly the same way, and the sibling it shares that construction
+        // with failed 4 in 200.
+        for (i, v) in seeded_vecs(dim, n as usize, 20_260_813)
+            .into_iter()
+            .enumerate()
+        {
+            let i = i as u64;
             vectors.push((i, v.clone()));
             index.insert(i, v);
         }
 
         // Run search and compare with exact
-        let query = rand_vec(dim);
+        let query = seeded_vecs(dim, 1, 20_260_814).remove(0);
         let k = 10;
         let hnsw_results = index.search(&query, k);
         let exact_results = exact_search(&vectors, &query, k, DistanceMetric::L2);
@@ -1914,10 +1946,14 @@ mod tests {
         let nlist = 8;
         let nprobe = 4;
 
-        let mut training: Vec<Vec<f32>> = Vec::with_capacity(n);
-        for _ in 0..n {
-            training.push(rand_vec(dim).data);
-        }
+        // Seeded: this asserts a recall FLOOR, which is a statistic over the
+        // data. See `seeded_vecs` — unseeded, it failed about 1 run in 50 and
+        // took the Full Regression gate red on a commit that touched nothing
+        // in this module.
+        let training: Vec<Vec<f32>> = seeded_vecs(dim, n, 20_260_811)
+            .into_iter()
+            .map(|v| v.data)
+            .collect();
 
         let mut index = IvfFlatIndex::new(dim, nlist, nprobe, DistanceMetric::L2);
         index.train(&training);
@@ -1933,7 +1969,7 @@ mod tests {
             .map(|(i, v)| (i as u64, Vector::new(v.clone())))
             .collect();
 
-        let query_vec = rand_vec(dim);
+        let query_vec = seeded_vecs(dim, 1, 20_260_812).remove(0);
         let query = &query_vec.data;
 
         let ivf_results = index.search(query, k);
