@@ -6235,6 +6235,42 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         // worked over pgwire from Python at all.
         "DOC_GET" | "DOC_PATH" | "DOC_PATH_IN" | "DOC_QUERY" => DataType::Text,
         "DOC_COUNT" => DataType::Int64,
+
+        // The rest of the read-only extension surface, added 2026-08-11 for
+        // exactly the reason the document entries above were: with a BOUND
+        // PARAMETER the describe probe fails inside the function (an unbound
+        // placeholder is not an id, a key or a timestamp), so Describe reported
+        // ZERO columns while Execute returned one, and asyncpg refuses that
+        // with "the number of columns in the result row (1) is different from
+        // what was described (0)".
+        //
+        // These are not hypothetical shapes: each one below is a query string
+        // taken verbatim from the Go/Python/Rust SDKs, and all 18 were measured
+        // describing zero columns against a live server. So `Graph.Neighbors`,
+        // `Graph.ShortestPath`, `CDC.Read`, `TimeSeries.RangeCount/RangeAvg`,
+        // `Streams.XRange/XRead`, `Blob.Get/Meta`, `Datalog.Query` and the KV
+        // range reads had never worked over pgwire from Python — the same
+        // never-worked-at-all class as `Document.get`, found the same way.
+        //
+        // The literal-argument form always worked, which is what kept this
+        // hidden: the probe can execute when the arguments are constants, so
+        // every psql check and every test that inlines its values passes.
+        //
+        // Return types are each read off the function's own `Ok(Value::…)`,
+        // not guessed: describing a type the executor does not produce would
+        // trade a loud failure for a wrong decode in binary format.
+        "BLOB_GET" | "BLOB_META" => DataType::Text,
+        "CDC_READ" | "CDC_TABLE_READ" => DataType::Text,
+        "DATALOG_QUERY" => DataType::Text,
+        "GEO_AREA" => DataType::Float64,
+        "GRAPH_NEIGHBORS" | "GRAPH_QUERY" | "GRAPH_SHORTEST_PATH" => DataType::Text,
+        // KV list/sorted-set reads return a JSON array; KV_LINDEX returns the
+        // element, which every push path stores as text.
+        "KV_LINDEX" | "KV_LRANGE" | "KV_ZRANGE" | "KV_ZRANGEBYSCORE" => DataType::Text,
+        "STREAM_XRANGE" | "STREAM_XREAD" => DataType::Text,
+        "TIME_BUCKET" => DataType::Int64,
+        "TS_RANGE_AVG" => DataType::Float64,
+        "TS_RANGE_COUNT" => DataType::Int64,
         _ => return None,
     };
     Some(dt)

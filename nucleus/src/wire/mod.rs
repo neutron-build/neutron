@@ -3851,6 +3851,42 @@ fn walk_expr_for_params(
                 // query placeholder is bindable; typing both is still correct.
                 "BM25" => &[Type::TEXT, Type::TEXT],
                 "KV_INCR" => &[Type::TEXT, Type::INT8],
+
+                // Everything below added 2026-08-11 (N24, uncontested half).
+                // Integer positions taken from the `val_to_u64(&args[N])` calls
+                // in executor/scalar_fns.rs, which is what decides whether an
+                // argument is an id, a count or a timestamp rather than text.
+                //
+                // Safe to type because Go, Python and Rust ALL pass native
+                // integers into these positions already — `fromID int64`,
+                // `int(node_id)`, `&after_sequence` — so today every one of
+                // these calls fails over pgwire against a TEXT description.
+                // Typing them makes those calls start working; it cannot break
+                // a caller, because no SDK sends text here.
+                //
+                // The DOC_* family is deliberately NOT in this table. Those
+                // four SDKs DO send their ids as text, on purpose, as a
+                // documented workaround for this very gap — so typing them is
+                // a coordinated breaking change rather than a fix, and it
+                // waits for a release that is already breaking something.
+                "GRAPH_ADD_EDGE" | "GRAPH_SHORTEST_PATH" => &[Type::INT8, Type::INT8],
+                "GRAPH_DELETE_NODE" | "GRAPH_DELETE_EDGE" | "GRAPH_NEIGHBORS" => &[Type::INT8],
+                "FTS_REMOVE" | "FTS_MATCH" => &[Type::INT8],
+                "TS_INSERT" => &[Type::TEXT, Type::INT8],
+                "TS_RANGE_COUNT" | "TS_RANGE_AVG" => &[Type::TEXT, Type::INT8, Type::INT8],
+                "TS_RETENTION" => &[Type::INT8],
+                "CDC_READ" => &[Type::INT8, Type::INT8],
+                "CDC_TABLE_READ" => &[Type::TEXT, Type::INT8, Type::INT8],
+                "STREAM_XRANGE" => &[Type::TEXT, Type::INT8, Type::INT8, Type::INT8],
+                "STREAM_XREAD" => &[Type::TEXT, Type::INT8, Type::INT8],
+                "STREAM_XGROUP_CREATE" => &[Type::TEXT, Type::TEXT, Type::INT8],
+                "STREAM_XREADGROUP" => &[Type::TEXT, Type::TEXT, Type::TEXT, Type::INT8],
+                "STREAM_XACK" => &[Type::TEXT, Type::TEXT, Type::INT8, Type::INT8],
+                "SPARSE_INSERT" | "SPARSE_REMOVE" => &[Type::INT8],
+                "SPARSE_SEARCH" | "SPARSE_WAND" => &[Type::TEXT, Type::INT8],
+                "KV_EXPIRE" => &[Type::TEXT, Type::INT8],
+                "KV_CEXPIRE" => &[Type::TEXT, Type::TEXT, Type::INT8],
+                "UNSUBSCRIBE" => &[Type::INT8],
                 _ => &[],
             };
             if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
