@@ -76,8 +76,17 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      # --ignore-workspace is load-bearing. benchmarks/ is not a workspace
+      # member, so from the workspace root pnpm resolved the install back to
+      # the root, exited 0, and installed nothing — the harness then died on
+      # `Cannot find package 'autocannon'`. The harness's own installSteps
+      # already pass this flag for every subject app; the workflow did not.
       - name: Install benchmark harness dependencies
-        run: pnpm --dir benchmarks install --frozen-lockfile
+        run: pnpm --dir benchmarks install --frozen-lockfile --ignore-workspace
+
+      - name: Assert the harness actually installed
+        run: node -e "import('autocannon').then(()=>console.log('harness deps OK'))"
+        working-directory: typescript/benchmarks
 
       - name: Run smoke benchmark
         run: pnpm --dir benchmarks run compare:quick
@@ -125,8 +134,17 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      # --ignore-workspace is load-bearing. benchmarks/ is not a workspace
+      # member, so from the workspace root pnpm resolved the install back to
+      # the root, exited 0, and installed nothing — the harness then died on
+      # `Cannot find package 'autocannon'`. The harness's own installSteps
+      # already pass this flag for every subject app; the workflow did not.
       - name: Install benchmark harness dependencies
-        run: pnpm --dir benchmarks install --frozen-lockfile
+        run: pnpm --dir benchmarks install --frozen-lockfile --ignore-workspace
+
+      - name: Assert the harness actually installed
+        run: node -e "import('autocannon').then(()=>console.log('harness deps OK'))"
+        working-directory: typescript/benchmarks
 
       - name: Run full benchmark
         run: pnpm --dir benchmarks run compare:full

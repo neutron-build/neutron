@@ -1,7 +1,7 @@
 {
   "packageManager": "pnpm9",
   "packages": {
-    "count": 24,
+    "count": 23,
     "items": [
       {
         "name": "@neutron-build/agents",
@@ -86,10 +86,6 @@
       {
         "name": "neutron-site",
         "path": "apps/site"
-      },
-      {
-        "name": "observe-dashboard",
-        "path": "apps/observe"
       },
       {
         "name": "website-smoke",

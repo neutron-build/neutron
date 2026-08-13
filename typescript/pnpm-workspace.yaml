@@ -1,6 +1,12 @@
 packages:
   - "packages/*"
   - "apps/*"
+  # apps/observe is a separate project and is gitignored, so it exists on some
+  # developers' disks and never in a checkout. Left matched by apps/*, the
+  # workspace graph became machine-dependent: a snapshot written locally listed
+  # observe-dashboard and CI could never reproduce it. The workspace definition
+  # has to describe the repository, not whatever happens to be on disk.
+  - "!apps/observe"
   - "examples/*"
   # Ecosystem compatibility harness (A-007). Never published.
   - "compat-matrix"
