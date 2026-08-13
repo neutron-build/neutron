@@ -1333,3 +1333,259 @@ async fn prisma_namespaces_query_shape() {
 
     server.abort();
 }
+
+// ============================================================================
+// Statement-level Describe: result columns and parameters of a cast
+// ============================================================================
+
+/// Statement Describe happens BEFORE Bind, so the engine probes the query with
+/// NULL substituted for each unbound placeholder. Two defects rode on that.
+///
+/// **Zero result columns.** `eval_cast` had no NULL arm for JSONB/JSON, UUID,
+/// BYTEA or BOOL, so the probe raised "cannot cast Null to JSONB" and Describe
+/// answered with no fields at all while Execute later returned one. asyncpg
+/// aborts on the mismatch: "the number of columns in the result row (1) is
+/// different from what was described (0)".
+///
+/// **A result column typed from the substituted NULL.** `Value::Null` carries
+/// no type, so `SELECT $1::int` was described as VARCHAR. That one raised no
+/// error anywhere: asyncpg requested the column in binary, decoded the four
+/// big-endian bytes of the integer with its text codec, and handed the caller
+/// the string `'\x00\x00\x00\x01'`. A wrong answer in the right shape.
+///
+/// Neither is visible through psql, which does not check the described column
+/// count against the row it receives, nor through a portal-describing driver
+/// such as node-postgres or pgx — they bind first, when the parameter type is
+/// already known.
+#[tokio::test(flavor = "multi_thread")]
+async fn parameterized_cast_describes_one_column_of_the_cast_type() {
+    use tokio_postgres::types::Type;
+
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    // (sql, expected result column type)
+    let cases: &[(&str, Type)] = &[
+        ("SELECT $1::text", Type::VARCHAR),
+        ("SELECT $1::jsonb", Type::JSONB),
+        ("SELECT $1::json", Type::JSONB),
+        ("SELECT $1::uuid", Type::UUID),
+        ("SELECT $1::bytea", Type::BYTEA),
+        ("SELECT $1::int", Type::INT4),
+        ("SELECT $1::int8", Type::INT8),
+        ("SELECT $1::bool", Type::BOOL),
+        ("SELECT $1::float8", Type::FLOAT8),
+        ("SELECT $1::numeric", Type::NUMERIC),
+        ("SELECT $1::timestamptz", Type::TIMESTAMPTZ),
+    ];
+
+    for (sql, want) in cases {
+        let stmt = client
+            .prepare(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: prepare failed: {e}"));
+        assert_eq!(
+            stmt.columns().len(),
+            1,
+            "{sql}: described {} result columns but Execute returns 1; a strict \
+             client aborts on the mismatch",
+            stmt.columns().len()
+        );
+        assert_eq!(
+            *stmt.columns()[0].type_(),
+            *want,
+            "{sql}: result column described as {:?}. A client that requests this \
+             column in binary decodes the value with the wrong codec and gets no \
+             error — only a wrong answer.",
+            stmt.columns()[0].type_()
+        );
+    }
+
+    server.abort();
+}
+
+/// The parameter side of the same statement. `::bool`, `::int8` and `::float8`
+/// are separate sqlparser variants from `::boolean`, `::bigint` and
+/// `::double precision`, and only the long spellings were in
+/// `convert_data_type` — so an explicit cast that names the type was still
+/// advertised as TEXT and asyncpg refused to bind ("expected str, got int").
+///
+/// This is NOT the `DOC_*` typing question pinned by
+/// `tests/describe_scalar_fns.rs`: those parameters carry no cast and the SDKs
+/// send them as text deliberately. Here the query itself names the type.
+#[tokio::test(flavor = "multi_thread")]
+async fn parameterized_cast_describes_its_parameter_as_the_cast_type() {
+    use tokio_postgres::types::Type;
+
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    let cases: &[(&str, Type)] = &[
+        ("SELECT $1::text", Type::VARCHAR),
+        ("SELECT $1::int", Type::INT4),
+        ("SELECT $1::int8", Type::INT8),
+        ("SELECT $1::bool", Type::BOOL),
+        ("SELECT $1::float8", Type::FLOAT8),
+        ("SELECT $1::numeric", Type::NUMERIC),
+        ("SELECT $1::uuid", Type::UUID),
+        ("SELECT $1::jsonb", Type::JSONB),
+    ];
+
+    for (sql, want) in cases {
+        let stmt = client
+            .prepare(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: prepare failed: {e}"));
+        assert_eq!(
+            stmt.params()[0],
+            *want,
+            "{sql}: parameter $1 described as {:?}",
+            stmt.params()[0]
+        );
+    }
+
+    server.abort();
+}
+
+/// Values must survive the round trip, not merely describe well — and until
+/// this test landed, `pg_compat.rs` bound no scalar `&str` parameter anywhere,
+/// which is how the single most common parameter type had zero coverage here.
+#[tokio::test(flavor = "multi_thread")]
+async fn scalar_parameters_round_trip_through_a_cast() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    let row = client.query_one("SELECT $1::text", &[&"hi"]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "hi");
+
+    let row = client.query_one("SELECT $1::int", &[&1i32]).await.unwrap();
+    assert_eq!(
+        row.get::<_, i32>(0),
+        1,
+        "the four raw BE bytes came back once"
+    );
+
+    let row = client.query_one("SELECT $1::int8", &[&7i64]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 7);
+
+    let row = client
+        .query_one("SELECT $1::float8", &[&1.5f64])
+        .await
+        .unwrap();
+    assert!((row.get::<_, f64>(0) - 1.5).abs() < f64::EPSILON);
+
+    let row = client.query_one("SELECT $1::bool", &[&true]).await.unwrap();
+    assert!(row.get::<_, bool>(0));
+
+    let doc = serde_json::json!({"a": 1});
+    let row = client.query_one("SELECT $1::jsonb", &[&doc]).await.unwrap();
+    assert_eq!(row.get::<_, serde_json::Value>(0), doc);
+
+    server.abort();
+}
+
+/// Casting NULL yields NULL of the target type, for every target. This is
+/// plain SQL, independent of the wire protocol — `SELECT NULL::jsonb` raised
+/// "cannot cast Null to JSONB" in psql over the SIMPLE protocol, and that
+/// error is what made the Describe probe above report zero columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn casting_null_yields_null_for_every_target_type() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    for ty in [
+        "text",
+        "jsonb",
+        "json",
+        "uuid",
+        "bytea",
+        "bool",
+        "boolean",
+        "int",
+        "int8",
+        "int2",
+        "float8",
+        "float4",
+        "numeric",
+        "date",
+        "timestamptz",
+    ] {
+        let sql = format!("SELECT NULL::{ty} IS NULL AS is_null");
+        let rows = client
+            .simple_query(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("SELECT NULL::{ty} must not error: {e}"));
+        let row = rows
+            .iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("SELECT NULL::{ty} returned no row"));
+        assert_eq!(row.get(0), Some("t"), "NULL::{ty} must still be NULL");
+    }
+
+    server.abort();
+}
+
+/// A computed column needs no parameter to hit the same defect: the static
+/// return-type table did not know the vector functions, so `score` below was
+/// described as TEXT while the executor produced a float8. asyncpg decodes the
+/// eight IEEE-754 bytes with its text codec and raises "UnicodeDecodeError:
+/// 'utf-8' codec can't decode byte 0xf0".
+#[tokio::test(flavor = "multi_thread")]
+async fn computed_vector_columns_describe_their_real_type() {
+    use tokio_postgres::types::Type;
+
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE vd (id TEXT PRIMARY KEY, embedding VECTOR(3), metadata JSONB)")
+        .await
+        .unwrap();
+
+    let stmt = client
+        .prepare(
+            "SELECT id, VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]'), 'cosine') AS score \
+             FROM vd",
+        )
+        .await
+        .unwrap();
+    assert_eq!(stmt.columns().len(), 2);
+    assert_eq!(
+        *stmt.columns()[1].type_(),
+        Type::FLOAT8,
+        "score described as {:?}",
+        stmt.columns()[1].type_()
+    );
+
+    let stmt = client
+        .prepare("SELECT VECTOR_DIMS(embedding) AS d FROM vd")
+        .await
+        .unwrap();
+    assert_eq!(*stmt.columns()[0].type_(), Type::INT4);
+
+    // The shape every SDK's vector search actually sends, and the one that
+    // survived the first round of this fix. Describe probes by substituting
+    // NULL for each unbound placeholder, and it cannot append `LIMIT 0` to a
+    // query that already ends in `LIMIT NULL` — so it re-runs the original,
+    // which DOES return rows. `VECTOR_DISTANCE` with a NULL metric argument
+    // returns NULL, and a NULL value was typed TEXT, so `score` came back
+    // described as varchar with real float8 bytes inside it.
+    let stmt = client
+        .prepare(
+            "SELECT id, VECTOR_DISTANCE(embedding, VECTOR($1), $2) AS score, metadata \
+             FROM vd ORDER BY score LIMIT $3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *stmt.columns()[1].type_(),
+        Type::FLOAT8,
+        "score described as {:?} on the ORDER BY ... LIMIT $n path",
+        stmt.columns()[1].type_()
+    );
+
+    server.abort();
+}

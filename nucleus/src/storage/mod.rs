@@ -1544,6 +1544,17 @@ pub enum StorageError {
     UniqueViolation(String),
     #[error("transaction ID space exhausted; restart from a fresh logical backup")]
     TransactionIdExhausted,
+    /// A stored tuple could not be decoded against its table's column types.
+    ///
+    /// Scans used to log this and CONTINUE, which turned any storage-format
+    /// defect into missing rows with no error reaching the client: a table
+    /// whose tuples all failed to decode answered `SELECT id` from the index
+    /// with every row and `SELECT *` from the heap with none. Two clients
+    /// disagreeing about how many rows a table holds, silently, is a worse
+    /// outcome than a failed query, so a scan that cannot read a row now
+    /// fails instead of quietly shortening its answer.
+    #[error("corrupt tuple: {0}")]
+    Corruption(String),
 }
 
 pub use mvcc::MvccStorageAdapter;

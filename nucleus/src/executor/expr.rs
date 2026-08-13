@@ -1739,6 +1739,25 @@ impl Executor {
     }
 
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
+        // Casting NULL yields NULL of the target type, for EVERY target. This
+        // has to be answered before the per-type arms because most of them
+        // reject anything they cannot recognise, and `Value::Null` is not
+        // recognised by JSONB/JSON, UUID, BYTEA, ARRAY or INTERVAL — so
+        // `SELECT NULL::jsonb` raised "cannot cast Null to JSONB" where
+        // Postgres returns NULL.
+        //
+        // That error was not merely a missing conversion. Statement-level
+        // Describe probes a SELECT by substituting NULL for every unbound
+        // placeholder and executing it, so the failing cast made
+        // `SELECT $1::jsonb` (and ::json, ::uuid, ::bytea, ::bool) describe
+        // ZERO result columns while Execute later returned one. asyncpg
+        // enforces that: "the number of columns in the result row (1) is
+        // different from what was described (0)". Every strict extended-
+        // protocol client was locked out of parameterised casts to those
+        // types.
+        if matches!(val, Value::Null) {
+            return Ok(Value::Null);
+        }
         match target {
             // '<catalog name>'::regclass — psql meta-commands (\dx notably) use
             // this to reference system catalogs by name. Resolve the fixed
@@ -1892,7 +1911,10 @@ impl Executor {
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to FLOAT"))),
                 _ => Err(ExecError::Unsupported("cannot cast to FLOAT".to_string())),
             },
-            ast::DataType::Boolean => match val {
+            // `::bool` is a distinct sqlparser variant from `::boolean`, and
+            // only the long spelling was handled — `SELECT 't'::bool` failed
+            // with "cast to BOOL" while `::boolean` worked.
+            ast::DataType::Boolean | ast::DataType::Bool => match val {
                 Value::Null => Ok(Value::Null),
                 Value::Bool(_) => Ok(val),
                 Value::Int32(n) => Ok(Value::Bool(n != 0)),
@@ -2024,7 +2046,7 @@ impl Executor {
                     .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to REAL"))),
                 _ => Err(ExecError::Unsupported("cannot cast to REAL".to_string())),
             },
-            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => {
+            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) | ast::DataType::Int2(_) => {
                 let n = match val {
                     Value::Int32(n) => i64::from(n),
                     Value::Int64(n) => n,

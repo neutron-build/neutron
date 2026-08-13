@@ -10,7 +10,7 @@ use sqlparser::ast::{self, Expr, SelectItem};
 use crate::planner;
 use crate::types::{Row, Value};
 
-use super::helpers::value_type;
+use super::helpers::projected_column_type;
 use super::types::{ColMeta, JoinType};
 use super::{ExecError, ExecResult, Executor};
 
@@ -29,12 +29,15 @@ impl Executor {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     let value = self.eval_const_expr(expr)?;
-                    columns.push((format!("{expr}"), value_type(&value)));
+                    columns.push((format!("{expr}"), projected_column_type(expr, &value, &[])));
                     row.push(value);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let value = self.eval_const_expr(expr)?;
-                    columns.push((alias.value.clone(), value_type(&value)));
+                    columns.push((
+                        alias.value.clone(),
+                        projected_column_type(expr, &value, &[]),
+                    ));
                     row.push(value);
                 }
                 _ => return Err(ExecError::Unsupported("unsupported select item".into())),

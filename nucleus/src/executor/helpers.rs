@@ -107,6 +107,41 @@ pub(super) fn pg_setting_metadata(name: &str) -> (&'static str, &'static str, &'
     }
 }
 
+/// Result-column type for a projected expression, given the value it produced
+/// for one row.
+///
+/// The value decides, EXCEPT when it is NULL. `Value::Null` carries no type,
+/// so `value_type` calls it TEXT — and every caller here is describing a
+/// column to a client, which then decodes the real value with the wrong codec
+/// and reports no error at all.
+///
+/// This bites hardest on the pgwire statement-Describe path, which probes a
+/// SELECT with NULL substituted for every unbound placeholder. Two examples
+/// that were live:
+///
+/// * `SELECT $1::int` was described as VARCHAR, so asyncpg decoded the four
+///   big-endian bytes of the integer as text and returned the string
+///   `'\x00\x00\x00\x01'`.
+/// * `SELECT VECTOR_DISTANCE(embedding, VECTOR($1), $2) AS score FROM t
+///   ORDER BY score LIMIT $3` described `score` as VARCHAR. The probe cannot
+///   append `LIMIT 0` to a query that already ends in `LIMIT NULL`, so it
+///   re-ran the original, which DOES return rows — and with a NULL metric
+///   argument `VECTOR_DISTANCE` returns NULL. A float8 column described as
+///   text; asyncpg raises `UnicodeDecodeError` on byte 0xf0.
+///
+/// A typed NULL still has a static type, so fall back to it.
+pub(super) fn projected_column_type(
+    expr: &sqlparser::ast::Expr,
+    value: &Value,
+    col_meta: &[ColMeta],
+) -> DataType {
+    if matches!(value, Value::Null) {
+        infer_expr_type(expr, col_meta)
+    } else {
+        value_type(value)
+    }
+}
+
 pub(super) fn value_type(value: &Value) -> DataType {
     match value {
         Value::Null => DataType::Text,
@@ -231,6 +266,21 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                 // bytes in a TEXT-described column (dogfood finding #23).
                 "KV_INCR" | "FTS_DOC_COUNT" | "FTS_TERM_COUNT" => DataType::Int64,
                 "FTS_INDEX" | "FTS_INDEX_FACETED" => DataType::Bool,
+                // Same class as the KV_INCR entry above, and it needs no bound
+                // parameter to bite: `SELECT VECTOR_DISTANCE(...) AS score
+                // FROM t` describes `score` from this table, so without these
+                // arms a float8 result column was advertised as TEXT. A client
+                // that then requests the column in binary decodes eight bytes
+                // of IEEE-754 with a text codec — asyncpg raises
+                // "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xf0".
+                "VECTOR_DISTANCE"
+                | "VECTOR_L2_DISTANCE"
+                | "L2_DISTANCE"
+                | "VECTOR_COSINE_DISTANCE"
+                | "COSINE_DISTANCE"
+                | "VECTOR_INNER_PRODUCT"
+                | "INNER_PRODUCT" => DataType::Float64,
+                "VECTOR_DIMS" => DataType::Int32,
                 _ => DataType::Text,
             }
         }

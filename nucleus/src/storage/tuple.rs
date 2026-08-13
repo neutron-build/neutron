@@ -451,8 +451,21 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 row.push(Value::Array(elems));
                 pos = arr_end;
             }
-            DataType::Vector(dim) => {
-                // Deserialize packed floats
+            DataType::Vector(_) => {
+                // Deserialize packed floats.
+                //
+                // The stored tuple is self-describing: it carries its own
+                // element count, so the DECLARED dimension must not gate the
+                // decode. It used to (`count != *dim` returned None), and a
+                // column declared as plain `VECTOR` — which `convert_data_type`
+                // maps to `Vector(0)`, meaning "dimension unknown" — therefore
+                // rejected every row it had itself written. The scan logged
+                // "failed to deserialize tuple" and SKIPPED the row, so a table
+                // with a dimensionless VECTOR column returned zero rows from
+                // any query that touched the heap while `SELECT id` still
+                // answered from the index. Silent, total, unattributed data
+                // loss; see `deserialize_size` and `deserialize_column_at` for
+                // the same check.
                 if pos + 4 > data.len() {
                     return None;
                 }
@@ -460,7 +473,7 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
                         as usize;
                 pos += 4;
-                if count != *dim || pos + count * 4 > data.len() {
+                if pos + count * 4 > data.len() {
                     return None;
                 }
                 let mut vec = Vec::with_capacity(count);
@@ -591,14 +604,15 @@ fn column_byte_size(data: &[u8], pos: usize, dtype: &DataType) -> Option<usize> 
             }
             Some(4 + total_len)
         }
-        DataType::Vector(dim) => {
-            // Format: [count: u32] [count * f32]
+        DataType::Vector(_) => {
+            // Format: [count: u32] [count * f32]. The count is authoritative;
+            // the declared dimension is not a decode gate (see `deserialize_row`).
             if pos + 4 > data.len() {
                 return None;
             }
             let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
                 as usize;
-            if count != *dim || pos + 4 + count * 4 > data.len() {
+            if pos + 4 + count * 4 > data.len() {
                 return None;
             }
             Some(4 + count * 4)
@@ -948,14 +962,16 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             }
             Some(Value::Array(elems))
         }
-        DataType::Vector(dim) => {
+        DataType::Vector(_) => {
+            // The stored count is authoritative; the declared dimension is not
+            // a decode gate (see `deserialize_row`).
             if pos + 4 > data.len() {
                 return None;
             }
             let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
                 as usize;
             let start = pos + 4;
-            if count != *dim || start + count * 4 > data.len() {
+            if start + count * 4 > data.len() {
                 return None;
             }
             let mut vec = Vec::with_capacity(count);
@@ -1108,6 +1124,56 @@ mod tests {
         let bytes = serialize_row(&row, &types);
         let decoded = deserialize_row(&bytes, &types).unwrap();
         assert_eq!(row, decoded);
+    }
+
+    /// A `VECTOR` column declared without a dimension is `Vector(0)`, meaning
+    /// "dimension unknown" — but the decoder read that 0 as a REQUIREMENT and
+    /// rejected every row it had itself written. The scan then logged a
+    /// deserialize failure and skipped the row, so a table with a
+    /// dimensionless vector column answered `SELECT id` from the index with
+    /// every row and `SELECT *` from the heap with none.
+    ///
+    /// The tuple is self-describing: its own element count decides.
+    #[test]
+    fn roundtrip_vector_with_undeclared_dimension() {
+        let types = vec![DataType::Vector(0)];
+        let row = vec![Value::Vector(vec![1.0, 0.0, 0.0])];
+        let bytes = serialize_row(&row, &types);
+
+        assert_eq!(
+            deserialize_row(&bytes, &types).as_ref(),
+            Some(&row),
+            "a dimensionless VECTOR column must read back what it wrote"
+        );
+        assert_eq!(
+            deserialize_row_projected(&bytes, &types, &[0]),
+            Some(row),
+            "projected decode must agree with the whole-row decode"
+        );
+
+        // A projection that SKIPS the vector goes through the size-only path,
+        // which carried the same check and so also failed the whole row.
+        let types = vec![DataType::Vector(0), DataType::Text];
+        let row = vec![Value::Vector(vec![1.0, 0.0, 0.0]), Value::Text("v1".into())];
+        let bytes = serialize_row(&row, &types);
+        assert_eq!(
+            deserialize_row_projected(&bytes, &types, &[1]),
+            Some(vec![Value::Text("v1".into())]),
+            "skipping a dimensionless vector must not fail the row"
+        );
+        assert_eq!(deserialize_row(&bytes, &types), Some(row));
+    }
+
+    /// A vector whose length differs from the column's DECLARED dimension is
+    /// accepted at INSERT time today. Whatever the right answer is there, the
+    /// decoder must not be the place it is discovered: rejecting the row here
+    /// makes already-written data unreadable instead of reporting an error.
+    #[test]
+    fn stored_vector_decodes_even_when_it_differs_from_the_declared_dimension() {
+        let types = vec![DataType::Vector(4)];
+        let row = vec![Value::Vector(vec![1.0, 0.0, 0.0])];
+        let bytes = serialize_row(&row, &types);
+        assert_eq!(deserialize_row(&bytes, &types).as_ref(), Some(&row));
     }
 
     #[test]

@@ -7371,6 +7371,28 @@ impl Executor {
                         name: "typinput".into(),
                         dtype: DataType::Text,
                     },
+                    // Postgrex's type bootstrap selects typsend/typreceive/
+                    // typoutput alongside typinput, and no client option
+                    // avoids them. Their absence failed the bootstrap query,
+                    // which Postgrex retries forever — so every Elixir/Ecto/
+                    // Phoenix caller saw a DBConnection queue timeout and
+                    // never the missing column. Same scalar spelling as
+                    // typinput.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typoutput".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typreceive".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typsend".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let domain_cols = |rows: &mut Vec<Vec<Value>>| {
                     for row in rows.iter_mut() {
@@ -7387,6 +7409,9 @@ impl Executor {
                             Value::Int32(0),
                             Value::Text(",".into()),
                             Value::Text(format!("{typname}in")),
+                            Value::Text(format!("{typname}out")),
+                            Value::Text(format!("{typname}recv")),
+                            Value::Text(format!("{typname}send")),
                         ]);
                     }
                 };
@@ -8675,6 +8700,39 @@ impl Executor {
                         dtype: DataType::Text,
                     },
                 ];
+                Ok(Some((cols, Vec::new())))
+            }
+            // Postgrex's type bootstrap LEFT JOINs pg_range for rngsubtype /
+            // rngtypid / rngmultitypid, and a server reporting >= 9.2 — which
+            // Nucleus does, as "16.0 (Nucleus)" — has no client option that
+            // skips the join. Missing, it raised 42P01 before a single
+            // statement could be served, and Postgrex retries the bootstrap
+            // rather than surfacing the error, so the caller only ever saw a
+            // DBConnection queue timeout.
+            //
+            // Nucleus has no range types, so the relation is legitimately
+            // empty. The COLUMNS are the part that has to be right: a
+            // pg_range with the wrong shape fails exactly like a missing one,
+            // and just as undiagnosably.
+            "pg_catalog.pg_range" | "pg_range" => {
+                // oid columns are Int32; rngcanonical/rngsubdiff are regproc,
+                // which Nucleus renders as the function name (text).
+                let cols = [
+                    ("rngtypid", DataType::Int32),
+                    ("rngsubtype", DataType::Int32),
+                    ("rngmultitypid", DataType::Int32),
+                    ("rngcollation", DataType::Int32),
+                    ("rngsubopc", DataType::Int32),
+                    ("rngcanonical", DataType::Text),
+                    ("rngsubdiff", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(name, dtype)| ColMeta {
+                    table: Some(label.into()),
+                    name: name.into(),
+                    dtype,
+                })
+                .collect::<Vec<_>>();
                 Ok(Some((cols, Vec::new())))
             }
             "pg_catalog.pg_index" | "pg_index" => {

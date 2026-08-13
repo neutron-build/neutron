@@ -1763,11 +1763,10 @@ impl DiskEngine {
                 let off = entry.offset() as usize;
                 let len = entry.length() as usize;
                 let Some(row) = tuple::deserialize_row(&pg[off..off + len], &col_types) else {
-                    tracing::error!(
-                        target: "nucleus::storage",
-                        "failed to deserialize tuple on page {page_id} (slot {slot_idx}); row omitted from scan"
-                    );
-                    continue;
+                    return Err(StorageError::Corruption(format!(
+                        "page {page_id} slot {slot_idx} does not decode against the \
+                         column types of '{table}'"
+                    )));
                 };
                 if let Some((col_idx, value)) = filter
                     && !row.get(col_idx).is_some_and(|v| v.loose_eq(value))
@@ -2553,15 +2552,13 @@ impl StorageEngine for DiskEngine {
                 .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             for (_slot_idx, tuple_data) in page::iter_tuples(&pg) {
-                match tuple::deserialize_row(tuple_data, &col_types) {
-                    Some(row) => rows.push(row),
-                    // A tuple that fails to deserialize indicates corruption. Don't
-                    // silently drop it from scan results with no trace — surface it.
-                    None => tracing::error!(
-                        target: "nucleus::storage",
-                        "failed to deserialize tuple on page {page_id} (slot {_slot_idx}); row omitted from scan"
-                    ),
-                }
+                let Some(row) = tuple::deserialize_row(tuple_data, &col_types) else {
+                    return Err(StorageError::Corruption(format!(
+                        "page {page_id} slot {_slot_idx} does not decode against the \
+                         column types of '{table}'"
+                    )));
+                };
+                rows.push(row);
             }
         }
 
@@ -2602,13 +2599,13 @@ impl StorageEngine for DiskEngine {
                 .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             for (_slot_idx, tuple_data) in page::iter_tuples(&pg) {
-                match tuple::deserialize_row(tuple_data, &col_types) {
-                    Some(row) => rows.push(row),
-                    None => tracing::error!(
-                        target: "nucleus::storage",
-                        "failed to deserialize tuple on page {page_id} (slot {_slot_idx}); row omitted from scan"
-                    ),
-                }
+                let Some(row) = tuple::deserialize_row(tuple_data, &col_types) else {
+                    return Err(StorageError::Corruption(format!(
+                        "page {page_id} slot {_slot_idx} does not decode against the \
+                         column types of '{table}'"
+                    )));
+                };
+                rows.push(row);
                 if rows.len() >= limit {
                     return Ok(rows);
                 }
@@ -2650,16 +2647,15 @@ impl StorageEngine for DiskEngine {
                 .read_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             for (_slot_idx, tuple_data) in page::iter_tuples(&pg) {
-                match tuple::deserialize_row_projected(tuple_data, &col_types, projection) {
-                    Some(row) => rows.push(row),
-                    // Same contract as `scan`: a tuple that fails to deserialize is
-                    // corruption, not an empty row. Surface it instead of dropping
-                    // it silently.
-                    None => tracing::error!(
-                        target: "nucleus::storage",
-                        "failed to deserialize tuple on page {page_id} (slot {_slot_idx}); row omitted from projected scan"
-                    ),
-                }
+                let Some(row) =
+                    tuple::deserialize_row_projected(tuple_data, &col_types, projection)
+                else {
+                    return Err(StorageError::Corruption(format!(
+                        "page {page_id} slot {_slot_idx} does not decode against the \
+                         column types of '{table}'"
+                    )));
+                };
+                rows.push(row);
                 if limit.is_some_and(|n| rows.len() >= n) {
                     return Ok(rows);
                 }
@@ -2702,12 +2698,20 @@ impl StorageEngine for DiskEngine {
                     .pool
                     .read_guard(page_id)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
+                // `filter_map` here dropped undecodable tuples without even a
+                // log line — the same silent shortening as the other scans,
+                // minus the evidence.
                 page::iter_tuples(&pg)
                     .into_iter()
-                    .filter_map(|(_slot_idx, tuple_data)| {
-                        tuple::deserialize_row(tuple_data, &col_types)
+                    .map(|(slot_idx, tuple_data)| {
+                        tuple::deserialize_row(tuple_data, &col_types).ok_or_else(|| {
+                            StorageError::Corruption(format!(
+                                "page {page_id} slot {slot_idx} does not decode against \
+                                 the column types of '{table}'"
+                            ))
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<Row>, StorageError>>()?
             };
             for row in page_rows {
                 batch.push(row);

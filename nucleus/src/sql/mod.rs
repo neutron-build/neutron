@@ -309,12 +309,24 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
 /// Convert a sqlparser DataType to our internal DataType.
 pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
     match dt {
-        ast::DataType::Boolean => Ok(DataType::Bool),
-        ast::DataType::Int(_) | ast::DataType::Integer(_) => Ok(DataType::Int32),
-        ast::DataType::BigInt(_) => Ok(DataType::Int64),
-        ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
-            Ok(DataType::Float64)
+        // The short Postgres spellings (`bool`, `int2/4/8`, `float4/8`) are
+        // SEPARATE sqlparser variants from the long ones, and only the long
+        // ones were listed here. `eval_cast` already accepted both, so the
+        // engine could evaluate `$1::int8` but this function — which is what
+        // types a parameter for ParameterDescription and what types a CAST
+        // result column — returned Err and the wire layer fell back to TEXT.
+        // asyncpg then refused to bind a Python int to `SELECT $1::int8`
+        // ("expected str, got int") for a cast that plainly says otherwise.
+        ast::DataType::Boolean | ast::DataType::Bool => Ok(DataType::Bool),
+        ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => {
+            Ok(DataType::Int32)
         }
+        ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Ok(DataType::Int64),
+        ast::DataType::Float(_)
+        | ast::DataType::Double(_)
+        | ast::DataType::DoublePrecision
+        | ast::DataType::Float4
+        | ast::DataType::Float8 => Ok(DataType::Float64),
         ast::DataType::Text
         | ast::DataType::Varchar(_)
         | ast::DataType::CharVarying(_)
@@ -341,7 +353,9 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
         ast::DataType::Uuid => Ok(DataType::Uuid),
         ast::DataType::Bytea => Ok(DataType::Bytea),
         ast::DataType::Blob(_) => Ok(DataType::Bytea),
-        ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => Ok(DataType::Int32),
+        ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) | ast::DataType::Int2(_) => {
+            Ok(DataType::Int32)
+        }
         ast::DataType::Real => Ok(DataType::Float64),
         ast::DataType::Array(inner) => match inner {
             ast::ArrayElemTypeDef::AngleBracket(dt) => {

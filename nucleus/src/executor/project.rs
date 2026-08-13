@@ -9,7 +9,7 @@ use crate::types::Row;
 
 use super::ExecError;
 use super::Executor;
-use super::helpers::{infer_expr_type, value_type};
+use super::helpers::infer_expr_type;
 use super::types::{ColMeta, ProjectedResult};
 
 impl Executor {
@@ -68,7 +68,10 @@ impl Executor {
                     // the correct column type instead of defaulting to TEXT.
                     if let Some(first) = rows.first() {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
-                        columns.push((super::helpers::default_output_name(expr), value_type(&val)));
+                        columns.push((
+                            super::helpers::default_output_name(expr),
+                            super::helpers::projected_column_type(expr, &val, col_meta),
+                        ));
                     } else {
                         columns.push((
                             super::helpers::default_output_name(expr),
@@ -81,7 +84,10 @@ impl Executor {
                 SelectItem::ExprWithAlias { expr, alias } => {
                     if let Some(first) = rows.first() {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
-                        columns.push((alias.value.clone(), value_type(&val)));
+                        columns.push((
+                            alias.value.clone(),
+                            super::helpers::projected_column_type(expr, &val, col_meta),
+                        ));
                     } else {
                         columns.push((alias.value.clone(), infer_expr_type(expr, col_meta)));
                     }
