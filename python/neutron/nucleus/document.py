@@ -24,6 +24,26 @@ def _doc_id(doc_id: int) -> str:
     return str(doc_id)
 
 
+def _decode_path_value(raw: object) -> Any:
+    """Return the VALUE at a document path, not its JSON encoding.
+
+    DOC_PATH hands back raw JSON, so a stored string arrived as `'"ada"'` and
+    every caller had to json.loads it — while `get`/`get_in` on the same client
+    return a decoded dict. Two shapes for the same idea in one API is drift, and
+    the live conformance spec asserts the decoded form for all seven SDKs.
+
+    A value that is not valid JSON is returned untouched rather than raising:
+    the engine is the only producer here, but a client that turns a readable
+    value into an exception is worse than one that passes it through.
+    """
+    if raw is None or not isinstance(raw, str):
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+
+
 def _parse_ids(raw: str | None) -> list[int]:
     """Robustly parse a comma-separated list of integer IDs."""
     if not raw:
@@ -208,15 +228,17 @@ class DocumentModel:
         base = 3 if collection else 2
         placeholders = ", ".join(f"${i + base}" for i in range(len(keys)))
         if collection:
-            return await self._exec.fetchval(
+            raw = await self._exec.fetchval(
                 f"SELECT DOC_PATH_IN($1, $2, {placeholders})",
                 collection,
                 _doc_id(doc_id),
                 *keys,
             )
-        return await self._exec.fetchval(
-            f"SELECT DOC_PATH($1, {placeholders})", _doc_id(doc_id), *keys
-        )
+        else:
+            raw = await self._exec.fetchval(
+                f"SELECT DOC_PATH($1, {placeholders})", _doc_id(doc_id), *keys
+            )
+        return _decode_path_value(raw)
 
     async def count(self) -> int:
         """Count documents in the default collection."""

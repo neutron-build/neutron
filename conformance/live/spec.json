@@ -68,7 +68,6 @@
       "model": "document",
       "why": "L2. DOC_PATH returns raw JSON and the Python client hands it back undecoded, so a string value arrives as '\"ada\"' rather than 'ada'. The contract is that get_path yields the VALUE. Until every SDK decodes, this is the drift the suite exists to surface.",
       "issue": "L2",
-      "xfail": { "reason": "Python returns '\"ada\"' where the contract says 'ada'. Confirmed against current main 2026-08-13. The contract decision is S22; when it lands, every SDK must agree and this xfail comes out." },
       "steps": [
         { "op": "document.insert", "args": ["@coll", { "user": { "name": "ada" } }], "bind": "docId" },
         { "op": "document.getPathIn", "args": ["@coll", "$docId", "user", "name"], "expect": { "equals": "ada" } }
