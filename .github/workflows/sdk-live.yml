@@ -169,6 +169,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
 
+      # The drift job runs EVERY executor that exists, so it needs every
+      # toolchain — not just Python. Without these it reported "typescript
+      # executor did not produce a report" and "spawn elixir ENOENT", which is a
+      # missing dependency wearing the costume of a cross-SDK disagreement.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: conformance/live/executors/go/go.sum
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+      - name: Build the TypeScript Nucleus client
+        working-directory: typescript
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @neutron-build/nucleus build
+
+      # Elixir is deliberately NOT installed yet. Its executor exists and is
+      # correct, but Postgrex still cannot complete a connection: the engine now
+      # has pg_range and pg_type.typsend/typreceive/typoutput (fixed 2026-08-13,
+      # which moved the error on), and the remaining blocker is that the type
+      # bootstrap uses `ARRAY (SELECT ...)`, which the engine answers with
+      # "subquery in function args". Installing the toolchain to run 42 cases
+      # that all fail at connect would spend CI minutes to restate a gap already
+      # recorded. Add this back with the same setup-beam step the moment the
+      # engine supports ARRAY(subquery).
+
       - name: Start Nucleus
         run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live
 

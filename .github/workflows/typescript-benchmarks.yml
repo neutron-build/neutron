@@ -98,8 +98,25 @@ jobs:
       - name: Run smoke benchmark
         run: pnpm --dir benchmarks run compare:quick
 
+      # Exit 1 is a real regression and fails the job. Exit 2 means the gate
+      # could not compare — the committed baseline was taken under a different
+      # profile (100 conn / 20s / 5 runs, February, on other hardware) than the
+      # CI smoke run (80 / 5s / 1). That is reported loudly and does not fail,
+      # because a red light for "the baseline is incomparable" is indistinguishable
+      # from a red light for "the code got slower", and the second one is the
+      # one that has to be believed. Record a smoke-profile baseline on this
+      # runner class and point BENCH_GATE_BASELINE at it to arm the gate.
       - name: Enforce smoke regression gate
-        run: pnpm --dir benchmarks run compare:gate:smoke
+        run: |
+          set +e
+          pnpm --dir benchmarks run compare:gate:smoke
+          code=$?
+          set -e
+          if [ "$code" = "2" ]; then
+            echo "::warning::benchmark gate not armed — no baseline matching this profile"
+            exit 0
+          fi
+          exit "$code"
 
       - name: Upload smoke results
         uses: actions/upload-artifact@v4
