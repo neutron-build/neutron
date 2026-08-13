@@ -1,0 +1,169 @@
+#!/usr/bin/env node
+// Runs every available SDK executor against one live Nucleus and diffs them.
+//
+// Each executor prints a JSON document {sdk, specVersion, cases:[{id,status,detail}]}
+// on stdout. This orchestrator collects them, prints a matrix, and — the part
+// that matters — fails when two SDKs disagree about the same case. A per-SDK
+// suite proves each client works. Only the diff proves they work the SAME.
+//
+//   NEUTRON_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/postgres \
+//       node runner/run.mjs [sdk...]
+
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, "..");
+const REPO = path.resolve(ROOT, "..", "..");
+const URL_ENV = process.env.NEUTRON_TEST_DATABASE_URL;
+
+// Every executor lives at executors/<sdk>/. `available` returns null when the
+// executor can run, or a string saying why it cannot. A missing executor is
+// reported as missing, never quietly treated as agreement.
+const EXECUTORS = [
+  {
+    sdk: "python",
+    entry: "executors/python/run_live.py",
+    cmd: () => {
+      const venv = path.join(REPO, "python", ".venv", "bin", "python");
+      const bin = existsSync(venv) ? venv : "python3";
+      return { command: bin, args: [path.join(ROOT, "executors/python/run_live.py")], cwd: path.join(REPO, "python") };
+    },
+  },
+  {
+    sdk: "go",
+    entry: "executors/go/main.go",
+    cmd: () => ({ command: "go", args: ["run", "."], cwd: path.join(ROOT, "executors/go") }),
+  },
+  {
+    sdk: "typescript",
+    entry: "executors/typescript/run-live.mjs",
+    cmd: () => ({ command: "node", args: [path.join(ROOT, "executors/typescript/run-live.mjs")], cwd: path.join(REPO, "typescript") }),
+  },
+  {
+    sdk: "rust",
+    entry: "executors/rust/Cargo.toml",
+    cmd: () => ({ command: "cargo", args: ["run", "--release", "--quiet"], cwd: path.join(ROOT, "executors/rust") }),
+  },
+  {
+    sdk: "elixir",
+    entry: "executors/elixir/run_live.exs",
+    cmd: () => ({ command: "elixir", args: ["run_live.exs"], cwd: path.join(ROOT, "executors/elixir") }),
+  },
+  {
+    sdk: "zig",
+    entry: "executors/zig/build.zig",
+    cmd: () => ({ command: "zig", args: ["build", "run"], cwd: path.join(ROOT, "executors/zig") }),
+  },
+  {
+    sdk: "julia",
+    entry: "executors/julia/run_live.jl",
+    cmd: () => ({ command: "julia", args: ["--project=.", "run_live.jl"], cwd: path.join(ROOT, "executors/julia") }),
+  },
+];
+
+function run({ command, args, cwd }) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, NEUTRON_TEST_DATABASE_URL: URL_ENV },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("error", (e) => resolve({ code: 127, out, err: String(e) }));
+    child.on("close", (code) => resolve({ code, out, err }));
+  });
+}
+
+const spec = JSON.parse(readFileSync(path.join(ROOT, "spec.json"), "utf8"));
+const only = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+
+if (!URL_ENV) {
+  console.error(
+    "NEUTRON_TEST_DATABASE_URL is not set. This suite is only meaningful\n" +
+      "against a live engine; refusing to report a green run for zero cases."
+  );
+  process.exit(1);
+}
+
+const reports = [];
+const missing = [];
+
+for (const ex of EXECUTORS) {
+  if (only.length && !only.includes(ex.sdk)) continue;
+  if (!existsSync(path.join(ROOT, ex.entry))) {
+    missing.push(ex.sdk);
+    continue;
+  }
+  process.stderr.write(`[live] ${ex.sdk} …\n`);
+  const { out, err } = await run(ex.cmd());
+  try {
+    reports.push(JSON.parse(out));
+  } catch {
+    reports.push({
+      sdk: ex.sdk,
+      specVersion: spec.specVersion,
+      cases: [],
+      fatal: (err || out).trim().split("\n").slice(-6).join("\n"),
+    });
+  }
+}
+
+// ── matrix ────────────────────────────────────────────────────────────────
+const sdks = reports.map((r) => r.sdk);
+const width = Math.max(...spec.cases.map((c) => c.id.length), 4);
+const head = "case".padEnd(width) + " | " + sdks.map((s) => s.padEnd(11)).join("| ");
+console.log(head);
+console.log("-".repeat(head.length));
+
+const byCase = new Map();
+for (const r of reports) for (const c of r.cases) byCase.set(`${r.sdk}:${c.id}`, c);
+
+const drift = [];
+for (const c of spec.cases) {
+  const cells = sdks.map((s) => byCase.get(`${s}:${c.id}`)?.status ?? "absent");
+  console.log(c.id.padEnd(width) + " | " + cells.map((x) => x.padEnd(11)).join("| "));
+  const distinct = new Set(cells.filter((x) => x !== "absent"));
+  if (distinct.size > 1) drift.push({ id: c.id, cells: Object.fromEntries(sdks.map((s, i) => [s, cells[i]])) });
+}
+console.log();
+
+let failed = false;
+for (const r of reports) {
+  if (r.fatal) {
+    console.error(`::error::${r.sdk} executor did not produce a report:\n${r.fatal}`);
+    failed = true;
+    continue;
+  }
+  const counts = {};
+  for (const c of r.cases) counts[c.status] = (counts[c.status] ?? 0) + 1;
+  console.log(`[${r.sdk}] ${JSON.stringify(counts)}`);
+  for (const c of r.cases) {
+    if (c.status === "fail" || c.status === "xpass") {
+      console.error(`::error::${r.sdk} ${c.id}: ${c.status} — ${c.detail ?? ""}`);
+      failed = true;
+    }
+  }
+  if (r.specVersion !== spec.specVersion) {
+    console.error(`::error::${r.sdk} ran spec version ${r.specVersion}, expected ${spec.specVersion}`);
+    failed = true;
+  }
+}
+
+if (missing.length) {
+  console.error(`::warning::no executor for: ${missing.join(", ")} — these SDKs are unproven, not passing`);
+}
+
+// Drift is the whole point. Two SDKs disagreeing about one case means one of
+// them is wrong, and which one is a question the spec exists to force.
+for (const d of drift) {
+  console.error(`::error::cross-SDK drift on ${d.id}: ${JSON.stringify(d.cells)}`);
+  failed = true;
+}
+
+process.exit(failed ? 1 : 0);

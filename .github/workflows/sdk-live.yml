@@ -12,23 +12,40 @@ name: SDK vs live Nucleus
 # test expects. It cannot know the server describes that statement with zero
 # result columns, or types a parameter as TEXT that the client binds as an int.
 #
-# The engine's own testing is not the gap: 4,200+ unit tests, a differential
+# The engine's own testing is not the gap: 4,248 unit tests, a differential
 # fuzzer at zero divergences against SQLite, 49 probes. Every one of those bugs
 # lived at the client boundary, where nothing looked.
 #
-# So this builds the real server, starts it, and runs the SDK against it.
+# The cases now live in conformance/live/spec.json and every SDK runs the SAME
+# ones through a thin executor, so six ports cannot drift from each other. The
+# `drift` job is the part a per-SDK suite can never provide: it compares the
+# recorded status of every case across every SDK and fails on disagreement.
 
 on:
   push:
     branches: [main]
     paths:
       - "nucleus/**"
+      - "conformance/live/**"
       - "python/**"
+      - "go/**"
+      - "typescript/packages/neutron-nucleus/**"
+      - "rust/crates/neutron-nucleus/**"
+      - "elixir/**"
+      - "zig/**"
+      - "julia/**"
       - ".github/workflows/sdk-live.yml"
   pull_request:
     paths:
       - "nucleus/**"
+      - "conformance/live/**"
       - "python/**"
+      - "go/**"
+      - "typescript/packages/neutron-nucleus/**"
+      - "rust/crates/neutron-nucleus/**"
+      - "elixir/**"
+      - "zig/**"
+      - "julia/**"
       - ".github/workflows/sdk-live.yml"
 
 env:
@@ -36,28 +53,54 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  python:
-    name: Python SDK vs live Nucleus
+  # One engine build, reused by every SDK leg.
+  engine:
+    name: Build the engine
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: nucleus
-
       - name: Build nucleus
         working-directory: nucleus
         run: cargo build --release --bin nucleus --features server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleus-bin
+          path: nucleus/target/release/nucleus
+          if-no-files-found: error
+          retention-days: 1
+
+  sdk:
+    name: ${{ matrix.sdk }} vs live Nucleus
+    needs: engine
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [python]
+        # S14-S19 add go, typescript, rust, elixir, zig and julia here as their
+        # executors land. An SDK absent from this list is UNPROVEN, and the
+        # drift job below says so out loud rather than counting it as agreement.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleus-bin
+          path: nucleus/target/release
+      - run: chmod +x nucleus/target/release/nucleus
 
       - uses: actions/setup-python@v5
+        if: matrix.sdk == 'python'
         with:
           python-version: "3.11"
 
       - name: Install the Python SDK
+        if: matrix.sdk == 'python'
         working-directory: python
         run: |
           python -m pip install --upgrade pip
@@ -65,46 +108,48 @@ jobs:
           # extra; pip ignores an unknown one silently, so the install
           # "succeeded" and then pytest was not found.
           pip install -e ".[test]"
+          python -c "import pytest, asyncpg; print('extras OK')"
 
       - name: Start Nucleus
-        working-directory: nucleus
-        run: |
-          mkdir -p /tmp/nucleus-live
-          # NOT 5433: the server binds its own cluster transport there (and
-          # replication on 5434, RESP on 6379), so serving SQL on 5433 makes it
-          # collide with itself -- "Failed to bind SQL listener on
-          # 127.0.0.1:5433: Address already in use", which is how this workflow
-          # failed its first CI run.
-          ./target/release/nucleus start --data /tmp/nucleus-live --port 55432 \
-            > /tmp/nucleus-live/server.log 2>&1 &
-          for i in $(seq 1 30); do
-            if pg_isready -h 127.0.0.1 -p 55432 -q 2>/dev/null; then break; fi
-            sleep 1
-          done
-          pg_isready -h 127.0.0.1 -p 55432 || (cat /tmp/nucleus-live/server.log; exit 1)
+        run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live
 
-      # Every test names its own keys/collections uniquely, so the suite does
-      # not depend on ordering or on a clean database between runs.
-      - name: Run the live SDK suite
-        working-directory: python
+      - name: Run the live spec
         env:
           NEUTRON_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:55432/postgres
-        run: pytest tests/test_nucleus_live.py -v
+        run: node conformance/live/runner/run.mjs ${{ matrix.sdk }}
 
-      # A suite that silently skips is the same as no suite -- which is exactly
-      # how the Python live tests came to never run. Fail loudly instead.
-      - name: Assert the suite actually ran
-        working-directory: python
-        env:
-          NEUTRON_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:55432/postgres
-        run: |
-          out=$(pytest tests/test_nucleus_live.py -q 2>&1 | tail -3)
-          echo "$out"
-          if echo "$out" | grep -qE "skipped|no tests ran"; then
-            echo "::error::The live SDK suite skipped. It is only meaningful when it runs."
-            exit 1
-          fi
-
-      - name: Server log
+      - name: Report
         if: always()
         run: tail -50 /tmp/nucleus-live/server.log || true
+
+  drift:
+    name: Cross-SDK behavioural diff
+    needs: engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleus-bin
+          path: nucleus/target/release
+      - run: chmod +x nucleus/target/release/nucleus
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Start Nucleus
+        run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live
+
+      # Runs every executor that exists and fails if two of them disagree about
+      # the same case. With one executor this proves nothing yet and says so;
+      # it becomes the anti-drift oracle the moment the second one lands.
+      - name: Every available executor, diffed
+        env:
+          NEUTRON_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:55432/postgres
+        run: node conformance/live/runner/run.mjs
