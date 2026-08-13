@@ -18,10 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No `version:` here on purpose. typescript/package.json declares
+      # `packageManager: pnpm@9.15.4` and the lockfile is written by it;
+      # `version: latest` silently ran pnpm 11 against it. Let the action read
+      # the declared version so there is one source of truth.
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: latest
+          package_json_file: typescript/package.json
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -60,6 +64,22 @@ jobs:
         run: pnpm run ci:compat-matrix
         working-directory: typescript
 
+      # These three were written as CI steps and then never ran: they lived in
+      # typescript/.github/workflows/ci.yml, and GitHub only reads workflows
+      # from the repository root. The file was syntactically valid, referenced
+      # real scripts, and executed zero times. Folded in here so they run.
+      - name: Naming conventions
+        run: pnpm run ci:naming
+        working-directory: typescript
+
+      - name: Workspace graph
+        run: pnpm run ci:workspace
+        working-directory: typescript
+
+      - name: Data profile smoke (memory)
+        run: pnpm run ci:data-profiles
+        working-directory: typescript
+
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
@@ -67,7 +87,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          package_json_file: typescript/package.json
       - uses: actions/setup-node@v4
         with:
           node-version: 22

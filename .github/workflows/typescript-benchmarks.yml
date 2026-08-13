@@ -1,0 +1,142 @@
+# Promoted from typescript/.github/workflows/benchmarks.yml, which GitHub never
+# read — workflows only run from the repository root. The smoke job carries a
+# regression gate (`compare:gate:smoke`) that has therefore never gated
+# anything.
+#
+# Numbers produced here are NOT publishable. Shared CI runners are noisy
+# neighbours and the absolute figures move run to run; this exists to catch a
+# regression in Neutron against itself, not to source a marketing claim. Every
+# published figure has to trace to _internal/GROUND_TRUTH.md with its
+# methodology attached.
+name: TypeScript Benchmarks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "typescript/packages/**"
+      - "typescript/apps/**"
+      - "typescript/benchmarks/**"
+      - "typescript/pnpm-lock.yaml"
+      - "typescript/pnpm-workspace.yaml"
+      - "typescript/turbo.json"
+      - ".github/workflows/typescript-benchmarks.yml"
+  pull_request:
+    paths:
+      - "typescript/packages/**"
+      - "typescript/apps/**"
+      - "typescript/benchmarks/**"
+      - "typescript/pnpm-lock.yaml"
+      - "typescript/pnpm-workspace.yaml"
+      - "typescript/turbo.json"
+      - ".github/workflows/typescript-benchmarks.yml"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Benchmark profile to run"
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
+
+concurrency:
+  group: ts-benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke Benchmark
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.profile == 'smoke'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            typescript/pnpm-lock.yaml
+            typescript/benchmarks/pnpm-lock.yaml
+            typescript/benchmarks/next-app/pnpm-lock.yaml
+            typescript/benchmarks/remix-app/pnpm-lock.yaml
+            typescript/benchmarks/remix3-fw/pnpm-lock.yaml
+            typescript/benchmarks/astro-app/pnpm-lock.yaml
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install benchmark harness dependencies
+        run: pnpm --dir benchmarks install --frozen-lockfile
+
+      - name: Run smoke benchmark
+        run: pnpm --dir benchmarks run compare:quick
+
+      - name: Enforce smoke regression gate
+        run: pnpm --dir benchmarks run compare:gate:smoke
+
+      - name: Upload smoke results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-${{ github.run_id }}
+          path: |
+            typescript/benchmarks/results/latest.json
+            typescript/benchmarks/results/run-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  full:
+    name: Full Benchmark
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            typescript/pnpm-lock.yaml
+            typescript/benchmarks/pnpm-lock.yaml
+            typescript/benchmarks/next-app/pnpm-lock.yaml
+            typescript/benchmarks/remix-app/pnpm-lock.yaml
+            typescript/benchmarks/remix3-fw/pnpm-lock.yaml
+            typescript/benchmarks/astro-app/pnpm-lock.yaml
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install benchmark harness dependencies
+        run: pnpm --dir benchmarks install --frozen-lockfile
+
+      - name: Run full benchmark
+        run: pnpm --dir benchmarks run compare:full
+
+      - name: Upload full results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-full-${{ github.run_id }}
+          path: |
+            typescript/benchmarks/results/latest.json
+            typescript/benchmarks/results/run-*.json
+          if-no-files-found: error
+          retention-days: 30

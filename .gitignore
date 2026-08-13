@@ -95,8 +95,9 @@ LAUNCH_PROMPTS.md
 # Deprecated
 mobile-preview/
 
-# Third-party benchmark apps (reference only)
-typescript/benchmarks/remix3-fw/
+# Third-party benchmark apps are tracked like every other subject app — an
+# ignored subject is a benchmark row nobody else can reproduce. Their own
+# .gitignore files keep node_modules and build output out.
 
 # Observe (separate project)
 typescript/apps/observe/
