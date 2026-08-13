@@ -1,0 +1,22 @@
+# Repository-wide cargo settings.
+
+[build]
+# Incremental compilation off.
+#
+# This is a deliberate trade of local rebuild speed for a machine that keeps
+# working. Incremental state is not bounded by anything: on 2026-08-13 a single
+# session produced 10 GB of it under nucleus/target/debug and then 6.9 GB more
+# after that was cleared. Twice before, target/ took a development machine to
+# zero bytes free.
+#
+# The cost of a full disk here is not "builds get slower". Nucleus refuses
+# writes below a 3% free-disk watermark, so the running engine goes read-only
+# mid-session and every test against it fails with an error that reads like a
+# product bug. That happened today: an entire conformance run failed with
+# DiskFullError and looked exactly like a conformance failure.
+#
+# CI already sets CARGO_INCREMENTAL=0, so this only changes local builds, and
+# only for the profiles that used it (dev and test — release never did).
+#
+# To trade back, delete this file or run with CARGO_INCREMENTAL=1.
+incremental = false

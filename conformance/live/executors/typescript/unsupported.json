@@ -1,0 +1,8 @@
+{
+  "why": "A case listed here is one the TypeScript SDK has no surface for. Each entry names the missing method, because 'unsupported' is a gap in the client, not a property of the spec — and an entry without a reason is indistinguishable from a case nobody bothered to map.",
+  "cases": {
+    "timeseries.range_query": "TimeSeriesModel.query() throws NucleusNotSupportedError — the TypeScript SDK has no raw point-range read at all. Python's client synthesises one by bucketing TS_RANGE_AVG over the range, so the op exists there and not here.",
+    "timeseries.aggregate_over_a_bucket": "TimeSeriesModel.aggregate() takes a NAMED interval (second/minute/hour/day/week/month), so the spec's 300000 ms window cannot be expressed. The TypeScript SDK does not carry the L1 bug — it converts its names to bucket_millis itself and never calls TIME_BUCKET — but it also cannot request an arbitrary bucket width.",
+    "vector.insert_and_search": "VectorModel has no count(). The TypeScript surface is createCollection/insert/delete/search/dims/distance only; Python's vector.count() (a plain SELECT COUNT(*)) has no equivalent here, so the case cannot reach its search step."
+  }
+}

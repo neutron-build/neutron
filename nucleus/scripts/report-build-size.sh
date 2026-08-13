@@ -24,6 +24,7 @@
 set -eu
 
 CEILING_GB="${CEILING_GB:-25}"
+FLOOR_GB="${FLOOR_GB:-15}"
 REPORT_ONLY=0
 [ "${1:-}" = "--report-only" ] && REPORT_ONLY=1
 
@@ -31,7 +32,15 @@ repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 status=0
 total_kb=0
 
-for dir in nucleus/target rust/target desktop/src-tauri/target; do
+# Discovered, not hardcoded. The list used to name desktop/src-tauri/target,
+# which does not exist — the real one is desktop/target, and it reached 7.4 GB
+# completely unseen by the very script written to see it. A hardcoded list of
+# build directories rots the moment a tree is added or moved.
+TARGET_DIRS=$(find "$repo_root" -maxdepth 3 -type d -name target \
+    -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null \
+    | sed "s|^$repo_root/||" | sort)
+
+for dir in $TARGET_DIRS; do
     path="$repo_root/$dir"
     [ -d "$path" ] || continue
 
@@ -52,6 +61,23 @@ done
 
 total_gb=$(awk -v k="$total_kb" 'BEGIN { printf "%.1f", k / 1048576 }')
 printf '%-32s %8s GB  (ceiling %s GB)\n' "TOTAL" "$total_gb" "$CEILING_GB"
+
+# Free space matters more than the total. Nucleus refuses writes below a 3%
+# free-disk watermark, so a full disk does not present as "disk full" — it
+# presents as the database going read-only mid-run, or as a conformance suite
+# failing every case. Both happened on 2026-08-13.
+free_kb=$(df -k "$repo_root" | awk 'NR==2 {print $4}')
+free_gb=$(awk -v k="$free_kb" 'BEGIN { printf "%.1f", k / 1048576 }')
+printf '%-32s %8s GB  (floor %s GB)\n' "FREE ON VOLUME" "$free_gb" "$FLOOR_GB"
+
+low=$(awk -v f="$free_gb" -v m="$FLOOR_GB" 'BEGIN { print (f < m) ? 1 : 0 }')
+if [ "$low" -eq 1 ]; then
+    echo
+    echo "WARNING: only ${free_gb} GB free. Nucleus goes read-only under 3% free"
+    echo "and a build can consume several GB in minutes."
+    echo "Reclaim with: sh nucleus/scripts/reclaim-disk.sh"
+    [ "$REPORT_ONLY" -eq 0 ] && status=1
+fi
 
 over=$(awk -v t="$total_gb" -v c="$CEILING_GB" 'BEGIN { print (t > c) ? 1 : 0 }')
 if [ "$over" -eq 1 ] && [ "$REPORT_ONLY" -eq 0 ]; then

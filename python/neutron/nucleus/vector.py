@@ -52,11 +52,21 @@ class VectorModel:
                 f"Invalid distance metric: {metric}. "
                 f"Must be one of: {', '.join(VALID_METRICS)}"
             )
+        if not isinstance(dimension, int) or dimension <= 0:
+            raise ValueError(f"dimension must be a positive integer, got {dimension!r}")
         safe_name = _safe(name)
+        # The dimension was accepted and then dropped, emitting a bare `VECTOR`
+        # column. That is not a cosmetic omission: a dimensionless VECTOR
+        # produces tuples the storage layer cannot deserialize, and the engine
+        # answers `SELECT id` with every row while answering `SELECT *` with
+        # none — silent data loss, logged server-side as "row omitted from
+        # scan" and invisible to the client. Every collection this client has
+        # ever created is affected. The engine bug is filed separately; passing
+        # the dimension is correct regardless, and is what the other SDKs do.
         await self._exec.execute(
             f"CREATE TABLE IF NOT EXISTS {safe_name} ("
             f"  id TEXT PRIMARY KEY,"
-            f"  embedding VECTOR,"
+            f"  embedding VECTOR({dimension}),"
             f"  metadata JSONB DEFAULT '{{}}'"
             f")"
         )

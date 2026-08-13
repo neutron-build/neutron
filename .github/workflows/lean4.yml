@@ -46,6 +46,7 @@ jobs:
       # that must not typecheck and fails if it is accepted.
       - name: Canary (the checker must reject a false proposition)
         run: bash scripts/canary.sh
+        working-directory: lean4
 
       - name: Verify proofs
         run: bash scripts/ci.sh

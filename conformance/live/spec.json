@@ -15,7 +15,7 @@
   "expectations": {
     "key": "Read this field out of a map result before comparing.",
     "index": "Read this position out of a list result before comparing.",
-    "jsonDecode": "Parse a string result as JSON before comparing.",
+    "jsonDecode": "Parse a string result as JSON before comparing. Pass the value through unchanged when it is NOT a string: several drivers decode jsonb themselves, and a literal implementation reports '[object Object] is not valid JSON' and hides the actual value. The point is to compare the VALUE, whichever side of the wire decoded it.",
     "equals": "Deep equality against the given JSON value.",
     "notNull": "Result is present.",
     "isNull": "Result is absent (null/None/nil/undefined, as the language spells it).",
@@ -266,7 +266,7 @@
       "issue": "L1",
       "steps": [
         { "op": "timeseries.write", "args": ["@measurement", [{ "t": 0, "v": 10.0 }, { "t": 1000, "v": 20.0 }]] },
-        { "op": "timeseries.aggregate", "args": ["@measurement", -60000, 60000, 300000], "expect": { "notNull": true } }
+        { "op": "timeseries.aggregate", "args": ["@measurement", -60000, 60000, 60000], "expect": { "notNull": true } }
       ]
     },
 
@@ -367,8 +367,8 @@
     {
       "id": "vector.insert_and_search",
       "model": "vector",
-      "why": "NEW, found by this suite 2026-08-13, and severe. Inserting two vectors and asking for the nearest returns nothing, for every valid metric. It is not an SDK bug: over the simple protocol in psql, `SELECT id FROM t` returns two rows and `SELECT id, VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]'), 'cosine') FROM t` returns ZERO on the same table. Adding the distance column drops every row. Vector similarity search has therefore never returned a result through any client, and this is a model the project publishes recall and latency comparisons about.",
-      "xfail": { "reason": "VECTOR_DISTANCE in a select list yields zero rows. Engine-side, reproduced in psql independently of any SDK." },
+      "why": "NEW 2026-08-13, and it is not a vector bug — it is silent data loss. A VECTOR column declared with NO dimension produces tuples the storage layer cannot deserialize; the engine logs `failed to deserialize tuple on page 2 (slot 0); row omitted from scan` and every scan that touches the heap drops every row, while PK/index-only reads still report them. Measured in psql: on such a table `SELECT id` returns 2 rows and `COUNT(*)` returns 2, while `SELECT *`, `SELECT embedding`, `SELECT metadata` and `SELECT id, metadata` each return 0. With `VECTOR(3)` everything returns both rows through every client. Two reads disagreeing about how many rows a table holds, with no error raised, is the worst failure mode this engine has. VECTOR_DISTANCE was a red herring — `SELECT *` loses the data just as thoroughly. Reached from Python because its create_collection accepted a dimension and emitted a bare VECTOR column; fixed on the SDK side, but the engine defect stands.",
+      "xfail": { "reason": "Two independent engine defects sit behind this one case, and which one you hit depends on the client. (a) A dimensionless VECTOR column yields tuples the storage layer cannot deserialize, and the failure is swallowed into row omission rather than raised. (b) With the dimension supplied the rows come back, and a statement-describing client then dies decoding the computed float8 `score` column, which the prepare-time Describe reports as varchar — the same defect as the sql.scalar_* cases, with no parameter involved. Python now hits (b); the Go and TypeScript collection shapes hit neither." },
       "steps": [
         { "op": "vector.createCollection", "args": ["@coll", 3] },
         { "op": "vector.insert", "args": ["@coll", "v1", [1.0, 0.0, 0.0]] },
@@ -405,7 +405,7 @@
       "model": "sql",
       "why": "NEW and the most severe thing this suite has found. `SELECT $1::jsonb` over the EXTENDED protocol describes the statement as returning ZERO result columns and then executes it returning one, so a strict client (asyncpg, and by construction pgx and JDBC) aborts with a protocol error. This is the same defect class as the 18 known never-worked shapes, except it is plain SQL rather than a specialty function — which means it is not a gap in a Nucleus extension, it is a gap in 'any PostgreSQL client works'. psql does not catch it because psql does not validate the described column count against the row it receives, and because \\bind is answered by substituting the parameter into the query text.",
       "issue": "P11",
-      "xfail": { "reason": "Extended-protocol Describe reports 0 result columns for a parameterized cast to jsonb/json/uuid/bytea. Execute then returns 1. Filed 2026-08-13." },
+      "xfail": { "reason": "The prepare-time STATEMENT Describe reports 0 result columns for a parameterized cast to jsonb/json/uuid/bytea; Execute then returns 1. Only affects clients that describe the statement before binding (asyncpg). Clients that bind first and describe the portal (node-postgres) are unaffected, and pgx was measured unaffected in all five exec modes — so this is narrower than 'any PostgreSQL client', but asyncpg is mainstream and the described type is simply wrong. Filed 2026-08-13." },
       "steps": [
         { "op": "sql.queryScalar", "args": ["SELECT $1::jsonb", ["{\"a\":1}"]], "expect": { "jsonDecode": true, "equals": { "a": 1 } } }
       ]
@@ -415,7 +415,7 @@
       "model": "sql",
       "why": "Same Describe defect, two more types. Recorded separately so a partial fix is visible as a partial fix.",
       "issue": "P11",
-      "xfail": { "reason": "Extended-protocol Describe reports 0 result columns for a parameterized cast to uuid or bytea." },
+      "xfail": { "reason": "Same statement-Describe defect, uuid and bytea. Portal-describing clients pass; a client that decodes uuid to a byte array rather than a string also reports this differently, which is container drift rather than a value difference." },
       "steps": [
         { "op": "sql.queryScalar", "args": ["SELECT $1::uuid", ["00000000-0000-0000-0000-000000000000"]], "expect": { "equals": "00000000-0000-0000-0000-000000000000" } }
       ]
@@ -425,7 +425,7 @@
       "model": "sql",
       "why": "WORSE than the Describe defect above, because it does not raise. `SELECT $1::int` bound with 1 comes back as the four raw big-endian bytes of that integer, delivered as a text value: '\\x00\\x00\\x00\\x01'. No error, no protocol complaint — the caller simply receives the wrong value in the right shape. This is the exact signature of the binary-parameter corruption that ran live for two months, on the read side.",
       "issue": "P11",
-      "xfail": { "reason": "A parameterized ::int result is returned as raw big-endian bytes in a text column instead of an integer. Silent wrong answer." },
+      "xfail": { "reason": "On the statement-Describe path the engine substitutes NULL for the unbound parameter, so the column is described as varchar; Execute then writes the real integer in binary and the client reads raw big-endian bytes out of a varchar. Silent wrong answer, no protocol error. asyncpg only — pgx and node-postgres both return 1." },
       "steps": [
         { "op": "sql.queryScalar", "args": ["SELECT $1::int", [1]], "expect": { "equals": 1 } }
       ]

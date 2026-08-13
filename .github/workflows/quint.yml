@@ -47,6 +47,7 @@ jobs:
       # must report, and asserts the real suite is not empty.
       - name: Canary (the gate must report a violated invariant)
         run: bash scripts/canary.sh
+        working-directory: quint
 
       - name: Run quint CI gate
         run: bash scripts/ci.sh

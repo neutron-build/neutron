@@ -36,16 +36,16 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+        working-directory: rust
 
       # target/ has taken a development machine to zero bytes free twice, and
       # both times it was cleared by hand after the fact. This was wired into
       # the Nucleus workflow only, so growth in every other Rust tree stayed
       # invisible. Reports on every run; the ceiling exists so "visible" does
-      # not depend on somebody reading the log.
+      # not depend on somebody reading the log. Runs from the repository root,
+      # which is where the script expects to find the target directories.
       - name: Build size
         run: sh nucleus/scripts/report-build-size.sh --report-only
-        working-directory: ${{ github.workspace }}
-        working-directory: rust
 
   clippy:
     name: Clippy
