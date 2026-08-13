@@ -36,6 +36,7 @@ BRANCH = os.environ.get("HEALTH_BRANCH", "main")
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 API = "https://api.github.com"
 EXCEPTIONS_PATH = ".github/workflow-health-exceptions.json"
+SELF = os.environ.get("HEALTH_SELF", "workflow-health.yml")
 
 
 def api(path: str) -> dict:
@@ -65,6 +66,16 @@ def main() -> int:
 
     workflows = api(f"/repos/{REPO}/actions/workflows?per_page=100")["workflows"]
     active = [w for w in workflows if w["state"] == "active"]
+
+    # Skip this workflow's own row.
+    #
+    # It reads the newest COMPLETED run, and while this run is in progress that
+    # is always the previous one — so a single failure made the check
+    # permanently red at itself and it could never clear, no matter what it was
+    # reporting about anything else. Nothing is lost by skipping: a failing
+    # health check is its own signal, visible directly in the run list. What it
+    # must never do is drown the workflows it exists to report on.
+    active = [w for w in active if not w["path"].endswith(SELF)]
 
     green: list[str] = []
     red: list[tuple[str, str, str]] = []
