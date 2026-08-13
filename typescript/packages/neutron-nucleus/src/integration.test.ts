@@ -1038,13 +1038,13 @@ describe("Integration: Datalog model SQL functions", () => {
 
   it("DATALOG_CLEAR clears knowledge base", async () => {
     transport.whenFetchval("DATALOG_CLEAR", true);
-    const ok = await datalog.clear();
+    const ok = await datalog.clear("parent");
     assert.equal(ok, true);
   });
 
   it("DATALOG_IMPORT_GRAPH imports graph data", async () => {
     transport.whenFetchval("DATALOG_IMPORT_GRAPH", 42);
-    const count = await datalog.importGraph();
+    const count = await datalog.importGraph("knows");
     assert.equal(count, 42);
   });
 

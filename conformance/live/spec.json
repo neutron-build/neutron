@@ -10,7 +10,7 @@
     "args": "Positional. A string of the form '@name' is a per-case unique fixture name (stable within a case, unique across runs, so cases never depend on a clean database or on ordering). A string of the form '$name' resolves to a value bound by an earlier step. Anything else is a literal.",
     "bind": "Names the step's result so later steps can reference it as '$name'.",
     "expect": "Omitted means the step's result is not asserted, only that the call survived the wire. See the expectation vocabulary below.",
-    "xfail": "The case is expected to FAIL. Strict: if it passes, the run fails, so nobody fixes the underlying bug without noticing that the note here is now stale."
+    "xfail": "The case is expected to FAIL. Strict: if it passes, the run fails, so nobody fixes the underlying bug without noticing that the note here is now stale. An optional `sdks` list scopes the expectation to named SDKs — some engine defects are only observable through a particular driver strategy, and without scoping every unaffected SDK reports xpass forever and the signal is lost."
   },
   "expectations": {
     "key": "Read this field out of a map result before comparing.",
@@ -405,7 +405,7 @@
       "model": "sql",
       "why": "NEW and the most severe thing this suite has found. `SELECT $1::jsonb` over the EXTENDED protocol describes the statement as returning ZERO result columns and then executes it returning one, so a strict client (asyncpg, and by construction pgx and JDBC) aborts with a protocol error. This is the same defect class as the 18 known never-worked shapes, except it is plain SQL rather than a specialty function — which means it is not a gap in a Nucleus extension, it is a gap in 'any PostgreSQL client works'. psql does not catch it because psql does not validate the described column count against the row it receives, and because \\bind is answered by substituting the parameter into the query text.",
       "issue": "P11",
-      "xfail": { "reason": "The prepare-time STATEMENT Describe reports 0 result columns for a parameterized cast to jsonb/json/uuid/bytea; Execute then returns 1. Only affects clients that describe the statement before binding (asyncpg). Clients that bind first and describe the portal (node-postgres) are unaffected, and pgx was measured unaffected in all five exec modes — so this is narrower than 'any PostgreSQL client', but asyncpg is mainstream and the described type is simply wrong. Filed 2026-08-13." },
+      "xfail": { "sdks": ["python"], "reason": "The prepare-time STATEMENT Describe reports 0 result columns for a parameterized cast to jsonb/json/uuid/bytea; Execute then returns 1. Only affects clients that describe the statement before binding (asyncpg). Clients that bind first and describe the portal (node-postgres) are unaffected, and pgx was measured unaffected in all five exec modes — so this is narrower than 'any PostgreSQL client', but asyncpg is mainstream and the described type is simply wrong. Filed 2026-08-13." },
       "steps": [
         { "op": "sql.queryScalar", "args": ["SELECT $1::jsonb", ["{\"a\":1}"]], "expect": { "jsonDecode": true, "equals": { "a": 1 } } }
       ]
@@ -415,7 +415,7 @@
       "model": "sql",
       "why": "Same Describe defect, two more types. Recorded separately so a partial fix is visible as a partial fix.",
       "issue": "P11",
-      "xfail": { "reason": "Same statement-Describe defect, uuid and bytea. Portal-describing clients pass; a client that decodes uuid to a byte array rather than a string also reports this differently, which is container drift rather than a value difference." },
+      "xfail": { "sdks": ["python"], "reason": "Same statement-Describe defect, uuid and bytea. Portal-describing clients pass; a client that decodes uuid to a byte array rather than a string also reports this differently, which is container drift rather than a value difference." },
       "steps": [
         { "op": "sql.queryScalar", "args": ["SELECT $1::uuid", ["00000000-0000-0000-0000-000000000000"]], "expect": { "equals": "00000000-0000-0000-0000-000000000000" } }
       ]
@@ -425,7 +425,7 @@
       "model": "sql",
       "why": "WORSE than the Describe defect above, because it does not raise. `SELECT $1::int` bound with 1 comes back as the four raw big-endian bytes of that integer, delivered as a text value: '\\x00\\x00\\x00\\x01'. No error, no protocol complaint — the caller simply receives the wrong value in the right shape. This is the exact signature of the binary-parameter corruption that ran live for two months, on the read side.",
       "issue": "P11",
-      "xfail": { "reason": "On the statement-Describe path the engine substitutes NULL for the unbound parameter, so the column is described as varchar; Execute then writes the real integer in binary and the client reads raw big-endian bytes out of a varchar. Silent wrong answer, no protocol error. asyncpg only — pgx and node-postgres both return 1." },
+      "xfail": { "sdks": ["python"], "reason": "On the statement-Describe path the engine substitutes NULL for the unbound parameter, so the column is described as varchar; Execute then writes the real integer in binary and the client reads raw big-endian bytes out of a varchar. Silent wrong answer, no protocol error. asyncpg only — pgx and node-postgres both return 1." },
       "steps": [
         { "op": "sql.queryScalar", "args": ["SELECT $1::int", [1]], "expect": { "equals": 1 } }
       ]

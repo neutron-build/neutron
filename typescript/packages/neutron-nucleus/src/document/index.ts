@@ -34,7 +34,7 @@ export interface DocumentModel {
   getTypedIn<T>(collection: string, id: number): Promise<T | null>;
   /** Query one collection; matches in others are not returned. */
   queryDocsIn(collection: string, filter: Record<string, unknown>): Promise<number[]>;
-  pathIn(collection: string, id: number, ...keys: string[]): Promise<string | null>;
+  pathIn(collection: string, id: number, ...keys: string[]): Promise<unknown>;
   countIn(collection: string): Promise<number>;
 
   /** Get a document by ID. Returns `null` if not found. */
@@ -47,7 +47,7 @@ export interface DocumentModel {
   queryDocs(filter: Record<string, unknown>): Promise<number[]>;
 
   /** Extract a nested value from a document by key path. */
-  path(id: number, ...keys: string[]): Promise<string | null>;
+  path(id: number, ...keys: string[]): Promise<unknown>;
 
   /** Return the total number of documents. */
   count(): Promise<number>;
@@ -161,7 +161,7 @@ class DocumentModelImpl implements DocumentModel {
       .filter((n) => !Number.isNaN(n));
   }
 
-  async path(id: number, ...keys: string[]): Promise<string | null> {
+  async path(id: number, ...keys: string[]): Promise<unknown> {
     return this.pathIn('', id, ...keys);
   }
 
@@ -172,7 +172,7 @@ class DocumentModelImpl implements DocumentModel {
    * key tail is variadic, so a leading collection could not be told apart from
    * a leading id.
    */
-  async pathIn(collection: string, id: number, ...keys: string[]): Promise<string | null> {
+  async pathIn(collection: string, id: number, ...keys: string[]): Promise<unknown> {
     this.require();
     if (keys.length === 0) {
       // Sending this built `DOC_PATH($1, )` — a malformed statement whose
@@ -187,7 +187,19 @@ class DocumentModelImpl implements DocumentModel {
     const args = collection
       ? [collection, DocumentModelImpl.id(id), ...keys]
       : [DocumentModelImpl.id(id), ...keys];
-    return this.transport.fetchval<string>(sql, args);
+    const raw = await this.transport.fetchval<string>(sql, args);
+    // DOC_PATH returns raw JSON, so a stored string arrived as `'"ada"'` while
+    // `get`/`getIn` on the same client return a decoded object. Two shapes for
+    // one idea is drift; the live conformance spec asserts the decoded form for
+    // every SDK. A value that is not valid JSON passes through rather than
+    // raising — the engine is the only producer, but turning a readable value
+    // into an exception is worse than handing it back.
+    if (typeof raw !== 'string') return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
   }
 
   async count(): Promise<number> {

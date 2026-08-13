@@ -81,10 +81,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk: [python]
-        # S14-S19 add go, typescript, rust, elixir, zig and julia here as their
-        # executors land. An SDK absent from this list is UNPROVEN, and the
-        # drift job below says so out loud rather than counting it as agreement.
+        sdk: [python, go, typescript]
+        # S15/S17-S19 add rust, elixir, zig and julia here as their executors
+        # land. An SDK absent from this list is UNPROVEN, and the drift job
+        # below says so out loud rather than counting it as agreement.
     steps:
       - uses: actions/checkout@v4
 
@@ -109,6 +109,32 @@ jobs:
           # "succeeded" and then pytest was not found.
           pip install -e ".[test]"
           python -c "import pytest, asyncpg; print('extras OK')"
+
+      - uses: actions/setup-go@v5
+        if: matrix.sdk == 'go'
+        with:
+          go-version: "1.25"
+          cache-dependency-path: conformance/live/executors/go/go.sum
+
+      - uses: pnpm/action-setup@v4
+        if: matrix.sdk == 'typescript'
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@v4
+        if: matrix.sdk == 'typescript'
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      # The executor imports the built package by path and fails loudly if it
+      # is missing, rather than resolving some other copy.
+      - name: Build the TypeScript Nucleus client
+        if: matrix.sdk == 'typescript'
+        working-directory: typescript
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @neutron-build/nucleus build
 
       - name: Start Nucleus
         run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live

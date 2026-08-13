@@ -410,7 +410,12 @@ async def main() -> int:
     try:
         for case in spec["cases"]:
             entry: dict[str, Any] = {"id": case["id"], "model": case["model"]}
-            expected_fail = "xfail" in case
+            xf = case.get("xfail")
+            # An xfail may be scoped to named SDKs: the statement-Describe
+            # defect is only observable through a client that describes
+            # before binding, and without scoping every other SDK reports
+            # xpass forever and the signal is lost.
+            expected_fail = bool(xf) and ("python" in xf.get("sdks", ["python"]))
             try:
                 await run_case(case, client, DATABASE_URL)
                 entry["status"] = "xpass" if expected_fail else "pass"

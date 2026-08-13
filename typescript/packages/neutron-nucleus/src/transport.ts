@@ -5,6 +5,7 @@
 import type { Transport, TransactionTransport, QueryResult, IsolationLevel } from './types.js';
 import {
   NucleusAuthError,
+  NucleusError,
   NucleusConflictError,
   NucleusConnectionError,
   NucleusNotFoundError,
@@ -621,6 +622,7 @@ class EmbeddedTransactionTransport implements TransactionTransport {
 // is not a compile-time dependency.
 type PgModule = {
   Pool: new (cfg: { connectionString: string; max?: number }) => PgPool;
+  types?: { setTypeParser(oid: number, parser: (value: string) => unknown): void };
 };
 interface PgPool {
   query(sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
@@ -651,6 +653,39 @@ async function loadPg(): Promise<PgModule> {
   return pgModulePromise;
 }
 
+// node-postgres hands back int8 (oid 20) as a STRING, because a 64-bit integer
+// does not fit a JS number in general. Nothing in this client coerced it, while
+// every signature said `Promise<number>` — so kv.incr() returned "5",
+// document.countIn() returned "2", graph.nodeCount() returned "24", and
+// `(await kv.incr(k)) + 1` evaluated to "51". Twenty-five Nucleus functions
+// return int8, including document ids and graph node/edge ids, so the defect
+// reached almost every model. It is precisely the class a mocked test cannot
+// see, because a mock returns a number.
+//
+// Coerced to Number, which is the right answer for what these values actually
+// are: counts, lengths, sequence numbers and ids. A count above 2^53 is not a
+// real quantity. The guard is there so the day one of them IS that large, the
+// client says so instead of silently rounding — a wrong number that looks
+// right is the failure this whole conformance effort exists to end.
+let typeParsersConfigured = false;
+function configureTypeParsers(pg: PgModule): void {
+  if (typeParsersConfigured || !pg.types) return;
+  typeParsersConfigured = true;
+  const INT8 = 20;
+  pg.types.setTypeParser(INT8, (value: string) => {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n)) {
+      throw new NucleusError(
+        'INT8_PRECISION',
+        `int8 value ${value} exceeds Number.MAX_SAFE_INTEGER and cannot be ` +
+          `represented exactly. Read this column with an explicit ::text cast ` +
+          `and handle it as a BigInt.`
+      );
+    }
+    return n;
+  });
+}
+
 const ISOLATION_SQL: Record<IsolationLevel, string> = {
   read_committed: 'READ COMMITTED',
   repeatable_read: 'REPEATABLE READ',
@@ -674,6 +709,7 @@ export class PgTransport implements Transport {
   private async getPool(): Promise<PgPool> {
     if (!this.pool) {
       const pg = await loadPg();
+      configureTypeParsers(pg);
       const pool = new pg.Pool({ connectionString: this.url, max: 8 });
       // An idle pooled connection dying (engine restart / accessory upgrade)
       // emits 'error' on the pool; unhandled, that CRASHES the process. This

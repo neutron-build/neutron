@@ -1260,13 +1260,13 @@ describe("withDatalog plugin", () => {
 
   it("clear sends DATALOG_CLEAR", async () => {
     transport.onFetchval("SELECT DATALOG_CLEAR", true);
-    const result = await datalog.clear();
+    const result = await datalog.clear("parent");
     assert.equal(result, true);
   });
 
   it("importGraph sends DATALOG_IMPORT_GRAPH", async () => {
     transport.onFetchval("SELECT DATALOG_IMPORT_GRAPH", 50);
-    const count = await datalog.importGraph();
+    const count = await datalog.importGraph("knows");
     assert.equal(count, 50);
   });
 

@@ -582,7 +582,11 @@ async function main() {
   try {
     for (const kase of spec.cases) {
       const entry = { id: kase.id, model: kase.model };
-      const expectedFail = 'xfail' in kase;
+      // An xfail may be scoped to named SDKs via `sdks`: some engine defects
+      // are only observable through one driver strategy, and without scoping
+      // every unaffected SDK reports xpass forever and the signal is lost.
+      const xf = kase.xfail;
+      const expectedFail = Boolean(xf) && (xf.sdks ?? ['typescript']).includes('typescript');
       try {
         await runCase(kase, client, DATABASE_URL, sdk);
         entry.status = expectedFail ? 'xpass' : 'pass';

@@ -23,10 +23,10 @@ export interface DatalogModel {
   query(pattern: string): Promise<string>;
 
   /** Clear all facts and rules. */
-  clear(): Promise<boolean>;
+  clear(predicate: string): Promise<boolean>;
 
   /** Import the graph model into the Datalog knowledge base. Returns count of facts imported. */
-  importGraph(): Promise<number>;
+  importGraph(predicate: string): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,14 +63,18 @@ class DatalogModelImpl implements DatalogModel {
     return (await this.transport.fetchval<string>('SELECT DATALOG_QUERY($1)', [pattern])) ?? '';
   }
 
-  async clear(): Promise<boolean> {
+  // Both of these emitted `SELECT DATALOG_CLEAR()` with no argument, and the
+  // engine answered "requires 1 argument(s), got 0". Neither has ever worked.
+  // The engine takes the predicate to clear or import, which is what every
+  // other SDK sends.
+  async clear(predicate: string): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT DATALOG_CLEAR()')) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT DATALOG_CLEAR($1)', [predicate])) ?? false;
   }
 
-  async importGraph(): Promise<number> {
+  async importGraph(predicate: string): Promise<number> {
     this.require();
-    return (await this.transport.fetchval<number>('SELECT DATALOG_IMPORT_GRAPH()')) ?? 0;
+    return (await this.transport.fetchval<number>('SELECT DATALOG_IMPORT_GRAPH($1)', [predicate])) ?? 0;
   }
 }
 

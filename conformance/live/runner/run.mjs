@@ -161,9 +161,39 @@ if (missing.length) {
 
 // Drift is the whole point. Two SDKs disagreeing about one case means one of
 // them is wrong, and which one is a question the spec exists to force.
+//
+// But a job that is permanently red teaches everyone to ignore it, which is the
+// exact failure this suite was built to end. So drift already recorded in
+// known-drift.json with a reason and a hard expiry is a warning; anything new,
+// and anything whose expiry has passed, is an error. Same contract as
+// .github/workflow-health-exceptions.json: a suppression that cannot expire
+// becomes the blind spot it was written to document.
+const KNOWN = path.join(ROOT, "known-drift.json");
+const known = existsSync(KNOWN)
+  ? Object.fromEntries((JSON.parse(readFileSync(KNOWN, "utf8")).drift ?? []).map((d) => [d.case, d]))
+  : {};
+const today = new Date(process.env.LIVE_SUITE_DATE ?? Date.now()).toISOString().slice(0, 10);
+
 for (const d of drift) {
-  console.error(`::error::cross-SDK drift on ${d.id}: ${JSON.stringify(d.cells)}`);
-  failed = true;
+  const entry = known[d.id];
+  if (!entry) {
+    console.error(`::error::NEW cross-SDK drift on ${d.id}: ${JSON.stringify(d.cells)}`);
+    failed = true;
+  } else if (entry.expires < today) {
+    console.error(`::error::drift exception for ${d.id} expired on ${entry.expires} — fix it or re-justify it`);
+    failed = true;
+  } else {
+    console.error(`::warning::known drift on ${d.id} (until ${entry.expires}): ${entry.reason}`);
+  }
+}
+
+// A recorded drift that no longer happens is also stale: it means somebody
+// fixed it and the note now describes a state that does not exist.
+for (const [id, entry] of Object.entries(known)) {
+  if (!drift.some((d) => d.id === id) && reports.length > 1) {
+    console.error(`::error::${id} is recorded in known-drift.json but the SDKs now agree — remove the entry (${entry.reason})`);
+    failed = true;
+  }
 }
 
 process.exit(failed ? 1 : 0);

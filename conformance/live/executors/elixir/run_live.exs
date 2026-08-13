@@ -417,7 +417,24 @@ defmodule Live do
     # testing nothing.
     {:ok, client} = Nucleus.Client.start_link(url: url, name: nil, pool_size: 1)
 
-    results = Enum.map(spec["cases"], &run_case(&1, client, declared))
+    results =
+      case preflight(client, url) do
+        :ok ->
+          Enum.map(spec["cases"], &run_case(&1, client, declared))
+
+        {:error, detail} ->
+          # Nothing ran, so nothing may be reported as expected-to-fail: an
+          # `xfail` says a case failed for the reason its note gives, and this
+          # one failed before the first statement was sent.
+          Enum.map(spec["cases"], fn kase ->
+            %{
+              "id" => kase["id"],
+              "model" => kase["model"],
+              "status" => "fail",
+              "detail" => detail
+            }
+          end)
+      end
 
     doc = %{"sdk" => "elixir", "specVersion" => spec["specVersion"], "cases" => results}
     IO.puts(Jason.encode!(doc, pretty: true))
@@ -429,6 +446,51 @@ defmodule Live do
     IO.puts(:stderr, "elixir: #{inspect(Enum.frequencies_by(results, & &1["status"]))}")
 
     exit_with(if bad == [], do: 0, else: 1)
+  end
+
+  # The client connects lazily and reports a connect failure as "connected to
+  # plain PostgreSQL", so an unreachable engine would otherwise be recorded 42
+  # times as a feature-detection result. One statement up front tells the two
+  # apart, and a second, deliberately synchronous connection recovers the
+  # server's actual error, which the pool only ever writes to the log.
+  defp preflight(client, url) do
+    case Nucleus.Client.query(client, "SELECT 1", []) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        {:error,
+         "the Elixir client never reached the engine, so no case ran: " <>
+           (connect_error(url) || inspect(reason))}
+    end
+  end
+
+  defp connect_error(url) do
+    uri = URI.parse(url)
+    [username | rest] = String.split(uri.userinfo || "postgres", ":", parts: 2)
+
+    opts =
+      [
+        hostname: uri.host || "localhost",
+        port: uri.port || 5432,
+        username: username,
+        database: String.trim_leading(uri.path || "/postgres", "/"),
+        pool_size: 1,
+        sync_connect: true,
+        backoff_type: :stop
+      ] ++ if(rest == [], do: [], else: [password: hd(rest)])
+
+    case Postgrex.start_link(opts) do
+      {:ok, pid} ->
+        GenServer.stop(pid)
+        nil
+
+      {:error, %{__exception__: true} = error} ->
+        Exception.message(error)
+
+      {:error, reason} ->
+        inspect(reason)
+    end
   end
 
   defp read_unsupported(path) do

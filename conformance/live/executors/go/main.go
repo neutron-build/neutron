@@ -62,10 +62,13 @@ type step struct {
 }
 
 type specCase struct {
-	ID    string          `json:"id"`
-	Model string          `json:"model"`
-	XFail json.RawMessage `json:"xfail"`
-	Steps []step          `json:"steps"`
+	ID    string `json:"id"`
+	Model string `json:"model"`
+	XFail *struct {
+		Reason string   `json:"reason"`
+		SDKs   []string `json:"sdks"`
+	} `json:"xfail"`
+	Steps []step `json:"steps"`
 }
 
 type spec struct {
@@ -171,16 +174,25 @@ func check(result any, expect map[string]any) error {
 		actual = l[i]
 	}
 
+	// Pass a non-string through unchanged. pgx decodes jsonb itself, so a
+	// literal implementation would report "expects a string, got map" and hide
+	// a value that is in fact correct. The point of the expectation is to
+	// compare the VALUE, whichever side of the wire decoded it.
 	if b, ok := expect["jsonDecode"].(bool); ok && b {
-		s, isStr := actual.(string)
-		if !isStr {
-			return fmt.Errorf("jsonDecode expects a string, got %T: %s", actual, show(actual))
+		if s, isStr := actual.(string); isStr {
+			var decoded any
+			if err := json.Unmarshal([]byte(s), &decoded); err != nil {
+				return fmt.Errorf("jsonDecode failed on %q: %v", s, err)
+			}
+			actual = decoded
 		}
-		var decoded any
-		if err := json.Unmarshal([]byte(s), &decoded); err != nil {
-			return fmt.Errorf("jsonDecode failed on %q: %v", s, err)
-		}
-		actual = decoded
+	}
+
+	// Same idea for containers the driver chose on our behalf. pgx decodes uuid
+	// to a [16]byte, so the value is right and only the shape differs; render
+	// it canonically rather than recording a false disagreement.
+	if arr, ok := actual.([16]byte); ok {
+		actual = fmt.Sprintf("%x-%x-%x-%x-%x", arr[0:4], arr[4:6], arr[6:8], arr[8:10], arr[10:16])
 	}
 
 	if b, ok := expect["notNull"].(bool); ok && b {
@@ -1031,7 +1043,18 @@ func run() int {
 	results := make([]caseResult, 0, len(sp.Cases))
 	for _, c := range sp.Cases {
 		entry := caseResult{ID: c.ID, Model: c.Model}
-		expectedFail := len(c.XFail) > 0
+		// An xfail may be scoped to named SDKs: some engine defects are only
+		// observable through one driver strategy, and without scoping every
+		// unaffected SDK reports xpass forever and the signal is lost.
+		expectedFail := c.XFail != nil
+		if expectedFail && len(c.XFail.SDKs) > 0 {
+			expectedFail = false
+			for _, s := range c.XFail.SDKs {
+				if s == "go" {
+					expectedFail = true
+				}
+			}
+		}
 
 		err := runCase(ctx, c, client, url)
 		switch {
