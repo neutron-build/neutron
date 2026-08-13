@@ -7,7 +7,7 @@
  * Browser support: Chrome 43+, Firefox 46+, Edge 79+, Safari 16+
  */
 
-import type { PermissionsModule, PermissionResult } from './permissions.js'
+import type { PermissionsModule } from './permissions.js'
 import type { PermissionStatus, PermissionName, ModuleMethod } from '../types.js'
 import { registerWebModule } from '../registry.js'
 

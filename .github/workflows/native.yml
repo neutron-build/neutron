@@ -20,7 +20,7 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10
 
       - uses: actions/setup-node@v4
         with:
@@ -30,8 +30,30 @@ jobs:
 
       - name: Install dependencies
         working-directory: native
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
+
+      # Without pnpm-workspace.yaml, `pnpm install` installs the root project only
+      # and still exits 0 — an empty install that makes every later step vacuous.
+      # Assert each workspace project really got its dependencies.
+      - name: Assert the workspace actually installed
+        working-directory: native
+        run: |
+          set -eu
+          for dir in packages/neutron-native packages/neutron-native-cli \
+                     packages/neutron-native-styling examples/hello-world; do
+            if [ ! -d "$dir/node_modules" ]; then
+              echo "::error::$dir has no node_modules - the workspace did not install"
+              exit 1
+            fi
+            echo "ok: $dir"
+          done
+
+      # The example resolves @neutron-build/native through its "types" entry in
+      # dist/, so the packages must be built before it can be typechecked.
+      - name: Build packages
+        working-directory: native
+        run: pnpm -r build
 
       - name: Typecheck
         working-directory: native
-        run: pnpm tsc --noEmit --skipLibCheck
+        run: pnpm -r typecheck

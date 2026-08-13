@@ -37,7 +37,7 @@ const WEB_BIOMETRICS: BiometricsModule = {
     }
   },
 
-  async authenticate(options?: BiometricPromptOptions): Promise<BiometricResult> {
+  async authenticate(_options?: BiometricPromptOptions): Promise<BiometricResult> {
     if (typeof window === 'undefined' || !window.PublicKeyCredential) {
       return { success: false, error: 'WebAuthn not supported in this browser' }
     }
@@ -62,7 +62,6 @@ const WEB_BIOMETRICS: BiometricsModule = {
       return { success: true }
     } catch (err: unknown) {
       const error = err instanceof Error ? err : new Error(String(err))
-      const isCancel = error.name === 'NotAllowedError'
       return {
         success: false,
         error: error.message,

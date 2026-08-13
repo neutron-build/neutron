@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import type { TextInputProps } from '../types.js'
 import { styleToCSS } from '../web-compat/style.js'
 
@@ -57,4 +58,4 @@ export function TextInput({
   }
 
   return <input type={secureTextEntry ? 'password' : 'text'} {...sharedProps as preact.JSX.HTMLAttributes<HTMLInputElement>} />
-}
+}

@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import type { ViewProps } from '../types.js'
 import { styleToCSS } from '../web-compat/style.js'
 
@@ -16,4 +17,4 @@ export function View({ children, style, testID, accessible, accessibilityLabel, 
       {children}
     </div>
   )
-}
+}

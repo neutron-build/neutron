@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import type { TextProps } from '../types.js'
 import { styleToCSS } from '../web-compat/style.js'
 
@@ -24,4 +25,4 @@ export function Text({ children, style, numberOfLines, onPress, testID, selectab
       {children}
     </span>
   )
-}
+}

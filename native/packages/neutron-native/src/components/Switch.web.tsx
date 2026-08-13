@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import type { SwitchProps } from './Switch.native.js'
 import { styleToCSS } from '../web-compat/style.js'
 
@@ -35,4 +36,4 @@ export function Switch({ value, onValueChange, disabled, trackColor, thumbColor,
       }} />
     </div>
   )
-}
+}

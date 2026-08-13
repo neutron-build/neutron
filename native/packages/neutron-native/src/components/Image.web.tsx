@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import type { ImageProps } from '../types.js'
 import { styleToCSS } from '../web-compat/style.js'
 
@@ -28,4 +29,4 @@ export function Image({ source, style, resizeMode, onLoad, onError, testID, acce
       {...(rest as Record<string, unknown>)}
     />
   )
-}
+}

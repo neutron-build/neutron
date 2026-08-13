@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import type { LinkProps } from './Link.native.js'
 import { navigate } from '../router/navigator.js'
 import { styleToCSS } from '../web-compat/style.js'
@@ -29,7 +30,7 @@ export function Link({
     navigate(href, { replace: shouldReplace, params })
   }
 
-  const resolvedStyle = typeof style === 'function' ? style({ pressed: false }) : style
+  const resolvedStyle = style
 
   return (
     <a
@@ -50,4 +51,4 @@ export function Link({
       {children}
     </a>
   )
-}
+}

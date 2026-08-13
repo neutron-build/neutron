@@ -30,7 +30,7 @@ import type {
   PanGesture, PinchGesture, RotationGesture, FlingGesture,
   TapGesture, LongPressGesture,
 } from './types.js'
-import type { ComposedGesture } from './gesture.js'
+import type { AnyGestureConfig, ComposedGesture } from './gesture.js'
 
 // ─── RNGH detection ──────────────────────────────────────────────────────────
 
@@ -87,7 +87,7 @@ function isComposed(g: GestureConfig | ComposedGesture): g is ComposedGesture {
  */
 function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
   // Flatten composed gestures — in fallback mode, we process sequentially
-  const gestures: GestureConfig[] = isComposed(config)
+  const gestures: AnyGestureConfig[] = isComposed(config)
     ? config.gestures
     : [config]
 
@@ -376,7 +376,7 @@ function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
  * Build a react-native-gesture-handler Gesture object from our config.
  * Maps our gesture config format to RNGH's fluent API.
  */
-function buildRNGHGesture(config: GestureConfig): any {
+function buildRNGHGesture(config: AnyGestureConfig): any {
   const rngh = getRNGH()
   if (!rngh) return null
 

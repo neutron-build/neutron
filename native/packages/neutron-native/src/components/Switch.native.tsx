@@ -1,4 +1,5 @@
 import { Switch as RNSwitch } from 'react-native'
+import type { NativeStyleProp } from '../types.js'
 
 export interface SwitchProps {
   value?: boolean
@@ -7,6 +8,7 @@ export interface SwitchProps {
   trackColor?: { false?: string; true?: string }
   thumbColor?: string
   ios_backgroundColor?: string
+  style?: NativeStyleProp
   testID?: string
 }
 

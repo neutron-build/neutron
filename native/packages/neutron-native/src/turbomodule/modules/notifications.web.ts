@@ -166,7 +166,7 @@ const WEB_NOTIFICATIONS: NotificationsModule = {
     }
   },
 
-  onReceived(callback: NativeEventCallback<NotificationPayload>): NativeSubscription {
+  onReceived(_callback: NativeEventCallback<NotificationPayload>): NativeSubscription {
     // On web, "received in foreground" happens when we show the notification.
     // There is no separate event — the Notification API fires onclick, not onshow in a useful way.
     // Best-effort: listen for ServiceWorker messages if available.

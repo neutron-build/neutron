@@ -119,7 +119,6 @@ describe('TurboModule Registry', () => {
   })
 
   it('isWeb returns false in non-browser environment', () => {
-    const registry = require('../registry')
     // In test env without document/window, should be false
     const g = globalThis as any
     const origDoc = g.document

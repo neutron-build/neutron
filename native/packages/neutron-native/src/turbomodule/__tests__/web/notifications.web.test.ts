@@ -28,7 +28,7 @@ describe('Notifications web implementation', () => {
 
   it('should create notification with title', () => {
     const Notif = Notification as any
-    const n = new Notif('Test Title')
+    new Notif('Test Title')
     expect(Notif).toHaveBeenCalledWith('Test Title')
   })
 
@@ -40,7 +40,6 @@ describe('Notifications web implementation', () => {
   })
 
   it('should cancel notification', () => {
-    const Notif = Notification as any
     const mock = jest.fn()
     const n = { close: mock }
     n.close()

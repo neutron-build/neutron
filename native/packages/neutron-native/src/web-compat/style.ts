@@ -6,9 +6,19 @@
  * have a 1:1 CSS equivalent.
  */
 
-import type { NativeStyleProp } from '../types.js'
+import type { NativeStyleProp, NativeTextStyleProp, NativeImageStyleProp } from '../types.js'
 
 type CSSObject = Record<string, string | number | undefined>
+
+/**
+ * Anything React Native accepts as a style prop, including the arbitrarily
+ * nested (and possibly readonly) arrays that `StyleProp<T>` permits.
+ */
+export type StyleInput =
+  | NativeStyleProp
+  | NativeTextStyleProp
+  | NativeImageStyleProp
+  | readonly StyleInput[]
 
 const SHADOW_SKIP = new Set(['shadowColor', 'shadowOffset', 'shadowOpacity', 'shadowRadius'])
 
@@ -16,7 +26,7 @@ const SHADOW_SKIP = new Set(['shadowColor', 'shadowOffset', 'shadowOpacity', 'sh
  * Convert a React Native style object (or array) to a plain CSS object
  * suitable for use as a Preact inline style.
  */
-export function styleToCSS(style: NativeStyleProp | NativeStyleProp[] | undefined | null): CSSObject {
+export function styleToCSS(style: StyleInput): CSSObject {
   if (!style) return {}
   if (Array.isArray(style)) {
     return style.reduce<CSSObject>((acc, s) => ({ ...acc, ...styleToCSS(s) }), {})

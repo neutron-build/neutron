@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import { useSignal } from '@preact/signals'
 import type { PressableProps, NativeStyleProp } from '../types.js'
 import { styleToCSS } from '../web-compat/style.js'
@@ -43,4 +44,4 @@ export function Pressable({
       {resolvedChildren}
     </button>
   )
-}
+}

@@ -28,7 +28,7 @@ function useCallback<T extends Function>(fn: T, _deps?: unknown[]): T {
   return fn
 }
 
-function useReducer<S, A>(reducer: (state: S, action: A) => S, initialState: S): [S, (action: A) => void] {
+function useReducer<S, A>(_reducer: (state: S, action: A) => S, initialState: S): [S, (action: A) => void] {
   return [initialState, jest.fn()]
 }
 
@@ -42,7 +42,7 @@ function useLayoutEffect(fn: () => void | (() => void), _deps?: unknown[]) {
 
 function useImperativeHandle(_ref: unknown, _create: () => unknown, _deps?: unknown[]) {}
 
-function forwardRef<T, P>(render: (props: P, ref: unknown) => unknown) {
+function forwardRef<T, P>(render: (props: P, ref: T) => unknown) {
   return render
 }
 

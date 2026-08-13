@@ -137,9 +137,26 @@ class LongPressBuilder extends GestureBuilder<LongPressGesture> {
 
 // ─── Composed gestures ───────────────────────────────────────────────────────
 
+/**
+ * Any concrete gesture config. Needed because `GestureConfig<E>` declares its
+ * callbacks as properties, so `PanGesture` (E = PanGestureEvent) is not
+ * assignable to `GestureConfig<GestureEvent>` under strictFunctionTypes.
+ */
+export type AnyGestureConfig =
+  | GestureConfig<GestureEvent>
+  | PanGesture
+  | PinchGesture
+  | RotationGesture
+  | FlingGesture
+  | TapGesture
+  | LongPressGesture
+
+/** Any gesture builder returned by the `Gesture.*` factories. */
+export type AnyGestureBuilder = { build(): AnyGestureConfig }
+
 export interface ComposedGesture {
   type: 'simultaneous' | 'exclusive' | 'race'
-  gestures: GestureConfig[]
+  gestures: AnyGestureConfig[]
 }
 
 // ─── Gesture namespace ───────────────────────────────────────────────────────
@@ -164,20 +181,20 @@ export const Gesture = {
   LongPress: () => new LongPressBuilder({ type: 'longPress', enabled: true }),
 
   /** Allow multiple gestures to be recognized simultaneously */
-  Simultaneous: (...gestures: (GestureConfig | GestureBuilder<GestureConfig>)[]): ComposedGesture => ({
+  Simultaneous: (...gestures: (AnyGestureConfig | AnyGestureBuilder)[]): ComposedGesture => ({
     type: 'simultaneous',
-    gestures: gestures.map(g => g instanceof GestureBuilder ? g.build() : g),
+    gestures: gestures.map(g => ('build' in g ? g.build() : g)),
   }),
 
   /** Only the first matching gesture is recognized (priority order) */
-  Exclusive: (...gestures: (GestureConfig | GestureBuilder<GestureConfig>)[]): ComposedGesture => ({
+  Exclusive: (...gestures: (AnyGestureConfig | AnyGestureBuilder)[]): ComposedGesture => ({
     type: 'exclusive',
-    gestures: gestures.map(g => g instanceof GestureBuilder ? g.build() : g),
+    gestures: gestures.map(g => ('build' in g ? g.build() : g)),
   }),
 
   /** First gesture to activate wins, others are cancelled */
-  Race: (...gestures: (GestureConfig | GestureBuilder<GestureConfig>)[]): ComposedGesture => ({
+  Race: (...gestures: (AnyGestureConfig | AnyGestureBuilder)[]): ComposedGesture => ({
     type: 'race',
-    gestures: gestures.map(g => g instanceof GestureBuilder ? g.build() : g),
+    gestures: gestures.map(g => ('build' in g ? g.build() : g)),
   }),
 } as const

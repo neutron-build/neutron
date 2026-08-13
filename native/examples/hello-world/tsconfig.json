@@ -7,7 +7,15 @@
     "jsxImportSource": "preact",
     "strict": true,
     "skipLibCheck": true,
-    "types": ["react-native"]
+    "types": ["react-native"],
+    // Type-level mirror of the `react` -> `preact/compat` alias in rspack.config.js.
+    // Without it, components typed with React's ReactNode reject Preact's JSX.Element.
+    "baseUrl": ".",
+    "paths": {
+      "react": ["./node_modules/preact/compat"],
+      "react/jsx-runtime": ["./node_modules/preact/compat/jsx-runtime"],
+      "react-dom": ["./node_modules/preact/compat"]
+    }
   },
   "include": ["**/*.ts", "**/*.tsx"],
   "exclude": ["node_modules", "dist"]

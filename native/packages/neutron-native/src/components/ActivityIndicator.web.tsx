@@ -1,3 +1,4 @@
+/** @jsxImportSource preact */
 import type { ActivityIndicatorProps } from './ActivityIndicator.native.js'
 import { styleToCSS } from '../web-compat/style.js'
 
@@ -21,4 +22,4 @@ export function ActivityIndicator({ animating, color, size, style, testID }: Act
       } as preact.JSX.CSSProperties}
     />
   )
-}
+}

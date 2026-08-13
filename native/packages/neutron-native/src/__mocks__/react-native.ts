@@ -25,11 +25,6 @@ class AnimatedValue {
   stopAnimation(cb?: (v: number) => void) { cb?.(this._value) }
 }
 
-const AnimatedTiming = {
-  start: (cb?: (r: { finished: boolean }) => void) => cb?.({ finished: true }),
-  stop: () => {},
-}
-
 const Animated = {
   Value: AnimatedValue,
   timing: (_av: AnimatedValue, _config: Record<string, unknown>) => ({
@@ -51,7 +46,7 @@ const Animated = {
     },
     stop: () => animations.forEach(a => a.stop()),
   }),
-  delay: (ms: number) => ({
+  delay: (_ms: number) => ({
     start: (cb?: (r: { finished: boolean }) => void) => {
       setTimeout(() => cb?.({ finished: true }), 0)
     },
@@ -166,7 +161,7 @@ const Easing = {
   ease: (t: number) => t,
   quad: (t: number) => t * t,
   cubic: (t: number) => t * t * t,
-  bezier: (x1: number, y1: number, x2: number, y2: number) => (t: number) => t,
+  bezier: (_x1: number, _y1: number, _x2: number, _y2: number) => (t: number) => t,
 }
 
 // --- NativeModules ---

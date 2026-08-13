@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from 'react'
-import type { NativeStyleProp } from '../types.js'
+import type { TextStyle, ViewStyle } from 'react-native'
 
 export interface ScreenConfig {
   /** Route name / segment */
@@ -14,9 +14,11 @@ export interface ScreenOptions {
   title?: string
   /** Hide the header entirely */
   headerShown?: boolean
-  headerStyle?: NativeStyleProp
+  /** Merged into the header bar's style object, so it must be a plain style — not an array. */
+  headerStyle?: ViewStyle
   headerTintColor?: string
-  headerTitleStyle?: NativeStyleProp
+  /** Merged into the header title's style object, so it must be a plain style — not an array. */
+  headerTitleStyle?: TextStyle
   /** Tab-specific */
   tabBarLabel?: string
   tabBarIcon?: ComponentType<{ focused: boolean; color: string; size: number }>

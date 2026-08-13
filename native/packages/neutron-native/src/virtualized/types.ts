@@ -3,6 +3,7 @@
  */
 
 import type { ComponentType, ReactNode, ReactElement } from 'react'
+import type { ViewStyle } from 'react-native'
 import type { NativeStyleProp } from '../types.js'
 
 /** Information about a visible item */
@@ -68,7 +69,8 @@ export interface VirtualizedListProps<T> {
 
   // ── Style ──────────────────────────────────────────────────────────
   style?: NativeStyleProp
-  contentContainerStyle?: NativeStyleProp
+  /** Merged into the scroll content's style object, so it must be a plain style — not an array. */
+  contentContainerStyle?: ViewStyle
 
   // ── Scroll ──────────────────────────────────────────────────────────
   onScroll?: (event: { nativeEvent: { contentOffset: { x: number; y: number } } }) => void
