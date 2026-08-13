@@ -88,6 +88,13 @@ jobs:
         run: node -e "import('autocannon').then(()=>console.log('harness deps OK'))"
         working-directory: typescript/benchmarks
 
+      # The harness builds apps/playground as the Neutron subject, and the
+      # playground resolves the framework through the workspace packages' dist/
+      # entry points. Without this the run dies on
+      # `Command failed (1): pnpm --filter @neutron/playground build`.
+      - name: Build the workspace
+        run: pnpm -r build
+
       - name: Run smoke benchmark
         run: pnpm --dir benchmarks run compare:quick
 
@@ -145,6 +152,13 @@ jobs:
       - name: Assert the harness actually installed
         run: node -e "import('autocannon').then(()=>console.log('harness deps OK'))"
         working-directory: typescript/benchmarks
+
+      # The harness builds apps/playground as the Neutron subject, and the
+      # playground resolves the framework through the workspace packages' dist/
+      # entry points. Without this the run dies on
+      # `Command failed (1): pnpm --filter @neutron/playground build`.
+      - name: Build the workspace
+        run: pnpm -r build
 
       - name: Run full benchmark
         run: pnpm --dir benchmarks run compare:full

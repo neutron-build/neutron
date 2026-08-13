@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Starts a Nucleus for the live conformance suite, the same way everywhere.
 #
 #   sh conformance/live/scripts/start-engine.sh [port] [datadir]
@@ -6,7 +6,11 @@
 # Every SDK's CI job and every developer should boot the engine through this
 # script rather than inventing their own invocation, because two of the three
 # things it does are non-obvious and both have already cost a red run.
-set -euo pipefail
+# POSIX, not bash: every documented invocation runs this under `sh`, which is
+# dash on Ubuntu, and `set -o pipefail` is a bashism dash exits 2 on. This
+# repo already documents that trap in report-build-size.sh and this script
+# walked into it anyway on its first CI run.
+set -eu
 
 PORT="${1:-55432}"
 DATA="${2:-/tmp/nucleus-live}"
