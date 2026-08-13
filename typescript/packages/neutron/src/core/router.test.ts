@@ -60,6 +60,21 @@ describe("router", () => {
     expect(result?.params["*"]).toBe("guide/getting-started");
   });
 
+  it("keeps suffixed params and catch-alls distinct", () => {
+    const router = createRouter();
+    router.insert(createTestRoute("/users/:id"));
+    router.insert(createTestRoute("/users/:id.json"));
+    router.insert(createTestRoute("/docs/*slug"));
+    router.insert(createTestRoute("/docs/*slug.md"));
+
+    expect(router.match("/users/42")?.params.id).toBe("42");
+    expect(router.match("/users/42.json")?.route.path).toBe("/users/:id.json");
+    expect(router.match("/users/42.json")?.params.id).toBe("42");
+    expect(router.match("/docs/guide/intro")?.route.path).toBe("/docs/*slug");
+    expect(router.match("/docs/guide/intro.md")?.route.path).toBe("/docs/*slug.md");
+    expect(router.match("/docs/guide/intro.md")?.params.slug).toBe("guide/intro");
+  });
+
   it("prioritizes static over dynamic", () => {
     const router = createRouter();
     router.insert(createTestRoute("/users/:id"));

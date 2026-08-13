@@ -202,7 +202,7 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
         params: {},
       });
 
-      for (const layoutRoute of [...layoutChain].reverse()) {
+      for (const layoutRoute of layoutChain) {
         const layoutModule = moduleCache.get(path.resolve(layoutRoute.file))!;
         if (layoutModule?.default) {
           element = h(layoutModule.default as any, {}, element);

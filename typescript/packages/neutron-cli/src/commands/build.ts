@@ -177,7 +177,28 @@ export async function build(): Promise<void> {
       mergeConfig(userConfig, {
         configFile: false,
         root: cwd,
-        plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        plugins: [
+          {
+            name: "neutron:resolve-render-to-string-stream-css",
+            enforce: "pre" as const,
+            resolveId(id: string) {
+              if (id === "preact-render-to-string/stream") {
+                return createRequire(path.join(cwd, "package.json")).resolve(id);
+              }
+              return null;
+            },
+            load(id: string) {
+              if (id.endsWith("/preact-render-to-string/stream")) {
+                const real = createRequire(path.join(cwd, "package.json")).resolve(
+                  "preact-render-to-string/stream"
+                );
+                return fs.readFileSync(real, "utf-8");
+              }
+              return null;
+            },
+          },
+          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+        ],
         css: cssConfig,
         resolve: {
           alias: preactAliases,
@@ -226,7 +247,28 @@ export async function build(): Promise<void> {
       mergeConfig(userConfig, {
         configFile: false,
         root: cwd,
-        plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        plugins: [
+          {
+            name: "neutron:resolve-render-to-string-stream-css",
+            enforce: "pre" as const,
+            resolveId(id: string) {
+              if (id === "preact-render-to-string/stream") {
+                return createRequire(path.join(cwd, "package.json")).resolve(id);
+              }
+              return null;
+            },
+            load(id: string) {
+              if (id.endsWith("/preact-render-to-string/stream")) {
+                const real = createRequire(path.join(cwd, "package.json")).resolve(
+                  "preact-render-to-string/stream"
+                );
+                return fs.readFileSync(real, "utf-8");
+              }
+              return null;
+            },
+          },
+          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+        ],
         css: cssConfig,
         resolve: {
           alias: preactAliases,
@@ -623,7 +665,7 @@ export async function build(): Promise<void> {
             params,
           });
 
-          for (const layoutRoute of [...layoutChain].reverse()) {
+          for (const layoutRoute of layoutChain) {
             const layoutModule = await loadRouteModule(layoutRoute);
             // Call layout loaders so sidebars, nav trees, etc. are populated.
             let layoutData: unknown = {};
@@ -706,7 +748,7 @@ export async function build(): Promise<void> {
         params: {},
       });
 
-      for (const layoutRoute of [...layoutChain].reverse()) {
+      for (const layoutRoute of layoutChain) {
         const layoutModule = await loadRouteModule(layoutRoute);
         let layoutData: unknown = {};
         if (layoutModule?.loader) {

@@ -3,20 +3,16 @@ import type { Route, RouteMatch } from "./types.js";
 
 interface TrieNode {
   children: Map<string, TrieNode>;
-  paramChild: TrieNode | null;
-  paramName: string | null;
-  wildcardChild: TrieNode | null;
-  wildcardName: string;
+  paramChildren: Map<string, { node: TrieNode; name: string }>;
+  wildcardChildren: Map<string, { node: TrieNode; name: string }>;
   route: Route | null;
 }
 
 function createNode(): TrieNode {
   return {
     children: new Map(),
-    paramChild: null,
-    paramName: null,
-    wildcardChild: null,
-    wildcardName: "*",
+    paramChildren: new Map(),
+    wildcardChildren: new Map(),
     route: null,
   };
 }
@@ -45,17 +41,19 @@ export function createRouter() {
         }
         node = node.children.get(segment.value)!;
       } else if (segment.type === "param") {
-        if (!node.paramChild) {
-          node.paramChild = createNode();
+        let child = node.paramChildren.get(segment.suffix);
+        if (!child) {
+          child = { node: createNode(), name: segment.value };
+          node.paramChildren.set(segment.suffix, child);
         }
-        node.paramName = segment.value;
-        node = node.paramChild;
+        node = child.node;
       } else if (segment.type === "wildcard") {
-        if (!node.wildcardChild) {
-          node.wildcardChild = createNode();
+        let child = node.wildcardChildren.get(segment.suffix);
+        if (!child) {
+          child = { node: createNode(), name: segment.value || "*" };
+          node.wildcardChildren.set(segment.suffix, child);
         }
-        node.wildcardName = segment.value || "*";
-        node = node.wildcardChild;
+        node = child.node;
       }
     }
 
@@ -110,20 +108,25 @@ export function createRouter() {
       if (result) return result;
     }
 
-    if (node.paramChild && node.paramName) {
-      params[node.paramName] = segment;
-      const result = matchNode(node.paramChild, segments, index + 1, params);
+    for (const [suffix, child] of dynamicChildren(node.paramChildren)) {
+      if (suffix && !segment.endsWith(suffix)) continue;
+      const value = suffix ? segment.slice(0, -suffix.length) : segment;
+      if (!value) continue;
+      params[child.name] = value;
+      const result = matchNode(child.node, segments, index + 1, params);
       if (result) return result;
-      delete params[node.paramName];
+      delete params[child.name];
     }
 
-    if (node.wildcardChild) {
-      const wildcardParam = segments.slice(index).join("/");
-      const name = node.wildcardName || "*";
-      params[name] = wildcardParam;
-      const result = matchNode(node.wildcardChild, segments, segments.length, params);
+    const remaining = segments.slice(index).join("/");
+    for (const [suffix, child] of dynamicChildren(node.wildcardChildren)) {
+      if (suffix && !remaining.endsWith(suffix)) continue;
+      const value = suffix ? remaining.slice(0, -suffix.length) : remaining;
+      if (!value) continue;
+      params[child.name] = value;
+      const result = matchNode(child.node, segments, segments.length, params);
       if (result) return result;
-      delete params[name];
+      delete params[child.name];
     }
 
     return null;
@@ -138,8 +141,8 @@ export function createRouter() {
 
 type PathSegment =
   | { type: "static"; value: string }
-  | { type: "param"; value: string }
-  | { type: "wildcard"; value: string };
+  | { type: "param"; value: string; suffix: string }
+  | { type: "wildcard"; value: string; suffix: string };
 
 function parsePath(path: string): PathSegment[] {
   const parts = path.split("/").filter(Boolean);
@@ -147,15 +150,30 @@ function parsePath(path: string): PathSegment[] {
 
   for (const part of parts) {
     if (part.startsWith("*")) {
-      segments.push({ type: "wildcard", value: part.slice(1) || "*" });
+      const { name, suffix } = splitDynamicSegment(part.slice(1), "*");
+      segments.push({ type: "wildcard", value: name, suffix });
     } else if (part.startsWith(":")) {
-      segments.push({ type: "param", value: part.slice(1) });
+      const { name, suffix } = splitDynamicSegment(part.slice(1), "");
+      segments.push({ type: "param", value: name, suffix });
     } else {
       segments.push({ type: "static", value: part });
     }
   }
 
   return segments;
+}
+
+function splitDynamicSegment(value: string, fallback: string): { name: string; suffix: string } {
+  const dot = value.indexOf(".");
+  if (dot === -1) return { name: value || fallback, suffix: "" };
+  return { name: value.slice(0, dot) || fallback, suffix: value.slice(dot) };
+}
+
+// A suffixed route such as `*slug.md` is more specific than a plain catch-all.
+// Try it first so `/docs/intro.md` reaches the markdown resource route while
+// `/docs/intro` continues to reach the page route.
+function dynamicChildren<T>(children: Map<string, T>): Array<[string, T]> {
+  return [...children.entries()].sort(([a], [b]) => b.length - a.length);
 }
 
 function parseUrlPath(path: string): string[] {

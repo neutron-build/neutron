@@ -900,7 +900,7 @@ async function handleRequest(
       actionData,
     });
 
-    for (const layoutRoute of [...layoutChain].reverse()) {
+    for (const layoutRoute of layoutChain) {
       const layoutResult = loaderResults.find((r) => r.routeId === layoutRoute.id);
       if (layoutResult?.module?.default) {
         const layoutData = loaderData[layoutRoute.id];
