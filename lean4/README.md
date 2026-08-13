@@ -9,9 +9,9 @@ This suite contains **hand-written Lean 4 models** of Nucleus's core algorithms 
 Concretely:
 
 - **26 `.lean` files**
-- **70 theorems**
+- **68 theorems**
 - **0 `sorry`** — every proof term is complete; nothing is admitted or left as a hole
-- **28 `axiom` declarations** — see [Axioms and assumptions](#axioms-and-assumptions)
+- **25 `axiom` declarations** — see [Axioms and assumptions](#axioms-and-assumptions)
 
 The proofs are checked by the Lean 4 kernel on `lake build`. "Zero `sorry`" is literally true: there are no gaps stubbed out with `sorry`. The proofs hold *modulo* the explicit axioms listed below.
 
@@ -36,14 +36,14 @@ Read this section before citing the suite anywhere.
 
 - **It does not certify the shipping Nucleus binary.** These are models of the *algorithm designs*, not a verification of the production Rust code. A proof here says the design is sound; it does not say the compiled engine faithfully implements that design.
 - **The models are hand-written, not machine-extracted.** The `Aeneas/` directory is named for the aspiration of using the [Aeneas](https://github.com/AeneasVerif/aeneas) Rust-to-Lean toolchain, but the files are hand-modeled. As `Aeneas/Mvcc.lean` states in its own header: *"In production, Aeneas auto-generates this; here we provide the hand-modeled version."* No Aeneas extraction runs in this build. There is no verified link between the Rust source and these Lean models.
-- **It is not "100% proven."** Zero `sorry` is real, but 28 axioms carry weight — some are load-bearing (see below). The correct claim is "0 `sorry` across 70 theorems, machine-checked modulo explicit, auditable axioms," not "the algorithm is correct forever" or "the running database is verified."
+- **It is not "100% proven."** Zero `sorry` is real, but 25 axioms carry weight — some are load-bearing (see below). The correct claim is "0 `sorry` across 68 theorems, machine-checked modulo explicit, auditable axioms," not "the algorithm is correct forever" or "the running database is verified."
 - **It makes no runtime or query-result guarantees.** Nothing here implies that a given query against Nucleus returns the right row, or that the binary behaves as modeled.
 
 If you need a one-line summary: *machine-checked Lean models of Nucleus's core algorithms — the designs, not the binary — with 0 `sorry` and a documented axiom base.*
 
 ## Axioms and assumptions
 
-The 28 axioms fall into three buckets. They are the trust boundary of the suite; everything else is proven from them.
+The 25 axioms fall into three buckets. They are the trust boundary of the suite; everything else is proven from them.
 
 1. **Foundational identities** (`Crypto/ConstantTime.lean`). Bitwise facts such as `n ^^^ n = 0`, `0 ||| n = n`, and `a ^^^ b = 0 → a = b`. These are true and could in principle be replaced by kernel-checked proofs; they are axiomatized here for convenience.
 
@@ -63,7 +63,7 @@ lake exe cache get   # optional: fetch prebuilt mathlib artifacts
 lake build           # builds all libraries and kernel-checks every proof
 ```
 
-A successful `lake build` means the Lean kernel has re-checked all 70 theorems.
+A successful `lake build` means the Lean kernel has re-checked all 68 theorems.
 
 ## Layout
 

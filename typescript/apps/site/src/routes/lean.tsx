@@ -6,7 +6,7 @@ import CodeBlock from "../components/CodeBlock";
 export function head() {
   return {
     title: "Lean 4 Proofs - Neutron",
-    description: "Machine-checked Lean 4 proofs of the algorithms behind Nucleus. 26 files, 70 theorems, zero sorry. MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU &mdash; the designs proven correct, not just tested.",
+    description: "Machine-checked Lean 4 proofs of the algorithms behind Nucleus. 26 files, 68 theorems, zero sorry. MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU &mdash; the designs proven correct, not just tested.",
   };
 }
 
@@ -14,7 +14,7 @@ export default function LeanPage() {
   return (
     <ProductPage
       title="Lean 4 Proofs"
-      description="Machine-checked correctness proofs for the algorithms Nucleus is built on. 26 files, 70 theorems, zero uses of sorry. Each proof covers a Lean model of the algorithm &mdash; MVCC, B-tree, WAL, Raft and more &mdash; correct for every input, not just the cases a test happened to try."
+      description="Machine-checked correctness proofs for the algorithms Nucleus is built on. 26 files, 68 theorems, zero uses of sorry. Each proof covers a Lean model of the algorithm &mdash; MVCC, B-tree, WAL, Raft and more &mdash; correct for every input, not just the cases a test happened to try."
       category="tool"
       status="available"
       accent="var(--accent-lean)"
@@ -22,7 +22,7 @@ export default function LeanPage() {
       heroTagline="Don't just test. Prove."
       stats={[
         { value: '26', label: 'Model Files' },
-        { value: '70', label: 'Theorems' },
+        { value: '68', label: 'Theorems' },
         { value: '0', label: 'Uses of sorry' },
         { value: 'Lean 4', label: 'Prover' },
       ]}
@@ -78,15 +78,20 @@ end Nucleus.MVCC`}</code></pre>
       <ComparisonTable
         headers={['', 'Unit tests', 'Property tests', 'Lean 4 proof']}
         rows={[
-          ['Input coverage', 'Hand-picked cases', 'Random cases', 'All possible inputs'],
-          ['Correctness', 'Likely correct', 'Probably correct', 'Mathematically correct'],
-          ['Stays correct', 'Until refactor', 'Until refactor', 'Forever (proof is permanent)'],
-          ['Finds edge cases', 'If you thought of them', 'Eventually', 'Cannot exist by construction'],
+          ['What it covers', 'Hand-picked cases', 'Random cases', 'Every input to the model'],
+          ['Subject', 'The Rust', 'The Rust', 'A Lean model of the algorithm'],
+          ['Strength of result', 'Likely correct', 'Probably correct', 'Proven, modulo stated axioms'],
+          ['When the code changes', 'Rerun the tests', 'Rerun the tests', 'Proof still holds; the model may no longer match'],
           ['Runtime cost', 'Zero', 'Zero', 'Zero'],
         ]}
         highlightColumn={3}
         accentRgb="59, 130, 246"
       />
+
+      <section>
+        <h3>What the proofs do not cover</h3>
+        <p>Two limits worth stating plainly, because a proof that is oversold is worse than no proof. First, the models are hand-written Lean, not extracted from the Rust &mdash; so a proof guarantees the <em>design</em> is sound, and keeping the implementation faithful to the design is still ordinary engineering work done by tests and review. Second, 25 declarations in the suite are <code>axiom</code>s rather than derived results. Most are foundational or standard cryptographic assumptions, but a handful in the Bloom filter and LRU models are genuine open obligations &mdash; the property is assumed rather than proven. Discharging those is tracked work, and until it is done the honest statement is "machine-checked modulo explicit, auditable axioms", not "proven".</p>
+      </section>
 
       <section>
         <h3>Where this shows up in Neutron</h3>

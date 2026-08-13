@@ -33,6 +33,28 @@ UNCLASSIFIED_INTEGRATION_IGNORES=$((INTEGRATION_IGNORED - STRESS_IGNORED))
 WAL_FILES=$(find "$SRC" -type f -name '*wal*.rs' | wc -l | tr -d ' ')
 TIERED_FILES=$(find "$SRC" -type f -name 'tiered.rs' | wc -l | tr -d ' ')
 
+# Lean 4. These were hand-maintained in GROUND_TRUTH and on the marketing site,
+# which is how "70 theorems" and "28 axioms" came to be quoted without anything
+# checking them -- the same shape as the LOC figure that rotted for two weeks.
+# The axiom count in particular is load-bearing: the honest claim is "machine-
+# checked modulo explicit, auditable axioms", and that sentence is only true for
+# as long as somebody knows the number.
+LEAN_DIR="$ROOT/../lean4"
+if [ -d "$LEAN_DIR" ]; then
+    LEAN_FILES=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' | wc -l | tr -d ' ')
+    LEAN_THEOREMS=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -exec grep -Ehc \
+        '^[[:space:]]*(private |protected )*(theorem|lemma) ' {} + 2>/dev/null \
+        | awk '{n+=$1} END {print n+0}')
+    LEAN_AXIOMS=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -exec grep -Ehc \
+        '^[[:space:]]*(private |protected )*axiom ' {} + 2>/dev/null \
+        | awk '{n+=$1} END {print n+0}')
+    LEAN_SORRY=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -exec grep -Ehc \
+        '(^|[^A-Za-z_])sorry([^A-Za-z_]|$)' {} + 2>/dev/null \
+        | awk '{n+=$1} END {print n+0}')
+else
+    LEAN_FILES=0; LEAN_THEOREMS=0; LEAN_AXIOMS=0; LEAN_SORRY=0
+fi
+
 print_metrics() {
     echo "SOURCE_LOC=$LOC"
     echo "SOURCE_RS_FILES=$RS_FILES"
@@ -47,6 +69,10 @@ print_metrics() {
     echo "UNCLASSIFIED_INTEGRATION_IGNORES=$UNCLASSIFIED_INTEGRATION_IGNORES"
     echo "WAL_SOURCE_FILES=$WAL_FILES"
     echo "TIERED_SOURCE_FILES=$TIERED_FILES"
+    echo "LEAN_FILES=$LEAN_FILES"
+    echo "LEAN_THEOREMS=$LEAN_THEOREMS"
+    echo "LEAN_AXIOMS=$LEAN_AXIOMS"
+    echo "LEAN_SORRY=$LEAN_SORRY"
     echo "EXECUTED_TESTS=not-measured (use CI/test output; cfg and parameterized tests change runtime counts)"
 }
 
@@ -112,6 +138,19 @@ if [ -f "$TRUTH" ]; then
     assert_truth_value "unit tests" "$UNIT_DECLARED" || fail=1
     assert_truth_value "modules" "$MODULES" || fail=1
     assert_truth_value "rs files" "$RS_FILES" || fail=1
+    if [ "$LEAN_FILES" -gt 0 ]; then
+        assert_truth_value "lean files" "$LEAN_FILES" || fail=1
+        assert_truth_value "lean theorems" "$LEAN_THEOREMS" || fail=1
+        assert_truth_value "lean axioms" "$LEAN_AXIOMS" || fail=1
+        # "zero sorry" is the one Lean claim that ships everywhere. If it ever
+        # stops being true, every page repeating it becomes false at once.
+        if [ "$LEAN_SORRY" -ne 0 ]; then
+            echo "FAIL: lean4 contains $LEAN_SORRY uses of sorry; every doc claiming zero is now wrong" >&2
+            fail=1
+        else
+            echo "OK: lean sorry=0"
+        fi
+    fi
 else
     echo "SKIP: _internal/GROUND_TRUTH.md not present (private, not in this checkout)"
 fi

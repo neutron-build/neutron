@@ -85,7 +85,7 @@ This holds for the model by construction — Lean checks it for every case, not 
 
 ## Axioms and Assumptions
 
-The suite compiles with **zero `sorry`**, but it declares **28 explicit `axiom`s** — facts assumed rather than derived from Lean's core. Being explicit about them is the point: what is assumed is stated in the open and can be audited. They fall into three groups:
+The suite compiles with **zero `sorry`**, but it declares **25 explicit `axiom`s** — facts assumed rather than derived from Lean's core. Being explicit about them is the point: what is assumed is stated in the open and can be audited. They fall into three groups:
 
 - **Foundational identities** — e.g. `n ^^^ n = 0`. True and mechanical; axiomatized to avoid pulling in heavy `Nat`/bitwise libraries.
 - **Standard cryptographic assumptions** — e.g. SHA-256 collision resistance (`sha256_collision_resistant`), HMAC PRF security. These are unprovable by nature; every crypto proof assumes them.
@@ -95,4 +95,4 @@ So the guarantees are **modulo these axioms**. The MVCC, WAL, and Raft models ar
 
 ## Status
 
-All 26 files compile with **0 `sorry`** across **70 theorems**. The proofs cover Lean models of the algorithms listed above; they do not (yet) prove properties of the production Rust directly. The open threads are discharging the remaining structural axioms and moving from hand-written models toward Aeneas-generated ones.
+All 26 files compile with **0 `sorry`** across **68 theorems**. The proofs cover Lean models of the algorithms listed above; they do not (yet) prove properties of the production Rust directly. The open threads are discharging the remaining structural axioms and moving from hand-written models toward Aeneas-generated ones.
