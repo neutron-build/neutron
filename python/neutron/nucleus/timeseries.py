@@ -115,7 +115,12 @@ class TimeSeriesModel:
         """Aggregate data points with time bucketing.
 
         Returns one data point per ``window``-sized bucket across the range.
-        ``fn``: ``avg``, ``sum``, ``min``, ``max``, ``count``, ``first``, ``last``
+
+        ``fn`` is ``avg`` or ``count``. The docstring used to promise ``sum``,
+        ``min``, ``max``, ``first`` and ``last`` as well; the engine ships
+        TS_RANGE_AVG and TS_RANGE_COUNT and nothing else, so those five raised
+        ValueError from the map below. Documenting what exists rather than what
+        was planned.
         """
         self._require()
         start_ms = int(start.timestamp() * 1000)
@@ -136,19 +141,18 @@ class TimeSeriesModel:
                 f"Supported: {', '.join(fn_map)}"
             )
 
-        # Align start to TIME_BUCKET boundary
-        secs = int(window.total_seconds())
-        if secs <= 60:
-            interval = "minute"
-        elif secs <= 3600:
-            interval = "hour"
-        elif secs <= 86400:
-            interval = "day"
-        else:
-            interval = "week"
-
+        # Align start to a TIME_BUCKET boundary.
+        #
+        # This passed an interval NAME here — "minute"/"hour"/"day"/"week" —
+        # chosen by bucketing the window size. The engine's TIME_BUCKET takes
+        # (bucket_millis, ts), both INT8, so every call raised on the type and
+        # aggregate() had never once worked. Two bugs in one: even had the
+        # string been accepted, aligning a 5-minute window to an hour boundary
+        # would have produced buckets that do not line up with the window the
+        # caller asked for. Align to window_ms, which is what "align to the
+        # bucket size" means.
         aligned = await self._exec.fetchval(
-            "SELECT TIME_BUCKET($1, $2)", interval, start_ms
+            "SELECT TIME_BUCKET($1, $2)", window_ms, start_ms
         )
         bucket_start = int(aligned) if aligned is not None else start_ms
 

@@ -265,7 +265,6 @@
       "model": "timeseries",
       "why": "L1. The SDK calls TIME_BUCKET($1, $2) with an interval NAME ('hour') while the engine's TIME_BUCKET takes bucket_millis. It has never worked in Python and every other SDK needs checking against the same shape.",
       "issue": "L1",
-      "xfail": { "reason": "SDK passes an interval name where the engine takes bucket_millis. Fix is S21; when it lands this case must start passing and this xfail must be removed." },
       "steps": [
         { "op": "timeseries.write", "args": ["@measurement", [{ "t": 0, "v": 10.0 }, { "t": 1000, "v": 20.0 }]] },
         { "op": "timeseries.aggregate", "args": ["@measurement", -60000, 60000, 300000], "expect": { "notNull": true } }
