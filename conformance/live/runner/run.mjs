@@ -75,7 +75,12 @@ function run({ command, args, cwd }) {
     let err = "";
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
-    child.on("error", (e) => resolve({ code: 127, out, err: String(e) }));
+    // ENOENT here means the language's toolchain is not installed, which is a
+    // different fact from "the executor ran and disagreed". Flagged so the
+    // caller can report it as unproven rather than as a conformance failure.
+    child.on("error", (e) =>
+      resolve({ code: 127, out, err: String(e), spawnFailed: e.code === "ENOENT" })
+    );
     child.on("close", (code) => resolve({ code, out, err }));
   });
 }
@@ -101,7 +106,14 @@ for (const ex of EXECUTORS) {
     continue;
   }
   process.stderr.write(`[live] ${ex.sdk} …\n`);
-  const { out, err } = await run(ex.cmd());
+  const { out, err, spawnFailed } = await run(ex.cmd());
+  if (spawnFailed) {
+    // The executor exists; the toolchain to run it does not. Same standing as
+    // "no executor at all": UNPROVEN, reported out loud, never counted as
+    // agreement — but not a failure, because nothing about the SDK was tested.
+    missing.push(`${ex.sdk} (toolchain not installed)`);
+    continue;
+  }
   try {
     reports.push(JSON.parse(out));
   } catch {
