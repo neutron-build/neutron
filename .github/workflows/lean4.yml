@@ -40,6 +40,13 @@ jobs:
       # ci.sh runs the Aeneas translation step (which no-ops when Aeneas is not
       # installed — CI uses the committed hand-modeled Lean files) then verifies
       # every proof with `lake build`.
+      # `lake build` going green does not by itself mean anything was CHECKED.
+      # A workflow that restores a cache and compiles nothing looks identical
+      # to one that verified 68 theorems. The canary hands Lean a proposition
+      # that must not typecheck and fails if it is accepted.
+      - name: Canary (the checker must reject a false proposition)
+        run: bash scripts/canary.sh
+
       - name: Verify proofs
         run: bash scripts/ci.sh
         working-directory: lean4

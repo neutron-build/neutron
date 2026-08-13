@@ -41,6 +41,13 @@ jobs:
       # ci.sh chains: typecheck every spec -> random simulation of each runnable
       # spec's invariants -> `quint test` conformance -> the Rust conformance
       # crate (`cargo test`). Non-zero exit on any failure.
+      # `quint test --match` exits 0 when it matches nothing, and a spec whose
+      # invariant is never evaluated also exits 0. Both look exactly like a
+      # passing verification. The canary gives Quint a violated invariant it
+      # must report, and asserts the real suite is not empty.
+      - name: Canary (the gate must report a violated invariant)
+        run: bash scripts/canary.sh
+
       - name: Run quint CI gate
         run: bash scripts/ci.sh
         working-directory: quint
