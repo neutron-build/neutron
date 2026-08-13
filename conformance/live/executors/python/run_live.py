@@ -67,8 +67,21 @@ def check(result: Any, expect: dict[str, Any]) -> None:
         actual = actual[expect["key"]] if isinstance(actual, dict) else getattr(actual, expect["key"])
     if "index" in expect:
         actual = actual[expect["index"]]
-    if expect.get("jsonDecode"):
+    if expect.get("jsonDecode") and isinstance(actual, str):
+        # Only decode when the driver handed back text. asyncpg decodes jsonb
+        # itself, and a literal implementation would report "not valid JSON"
+        # while hiding a value that is in fact correct.
         actual = json.loads(actual)
+
+    # Normalize containers the driver chose on our behalf. asyncpg decodes uuid
+    # to a UUID object; the value is right and only the shape differs, so render
+    # it canonically rather than recording a false disagreement. Same rule the
+    # Go executor applies to pgx's [16]byte.
+    import uuid as _uuid
+    if isinstance(actual, _uuid.UUID):
+        actual = str(actual)
+    if isinstance(actual, (bytes, bytearray)) and isinstance(expect.get("equals"), str):
+        actual = base64.b64encode(bytes(actual)).decode()
 
     if expect.get("notNull"):
         assert actual is not None, "expected a value, got None"

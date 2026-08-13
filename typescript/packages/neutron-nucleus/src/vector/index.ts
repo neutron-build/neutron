@@ -44,6 +44,9 @@ export interface VectorModel {
   search(collection: string, query: number[], opts?: VectorSearchOptions): Promise<VectorSearchResult[]>;
 
   /** Return the dimensionality of a vector. */
+  /** Number of vectors in a collection. */
+  count(collection: string): Promise<number>;
+
   dims(vector: number[]): Promise<number>;
 
   /** Compute the distance between two vectors. */
@@ -106,6 +109,17 @@ class VectorModelImpl implements VectorModel {
     this.require();
     assertIdentifier(collection, 'collection name');
     await this.transport.execute(`DELETE FROM ${collection} WHERE id = $1`, [id]);
+  }
+
+  // The other SDKs have this and TypeScript did not, so a caller had to drop to
+  // raw SQL to answer "how many vectors are in here" — which is also why the
+  // live conformance suite could not run the vector case against TypeScript at
+  // all, and reported it as unsupported rather than as a pass or a failure.
+  async count(collection: string): Promise<number> {
+    this.require();
+    assertIdentifier(collection, 'collection name');
+    const n = await this.transport.fetchval<number>(`SELECT COUNT(*) FROM ${collection}`);
+    return n ?? 0;
   }
 
   async search(

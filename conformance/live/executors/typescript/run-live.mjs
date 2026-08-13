@@ -497,6 +497,10 @@ class Ops {
     return this.c.vector.insert(coll, vecId, values);
   }
 
+  async vector_count(coll) {
+    return this.c.vector.count(coll);
+  }
+
   async vector_search(coll, values, k) {
     return this.c.vector.search(coll, values, { limit: k });
   }

@@ -133,6 +133,17 @@ for (const c of spec.cases) {
 }
 console.log();
 
+// The baseline is consulted by BOTH the per-SDK pass below and the drift pass
+// at the end. A case listed here is a known, dated, explained gap; reporting it
+// as a hard failure in one place and a warning in the other would make the
+// suite argue with itself, and a permanently red job is one nobody reads.
+const KNOWN = path.join(ROOT, "known-drift.json");
+const known = existsSync(KNOWN)
+  ? Object.fromEntries((JSON.parse(readFileSync(KNOWN, "utf8")).drift ?? []).map((d) => [d.case, d]))
+  : {};
+const today = new Date(process.env.LIVE_SUITE_DATE ?? Date.now()).toISOString().slice(0, 10);
+const expired = (id) => known[id] && known[id].expires < today;
+
 let failed = false;
 for (const r of reports) {
   if (r.fatal) {
@@ -144,9 +155,19 @@ for (const r of reports) {
   for (const c of r.cases) counts[c.status] = (counts[c.status] ?? 0) + 1;
   console.log(`[${r.sdk}] ${JSON.stringify(counts)}`);
   for (const c of r.cases) {
-    if (c.status === "fail" || c.status === "xpass") {
-      console.error(`::error::${r.sdk} ${c.id}: ${c.status} — ${c.detail ?? ""}`);
+    // An xpass is ALWAYS an error: the note claiming this is broken is now
+    // false, and a stale note is the rot this whole suite exists to prevent.
+    // A fail is an error unless it is a recorded, unexpired known gap.
+    if (c.status === "xpass") {
+      console.error(`::error::${r.sdk} ${c.id}: xpass — ${c.detail ?? ""}`);
       failed = true;
+    } else if (c.status === "fail") {
+      if (known[c.id] && !expired(c.id)) {
+        console.error(`::warning::${r.sdk} ${c.id}: known gap — ${known[c.id].reason}`);
+      } else {
+        console.error(`::error::${r.sdk} ${c.id}: fail — ${c.detail ?? ""}`);
+        failed = true;
+      }
     }
   }
   if (r.specVersion !== spec.specVersion) {
@@ -168,11 +189,6 @@ if (missing.length) {
 // and anything whose expiry has passed, is an error. Same contract as
 // .github/workflow-health-exceptions.json: a suppression that cannot expire
 // becomes the blind spot it was written to document.
-const KNOWN = path.join(ROOT, "known-drift.json");
-const known = existsSync(KNOWN)
-  ? Object.fromEntries((JSON.parse(readFileSync(KNOWN, "utf8")).drift ?? []).map((d) => [d.case, d]))
-  : {};
-const today = new Date(process.env.LIVE_SUITE_DATE ?? Date.now()).toISOString().slice(0, 10);
 
 for (const d of drift) {
   const entry = known[d.id];

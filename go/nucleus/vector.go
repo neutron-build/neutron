@@ -128,7 +128,16 @@ func (v *VectorModel) Search(ctx context.Context, collection string, query []flo
 		}
 		meta := make(map[string]any)
 		if len(metaJSON) > 0 {
+			// Unmarshalling the literal `null` SETS meta to nil, discarding the
+			// make() above, and the next line then panics with "assignment to
+			// entry in nil map". Insert(ctx, coll, id, vec, nil) is the documented
+			// default call and used to store `null`, so the SDK's own default path
+			// guaranteed a crash on the next Search. Rows written before this fix
+			// still carry `null`, so this guard stays regardless of the Insert fix.
 			_ = json.Unmarshal(metaJSON, &meta)
+			if meta == nil {
+				meta = make(map[string]any)
+			}
 		}
 		meta["id"] = id
 		// Score is the inverse of distance (closer = higher score)
@@ -222,6 +231,11 @@ func (v *VectorModel) Insert(ctx context.Context, collection string, id string, 
 	vecJSON, err := json.Marshal(vector)
 	if err != nil {
 		return fmt.Errorf("nucleus: vector marshal vector: %w", err)
+	}
+	// A nil map marshals to the literal `null`, not `{}`. Stored, that is what
+	// made Search panic; it is also the wrong value for "no metadata".
+	if metadata == nil {
+		metadata = map[string]any{}
 	}
 	metaJSON, err := json.Marshal(metadata)
 	if err != nil {

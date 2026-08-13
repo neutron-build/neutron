@@ -1,5 +1,5 @@
 {
-  "$comment": "Cross-SDK disagreements that are known, understood, and being worked. Every entry needs a reason and a hard expiry. NEW drift fails the run; an expired entry fails the run; and a recorded entry whose SDKs now AGREE also fails, because a note describing a state that no longer exists is the same rot as a stale finding. Baseline taken 2026-08-13 from the first three-SDK run (python, go, typescript). Nothing here is acceptable \u2014 it is the work list. 2026-08-13 later the same day: nine entries removed after the TypeScript int8 coercion, pathIn decode and datalog arity fixes landed \u2014 the runner refuses to keep an entry whose SDKs now agree.",
+  "$comment": "Cross-SDK disagreements that are known, understood, and being worked. Every entry needs a reason and a hard expiry. NEW drift fails the run; an expired entry fails the run; and a recorded entry whose SDKs now AGREE also fails, because a note describing a state that no longer exists is the same rot as a stale finding. Baseline taken 2026-08-13 from the first three-SDK run (python, go, typescript). Nothing here is acceptable \u2014 it is the work list. 2026-08-13 later the same day: nine entries removed after the TypeScript int8 coercion, pathIn decode and datalog arity fixes landed \u2014 the runner refuses to keep an entry whose SDKs now agree. 2026-08-13, third pass: the four SQL/vector entries removed after the engine fixes landed \u2014 dimensionless-VECTOR row omission and the statement-Describe column typing. The three that remain are SDK-side work, not engine defects.",
   "baselineDate": "2026-08-13",
   "drift": [
     {
@@ -15,26 +15,6 @@
     {
       "case": "cdc.read_returns_a_list",
       "reason": "Go and TypeScript both return CDC events as a raw JSON STRING rather than a list; Go has no CDCEvent type at all. Latent false green risk: a non-empty string is truthy, so a nonEmpty assertion would pass on an empty result.",
-      "expires": "2026-09-30"
-    },
-    {
-      "case": "vector.insert_and_search",
-      "reason": "Two engine defects behind one case (see the spec's xfail note), plus TypeScript's VectorModel having no count(), so it cannot run the case at all. Also worth fixing while here: TypeScript's search score is inverted \u2014 score = dist > 0 ? 1/dist : 0, so an exact match scores 0 and a worse match scores 1. And Go's Vector.Search panics on nil-metadata inserts, which is the documented default call.",
-      "expires": "2026-09-30"
-    },
-    {
-      "case": "sql.scalar_jsonb_parameter",
-      "reason": "The statement-Describe defect only reaches clients that describe before binding. asyncpg does and fails; node-postgres binds first and passes, so TypeScript xpasses. Not drift between SDKs so much as drift between driver strategies \u2014 but it stays recorded until the engine describes the column correctly, because until then the two clients genuinely disagree about what the database returns.",
-      "expires": "2026-09-30"
-    },
-    {
-      "case": "sql.scalar_uuid_and_bytea_parameters",
-      "reason": "Same statement-Describe defect. Additionally Go decodes uuid to a 16-byte array rather than a string, which is container drift the expectation vocabulary cannot currently express.",
-      "expires": "2026-09-30"
-    },
-    {
-      "case": "sql.scalar_int_parameter_returns_an_integer",
-      "reason": "Same statement-Describe defect; Go and TypeScript both return 1 correctly, asyncpg gets raw big-endian bytes. Note separately that go/nucleus/sql.go forces pgx.QueryExecModeSimpleProtocol on every Query/QueryOne/Exec, so Go interpolates parameters into the statement text and cannot exercise the binary parameter path at all \u2014 its pass here is not evidence the path works.",
       "expires": "2026-09-30"
     }
   ]
