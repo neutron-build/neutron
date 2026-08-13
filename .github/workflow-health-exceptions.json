@@ -1,0 +1,10 @@
+{
+  "$comment": "Workflows knowingly red on main. Every entry needs a reason and a hard expiry: an exception that cannot expire becomes the blind spot it was written to document. An expired entry fails the health check just as a red workflow does.",
+  "exceptions": [
+    {
+      "workflow": "mojo-validation.yml",
+      "reason": "Mojo's API surface is still moving pre-1.0; the tree is deliberately parked until 1.0 lands and is not being carried as active work. Regressed from green on 2026-07-16.",
+      "expires": "2027-02-13"
+    }
+  ]
+}

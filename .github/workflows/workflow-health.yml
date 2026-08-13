@@ -1,0 +1,31 @@
+# The structural fix for five workflows sitting red on main for months without
+# anything saying so. Deliberately NOT path-filtered — a path filter is exactly
+# what hid the problem it exists to catch.
+name: Workflow Health
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/scripts/workflow_health.py"
+      - ".github/workflow-health-exceptions.json"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  health:
+    name: Every workflow green on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check newest run of every workflow
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/workflow_health.py
