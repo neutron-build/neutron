@@ -1,53 +1,50 @@
 ---
-title: Islands Architecture
-description: Partial hydration for static routes.
+title: Islands
+description: Hydrate individual components on a static page.
 ---
 
-The "Islands Architecture" is a pattern that encourages small, focused chunks of interactivity within server-rendered web pages.
+An island is an interactive Preact component inside an otherwise static page.
+Neutron emits the island runtime and component chunk without hydrating the
+surrounding route.
 
-## The Concept
-
-Imagine a static HTML page as a "sea" of static content. In this sea, there are "islands" of interactivity.
-
--   **The Sea**: Static HTML (Header, Footer, Sidebar, Text). Zero JS.
--   **The Islands**: Interactive components (Image Carousel, Buy Button, Search Bar). Hydrated with JS.
-
-## Usage
-
-In a static route, import your component and use it with a `client:` directive.
+## Add an island
 
 ```tsx
-import { Island } from "@neutron-build/core";
+import { Island } from "@neutron-build/core/client";
 import Counter from "../components/Counter";
 
 export default function Page() {
   return (
     <main>
-      <h1>Static Content</h1>
-      
-      {/* This component will hydrate */}
-      <Island component={Counter} client="load" />
-      
-      <p>More static content</p>
+      <h1>Static content</h1>
+      <Island component={Counter} client="visible" initialCount={0} />
     </main>
   );
 }
 ```
 
-## Directives
+Props are serialized into the generated HTML, so pass values that can be
+represented as JSON.
 
-Neutron supports several directives to control *when* an island hydrates.
+## Hydration timing
 
-| Directive | Description | Use Case |
-| :--- | :--- | :--- |
-| `client="load"` | Hydrates immediately on page load. | Critical UI (Nav menus). |
-| `client="visible"` | Hydrates when the element enters the viewport. | Footer forms, comments. |
-| `client="idle"` | Hydrates when the browser is idle. | Low priority UI. |
-| `client="media"` | Hydrates when a CSS media query matches. | Mobile-only toggles. |
-| `client="only"` | Skips SSR entirely and only renders on client. | Components using `window`. |
+| Value | Hydration begins |
+| --- | --- |
+| `client="load"` | When the island runtime starts |
+| `client="visible"` | When the element enters the viewport |
+| `client="idle"` | During browser idle time, with a timeout fallback |
+| `client="media"` | When the query passed through `media` matches |
+| `client="only"` | Immediately, rendering a fresh tree if no server markup exists |
 
-## Benefits
+For a media-controlled island:
 
--   **Performance**: You only ship JavaScript for the interactive parts of the page.
--   **Bandwidth**: Users download less code.
--   **CPU**: The browser main thread has less work to do.
+```tsx
+<Island
+  component={MobileMenu}
+  client="media"
+  media="(max-width: 720px)"
+/>
+```
+
+Use app mode instead when navigation state, loaders, and actions belong to the
+whole route rather than a few isolated controls.

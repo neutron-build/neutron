@@ -1,74 +1,63 @@
 ---
 title: Project Structure
-description: Understanding the anatomy of a Neutron project.
+description: The files in a basic Neutron TypeScript project.
 ---
 
-A standard Neutron project follows a convention-over-configuration structure.
+The `basic` template starts with this structure:
 
-## Directory Tree
-
-Here's an overview of a typical Neutron project:
-
-```
+```text
 my-app/
+├── public/
+│   └── favicon.svg
 ├── src/
-│   ├── routes/              # File-based routing (pages & API)
-│   │   ├── _layout.tsx      # Root layout
-│   │   ├── index.tsx        # Homepage (/)
-│   │   └── app/             # Nested routes (/app)
-│   │       ├── _layout.tsx
-│   │       └── dashboard.tsx
-│   ├── components/          # Shared UI components
-│   ├── styles/              # Global styles
-│   └── middleware.ts        # Global middleware
-├── public/                  # Static assets (favicon, robots.txt)
-├── neutron.config.ts        # Framework configuration
-├── tsconfig.json            # TypeScript configuration
-├── package.json             # Dependencies and scripts
-└── .env                     # Environment variables
+│   ├── routes/
+│   │   ├── _layout.tsx
+│   │   ├── index.tsx
+│   │   └── users/
+│   │       └── [id].tsx
+│   ├── main.tsx
+│   └── neutron-env.d.ts
+├── neutron.config.ts
+├── package.json
+├── tsconfig.json
+└── vite.config.ts
 ```
 
-## Key Files & Directories
+## `src/routes`
 
-### `src/routes/`
+Files define URLs:
 
-This is the most important directory. The structure of files here determines your application's URLs.
+- `index.tsx` maps to the directory root.
+- `[id].tsx` creates a dynamic segment.
+- `[...slug].tsx` creates a catch-all segment.
+- `_layout.tsx` wraps routes in its directory and all child directories.
 
--   **`index.tsx`**: Maps to the root path of the directory (e.g., `src/routes/index.tsx` → `/`).
--   **`[param].tsx`**: Dynamic route segments (e.g., `src/routes/users/[id].tsx` → `/users/123`).
--   **`_layout.tsx`**: Wraps all sibling and child routes. Used for persistent UI like headers and sidebars.
--   **`_error.tsx`**: Error boundary for the directory. Handles errors thrown in sibling routes.
+A route can export a component, a `loader`, an `action`, metadata through
+`head`, middleware, and route configuration. Import framework APIs from
+`@neutron-build/core`.
 
-### `neutron.config.ts`
+## `src/main.tsx`
 
-The configuration file for your Neutron app. This is where you configure adapters (deployment targets), Vite plugins, and framework features.
+This is the browser entry point. The generated file registers the virtual route
+manifest and initializes Neutron. Most applications do not need to change it.
+
+## `neutron.config.ts`
+
+The scaffold records the rendering runtime here:
 
 ```ts
 import { defineConfig } from "@neutron-build/core";
 
 export default defineConfig({
-  routesDir: "src/routes",
+  runtime: "preact",
 });
-// Deployment adapters are bundled in @neutron-build/core and selected at
-// build time with the CLI's --preset flag (e.g. neutron-ts build --preset vercel).
 ```
 
-### `src/middleware.ts`
+Deployment presets are selected by the CLI, for example
+`neutron-ts build --preset vercel`.
 
-Global middleware that runs on every request. Use this for authentication, logging, or modifying headers globally.
+## Next
 
-```ts
-import type { MiddlewareFn } from "@neutron-build/core";
-
-export const middleware: MiddlewareFn[] = [
-  async (request, context, next) => {
-    console.log(`${request.method} ${request.url}`);
-    return next();
-  },
-];
-```
-
-## Next steps
-
-- [Your first route](/docs/getting-started/your-first-route) — create static and app routes.
-- [Configuration](/docs/configuration/neutron-config) — `neutron.config.ts` options.
+- [Your first route](/docs/getting-started/your-first-route)
+- [File conventions](/docs/routing/file-conventions)
+- [Configuration](/docs/configuration/neutron-config)

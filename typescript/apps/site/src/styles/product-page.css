@@ -5,12 +5,19 @@
 
 .product-header {
   position: relative;
-  padding: 120px 0 var(--space-9);
+  padding: var(--space-9) 0 var(--space-8);
   border-bottom: 1px solid var(--border);
 }
 
 .product-header__inner {
   position: relative;
+}
+
+.product-header__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
 }
 
 .product-header__category {
@@ -20,7 +27,7 @@
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--text-tertiary);
-  margin-bottom: var(--space-5);
+  margin: 0;
 }
 
 .product-header__title {
@@ -29,7 +36,7 @@
   font-weight: 400;
   letter-spacing: -0.01em;
   line-height: 1.1;
-  margin-bottom: var(--space-6);
+  margin-bottom: var(--space-4);
   color: var(--text-primary);
 }
 
@@ -37,8 +44,14 @@
   font-size: 1.1875rem;
   line-height: 1.7;
   color: var(--text-secondary);
-  max-width: 600px;
-  margin-bottom: var(--space-5);
+  max-width: 680px;
+  margin-bottom: var(--space-6);
+}
+
+.product-header__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
 }
 
 .product-header__tagline {
@@ -150,7 +163,7 @@
 }
 
 .product-content {
-  padding: var(--space-10) 0;
+  padding: var(--space-8) 0;
 }
 
 .product-content__body {
@@ -175,6 +188,11 @@
   padding-right: var(--space-5);
 }
 
+.product-content__body > section {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
 /* Vertical rhythm around block components */
 .product-content__body > .code-block,
 .product-content__body > .feature-grid,
@@ -189,7 +207,7 @@
   font-family: var(--font-serif);
   font-size: 2.25rem;
   font-weight: 400;
-  margin-top: var(--space-10);
+  margin-top: var(--space-8);
   margin-bottom: var(--space-6);
   color: var(--text-primary);
 }
@@ -222,6 +240,49 @@
   margin-bottom: var(--space-3);
   color: var(--text-secondary);
   line-height: 1.7;
+}
+
+.language-facts {
+  margin-top: var(--space-6);
+  border-top: 1px solid var(--border);
+}
+
+.language-facts > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.35fr) 1fr;
+  gap: var(--space-5);
+  padding: var(--space-4) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.language-facts dt {
+  color: var(--text-tertiary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.language-facts dd {
+  color: var(--text-secondary);
+}
+
+.language-overview__note {
+  margin-top: var(--space-5);
+}
+
+.language-overview__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin-top: var(--space-6);
+}
+
+.language-overview__links a {
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 4px;
 }
 
 /* Product page section typography */
@@ -277,6 +338,10 @@
   .product-content__body > section ul {
     padding-left: var(--space-5);
   }
+  .language-facts > div {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
 }
 
 @media (max-width: 480px) {
@@ -289,30 +354,4 @@
   .product-content__body > section h2 {
     font-size: 1.375rem;
   }
-}
-
-/* Shared closing CTA — gives every product page a consistent end cap. */
-.product-cta {
-  border-top: 1px solid var(--border);
-  margin-top: var(--space-9);
-  padding: var(--space-9) 0;
-}
-
-.product-cta__inner {
-  text-align: center;
-}
-
-.product-cta__title {
-  font-family: var(--font-serif);
-  font-size: clamp(1.75rem, 4vw, 2.5rem);
-  font-weight: 400;
-  letter-spacing: -0.02em;
-  margin-bottom: var(--space-6);
-}
-
-.product-cta__actions {
-  display: flex;
-  gap: var(--space-4);
-  justify-content: center;
-  flex-wrap: wrap;
 }

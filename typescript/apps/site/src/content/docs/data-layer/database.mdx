@@ -1,39 +1,68 @@
 ---
-title: Database & Drizzle
-description: Typed SQL with Drizzle ORM.
+title: Database and Drizzle
+description: Create a Drizzle client for SQLite, PostgreSQL, or Nucleus.
 ---
 
-Neutron uses **Drizzle ORM** for database access. It's a lightweight, TypeScript-first ORM that provides the power of raw SQL with the safety of types.
+`createDrizzleDatabase()` from `@neutron-build/data` resolves a database
+profile and creates the matching Drizzle client.
 
-## Schema Definition
+## Install a driver
 
-Define your schema in `src/db/schema.ts`.
+For PostgreSQL or Nucleus SQL:
 
-```ts
-import { pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
-
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  name: text("name").notNull(),
-  email: text("email").notNull().unique(),
-  createdAt: timestamp("created_at").defaultNow(),
-});
+```bash
+npm install @neutron-build/data drizzle-orm postgres
 ```
 
-## Querying in Loaders
+For SQLite:
 
-Loaders have direct access to the database via the `context`.
+```bash
+npm install @neutron-build/data drizzle-orm @libsql/client
+```
+
+## Connect
 
 ```ts
-export async function loader({ context }) {
-  const allUsers = await context.db.select().from(users);
-  return { allUsers };
+import { createDrizzleDatabase } from "@neutron-build/data";
+import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+import * as schema from "./schema";
+
+const database = await createDrizzleDatabase({
+  config: { database: "postgres" },
+  schema,
+});
+const db = database.db as PostgresJsDatabase<typeof schema>;
+
+try {
+  const users = await db.select().from(schema.users);
+} finally {
+  await database.close();
 }
 ```
 
-## Why Drizzle?
+The returned object contains:
 
-1.  **Performance**: No heavy "runtime" or "generate" step. It's just a thin layer over SQL.
-2.  **Type Safety**: Your queries are fully typed based on your schema.
-3.  **Composability**: Easily build complex queries using standard SQL patterns.
-4.  **Compatibility**: Supports both PostgreSQL (Prod) and SQLite (Dev) seamlessly.
+- `profile` — the selected provider and connection string.
+- `db` — the Drizzle database instance.
+- `client` — the underlying Postgres or libSQL client.
+- `nucleus` — the optional multi-model client when using Nucleus.
+- `close()` — closes the created clients.
+
+The `db` and `client` fields are currently exposed as `unknown`; narrow them to
+the installed driver's types, as in the example above.
+
+## Select a provider
+
+Pass a provider explicitly:
+
+```ts
+const database = await createDrizzleDatabase({
+  config: { database: "postgres" },
+  schema,
+});
+```
+
+Without an explicit provider, selection checks `NUCLEUS_URL`, then
+`DATABASE_URL`, then uses `.neutron/dev.db` with SQLite. Nucleus uses the
+PostgreSQL driver for SQL and optionally creates an `@neutron-build/nucleus`
+client for its other data models.

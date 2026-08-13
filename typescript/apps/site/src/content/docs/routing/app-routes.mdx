@@ -1,77 +1,32 @@
 ---
 title: App Routes
-description: Server-Side Rendered (SSR) interactive routes.
+description: Render per request with hydration and client navigation.
 ---
 
-App routes are fully dynamic, server-side rendered (SSR) routes that hydrate on the client. They function like a Single Page Application (SPA) after the initial load.
-
-## Characteristics
-
--   **SSR**: HTML is generated on the server for every request.
--   **Hydration**: Preact hydrates the page on the client, making it fully interactive.
--   **Client-side Navigation**: Clicking links uses client-side routing, avoiding full page reloads.
--   **Shared State**: Layouts persist state during navigation.
-
-## The client entry
-
-App routes hydrate on the client from a single **client entry** — `src/main.tsx`
-(or `src/client.tsx`; `.ts`/`.jsx`/`.js` variants are also detected). Every
-Neutron project starts with one, and the starter templates include it:
-
-```tsx
-// src/main.tsx
-import { init, registerRoutes } from "@neutron-build/core/client";
-import { routes } from "virtual:neutron/routes";
-
-registerRoutes(routes);
-void init();
-```
-
-`registerRoutes` hands the client router the same route table the server used
-(via the `virtual:neutron/routes` module the build injects), and `init()`
-hydrates the server-rendered HTML and takes over client-side navigation. You
-normally never edit this file — add hydration-time setup (analytics, error
-reporting, a global store) before `init()` if you need it. If the entry is
-missing, pages still server-render but do not hydrate (no interactivity or
-client navigation).
-
-## Configuration
-
-To make a route an app route, set the mode to `app`:
+App mode is for routes whose response depends on the request or whose interface
+needs the client router. Neutron runs matching middleware and loaders on the
+server, renders HTML, then hydrates the route in the browser.
 
 ```tsx
 export const config = { mode: "app" };
 ```
 
-## Runtime Choice
+After the initial document load, links between app routes use client-side
+navigation. A project can mix app routes with [static routes](/docs/routing/static-routes);
+navigation to a static route remains a browser-native document navigation.
 
-Neutron allows you to choose the underlying runtime for your app routes.
+## Load server data
 
--   **Preact (Default)**: Optimized for performance and size (~3KB runtime). Highly compatible with the React ecosystem.
--   **React**: For apps that require specific React internals or libraries that are not fully compatible with Preact.
-
-You can configure this in `neutron.config.ts`:
-
-```ts
-export default defineConfig({
-  runtime: "preact", // or "react"
-});
-```
-
-Regardless of the runtime, your code uses standard React-style hooks and JSX.
-
-## Data Loading
-
-App routes use `loader` functions to fetch data on the server.
+Matching layout and page loaders run in parallel. Their return values are
+serialized for the route components:
 
 ```tsx
 import { useLoaderData } from "@neutron-build/core";
 
 export const config = { mode: "app" };
 
-export async function loader({ request }: LoaderArgs) {
-  const user = await getUser(request);
-  return { user };
+export async function loader({ request }) {
+  return { user: await getUser(request) };
 }
 
 export default function Profile() {
@@ -80,26 +35,60 @@ export default function Profile() {
 }
 ```
 
-## Mutations
+Keep credentials and private services inside loaders and actions; those
+exports are stripped from the client build.
 
-App routes use `action` functions to handle form submissions and data mutations.
+## Handle mutations
+
+An `action` handles non-GET submissions for the matched route:
 
 ```tsx
 import { Form } from "@neutron-build/core";
 
-export async function action({ request }: ActionArgs) {
-  const formData = await request.formData();
-  // ... handle update
-  return { success: true };
+export const config = { mode: "app" };
+
+export async function action({ request }) {
+  const form = await request.formData();
+  await updateName(form.get("name"));
+  return { saved: true };
 }
 
 export default function Settings() {
   return (
     <Form method="post">
-      <button>Update</button>
+      <input name="name" />
+      <button>Save</button>
     </Form>
   );
 }
 ```
 
-See the [Data Loading](/docs/data/loaders) and [Actions](/docs/data/actions) guides for more details.
+See [Loaders](/docs/data/loaders), [Actions](/docs/data/actions), and
+[Forms](/docs/data/forms).
+
+## Client entry
+
+The generated `src/main.tsx` registers the shared route table and starts
+hydration:
+
+```tsx
+import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+
+registerRoutes(routes);
+void init();
+```
+
+The starter creates this file. Add browser-only setup before `init()` when
+needed; removing the entry disables hydration and client navigation.
+
+## Runtime
+
+Preact is the default. Projects that need React package compatibility can use
+the `react-compat` runtime when they are created:
+
+```bash
+npm create neutron@latest my-app -- --runtime react-compat
+```
+
+The runtime setting is project-wide; the static/app decision is per route.

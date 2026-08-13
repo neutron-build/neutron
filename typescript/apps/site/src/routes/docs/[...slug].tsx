@@ -42,8 +42,18 @@ interface DocEntry {
 }
 
 export default function DocPage({ data }: { data: { entry: DocEntry; Content: any } }) {
+  const section = data.entry.slug
+    .split("/")[0]
+    .split("-")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+
   return (
     <article>
+      <nav class="doc-breadcrumbs" aria-label="Breadcrumb">
+        <a href="/docs">Docs</a>
+        <span aria-hidden="true">/</span><span>{section}</span>
+      </nav>
       <div class="doc-page__header">
         <h1>{data.entry.data.title}</h1>
         <a class="doc-page__md-link" href={`/docs/${data.entry.slug}.md`}>View as Markdown</a>

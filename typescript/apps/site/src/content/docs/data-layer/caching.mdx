@@ -1,33 +1,51 @@
 ---
 title: Caching Loaders
-description: Automatic performance for your data layer.
+description: Cache app responses and loader data by route.
 ---
 
-To maximize throughput and reduce database load, Neutron supports **Auto-Caching Loaders**.
+App routes can cache a rendered response, loader data, or both. Cache behavior
+is declared on the route:
 
-## Enabling Cache
-
-You can wrap your loader definition with a cache configuration.
-
-```ts
-// src/routes/dashboard.tsx
-export const loader = defineLoader(async ({ context }) => {
-  const stats = await context.db.query.stats.findMany();
-  return { stats };
-}, {
+```tsx
+export const config = {
+  mode: "app",
   cache: {
-    ttl: 60, // Cache in Dragonfly for 60 seconds
-    key: "dashboard-stats"
-  }
-});
+    maxAge: 60,
+    loaderMaxAge: 15,
+  },
+};
 ```
 
-## How It Works
+- `maxAge` is the response-cache lifetime in seconds.
+- `loaderMaxAge` is the loader-data cache lifetime in seconds.
+- A missing or zero value disables that cache.
 
-1.  **Request**: When a request hits the route, Neutron checks Dragonfly for a valid cache entry.
-2.  **Hit**: If found, the cached JSON is returned immediately (0.1ms). No DB query is performed.
-3.  **Miss**: If not found, the loader executes, fetches data from the DB, and stores the result in Dragonfly for the next request.
+The cache key includes the request path. Loader keys also include the route and
+its parameters.
 
-## Invalidation
+## Distributed cache
 
-By default, the cache is invalidated when its TTL expires. However, Neutron's `action` handlers can be configured to automatically purge relevant cache keys after a mutation, ensuring users always see fresh data after an update.
+Core includes the cache contracts. For shared cache state across server
+instances, use the optional Redis-compatible provider:
+
+```bash
+npm install @neutron-build/cache-redis ioredis
+```
+
+```ts
+import { createServer } from "@neutron-build/core";
+import { createRedisNeutronCacheStores } from "@neutron-build/cache-redis";
+
+const cache = await createRedisNeutronCacheStores({
+  url: process.env.DRAGONFLY_URL ?? process.env.REDIS_URL,
+  keyPrefix: "my-app:",
+});
+
+await createServer({ cache });
+```
+
+The provider works with Redis or a compatible Dragonfly endpoint. It stores
+app and loader entries separately and supports deleting entries by route path.
+
+Do not cache personalized responses unless the cache policy and keying scheme
+provide the required user isolation.

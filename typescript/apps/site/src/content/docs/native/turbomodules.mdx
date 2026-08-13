@@ -7,7 +7,7 @@ Neutron Native provides two layers for accessing native device capabilities: **T
 
 ## How TurboModules Work
 
-TurboModules use React Native's JSI (JavaScript Interface) to call native code directly from JavaScript — no JSON serialization, no async bridge queue. Synchronous methods run on the JS thread with zero overhead. Async methods return real promises backed by native dispatch.
+TurboModules use React Native's JSI (JavaScript Interface) to call native code without the legacy JSON bridge. Synchronous methods execute from the JavaScript thread; asynchronous methods return promises backed by native dispatch.
 
 ```
 ┌─────────────┐    JSI (C++)    ┌──────────────────┐

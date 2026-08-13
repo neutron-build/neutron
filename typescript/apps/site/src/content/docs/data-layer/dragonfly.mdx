@@ -1,43 +1,51 @@
 ---
-title: Dragonfly
-description: Multithreaded caching, sessions, and queues.
+title: Redis and Dragonfly
+description: Optional Redis-compatible cache, session, queue, and realtime drivers.
 ---
 
-Neutron uses **Dragonfly** as its primary engine for caching, sessions, and background jobs.
+Neutron does not require Dragonfly. Its optional Redis integrations accept a
+Redis or Dragonfly connection URL because both expose the commands these
+drivers use.
 
-## What is Dragonfly?
-
-Dragonfly is a modern, multithreaded, drop-in replacement for Redis. It supports the same wire protocol but offers significantly higher performance.
-
--   **25x Throughput**: On multi-core systems, Dragonfly utilizes all available cores.
--   **Memory Efficient**: Uses up to 30% less memory than Redis in many scenarios.
--   **No Snapshots Spikes**: Avoids the memory spikes common during Redis snapshots.
-
-## Usage in Neutron
-
-You don't need to learn a new API. Neutron uses standard Redis-compatible clients under the hood.
-
-### Caching
+## Cache client
 
 ```ts
-// Using the unified cache module
-await context.cache.set("key", "value", { ttl: 60 });
-```
+import { createRedisCacheClient } from "@neutron-build/data";
 
-### Sessions
-
-Sessions are automatically stored in Dragonfly by the `nucleus` session module, ensuring your app servers remain stateless and easy to scale.
-
-### Queues (BullMQ)
-
-Neutron integrates with **BullMQ** for background job processing, using Dragonfly as the backend.
-
-```ts
-// Define a job
-export const myJob = defineJob("process-video", async (data) => {
-  // heavy processing...
+const cache = await createRedisCacheClient({
+  url: process.env.DRAGONFLY_URL ?? process.env.REDIS_URL,
+  keyPrefix: "my-app:",
 });
 
-// Trigger a job from an action
-await myJob.enqueue({ id: 123 });
+await cache.set("status", "ready", 60);
+const status = await cache.get("status");
+await cache.close();
 ```
+
+The client implements `get`, `set`, `del`, and `incr`. If no URL is passed, it
+checks `DRAGONFLY_URL`, then `REDIS_URL`, then uses
+`redis://127.0.0.1:6379`.
+
+## BullMQ queue
+
+BullMQ and `ioredis` are optional peer dependencies:
+
+```bash
+npm install @neutron-build/data bullmq ioredis
+```
+
+```ts
+import { createBullMqQueueDriver } from "@neutron-build/data";
+
+const queue = await createBullMqQueueDriver({ queueName: "media" });
+
+await queue.process("transcode", async (job) => {
+  await transcode(job.payload);
+});
+
+await queue.add("transcode", { assetId: "asset_123" });
+```
+
+`@neutron-build/data` also exports Redis-compatible session and realtime
+drivers. These are explicit application choices; Neutron does not start or
+configure a Dragonfly server automatically.

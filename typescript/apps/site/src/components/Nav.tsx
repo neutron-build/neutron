@@ -20,30 +20,62 @@ const verification = [
 ];
 
 const platforms = [
-  { id: "web", label: "Web", desc: "Edge, Node, Serverless, Static", href: "/web" },
-  { id: "native", label: "Mobile", desc: "Cross-platform native with Preact", href: "/native" },
-  { id: "desktop", label: "Desktop", desc: "Lightweight apps with system WebView", href: "/desktop" },
+  { id: "web", label: "Web", desc: "Static and server-rendered TypeScript", href: "/web" },
+  { id: "native", label: "Mobile", desc: "React Native for iOS and Android", href: "/native" },
+  { id: "desktop", label: "Desktop", desc: "Tauri 2 with Preact", href: "/desktop" },
 ];
 
 const database = [
-  { id: "nucleus", label: "Nucleus", desc: "14-in-1 database engine", href: "/nucleus" },
-  { id: "client", label: "Client", desc: "Universal database SDK", href: "/client" },
-  { id: "orm", label: "ORM", desc: "Type-safe multi-model queries", href: "/orm" },
+  { id: "nucleus", label: "Nucleus", desc: "Multi-model database engine", href: "/nucleus" },
+  { id: "client", label: "Client", desc: "Modular TypeScript SDK", href: "/client" },
+  { id: "orm", label: "Data & Drizzle", desc: "Optional SQL and backend drivers", href: "/orm" },
   { id: "studio", label: "Studio", desc: "Visual database management", href: "/studio" },
 ];
 
 const ai = [
   { id: "ai", label: "AI", desc: "Model calls, streaming, tools", href: "/ai" },
-  { id: "agents", label: "Agents", desc: "Durable file-based agents", href: "/agents" },
-  { id: "workflow", label: "Workflow", desc: "Event-sourced durable execution", href: "/workflow" },
+  { id: "agents", label: "Agents", desc: "File-based tools and execution", href: "/agents" },
+  { id: "workflow", label: "Workflow", desc: "Recorded steps and replay", href: "/workflow" },
 ];
+
+function BrandSwitcher() {
+  return (
+    <div class="nav__brand">
+      <a href="/" class="nav__logo">neutron</a>
+      <details class="nav__ecosystem">
+        <summary class="nav__ecosystem-trigger" aria-label="Switch between Neutron and Teploy">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+            <path d="m3 4.5 3 3 3-3" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </summary>
+        <div class="nav__ecosystem-menu">
+          <span class="nav__ecosystem-label">Build &amp; deploy</span>
+          <a href="/" class="nav__ecosystem-option is-active" aria-current="page">
+            <span class="nav__ecosystem-mark" aria-hidden="true"></span>
+            <span>
+              <strong>Neutron</strong>
+              <small>Build applications</small>
+            </span>
+          </a>
+          <a href="https://teploy.com" class="nav__ecosystem-option">
+            <span class="nav__ecosystem-mark" aria-hidden="true"></span>
+            <span>
+              <strong>Teploy <span aria-hidden="true">↗</span></strong>
+              <small>Deploy and operate them</small>
+            </span>
+          </a>
+        </div>
+      </details>
+    </div>
+  );
+}
 
 export default function Nav({ activeProduct }: NavProps) {
   return (
     <>
       <nav class="nav" aria-label="Main navigation" id="main-nav">
         <div class="nav__inner container">
-          <a href="/" class="nav__logo">neutron</a>
+          <BrandSwitcher />
 
           {/* Full language bar — wide screens only */}
           <div class="nav__products" id="nav-products">
@@ -168,7 +200,7 @@ export default function Nav({ activeProduct }: NavProps) {
         <div class="nav__drawer-backdrop" data-drawer-close></div>
         <div class="nav__drawer-panel" role="dialog" aria-modal="true" aria-label="Main navigation">
           <div class="nav__drawer-header">
-            <a href="/" class="nav__logo">neutron</a>
+            <BrandSwitcher />
             <button type="button" class="nav__drawer-close" data-drawer-close aria-label="Close menu">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                 <line x1="6" y1="6" x2="18" y2="18" />

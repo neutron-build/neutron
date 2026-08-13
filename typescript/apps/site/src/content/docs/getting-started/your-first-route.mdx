@@ -1,75 +1,53 @@
 ---
 title: Your First Route
-description: Create your first page in Neutron.
+description: Add static and interactive routes to a Neutron project.
 ---
 
-Neutron uses file-based routing. To create a new page, you simply add a file to `src/routes`.
+Neutron maps files in `src/routes` to URLs.
 
-## Creating a Static Route
+## Static route
 
-By default, Neutron routes are **static**. They render to pure HTML at build time and ship zero JavaScript to the client.
-
-Create a file at `src/routes/about.tsx`:
+Static mode is the default. Create `src/routes/about.tsx`:
 
 ```tsx
-// src/routes/about.tsx
-
-// Optional: Explicitly set mode (default is "static")
-export const config = { mode: "static" };
-
 export default function About() {
   return (
     <main>
-      <h1>About Us</h1>
-      <p>We are building the future of web development.</p>
+      <h1>About</h1>
+      <p>This route is rendered to HTML at build time.</p>
     </main>
   );
 }
 ```
 
-Visit `/about` in your browser. You'll see your page rendered. If you inspect the network tab, you'll see no JavaScript bundles are loaded for this page.
+The file is available at `/about`. Add
+`export const config = { mode: "static" }` when you want the mode to be
+explicit.
 
-## Creating an App Route
+## App route
 
-When you need interactivity, server-side data loading, or mutations, you can opt into **app mode**.
-
-Create a file at `src/routes/dashboard.tsx`:
+Use app mode for client-side navigation and hydration:
 
 ```tsx
-// src/routes/dashboard.tsx
 import { useLoaderData } from "@neutron-build/core";
 
-// 1. Opt into app mode
 export const config = { mode: "app" };
 
-// 2. Define a loader (runs on server)
 export async function loader() {
-  return {
-    user: "Alice",
-    lastLogin: new Date().toISOString(),
-  };
+  return { user: "Alice" };
 }
 
-// 3. Render component (receives loader data)
 export default function Dashboard() {
   const data = useLoaderData<typeof loader>();
-  
-  return (
-    <main>
-      <h1>Welcome back, {data.user}!</h1>
-      <p>Last login: {data.lastLogin}</p>
-    </main>
-  );
+  return <h1>Welcome, {data.user}</h1>;
 }
 ```
 
-This route is now Server-Side Rendered (SSR) and hydrated with Preact on the client. It supports client-side navigation and interactivity.
+The loader runs on the server. `useLoaderData<typeof loader>()` carries its
+return type into the component without a separate interface.
 
-## Next steps
+## Next
 
-You now have static and app routes. From here:
-
-- [Loaders](/docs/data/loaders) — load data on the server for any route.
-- [Actions](/docs/data/actions) — handle form submissions and mutations.
-- [Routing](/docs/routing/file-conventions) — dynamic segments, catch-all routes, and layouts.
-- [Deployment](/docs/deployment/adapters) — ship your app with the static, Docker, Vercel, or Cloudflare adapter.
+- [Loaders](/docs/data/loaders)
+- [Actions](/docs/data/actions)
+- [Route conventions](/docs/routing/file-conventions)

@@ -1,32 +1,54 @@
 ---
-title: The Data Layer
-description: Overview of the unified nucleus package.
+title: Data Layer
+description: Optional database, cache, session, queue, and storage drivers.
 ---
 
-Neutron isn't just a rendering framework; it's a full-stack platform. The `nucleus` package provides a unified, high-performance backend layer that covers everything your app needs.
+`@neutron-build/data` contains optional backend primitives for TypeScript
+applications. The framework core does not install a database, cache, or queue
+on its own.
 
-## Why a Unified Data Layer?
+## Available drivers
 
-Most frameworks leave the "backend" to you, leading to fragmented setups with different libraries for databases, caching, and queues. Neutron takes a different approach by providing a single, coherent package that:
+| Area | Included interface and implementations |
+| --- | --- |
+| Database | Drizzle profiles for SQLite, PostgreSQL, and Nucleus |
+| Cache | In-memory, Redis/Dragonfly, and Nucleus KV clients |
+| Sessions | Generic cache-backed store and Redis/Dragonfly store |
+| Queues | In-memory driver and BullMQ |
+| Storage | In-memory, S3-compatible, and Nucleus Blob drivers |
+| Realtime | In-memory, Redis/Dragonfly, and Nucleus PubSub buses |
 
-1.  **Eliminates Boilerplate**: Everything is pre-configured and designed to work together.
-2.  **Optimizes Performance**: Built-in auto-caching and parallel loading.
-3.  **Simplifies Scaling**: A stateless architecture that scale horizontally with ease.
+The integrations load their third-party dependencies lazily. Install only the
+drivers an application uses:
 
-## Core Stack
+```bash
+npm install @neutron-build/data
+npm install drizzle-orm postgres       # PostgreSQL or Nucleus SQL
+npm install drizzle-orm @libsql/client # SQLite
+npm install ioredis bullmq              # Redis/Dragonfly and queues
+```
 
-| Component | Technology | Role |
-| :--- | :--- | :--- |
-| **Database** | PostgreSQL / SQLite | Primary persistence with Drizzle ORM. |
-| **Cache & Queue** | Dragonfly | Drop-in Redis replacement for speed and efficiency. |
-| **Auth** | Better Auth | Full-featured authentication with session management. |
-| **Storage** | S3-Compatible | Standard protocol for file storage (AWS, R2, etc). |
+## Database selection
 
-## Environment Awareness
+`resolveDataConfig()` uses an explicit `database` option when supplied.
+Otherwise it checks `NUCLEUS_URL`, then `DATABASE_URL`, and falls back to a
+local SQLite file at `.neutron/dev.db`.
 
-Neutron automatically detects your environment to provide the best developer experience:
+```ts
+import { resolveDataConfig } from "@neutron-build/data";
 
--   **Development**: Uses **SQLite** (zero config) and a local Dragonfly instance.
--   **Production**: Connects to **PostgreSQL** and your production Dragonfly/S3 services.
+const config = resolveDataConfig({ database: "nucleus" });
+```
 
-You can customize this behavior in your `neutron.config.ts`.
+This resolution selects a profile; it does not start local services or
+provision production infrastructure.
+
+## In-memory defaults
+
+The cache, queue, storage, and realtime modules include in-memory
+implementations for local use and tests. Choose an external driver explicitly
+when state must be shared across processes.
+
+Continue with [Database and Drizzle](/docs/data-layer/database),
+[Caching loaders](/docs/data-layer/caching), or
+[Redis and Dragonfly](/docs/data-layer/dragonfly).

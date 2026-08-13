@@ -1,38 +1,49 @@
 ---
 title: Static Rendering
-description: Build-time HTML generation.
+description: How Neutron generates build-time HTML.
 ---
 
-Static rendering is the default mode in Neutron. It offers the best possible performance for content-heavy sites.
+Static rendering is the default for Neutron routes. It is intended for pages
+whose output can be known at build time.
 
-## How It Works
+## Build process
 
-When you run `neutron-ts build`, the framework:
-1.  Discovers all static routes.
-2.  Executes their `loader` functions (if any) to fetch data.
-3.  Renders the component tree to an HTML string.
-4.  Inlines critical CSS.
-5.  Writes the result to an `.html` file in the output directory.
+For each static route, `neutron-ts build`:
 
-## Zero JavaScript
+1. Loads the matching layouts and page.
+2. Runs their loaders, if present.
+3. Renders the component tree to HTML.
+4. Writes the HTML and links it to the built stylesheet assets.
 
-By default, the resulting HTML includes **no framework script tags**. There is no React runtime, no hydration code, and no overhead. It's just semantic markup and styles.
+Dynamic routes are generated once for every parameter set returned by
+`getStaticPaths`.
 
-This ensures:
--   **100 Lighthouse Scores**: Performance is limited only by your assets (images, fonts).
--   **Instant Loading**: The browser paints content immediately.
--   **Robustness**: The site works perfectly even if JavaScript is disabled or fails to load.
+## Client JavaScript
 
-## Dynamic Content
+A plain static page does not receive Neutron's client router or page-shell
+hydration. Static pages can still contain authored scripts, native browser
+features such as view transitions, and independently hydrated
+[islands](/docs/rendering/islands).
 
-You can still use data in static routes via `loader` functions. The difference is that this data is fetched **once at build time**, not on every request.
+This distinction matters: `static` describes when the page HTML is produced,
+not a blanket prohibition on JavaScript.
+
+## Build-time data
+
+Static loaders run during the build:
 
 ```tsx
-// Fetched once during 'neutron-ts build'
+import { useLoaderData } from "@neutron-build/core";
+
 export async function loader() {
-  const posts = await db.posts.findMany();
-  return { posts };
+  return { posts: await listPublishedPosts() };
+}
+
+export default function Posts() {
+  const { posts } = useLoaderData<typeof loader>();
+  return <PostList posts={posts} />;
 }
 ```
 
-If you need to update the content, you simply rebuild and redeploy the site.
+Rebuild to publish changes in that data. If the response must vary by user or
+request, use [server-rendered app mode](/docs/rendering/server-side-rendering).

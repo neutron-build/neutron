@@ -1,59 +1,69 @@
 ---
 title: Static Routes
-description: Zero-JS, build-time rendered routes.
+description: Generate a route as HTML at build time.
 ---
 
-By default, all routes in Neutron are **static**. This means they are rendered to HTML at build time.
-
-## Characteristics
-
--   **Zero JavaScript**: No framework runtime is sent to the client. The page is pure HTML and CSS.
--   **Fast**: Because there is no client-side hydration for the page shell, First Contentful Paint (FCP) and Time to Interactive (TTI) are near-instant.
--   **SEO Friendly**: Search engines love static HTML.
-
-## Configuration
-
-You can explicitly opt into static mode (though it is the default) by exporting a `config` object:
+Static is Neutron's default route mode. The build runs the route, writes its
+HTML to `dist`, and serves that file without rendering it again for each
+request.
 
 ```tsx
-export const config = { mode: "static" };
-
-export default function Page() {
-  return <h1>Hello World</h1>;
+export default function About() {
+  return <h1>About</h1>;
 }
 ```
 
-## Interactivity (Islands)
-
-Static routes doesn't mean "no interactivity". Neutron uses the **Islands Architecture** to allow you to add interactive components to static pages.
-
-See the [Islands](/docs/rendering/islands) guide for more details.
-
-## Dynamic Static Routes
-
-If you have a dynamic route (e.g., `src/routes/blog/[slug].tsx`) that uses static mode, you must export a `getStaticPaths` function so Neutron knows which paths to generate at build time.
+You can make the default explicit:
 
 ```tsx
-// src/routes/blog/[slug].tsx
+export const config = { mode: "static" };
+```
+
+## What ships to the browser
+
+Neutron does not hydrate the page shell or ship the client router for a plain
+static route. Your own scripts still run normally, and an [`Island`](/docs/rendering/islands)
+can hydrate one component without turning the whole route into app mode.
+
+Static routes are appropriate when the response does not depend on the current
+request. Use [app mode](/docs/routing/app-routes) for authentication,
+request-time personalization, actions, or route middleware.
+
+## Load data at build time
+
+A static route may export a `loader`. Neutron runs it during the build and
+renders its result into the generated page.
+
+```tsx
 import { useLoaderData } from "@neutron-build/core";
 
-export const config = { mode: "static" };
-
-// 1. Define all possible paths
-export async function getStaticPaths() {
-  const posts = await getPosts();
-  return posts.map(post => ({
-    params: { slug: post.slug }
-  }));
+export async function loader() {
+  return { released: "2026-08-11" };
 }
 
-// 2. Fetch data for each path
-export async function loader({ params }: LoaderArgs) {
-  return await getPost(params.slug);
-}
-
-export default function BlogPost() {
-  const post = useLoaderData<typeof loader>();
-  return <article>{post.content}</article>;
+export default function Release() {
+  const data = useLoaderData<typeof loader>();
+  return <time>{data.released}</time>;
 }
 ```
+
+Rebuild and redeploy when build-time data changes.
+
+## Generate dynamic paths
+
+Dynamic static routes must enumerate their URLs with `getStaticPaths`:
+
+```tsx
+export const config = { mode: "static" };
+
+export async function getStaticPaths() {
+  const posts = await getPosts();
+  return posts.map((post) => ({ params: { slug: post.slug } }));
+}
+
+export async function loader({ params }) {
+  return getPost(params.slug);
+}
+```
+
+Each returned parameter set becomes a generated page.

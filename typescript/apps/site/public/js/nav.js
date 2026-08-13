@@ -178,6 +178,10 @@
     }
   }
   document.addEventListener('click', function (e) {
+    document.querySelectorAll('.nav__ecosystem[open]').forEach(function (details) {
+      if (!details.contains(e.target)) details.removeAttribute('open');
+    });
+
     if (e.target.closest && e.target.closest('#nav-hamburger')) {
       e.preventDefault();
       var d = getDrawer();
@@ -191,6 +195,11 @@
   });
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') {
+      document.querySelectorAll('.nav__ecosystem[open]').forEach(function (details) {
+        details.removeAttribute('open');
+        var summary = details.querySelector('summary');
+        if (summary) summary.focus();
+      });
       var d = getDrawer();
       if (d && d.classList.contains('is-open')) closeDrawer();
     }

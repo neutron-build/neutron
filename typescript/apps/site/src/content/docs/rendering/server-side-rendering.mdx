@@ -1,36 +1,53 @@
 ---
 title: Server-Side Rendering
-description: On-demand rendering for dynamic apps.
+description: Request-time rendering for app routes.
 ---
 
-For applications that need personalized data, authentication, or real-time updates, Neutron provides Server-Side Rendering (SSR).
+Routes with `config.mode` set to `"app"` render on the server. Use them when
+middleware, authentication, request data, or mutations must run at request
+time.
 
-## The Request Lifecycle
+## Request lifecycle
 
-When a request hits an App Route:
+For a matched app route, Neutron:
 
-1.  **Request**: The server receives the HTTP request.
-2.  **Middleware**: Global and route-specific middleware run.
-3.  **Routing**: The router matches the URL to a set of components (Layouts + Page).
-4.  **Loaders**: All matching loaders run in **parallel** to fetch data.
-5.  **Render**: The component tree is rendered to HTML strings, injected with the loader data.
-6.  **Response**: The HTML is streamed to the browser.
-7.  **Hydration**: The browser loads the client-side JavaScript, and Preact "hydrates" the HTML to make it interactive.
+1. Runs the configured middleware chain.
+2. Runs matching layout and page loaders in parallel.
+3. Renders their component tree into the document shell.
+4. Streams the response when the selected renderer supports streaming.
+5. Hydrates the document and starts the client router in the browser.
 
-## Why SSR?
+The initial response contains rendered HTML; it is not an empty client-side
+application shell.
 
--   **SEO**: Search engines see the fully rendered content.
--   **Performance**: Users see content sooner than with Client-Side Rendering (CSR), as they don't have to wait for the JS bundle to download and execute before seeing the page.
--   **Robustness**: Works gracefully on slow networks/devices.
+## Enable app mode
 
-## Caching
+```tsx
+export const config = { mode: "app" };
+```
 
-Unlike static routes, SSR routes are rendered on every request. To improve performance, you can use standard HTTP `Cache-Control` headers.
+The mode is declared per route, so static documentation or marketing pages can
+live beside authenticated application routes in the same project.
+
+## Cache a rendered response
+
+`cache.maxAge` enables Neutron's route response cache:
+
+```tsx
+export const config = {
+  mode: "app",
+  cache: { maxAge: 60 },
+};
+```
+
+Use request-specific caching rules carefully for personalized responses. Route
+headers can also control downstream browser or CDN caching:
 
 ```tsx
 export function headers() {
-  return {
-    "Cache-Control": "public, max-age=60, s-maxage=3600",
-  };
+  return { "Cache-Control": "public, max-age=60, s-maxage=3600" };
 }
 ```
+
+See [App Routes](/docs/routing/app-routes) for loaders, actions, and the client
+entry.

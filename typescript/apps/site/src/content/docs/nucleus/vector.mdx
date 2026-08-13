@@ -127,10 +127,10 @@ LIMIT 5;
 -- 4. Pass retrieved chunks to your LLM as context
 ```
 
-## Performance
+## Index choice
 
-- **HNSW**: ~1ms queries on 1M vectors (384 dimensions)
-- **IVFFlat**: ~0.5ms queries with nprobe=10, lower recall
-- **Brute force**: Exact results, O(n) — use for small datasets (under 10K vectors)
+- **HNSW** provides approximate nearest-neighbor search with a graph index.
+- **IVFFlat** trades recall for a smaller candidate set controlled by its probe configuration.
+- **Brute force** compares every candidate and returns exact results without an approximate index.
 
-SIMD-accelerated distance calculations are used automatically on supported hardware.
+Measure index build time, recall, memory use, and query latency with your own dimensions and dataset before choosing an index.

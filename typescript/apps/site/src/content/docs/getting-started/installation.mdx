@@ -1,72 +1,58 @@
 ---
 title: Installation
-description: How to create a new Neutron project.
+description: Create and run a Neutron TypeScript project.
 ---
 
-Get started with Neutron by running the create command.
-
-## Quick Start
-
-Run the following command in your terminal:
+## Create a project
 
 ```bash
-npm create neutron@latest
-```
-
-Follow the interactive prompts to set up your project:
-
-1.  **Project name**: Choose a name for your directory (e.g., `my-app`).
-2.  **Template**: Select a starting point (Minimal, Blog, App, or Full).
-3.  **Tailwind CSS**: Add styling support.
-4.  **Database**: Include Drizzle ORM (optional).
-5.  **Git**: Initialize a git repository.
-
-Once the setup is complete, navigate to your project and start the development server:
-
-```bash
+npm create neutron@latest my-app
 cd my-app
+npm install
 npm run dev
 ```
 
-Open your browser to `http://localhost:3000` to see your new Neutron app.
+The development server prints its local URL when it starts.
 
-## Manual Setup
+The default scaffold uses Preact and the `basic` template. No interactive
+questions are asked.
 
-Neutron is designed to be easy to set up manually if you prefer.
+## Choose a template
 
-1.  Initialize a new project:
-    ```bash
-    mkdir my-neutron-app
-    cd my-neutron-app
-    npm init -y
-    ```
+Pass `--template` when you need a different starting point:
 
-2.  Install dependencies:
-    ```bash
-    npm install @neutron-build/core @neutron-build/cli preact
-    npm install -D typescript vite
-    ```
+```bash
+npm create neutron@latest my-docs -- --template docs
+```
 
-3.  Create a `neutron.config.ts`:
-    ```ts
-    import { defineConfig } from "@neutron-build/core";
+Available templates are `basic`, `marketing`, `app`, `full`, and `docs`.
 
-    export default defineConfig({});
-    ```
-    Adapters are bundled in `@neutron-build/core`; select one at build time with the CLI's `--preset` flag (e.g. `--preset docker`, `--preset vercel`, `--preset cloudflare`, `--preset static`).
+To use React compatibility instead of the default Preact runtime:
 
-4.  Add scripts to `package.json`:
-    ```json
-    {
-      "scripts": {
-        "dev": "neutron-ts dev",
-        "build": "neutron-ts build",
-        "preview": "neutron-ts preview"
-      }
-    }
-    ```
+```bash
+npm create neutron@latest my-app -- --runtime react-compat
+```
 
-## Next steps
+Run `npm create neutron@latest -- --help` for the complete option list.
 
-- [Project structure](/docs/getting-started/project-structure) — how a Neutron app is laid out.
-- [Your first route](/docs/getting-started/your-first-route) — create a page and load data.
+## What the scaffold installs
+
+The generated project depends on `@neutron-build/core`,
+`@neutron-build/cli`, Preact, and `preact-render-to-string`. Its main scripts
+are:
+
+```json
+{
+  "scripts": {
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "start": "neutron-ts start",
+    "preview": "neutron-ts preview"
+  }
+}
+```
+
+## Next
+
+- [Project structure](/docs/getting-started/project-structure)
+- [Your first route](/docs/getting-started/your-first-route)

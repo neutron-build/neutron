@@ -8,21 +8,21 @@ interface DocEntry {
 
 interface DocsLayoutProps {
   children: any;
-  data?: { entries?: DocEntry[] };
+  data?: { entries?: DocEntry[]; currentPath?: string };
   currentPath?: string;
 }
 
 // Layout loader: feed the docs collection to the client-side Search island.
-export async function loader() {
+export async function loader({ request }: { request: Request }) {
   const docs = await getCollection("docs");
   const entries: DocEntry[] = docs.map((d: any) => ({
     slug: d.slug,
     data: { title: d.data.title, description: d.data.description },
   }));
-  return { entries };
+  return { entries, currentPath: new URL(request.url).pathname.replace(/\/$/, "") || "/" };
 }
 
-const sidebar = [
+export const docsNavigation = [
   {
     label: "Getting Started",
     items: [
@@ -313,32 +313,49 @@ export default function DocsLayout({
   data,
   currentPath = "",
 }: DocsLayoutProps) {
+  const path = currentPath || data?.currentPath || "";
+  const isLanding = path === "/docs";
+
   return (
-    <div class="docs-container container">
-        <aside class="sidebar">
-          <SearchShell entries={data?.entries} />
-          {sidebar.map((section) => (
-            <div class="sidebar-section" key={section.label}>
-              <h3>{section.label}</h3>
-              <ul>
-                {section.items.map((item) => (
-                  <li key={item.link}>
-                    <a
-                      href={item.link}
-                      class={
-                        currentPath === item.link ? "active" : undefined
-                      }
-                    >
-                      {item.label}
-                    </a>
-                  </li>
-                ))}
-              </ul>
+    <div class={`docs-shell${isLanding ? " docs-shell--landing" : ""}`}>
+        {!isLanding && <aside class="docs-sidebar">
+          <div class="docs-sidebar__inner">
+            <input class="docs-sidebar__toggle" type="checkbox" id="docs-navigation" />
+            <label class="docs-sidebar__toggle-label" for="docs-navigation">
+              Browse documentation <span aria-hidden="true">+</span>
+            </label>
+            <div class="docs-sidebar__panel">
+              <div class="docs-sidebar__header">
+                <a class="docs-sidebar__home" href="/docs">Documentation</a>
+                <span>Neutron reference</span>
+              </div>
+              <SearchShell entries={data?.entries} />
+              <nav class="docs-sidebar__nav" aria-label="Documentation">
+                {docsNavigation.map((section) => {
+                  const sectionActive = section.items.some((item) => item.link === path);
+                  return (
+                    <details class="docs-sidebar__section" open={sectionActive} key={section.label}>
+                      <summary>{section.label}</summary>
+                      <div class="docs-sidebar__items">
+                        {section.items.map((item) => (
+                          <a
+                            href={item.link}
+                            aria-current={path === item.link ? "page" : undefined}
+                            key={item.link}
+                          >
+                            {item.label}
+                          </a>
+                        ))}
+                      </div>
+                    </details>
+                  );
+                })}
+              </nav>
             </div>
-          ))}
-        </aside>
-        <main id="main-content" class="docs-content">
-          <div class="content-wrapper">{children}</div>
+          </div>
+        </aside>}
+        <main id="main-content" class="docs-main">
+          <div class="docs-content-wrapper">{children}</div>
         </main>
     </div>
   );
