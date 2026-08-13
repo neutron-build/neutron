@@ -11,7 +11,6 @@ Key verification:
   - FixedPressure boundary condition
 """
 
-import math
 import numpy as np
 import pytest
 
@@ -159,13 +158,10 @@ class TestValve:
         """
         Cv = 0.002
         P_fixed_high = 200000.0  # Pa (upstream)
-        P_fixed_low = 100000.0   # Pa (downstream)
-        dP = P_fixed_high - P_fixed_low
 
-        # Expected steady-state flow through valve alone
-        m_dot_expected = Cv * dP
-
-        # Simple steady-state verification using a tank as integrator
+        # Simple steady-state verification using a tank as integrator.
+        # The tank replaces a downstream boundary: at t~0 its head is zero,
+        # so the full upstream pressure drives the valve.
         # Tank fills at m_dot / rho rate
         rho = 1000.0
         A_tank = 1.0
@@ -201,42 +197,62 @@ class TestValve:
 
 class TestFixedPressure:
     def test_boundary_pressure(self):
-        """FixedPressure boundary maintains specified pressure at the port."""
+        """A tank whose head already equals the boundary pressure does not move."""
         P_val = 200000.0
-        boundary = FixedPressure(P=P_val)
+        rho = 1000.0
+        g = 9.81
+        h_expected = P_val / (rho * g)
 
-        # Connect to a tank — the tank's port pressure should equalise
-        # to the boundary pressure via Kirchhoff across-variable equalisation
-        tank = Tank(A=1.0, rho=1000.0, h0=P_val / (1000.0 * 9.81))
+        boundary = FixedPressure(P=P_val)
+        pipe = Pipe(R=2000.0)
+        tank = Tank(A=1.0, rho=rho, h0=h_expected)
 
         system = System(
-            components=[boundary, tank],
+            components=[boundary, pipe, tank],
             connections=[
-                connect(boundary.port, tank.port),
+                connect(boundary.port, pipe.port_a),
+                connect(pipe.port_b, tank.port),
             ],
         )
 
         result = simulate(system, t_span=(0.0, 0.1), dt=0.01)
-        # Tank level should remain constant when its hydrostatic head equals
+        # Tank level remains constant when its hydrostatic head equals
         # the fixed pressure: rho * g * h = P  =>  h = P / (rho * g)
-        h_expected = P_val / (1000.0 * 9.81)
         np.testing.assert_allclose(result[tank.h], h_expected, rtol=1e-3)
 
-    def test_two_boundaries_with_pipe(self):
+    def test_boundary_directly_on_tank_is_rejected(self):
         """
-        Two fixed-pressure boundaries connected by a pipe reach equilibrium.
-        Since there is no dynamic element (no tank/capacitor), we connect
-        through a tank to get an ODE state variable.
+        An ideal pressure source wired straight onto a tank is a higher-index
+        DAE: the tank level is algebraically pinned by the boundary while still
+        carrying a der(), and the two port flows share a single conservation
+        equation. The explicit-ODE path must reject this structurally.
+        """
+        P_val = 200000.0
+        boundary = FixedPressure(P=P_val)
+        tank = Tank(A=1.0, rho=1000.0, h0=P_val / (1000.0 * 9.81))
+
+        system = System(
+            components=[boundary, tank],
+            connections=[connect(boundary.port, tank.port)],
+        )
+
+        with pytest.raises(ValueError, match="structurally singular"):
+            simulate(system, t_span=(0.0, 0.1), dt=0.01)
+
+    def test_boundary_fills_tank_through_pipe(self):
+        """
+        A fixed-pressure boundary feeding a tank through a pipe is a first-order
+        lag: the level approaches h_eq = P / (rho*g) with time constant
+        tau = R*rho*A/(rho*g). It must be simulated for several tau to get there.
         """
         P_high = 300000.0
-        P_low = 100000.0
         R_pipe = 2000.0
         rho = 1000.0
         A_tank = 1.0
         g = 9.81
 
-        # High-pressure source -> pipe -> tank <- pipe <- low-pressure sink
-        # Tank level will adjust until hydrostatic head balances
+        # High-pressure boundary -> pipe -> tank.
+        # Tank level rises until hydrostatic head balances the boundary.
         source = FixedPressure(P=P_high)
         pipe = Pipe(R=R_pipe)
         tank = Tank(A=A_tank, rho=rho, h0=1.0)
@@ -249,11 +265,15 @@ class TestFixedPressure:
             ],
         )
 
-        # Run long enough for tank to fill toward equilibrium
-        result = simulate(system, t_span=(0.0, 50.0), dt=0.1)
+        tau = R_pipe * rho * A_tank / (rho * g)
+        result = simulate(system, t_span=(0.0, 5.0 * tau), dt=tau / 100.0)
 
         h_arr = result[tank.h]
         # At equilibrium, tank pressure = P_high => h = P_high / (rho*g)
         h_eq = P_high / (rho * g)
-        # Should be approaching equilibrium (within 5%)
+        # Five time constants leaves < 1% of the initial gap.
         assert abs(h_arr[-1] - h_eq) / h_eq < 0.05
+
+        # And the whole trajectory must match the first-order analytical lag.
+        h_analytical = h_eq + (1.0 - h_eq) * np.exp(-result.t / tau)
+        np.testing.assert_allclose(h_arr, h_analytical, rtol=1e-3)

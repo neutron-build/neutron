@@ -5,13 +5,13 @@ Matplotlib is used in non-interactive mode; no display required.
 Surrogate model tests are conditionally skipped if scikit-learn is absent.
 """
 
-import os
+import importlib.util
 import numpy as np
 import pytest
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — no display needed
 
-from neutron_sim import Variable, System, simulate, connect
+from neutron_sim import System, simulate, connect
 from neutron_sim.domains.mechanical import Mass, Spring, Damper, Fixed
 
 
@@ -260,18 +260,14 @@ class TestSummary:
 
 # ── End-to-end example: parameter sweep + surrogate prediction ─────────────────
 
-try:
-    import sklearn
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
+HAS_SKLEARN = importlib.util.find_spec("sklearn") is not None
 
 
 @pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
 class TestEndToEndSweep:
     def test_sweep_and_surrogate(self):
         from neutron_sim.ai import train_surrogate
-        from neutron_sim.viz import plot_parameter_sweep, plot_timeseries
+        from neutron_sim.viz import plot_parameter_sweep
         import matplotlib.pyplot as plt
 
         k_values = np.linspace(5.0, 40.0, 20)

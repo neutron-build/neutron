@@ -8,7 +8,7 @@ without running a full simulation.
 from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 
 @dataclass
@@ -71,8 +71,6 @@ class SurrogateModel:
         return scores
 
 
-# Import Any for type hint compatibility
-from typing import Any
 SurrogateModel.__annotations__["_scaler_X"] = Any
 SurrogateModel.__annotations__["_scalers_y"] = dict
 
@@ -185,8 +183,6 @@ def train_surrogate_from_nucleus(
     -------
     Trained SurrogateModel
     """
-    from .load import list_runs, load_results  # noqa (nucleus module)
-    # Can't import from nucleus here - use direct queries
     from ..nucleus.load import list_runs, load_results
 
     run_ids = list_runs(conn, pattern=run_id_pattern)

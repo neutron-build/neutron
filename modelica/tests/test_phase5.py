@@ -9,7 +9,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from neutron_sim.core.system import System, connect
-from neutron_sim.core.variable import Variable, Equation, der, Constant
+from neutron_sim.core.variable import Variable, der
 from neutron_sim.core.component import Component
 from neutron_sim.solvers.ode import simulate
 from neutron_sim.domains.electrical import (

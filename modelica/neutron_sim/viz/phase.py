@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..solvers.ode import SimulationResult
-    from ..core.variable import Variable
 
 
 def phase_portrait(
@@ -55,7 +54,6 @@ def phase_portrait(
         points = np.array([x_arr, y_arr]).T.reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
         from matplotlib.collections import LineCollection
-        from matplotlib.cm import viridis
         norm = plt.Normalize(result.t.min(), result.t.max())
         lc = LineCollection(segments, cmap="viridis", norm=norm)
         lc.set_array(result.t[:-1])

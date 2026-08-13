@@ -1,7 +1,6 @@
 """Variable, Parameter, Equation, and der() — the core modeling primitives."""
 
 from __future__ import annotations
-import math
 from typing import Any
 
 
@@ -158,16 +157,16 @@ class BinOp(Expr):
         self.right = right
 
     def eval(self, state: dict[str, float]) -> float:
-        l = self.left.eval(state)
+        lv = self.left.eval(state)
         r = self.right.eval(state)
         if self.op == "+":
-            return l + r
+            return lv + r
         if self.op == "-":
-            return l - r
+            return lv - r
         if self.op == "*":
-            return l * r
+            return lv * r
         if self.op == "/":
-            return l / r
+            return lv / r
         raise ValueError(f"Unknown op: {self.op}")
 
     def variables(self) -> set[Variable]:

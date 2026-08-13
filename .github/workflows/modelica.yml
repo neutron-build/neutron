@@ -33,6 +33,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,ai]"
 
+      # pip exits 0 for an extra that does not exist, and the scikit-learn tests
+      # are skipif-gated — so a silently-missing "ai" extra would turn real
+      # coverage into skips while CI stayed green. Fail loudly instead.
+      - name: Verify optional extras actually installed
+        working-directory: modelica
+        run: |
+          python -c "import pytest, sklearn, numpy, scipy, matplotlib; print('extras OK')"
+
       - name: Run tests
         working-directory: modelica
         run: |
@@ -49,8 +57,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Pinned: an unpinned ruff silently gains rules on every release, which
+      # would turn this job red without any change to the tree.
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.16.2
 
       - name: Lint neutron_sim
         working-directory: modelica

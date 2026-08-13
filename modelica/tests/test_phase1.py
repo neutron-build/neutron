@@ -8,7 +8,7 @@ import math
 import numpy as np
 import pytest
 
-from neutron_sim import Variable, Parameter, Equation, der, System, simulate, connect
+from neutron_sim import Variable, Parameter, der, System, simulate, connect
 from neutron_sim.domains.mechanical import Mass, Spring, Damper, Fixed, Force
 from neutron_sim.solvers.auto_select import estimate_stiffness, select_method
 
@@ -180,10 +180,11 @@ class TestDampedOscillator:
 class TestSolverSelection:
     def test_non_stiff_selects_rk45(self):
         # Harmonic oscillator — moderate eigenvalues, not stiff
-        x = Variable("x")
-        v = Variable("v")
         omega = 1.0
-        f = lambda t, y: [y[1], -(omega**2) * y[0]]
+
+        def f(t, y):
+            return [y[1], -(omega**2) * y[0]]
+
         y0 = np.array([1.0, 0.0])
         ratio = estimate_stiffness(f, 0.0, y0)
         # Non-stiff: ratio should be small
@@ -192,7 +193,9 @@ class TestSolverSelection:
 
     def test_stiff_selects_radau(self):
         # Very stiff system: dy1/dt = -1000*y1, dy2/dt = -y2
-        f = lambda t, y: [-1000.0 * y[0], -y[1]]
+        def f(t, y):
+            return [-1000.0 * y[0], -y[1]]
+
         y0 = np.array([1.0, 1.0])
         ratio = estimate_stiffness(f, 0.0, y0)
         assert ratio > 900.0  # ≈ 1000, allow FD noise

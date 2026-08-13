@@ -7,7 +7,7 @@ from .variable import Variable, Equation, Expr, Der, BinOp, Constant, UnaryOp
 from .connector import Connector
 
 if TYPE_CHECKING:
-    from .component import Component
+    pass
 
 
 class Connection:

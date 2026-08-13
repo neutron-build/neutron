@@ -1,7 +1,6 @@
 """Connector types for acausal component modeling."""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
 from .variable import Variable
 
 

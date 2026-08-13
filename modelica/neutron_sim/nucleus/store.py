@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..solvers.ode import SimulationResult
-    from ..core.variable import Variable
 
 
 def store_results(

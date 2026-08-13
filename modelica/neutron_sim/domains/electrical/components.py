@@ -150,7 +150,7 @@ class CurrentSource(Component):
     Ideal current source: i = I (constant, from p to n through external circuit).
     """
 
-    def __init__(self, I: float = 1.0, **kwargs):
+    def __init__(self, I: float = 1.0, **kwargs):  # noqa: E741 - I is the standard symbol for current
         self.I = I
         self.p = Pin(prefix=f"isrc_p_{id(self):#x}")
         self.n = Pin(prefix=f"isrc_n_{id(self):#x}")

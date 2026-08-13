@@ -23,10 +23,9 @@ FMI 3.0 additions over 2.0:
 
 from __future__ import annotations
 
-import json
 import pickle
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from xml.etree import ElementTree as ET
 from typing import Any

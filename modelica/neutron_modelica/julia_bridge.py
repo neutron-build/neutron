@@ -156,8 +156,7 @@ class JuliaDEBridge:
         -------
         Julia source code string defining ``f!``, ``u0``, and ``tspan``.
         """
-        from neutron_sim.solvers.ode import _build_ode_rhs, _extract_scaled_der
-        from neutron_sim.core.variable import Der, BinOp, Variable, Constant, UnaryOp
+        from neutron_sim.solvers.ode import _extract_scaled_der
 
         state_vars = system.state_variables()
         ics = system.initial_conditions()

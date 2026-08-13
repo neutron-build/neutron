@@ -4,7 +4,7 @@ from .component import Component
 from .system import System, Connection, connect
 
 __all__ = [
-    "Variable", "Parameter", "Equation", "Der", "der",
+    "Variable", "Parameter", "Equation", "Der", "der", "Constant",
     "Connector", "Component",
     "System", "Connection", "connect",
 ]

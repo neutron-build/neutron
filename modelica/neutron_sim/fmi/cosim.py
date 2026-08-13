@@ -19,7 +19,6 @@ from __future__ import annotations
 import numpy as np
 from typing import Callable
 
-from ..core.variable import Variable, Expr, Constant, BinOp, UnaryOp, Der
 from ..core.system import System
 from ..solvers.ode import SimulationResult, _build_ode_rhs
 
@@ -89,7 +88,6 @@ class OdeStepper:
             return result  # forcing is already injected via state dict override
 
         # Rebuild RHS injecting forcing as extra state entries
-        state_vars = self._state_vars
         names = self._names
         _forcing = dict(forcing)
 
@@ -99,7 +97,6 @@ class OdeStepper:
 
             eqs = self._system.flatten()
             from ..solvers.ode import _extract_scaled_der
-            from ..core.variable import Expr
 
             result = []
             for vname in names:

@@ -329,7 +329,7 @@ class CurrentSource(Component):
     I      : current [A]
     """
 
-    def __init__(self, name: str, node_p: str, node_n: str, I: float):
+    def __init__(self, name: str, node_p: str, node_n: str, I: float):  # noqa: E741 - I is the standard symbol for current
         super().__init__(name, node_p, node_n)
         self.I = I
 
@@ -552,7 +552,6 @@ class Circuit:
 
         node_map, vsrc_offset, vsrc_index = self._build_maps()
         n = self._matrix_size()
-        nodes = self.nodes
 
         # Initialize solution vector from DC operating point or ICs
         x = np.zeros(n)

@@ -6,13 +6,11 @@ The round-trip test uses the pickled System embedded in the FMU.
 """
 
 import os
-import math
 import zipfile
-import tempfile
 import numpy as np
 import pytest
 
-from neutron_sim import Variable, Parameter, System, connect, simulate
+from neutron_sim import System, connect, simulate
 from neutron_sim.domains.mechanical import Mass, Spring, Damper, Fixed
 from neutron_sim.fmi import export_fmu, import_fmu, ImportedFMU, CoSimulation, OdeStepper
 

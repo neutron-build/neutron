@@ -5,7 +5,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from typing import TYPE_CHECKING
 
-from ..core.variable import Variable, Der, BinOp, Constant, Equation, Expr
+from ..core.variable import Variable, Der, BinOp, Expr
 from ..core.system import System
 from .auto_select import estimate_stiffness, select_method
 
@@ -147,6 +147,32 @@ def _build_ode_rhs(system: System, state_vars: list[Variable]):
         raise ValueError(
             f"No derivative equation found for: {missing}. "
             "Only explicit ODE systems are supported. Use Julia bridge for DAEs."
+        )
+
+    # Every variable left in a right-hand side must be a state variable. Anything
+    # else is an algebraic unknown the flattener could not eliminate, which means
+    # the model is structurally singular (more unknown flow variables than
+    # conservation equations) — typically an ideal source wired straight onto a
+    # storage element. Report it here instead of letting eval() raise an opaque
+    # KeyError from inside the integrator.
+    known = set(state_names)
+    unresolved: dict[str, str] = {}
+    for name in state_names:
+        rhs_expr, _ = der_map[name]
+        for v in rhs_expr.variables():
+            if v.name not in known:
+                unresolved.setdefault(v.name, name)
+    if unresolved:
+        detail = ", ".join(
+            f"{v!r} (in the equation for {s!r})" for v, s in sorted(unresolved.items())
+        )
+        raise ValueError(
+            f"Unresolved algebraic variable(s): {detail}. The system is "
+            "structurally singular — these unknowns have no defining equation "
+            "after flattening. This usually means an ideal source is connected "
+            "directly to a storage element (e.g. FixedTemperature straight onto "
+            "a ThermalCapacitance), which is a higher-index DAE. Insert a "
+            "resistive element between them, or use the Julia bridge for DAEs."
         )
 
     def f(t: float, y: np.ndarray) -> list[float]:

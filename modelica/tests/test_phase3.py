@@ -6,13 +6,13 @@ Julia bridge tests are skipped unless juliacall is installed.
 Surrogate model tests run if scikit-learn is available.
 """
 
+import importlib.util
 import os
-import math
 import numpy as np
 import pytest
 
-from neutron_sim import Variable, System, simulate
-from neutron_sim.domains.mechanical import Mass, Spring, Damper, Fixed
+from neutron_sim import System, simulate
+from neutron_sim.domains.mechanical import Mass, Spring, Fixed
 from neutron_sim import connect
 
 
@@ -232,11 +232,7 @@ class TestMCPTool:
 
 # ── Surrogate Model Tests ─────────────────────────────────────────────────────
 
-try:
-    import sklearn
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
+HAS_SKLEARN = importlib.util.find_spec("sklearn") is not None
 
 
 @pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
