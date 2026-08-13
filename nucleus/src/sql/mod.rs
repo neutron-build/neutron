@@ -1,6 +1,9 @@
 //! SQL parsing layer — wraps sqlparser-rs and converts AST to Nucleus types.
 
+use std::ops::ControlFlow;
+
 use sqlparser::ast;
+use sqlparser::ast::{Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -217,6 +220,65 @@ fn check_nesting_depth(sql: &str) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Maximum nesting depth of the *parsed* expression tree.
+///
+/// The pre-parse `check_nesting_depth` scan only sees parentheses, but a tree
+/// can be arbitrarily deep with none: `a AND a AND a AND ...` parses into a
+/// left-deep `BinaryOp` chain one level per term. sqlparser's own
+/// `RecursionCounter` does not fire either, because equal-precedence infix
+/// operators are consumed by a loop rather than by recursion.
+///
+/// Everything downstream of the parser walks that tree recursively — the
+/// AST cache's deep `Clone`, literal substitution, planning, `Drop` — so an
+/// unbounded tree is an unbounded stack walk, i.e. a process-killing stack
+/// overflow rather than a query error. Reject it here, at the single choke
+/// point every SQL string passes through, before anything recurses over it.
+///
+/// Kept equal to the executor's `MAX_EXPR_DEPTH` (256), which is the depth the
+/// engine already commits to being able to recurse to during evaluation.
+const MAX_AST_EXPR_DEPTH: usize = 256;
+
+/// Depth-limited AST walker. Breaks as soon as the limit is passed, so the
+/// visitor's own recursion never exceeds `MAX_AST_EXPR_DEPTH` levels either.
+struct ExprDepthVisitor {
+    depth: usize,
+    limit: usize,
+}
+
+impl Visitor for ExprDepthVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, _expr: &ast::Expr) -> ControlFlow<Self::Break> {
+        self.depth += 1;
+        if self.depth > self.limit {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn post_visit_expr(&mut self, _expr: &ast::Expr) -> ControlFlow<Self::Break> {
+        self.depth = self.depth.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Reject statements whose expression tree nests deeper than
+/// `MAX_AST_EXPR_DEPTH`. See that constant for why the pre-parse scan is not
+/// enough on its own.
+fn check_ast_depth(stmts: &[ast::Statement]) -> Result<(), ParseError> {
+    for stmt in stmts {
+        let mut visitor = ExprDepthVisitor {
+            depth: 0,
+            limit: MAX_AST_EXPR_DEPTH,
+        };
+        if stmt.visit(&mut visitor).is_break() {
+            return Err(ParseError::ExpressionTooDeep(MAX_AST_EXPR_DEPTH));
+        }
+    }
+    Ok(())
+}
+
 /// Parse a SQL string into sqlparser AST statements.
 pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     // DoS guard: reject pathologically deep nesting BEFORE handing the input to
@@ -235,6 +297,12 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     // which itself is below the default-50 recursion guard.
     let dialect = PostgreSqlDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)?;
+
+    // Second DoS guard: paren-free constructs (long `AND`/`OR`/arithmetic
+    // chains) build an arbitrarily deep tree that the scan above cannot see.
+    // Reject before any recursive walk of the tree happens.
+    check_ast_depth(&stmts)?;
+
     Ok(stmts)
 }
 
@@ -563,6 +631,8 @@ pub enum ParseError {
     UnexpectedStatement(String),
     #[error("statement too complex: parenthesis nesting exceeds maximum of {0}")]
     StatementTooComplex(usize),
+    #[error("statement too complex: expression nesting exceeds maximum of {0}")]
+    ExpressionTooDeep(usize),
 }
 
 // ============================================================================
@@ -578,6 +648,33 @@ mod tests {
         let stmts = parse("SELECT 1").unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(matches!(stmts[0], ast::Statement::Query(_)));
+    }
+
+    /// A paren-free `AND` chain builds one tree level per term, so it must be
+    /// bounded by `check_ast_depth` — `check_nesting_depth` cannot see it, and
+    /// neither can sqlparser's own recursion counter. Left unbounded it is a
+    /// stack overflow (process abort), not a query error, because every walk of
+    /// the tree downstream — the AST cache's `Clone` in particular — recurses.
+    #[test]
+    fn parse_rejects_paren_free_deep_expression_chain() {
+        let terms = vec!["1=1"; MAX_AST_EXPR_DEPTH * 2];
+        let sql = format!("SELECT id FROM t WHERE {}", terms.join(" AND "));
+        assert!(matches!(
+            parse(&sql),
+            Err(ParseError::ExpressionTooDeep(MAX_AST_EXPR_DEPTH))
+        ));
+    }
+
+    /// The cap must not reject chains a real query might contain.
+    #[test]
+    fn parse_accepts_moderately_deep_expression_chain() {
+        let terms = vec!["1=1"; 100];
+        let sql = format!("SELECT id FROM t WHERE {}", terms.join(" AND "));
+        assert!(parse(&sql).is_ok());
+
+        // Wide, not deep: many sibling expressions nest only one level each.
+        let cols: Vec<String> = (0..500).map(|i| format!("c{i} + 1")).collect();
+        assert!(parse(&format!("SELECT {} FROM t", cols.join(", "))).is_ok());
     }
 
     #[test]
