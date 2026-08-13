@@ -239,7 +239,8 @@ defmodule Live.Ops do
   # Document.query_in is the client's filter surface. It answers with matching
   # ids rather than documents; `find_one` cannot be synthesised from it without
   # this executor becoming the client, so that op is left unmapped.
-  defp dispatch(c, "document.find", [coll, filter]), do: unwrap(Document.query_in(c, coll, filter))
+  defp dispatch(c, "document.find", [coll, filter]),
+    do: unwrap(Document.query_in(c, coll, filter))
 
   # ── graph ────────────────────────────────────────────────────────────
   # Graph.add_node takes ONE label where the spec passes a label list; the first
@@ -248,7 +249,8 @@ defmodule Live.Ops do
     do: unwrap(Graph.add_node(c, hd(labels), props))
 
   # Spec order is (type, from, to); the Elixir signature is (from, to, type).
-  defp dispatch(c, "graph.addEdge", [type, from, to]), do: unwrap(Graph.add_edge(c, from, to, type))
+  defp dispatch(c, "graph.addEdge", [type, from, to]),
+    do: unwrap(Graph.add_edge(c, from, to, type))
 
   defp dispatch(c, "graph.neighbors", [id, direction]),
     do: unwrap(Graph.neighbors(c, id, String.to_atom(direction)))
@@ -299,7 +301,9 @@ defmodule Live.Ops do
   defp dispatch(c, "streams.xadd", [s, fields]), do: unwrap(Streams.xadd(c, s, fields))
   defp dispatch(c, "streams.xlen", [s]), do: unwrap(Streams.xlen(c, s))
   defp dispatch(c, "streams.xrange", [s, a, b, n]), do: unwrap(Streams.xrange(c, s, a, b, n))
-  defp dispatch(c, "streams.xread", [s, after_id, n]), do: unwrap(Streams.xread(c, s, after_id, n))
+
+  defp dispatch(c, "streams.xread", [s, after_id, n]),
+    do: unwrap(Streams.xread(c, s, after_id, n))
 
   defp dispatch(c, "streams.xgroupCreate", [s, g, start]),
     do: unwrap(Streams.xgroup_create(c, s, g, start))
@@ -396,7 +400,10 @@ defmodule Live.Ops do
 
   defp unwrap({:ok, value}), do: value
   defp unwrap(:ok), do: nil
-  defp unwrap({:error, reason}), do: raise(Live.Failed, message: "client error: #{inspect(reason)}")
+
+  defp unwrap({:error, reason}),
+    do: raise(Live.Failed, message: "client error: #{inspect(reason)}")
+
   defp unwrap(other), do: other
 end
 
@@ -475,21 +482,17 @@ defmodule Live do
         port: uri.port || 5432,
         username: username,
         database: String.trim_leading(uri.path || "/postgres", "/"),
-        pool_size: 1,
-        sync_connect: true,
-        backoff_type: :stop
+        types: Postgrex.DefaultTypes,
+        timeout: 15_000
       ] ++ if(rest == [], do: [], else: [password: hd(rest)])
 
-    case Postgrex.start_link(opts) do
-      {:ok, pid} ->
-        GenServer.stop(pid)
-        nil
-
-      {:error, %{__exception__: true} = error} ->
-        Exception.message(error)
-
-      {:error, reason} ->
-        inspect(reason)
+    # One unpooled connection. The pool retries in the background and answers
+    # callers with a queue timeout, which names the symptom and never the cause;
+    # this returns what the server actually said.
+    case Postgrex.Protocol.connect(opts) do
+      {:ok, _state} -> nil
+      {:error, %{__exception__: true} = error} -> Exception.message(error)
+      {:error, reason} -> inspect(reason)
     end
   end
 
