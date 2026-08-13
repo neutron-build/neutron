@@ -12,3 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
+
+# Used by the Linux-only XDG scheme registration path in `register_scheme`.
+[target.'cfg(target_os = "linux")'.dependencies]
+dirs = { workspace = true }

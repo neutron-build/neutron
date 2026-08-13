@@ -58,16 +58,18 @@ jobs:
 
       - name: Install Linux dependencies
         if: matrix.os == 'linux'
+        # NOTE: do not add libappindicator3-dev here — it conflicts with
+        # libayatana-appindicator3-dev and makes apt exit 100. See the same
+        # note in desktop.yml.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
+            libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
             libssl-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev
+            libgtk-3-dev
 
       # ---- Toolchains ----
 

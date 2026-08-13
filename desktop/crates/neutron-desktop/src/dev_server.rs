@@ -314,14 +314,18 @@ mod tests {
 
     #[test]
     fn test_is_dev_mode_default() {
-        // Without the env var set, should return false
-        std::env::remove_var("NEUTRON_DESKTOP_DEV");
+        // Without the env var set, should return false.
+        // SAFETY: no other test in this crate reads or writes
+        // NEUTRON_DESKTOP_DEV, so there is no concurrent environment access.
+        unsafe { std::env::remove_var("NEUTRON_DESKTOP_DEV") };
         assert!(!is_dev_mode());
     }
 
     #[test]
     fn test_dev_port_default() {
-        std::env::remove_var("NEUTRON_DESKTOP_DEV_PORT");
+        // SAFETY: no other test in this crate reads or writes
+        // NEUTRON_DESKTOP_DEV_PORT, so there is no concurrent environment access.
+        unsafe { std::env::remove_var("NEUTRON_DESKTOP_DEV_PORT") };
         assert_eq!(dev_port(), 3001);
     }
 }

@@ -117,10 +117,10 @@ $result.GetAwaiter().GetResult()"#,
 #[tauri::command]
 async fn get_biometric_type() -> Result<BiometricType, String> {
     #[cfg(target_os = "macos")]
-    { return Ok(BiometricType::TouchID); }
+    { Ok(BiometricType::TouchID) }
 
     #[cfg(target_os = "windows")]
-    { return Ok(BiometricType::WindowsHello); }
+    { Ok(BiometricType::WindowsHello) }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     { Ok(BiometricType::None) }

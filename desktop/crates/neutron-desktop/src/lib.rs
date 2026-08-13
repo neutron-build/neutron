@@ -6,13 +6,19 @@ mod window;
 
 pub use bridge::{create_protocol_handler, Request, Response};
 pub use dev_server::{dev_port, is_dev_mode};
-pub use nucleus_state::{NucleusError, NucleusState};
+// Re-exported so callers of the `ipc_handler!` macro can name `IpcCommand`,
+// and so the TypeScript codegen helpers are reachable from outside the crate.
+pub use ipc::{collect_bindings, IpcCommand, TypeScriptBinding};
+pub use nucleus_state::{platform_data_dir, NucleusError, NucleusState};
 #[cfg(feature = "nucleus-embedded")]
 pub use nucleus_state::NucleusQueryResult;
 pub use window::WindowConfig;
 
 use tauri::Manager;
 use std::sync::Arc;
+
+/// A deferred `tauri::Builder` transformation used to register a plugin.
+type PluginRegistration = Box<dyn FnOnce(tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry>>;
 
 /// Builder for configuring and launching a Neutron Desktop application.
 ///
@@ -25,7 +31,7 @@ pub struct NeutronDesktopBuilder {
     nucleus_enabled: bool,
     nucleus_data_dir: Option<std::path::PathBuf>,
     routes: Vec<Route>,
-    plugins: Vec<Box<dyn FnOnce(tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry>>>,
+    plugins: Vec<PluginRegistration>,
 }
 
 struct Route {

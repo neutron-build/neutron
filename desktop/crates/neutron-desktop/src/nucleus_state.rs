@@ -42,7 +42,11 @@ impl NucleusState {
             if self.db.get().is_some() {
                 return Ok(());
             }
-            let database = nucleus::embedded::Database::open(&self.data_dir)
+            // `Database::open` takes a database FILE, not a directory —
+            // passing `data_dir` here failed with EISDIR ("Is a directory").
+            // `data_dir` stays the per-app directory; the database lives in it.
+            let db_path = self.data_dir.join("nucleus.db");
+            let database = nucleus::embedded::Database::open(&db_path)
                 .map_err(|e| NucleusError::Database(e.to_string()))?;
             let _ = self.db.set(database);
             tracing::info!(dir = %self.data_dir.display(), "Nucleus embedded database opened");

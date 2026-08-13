@@ -66,11 +66,13 @@ async fn create_tray(
     }
 
     builder = builder.on_tray_icon_event(|_tray, event| {
-        match event {
-            tauri::tray::TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
-                tracing::debug!("Tray icon left-clicked");
-            }
-            _ => {}
+        if let tauri::tray::TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            tracing::debug!("Tray icon left-clicked");
         }
     });
 
@@ -141,10 +143,10 @@ async fn set_tray_tooltip(
     state: tauri::State<'_, TrayState>,
 ) -> Result<(), String> {
     let id = state.icon_id.lock().map_err(|e| e.to_string())?;
-    if let Some(id) = id.as_ref() {
-        if let Some(tray) = app.tray_by_id(id) {
-            tray.set_tooltip(Some(&tooltip)).map_err(|e| e.to_string())?;
-        }
+    if let Some(id) = id.as_ref()
+        && let Some(tray) = app.tray_by_id(id)
+    {
+        tray.set_tooltip(Some(&tooltip)).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -162,16 +164,16 @@ async fn set_tray_icon(
     state: tauri::State<'_, TrayState>,
 ) -> Result<(), String> {
     let id = state.icon_id.lock().map_err(|e| e.to_string())?;
-    if let Some(id) = id.as_ref() {
-        if let Some(tray) = app.tray_by_id(id) {
-            let rgba_bytes = std::fs::read(&icon_path)
-                .map_err(|e| format!("failed to read icon file: {e}"))?;
-            let w = width.unwrap_or(32);
-            let h = height.unwrap_or(32);
-            let icon = tauri::image::Image::new_owned(rgba_bytes, w, h);
-            tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
-            tracing::info!(path = %icon_path, width = w, height = h, "Updated tray icon");
-        }
+    if let Some(id) = id.as_ref()
+        && let Some(tray) = app.tray_by_id(id)
+    {
+        let rgba_bytes = std::fs::read(&icon_path)
+            .map_err(|e| format!("failed to read icon file: {e}"))?;
+        let w = width.unwrap_or(32);
+        let h = height.unwrap_or(32);
+        let icon = tauri::image::Image::new_owned(rgba_bytes, w, h);
+        tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+        tracing::info!(path = %icon_path, width = w, height = h, "Updated tray icon");
     }
     Ok(())
 }
