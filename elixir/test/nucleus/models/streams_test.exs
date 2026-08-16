@@ -29,8 +29,10 @@ defmodule Nucleus.Models.StreamsTest do
       assert function_exported?(Streams, :xreadgroup, 5)
     end
 
-    test "exports xack/5" do
-      assert function_exported?(Streams, :xack, 5)
+    # xack/4, not /5: the id is one "<ms>-<seq>" string rather than two
+    # integers, so it composes with what xadd returns.
+    test "exports xack/4" do
+      assert function_exported?(Streams, :xack, 4)
     end
   end
 end

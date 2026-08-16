@@ -1198,8 +1198,8 @@ impl KvStore {
     pub fn col_zrange(
         &self,
         key: &str,
-        start: usize,
-        stop: usize,
+        start: i64,
+        stop: i64,
     ) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zrange(key, start, stop)
@@ -1207,8 +1207,8 @@ impl KvStore {
     pub fn col_zrevrange(
         &self,
         key: &str,
-        start: usize,
-        stop: usize,
+        start: i64,
+        stop: i64,
     ) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zrevrange(key, start, stop)
@@ -1887,6 +1887,29 @@ impl Default for SortedSet {
     }
 }
 
+/// Resolve an inclusive `[start, stop]` rank range against a collection of
+/// `len` elements, Redis-style: negative counts from the end, an underflowing
+/// start clamps to 0, and an empty range answers `None`.
+///
+/// Shared by ZRANGE and ZREVRANGE so the two cannot drift — which is exactly
+/// how LRANGE came to handle negatives correctly while ZRANGE did not.
+fn resolve_rank_range(start: i64, stop: i64, len: i64) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let s = if start < 0 {
+        let adj = len + start;
+        if adj < 0 { 0 } else { adj }
+    } else {
+        start
+    };
+    let e = if stop < 0 { len + stop } else { stop };
+    if e < 0 || s >= len || s > e {
+        return None;
+    }
+    Some((s as usize, (e.min(len - 1)) as usize))
+}
+
 impl SortedSet {
     pub fn new() -> Self {
         Self {
@@ -1940,17 +1963,26 @@ impl SortedSet {
     }
 
     /// ZRANGE — entries by rank ascending (inclusive start/stop).
-    pub fn zrange(&self, start: usize, stop: usize) -> Vec<SortedSetEntry> {
-        // Inverted rank range (start past stop) yields no elements, matching
-        // Redis ZRANGE semantics. Without this guard, `stop.saturating_sub(start)`
-        // floors at 0 and `.take(0 + 1)` would emit one spurious element.
-        if start > stop {
-            return Vec::new();
-        }
+    ///
+    /// Indices are SIGNED and negative means from the end, as in Redis and as
+    /// LRANGE already did: `zrange(0, -1)` is the whole set.
+    ///
+    /// This took `usize`, so callers cast a signed index and `-1` became
+    /// `usize::MAX`. The result was not "everything" but NOTHING:
+    /// `stop.saturating_sub(start) + 1` overflowed to 0 and `.take(0)` returned
+    /// an empty vector. A wrong answer with no error, on the most idiomatic
+    /// call in the surface — `zrange(key, 0, -1)`. LRANGE was fixed for this
+    /// long ago; ZRANGE was missed, and the conformance note recorded it as
+    /// "reads -1 literally", which is not what happens.
+    pub fn zrange(&self, start: i64, stop: i64) -> Vec<SortedSetEntry> {
+        let (start, stop) = match resolve_rank_range(start, stop, self.tree.len() as i64) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
         self.tree
             .iter()
             .skip(start)
-            .take(stop.saturating_sub(start) + 1)
+            .take(stop - start + 1)
             .map(|((OrderedF64(s), m), _)| SortedSetEntry {
                 member: m.clone(),
                 score: *s,
@@ -1958,18 +1990,17 @@ impl SortedSet {
             .collect()
     }
 
-    /// ZREVRANGE — entries by rank descending.
-    pub fn zrevrange(&self, start: usize, stop: usize) -> Vec<SortedSetEntry> {
-        // Inverted rank range (start past stop) yields no elements, matching
-        // Redis ZREVRANGE semantics (mirror of the zrange guard above).
-        if start > stop {
-            return Vec::new();
-        }
+    /// ZREVRANGE — entries by rank descending. Signed indices, as `zrange`.
+    pub fn zrevrange(&self, start: i64, stop: i64) -> Vec<SortedSetEntry> {
+        let (start, stop) = match resolve_rank_range(start, stop, self.tree.len() as i64) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
         self.tree
             .iter()
             .rev()
             .skip(start)
-            .take(stop.saturating_sub(start) + 1)
+            .take(stop - start + 1)
             .map(|((OrderedF64(s), m), _)| SortedSetEntry {
                 member: m.clone(),
                 score: *s,

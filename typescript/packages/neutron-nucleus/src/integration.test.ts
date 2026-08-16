@@ -941,10 +941,14 @@ describe("Integration: Streams model SQL functions", () => {
     assert.equal(ok, true);
   });
 
-  it("STREAM_XACK returns acknowledged count", async () => {
+  it("STREAM_XACK takes the id xadd returned", async () => {
+    // Was xack("events", "workers", 100, 0) — the id split into two numbers,
+    // which is what stopped xadd and xack composing.
     transport.whenFetchval("STREAM_XACK", 1);
-    const acked = await streams.xack("events", "workers", 100, 0);
+    const acked = await streams.xack("events", "workers", "100-0");
     assert.equal(acked, 1);
+    const call = transport.sqlCalls("STREAM_XACK")[0];
+    assert.deepEqual(call.params, ["events", "workers", "100-0"]);
   });
 
   it("xadd rejects an empty fields object", async () => {

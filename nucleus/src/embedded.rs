@@ -790,16 +790,16 @@ impl KvHandle<'_> {
     pub fn col_zrange(
         &self,
         key: &str,
-        start: usize,
-        stop: usize,
+        start: i64,
+        stop: i64,
     ) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> {
         self.store.col_zrange(key, start, stop)
     }
     pub fn col_zrevrange(
         &self,
         key: &str,
-        start: usize,
-        stop: usize,
+        start: i64,
+        stop: i64,
     ) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> {
         self.store.col_zrevrange(key, start, stop)
     }

@@ -298,18 +298,23 @@ func TestStreamXAck(t *testing.T) {
 	}
 
 	s := &StreamModel{pool: q, client: nucleusClient()}
-	count, err := s.XAck(context.Background(), "events", "workers", 400, 0)
+	count, err := s.XAck(context.Background(), "events", "workers", "400-0")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if count != 1 {
 		t.Errorf("count = %d, want 1", count)
 	}
-	if capturedSQL != "SELECT STREAM_XACK($1, $2, $3, $4)" {
+	// Three parameters, with the id sent whole. This asserted the four-argument
+	// form, which is what stopped XAdd and XAck composing.
+	if capturedSQL != "SELECT STREAM_XACK($1, $2, $3)" {
 		t.Errorf("SQL = %q", capturedSQL)
 	}
-	if len(capturedArgs) != 4 {
-		t.Fatalf("args len = %d, want 4", len(capturedArgs))
+	if len(capturedArgs) != 3 {
+		t.Fatalf("args len = %d, want 3", len(capturedArgs))
+	}
+	if capturedArgs[2] != "400-0" {
+		t.Errorf("id arg = %v, want \"400-0\" sent whole", capturedArgs[2])
 	}
 }
 
@@ -328,7 +333,7 @@ func TestStreamRequiresNucleus(t *testing.T) {
 		{"XRead", func() error { _, err := s.XRead(context.Background(), "s", 0, 10); return err }},
 		{"XGroupCreate", func() error { _, err := s.XGroupCreate(context.Background(), "s", "g", 0); return err }},
 		{"XReadGroup", func() error { _, err := s.XReadGroup(context.Background(), "s", "g", "c", 1); return err }},
-		{"XAck", func() error { _, err := s.XAck(context.Background(), "s", "g", 0, 0); return err }},
+		{"XAck", func() error { _, err := s.XAck(context.Background(), "s", "g", "0-0"); return err }},
 	}
 
 	for _, tc := range tests {

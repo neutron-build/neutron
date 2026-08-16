@@ -3561,9 +3561,11 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                // Signed, so -1 means "last". Casting to usize here turned -1
+                // into usize::MAX, which the store then read as an empty range.
                 let start = match &args[1] {
-                    Value::Int32(n) => *n as usize,
-                    Value::Int64(n) => *n as usize,
+                    Value::Int32(n) => *n as i64,
+                    Value::Int64(n) => *n,
                     _ => {
                         return Err(ExecError::Unsupported(
                             "KV_ZRANGE start must be integer".into(),
@@ -3571,8 +3573,8 @@ impl Executor {
                     }
                 };
                 let stop = match &args[2] {
-                    Value::Int32(n) => *n as usize,
-                    Value::Int64(n) => *n as usize,
+                    Value::Int32(n) => *n as i64,
+                    Value::Int64(n) => *n,
                     _ => {
                         return Err(ExecError::Unsupported(
                             "KV_ZRANGE stop must be integer".into(),
@@ -3858,8 +3860,20 @@ impl Executor {
                 }
             }
             "STREAM_XACK" => {
-                // stream_xack(stream, group, id_ms, id_seq) → integer count acknowledged
-                require_args(fname, &args, 4)?;
+                // stream_xack(stream, group, id_ms, id_seq) → count acknowledged
+                // stream_xack(stream, group, '<ms>-<seq>') → the same
+                //
+                // The three-argument form exists because the four-argument one
+                // does not compose with XADD, which returns the id as a single
+                // "<ms>-<seq>" string. Every SDK had to split that string to
+                // acknowledge an entry it had just added, and every SDK's live
+                // conformance case for consumer groups was marked xfail with
+                // the same note: "the two ends of the same API do not compose."
+                //
+                // Splitting it in five clients would have been five chances to
+                // disagree about the separator, so the engine accepts the shape
+                // its own XADD produces. The four-argument form is unchanged.
+                require_args(fname, &args, 3)?;
                 let stream_name = match &args[0] {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
@@ -3868,8 +3882,41 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let id_ms = val_to_u64(&args[2], "STREAM_XACK id_ms")?;
-                let id_seq = val_to_u64(&args[3], "STREAM_XACK id_seq")?;
+                let (id_ms, id_seq) = if args.len() >= 4 {
+                    (
+                        val_to_u64(&args[2], "STREAM_XACK id_ms")?,
+                        val_to_u64(&args[3], "STREAM_XACK id_seq")?,
+                    )
+                } else {
+                    let raw = match &args[2] {
+                        Value::Text(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    // A bare "<ms>" is accepted as seq 0 — the same reading
+                    // Redis gives an id with no sequence part.
+                    match raw.split_once('-') {
+                        Some((ms, seq)) => (
+                            ms.trim().parse::<u64>().map_err(|_| {
+                                ExecError::Unsupported(format!(
+                                    "STREAM_XACK id {raw:?} is not <ms>-<seq>"
+                                ))
+                            })?,
+                            seq.trim().parse::<u64>().map_err(|_| {
+                                ExecError::Unsupported(format!(
+                                    "STREAM_XACK id {raw:?} is not <ms>-<seq>"
+                                ))
+                            })?,
+                        ),
+                        None => (
+                            raw.trim().parse::<u64>().map_err(|_| {
+                                ExecError::Unsupported(format!(
+                                    "STREAM_XACK id {raw:?} is not <ms>-<seq>"
+                                ))
+                            })?,
+                            0,
+                        ),
+                    }
+                };
                 self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
                 match streams.get_mut(&stream_name) {

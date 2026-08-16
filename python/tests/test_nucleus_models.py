@@ -890,9 +890,12 @@ class TestStreams:
     async def test_xack(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = True
         sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
-        assert await sm.xack("events", "workers", 400, 0) is True
+        # The id is sent whole, as xadd returns it. This asserted the
+        # four-argument form with the id split into two integers, which is what
+        # stopped xadd and xack composing.
+        assert await sm.xack("events", "workers", "400-0") is True
         mock_conn.fetchval.assert_called_with(
-            "SELECT STREAM_XACK($1, $2, $3, $4)", "events", "workers", 400, 0
+            "SELECT STREAM_XACK($1, $2, $3)", "events", "workers", "400-0"
         )
 
     @pytest.mark.asyncio

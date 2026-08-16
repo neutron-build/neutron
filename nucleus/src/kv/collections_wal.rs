@@ -446,7 +446,7 @@ fn serialize_snapshot(collections: &ShardedCollections) -> Vec<u8> {
                 let card = zset.zcard();
                 buf.extend_from_slice(&(card as u32).to_le_bytes());
                 // Use zrange to get all entries in order
-                let entries = zset.zrange(0, card.saturating_sub(1));
+                let entries = zset.zrange(0, -1); // whole set
                 for entry in &entries {
                     write_string(&entry.member, &mut buf);
                     buf.extend_from_slice(&entry.score.to_le_bytes());

@@ -1338,7 +1338,10 @@ impl RespHandler {
                 let entries = if card == 0 || start >= card || start > stop {
                     Vec::new()
                 } else {
-                    match self.kv.col_zrange(key, start as usize, stop as usize) {
+                    // Already resolved above, so these are non-negative; the
+                    // store takes signed indices now and resolves them itself,
+                    // which is why the SQL path was broken and this one was not.
+                    match self.kv.col_zrange(key, start, stop) {
                         Ok(e) => e,
                         Err(e) => return encode_wrongtype(&e),
                     }

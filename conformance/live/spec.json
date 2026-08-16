@@ -662,11 +662,8 @@
     {
       "id": "kv.zrange_negative_index_means_from_the_end",
       "model": "kv",
-      "why": "The half of L3 that is still true. ZRANGE(0, 10) returns both members and ZRANGE(0, -1) returns nothing, so -1 is still read literally here. Redis semantics everywhere else in this surface make that a wrong answer rather than a documented limit.",
+      "why": "Fixed 2026-08-16, and the note had the mechanism wrong. It said KV_ZRANGE \"reads -1 literally\"; what actually happened is that the store took usize, so -1 became usize::MAX, then `stop.saturating_sub(start) + 1` OVERFLOWED to 0 and `.take(0)` returned an empty vector. Reading -1 literally would have returned something; this returned nothing. ZRANGE and ZREVRANGE now take signed indices through a resolver shared with LRANGE, so the three cannot drift again — LRANGE having been fixed years earlier while ZRANGE was missed is how this survived.",
       "issue": "L3",
-      "xfail": {
-        "reason": "KV_ZRANGE reads -1 literally. LRANGE was fixed and ZRANGE was not; S23 is narrower than its note claims."
-      },
       "steps": [
         {
           "op": "kv.zadd",
@@ -1101,10 +1098,7 @@
     {
       "id": "streams.consumer_group_round_trip",
       "model": "streams",
-      "why": "NEW, found by this suite on 2026-08-13 and in no prior finding list. xadd returns an entry id as a string ('1786606665529-0'), and xack's signature is (stream, group, id_ms: int, id_seq: int). The client cannot feed its own xadd output back into its own xack — the natural round trip does not typecheck, so the consumer-group surface has never been usable end to end from Python. Not one of the 18 known never-worked shapes.",
-      "xfail": {
-        "reason": "xack takes (id_ms, id_seq) integers while xadd returns a single 'ms-seq' string. The two halves of the same API do not compose."
-      },
+      "why": "xadd returned a single \"<ms>-<seq>\" string while xack took the two halves as separate integers, so the two ends of the same API did not compose and every SDK had to split the id itself. Fixed 2026-08-16 in the ENGINE rather than in five clients: STREAM_XACK now accepts (stream, group, '<ms>-<seq>') alongside the four-argument form, so xack takes exactly what xadd produced. Splitting it per client would have been five chances to disagree about the separator.",
       "steps": [
         {
           "op": "streams.xadd",

@@ -3911,6 +3911,26 @@ fn walk_expr_for_params(
                 "TIME_BUCKET" => &[Type::INT8, Type::INT8],
                 _ => &[],
             };
+            // Arity-dependent signature. STREAM_XACK takes either
+            // (stream, group, id_ms, id_seq) or (stream, group, '<ms>-<seq>'),
+            // and the third parameter is INT8 in the first and TEXT in the
+            // second. This table is keyed by name alone, so without the check
+            // the composable three-argument form would have its id typed INT8
+            // and fail to bind — the table being position-keyed but not
+            // arity-keyed is invisible until one function has two shapes.
+            let sig: &[Type] = if fname.as_str() == "STREAM_XACK" {
+                let argc = match &func.args {
+                    sqlparser::ast::FunctionArguments::List(l) => l.args.len(),
+                    _ => 0,
+                };
+                if argc == 3 {
+                    &[Type::TEXT, Type::TEXT, Type::TEXT]
+                } else {
+                    sig
+                }
+            } else {
+                sig
+            };
             if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
                 for (pos, arg) in list.args.iter().enumerate() {
                     if let sqlparser::ast::FunctionArg::Unnamed(

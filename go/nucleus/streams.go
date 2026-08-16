@@ -126,14 +126,20 @@ func (s *StreamModel) XReadGroup(ctx context.Context, stream, group, consumer st
 	return entries, nil
 }
 
-// XAck acknowledges processing of a stream entry in a consumer group.
-// Returns the number of entries acknowledged (0 or 1).
-func (s *StreamModel) XAck(ctx context.Context, stream, group string, idMs, idSeq int64) (int64, error) {
+// XAck acknowledges a processed entry by the id XAdd returned.
+//
+// The id is the "<ms>-<seq>" string XAdd hands back. This used to take idMs and
+// idSeq as separate integers, which meant the two ends of the same API did not
+// compose: every caller had to split XAdd's return value itself, and the
+// cross-SDK conformance case for consumer groups was marked xfail in all five
+// SDKs for exactly that reason. The engine now accepts the shape its own XAdd
+// produces.
+func (s *StreamModel) XAck(ctx context.Context, stream, group, id string) (int64, error) {
 	if err := s.client.requireNucleus("Streams.XAck"); err != nil {
 		return 0, err
 	}
 	var count int64
-	err := s.pool.QueryRow(ctx, "SELECT STREAM_XACK($1, $2, $3, $4)",
-		stream, group, idMs, idSeq).Scan(&count)
+	err := s.pool.QueryRow(ctx, "SELECT STREAM_XACK($1, $2, $3)",
+		stream, group, id).Scan(&count)
 	return count, wrapErr("stream xack", err)
 }

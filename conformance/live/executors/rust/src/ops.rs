@@ -581,21 +581,12 @@ pub async fn call(client: &NucleusClient, url: &str, op: &str, args: &[Value]) -
                 .map_err(err)?;
             Ok(entries(e))
         }
-        // xadd returns a single "<ms>-<seq>" string and xack takes the two
-        // halves as separate integers, so the two ends of the same API do not
-        // compose — which is exactly what this case's xfail records.
-        //
-        // The first version of this arm split the string here and the case
-        // PASSED, reporting an xpass and claiming the defect was fixed. An
-        // executor that does the SDK's job proves the engine works and hides
-        // that the client does not, which is the one thing this suite must
-        // never do. It is left failing, honestly, until the SDK composes.
-        "streams.xack" => Err(StepError::failed(
-            "xadd returns a single \"<ms>-<seq>\" string and xack takes the two halves \
-             as separate integers, so the two ends of the same API do not compose. \
-             The executor deliberately does not split the string on the SDK's behalf: \
-             doing so made this case pass and report the defect fixed.",
-        )),
+        // XAdd's return value fed straight back — the two halves compose now.
+        "streams.xack" => Ok(json!(client
+            .streams()
+            .xack(&s(args, 0)?, &s(args, 1)?, &s(args, 2)?)
+            .await
+            .map_err(err)?)),
 
         // ── datalog ──────────────────────────────────────────────────────────
         "datalog.assertFact" => Ok(json!(client

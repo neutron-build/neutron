@@ -104,16 +104,22 @@ class StreamsModel:
         )
         return _parse_stream_entries(raw)
 
-    async def xack(
-        self, stream: str, group: str, id_ms: int, id_seq: int = 0
-    ) -> bool:
-        """Acknowledge a processed entry."""
+    async def xack(self, stream: str, group: str, entry_id: str) -> bool:
+        """Acknowledge a processed entry by the id ``xadd`` returned.
+
+        ``entry_id`` is the ``"<ms>-<seq>"`` string. This used to take
+        ``id_ms`` and ``id_seq`` as separate integers, so the two ends of the
+        same API did not compose — every caller split ``xadd``'s return value
+        itself, and the consumer-group conformance case was xfail in all five
+        SDKs for that reason. The engine now accepts the shape its own ``xadd``
+        produces.
+        """
         self._require()
         return cast(
             "bool",
             await self._exec.fetchval(
-                "SELECT STREAM_XACK($1, $2, $3, $4)", stream, group, id_ms, id_seq
-            )
+                "SELECT STREAM_XACK($1, $2, $3)", stream, group, entry_id
+            ),
         )
 
 

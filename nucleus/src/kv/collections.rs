@@ -922,8 +922,8 @@ impl ShardedCollections {
     pub fn zrange(
         &self,
         key: &str,
-        start: usize,
-        stop: usize,
+        start: i64,
+        stop: i64,
     ) -> Result<Vec<SortedSetEntry>, WrongTypeError> {
         let shard = self.shard(key);
         let data = shard.data.read();
@@ -941,8 +941,8 @@ impl ShardedCollections {
     pub fn zrevrange(
         &self,
         key: &str,
-        start: usize,
-        stop: usize,
+        start: i64,
+        stop: i64,
     ) -> Result<Vec<SortedSetEntry>, WrongTypeError> {
         let shard = self.shard(key);
         let data = shard.data.read();
@@ -1561,7 +1561,7 @@ fn clone_collection(coll: &KvCollection) -> KvCollection {
         KvCollection::SortedSet(zset) => {
             // Rebuild from entries since SortedSet fields are private
             let mut new_zset = SortedSet::new();
-            let entries = zset.zrange(0, zset.zcard().saturating_sub(1));
+            let entries = zset.zrange(0, -1); // whole set
             for entry in &entries {
                 new_zset.zadd(&entry.member, entry.score);
             }

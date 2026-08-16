@@ -37,8 +37,13 @@ export interface StreamsModel {
   /** Read entries from a consumer group. */
   xreadGroup(stream: string, group: string, consumer: string, count: number): Promise<StreamEntry[]>;
 
-  /** Acknowledge processing of an entry in a consumer group. Returns the number of entries acknowledged. */
-  xack(stream: string, group: string, idMs: number, idSeq: number): Promise<number>;
+  /**
+   * Acknowledge processing of an entry in a consumer group, by the id `xadd`
+   * returned. Returns the number of entries acknowledged.
+   *
+   * The id is the `"<ms>-<seq>"` string xadd returns. This took idMs and idSeq as separate numbers, so the two ends of the same API did not compose — every caller split xadd's return value itself, and the consumer-group conformance case was xfail in all five SDKs for that reason.
+   */
+  xack(stream: string, group: string, entryId: string): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,11 +116,11 @@ class StreamsModelImpl implements StreamsModel {
     return JSON.parse(raw) as StreamEntry[];
   }
 
-  async xack(stream: string, group: string, idMs: number, idSeq: number): Promise<number> {
+  async xack(stream: string, group: string, entryId: string): Promise<number> {
     this.require();
     return (
-      (await this.transport.fetchval<number>('SELECT STREAM_XACK($1, $2, $3, $4)', [
-        stream, group, idMs, idSeq,
+      (await this.transport.fetchval<number>('SELECT STREAM_XACK($1, $2, $3)', [
+        stream, group, entryId,
       ])) ?? 0
     );
   }

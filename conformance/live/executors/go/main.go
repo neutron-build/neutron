@@ -610,17 +610,9 @@ func (o *Ops) call(ctx context.Context, op string, args []any) (any, error) {
 		return jsonList(es), err
 
 	case "streams.xack":
-		// XAdd hands back one "ms-seq" string; XAck takes (idMs, idSeq) as two
-		// integers. Feeding the id straight back is the natural round trip and
-		// is what a caller writes, so that is what is measured here — not a
-		// split invented by the executor to make the two halves compose.
-		entryID := argStr(args, 2)
-		idMs, err := strconv.ParseInt(entryID, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("XAck takes an integer id_ms; XAdd returned %q: %v", entryID, err)
-		}
-		n, err := o.c.Streams().XAck(ctx, argStr(args, 0), argStr(args, 1), idMs, 0)
-		return n, err
+		// XAdd's return value fed straight back, which is the whole point: the
+		// two halves compose now.
+		return o.c.Streams().XAck(ctx, argStr(args, 0), argStr(args, 1), argStr(args, 2))
 
 	// ── blobs ───────────────────────────────────────────────────────────
 	case "blob.put":

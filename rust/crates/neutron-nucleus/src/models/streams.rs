@@ -160,19 +160,24 @@ impl StreamModel {
 
     /// Acknowledge processing of a stream entry in a consumer group.
     /// Returns the number of entries acknowledged.
+    /// Acknowledge a processed entry by the id [`Self::xadd`] returned.
+    ///
+    /// `entry_id` is the `"<ms>-<seq>"` string. This took `id_ms` and `id_seq`
+    /// as separate integers, so the two ends of the same API did not compose —
+    /// every caller split `xadd`'s return value itself, and the consumer-group
+    /// conformance case was xfail in all five SDKs for that reason.
     pub async fn xack(
         &self,
         stream: &str,
         group: &str,
-        id_ms: i64,
-        id_seq: i64,
+        entry_id: &str,
     ) -> Result<i64, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
             .query_one(
-                "SELECT STREAM_XACK($1, $2, $3, $4)",
-                &[&stream, &group, &id_ms, &id_seq],
+                "SELECT STREAM_XACK($1, $2, $3)",
+                &[&stream, &group, &entry_id],
             )
             .await
             .map_err(NucleusError::Query)?;
