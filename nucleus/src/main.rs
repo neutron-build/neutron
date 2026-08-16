@@ -1178,7 +1178,29 @@ async fn cmd_start(cfg: StartConfig) {
     executor.load_stats().await;
 
     // Load persisted executor metadata (views, sequences, triggers, roles, functions).
-    executor.load_meta().await;
+    //
+    // Fail closed. `security.rls` and `security.masking` are the only parts of
+    // this load installed unconditionally — every other catalog is
+    // `is_empty()`-guarded — so a meta.json that exists and cannot be read used
+    // to start the server with row-level security and column masking silently
+    // switched off, and the next DDL wrote that empty catalog back over the
+    // file. Serving with an unknown security posture is worse than not serving,
+    // and the operator's remedy is explicit: restore the file, or move it aside
+    // to declare the empty catalog intentional. An ABSENT meta.json is an
+    // ordinary first boot and is not an error.
+    if let Err(e) = executor.load_meta_checked().await {
+        tracing::error!("{e}");
+        eprintln!(
+            "nucleus: refusing to start — {e}\n\
+             \n\
+             meta.json holds the row-level-security policies and column-masking rules.\n\
+             Starting without it would serve every table with those protections off.\n\
+             \n\
+             Restore it from backup, or move it aside to start with an explicitly\n\
+             empty policy catalog."
+        );
+        std::process::exit(1);
+    }
 
     // Re-register per-table engine overrides (mergetree/columnar tables) from
     // engines.json: reopens their WAL-backed storage and restores

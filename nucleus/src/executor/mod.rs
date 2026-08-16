@@ -311,6 +311,11 @@ pub struct Executor {
     /// Serializes check-then-write for UNIQUE / PRIMARY KEY. The engines the
     /// server runs enforce neither atomically — see `unique_gate`.
     unique_gate: unique_gate::UniqueGate,
+    /// Set when `load_meta` could not read an existing meta.json. While set,
+    /// metadata is never persisted: the in-memory policy catalog is empty
+    /// because the load FAILED, not because there are no policies, and writing
+    /// it back would atomically replace the file that could not be read.
+    meta_load_failed: AtomicBool,
     views: RwLock<HashMap<String, ViewDef>>,
     sequences: parking_lot::RwLock<HashMap<String, parking_lot::Mutex<SequenceDef>>>,
     storage: Arc<dyn StorageEngine>,
@@ -599,6 +604,7 @@ impl Executor {
             self_ref: std::sync::OnceLock::new(),
             catalog,
             unique_gate: unique_gate::UniqueGate::new(),
+            meta_load_failed: AtomicBool::new(false),
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
             data_dir: None,
@@ -1088,11 +1094,46 @@ impl Executor {
     ///
     /// Must be called as `executor.load_meta().await` after `new_with_persistence`.
     /// In `main.rs` this is called once before accepting connections.
+    ///
+    /// Prefer [`load_meta_checked`](Self::load_meta_checked). This wrapper keeps
+    /// the old signature for callers that cannot fail, and it no longer hides
+    /// the failure: a load error is logged at ERROR and latches
+    /// `meta_load_failed`, so the emptied policy state can never be written
+    /// back over the file it failed to read.
     pub async fn load_meta(&self) {
+        if let Err(e) = self.load_meta_checked().await {
+            tracing::error!(
+                "{e}. Refusing to persist metadata until this is resolved: writing the \
+                 empty in-memory catalog back would destroy the on-disk policy catalog. \
+                 Restore meta.json from backup, or move it aside to start with an \
+                 explicitly empty one."
+            );
+        }
+    }
+
+    /// Load persisted executor metadata, reporting a meta.json that exists but
+    /// cannot be read or parsed instead of treating it as an empty catalog.
+    ///
+    /// An ABSENT file is an ordinary first boot and returns `Ok`. A file that is
+    /// present and unreadable is not: `security.rls` and `security.masking` are
+    /// the only pieces of the load installed unconditionally (everything else is
+    /// `is_empty()`-guarded), so folding a read failure into an empty value
+    /// booted the server with RLS and masking silently switched off. See
+    /// `MetaPersistence::load_checked`.
+    pub async fn load_meta_checked(&self) -> Result<(), ExecError> {
         let Some(ref cp) = self.catalog_path else {
-            return;
+            return Ok(());
         };
-        let loaded = meta_persistence::MetaPersistence::alongside_catalog(cp).load();
+        let loaded = match meta_persistence::MetaPersistence::alongside_catalog(cp).load_checked() {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                // Latch BEFORE returning: the caller may ignore the error, and
+                // the unrecoverable half of this defect is the write-back, not
+                // the empty read.
+                self.meta_load_failed.store(true, Ordering::SeqCst);
+                return Err(ExecError::Runtime(e));
+            }
+        };
 
         // tokio::sync::RwLock — await the write locks
         if !loaded.views.is_empty() {
@@ -1138,6 +1179,7 @@ impl Executor {
         self.load_sequences_sync();
 
         self.report_policies_without_grants().await;
+        Ok(())
     }
 
     /// Warn about policies whose target roles hold no GRANT on the table.
@@ -3407,6 +3449,20 @@ impl Executor {
         let Some(ref path) = self.catalog_path else {
             return Ok(());
         };
+        // A failed meta load leaves an empty in-memory policy catalog that is
+        // empty for the wrong reason. Persisting it here is what turns a
+        // transient read error into permanent loss, because the save is atomic
+        // and replaces the file that could not be read. Fail loudly instead:
+        // the operator restores meta.json, or moves it aside to declare the
+        // empty catalog intentional.
+        if self.meta_load_failed.load(Ordering::SeqCst) {
+            return Err(ExecError::Runtime(
+                "refusing to persist metadata: meta.json could not be read at startup, so the \
+                 in-memory policy catalog is unknown rather than empty. Restore it from backup, \
+                 or move it aside to start with an explicitly empty one."
+                    .into(),
+            ));
+        }
 
         // 1. Persist table/index catalog.
         let persistence = crate::storage::persistence::CatalogPersistence::new(path);

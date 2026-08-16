@@ -378,26 +378,45 @@ impl MetaPersistence {
 
     // ── Load ─────────────────────────────────────────────────────────────────
 
-    /// Load persisted metadata. Returns empty maps if the file doesn't exist.
-    pub fn load(&self) -> LoadedMeta {
-        if !self.path.exists() {
-            return LoadedMeta::default();
+    /// Load persisted metadata, distinguishing "absent" from "unreadable".
+    ///
+    /// This used to be one function returning `LoadedMeta` that folded three
+    /// outcomes into an empty value at `warn` level: the file is absent (first
+    /// boot, legitimately empty), it could not be read (permissions, I/O), and
+    /// it did not parse (corruption). Only the first is empty; the other two
+    /// are "the policy catalog is unknown", which is not the same thing and
+    /// must not be presented as it.
+    ///
+    /// It mattered because the installer treats security differently from every
+    /// other catalog. Views, matviews, triggers, roles, sequences, functions and
+    /// extensions are each `is_empty()`-guarded and survive an empty load;
+    /// `security.rls` and `security.masking` are assigned unconditionally. So an
+    /// unreadable byte booted the server with no RLS and no masking, and then
+    /// the next DDL snapshotted that emptied state and atomically wrote it back
+    /// — turning a transient read failure into permanent destruction of the
+    /// policy catalog. Measured: seed a policy, corrupt the file, boot, run one
+    /// `CREATE TABLE`, and the policy is gone from disk.
+    pub fn load_checked(&self) -> Result<LoadedMeta, String> {
+        // `exists()` is also false when the parent directory cannot be walked,
+        // so a permission error arrives here looking like a fresh database.
+        // Distinguish by asking for the metadata and reading the error kind.
+        match std::fs::metadata(&self.path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LoadedMeta::default());
+            }
+            Err(e) => {
+                return Err(format!("meta.json stat error: {e}"));
+            }
         }
-        let json = match std::fs::read_to_string(&self.path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("meta.json read error: {e}");
-                return LoadedMeta::default();
-            }
-        };
-        let snap: MetaSnapshot = match serde_json::from_str(&json) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("meta.json parse error: {e}");
-                return LoadedMeta::default();
-            }
-        };
+        let json = std::fs::read_to_string(&self.path)
+            .map_err(|e| format!("meta.json read error: {e}"))?;
+        let snap: MetaSnapshot =
+            serde_json::from_str(&json).map_err(|e| format!("meta.json parse error: {e}"))?;
+        Ok(self.assemble(snap))
+    }
 
+    fn assemble(&self, snap: MetaSnapshot) -> LoadedMeta {
         let mut meta = LoadedMeta {
             rls: snap.rls,
             masking: snap.masking,
