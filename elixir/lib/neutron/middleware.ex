@@ -481,7 +481,12 @@ defmodule Neutron.Middleware do
   2. **Logger** — structured request/response logging
   3. **Recovery** — catches exceptions, returns 500
   4. **CORS** — configurable cross-origin headers
-  5. **Compress** — gzip via Plug.Deflate (if accepted)
+  5. **Compress** — content-encoding negotiation, provided by Bandit
+     (`compress: true` is its default), NOT by a plug in this pipeline.
+     Verified: `/api/items` answers `content-encoding: gzip` +
+     `vary: accept-encoding`. This line used to say "gzip via Plug.Deflate",
+     which names a module that does not exist and sent at least one reader
+     looking for compression that is not here and concluding it was missing.
   6. **RateLimit** — ETS-based sliding window per IP
   7. **Auth** — JWT verification (optional)
   8. **Timeout** — Task.async with deadline
@@ -512,7 +517,9 @@ defmodule Neutron.Middleware do
   plug(Neutron.Middleware.Recovery)
   # Layer 4: CORS
   plug(Neutron.Middleware.Cors)
-  # Layer 5: Compression
+  # Layer 5: Compression is Bandit's, not a plug — see the moduledoc. This slot
+  # holds Plug.Head, which turns HEAD into GET and is unrelated to compression;
+  # the label was simply wrong.
   plug(Plug.Head)
   # Layer 6: Rate Limiting
   plug(Neutron.Middleware.RateLimit)

@@ -8,6 +8,7 @@ on:
       - "go/**"
       - "python/**"
       - "rust/**"
+      - "elixir/**"
       - "typescript/packages/neutron/**"
       - ".github/workflows/conformance.yml"
   pull_request:
@@ -16,6 +17,7 @@ on:
       - "go/**"
       - "python/**"
       - "rust/**"
+      - "elixir/**"
       - "typescript/packages/neutron/**"
       - ".github/workflows/conformance.yml"
   schedule:
@@ -23,7 +25,7 @@ on:
 
 jobs:
   conformance:
-    name: contract matrix (go × rust × python × ts)
+    name: contract matrix (go × rust × python × ts × elixir)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +58,12 @@ jobs:
         # A hand-maintained dependency list drifts from the real requirements
         # silently and forever; `-e ./python` cannot.
         run: pip install -e ./python
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.17"
+          otp-version: "27"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4

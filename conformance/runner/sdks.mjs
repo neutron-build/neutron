@@ -31,6 +31,7 @@ const RUST_BIN = path.join(REPO, "rust/target/release/examples/conformance_app")
 const PY_APP = path.join(CONF, "adapters/python/conformance_app.py");
 const TS_APP = path.join(CONF, "adapters/typescript/conformance_app.mjs");
 const TS_DIST = path.join(REPO, "typescript/packages/neutron/dist/server/index.js");
+const EX_APP = path.join(CONF, "adapters/elixir/conformance_app.exs");
 
 function pythonBin() {
   for (const c of ["python3", "python"]) {
@@ -118,6 +119,23 @@ export const SDKS = [
       if (!fs.existsSync(TS_DIST)) {
         return "TS package not built (run: pnpm --filter @neutron-build/core build)";
       }
+      return null;
+    },
+  },
+  {
+    name: "elixir",
+    portEnv: "PORT",
+    hostEnv: "HOST",
+    // Mix.install compiles the path dependency on first run and caches it by
+    // lockfile hash, so the build step is a no-op and the first boot is slow.
+    // The runner's health wait covers it.
+    build() {},
+    cmd() {
+      return { command: "elixir", args: [EX_APP] };
+    },
+    available() {
+      if (!have("elixir")) return "elixir toolchain not found";
+      if (!have("mix")) return "mix not found";
       return null;
     },
   },
