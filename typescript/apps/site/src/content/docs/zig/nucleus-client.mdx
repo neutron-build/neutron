@@ -3,38 +3,119 @@ title: Nucleus Client
 description: The typed Zig client for all 14 Nucleus data models.
 ---
 
-Neutron for Zig ships a full multi-model client for all 14 Nucleus data models. It connects over the PostgreSQL wire protocol, so it works against Nucleus or plain PostgreSQL, with feature detection to light up the non-SQL models when connected to Nucleus.
+Neutron for Zig ships a typed client for all 14 Nucleus data models. It connects over the PostgreSQL wire protocol, so it works against Nucleus or plain PostgreSQL, with feature detection to light up the non-SQL models when connected to Nucleus.
 
 > **Status: not covered by the live conformance suite.** The `sdk-live` CI matrix
-> runs python, go and typescript against a running engine; zig is not in it. The
-> shapes below come from the SDK source and its own unit tests, not from executed
-> calls against Nucleus. When that suite was first pointed at an SDK it found
-> breakage in eight methods on day one, so treat unverified surfaces here as
-> likely to hold surprises. Verified as unverified 2026-08-15.
+> runs python, go, typescript and elixir against a running engine; zig is not in
+> it. The signatures below are taken from the SDK source and its own unit tests,
+> not from executed calls against Nucleus. When that suite was first pointed at
+> an SDK it found breakage in eight methods on day one, so treat this surface as
+> likely to hold surprises. Checked against source 2026-08-15.
+
+## Connecting
 
 ```zig
 const NucleusClient = @import("nucleus/client.zig").NucleusClient;
 
 var client = try NucleusClient.fromUrl(allocator, "postgres://localhost:5432/mydb");
 try client.connect();
-defer client.deinit();
+defer client.close();
 
-// Feature detection (Nucleus vs PostgreSQL)
-if (client.features.is_nucleus) {
-    // Use KV, Vector, Graph, etc.
+if (client.isNucleus()) {
+    // Non-SQL models are available.
 }
-
-// SQL
-const rows = try client.query("SELECT * FROM users WHERE active = true");
-
-// Key-Value
-try client.kv.set("session:abc", "user_42");
-const val = try client.kv.get("session:abc");
-
-// Vector search
-const results = try client.vector.search("embeddings", query_vec, .{ .k = 10, .metric = .cosine });
-
-// TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, PubSub...
 ```
 
-Each data model has its own typed accessor file in `nucleus/` — `sql.zig`, `kv.zig`, `vector.zig`, and so on. Import only the models you use; unused accessors compile away.
+`connect()` authenticates, fills the connection pool, and runs feature
+detection. `client.features` carries `is_nucleus` and the server version string
+(`features.versionStr()`) — **not** a per-model capability flag, unlike the
+Python, Go and TypeScript clients. `isNucleus()` is the shorthand for the check
+you actually want.
+
+## Model accessors are functions, not fields
+
+Each model is reached through a **method call** on the client, which returns a
+typed model struct:
+
+```zig
+const kv = client.kv();
+_ = try kv.set("session:abc", "user_42", 3600); // ttl in seconds, 0 for none
+const val = try kv.get("session:abc");          // ?[]const u8 — null when absent
+```
+
+Written as a field access — `client.kv.set(...)` — this does not compile. The
+accessors are `sql()`, `kv()`, `vector()`, `timeseries()`, `document()`,
+`fts()`, `graph()`, `geo()`, `blob()`, `streams()`, `pubsub()`, `columnar()`,
+`datalog()` and `cdc()`, one per model, each in its own file under
+`src/nucleus/`.
+
+## Reading results
+
+Runtime model methods return `!?[]const u8` — an error union wrapping an
+optional slice. `null` means the query returned no row, which is distinct from
+an empty string:
+
+```zig
+if (try kv.get("missing")) |value| {
+    std.debug.print("got {s}\n", .{value});
+} else {
+    // key absent
+}
+```
+
+Raw SQL goes through the client directly:
+
+```zig
+const rows = try client.query("SELECT id, email FROM users WHERE active = true");
+const tag = try client.exec("UPDATE users SET active = false WHERE id = 1");
+```
+
+## Vector search
+
+```zig
+const vec = client.vector();
+const hits = try vec.search("embeddings", "[0.1,0.2,0.3]", 10, "cosine");
+```
+
+The query vector is passed as its **text representation**, and the metric as a
+string (`"cosine"`, `"l2"`, `"inner_product"`). Each model also exposes
+`*Sql` builder functions (`Vector.searchSql`, `KV.setSql`, …) that write the
+statement into a caller-supplied buffer and perform no I/O — that is the
+zero-allocation path, and it is what the runtime methods are built on.
+
+## Two API layers
+
+This is the distinction worth understanding before reading the source:
+
+| Layer | Shape | Allocates | Use when |
+|---|---|---|---|
+| `*Sql` builders | `fn setSql(key, value, ttl, buf) ![]const u8` | no — writes into `buf` | you own the connection, or you are on a fixed budget |
+| Runtime methods | `fn set(self, key, value, ttl) !?[]const u8` | via the client | you want the call to execute |
+
+The builders are why the SDK fits in a 12KB binary with no heap: on an embedded
+target you can format the statement into a stack buffer and send it over your
+own transport, never linking the pool at all.
+
+## Connection pool
+
+```zig
+client.poolSize();              // configured slots
+client.availableConnections();  // idle
+client.inUseConnections();      // checked out
+```
+
+Pool size comes from the connection URL or `Config`. `close()` returns every
+connection and is safe to call twice.
+
+## Errors
+
+`lastErrorCode()` returns the SQLSTATE of the most recent server error, captured
+before the connection is recycled:
+
+```zig
+_ = client.exec("INSERT INTO users (id) VALUES (1)") catch {
+    if (std.mem.eql(u8, client.lastErrorCode(), "23505")) {
+        // unique violation
+    }
+};
+```

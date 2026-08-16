@@ -6,11 +6,12 @@ description: The typed Julia client for all 14 Nucleus data models.
 Neutron for Julia accesses all 14 Nucleus data models through typed accessors, using multiple dispatch so each model exposes an idiomatic Julia API. Connect once, then reach any model.
 
 > **Status: not covered by the live conformance suite.** The `sdk-live` CI matrix
-> runs python, go and typescript against a running engine; julia is not in it.
-> The shapes below come from the SDK source and its own unit tests, not from
-> executed calls against Nucleus. When that suite was first pointed at an SDK it
-> found breakage in eight methods on day one, so treat unverified surfaces here
-> as likely to hold surprises. Verified as unverified 2026-08-15.
+> runs python, go, typescript and elixir against a running engine; julia is not
+> in it. The signatures below are taken from the SDK source, not from executed
+> calls against Nucleus. When that suite was first pointed at an SDK it found
+> breakage in eight methods on day one — and a source audit of this page on
+> 2026-08-15 found four documented calls that could not have worked. Checked
+> against source 2026-08-15.
 
 ```julia
 client = NeutronJulia.connect(url)
@@ -33,40 +34,72 @@ pubsub(client)     # PubSub (LISTEN/NOTIFY)
 
 ## SQL
 
+Parameters are **varargs, not an array**. `query(s, sql, [true])` binds a
+one-element array to `$1`; `query(s, sql, true)` binds the boolean:
+
 ```julia
 s = sql(client)
 
-rows = query(s, "SELECT id, name, email FROM users WHERE active = \$1", [true])
-row = query_one(s, "SELECT * FROM users WHERE id = \$1", [42])
-execute!(s, "INSERT INTO users (name, email) VALUES (\$1, \$2)", ["Alice", "alice@example.com"])
+rows = query(s, "SELECT id, name, email FROM users WHERE active = \$1", true)
+row  = query_one(s, "SELECT * FROM users WHERE id = \$1", 42)
+n    = execute!(s, "INSERT INTO users (name, email) VALUES (\$1, \$2)",
+                "Alice", "alice@example.com")
 ```
+
+`query` returns a column table (`Tables.columntable`), so it drops straight into
+`DataFrame(rows)`. `query_one` returns a single `NamedTuple` and **throws a
+`NucleusError` with status 404 when there are no rows** — it does not return
+`nothing`, so a lookup that may legitimately miss belongs in a `try` or should
+go through `query` and check for empty. `execute!` returns the affected-row
+count.
 
 ## Key-Value
 
 ```julia
 k = kv(client)
 
-set!(k, "key", "value")
-get(k, "key")              # "value"
-delete!(k, "key")
+kv_set!(k, "key", "value")          # or the alias set!
+kv_get(k, "key")                    # "value", or nothing when absent
+kv_delete!(k, "key")
+
+kv_set!(k, "session", "abc", ttl=3600)   # ttl in seconds, keyword argument
 
 # Collections
-lpush!(k, "queue", "item1", "item2")
+lpush!(k, "queue", "item1")
 hset!(k, "user:1", "name", "Alice")
 sadd!(k, "tags", "rust", "julia")
 zadd!(k, "leaderboard", 100.0, "player1")
 pfadd!(k, "visitors", "user1", "user2")   # HyperLogLog
 ```
 
+**On the `kv_` prefix.** Every scalar KV operation is exported twice: as
+`kv_get` / `kv_set!` / `kv_delete!` / `kv_exists` / `kv_incr!` / `kv_ttl` /
+`kv_expire!`, and — where the short name does not collide with Julia's `Base` —
+as an alias (`set!`, `setnx!`, `exists`, `incr!`, `ttl`, `expire!`, `dbsize`,
+`flushdb!`).
+
+There is deliberately **no `get` and no `delete!` alias**: those would clash with
+`Base.get` and `Base.delete!` and silently change dispatch for the whole
+session. Reach for the `kv_` form when in doubt — it always exists. The
+collection operations (`lpush!`, `hset!`, `sadd!`, `zadd!`, `pfadd!`, …) have no
+prefix, because none of them collide.
+
 ## Vector Search
 
 ```julia
 v = vector(client)
 
-create_index!(v, "embeddings", 384; metric=Cosine, index_type=HNSW)
+# The dimension is taken from the column, not passed in. `column` defaults to
+# "embedding"; `ef` and `m_param` tune HNSW build quality.
+create_index!(v, "embeddings"; column="embedding", metric=Cosine, ef=200, m_param=16)
+
 results = search(v, "embeddings", query_vec; k=10, metric=Cosine)
-d = dims(v, "embeddings")  # 384
+d = dims(v, "embeddings")
 ```
+
+`metric` takes the exported `DistanceMetric` values `L2`, `Cosine` and
+`InnerProduct` — not strings. There is no `index_type` keyword: `create_index!`
+builds an HNSW index, and IvfFlat is created through SQL directly.
 
 ## TimeSeries
 
@@ -84,22 +117,48 @@ avg = range_avg(ts, "cpu_usage", start_ms, end_ms)
 ```julia
 g = graph(client)
 
-add_node!(g, "Person", Dict("name" => "Alice"))
-add_edge!(g, node_a, node_b, "KNOWS", Dict("since" => 2024))
-neighbors(g, node_a)
-path = shortest_path(g, node_a, node_b)
+# `properties` is a KEYWORD argument — passing the Dict positionally is a
+# MethodError, not a silently ignored extra.
+alice = add_node!(g, "Person"; properties=Dict("name" => "Alice"))
+bob   = add_node!(g, "Person"; properties=Dict("name" => "Bob"))
+
+add_edge!(g, alice, bob, "KNOWS"; properties=Dict("since" => 2024))
+
+neighbors(g, alice)                 # Vector{Int64}
+path = shortest_path(g, alice, bob) # Vector{Int64}
 ```
+
+Node and edge ids are `Int64` and are what every other graph call takes —
+`add_edge!`, `neighbors`, `shortest_path`, `delete_node!` and `delete_edge!` all
+address nodes by the id `add_node!` returned. Cypher is available too, through
+`graph_query(g, "MATCH ...")`.
 
 ## Transactions
 
+`transaction` takes a function, so it is used as a `do` block. COMMIT and
+ROLLBACK are automatic — the block committing on normal return and rolling back
+on any exception, which is then rethrown:
+
 ```julia
-tx = transaction(client, read_write)
-try
-    execute!(sql(client), "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
-    execute!(sql(client), "UPDATE accounts SET balance = balance + 100 WHERE id = 2")
-    commit!(tx)
-catch e
-    rollback!(tx)
-    rethrow(e)
+transaction(client) do tx
+    execute!(sql(tx), "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
+    execute!(sql(tx), "UPDATE accounts SET balance = balance + 100 WHERE id = 2")
+end
+```
+
+The block receives a `NucleusTransaction`, and **every model accessor works on
+it** — `sql(tx)`, `kv(tx)`, `vector(tx)`, and so on — so a transaction can span
+models. Use `tx` rather than `client` inside the block; reaching for the outer
+`client` issues statements on the same connection but outside the reader's
+intent, which is the kind of thing that reads correct and is not.
+
+There is no `commit!` or `rollback!` to call: neither is exported, and the
+lifecycle is the block's.
+
+The return value of the block is the return value of `transaction`:
+
+```julia
+balance = transaction(client) do tx
+    query_one(sql(tx), "SELECT balance FROM accounts WHERE id = \$1", 1)
 end
 ```
