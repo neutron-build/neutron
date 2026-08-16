@@ -171,10 +171,8 @@ async fn the_irregular_io_names_match_postgresql_exactly() {
         nucleus::types::Value::Text(s) => s.clone(),
         other => panic!("expected text, got {other:?}"),
     };
-    let by_name: std::collections::HashMap<String, String> = rows
-        .iter()
-        .map(|r| (text(&r[0]), text(&r[1])))
-        .collect();
+    let by_name: std::collections::HashMap<String, String> =
+        rows.iter().map(|r| (text(&r[0]), text(&r[1]))).collect();
 
     for (typname, expected_send) in [
         ("uuid", "uuid_send"),
