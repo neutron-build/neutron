@@ -43,8 +43,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Python contract deps
-        run: pip install starlette pydantic uvicorn
+      - name: Install the Python SDK
+        # Install the SDK itself, not a hand-listed subset of its dependencies.
+        #
+        # This used to be `pip install starlette pydantic uvicorn` — three of the
+        # eight packages `python/pyproject.toml` requires. The conformance app
+        # imports `neutron`, which imports `structlog`, so it died at import and
+        # the matrix reported `[python] UNAVAILABLE — server did not become
+        # healthy` while the workflow went GREEN. Python had never once been in
+        # the contract matrix the job is named after.
+        #
+        # A hand-maintained dependency list drifts from the real requirements
+        # silently and forever; `-e ./python` cannot.
+        run: pip install -e ./python
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -73,5 +84,10 @@ jobs:
         working-directory: typescript
 
       - name: Run conformance matrix
-        run: node run.mjs
+        # --strict: every SDK must actually be exercised. This job provisions
+        # all four toolchains, so an SDK reported absent here means the setup
+        # broke — and an SDK that booted but never became healthy is a defect
+        # either way. Without this the matrix was green while Python had never
+        # run in it at all.
+        run: node run.mjs --strict
         working-directory: conformance/runner

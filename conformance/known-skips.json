@@ -1,0 +1,35 @@
+{
+  "$comment": "Contract dimensions an SDK does not exercise, with a reason and a hard expiry each. Same contract as conformance/live/known-drift.json, and for the same reason: a skip that costs nothing is invisible, and invisible partial coverage is how the matrix stayed green while Python had never run in it at all. Rules enforced by runner/run.mjs: an UNRECORDED skip fails the run; an EXPIRED entry fails; and an entry whose dimension now PASSES also fails, because a note describing a state that no longer exists is the same rot as a stale finding. Seeded 2026-08-16 from the first strict run.",
+  "skips": {
+    "ts": {
+      "error.rfc7807": {
+        "reason": "The TS conformance app exposes no forced-error endpoints, and the SDK has no problem+json support at all (zero occurrences in packages/neutron/src). The adapter's header calls this skip-by-design for a web/SSR framework whose routes are pages rather than JSON API endpoints. FRAMEWORK_CONTRACT.md §2 says 'All frameworks MUST return errors as RFC 7807 Problem Details JSON' and grants no SSR exemption, so the adapter is self-exempting from a MUST. That is a real contradiction between the contract and the flagship SDK and it needs a product decision — scope the contract, or implement it (plan step S81). Recorded here so the disagreement is visible instead of living in a comment inside the harness that would otherwise catch it.",
+        "expires": "2026-11-30"
+      },
+      "error.contenttype": {
+        "reason": "Same root as error.rfc7807: no forced-error endpoints, no application/problem+json anywhere in the TS SDK.",
+        "expires": "2026-11-30"
+      },
+      "error.codes": {
+        "reason": "Same root as error.rfc7807: the standard error-code taxonomy in FRAMEWORK_CONTRACT.md §2 has nothing to assert against without forced-error endpoints.",
+        "expires": "2026-11-30"
+      },
+      "validation.format": {
+        "reason": "No /api/items validation endpoint in the TS adapter. Go and Python both expose one and both pass. Whether an SSR framework owes typed request validation is part of the same S81 decision.",
+        "expires": "2026-11-30"
+      },
+      "openapi.present": {
+        "reason": "No /openapi.json endpoint. FRAMEWORK_CONTRACT.md §4 requires serving it at /openapi.json; the TS SDK has no OpenAPI support (zero occurrences of 'openapi' in packages/neutron/src). Same S81 decision.",
+        "expires": "2026-11-30"
+      },
+      "openapi.31": {
+        "reason": "Follows openapi.present — there is no document to check the version of.",
+        "expires": "2026-11-30"
+      },
+      "mw.compression": {
+        "reason": "The adapter boots with no route tree, so it serves no compressible body for the gzip check to act on. This one is genuinely an ADAPTER gap rather than an SDK gap — compression is enabled in createServer({compress:true}) and the middleware exists; the harness simply gives it nothing to compress. Cheapest of the seven to close: add one route returning a compressible payload.",
+        "expires": "2026-11-30"
+      }
+    }
+  }
+}
