@@ -40,3 +40,18 @@ jobs:
           else
             python3 .github/scripts/check_line_endings.py --range "HEAD~1..HEAD"
           fi
+
+  contract-ir:
+    name: The contract IR agrees with the prose contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # Lives here rather than in the conformance workflow because that one is
+      # path-filtered to the SDK trees, and the thing most likely to break this
+      # is an edit to FRAMEWORK_CONTRACT.md itself. Dependency-free and boots no
+      # SDK, so it costs a few seconds.
+      - name: contract-ir.json matches FRAMEWORK_CONTRACT.md
+        run: node conformance/runner/validate-ir.mjs

@@ -1,0 +1,105 @@
+{
+  "$comment": "Machine-readable FRAMEWORK_CONTRACT (plan step S39). The contract was prose, and the conformance checker carried its own copy of every constant in it — the error taxonomy, the health shape, the nucleus tri-state, the OpenAPI path. Two sources of truth for one contract, free to drift, with nothing comparing them. This file is the single source; `runner/contract.mjs` reads it instead of hardcoding, and `runner/validate-ir.mjs` re-parses FRAMEWORK_CONTRACT.md and fails if the prose and this file disagree. Derived from the document 2026-08-16, not hand-typed.",
+  "version": 1,
+  "source": "FRAMEWORK_CONTRACT.md",
+
+  "health": {
+    "$section": "7",
+    "path": "/health",
+    "status": 200,
+    "requiredKeys": ["status", "nucleus", "version"],
+    "exactKeys": true,
+    "types": {
+      "status": "string",
+      "nucleus": "enum",
+      "version": "string"
+    },
+    "nucleusStates": ["connected", "disconnected", "unconfigured"],
+    "statusStates": ["ok", "degraded"],
+    "$note": "`nucleus` is the HEALTH of the dependency, NOT whether the database is a Nucleus instance. The contract says so explicitly: 'Feature detection (is the connected DB a Nucleus instance vs plain Postgres) is §1, not /health.' Elixir returned a boolean from is_nucleus?/1 here until 2026-08-16 — wrong type and wrong question — and its own test asserted the boolean."
+  },
+
+  "featureDetection": {
+    "$section": "1",
+    "$note": "Whether the connected database is Nucleus vs plain PostgreSQL. Determined by parsing the version string for 'Nucleus'. Deliberately NOT the /health nucleus field."
+  },
+
+  "errors": {
+    "$section": "2",
+    "typeBaseUrl": "https://neutron.dev/errors/",
+    "contentType": "application/problem+json",
+    "requiredFields": ["type", "title", "status", "detail"],
+    "optionalFields": ["instance", "errors"],
+    "taxonomy": [
+      { "status": 400, "code": "bad-request", "title": "Bad Request", "probePath": "/errors/bad-request" },
+      { "status": 401, "code": "unauthorized", "title": "Unauthorized", "probePath": "/errors/unauthorized" },
+      { "status": 403, "code": "forbidden", "title": "Forbidden", "probePath": "/errors/forbidden" },
+      { "status": 404, "code": "not-found", "title": "Not Found", "probePath": "/errors/not-found" },
+      { "status": 409, "code": "conflict", "title": "Conflict", "probePath": "/errors/conflict" },
+      { "status": 422, "code": "validation", "title": "Validation Failed", "probePath": null },
+      { "status": 429, "code": "rate-limited", "title": "Rate Limited", "probePath": "/errors/rate-limited" },
+      { "status": 500, "code": "internal", "title": "Internal Server Error", "probePath": "/errors/internal" }
+    ],
+    "$probeNote": "`validation` has no forced-error probe path on purpose: it is produced by POSTing an invalid body to the validation endpoint, and is asserted by the `validation.format` dimension instead. Every other code gets a GET endpoint that forces it. The checker used to hardcode a 7-entry list that silently omitted 422; here the omission is explicit and the count is checked against the document's 8-row table."
+  },
+
+  "validation": {
+    "$section": "2",
+    "endpoint": "/api/items",
+    "method": "POST",
+    "status": 422,
+    "code": "validation",
+    "errorsArrayField": "errors",
+    "errorEntryFields": ["field", "message"]
+  },
+
+  "openapi": {
+    "$section": "4",
+    "specPath": "/openapi.json",
+    "docsPath": "/docs",
+    "requiredVersionPrefix": "3.1",
+    "errorContentType": "application/problem+json"
+  },
+
+  "middleware": {
+    "$section": "5",
+    "$note": "Order is outermost-first and the contract says SHOULD, not MUST. Recorded so a framework's actual pipeline can be compared against it; today only the observable layers (request id, CORS, compression) are asserted over HTTP.",
+    "requirement": "SHOULD",
+    "order": [
+      "Request ID generation",
+      "Logging (structured)",
+      "Recovery / panic handler",
+      "CORS",
+      "Compression",
+      "Rate limiting",
+      "Authentication",
+      "Timeout",
+      "OpenTelemetry tracing",
+      "Route handler"
+    ],
+    "observable": {
+      "requestId": { "header": "x-request-id" },
+      "cors": { "header": "access-control-allow-origin" },
+      "compression": {
+        "requestHeader": "accept-encoding",
+        "acceptedEncodings": ["gzip", "br", "deflate"],
+        "varyHeader": "accept-encoding"
+      }
+    }
+  },
+
+  "dimensions": [
+    { "id": "health.shape", "section": "7", "asserts": "GET /health returns exactly {status, nucleus, version}" },
+    { "id": "health.types", "section": "7", "asserts": "status/version are strings; nucleus is one of the tri-state values" },
+    { "id": "error.rfc7807", "section": "2", "asserts": "forced errors carry the RFC 7807 required fields" },
+    { "id": "error.contenttype", "section": "2", "asserts": "forced errors are served as application/problem+json" },
+    { "id": "error.codes", "section": "2", "asserts": "each taxonomy entry returns its status, type suffix and title" },
+    { "id": "validation.format", "section": "2", "asserts": "an invalid body returns 422 with a populated errors[]" },
+    { "id": "feature.detection", "section": "1", "asserts": "the nucleus field reports dependency health, not DB identity" },
+    { "id": "openapi.present", "section": "4", "asserts": "GET /openapi.json serves a document" },
+    { "id": "openapi.31", "section": "4", "asserts": "that document declares OpenAPI 3.1" },
+    { "id": "mw.requestid", "section": "5", "asserts": "responses carry x-request-id" },
+    { "id": "mw.cors", "section": "5", "asserts": "preflight and Access-Control-Allow-Origin" },
+    { "id": "mw.compression", "section": "5", "asserts": "content-encoding negotiated, with Vary: Accept-Encoding" }
+  ]
+}

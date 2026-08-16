@@ -10,6 +10,7 @@ on:
       - "rust/**"
       - "elixir/**"
       - "typescript/packages/neutron/**"
+      - "FRAMEWORK_CONTRACT.md"
       - ".github/workflows/conformance.yml"
   pull_request:
     paths:
@@ -19,6 +20,7 @@ on:
       - "rust/**"
       - "elixir/**"
       - "typescript/packages/neutron/**"
+      - "FRAMEWORK_CONTRACT.md"
       - ".github/workflows/conformance.yml"
   schedule:
     - cron: "0 8 * * 1"
@@ -90,6 +92,12 @@ jobs:
         # nothing else here does.
         run: pnpm install && pnpm --filter "./packages/*" run build
         working-directory: typescript
+
+      - name: Validate the contract IR
+        # Before booting five SDKs against it: if the IR and the prose contract
+        # disagree, every result below is measured against the wrong contract.
+        run: node runner/validate-ir.mjs
+        working-directory: conformance
 
       - name: Run conformance matrix
         # --strict: every SDK must actually be exercised. This job provisions

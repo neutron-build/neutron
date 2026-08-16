@@ -8,35 +8,41 @@
 // Each check returns { dim, status: "pass"|"fail"|"skip", detail }.
 //   pass — contract satisfied
 //   fail — contract violated (drift) — this is a finding, recorded with evidence
-//   skip — the SDK does not expose this surface (documented, not a hard failure)
+//   skip — the SDK does not expose this surface, and must be recorded in
+//          conformance/known-skips.json with a reason and an expiry
+//
+// Every constant below comes from `conformance/contract-ir.json` (plan step
+// S39), which `validate-ir.mjs` keeps in agreement with FRAMEWORK_CONTRACT.md.
+// This file used to carry its own copy of the error taxonomy, the health shape
+// and the nucleus tri-state — a second source of truth for one contract, free
+// to drift from the prose with nothing comparing them. Its hardcoded taxonomy
+// had in fact already lost the 422 `validation` row.
 
-// Contract dimensions, in report order.
-export const DIMENSIONS = [
-  "health.shape",
-  "health.types",
-  "error.rfc7807",
-  "error.contenttype",
-  "error.codes",
-  "validation.format",
-  "feature.detection",
-  "openapi.present",
-  "openapi.31",
-  "mw.requestid",
-  "mw.cors",
-  "mw.compression",
-];
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-// Standard error codes from FRAMEWORK_CONTRACT.md §2.
-// path → { status, typeSuffix, title }
-const STANDARD_ERRORS = [
-  { path: "/errors/bad-request", status: 400, suffix: "bad-request", title: "Bad Request" },
-  { path: "/errors/unauthorized", status: 401, suffix: "unauthorized", title: "Unauthorized" },
-  { path: "/errors/forbidden", status: 403, suffix: "forbidden", title: "Forbidden" },
-  { path: "/errors/not-found", status: 404, suffix: "not-found", title: "Not Found" },
-  { path: "/errors/conflict", status: 409, suffix: "conflict", title: "Conflict" },
-  { path: "/errors/rate-limited", status: 429, suffix: "rate-limited", title: "Rate Limited" },
-  { path: "/errors/internal", status: 500, suffix: "internal", title: "Internal Server Error" },
-];
+const IR = JSON.parse(
+  fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "contract-ir.json"),
+    "utf8",
+  ),
+);
+
+// Contract dimensions, in report order — from the IR.
+export const DIMENSIONS = IR.dimensions.map((d) => d.id);
+
+
+// Standard error codes from FRAMEWORK_CONTRACT.md §2, via the IR.
+//
+// Only the entries with a forced-error endpoint are probed here. `validation`
+// (422) deliberately has `probePath: null` — it is produced by POSTing an
+// invalid body and is asserted by the `validation.format` dimension instead.
+// The hand-written list this replaces simply omitted that row, with nothing
+// saying whether the omission was intentional.
+const STANDARD_ERRORS = IR.errors.taxonomy
+  .filter((e) => e.probePath)
+  .map((e) => ({ path: e.probePath, status: e.status, suffix: e.code, title: e.title }));
 
 function result(dim, status, detail) {
   return { dim, status, detail };
@@ -78,7 +84,7 @@ async function checkHealth(base, results, ctx) {
 
   // §7: exactly { status, nucleus, version }.
   const keys = Object.keys(body).sort();
-  const expected = ["nucleus", "status", "version"];
+  const expected = [...IR.health.requiredKeys].sort();
   const extra = keys.filter((k) => !expected.includes(k));
   const missing = expected.filter((k) => !keys.includes(k));
   if (missing.length === 0 && extra.length === 0) {
@@ -95,7 +101,7 @@ async function checkHealth(base, results, ctx) {
 
   // Types: status string, version string, nucleus tri-state string per §7
   // ("connected" | "disconnected" | "unconfigured").
-  const NUCLEUS_STATES = ["connected", "disconnected", "unconfigured"];
+  const NUCLEUS_STATES = IR.health.nucleusStates;
   const typeProblems = [];
   if (typeof body.status !== "string") typeProblems.push(`status is ${typeof body.status}, want string`);
   if (typeof body.version !== "string") typeProblems.push(`version is ${typeof body.version}, want string`);
