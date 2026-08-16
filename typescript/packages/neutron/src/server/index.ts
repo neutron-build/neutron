@@ -439,6 +439,26 @@ export async function createServer(
   }
 
   if (enableCompress) {
+    // `Vary: Accept-Encoding` is ours to add — hono's compress middleware sets
+    // Content-Encoding and weakens the ETag, and never touches Vary.
+    //
+    // Without it a shared cache can store the gzipped body and hand it to a
+    // client that did not ask for gzip and cannot decode it. RFC 9110 §12.5.5
+    // requires Vary whenever a response is content-negotiated, and the other
+    // four SDKs in the conformance matrix all send it.
+    //
+    // Set on EVERY response this middleware could compress, not only the ones
+    // it did: the header describes how the resource varies, so a cache that
+    // stored the uncompressed representation needs it just as much.
+    app.use("*", async (c, next) => {
+      await next();
+      const existing = c.res.headers.get("Vary");
+      if (!existing) {
+        c.res.headers.set("Vary", "Accept-Encoding");
+      } else if (!/\baccept-encoding\b/i.test(existing)) {
+        c.res.headers.set("Vary", `${existing}, Accept-Encoding`);
+      }
+    });
     app.use("*", compress());
   }
 
