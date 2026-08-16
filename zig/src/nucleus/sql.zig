@@ -49,10 +49,21 @@ pub fn structFields(comptime T: type) []const []const u8 {
     const info = @typeInfo(T);
     switch (info) {
         .@"struct" => |s| {
-            var names: [s.fields.len][]const u8 = undefined;
-            for (s.fields, 0..) |field, i| {
-                names[i] = field.name;
-            }
+            // The array is built in a comptime block so the returned pointer
+            // refers to promoted static memory.
+            //
+            // This was a plain `var` with `return &names`, which Zig 0.14
+            // accepted and 0.16 rejects as "returning address of expired local
+            // variable" — correctly, since the array lived on a stack frame
+            // that was already gone. CI pins 0.14, so the whole SDK stopped
+            // compiling on current Zig without anything saying so.
+            const names = comptime blk: {
+                var acc: [s.fields.len][]const u8 = undefined;
+                for (s.fields, 0..) |field, i| {
+                    acc[i] = field.name;
+                }
+                break :blk acc;
+            };
             return &names;
         },
         else => @compileError("structFields requires a struct type"),

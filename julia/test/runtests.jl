@@ -82,8 +82,16 @@ end
     @test NeutronJulia._json_strings("[]") == String[]
     @test NeutronJulia._json_strings(missing) == String[]
 
-    # KV_ZRANGE / KV_ZRANGEBYSCORE: JSON array of [member, score] pairs
-    @test NeutronJulia._zentries("[[\"a\",1.5],[\"b\",2.0]]") == ["a:1.5", "b:2.0"]
+    # KV_ZRANGE / KV_ZRANGEBYSCORE: JSON array of [member, score] pairs.
+    #
+    # Members only. This asserted ["a:1.5", "b:2.0"] — the joined form — so the
+    # test and the implementation shared one wrong assumption and the test
+    # passed while pinning the bug: a member containing ':' was
+    # indistinguishable from the separator. All five other SDKs were fixed the
+    # same way; Julia was the fifth.
+    @test NeutronJulia._zentries("[[\"a\",1.5],[\"b\",2.0]]") == ["a", "b"]
+    @test NeutronJulia._zentries("[[\"a:b\",1.0]]") == ["a:b"]
+    @test NeutronJulia._zentries_scored("[[\"a:b\",1.0]]") == [("a:b", 1.0)]
     @test NeutronJulia._zentries("[]") == String[]
     @test NeutronJulia._zentries(missing) == String[]
 

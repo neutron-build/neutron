@@ -248,11 +248,30 @@ function zrangebyscore(m::KVModel, key::String, min_score::Float64, max_score::F
     return _zentries(first(result)[1])
 end
 
-# Engine returns a JSON array of [member, score] pairs; format as "member:score"
-# to match the other SDKs' return shape.
+# Members only, like Redis ZRANGE without WITHSCORES.
+#
+# This joined member and score with ':' and its comment claimed that matched
+# "the other SDKs' return shape". It did at the time — and all four of the
+# others were wrong in the same way. KV_ZRANGE answers with clean JSON pairs,
+# so the ENGINE never had the delimiter problem; each client reintroduced it,
+# making a member containing ':' indistinguishable from the separator. Python,
+# Go, TypeScript and Elixir were fixed 2026-08-15; this is the fifth.
 function _zentries(raw)::Vector{String}
     (ismissing(raw) || raw === nothing || isempty(raw)) && return String[]
-    return [string(p[1], ":", Float64(p[2])) for p in JSON3.read(raw, Vector{Vector{Any}})]
+    return [string(p[1]) for p in JSON3.read(raw, Vector{Vector{Any}})]
+end
+
+"""Members with their scores, unambiguous for any member text."""
+function _zentries_scored(raw)::Vector{Tuple{String, Float64}}
+    (ismissing(raw) || raw === nothing || isempty(raw)) && return Tuple{String, Float64}[]
+    return [(string(p[1]), Float64(p[2])) for p in JSON3.read(raw, Vector{Vector{Any}})]
+end
+
+"""KV_ZRANGE(key, start, stop) → Vector of (member, score). Signed indices."""
+function zrange_with_scores(m::KVModel, key::String, start::Int, stop::Int)
+    require_nucleus(m.features, "KV")
+    result = LibPQ.execute(m.conn, "SELECT KV_ZRANGE(\$1, \$2, \$3)", [key, start, stop])
+    return _zentries_scored(first(result)[1])
 end
 
 """KV_ZREM(key, member) → Bool"""

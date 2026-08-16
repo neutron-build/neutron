@@ -81,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk: [python, go, typescript, elixir, rust]
+        sdk: [python, go, typescript, elixir, rust, julia]
         # elixir joined 2026-08-15, once it could connect at all. Its executor
         # existed since S17 and reported 42/42 failing, because Postgrex's type
         # bootstrap died on `ARRAY (SELECT ...)`; with that fixed it runs
@@ -93,7 +93,16 @@ jobs:
         # parameter, TimeSeries.time_bucket took an interval NAME the engine
         # never accepted, and 85 row.get() calls panicked on any type mismatch.
         #
-        # S18/S19 add zig and julia here as their executors land. An
+        # julia joined 2026-08-16 with its executor. Writing it found SEVEN
+        # defects, every one a method that had never worked: cdc_read and
+        # datalog clear!/import_graph! sent the wrong number of arguments,
+        # assert_fact! declared Bool where the engine answers a status string,
+        # time_bucket took an interval NAME (the third SDK with that identical
+        # defect), execute! raised on any DDL or transaction control, and
+        # zrange re-joined member:score.
+        #
+        # S18 adds zig when its executor lands — blocked on a Zig toolchain
+        # migration, see the note in that executor's directory. An
         # SDK absent from this list is UNPROVEN, and the drift job below says so
         # out loud rather than counting it as agreement.
     steps:
@@ -149,6 +158,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.sdk == 'rust'
+
+      - uses: julia-actions/setup-julia@v2
+        if: matrix.sdk == 'julia'
+        with:
+          version: "1.11"
+      - name: Instantiate the Julia SDK
+        if: matrix.sdk == 'julia'
+        working-directory: julia
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
       - uses: erlef/setup-beam@v1
         if: matrix.sdk == 'elixir'
@@ -228,6 +246,12 @@ jobs:
       # suite now runs 32 pass / 7 unsupported / 3 xfail / 0 fail. Installed as
       # the note said to.
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.11"
+      - working-directory: julia
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
       - uses: erlef/setup-beam@v1
         with:

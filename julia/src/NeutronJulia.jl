@@ -131,6 +131,8 @@ export set_retention!, match_pattern, time_bucket
 
 # Document model
 export doc_get, doc_query, doc_path, doc_count
+export doc_update!, doc_delete!, find, find_one, update_where!, delete_where!
+export ts_range, aggregate, vector_insert!, vector_count, blob_exists, zrange_with_scores
 
 # Graph model
 export add_node!, add_edge!, delete_node!, delete_edge!

@@ -5,18 +5,25 @@ struct DatalogModel
     features::NucleusFeatures
 end
 
-"""DATALOG_ASSERT(fact) → Bool"""
-function assert_fact!(m::DatalogModel, fact::String)::Bool
+"""DATALOG_ASSERT(fact) → String status, e.g. "ASSERT parent/2"
+
+Declared `::Bool` and called `_bool`, but the engine answers with a status
+string, so every call raised `MethodError: Cannot convert an object of type
+String`. The function had never worked. Rust and Go already returned the string.
+"""
+function assert_fact!(m::DatalogModel, fact::String)::String
     require_nucleus(m.features, "Datalog")
     result = LibPQ.execute(m.conn, "SELECT DATALOG_ASSERT(\$1)", [fact])
-    return _bool(result)
+    v = first(result)[1]
+    return ismissing(v) ? "" : String(v)
 end
 
-"""DATALOG_RETRACT(fact) → Bool"""
-function retract!(m::DatalogModel, fact::String)::Bool
+"""DATALOG_RETRACT(fact) → String status (same shape as assert_fact!)."""
+function retract!(m::DatalogModel, fact::String)::String
     require_nucleus(m.features, "Datalog")
     result = LibPQ.execute(m.conn, "SELECT DATALOG_RETRACT(\$1)", [fact])
-    return _bool(result)
+    v = first(result)[1]
+    return ismissing(v) ? "" : String(v)
 end
 
 """DATALOG_RULE(head, body) → Bool"""
@@ -35,15 +42,28 @@ function datalog_query(m::DatalogModel, query::String)::String
 end
 
 """DATALOG_CLEAR() → Bool"""
-function clear!(m::DatalogModel)::Bool
+# Takes the predicate to clear.
+#
+# Sent ZERO arguments where DATALOG_CLEAR requires one, so every call failed
+# with "requires 1 argument(s), got 0" — the function had never worked. This is
+# the same defect TypeScript had (recorded 2026-08-13), in a second SDK, and
+# both survived because nothing executed the call against a live engine.
+function clear!(m::DatalogModel, predicate::String)::String
     require_nucleus(m.features, "Datalog")
-    result = LibPQ.execute(m.conn, "SELECT DATALOG_CLEAR()")
-    return _bool(result)
+    result = LibPQ.execute(m.conn, "SELECT DATALOG_CLEAR(\$1)", [predicate])
+    v = first(result)[1]
+    return ismissing(v) ? "" : String(v)
 end
 
-"""DATALOG_IMPORT_GRAPH() → Int64 facts imported"""
-function import_graph!(m::DatalogModel)::Int64
+"""DATALOG_IMPORT_GRAPH(predicate) → String status, e.g. "IMPORTED 30 edges into edge"
+
+Sent ZERO arguments where the engine requires one, and declared `::Int64` where
+it answers with a status string — two ways of never having worked, in the same
+four lines as `clear!`.
+"""
+function import_graph!(m::DatalogModel, predicate::String)::String
     require_nucleus(m.features, "Datalog")
-    result = LibPQ.execute(m.conn, "SELECT DATALOG_IMPORT_GRAPH()")
-    return _int(result)
+    result = LibPQ.execute(m.conn, "SELECT DATALOG_IMPORT_GRAPH(\$1)", [predicate])
+    v = first(result)[1]
+    return ismissing(v) ? "" : String(v)
 end

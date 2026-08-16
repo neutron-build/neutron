@@ -1,0 +1,7 @@
+{
+  "why": [
+    "A case listed here is one the Zig client has no surface for, not one that fails. Each reason names what is missing, so the entry stops being true the moment the SDK grows it.",
+    "Written 2026-08-16 with the executor. The Zig client is thinner than the others at the runtime layer: every model ships *Sql builders for the full surface (that is the zero-allocation path the 12KB binary depends on), but not every builder had a runtime wrapper."
+  ],
+  "cases": {}
+}

@@ -115,3 +115,26 @@ function create_index!(m::VectorModel, table::String;
     LibPQ.execute(m.conn, sql_str)
     return nothing
 end
+
+"""Insert a vector into `table`. `metadata` is stored as JSONB."""
+function vector_insert!(m::VectorModel, table::String, id::String,
+                        v::AbstractVector{<:Real}; metadata=Dict{String, Any}(),
+                        column::String="embedding")
+    require_nucleus(m.features, "Vector")
+    LibPQ.execute(m.conn,
+        "INSERT INTO $table (id, $column, metadata) VALUES (\$1, VECTOR(\$2), \$3)",
+        [id, to_vector_literal(v), JSON3.write(metadata)])
+    return nothing
+end
+
+"""Count the vectors in `table`.
+
+A collection is a table, so this is a plain COUNT(*) — there is no VECTOR_*
+primitive for it.
+"""
+function vector_count(m::VectorModel, table::String)::Int64
+    require_nucleus(m.features, "Vector")
+    result = LibPQ.execute(m.conn, "SELECT COUNT(*) FROM $table")
+    return Int64(first(result)[1])
+end
+

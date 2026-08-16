@@ -229,3 +229,7 @@ uv.lock
 # suite, not part of it.
 conformance/live/executors/go/neutron-live-conformance-go
 conformance/live/executors/rust/target/
+
+# Zig conformance executor build output.
+conformance/live/executors/zig/.zig-cache/
+conformance/live/executors/zig/zig-out/

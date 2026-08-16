@@ -111,8 +111,62 @@ end
 
 TIME_BUCKET(interval, timestamp). Intervals: 'second','minute','hour','day','week','month'.
 """
-function time_bucket(m::TimeSeriesModel, interval::String, timestamp_ms::Int64)::Int64
+# Takes the bucket size in MILLISECONDS.
+#
+# This took an interval NAME (`interval::String`) while the engine's TIME_BUCKET
+# has always taken `(bucket_millis, ts)` as INT8, so every call bound text where
+# an integer was required and the function had never once worked. This is the
+# THIRD SDK with the identical defect — Python (L1) and Rust had it too, each
+# found only when something finally executed the call against a live engine.
+function time_bucket(m::TimeSeriesModel, bucket_ms::Int64, timestamp_ms::Int64)::Int64
     require_nucleus(m.features, "TimeSeries")
-    result = LibPQ.execute(m.conn, "SELECT TIME_BUCKET(\$1, \$2)", [interval, timestamp_ms])
+    result = LibPQ.execute(m.conn, "SELECT TIME_BUCKET(\$1, \$2)", [bucket_ms, timestamp_ms])
     return _int(result)
 end
+
+"""TS_RANGE(series, start_ms, end_ms) → Vector of (timestamp_ms, value).
+
+The raw points, not an aggregate. There was no function for this and no SQL
+surface either, so Python synthesised it from sixty bucketed TS_RANGE_AVG calls,
+Go refused and TypeScript threw — three answers to one question. TS_RANGE was
+added to the engine 2026-08-15 and every SDK now uses it.
+"""
+function ts_range(m::TimeSeriesModel, series::String, start_ms::Int64, end_ms::Int64)
+    require_nucleus(m.features, "TimeSeries")
+    end_ms <= start_ms && return Tuple{Int64, Float64}[]
+    result = LibPQ.execute(m.conn, "SELECT TS_RANGE(\$1, \$2, \$3)", [series, start_ms, end_ms])
+    raw = first(result)[1]
+    (ismissing(raw) || raw === nothing || isempty(raw)) && return Tuple{Int64, Float64}[]
+    return [(Int64(p["t"]), Float64(p["v"])) for p in JSON3.read(raw)]
+end
+
+"""Aggregate a series into fixed windows across a range.
+
+One `(bucket_start_ms, value)` per `window_ms`-sized bucket, skipping empty
+buckets. `fn` is `:avg` or `:count`: the engine ships TS_RANGE_AVG and
+TS_RANGE_COUNT and nothing else.
+
+Alignment is to `window_ms`, not to a calendar unit — aligning a five-minute
+window to an hour boundary produces buckets that do not line up with the window
+the caller asked for, which is a wrong answer rather than an error.
+"""
+function aggregate(m::TimeSeriesModel, series::String, start_ms::Int64, end_ms::Int64,
+                   window_ms::Int64, fn::Symbol=:avg)
+    require_nucleus(m.features, "TimeSeries")
+    (window_ms <= 0 || end_ms <= start_ms) && return Tuple{Int64, Float64}[]
+    sql_fn = fn === :avg ? "TS_RANGE_AVG" :
+             fn === :count ? "TS_RANGE_COUNT" :
+             throw(ArgumentError("unsupported aggregate $fn; use :avg or :count"))
+
+    bucket = time_bucket(m, window_ms, start_ms)
+    out = Tuple{Int64, Float64}[]
+    while bucket < end_ms
+        stop = min(bucket + window_ms, end_ms)
+        r = LibPQ.execute(m.conn, "SELECT $sql_fn(\$1, \$2, \$3)", [series, bucket, stop])
+        v = first(r)[1]
+        (ismissing(v) || v === nothing) || push!(out, (Int64(bucket), Float64(v)))
+        bucket += window_ms
+    end
+    return out
+end
+

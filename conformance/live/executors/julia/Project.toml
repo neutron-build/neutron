@@ -1,0 +1,7 @@
+# The executor runs under the SDK's own project (activated in run_live.jl), so
+# this file exists only to make the directory a valid Julia project root for
+# tooling. Dependencies come from ../../../../julia/Project.toml — the client
+# under test is the one the SDK ships, not a copy resolved from the registry.
+name = "NeutronLiveConformanceJulia"
+uuid = "1d6b1f4e-3c7a-4b5e-9a2f-8c4d6e0b7a13"
+version = "0.0.0"

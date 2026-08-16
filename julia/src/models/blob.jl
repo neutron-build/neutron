@@ -83,3 +83,14 @@ end
 # Public aliases matching PLAN naming
 get(m::BlobModel, key::String) = blob_get(m, key)
 delete!(m::BlobModel, key::String) = blob_delete!(m, key)
+
+"""Whether a blob exists.
+
+Asks BLOB_META and reports whether it answered — metadata rather than BLOB_GET
+on purpose, since `get` would pull the whole payload across the wire to answer a
+boolean.
+"""
+function blob_exists(m::BlobModel, key::String)::Bool
+    return meta(m, key) !== nothing
+end
+

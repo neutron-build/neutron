@@ -22,3 +22,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check .gitignore intent matches reality
         run: python3 .github/scripts/check_ignored_not_tracked.py
+
+  line-endings:
+    name: No file flips its line-ending style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The check compares each modified file against its previous version,
+          # so it needs the parent commit as well as the tip.
+          fetch-depth: 2
+      - name: Check line endings are preserved
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --depth=1 origin "${{ github.base_ref }}"
+            python3 .github/scripts/check_line_endings.py --range "origin/${{ github.base_ref }}..HEAD"
+          else
+            python3 .github/scripts/check_line_endings.py --range "HEAD~1..HEAD"
+          fi

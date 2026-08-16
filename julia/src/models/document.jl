@@ -132,3 +132,98 @@ function doc_count(m::DocumentModel, collection::AbstractString)::Int64
     result = LibPQ.execute(m.conn, "SELECT DOC_COUNT(\$1)", [collection])
     return _int(result)
 end
+
+
+"""DOC_UPDATE(id, json) → Bool — replaces the document in place."""
+function doc_update!(m::DocumentModel, id::Int64, doc)::Bool
+    require_nucleus(m.features, "Document")
+    result = LibPQ.execute(m.conn, "SELECT DOC_UPDATE(\$1, \$2)",
+                           [string(id), JSON3.write(doc)])
+    v = first(result)[1]
+    return v === true || v == "t" || v == "true"
+end
+
+"""DOC_UPDATE(collection, id, json) → Bool (scoped)."""
+function doc_update!(m::DocumentModel, collection::AbstractString, id::Int64, doc)::Bool
+    isempty(collection) && return doc_update!(m, id, doc)
+    require_nucleus(m.features, "Document")
+    result = LibPQ.execute(m.conn, "SELECT DOC_UPDATE(\$1, \$2, \$3)",
+                           [String(collection), string(id), JSON3.write(doc)])
+    v = first(result)[1]
+    return v === true || v == "t" || v == "true"
+end
+
+"""DOC_DELETE(id) → Bool."""
+function doc_delete!(m::DocumentModel, id::Int64)::Bool
+    require_nucleus(m.features, "Document")
+    result = LibPQ.execute(m.conn, "SELECT DOC_DELETE(\$1)", [string(id)])
+    v = first(result)[1]
+    return v === true || v == "t" || v == "true"
+end
+
+"""DOC_DELETE(collection, id) → Bool (scoped)."""
+function doc_delete!(m::DocumentModel, collection::AbstractString, id::Int64)::Bool
+    isempty(collection) && return doc_delete!(m, id)
+    require_nucleus(m.features, "Document")
+    result = LibPQ.execute(m.conn, "SELECT DOC_DELETE(\$1, \$2)",
+                           [String(collection), string(id)])
+    v = first(result)[1]
+    return v === true || v == "t" || v == "true"
+end
+
+"""DOC_QUERY with a Dict/NamedTuple filter rather than a pre-encoded string."""
+doc_query(m::DocumentModel, collection::AbstractString, filter::AbstractDict) =
+    doc_query(m, collection, JSON3.write(filter))
+doc_query(m::DocumentModel, filter::AbstractDict) = doc_query(m, JSON3.write(filter))
+
+# ── Filter-based operations ──────────────────────────────────────────────────
+#
+# The engine indexes documents but only DOC_QUERY takes a filter, and it answers
+# with ids. Find, update-by-filter and delete-by-filter therefore resolve ids
+# first and act per id — which is what the Python, Go, Rust and Elixir clients
+# do. The contract is defined by behaviour, not by where the loop runs.
+
+"""Find whole documents in `collection` matching `filter`."""
+function find(m::DocumentModel, collection::String, filter; limit::Int=100, skip::Int=0)
+    pairs_ = _find_with_ids(m, collection, filter, limit, skip)
+    return [doc for (_id, doc) in pairs_]
+end
+
+"""Find the first document matching `filter`, or `nothing`. Absence is not an error."""
+function find_one(m::DocumentModel, collection::String, filter)
+    pairs_ = _find_with_ids(m, collection, filter, 1, 0)
+    return isempty(pairs_) ? nothing : pairs_[1][2]
+end
+
+"""Merge `patch` into every document matching `filter`. Returns the count.
+
+A PARTIAL update: keys in `patch` overwrite, keys absent from it survive.
+"""
+function update_where!(m::DocumentModel, collection::String, filter, patch)
+    n = 0
+    for (id, existing) in _find_with_ids(m, collection, filter, 10_000, 0)
+        merged = merge(Dict{String, Any}(string(k) => v for (k, v) in pairs(existing)),
+                       Dict{String, Any}(string(k) => v for (k, v) in pairs(patch)))
+        doc_update!(m, collection, id, merged) && (n += 1)
+    end
+    return n
+end
+
+"""Delete every document matching `filter`. Returns the count."""
+function delete_where!(m::DocumentModel, collection::String, filter)
+    n = 0
+    for (id, _doc) in _find_with_ids(m, collection, filter, 10_000, 0)
+        doc_delete!(m, collection, id) && (n += 1)
+    end
+    return n
+end
+
+function _find_with_ids(m::DocumentModel, collection::String, filter, limit::Int, skip::Int)
+    ids = doc_query(m, collection, filter)
+    out = Tuple{Int64, Any}[]
+    for id in Iterators.take(Iterators.drop(ids, skip), limit)
+        doc = doc_get(m, collection, id)
+        doc === nothing || push!(out, (Int64(id), doc))
+    end
+    return out
+end

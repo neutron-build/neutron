@@ -75,11 +75,16 @@ function xreadgroup(m::StreamsModel, stream::String, group::String,
 end
 
 """STREAM_XACK(stream, group, id_ms, id_seq) → Bool"""
-function xack!(m::StreamsModel, stream::String, group::String,
-               id_ms::Int64, id_seq::Int64)::Bool
+# Takes the "<ms>-<seq>" string xadd! returns.
+#
+# This took id_ms and id_seq as separate integers, so the two ends of the same
+# API did not compose: every caller had to split xadd!'s return value itself.
+# The engine accepts the joined form since 2026-08-16 and all five SDKs now use
+# it.
+function xack!(m::StreamsModel, stream::String, group::String, entry_id::String)::Int64
     require_nucleus(m.features, "Streams")
     result = LibPQ.execute(m.conn,
-        "SELECT STREAM_XACK(\$1, \$2, \$3, \$4)",
-        [stream, group, id_ms, id_seq])
-    return _bool(result)
+        "SELECT STREAM_XACK(\$1, \$2, \$3)",
+        [stream, group, entry_id])
+    return _int(result)
 end

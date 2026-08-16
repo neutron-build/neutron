@@ -1,0 +1,7 @@
+{
+  "why": [
+    "A case listed here is one the Julia client has no surface for, not one that fails. Each reason names the missing function, so the entry stops being true the moment the SDK grows it.",
+    "Written 2026-08-16 with the executor."
+  ],
+  "cases": {}
+}

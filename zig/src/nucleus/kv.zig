@@ -291,6 +291,65 @@ pub const KVModel = struct {
         return try self.client.execute(sql);
     }
 
+    // Runtime wrappers for builders that had none. Every *Sql generator below
+    // existed; nine of them were unreachable without hand-writing the call,
+    // which is why the Zig conformance executor could not exercise hashes, sets
+    // or sorted sets at all.
+    pub fn hdel(self: KVModel, key: []const u8, field: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try hdelSql(key, field, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn hexists(self: KVModel, key: []const u8, field: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try hexistsSql(key, field, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn hlen(self: KVModel, key: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try hlenSql(key, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn hgetall(self: KVModel, key: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try hgetallSql(key, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn sadd(self: KVModel, key: []const u8, member: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try saddSql(key, member, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn srem(self: KVModel, key: []const u8, member: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try sremSql(key, member, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn smembers(self: KVModel, key: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try smembersSql(key, &buf);
+        return try self.client.execute(sql);
+    }
+
+    pub fn zadd(self: KVModel, key: []const u8, score: f64, member: []const u8) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try zaddSql(key, score, member, &buf);
+        return try self.client.execute(sql);
+    }
+
+    /// Signed indices: -1 is the last element, as in Redis.
+    pub fn zrange(self: KVModel, key: []const u8, start: i64, stop: i64) !?[]const u8 {
+        var buf: [512]u8 = undefined;
+        const sql = try zrangeSql(key, start, stop, &buf);
+        return try self.client.execute(sql);
+    }
+
     pub fn hget(self: KVModel, key: []const u8, field: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try hgetSql(key, field, &buf);
