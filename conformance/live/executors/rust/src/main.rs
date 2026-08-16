@@ -377,25 +377,21 @@ fn config_from_url(url: &str) -> Result<NucleusConfig, String> {
         None => (hostport.to_string(), 5432),
     };
 
-    // sslmode=disable, deliberately, and it is worth knowing why.
+    // Left on the DEFAULT sslmode (Prefer) on purpose: this executor should
+    // connect the way a real user's first program does, so a regression in the
+    // default path fails the suite rather than hiding behind an override.
     //
-    // Nucleus answers SSLRequest with 'S' — it advertises TLS by default. The
-    // Rust client's DEFAULT is SslMode::Prefer, and its TLS path uses rustls
-    // with the OS trust store and full chain + hostname verification (a
-    // documented decision: there is no encrypt-but-do-not-verify mode). So
-    // `prefer` against a default Nucleus attempts TLS, fails to verify the
-    // engine's self-signed certificate, and errors — tokio-postgres does not
-    // fall back to plaintext after a failed handshake the way libpq's `prefer`
-    // does.
-    //
-    // The consequence is that the Rust client's default configuration cannot
-    // connect to a default Nucleus, which is a real interop finding and is
-    // filed as such. The conformance engine is loopback plaintext, so this
-    // executor is explicit rather than working around it silently.
+    // That default could not connect at all until 2026-08-16. Nucleus answers
+    // SSLRequest with 'S' and presents a self-signed certificate; the client's
+    // rustls verifier correctly rejects it, and `Prefer` did not then retry in
+    // plaintext the way libpq's `prefer` does — so it behaved exactly like
+    // `require` and every Rust user's first connection failed on a mode whose
+    // own documentation says "otherwise plaintext". Fixed in the client; this
+    // executor is the regression test.
     Ok(NucleusConfig::new(host, port, dbname.to_string())
         .user(user)
         .password(password)
-        .sslmode(SslMode::Disable))
+        .sslmode(SslMode::Prefer))
 }
 
 #[tokio::main]

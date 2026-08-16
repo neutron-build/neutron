@@ -283,13 +283,38 @@ impl NucleusPool {
         #[cfg(feature = "tls")]
         if sslmode != SslMode::Disable {
             let connector = self.0.tls_connector()?;
-            let (client, conn) = tokio_postgres::connect(&cs, connector)
-                .await
-                .map_err(NucleusError::Connect)?;
-            return Ok(ClientWithDriver {
-                client,
-                driver: spawn_driver(conn),
-            });
+            match tokio_postgres::connect(&cs, connector).await {
+                Ok((client, conn)) => {
+                    return Ok(ClientWithDriver {
+                        client,
+                        driver: spawn_driver(conn),
+                    });
+                }
+                // `prefer` means "TLS if it works, otherwise plaintext", which
+                // is what this type's own documentation says and what libpq
+                // does — libpq retries without SSL when the SSL attempt fails.
+                // This did not retry, so `prefer` behaved exactly like
+                // `require`, and the DEFAULT configuration could not connect to
+                // a DEFAULT Nucleus: the engine answers SSLRequest with 'S' and
+                // presents a self-signed certificate, which the verifier
+                // correctly rejects. Every Rust user's first connection failed
+                // with "error performing TLS handshake" and no indication that
+                // the mode they were on was supposed to cope with it.
+                //
+                // Falling back sends credentials in cleartext, which is why
+                // `prefer` is not a secure mode in libpq either and why
+                // `require`/`verify-full` still fail closed below. The fallback
+                // is logged at warn so it is never silent.
+                Err(e) if sslmode == SslMode::Prefer => {
+                    tracing::warn!(
+                        error = %e,
+                        "TLS negotiation failed under sslmode=prefer; retrying in \
+                         plaintext. Credentials will be sent unencrypted — use \
+                         sslmode=require to fail closed instead."
+                    );
+                }
+                Err(e) => return Err(NucleusError::Connect(e)),
+            }
         }
 
         // Without the `tls` feature, a strict mode is unsatisfiable — fail loudly
