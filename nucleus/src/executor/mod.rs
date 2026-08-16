@@ -2512,7 +2512,9 @@ impl Executor {
                 "role '{user}' is not permitted to log in"
             )));
         }
-        let session = self.get_session(id);
+        // No fallback: an id naming no session must not authenticate. See
+        // `require_session`.
+        let session = self.require_session(id)?;
         *session.authenticated_user.write() = Some(user.to_string());
         *session.current_role.write() = None;
         self.recompute_session_context(&session);
@@ -2522,10 +2524,16 @@ impl Executor {
     /// Install a tenant claim from a trusted authentication/proxy boundary.
     /// SQL `SET nucleus.tenant_id` is intentionally not an authority source.
     #[cfg(feature = "server")]
-    pub fn bind_trusted_tenant(&self, id: u64, tenant_id: Option<String>) {
-        let session = self.get_session(id);
+    ///
+    /// Returns an error for an id that names no session, for the same reason
+    /// [`bind_authenticated_session`](Self::bind_authenticated_session) does: a
+    /// tenant claim is authority, and the fallback this used to resolve to is
+    /// shared by every session that has none of its own.
+    pub fn bind_trusted_tenant(&self, id: u64, tenant_id: Option<String>) -> Result<(), ExecError> {
+        let session = self.require_session(id)?;
         *session.trusted_tenant_id.write() = tenant_id;
         self.recompute_session_context(&session);
+        Ok(())
     }
 
     /// Drop a session when a connection closes, freeing its state.
@@ -2697,6 +2705,34 @@ impl Executor {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| self.default_session.clone())
+    }
+
+    /// Look up a session that must already exist, with **no fallback**.
+    ///
+    /// [`get_session`](Self::get_session) answers an unknown id with
+    /// `default_session`, which is deliberately the bootstrap superuser so an
+    /// unconfigured single-user deployment bypasses RLS. That is a defensible
+    /// default for a read. It is not defensible for a WRITE: the two calls that
+    /// install authority resolved ids the same way and then wrote to whatever
+    /// came back, so binding a principal to an id that names no session stamped
+    /// that principal onto the process-wide fallback identity. Measured: three
+    /// rows visible to an unauthenticated read before
+    /// `bind_authenticated_session(999_999, "alice")`, two after — the identity
+    /// every later fallback runs as, changed from outside any session.
+    ///
+    /// The wire layer manufactures exactly such an id. `session_id_from_client`
+    /// ends in `.unwrap_or(0)` while ids are allocated from 1, so a peer
+    /// address missing from the registry authenticates against session 0.
+    /// Failing closed here turns that into a visible login error instead of a
+    /// silent change of who the server is.
+    #[cfg(feature = "server")]
+    fn require_session(&self, id: u64) -> Result<Arc<Session>, ExecError> {
+        self.sessions.read().get(&id).cloned().ok_or_else(|| {
+            ExecError::PermissionDenied(format!(
+                "session {id} does not exist; refusing to install authority on the \
+                 default session"
+            ))
+        })
     }
 
     /// Read a session-level setting by key. Returns `None` if unset.

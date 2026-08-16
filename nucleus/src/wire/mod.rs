@@ -963,13 +963,32 @@ impl NucleusHandler {
     }
 
     /// Get the session ID for a client connection from the session registry.
-    fn session_id_from_client(&self, client: &impl ClientInfo) -> u64 {
+    ///
+    /// This used to end in `.unwrap_or(0)`. Session ids are allocated from 1,
+    /// so 0 names no session — and `Executor::get_session` answers an unknown
+    /// id with `default_session`, which is the bootstrap superuser. A peer
+    /// address missing from the registry therefore ran every statement on that
+    /// connection as the superuser, with RLS and column masking keyed off that
+    /// identity, and nothing in the path said so. Failing closed turns a silent
+    /// privilege substitution into an error the client sees.
+    fn session_id_from_client(&self, client: &impl ClientInfo) -> Result<u64, PgWireError> {
         let addr = client.socket_addr().to_string();
         self.session_registry
             .read()
             .get(&addr)
             .copied()
-            .unwrap_or(0)
+            .ok_or_else(|| {
+                tracing::error!(
+                    peer = %addr,
+                    "no session registered for this connection; refusing the command \
+                     rather than running it as the default (superuser) session"
+                );
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    "08P01".to_owned(),
+                    "connection has no established session".to_owned(),
+                )))
+            })
     }
 
     /// Mirror the executor's per-session transaction state into the wire
@@ -1514,7 +1533,7 @@ impl StartupHandler for NucleusHandler {
                     if authentication_complete {
                         let login_info = LoginInfo::from_client_info(client);
                         let user = login_info.user().unwrap_or("");
-                        let session_id = self.session_id_from_client(client);
+                        let session_id = self.session_id_from_client(client)?;
                         self.executor
                             .bind_authenticated_session(session_id, user)
                             .await
@@ -1550,7 +1569,7 @@ impl SimpleQueryHandler for NucleusHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let peer_addr_str = client.socket_addr().to_string();
-        let session_id = self.session_id_from_client(client);
+        let session_id = self.session_id_from_client(client)?;
         // New client command: a cancel for a previous command must not leak
         // into this one.
         self.executor.clear_session_cancel(session_id);
@@ -1934,7 +1953,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let parsed_stmt = &portal.statement.statement;
-        let session_id = self.session_id_from_client(client);
+        let session_id = self.session_id_from_client(client)?;
         // NOTE: no cancel-flag clear at entry. Extended-protocol clients
         // pipeline Parse+Describe+Bind+Execute in one batch; a cancel that
         // lands while the Describe probe runs targets this same client
