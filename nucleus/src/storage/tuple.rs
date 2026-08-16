@@ -67,7 +67,16 @@ pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
                 buf.extend_from_slice(bytes);
             }
             Value::Jsonb(v) => {
-                let bytes = serde_json::to_vec(v).unwrap_or_default();
+                // `unwrap_or_default()` here wrote ZERO bytes on failure, and
+                // an empty slice is not valid JSON — so a value that failed to
+                // serialize came back as null on read, silently. Now that a
+                // malformed JSONB payload is reported as corruption, writing
+                // unreadable bytes would turn that write into an unreadable
+                // row. Store a valid `null` document instead: same observable
+                // value as before, but readable. (`to_vec` on a
+                // `serde_json::Value` is effectively infallible — Number cannot
+                // hold NaN or infinity — so this is a guard, not a path.)
+                let bytes = serde_json::to_vec(v).unwrap_or_else(|_| b"null".to_vec());
                 buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&bytes);
             }
@@ -248,9 +257,20 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + len > data.len() {
                     return None;
                 }
-                // Malformed stored JSONB must not drop the row; fall back to null.
-                let v: serde_json::Value = serde_json::from_slice(&data[pos..pos + len])
-                    .unwrap_or(serde_json::Value::Null);
+                // JSONB used to be the ONE type that routed around the
+                // corruption gate: `.unwrap_or(Value::Null)`, justified by
+                // "malformed stored JSONB must not drop the row". That was true
+                // when a `None` here meant the row was silently dropped from
+                // the scan. It is not true any more — `deserialize_row`
+                // returning None now raises `StorageError::Corruption` naming
+                // the page, slot and table. So the choice is no longer "lose
+                // the row or null the column", it is "report corruption or
+                // answer a query with a value that was never stored", and a
+                // silent wrong answer is the worse of those.
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data[pos..pos + len])
+                else {
+                    return None;
+                };
                 row.push(Value::Jsonb(v));
                 pos += len;
             }
@@ -777,9 +797,11 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             if start + len > data.len() {
                 return None;
             }
-            // Malformed stored JSONB must not drop the row; fall back to null.
-            let v: serde_json::Value = serde_json::from_slice(&data[start..start + len])
-                .unwrap_or(serde_json::Value::Null);
+            // Same as the full-row path above: report, do not invent a value.
+            // A projected read that answered `null` where the full read
+            // errored would also make the two paths disagree about the same
+            // bytes.
+            let v: serde_json::Value = serde_json::from_slice(&data[start..start + len]).ok()?;
             Some(Value::Jsonb(v))
         }
         DataType::Date => {
@@ -1035,6 +1057,55 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    /// NU-239: stored JSONB bytes that do not parse used to decode as JSON
+    /// `null`, so a corrupt document read back as a legitimate SQL value.
+    ///
+    /// JSONB was the one type routing around the corruption gate. The comment
+    /// justifying it — "malformed stored JSONB must not drop the row" — was
+    /// true when a `None` from here meant the row was silently dropped from a
+    /// scan. Since that became `StorageError::Corruption` naming page, slot and
+    /// table, the trade is no longer "lose the row or null the column"; it is
+    /// "report corruption or answer with a value nobody stored".
+    #[test]
+    fn corrupt_jsonb_is_reported_not_read_as_null() {
+        let types = vec![DataType::Int32, DataType::Jsonb];
+        let row = vec![Value::Int32(1), Value::Jsonb(serde_json::json!({"k": "v"}))];
+        let mut bytes = serialize_row(&row, &types);
+
+        // Intact bytes round-trip, so the fixture is real.
+        let clean = deserialize_row(&bytes, &types).expect("valid JSONB must decode");
+        assert_eq!(clean[1], Value::Jsonb(serde_json::json!({"k": "v"})));
+
+        // Corrupt the JSON payload only; the length prefix stays honest, so
+        // this is a bad document rather than a truncated record.
+        let n = bytes.len();
+        bytes[n - 3] = b'~';
+        bytes[n - 2] = b'~';
+
+        assert!(
+            deserialize_row(&bytes, &types).is_none(),
+            "corrupt JSONB must reach the corruption gate, not decode as null"
+        );
+
+        // The projected path must agree with the full path about the same
+        // bytes — otherwise which answer you get depends on the query plan.
+        assert!(
+            deserialize_row_projected(&bytes, &types, &[1]).is_none(),
+            "the projected read must report corruption too"
+        );
+    }
+
+    /// A JSONB value that legitimately IS null still round-trips. A fix that
+    /// treated the null document as corruption would pass the test above.
+    #[test]
+    fn a_genuine_json_null_still_round_trips() {
+        let types = vec![DataType::Jsonb];
+        let row = vec![Value::Jsonb(serde_json::Value::Null)];
+        let bytes = serialize_row(&row, &types);
+        let out = deserialize_row(&bytes, &types).expect("a null JSON document is valid");
+        assert_eq!(out[0], Value::Jsonb(serde_json::Value::Null));
+    }
 
     #[test]
     fn roundtrip_basic() {
