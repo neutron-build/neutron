@@ -27,9 +27,24 @@ LOG_DIR="${PROBE_LOG_DIR:-probe-artifacts}"
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
-# name | args (iteration counts scale with M)
+# name | args [| label]
+#
+# `label` names the log file and the PASS/FAIL line. It only matters when the
+# same binary appears twice under different arguments — without it both runs
+# would write to one log and the second would overwrite the first.
+#
+# (iteration counts scale with M)
 PROBES=(
-  "fuzz|--iterations $((1500 * M))"
+  "fuzz|--iterations $((1500 * M))|fuzz-mvcc"
+  # The oracle above runs on the DEFAULT engine, which is mvcc. Its own banner
+  # says so on every run: "this engine has no buffer pool or paged storage, so
+  # nothing below covers DiskEngine." `nucleus serve` builds
+  # BufferedDiskEngine(DiskEngine) (main.rs:1022), so until this second entry
+  # existed the strongest correctness instrument in the project had never been
+  # aimed at production storage, and "0 divergences" said nothing about it.
+  # Paged engines open a fresh temp dir per iteration and fsync on commit, so
+  # they are far slower — hence the smaller budget, not a smaller priority.
+  "fuzz|--engine buffered-disk --iterations $((250 * M))|fuzz-buffered-disk"
   "probe_kv|--iterations $((3000 * M))"
   "probe_kv_coll|--iterations $((3000 * M))"
   "probe_vector|--iterations $((20000 * M))"
@@ -79,14 +94,20 @@ passed=0
 echo
 echo "==> Running ${#PROBES[@]} harnesses"
 for entry in "${PROBES[@]}"; do
-  name="${entry%%|*}"; args="${entry#*|}"
-  log="$LOG_DIR/${name}.log"
+  name="${entry%%|*}"; rest="${entry#*|}"; args="${rest%%|*}"; label="${rest#*|}"
+  [ "$label" = "$args" ] && label="$name"      # no third field -> label is the binary name
+  log="$LOG_DIR/${label}.log"
   printf 'scale=%s\ncommand=%s/%s %s\n' "${PROBE_SCALE:-ci}" "$BIN" "$name" "$args" >"$log"
   # shellcheck disable=SC2086
   if "$BIN/$name" $args >>"$log" 2>&1; then
-    echo "  PASS  $name"
+    echo "  PASS  $label"
     passed=$((passed + 1))
-    rm -f "$log"
+    # The log is KEPT on pass. It used to be deleted here, which meant a green
+    # run left no record of what it had actually executed — and several of these
+    # harnesses can exit 0 without exercising the property they advertise
+    # (V20 NU-359..NU-383). A pass you cannot audit afterwards is not evidence.
+    # Set PROBE_KEEP_PASS_LOGS=0 to restore the old behaviour.
+    [ "${PROBE_KEEP_PASS_LOGS:-1}" = "1" ] || rm -f "$log"
   else
     echo "  FAIL  $name  (exit $?)"
     sed 's/^/        /' "$log" | tail -25

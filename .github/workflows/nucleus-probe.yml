@@ -58,11 +58,16 @@ jobs:
       - name: Run probe suite (${{ steps.scale.outputs.scale }})
         run: PROBE_SCALE=${{ steps.scale.outputs.scale }} bash scripts/probe.sh
         working-directory: nucleus
-      - name: Upload failing probe commands and logs
-        if: failure()
+      # Uploaded on success too, deliberately. This used to be `if: failure()`,
+      # which combined with probe.sh deleting each log on PASS meant a green run
+      # left no evidence of what it had actually executed. Several of these
+      # harnesses can exit 0 without exercising the property they advertise
+      # (V20 NU-359..NU-383), so "it passed" is only worth what the log proves.
+      - name: Upload probe commands and logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nucleus-probe-failures-${{ github.run_id }}
+          name: nucleus-probe-${{ github.run_id }}
           path: nucleus/probe-artifacts
           if-no-files-found: ignore
           retention-days: 30
