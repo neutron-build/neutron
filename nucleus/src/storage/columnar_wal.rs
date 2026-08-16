@@ -355,7 +355,7 @@ fn decode_rows(data: &[u8]) -> Vec<Row> {
         Some(n) => n as usize,
         None => return vec![],
     };
-    let mut rows = Vec::with_capacity(n);
+    let mut rows = Vec::with_capacity(super::wal_util::bounded_capacity(n));
     for _ in 0..n {
         match decode_row(data, &mut pos) {
             Some(r) => rows.push(r),

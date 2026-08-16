@@ -457,7 +457,7 @@ fn decode_snapshot(data: &[u8]) -> Option<GraphWalState> {
 
     // nodes
     let n_nodes = read_u32(data, &mut pos)? as usize;
-    let mut nodes = HashMap::with_capacity(n_nodes);
+    let mut nodes = HashMap::with_capacity(crate::storage::wal_util::bounded_capacity(n_nodes));
     for _ in 0..n_nodes {
         let id = read_u64(data, &mut pos)?;
         let labels = decode_labels(data, &mut pos)?;
@@ -474,7 +474,7 @@ fn decode_snapshot(data: &[u8]) -> Option<GraphWalState> {
 
     // edges
     let n_edges = read_u32(data, &mut pos)? as usize;
-    let mut edges = HashMap::with_capacity(n_edges);
+    let mut edges = HashMap::with_capacity(crate::storage::wal_util::bounded_capacity(n_edges));
     for _ in 0..n_edges {
         let id = read_u64(data, &mut pos)?;
         let src = read_u64(data, &mut pos)?;
@@ -517,7 +517,7 @@ fn decode_string(data: &[u8], pos: &mut usize) -> Option<String> {
 
 fn decode_labels(data: &[u8], pos: &mut usize) -> Option<Vec<String>> {
     let n = read_u32(data, pos)? as usize;
-    let mut labels = Vec::with_capacity(n);
+    let mut labels = Vec::with_capacity(crate::storage::wal_util::bounded_capacity(n));
     for _ in 0..n {
         labels.push(decode_string(data, pos)?);
     }

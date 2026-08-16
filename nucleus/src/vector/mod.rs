@@ -1070,6 +1070,23 @@ impl HnswIndex {
             let num_layers = num_layers as usize;
             pos += 4;
 
+            // Bound the count against the data actually present, exactly as the
+            // `dim` and `nn` reads above and below already do. Without this,
+            // `num_layers` was a raw u32 straight from the file feeding
+            // `Vec::<Vec<u64>>::with_capacity` — u32::MAX layers asks for
+            // 103 GB, and a Rust allocation failure ABORTS: no unwind, no Err,
+            // no log, SIGABRT. On a startup path that is a boot crash-loop with
+            // no diagnostic.
+            //
+            // Found by this module's own corruption test failing on Linux CI
+            // while passing on macOS, which overcommits and let the 103 GB
+            // reservation succeed. Same class as the counts bounded in
+            // `kv::collections_wal`; the audit filed it there and it lives here
+            // too. Each layer costs at least its own 4-byte neighbour count, so
+            // a layer count larger than the remaining bytes / 4 cannot be real.
+            if num_layers > (data.len() - pos) / 4 {
+                return Err("num_layers exceeds remaining data".into());
+            }
             let mut neighbors = Vec::with_capacity(num_layers);
             for _ in 0..num_layers {
                 if pos + 4 > data.len() {
@@ -1610,6 +1627,37 @@ impl HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A declared count out of a corrupt file must never size an allocation.
+    ///
+    /// `num_layers` was a raw `u32` feeding `Vec::<Vec<u64>>::with_capacity`,
+    /// so `u32::MAX` asked for 103 GB — and a Rust allocation failure ABORTS
+    /// (SIGABRT, no unwind, no `Err`, no log). On the startup path that is a
+    /// boot crash-loop with no diagnostic.
+    ///
+    /// This asserts the `Err` rather than the absence of a crash on purpose:
+    /// the bug was invisible on macOS, which overcommits and let the 103 GB
+    /// reservation succeed, and only aborted on Linux. A test that merely
+    /// "didn't crash" would have passed on the machine that wrote it — which is
+    /// exactly what happened.
+    #[test]
+    fn a_huge_declared_layer_count_is_rejected_not_allocated() {
+        let mut data = Vec::new();
+        data.push(0u8); // metric = L2
+        data.extend_from_slice(&8u32.to_le_bytes()); // m
+        data.extend_from_slice(&50u32.to_le_bytes()); // ef_search
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_nodes = 1
+        data.extend_from_slice(&1u64.to_le_bytes()); // node id
+        data.extend_from_slice(&0u32.to_le_bytes()); // dim = 0
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // num_layers = 4.29e9
+
+        let err = HnswIndex::deserialize(&data)
+            .expect_err("a layer count larger than the whole buffer must be refused");
+        assert!(
+            err.contains("num_layers"),
+            "the error should name the field, got: {err}"
+        );
+    }
 
     fn rand_vec(dim: usize) -> Vector {
         use rand::Rng;

@@ -7,6 +7,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::wal::GroupCommitter;
 
+/// Cap for any pre-allocation sized by a count read out of a file or a socket.
+///
+/// Decode paths across this engine read an element count as a `u32` and hand it
+/// straight to `with_capacity`. A corrupt or hostile count of `u32::MAX` asks
+/// for ~4.3 billion elements — 103 GB for a 24-byte element — and **a Rust
+/// allocation failure aborts**: SIGABRT, no unwind, no `Err`, no log. On a
+/// recovery path that is a boot crash-loop with no diagnostic, which is exactly
+/// the shape NU-385 describes.
+///
+/// This was found the hard way. `HnswIndex::deserialize` asked for 103 GB from
+/// a corrupt layer count and aborted on Linux CI while passing on macOS, which
+/// overcommits and let the reservation succeed. The count itself is not
+/// trustworthy enough to size anything.
+pub const MAX_PREALLOC: usize = 4096;
+
+/// Clamp a declared element count before it sizes an allocation.
+///
+/// Reserving a bounded amount and letting the container grow costs at most a
+/// few reallocations on the honest path, and removes the abort on the dishonest
+/// one. Every caller's loop already stops when the data runs out, so this
+/// changes no result — only the peak reservation.
+///
+/// Use this wherever a count comes from bytes you did not just write. Where a
+/// cheap exact bound exists (`pos + n * elem_size > data.len()`), prefer that:
+/// it rejects the corrupt input instead of merely surviving it.
+pub fn bounded_capacity(declared: usize) -> usize {
+    declared.min(MAX_PREALLOC)
+}
+
 /// Group-commit fsync coordinator shared by the specialty-store WALs
 /// (KV, KV-collections, timeseries, vector, graph, streams, CDC).
 ///

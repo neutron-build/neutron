@@ -376,7 +376,7 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
                         as usize;
                 pos += 4;
-                let mut elems = Vec::with_capacity(elem_count);
+                let mut elems = Vec::with_capacity(super::wal_util::bounded_capacity(elem_count));
                 for _ in 0..elem_count {
                     if pos >= arr_end {
                         return None;

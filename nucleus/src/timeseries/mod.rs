@@ -1311,7 +1311,9 @@ impl TsWal {
     ) -> Option<(String, Vec<(u64, f64, Vec<(String, String)>)>, usize)> {
         let (name, pos) = Self::read_string(data, pos)?;
         let (n_points, mut pos) = Self::read_u32(data, pos)?;
-        let mut points = Vec::with_capacity(n_points as usize);
+        let mut points = Vec::with_capacity(crate::storage::wal_util::bounded_capacity(
+            n_points as usize,
+        ));
         for _ in 0..n_points {
             let (ts, new_pos) = Self::read_u64(data, pos)?;
             let (value, new_pos) = Self::read_f64(data, new_pos)?;

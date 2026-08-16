@@ -503,16 +503,7 @@ fn serialize_snapshot(collections: &ShardedCollections) -> Vec<u8> {
     buf
 }
 
-/// Cap for any pre-allocation sized by a count read out of the file.
-///
-/// Every `with_capacity` below is fed a `u32` the file supplies. A corrupt or
-/// hostile count of `u32::MAX` asks for ~4.3 billion elements in one go, and a
-/// Rust allocation failure **aborts** — no unwind, no `Err`, no log — so the
-/// observable shape is a boot crash-loop with no diagnostic, on the startup
-/// path. Reserving a bounded amount and letting the container grow costs one
-/// reallocation on the honest path and removes the abort on the dishonest one;
-/// the loops below already stop as soon as the data runs out.
-const MAX_PREALLOC: usize = 4096;
+use crate::storage::wal_util::MAX_PREALLOC;
 
 fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvCollection)>> {
     let n = read_u32(data, pos)? as usize;

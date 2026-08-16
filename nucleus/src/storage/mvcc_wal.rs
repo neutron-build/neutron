@@ -622,7 +622,7 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
         TAG_CREATE_TABLE => {
             let name = read_str(data, &mut pos)?;
             let count = read_u32_val(data, &mut pos)? as usize;
-            let mut columns = Vec::with_capacity(count);
+            let mut columns = Vec::with_capacity(super::wal_util::bounded_capacity(count));
             for _ in 0..count {
                 let col_name = read_str(data, &mut pos)?;
                 let col_type = *data.get(pos)?;
