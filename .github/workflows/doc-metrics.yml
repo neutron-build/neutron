@@ -1,0 +1,43 @@
+name: Doc Metrics Check
+
+# Runs `metrics.sh --check`, which validates that every published figure still
+# matches source: the canonical plan, the private ground-truth sheet when the
+# checkout has it, and the public surface (README, llms.txt, marketing site).
+#
+# This lives in its own workflow rather than inside nucleus.yml because the
+# check's perimeter is wider than that workflow's path filter. nucleus.yml fires
+# on `nucleus/**` only, so an edit that put a stale figure into README.md or the
+# homepage would never have run the job that exists to catch it -- which is how
+# "234K lines of Rust, 2,596 tests" survived on the front door for months. The
+# job is seconds long, so triggering it on the wider path set costs nothing.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/**"
+      - "README.md"
+      - "llms.txt"
+      - "typescript/apps/site/src/**"
+      - "lean4/**"
+      - ".github/workflows/doc-metrics.yml"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - "README.md"
+      - "llms.txt"
+      - "typescript/apps/site/src/**"
+      - "lean4/**"
+      - ".github/workflows/doc-metrics.yml"
+  schedule:
+    - cron: "0 8 * * 1"
+
+jobs:
+  docs:
+    name: Validate doc metrics match source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate doc metrics match source code
+        run: sh scripts/metrics.sh --check
+        working-directory: nucleus

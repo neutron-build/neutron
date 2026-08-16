@@ -155,6 +155,92 @@ else
     echo "SKIP: _internal/GROUND_TRUTH.md not present (private, not in this checkout)"
 fi
 
+# The public surface. GROUND_TRUTH is where numbers are cited *from*, but until
+# now nothing checked that the public files actually cite it -- so README.md and
+# the site homepage carried "234K lines of Rust, 2,596 tests" for months, both
+# figures on the sheet's own banned list, while --check passed clean. The
+# perimeter stopped one file short of the front door.
+#
+# These are asserted positively -- the file must contain the current figure --
+# rather than by ban list alone. A ban list only catches numbers already known
+# to have rotted; a positive assertion fails the moment source moves, which is
+# the case that actually recurs.
+REPO="$(cd "$ROOT/.." && pwd)"
+README="$REPO/README.md"
+HOMEPAGE="$REPO/typescript/apps/site/src/routes/index.tsx"
+
+# 294623 -> 294,623. Public copy uses separators; the check compares the same
+# form the reader sees, so a figure cannot pass here and read wrong on the page.
+group_thousands() {
+    printf '%s' "$1" | sed -e :a -e 's/\(.*[0-9]\)\([0-9]\{3\}\)/\1,\2/;ta'
+}
+
+LOC_FMT=$(group_thousands "$LOC")
+DECLARED_TESTS_FMT=$(group_thousands "$DECLARED_TESTS")
+
+echo "Checking public surface..."
+assert_public_value() {
+    _file=$1
+    _what=$2
+    _needle=$3
+    _rel=${_file#"$REPO/"}
+    if [ ! -f "$_file" ]; then
+        echo "SKIP: $_rel not present"
+        return 0
+    fi
+    if grep -Fq "$_needle" "$_file"; then
+        echo "OK: $_rel cites current $_what"
+    else
+        echo "FAIL: $_rel must cite current $_what -- expected '$_needle'" >&2
+        return 1
+    fi
+}
+
+assert_public_value "$README" "LOC" "$LOC_FMT lines of Rust" || fail=1
+assert_public_value "$README" "declared tests" "$DECLARED_TESTS_FMT declared tests" || fail=1
+assert_public_value "$HOMEPAGE" "declared tests" ">$DECLARED_TESTS_FMT<" || fail=1
+
+# Backstop sweep. Positive assertions cover the figures we know are cited; this
+# catches a retired figure reappearing somewhere new on the front door. Scoped
+# to reader-facing surfaces only -- "3,300+ lines" in a benchmark file is an
+# unrelated use of a banned string, and a sweep that cries wolf gets ignored.
+#
+# Exemption: the launch post is dated and its figures are scoped to that date.
+# A published post must not silently acquire new numbers, so its historical
+# line is allowed to keep them.
+BANNED_FIGURES="3,184 3,724 2,171 2,611 3,850 3,836 2,596 234,621 234,582"
+
+# Targets are listed as separate quoted arguments, never as a space-separated
+# string: the repo path contains a space ("Code Projects"), which word-splits a
+# path list into fragments that match nothing. Written that way first, and the
+# sweep skipped every file while still reporting success.
+sweep_front_door() {
+    _swept=0
+    for _target in "$@"; do
+        [ -e "$_target" ] || continue
+        _swept=$((_swept + 1))
+        for _fig in $BANNED_FIGURES; do
+            _hits=$(grep -rn -F -- "$_fig" "$_target" 2>/dev/null \
+                | grep -v 'at launch (2026-02-15)' || true)
+            if [ -n "$_hits" ]; then
+                echo "FAIL: retired figure '$_fig' is on the public surface:" >&2
+                printf '%s\n' "$_hits" | sed 's|^|      |' >&2
+                fail=1
+            fi
+        done
+    done
+    # A sweep that inspected nothing must not read as a pass -- that is the
+    # exact failure this function was just rewritten to escape.
+    if [ "$_swept" -eq 0 ]; then
+        echo "FAIL: front-door sweep found none of its targets; check the paths" >&2
+        fail=1
+    else
+        echo "OK: swept $_swept front-door target(s) for retired figures"
+    fi
+}
+
+sweep_front_door "$README" "$REPO/llms.txt" "$REPO/typescript/apps/site/src"
+
 if [ "$fail" -ne 0 ]; then
     echo "Current values:" >&2
     print_metrics >&2

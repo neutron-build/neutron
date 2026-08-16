@@ -141,14 +141,9 @@ jobs:
       - run: cargo fmt --check
         working-directory: nucleus
 
-  docs:
-    name: Doc Metrics Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate doc metrics match source code
-        run: sh scripts/metrics.sh --check
-        working-directory: nucleus
+  # The doc-metrics check moved to .github/workflows/doc-metrics.yml: it also
+  # validates README.md, llms.txt and the marketing site, which this workflow's
+  # `nucleus/**` path filter would never trigger on.
 
   dependency-policy:
     name: Dependency, license, and unsafe policy

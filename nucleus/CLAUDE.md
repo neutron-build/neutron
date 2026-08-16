@@ -13,14 +13,26 @@ Multi-model database engine in Rust. Single binary, no external dependencies at 
 ## After Code Changes
 
 Run `sh scripts/metrics.sh --check` to verify docs aren't stale. It asserts against
-**DATABASE_COMPLETION.md** ("Current baseline" section) and, when present, the
-private **`_internal/GROUND_TRUTH.md`** sheet that docs/site/README claims are cited
-from. Update the failing file's LOC / file / module / test counts when it fails —
-never edit a number to match a doc. Plain `sh scripts/metrics.sh` prints current values.
+three surfaces: **DATABASE_COMPLETION.md** ("Current baseline" section); the private
+**`_internal/GROUND_TRUTH.md`** sheet when present; and the **public surface** —
+`README.md`, `llms.txt`, and the marketing site under `typescript/apps/site/src`.
+Update the failing file's LOC / file / module / test counts when it fails — never
+edit a number to match a doc. Plain `sh scripts/metrics.sh` prints current values.
 
 The ground-truth half exists because that sheet went stale for two weeks while every
 other doc quoted its wrong figures; five different test counts were live in committed
 docs at once. `_internal/` is gitignored, so absence is skipped, not failed.
+
+The public half was added 2026-08-15 because the perimeter stopped one file short of
+the front door: GROUND_TRUTH was green while `README.md` and the site homepage both
+published "234K lines of Rust, 2,596 tests" — two figures on the sheet's own banned
+list — for months. Public figures are asserted **positively** (the file must contain
+the current number), not just swept against a ban list, because a ban list only
+catches figures already known to have rotted. A dated exemption keeps the launch
+blog post's historical numbers; see the comment in the script.
+
+CI: `.github/workflows/doc-metrics.yml`, not `nucleus.yml` — that workflow's
+`nucleus/**` path filter would never fire on a README or site edit.
 
 ## Doc File Purposes
 

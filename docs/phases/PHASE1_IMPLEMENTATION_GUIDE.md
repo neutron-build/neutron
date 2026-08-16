@@ -1,5 +1,21 @@
 # Phase 1 Implementation Guide: Vectorized Aggregation Functions
 
+> [!NOTE]
+> **Historical — March 2026. Describes the Phase 1–4 Nucleus optimization
+> program, not the current engine.** Kept for the research and reasoning;
+> not maintained, and not a status report.
+>
+> At least one component described across this material was cut outright:
+> the binary TLV wire protocol was dropped and `nucleus/src/binary_wire/`
+> does not exist. Others landed but were later measured as dead ends for the
+> problem they were meant to solve. Any figure, checklist or "complete"
+> marker here predates five months of engine work — verify against source
+> before relying on it, and cite numbers only from the ground-truth sheet.
+>
+> Current status and next work: `_internal/ORCHESTRATION.md`. Engine
+> completion gates: `nucleus/DATABASE_COMPLETION.md`. See `docs/README.md`
+> for what in this tree is current.
+
 **Objective:** Extend Nucleus SIMD support from filtering & sum to all aggregation functions (COUNT, MIN, MAX, AVG)
 
 **Scope:** 1-2 weeks | 3 new aggregate functions + NULL handling | 2-4x speedup on aggregates
