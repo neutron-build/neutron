@@ -73,7 +73,17 @@ impl VectorWal {
         let path = dir.join("vector.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data)
+            let outcome = replay(&data);
+            // A rejected snapshot used to come back as an empty index and an
+            // `Ok`, so `Executor::open_durable` — which exists to announce
+            // exactly this — never fired for the vector store.
+            if let Some(reason) = outcome.corruption {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: {reason}", path.display()),
+                ));
+            }
+            outcome.state
         } else {
             VectorWalState {
                 indexes: HashMap::new(),
@@ -254,8 +264,19 @@ struct ReplayIndex {
 ///
 /// SNAPSHOT entries reset all state. After the last snapshot, incremental
 /// delta entries (INSERT_VEC, DELETE_VEC) are collected and applied on top.
-fn replay(data: &[u8]) -> VectorWalState {
+/// What replay produced, and whether it is trustworthy. Same shape and same
+/// reason as `kv::collections_wal::ReplayOutcome`: replay could detect
+/// corruption and had no channel to report it.
+struct ReplayOutcome {
+    state: VectorWalState,
+    /// `Some` when replay stopped on structural corruption rather than a clean
+    /// end of data. A torn trailing record is not corruption.
+    corruption: Option<String>,
+}
+
+fn replay(data: &[u8]) -> ReplayOutcome {
     let mut indexes: HashMap<String, ReplayIndex> = HashMap::new();
+    let mut corruption: Option<String> = None;
     let mut pos = 0usize;
 
     while pos < data.len() {
@@ -377,7 +398,27 @@ fn replay(data: &[u8]) -> VectorWalState {
                     let blob = &data[pos..pos + blob_len];
                     pos += blob_len;
 
-                    let hnsw = HnswIndex::deserialize(blob).ok();
+                    // `.ok()` here was silent, total data loss. `hnsw: None` is
+                    // a LEGITIMATE state — `TAG_CREATE_INDEX` produces it for an
+                    // index that exists but has never been checkpointed — so a
+                    // rejected snapshot blob was indistinguishable from "no
+                    // snapshot yet", and the index was rebuilt from deltas
+                    // alone. Every vector in the snapshot vanished at restart
+                    // with no warning and no error. A snapshot record always
+                    // carries a blob (`IndexSnapshot::hnsw` is `&HnswIndex`, not
+                    // an Option), so a failure to deserialize one is always
+                    // corruption and never an empty index.
+                    let hnsw = match HnswIndex::deserialize(blob) {
+                        Ok(h) => Some(h),
+                        Err(e) => {
+                            corruption = Some(format!(
+                                "HNSW snapshot for index '{name}' ({blob_len} bytes) did not \
+                                 deserialize: {e}"
+                            ));
+                            ok = false;
+                            break;
+                        }
+                    };
 
                     indexes.insert(
                         name,
@@ -449,7 +490,10 @@ fn replay(data: &[u8]) -> VectorWalState {
         );
     }
 
-    VectorWalState { indexes: result }
+    ReplayOutcome {
+        state: VectorWalState { indexes: result },
+        corruption,
+    }
 }
 
 // ─── Primitive readers ────────────────────────────────────────────────────────
@@ -504,6 +548,84 @@ mod tests {
             idx.insert(i as u64, Vector::new(data));
         }
         idx
+    }
+
+    /// NU-204: a snapshot blob that does not deserialize used to become
+    /// `hnsw: None`, which is the SAME state `TAG_CREATE_INDEX` produces for an
+    /// index that has never been checkpointed. So the index was rebuilt from
+    /// deltas alone, every vector in the snapshot was lost at restart, and
+    /// `open` returned `Ok`.
+    #[test]
+    fn a_corrupt_hnsw_snapshot_is_reported_not_silently_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = VectorWal::open(dir.path()).unwrap();
+        let idx = make_index(24, 8, DistanceMetric::L2);
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "v".to_string(),
+            IndexSnapshot {
+                hnsw: &idx,
+                dims: 8,
+                metric: 0,
+                m: 8,
+                ef: 50,
+            },
+        );
+        wal.checkpoint(&snaps).unwrap();
+        drop(wal);
+
+        // Clean reopen holds the vectors, so the fixture is real.
+        {
+            let (_w, st) = VectorWal::open(dir.path()).unwrap();
+            assert!(
+                st.indexes.contains_key("v"),
+                "clean reopen should recover the index"
+            );
+        }
+
+        // Corrupt the middle of the serialized HNSW blob, leaving the record
+        // framing (tag, name, dims, metric, m, ef, blob_len) intact — so this
+        // is a bad payload, not a torn tail.
+        let path = dir.path().join("vector.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        for b in bytes[mid..].iter_mut().take(64) {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        match VectorWal::open(dir.path()) {
+            Ok((_w, st)) => panic!(
+                "a corrupt HNSW snapshot opened successfully with {} index(es); \
+                 an empty index and a lost one must not look the same",
+                st.indexes.len()
+            ),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    e.to_string().contains("HNSW snapshot"),
+                    "the error should name what failed, got: {e}"
+                );
+            }
+        }
+    }
+
+    /// An index created but never checkpointed legitimately has no snapshot,
+    /// and must still recover cleanly — a fix that treated every missing HNSW
+    /// as corruption would pass the test above and break normal operation.
+    #[test]
+    fn an_index_with_no_snapshot_yet_still_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = VectorWal::open(dir.path()).unwrap();
+        wal.log_create_index("fresh", 4, 0, 8, 50).unwrap();
+        wal.log_insert("fresh", 1, &[1.0, 2.0, 3.0, 4.0], "")
+            .unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        let (_w, st) = VectorWal::open(dir.path())
+            .expect("an index with deltas and no checkpoint is not corrupt");
+        assert!(st.indexes.contains_key("fresh"));
     }
 
     #[test]

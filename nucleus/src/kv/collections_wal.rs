@@ -190,14 +190,28 @@ impl CollectionWal {
     /// Open or create the collections WAL file in `dir`.
     ///
     /// Returns `(wal, recovered_collections)`. If no WAL file exists a fresh
-    /// `ShardedCollections` is returned. Corrupt trailing bytes are silently
-    /// ignored (best-effort recovery).
+    /// `ShardedCollections` is returned. A torn trailing record is still
+    /// ignored — a crash can always half-write the last append, and dropping it
+    /// is correct WAL behaviour.
+    ///
+    /// **Structural corruption is an error, not an empty result.** This used to
+    /// return `Ok` no matter what replay found, so `Executor::open_durable` —
+    /// which exists precisely to shout "this model is now VOLATILE" — could
+    /// never fire for this store. Recovery could detect corruption and had no
+    /// way to say so.
     pub fn open(dir: &Path) -> io::Result<(Self, ShardedCollections)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("collections.wal");
         let collections = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data)
+            let outcome = replay(&data);
+            if let Some(reason) = outcome.corruption {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: {reason}", path.display()),
+                ));
+            }
+            outcome.collections
         } else {
             ShardedCollections::new()
         };
@@ -489,9 +503,20 @@ fn serialize_snapshot(collections: &ShardedCollections) -> Vec<u8> {
     buf
 }
 
+/// Cap for any pre-allocation sized by a count read out of the file.
+///
+/// Every `with_capacity` below is fed a `u32` the file supplies. A corrupt or
+/// hostile count of `u32::MAX` asks for ~4.3 billion elements in one go, and a
+/// Rust allocation failure **aborts** — no unwind, no `Err`, no log — so the
+/// observable shape is a boot crash-loop with no diagnostic, on the startup
+/// path. Reserving a bounded amount and letting the container grow costs one
+/// reallocation on the honest path and removes the abort on the dishonest one;
+/// the loops below already stop as soon as the data runs out.
+const MAX_PREALLOC: usize = 4096;
+
 fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvCollection)>> {
     let n = read_u32(data, pos)? as usize;
-    let mut result = Vec::with_capacity(n);
+    let mut result = Vec::with_capacity(n.min(MAX_PREALLOC));
     for _ in 0..n {
         let key = read_string(data, pos)?;
         let type_tag = *data.get(*pos)?;
@@ -499,7 +524,7 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
         let coll = match type_tag {
             COLL_LIST => {
                 let len = read_u32(data, pos)? as usize;
-                let mut list = VecDeque::with_capacity(len);
+                let mut list = VecDeque::with_capacity(len.min(MAX_PREALLOC));
                 for _ in 0..len {
                     let val = decode_value(data, pos)?;
                     list.push_back(val);
@@ -508,7 +533,7 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
             }
             COLL_HASH => {
                 let len = read_u32(data, pos)? as usize;
-                let mut hash = HashMap::with_capacity(len);
+                let mut hash = HashMap::with_capacity(len.min(MAX_PREALLOC));
                 for _ in 0..len {
                     let field = read_string(data, pos)?;
                     let val = decode_value(data, pos)?;
@@ -518,7 +543,7 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
             }
             COLL_SET => {
                 let len = read_u32(data, pos)? as usize;
-                let mut set = HashSet::with_capacity(len);
+                let mut set = HashSet::with_capacity(len.min(MAX_PREALLOC));
                 for _ in 0..len {
                     let member = read_string(data, pos)?;
                     set.insert(member);
@@ -553,7 +578,7 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
                     let ms = read_u64(data, pos)?;
                     let seq = read_u64(data, pos)?;
                     let n_fields = read_u32(data, pos)? as usize;
-                    let mut fields = Vec::with_capacity(n_fields);
+                    let mut fields = Vec::with_capacity(n_fields.min(MAX_PREALLOC));
                     for _ in 0..n_fields {
                         let field = read_string(data, pos)?;
                         let value = read_string(data, pos)?;
@@ -590,11 +615,34 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
 ///
 /// SNAPSHOT entries reset all state to their embedded snapshot. Only the last
 /// SNAPSHOT and subsequent incremental entries matter in practice.
-fn replay(data: &[u8]) -> ShardedCollections {
+/// What replay produced, and whether it is trustworthy.
+///
+/// The signature used to be `fn replay(&[u8]) -> ShardedCollections` — no error
+/// channel at all — so five separate corruption paths could only `break` and
+/// return partial state indistinguishable from a clean end of log. That is the
+/// structural root of this bug class: recovery could not report failure even
+/// when it detected it.
+struct ReplayOutcome {
+    collections: ShardedCollections,
+    /// `Some` when replay stopped on structural corruption rather than on a
+    /// clean end of data. Recovery must not report success while this is set.
+    ///
+    /// A torn trailing record is NOT corruption: a WAL's last append can be
+    /// half-written when the process dies, and discarding it is the documented,
+    /// correct behaviour. What belongs here is a record whose framing is intact
+    /// and whose contents are not — which no crash produces.
+    corruption: Option<String>,
+}
+
+fn replay(data: &[u8]) -> ReplayOutcome {
     let collections = ShardedCollections::new();
+    let mut corruption: Option<String> = None;
     let mut pos = 0usize;
 
     while pos < data.len() {
+        // Where this record begins, so a corruption report can name the offset
+        // rather than just the fact.
+        let rec_start = pos;
         let Some(&op) = data.get(pos) else { break };
         pos += 1;
 
@@ -728,7 +776,7 @@ fn replay(data: &[u8]) -> ShardedCollections {
                     (read_u64(payload, &mut dpos), read_u64(payload, &mut dpos))
                     && let Some(n_fields) = read_u32(payload, &mut dpos)
                 {
-                    let mut fields = Vec::with_capacity(n_fields as usize);
+                    let mut fields = Vec::with_capacity((n_fields as usize).min(MAX_PREALLOC));
                     let mut ok = true;
                     for _ in 0..n_fields {
                         match (
@@ -753,7 +801,7 @@ fn replay(data: &[u8]) -> ShardedCollections {
             OP_XDEL => {
                 let mut dpos = 0;
                 if let Some(n_ids) = read_u32(payload, &mut dpos) {
-                    let mut ids = Vec::with_capacity(n_ids as usize);
+                    let mut ids = Vec::with_capacity((n_ids as usize).min(MAX_PREALLOC));
                     for _ in 0..n_ids {
                         if let (Some(ms), Some(seq)) =
                             (read_u64(payload, &mut dpos), read_u64(payload, &mut dpos))
@@ -770,23 +818,52 @@ fn replay(data: &[u8]) -> ShardedCollections {
                 collections.del(&key);
             }
             OP_SNAPSHOT => {
-                // Clear all existing data and load from snapshot
-                collections.clear_all();
+                // Deserialize BEFORE clearing. This used to clear first and
+                // then try to parse, so a snapshot that failed to deserialize
+                // left the collections empty AND — unlike the unknown-op arm
+                // below — did not stop, so every later record was replayed onto
+                // the emptied state. Measured: three keys checkpointed, one
+                // appended after, snapshot payload corrupted, and recovery came
+                // back holding only the fourth. A database that comes up
+                // looking populated and is missing most of itself is worse than
+                // one that comes up empty, because nothing about it looks wrong.
                 let mut dpos = 0;
-                if let Some(items) = deserialize_snapshot(payload, &mut dpos) {
-                    for (k, coll) in items {
-                        collections.insert_collection(&k, coll);
+                match deserialize_snapshot(payload, &mut dpos) {
+                    Some(items) => {
+                        collections.clear_all();
+                        for (k, coll) in items {
+                            collections.insert_collection(&k, coll);
+                        }
+                    }
+                    None => {
+                        corruption = Some(format!(
+                            "snapshot record at byte {rec_start} is framed correctly but did \
+                             not deserialize ({} payload bytes); refusing to clear recovered \
+                             state or replay past it",
+                            payload.len()
+                        ));
+                        break;
                     }
                 }
             }
-            _ => {
-                // Unknown op — stop replay (can't know how much to skip).
+            other => {
+                // Unknown op — we cannot know how much to skip, so replay stops
+                // here and everything after it is discarded. That is data loss,
+                // and it used to be silent.
+                corruption = Some(format!(
+                    "unknown opcode {other} at byte {rec_start}; replay stopped and the \
+                     remaining {} byte(s) of log were discarded",
+                    data.len().saturating_sub(rec_start)
+                ));
                 break;
             }
         }
     }
 
-    collections
+    ReplayOutcome {
+        collections,
+        corruption,
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -807,6 +884,124 @@ mod tests {
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
+    }
+
+    /// NU-384: a malformed snapshot used to clear the collections BEFORE it was
+    /// validated and then keep replaying, so recovery came back holding a
+    /// mosaic — some keys, silently missing the rest, reporting success.
+    ///
+    /// Measured on the old code: three keys checkpointed, a fourth appended
+    /// after the snapshot, then the snapshot payload corrupted. Recovery
+    /// returned `Ok` holding exactly `["delta"]` — the post-snapshot append,
+    /// replayed onto state the failed snapshot had already emptied.
+    #[test]
+    fn a_malformed_snapshot_is_reported_and_never_clears_recovered_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
+
+        for k in ["alpha", "beta", "gamma"] {
+            colls.lpush(k, Value::Text("v".into())).unwrap();
+            wal.log_lpush(k, &Value::Text("v".into())).unwrap();
+        }
+        wal.checkpoint(&colls).unwrap();
+
+        colls.lpush("delta", Value::Text("v".into())).unwrap();
+        wal.log_lpush("delta", &Value::Text("v".into())).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        // A clean reopen sees all four, so the fixture is real.
+        {
+            let (_w, c) = CollectionWal::open(dir.path()).unwrap();
+            for k in ["alpha", "beta", "gamma", "delta"] {
+                assert_eq!(c.llen(k).unwrap(), 1, "clean reopen should hold {k}");
+            }
+        }
+
+        // Corrupt ONLY the snapshot payload; the record framing stays valid, so
+        // this is not a torn tail. Payload begins after op(1) + key_len(4) +
+        // empty key(0) + payload_len(4).
+        let path = dir.path().join("collections.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let payload_start = 1 + 4 + 4;
+        bytes[payload_start..payload_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match CollectionWal::open(dir.path()) {
+            Ok(_) => panic!("a snapshot that does not deserialize must not open successfully"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("snapshot record"),
+            "the error should name what was wrong, got: {msg}"
+        );
+    }
+
+    /// The torn tail stays non-fatal. A crash can always half-write the last
+    /// append, and turning that into a refusal to open would make ordinary
+    /// crash recovery fail — a fix that did so would still pass the test above.
+    #[test]
+    fn a_torn_trailing_record_is_not_treated_as_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
+        for k in ["alpha", "beta"] {
+            colls.lpush(k, Value::Text("v".into())).unwrap();
+            wal.log_lpush(k, &Value::Text("v".into())).unwrap();
+        }
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        // Chop the last few bytes: the final record is now incomplete.
+        let path = dir.path().join("collections.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (_w, c) = CollectionWal::open(dir.path())
+            .expect("a torn trailing record is normal crash recovery, not corruption");
+        assert_eq!(c.llen("alpha").unwrap(), 1, "the intact record survives");
+    }
+
+    /// An unknown opcode discards everything after it. That is data loss, and
+    /// it used to happen silently.
+    #[test]
+    fn an_unknown_opcode_is_reported_rather_than_silently_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
+        colls.lpush("alpha", Value::Text("v".into())).unwrap();
+        wal.log_lpush("alpha", &Value::Text("v".into())).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        let path = dir.path().join("collections.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] = 250; // not a defined opcode
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match CollectionWal::open(dir.path()) {
+            Ok(_) => panic!("an unknown opcode discards the rest of the log and must say so"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("unknown opcode"), "got: {err}");
+    }
+
+    /// NU-385: counts come out of the file, and a Rust allocation failure
+    /// aborts rather than erroring — so an unbounded `with_capacity` driven by
+    /// a corrupt `u32` is a boot crash-loop with no diagnostic. The snapshot
+    /// above already claims `u32::MAX` items; this asserts the parse declines
+    /// instead of trying to reserve ~4.3 billion elements.
+    #[test]
+    fn a_huge_declared_count_does_not_preallocate() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // item count
+        // ...and nothing else. Honest data would follow.
+        let mut pos = 0;
+        assert!(
+            deserialize_snapshot(&payload, &mut pos).is_none(),
+            "a count with no data behind it must fail the parse"
+        );
     }
 
     #[test]

@@ -1033,14 +1033,77 @@ impl Executor {
     }
 
     /// Load the FTS index from disk at startup (called by new_with_persistence).
+    /// Load the legacy `fts_index.json`, which **overrides** the WAL-backed
+    /// index opened above.
+    ///
+    /// Two things about this are measured facts, not readings of the code, and
+    /// both matter before anyone "fixes" the override:
+    ///
+    /// 1. From the SECOND boot onward the FTS WAL receives nothing. Once this
+    ///    file exists, the index is replaced by a `from_json` one, and
+    ///    `InvertedIndex::wal` is `#[serde(skip)]`, so the live index has
+    ///    `wal: None` and all three WAL write sites are `if let Some(wal)`.
+    ///    Measured: WAL directory 64 bytes before a second session's write and
+    ///    64 bytes after it; the document was searchable only while the JSON
+    ///    was present.
+    /// 2. The obvious fix — let the WAL win — would DESTROY DATA on upgrade,
+    ///    because every existing deployment's WAL has been stale since its own
+    ///    second boot, and the JSON is the only copy of everything written
+    ///    since.
+    ///
+    /// And it cannot be migrated the easy way either: the WAL stores original
+    /// document text and replays it, while the JSON stores derived postings and
+    /// `DocInfo` keeps only a length. There is no text to rebuild a WAL from, so
+    /// JSON -> WAL is not a conversion, it is a re-index from base tables. That
+    /// is a product decision with a migration, not a bug fix, and it is filed
+    /// rather than taken here.
+    ///
+    /// What IS fixed here: the read and parse errors used to be swallowed
+    /// entirely — `if let Ok(..) && let Ok(..)` — so a corrupt legacy file
+    /// silently reverted FTS to whatever the stale WAL happened to hold, with
+    /// no message anywhere. Given this file is the authoritative store, that is
+    /// the same silent-empty-recovery shape as the rest of this class.
     fn load_fts_index(&self) {
         let Some(path) = self.fts_persist_path() else {
             return;
         };
-        if let Ok(data) = std::fs::read_to_string(&path)
-            && let Ok(idx) = fts::InvertedIndex::from_json(&data)
-        {
-            *self.fts_index.write() = idx;
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::error!(
+                    target: "nucleus::startup",
+                    "FTS index at {} exists but could not be read: {e}. Falling back to the \
+                     WAL-backed index, which has not been written to since this file was \
+                     first created — expect missing documents.",
+                    path.display()
+                );
+                return;
+            }
+        };
+        match fts::InvertedIndex::from_json(&data) {
+            Ok(idx) => {
+                let had_wal_state = self.fts_index.read().doc_count() > 0;
+                if had_wal_state {
+                    tracing::warn!(
+                        target: "nucleus::startup",
+                        "FTS: legacy {} is replacing the WAL-backed index recovered from disk. \
+                         The replacement carries no WAL handle, so FTS writes this session will \
+                         NOT be logged to the WAL — the legacy file is the only durable copy.",
+                        path.display()
+                    );
+                }
+                *self.fts_index.write() = idx;
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "nucleus::startup",
+                    "FTS index at {} did not parse: {e}. Falling back to the WAL-backed index, \
+                     which has not been written to since this file was first created — expect \
+                     missing documents.",
+                    path.display()
+                );
+            }
         }
     }
 
