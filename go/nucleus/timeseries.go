@@ -2,6 +2,7 @@ package nucleus
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -29,7 +30,7 @@ type TimeSeriesPoint struct {
 type AggFunc int
 
 const (
-	Sum   AggFunc = iota
+	Sum AggFunc = iota
 	Avg
 	Min
 	Max
@@ -202,11 +203,16 @@ func (ts *TimeSeriesModel) TimeBucket(ctx context.Context, interval string, time
 	return bucket, wrapErr("ts time_bucket", err)
 }
 
-// Query retrieves data points in a time range.
-// The engine exposes no raw point-range fetch (only TS_COUNT, TS_LAST,
-// TS_RANGE_COUNT and TS_RANGE_AVG), so raw point retrieval is not
-// supported. If WithDownsample is specified, the query delegates to
-// Aggregate; WithTags is not supported by the engine.
+// Query retrieves the raw data points stored in a time range.
+//
+// It used to refuse: "raw point retrieval is not supported by the engine".
+// That was true of the SQL surface and false of the store — Python was
+// synthesising the same answer from sixty bucketed TS_RANGE_AVG calls at the
+// time, so the three SDKs gave three different answers to one question.
+// TS_RANGE now exposes the points directly and every SDK uses it.
+//
+// If WithDownsample is specified the query still delegates to Aggregate;
+// WithTags remains unsupported by the engine.
 func (ts *TimeSeriesModel) Query(ctx context.Context, measurement string, from, to time.Time, opts ...TSOption) ([]TimeSeriesPoint, error) {
 	if err := ts.client.requireNucleus("TimeSeries.Query"); err != nil {
 		return nil, err
@@ -223,7 +229,35 @@ func (ts *TimeSeriesModel) Query(ctx context.Context, measurement string, from, 
 		return ts.Aggregate(ctx, measurement, from, to, o.downsample.window, o.downsample.fn)
 	}
 
-	return nil, fmt.Errorf("nucleus: ts query: raw point retrieval is not supported by the engine; use RangeCount, RangeAvg, Last, or WithDownsample")
+	startMs, endMs := from.UnixMilli(), to.UnixMilli()
+	if endMs <= startMs {
+		return []TimeSeriesPoint{}, nil
+	}
+
+	var raw string
+	if err := ts.pool.QueryRow(ctx, "SELECT TS_RANGE($1, $2, $3)", measurement, startMs, endMs).Scan(&raw); err != nil {
+		return nil, wrapErr("ts query", err)
+	}
+	if raw == "" {
+		return []TimeSeriesPoint{}, nil
+	}
+
+	var wire []struct {
+		T int64   `json:"t"`
+		V float64 `json:"v"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
+		return nil, wrapErr("ts query decode", err)
+	}
+
+	points := make([]TimeSeriesPoint, len(wire))
+	for i, w := range wire {
+		points[i] = TimeSeriesPoint{
+			Timestamp: time.UnixMilli(w.T).UTC(),
+			Value:     w.V,
+		}
+	}
+	return points, nil
 }
 
 // maxAggregateBuckets caps the number of per-bucket engine calls Aggregate

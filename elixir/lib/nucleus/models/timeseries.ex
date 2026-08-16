@@ -96,6 +96,42 @@ defmodule Nucleus.Models.TimeSeries do
   end
 
   @doc """
+  Returns the raw data points stored in `[start_ms, end_ms]`.
+
+  There was no function for this: raw point retrieval had no SQL surface, so
+  Python synthesised it from sixty bucketed `TS_RANGE_AVG` calls, Go refused,
+  and TypeScript threw — three answers to one question. `TS_RANGE` now returns
+  the points and every SDK uses it. Use `aggregate/6` for bucketed averages.
+  """
+  @spec range(client(), String.t(), integer(), integer()) ::
+          {:ok, [{integer(), float()}]} | {:error, term()}
+  def range(client, series, start_ms, end_ms) do
+    with :ok <- Nucleus.Client.require_nucleus(client, "TimeSeries.range") do
+      if end_ms <= start_ms do
+        {:ok, []}
+      else
+        case Nucleus.Client.query(client, "SELECT TS_RANGE($1, $2, $3)", [
+               series,
+               start_ms,
+               end_ms
+             ]) do
+          {:ok, %{rows: [[raw]]}} when is_binary(raw) and raw != "" ->
+            {:ok,
+             raw
+             |> Jason.decode!()
+             |> Enum.map(fn %{"t" => t, "v" => v} -> {t, v / 1} end)}
+
+          {:ok, _} ->
+            {:ok, []}
+
+          {:error, _} = error ->
+            error
+        end
+      end
+    end
+  end
+
+  @doc """
   Aggregates a series into fixed windows across a range.
 
   Returns one `{bucket_start_ms, value}` per `window_ms`-sized bucket between

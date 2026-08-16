@@ -3874,7 +3874,9 @@ fn walk_expr_for_params(
                 "FTS_REMOVE" | "FTS_MATCH" => &[Type::INT8],
                 // ts_insert(series, timestamp_ms, value) — the value is a float.
                 "TS_INSERT" => &[Type::TEXT, Type::INT8, Type::FLOAT8],
-                "TS_RANGE_COUNT" | "TS_RANGE_AVG" => &[Type::TEXT, Type::INT8, Type::INT8],
+                "TS_RANGE_COUNT" | "TS_RANGE_AVG" | "TS_RANGE" => {
+                    &[Type::TEXT, Type::INT8, Type::INT8]
+                }
                 "TS_RETENTION" => &[Type::INT8],
                 "CDC_READ" => &[Type::INT8, Type::INT8],
                 "CDC_TABLE_READ" => &[Type::TEXT, Type::INT8, Type::INT8],

@@ -68,8 +68,16 @@ func TestCDCRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result == "" {
-		t.Error("expected non-empty result")
+	// Assert the DECODED event, not that a string is non-empty. The old
+	// assertion was `result == ""`, which a raw JSON payload satisfies
+	// whatever it contains — the "a non-empty string is truthy" false green
+	// this model's conformance case was filed against.
+	if len(result) != 1 {
+		t.Fatalf("expected 1 event, got %d: %+v", len(result), result)
+	}
+	if result[0].Seq != 1 || result[0].Table != "users" ||
+		result[0].Change != "INSERT" || result[0].TS != 1700000000000 {
+		t.Errorf("event = %+v, want {1 users INSERT 1700000000000}", result[0])
 	}
 	if capturedSQL != "SELECT CDC_READ($1, $2)" {
 		t.Errorf("SQL = %q, want SELECT CDC_READ($1, $2)", capturedSQL)
@@ -148,8 +156,11 @@ func TestCDCTableRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result == "" {
-		t.Error("expected non-empty result")
+	if len(result) != 1 {
+		t.Fatalf("expected 1 event, got %d: %+v", len(result), result)
+	}
+	if result[0].Seq != 6 || result[0].Table != "users" || result[0].Change != "UPDATE" {
+		t.Errorf("event = %+v, want {6 users UPDATE ...}", result[0])
 	}
 	if capturedSQL != "SELECT CDC_TABLE_READ($1, $2, $3)" {
 		t.Errorf("SQL = %q, want SELECT CDC_TABLE_READ($1, $2, $3)", capturedSQL)

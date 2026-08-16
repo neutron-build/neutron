@@ -184,11 +184,26 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
       return this.aggregate(measurement, from, to, opts.downsample.interval, opts.downsample.fn);
     }
 
-    throw new NucleusNotSupportedError(
-      'timeseries.query: the engine has no raw point-range fetch. ' +
-        'Available surfaces are last(), count(), rangeCount(), rangeAvg(), and ' +
-        'aggregate() with avg/count. Pass opts.downsample to aggregate instead.',
-    );
+    // This used to throw NucleusNotSupportedError: "the engine has no raw
+    // point-range fetch". That was true of the SQL surface and false of the
+    // store — Python was synthesising the same answer from sixty bucketed
+    // TS_RANGE_AVG calls at the time, and Go refused outright, so one question
+    // had three answers. TS_RANGE now returns the points and every SDK uses it.
+    const startMs = from.getTime();
+    const endMs = to.getTime();
+    if (endMs <= startMs) return [];
+
+    const raw = await this.transport.fetchval<string>('SELECT TS_RANGE($1, $2, $3)', [
+      measurement,
+      startMs,
+      endMs,
+    ]);
+    if (!raw) return [];
+
+    return (JSON.parse(raw) as Array<{ t: number; v: number }>).map(({ t, v }) => ({
+      timestamp: new Date(t),
+      value: v,
+    }));
   }
 
   async aggregate(

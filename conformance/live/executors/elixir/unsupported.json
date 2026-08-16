@@ -4,7 +4,5 @@
     "None of these were reached on 2026-08-13: Postgrex cannot complete a connection to Nucleus at all (its type bootstrap selects from pg_range, which the engine's pg_catalog does not implement), so every case fails before its first statement. They are recorded from reading elixir/lib/nucleus/models/, and become live results the moment the connection works.",
     "2026-08-15: six of the seven entries removed after the missing SDK surface was implemented — Document.find/find_one/update_where/delete_where/path_all, Blob bucket forms + exists, Vector.count, TimeSeries.aggregate. They are now live results, not declarations. timeseries.range_query remains: raw point retrieval is a cross-SDK contract question (three SDKs give three answers), not a missing Elixir function."
   ],
-  "cases": {
-    "timeseries.range_query": "TimeSeries exposes range_count/4 and range_avg/4 but nothing that returns the points in a range, so there is no equivalent of the spec's timeseries.query."
-  }
+  "cases": {}
 }

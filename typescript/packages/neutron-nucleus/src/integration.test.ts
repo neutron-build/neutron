@@ -502,11 +502,18 @@ describe("Integration: TimeSeries model SQL functions", () => {
     assert.equal(calls[0].params![0], 3_600_000);
   });
 
-  it("query without downsample throws NotSupported (no raw point fetch)", async () => {
-    await assert.rejects(
-      () => ts.query("cpu", new Date(0), new Date(1000)),
-      /no raw point-range fetch/
-    );
+  it("query without downsample reads raw points through TS_RANGE", async () => {
+    // This asserted that query REJECTS with "no raw point-range fetch". That
+    // was true of the SQL surface and false of the store, and it meant three
+    // SDKs gave three answers to one question — Python synthesised the result
+    // from sixty bucketed calls while this one threw. TS_RANGE closed the gap
+    // in the engine; the test now asserts the behaviour rather than the gap.
+    transport.whenFetchval("TS_RANGE", JSON.stringify([{ t: 0, v: 1.5 }, { t: 500, v: 2.5 }]));
+    const points = await ts.query("cpu", new Date(0), new Date(1000));
+    assert.equal(points.length, 2);
+    assert.equal(points[0].value, 1.5);
+    assert.equal(points[0].timestamp.getTime(), 0);
+    assert.equal(points[1].timestamp.getTime(), 500);
   });
 
   it("aggregate rejects unsupported aggregation functions", async () => {

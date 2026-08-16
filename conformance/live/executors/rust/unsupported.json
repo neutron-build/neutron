@@ -3,7 +3,5 @@
     "A case listed here is one the Rust client has no surface for, not one that fails. Each reason names the missing function, so the entry stops being true the moment the SDK grows it and the case starts reporting a real status.",
     "Written 2026-08-15 with the executor. The Rust client's gaps were closed in the same session where they were shared with Elixir (document filter ops, vector count, blob exists, timeseries aggregate), so this list is short by construction rather than by luck."
   ],
-  "cases": {
-    "timeseries.range_query": "TimeSeries exposes range_count and range_avg but nothing that returns the points in a range, so there is no equivalent of the spec's timeseries.query. This is a cross-SDK contract question — Python synthesises it from bucketed calls, Go refuses outright, TypeScript has no surface — tracked in known-drift rather than invented here."
-  }
+  "cases": {}
 }

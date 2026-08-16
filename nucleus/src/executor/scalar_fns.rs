@@ -4171,6 +4171,35 @@ impl Executor {
                     Ok(Value::Float64(sum / points.len() as f64))
                 }
             }
+            "TS_RANGE" => {
+                // ts_range(series, start_ms, end_ms) → JSON [{"t":ms,"v":value}]
+                //
+                // Raw point retrieval had no SQL surface at all, only the
+                // aggregates, and every SDK answered that differently: Python
+                // synthesised it from sixty bucketed TS_RANGE_AVG calls (sixty
+                // round trips to read points the store already had, and wrong
+                // wherever a bucket held more than one point), Go refused with
+                // "raw point retrieval is not supported by the engine" — false
+                // at the store level, true at the SQL surface it could see —
+                // and TypeScript, Rust and Elixir simply had no method.
+                //
+                // Three answers to one question is a contract gap, and the
+                // right place to close it is here rather than in five clients.
+                require_args(fname, &args, 3)?;
+                let series = match &args[0] {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let start = val_to_u64(&args[1], "TS_RANGE start")?;
+                let end = val_to_u64(&args[2], "TS_RANGE end")?;
+                let store = self.ts_store.read();
+                let points = store.query(&series, start, end);
+                let items: Vec<serde_json::Value> = points
+                    .iter()
+                    .map(|p| serde_json::json!({ "t": p.timestamp, "v": p.value }))
+                    .collect();
+                Ok(Value::Text(serde_json::Value::Array(items).to_string()))
+            }
             "TS_RETENTION" => {
                 // ts_retention(max_age_ms) → 'OK' — sets global retention policy
                 require_args(fname, &args, 1)?;
@@ -6341,6 +6370,7 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         // everything as text and fatal to one that does not.
         "TS_LAST" => DataType::Float64,
         "TS_COUNT" => DataType::Int64,
+        "TS_RANGE" => DataType::Text,
         _ => return None,
     };
     Some(dt)

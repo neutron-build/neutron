@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import cast
 
 from datetime import datetime, timedelta, timezone
@@ -64,45 +65,39 @@ class TimeSeriesModel:
         end: datetime,
         *,
         tags: dict[str, str] | None = None,
-        buckets: int = 60,
     ) -> list[TimeSeriesPoint]:
-        """Query data points in a time range.
+        """Return the raw data points stored in ``[start, end]``.
 
-        Returns one averaged data point per bucket (default 60 buckets).
-        Each bucket spans an equal portion of [start, end].
+        This used to synthesize the answer from ``buckets`` (default 60)
+        ``TS_RANGE_AVG`` calls, because raw point retrieval had no SQL surface.
+        That was sixty round trips to read points the engine already held, and
+        it was lossy: any bucket containing more than one point returned their
+        average as a single fabricated point at the bucket boundary, so the
+        timestamps did not correspond to stored data.
+
+        ``TS_RANGE`` now returns the points themselves, and every SDK uses it,
+        which is what closes the three-different-answers gap this method was on
+        the wrong side of. Use ``aggregate`` when bucketed averages are what is
+        wanted — that is a different question and has its own method.
         """
         self._require()
         start_ms = int(start.timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
-        total_ms = end_ms - start_ms
-        if total_ms <= 0:
+        if end_ms <= start_ms:
             return []
 
-        # Short-circuit if no data in range
-        total_count = await self._exec.fetchval(
-            "SELECT TS_RANGE_COUNT($1, $2, $3)", measurement, start_ms, end_ms
+        raw = await self._exec.fetchval(
+            "SELECT TS_RANGE($1, $2, $3)", measurement, start_ms, end_ms
         )
-        if not total_count:
+        if not raw:
             return []
-
-        # Split range into equal buckets; return one averaged point per bucket
-        bucket_ms = max(1, total_ms // buckets)
-        points: list[TimeSeriesPoint] = []
-        bucket_start = start_ms
-        while bucket_start < end_ms:
-            bucket_end = min(bucket_start + bucket_ms, end_ms)
-            avg = await self._exec.fetchval(
-                "SELECT TS_RANGE_AVG($1, $2, $3)",
-                measurement,
-                bucket_start,
-                bucket_end,
+        return [
+            TimeSeriesPoint(
+                timestamp=datetime.fromtimestamp(item["t"] / 1000, tz=timezone.utc),
+                value=float(item["v"]),
             )
-            if avg is not None:
-                ts = datetime.fromtimestamp(bucket_start / 1000, tz=timezone.utc)
-                points.append(TimeSeriesPoint(timestamp=ts, value=float(avg)))
-            bucket_start = bucket_end
-
-        return points
+            for item in json.loads(raw)
+        ]
 
     async def aggregate(
         self,

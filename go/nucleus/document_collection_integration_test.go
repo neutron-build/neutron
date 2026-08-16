@@ -149,15 +149,18 @@ func TestCollectionCountAndPathAreScopedIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("path: %v", err)
 	}
-	if val == nil || *val != `"value"` {
-		t.Fatalf("PathIn returned %v, want \"value\"", val)
+	// The DECODED value, per the S22 cross-SDK contract. This asserted the
+	// JSON-encoded form `"value"` — quotes included — which is what PathIn
+	// used to return and what made Go disagree with Python on the same call.
+	if val != "value" {
+		t.Fatalf("PathIn returned %#v, want \"value\"", val)
 	}
 	cross, err := docs.PathIn(ctx, other, id, "nested", "leaf")
 	if err != nil {
 		t.Fatalf("path across: %v", err)
 	}
 	if cross != nil {
-		t.Fatalf("PathIn read across a collection boundary: %v", *cross)
+		t.Fatalf("PathIn read across a collection boundary: %v", cross)
 	}
 
 	// No keys is refused locally rather than sent as a malformed statement.

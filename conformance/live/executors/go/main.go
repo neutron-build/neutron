@@ -392,8 +392,9 @@ func (o *Ops) call(ctx context.Context, op string, args []any) (any, error) {
 		for _, a := range args[2:] {
 			keys = append(keys, fmt.Sprint(a))
 		}
-		val, err := o.c.Document().PathIn(ctx, argStr(args, 0), argInt(args, 1), keys...)
-		return strPtr(val), err
+		// PathIn returns the DECODED value per the S22 contract, so it is
+		// handed back as-is rather than dereferenced as a string pointer.
+		return o.c.Document().PathIn(ctx, argStr(args, 0), argInt(args, 1), keys...)
 
 	case "document.update":
 		n, err := o.c.Document().Update(ctx, argStr(args, 0), argMap(args, 1), argMap(args, 2))
@@ -657,10 +658,17 @@ func (o *Ops) call(ctx context.Context, op string, args []any) (any, error) {
 
 	// ── cdc ─────────────────────────────────────────────────────────────
 	case "cdc.read":
-		// The Go SDK returns CDC_READ's payload as raw JSON text rather than a
-		// decoded list. Returned as-is: what the caller gets is the result.
-		raw, err := o.c.CDC().Read(ctx, argInt(args, 0), argInt(args, 1))
-		return raw, err
+		events, err := o.c.CDC().Read(ctx, argInt(args, 0), argInt(args, 1))
+		if err != nil {
+			return nil, err
+		}
+		out := make([]any, len(events))
+		for i, e := range events {
+			out[i] = map[string]any{
+				"seq": e.Seq, "table": e.Table, "change": e.Change, "ts": e.TS,
+			}
+		}
+		return out, nil
 
 	case "cdc.count":
 		n, err := o.c.CDC().Count(ctx)

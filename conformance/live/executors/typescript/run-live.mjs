@@ -381,6 +381,17 @@ class Ops {
     return this.c.timeseries.query(measurement, new Date(TS_BASE + startMs), new Date(TS_BASE + endMs));
   }
 
+  async timeseries_query(measurement, startMs, endMs) {
+    // TS_BASE is a NUMBER (Date.UTC), not a Date — the other arms add to it
+    // directly. Calling .getTime() on it threw.
+    const pts = await this.c.timeseries.query(
+      measurement,
+      new Date(TS_BASE + startMs),
+      new Date(TS_BASE + endMs),
+    );
+    return pts.map((p) => ({ t: p.timestamp.getTime(), v: p.value }));
+  }
+
   // The TS client takes a NAMED bucket interval, not a width in milliseconds,
   // so a window it has no name for cannot be requested at all.
   async timeseries_aggregate(measurement, startMs, endMs, windowMs) {

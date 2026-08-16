@@ -196,7 +196,7 @@ func (d *DocumentModel) QueryDocsIn(ctx context.Context, collection string, filt
 }
 
 // Path extracts a nested value from a document in the default collection.
-func (d *DocumentModel) Path(ctx context.Context, id int64, keys ...string) (*string, error) {
+func (d *DocumentModel) Path(ctx context.Context, id int64, keys ...string) (any, error) {
 	return d.PathIn(ctx, "", id, keys...)
 }
 
@@ -205,7 +205,13 @@ func (d *DocumentModel) Path(ctx context.Context, id int64, keys ...string) (*st
 // Calling with no keys is refused rather than sent: the engine requires at
 // least one, and building the call without one produced a malformed statement
 // (a trailing comma) that surfaced as a syntax error naming nothing useful.
-func (d *DocumentModel) PathIn(ctx context.Context, collection string, id int64, keys ...string) (*string, error) {
+// The return is `any`, not `*string`, and that is a deliberate API break.
+// DOC_PATH answers with raw JSON, so a stored string arrived as `"ada"` — with
+// the quotes — while Get/GetIn on the same client return decoded values. Two
+// shapes for one idea is drift, and S22 settled the cross-SDK contract as: the
+// VALUE. Python landed it; Go kept returning the encoded text, which is what
+// this changes. A caller wanting the raw text can json.Marshal the result.
+func (d *DocumentModel) PathIn(ctx context.Context, collection string, id int64, keys ...string) (any, error) {
 	if err := d.client.requireNucleus("Document.Path"); err != nil {
 		return nil, err
 	}
@@ -233,8 +239,20 @@ func (d *DocumentModel) PathIn(ctx context.Context, collection string, id int64,
 	}
 	q := fmt.Sprintf("SELECT %s(%s, %s)", fn, idArg, strings.Join(placeholders, ", "))
 	var val *string
-	err := d.pool.QueryRow(ctx, q, args...).Scan(&val)
-	return val, wrapErr("doc path", err)
+	if err := d.pool.QueryRow(ctx, q, args...).Scan(&val); err != nil {
+		return nil, wrapErr("doc path", err)
+	}
+	if val == nil {
+		return nil, nil
+	}
+	// A value that is not valid JSON passes through as the raw string rather
+	// than erroring — the engine is the only producer, but turning a readable
+	// value into an error is worse than handing it back.
+	var decoded any
+	if err := json.Unmarshal([]byte(*val), &decoded); err != nil {
+		return *val, nil
+	}
+	return decoded, nil
 }
 
 // Count returns the number of documents in the default collection.

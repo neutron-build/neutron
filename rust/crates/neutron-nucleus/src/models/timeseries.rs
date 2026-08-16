@@ -44,6 +44,43 @@ impl TimeSeriesModel {
         Ok(row.get_ck::<Option<f64>>(0)?)
     }
 
+    /// Return the raw data points stored in `[start_ms, end_ms]`.
+    ///
+    /// There was no method for this at all, and the reason is worth recording:
+    /// raw point retrieval had no SQL surface, so Python synthesised it from
+    /// sixty bucketed `TS_RANGE_AVG` calls, Go refused with "not supported by
+    /// the engine", and TypeScript threw — three answers to one question.
+    /// `TS_RANGE` now returns the points and every SDK uses it. Use
+    /// [`Self::aggregate`] for bucketed averages; that is a different question.
+    pub async fn range(
+        &self,
+        series: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<(i64, f64)>, NucleusError> {
+        if end_ms <= start_ms {
+            return Ok(Vec::new());
+        }
+        let conn = self.pool.get().await?;
+        let row = conn
+            .client()
+            .query_one("SELECT TS_RANGE($1, $2, $3)", &[&series, &start_ms, &end_ms])
+            .await
+            .map_err(NucleusError::Query)?;
+        let raw = row.get_ck::<String>(0)?;
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[derive(serde::Deserialize)]
+        struct Point {
+            t: i64,
+            v: f64,
+        }
+        let points: Vec<Point> =
+            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
+        Ok(points.into_iter().map(|p| (p.t, p.v)).collect())
+    }
+
     /// Return the total number of data points in a series.
     pub async fn count(&self, series: &str) -> Result<i64, NucleusError> {
         let conn = self.pool.get().await?;

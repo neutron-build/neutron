@@ -305,6 +305,11 @@ defmodule Live.Ops do
 
   defp dispatch(c, "timeseries.count", [series]), do: unwrap(TimeSeries.count(c, series))
 
+  defp dispatch(c, "timeseries.query", [series, start_ms, end_ms]) do
+    unwrap(TimeSeries.range(c, series, ts_base_ms() + start_ms, ts_base_ms() + end_ms))
+    |> Enum.map(fn {t, v} -> %{"t" => t, "v" => v} end)
+  end
+
   # start/end are OFFSETS from the spec's base instant, like the points written
   # above; the window is a DURATION and must not be shifted. Passing the offsets
   # through raw sent the engine a negative timestamp, which it rejects.

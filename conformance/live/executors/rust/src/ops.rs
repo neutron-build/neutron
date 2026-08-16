@@ -375,11 +375,20 @@ pub async fn call(client: &NucleusClient, url: &str, op: &str, args: &[Value]) -
                     .collect(),
             ))
         }
-        // Raw point retrieval: the engine exposes range_count and range_avg and
-        // nothing that returns the points themselves. Python synthesises it from
-        // bucketed calls, Go refuses, TypeScript has no surface — three answers
-        // to one question, tracked in known-drift. Not invented here.
-        "timeseries.query" => Err(unsupported(op)),
+        "timeseries.query" => {
+            let pts = client
+                .timeseries()
+                .range(
+                    &s(args, 0)?,
+                    TS_BASE_MS + i64_at(args, 1)?,
+                    TS_BASE_MS + i64_at(args, 2)?,
+                )
+                .await
+                .map_err(err)?;
+            Ok(Value::Array(
+                pts.into_iter().map(|(t, v)| json!({"t": t, "v": v})).collect(),
+            ))
+        }
 
         // ── blob ─────────────────────────────────────────────────────────────
         // Buckets are a client-side "bucket/key" convention shared with every
@@ -606,11 +615,20 @@ pub async fn call(client: &NucleusClient, url: &str, op: &str, args: &[Value]) -
             .map_err(err)?)),
 
         // ── cdc ──────────────────────────────────────────────────────────────
-        "cdc.read" => Ok(json!(client
-            .cdc()
-            .read(i64_at(args, 0)?, i64_at(args, 1)?)
-            .await
-            .map_err(err)?)),
+        "cdc.read" => {
+            let events = client
+                .cdc()
+                .read(i64_at(args, 0)?, i64_at(args, 1)?)
+                .await
+                .map_err(err)?;
+            Ok(Value::Array(
+                events
+                    .into_iter()
+                    .map(|e| json!({"seq": e.seq, "table": e.table,
+                                    "change": e.change, "ts": e.ts}))
+                    .collect(),
+            ))
+        }
         "cdc.count" => Ok(json!(client.cdc().count().await.map_err(err)?)),
 
         other => Err(unsupported(other)),
