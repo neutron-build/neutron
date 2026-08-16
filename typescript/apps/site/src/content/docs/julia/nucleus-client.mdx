@@ -5,6 +5,13 @@ description: The typed Julia client for all 14 Nucleus data models.
 
 Neutron for Julia accesses all 14 Nucleus data models through typed accessors, using multiple dispatch so each model exposes an idiomatic Julia API. Connect once, then reach any model.
 
+> **Status: not covered by the live conformance suite.** The `sdk-live` CI matrix
+> runs python, go and typescript against a running engine; julia is not in it.
+> The shapes below come from the SDK source and its own unit tests, not from
+> executed calls against Nucleus. When that suite was first pointed at an SDK it
+> found breakage in eight methods on day one, so treat unverified surfaces here
+> as likely to hold surprises. Verified as unverified 2026-08-15.
+
 ```julia
 client = NeutronJulia.connect(url)
 

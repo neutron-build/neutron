@@ -5,6 +5,21 @@ description: Using all 14 Nucleus data models from Elixir.
 
 The Elixir Nucleus client provides access to all 14 data models over the PostgreSQL wire protocol. Connections are managed via a GenServer-backed pool with OTP supervision.
 
+> **Status: none of this page runs yet.** The connection shown below cannot be
+> established against Nucleus today, so everything here is API reference rather
+> than working code.
+>
+> Postgrex's type-bootstrap query fails at connect time on `ARRAY (SELECT ...)`
+> in a function argument — `ERROR 0A000 subquery in function args`. The pool
+> retries, so it presents as a hang rather than an error. Postgrex's
+> `disable_composite_types: true` avoids the query client-side, but that hides an
+> engine gap behind an SDK flag, so it is deliberately not recommended here.
+>
+> These shapes are also **not covered by the live conformance suite** — the
+> `sdk-live` CI matrix runs python, go and typescript only. They are taken from
+> the SDK source and have not been executed against a running engine. Verified
+> 2026-08-15.
+
 ## Connection
 
 ```elixir

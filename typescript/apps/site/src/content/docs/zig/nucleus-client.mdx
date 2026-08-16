@@ -5,6 +5,13 @@ description: The typed Zig client for all 14 Nucleus data models.
 
 Neutron for Zig ships a full multi-model client for all 14 Nucleus data models. It connects over the PostgreSQL wire protocol, so it works against Nucleus or plain PostgreSQL, with feature detection to light up the non-SQL models when connected to Nucleus.
 
+> **Status: not covered by the live conformance suite.** The `sdk-live` CI matrix
+> runs python, go and typescript against a running engine; zig is not in it. The
+> shapes below come from the SDK source and its own unit tests, not from executed
+> calls against Nucleus. When that suite was first pointed at an SDK it found
+> breakage in eight methods on day one, so treat unverified surfaces here as
+> likely to hold surprises. Verified as unverified 2026-08-15.
+
 ```zig
 const NucleusClient = @import("nucleus/client.zig").NucleusClient;
 
