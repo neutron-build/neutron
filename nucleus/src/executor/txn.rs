@@ -157,6 +157,11 @@ impl Executor {
 
         let gin_dirty = txn.gin_dirty;
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
+        // The storage commit above made this transaction's rows visible, so any
+        // UNIQUE / PRIMARY KEY slots it was holding can go back: a waiting
+        // session's constraint check will now see the rows and report the
+        // duplicate itself. Released only after the commit, never before.
+        self.release_unique_slots(super::unique_gate::gate_session_id());
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
@@ -221,6 +226,9 @@ impl Executor {
         let engine_snapshots: Vec<(String, Vec<crate::types::Row>)> =
             txn.engine_snapshots.drain().collect();
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
+        // Rolled back: the rows this transaction was holding keys for no longer
+        // exist, so the keys are free.
+        self.release_unique_slots(super::unique_gate::gate_session_id());
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();

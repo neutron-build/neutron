@@ -364,6 +364,19 @@ impl Executor {
         // and must NOT pay for a full rebuild.
         let mut conflict_updated = false;
 
+        // Serialize this statement against any other session inserting the same
+        // UNIQUE / PRIMARY KEY value. `check_unique_constraints` below reads a
+        // snapshot and the write happens after the loop, and on the served
+        // engines nothing closes that window: `insert_unique` is a plain insert
+        // on everything except `MvccStorageAdapter`, and below SERIALIZABLE no
+        // table lock is taken. Four sessions racing on one primary key produced
+        // duplicates in 14 of 20 rounds before this. Slots are given back when
+        // the guard drops — every early return included — unless the session is
+        // in an explicit transaction, where the row stays invisible to other
+        // sessions until COMMIT and the slot has to live that long.
+        let gate_session = super::unique_gate::gate_session_id();
+        let mut unique_guard = super::unique_gate::GateGuard::new(&self.unique_gate, gate_session);
+
         for mut row in source_rows {
             // Canonicalize every value to its column's declared type at write time,
             // so the stored representation never depends on the insert path: `VALUES`
@@ -412,7 +425,13 @@ impl Executor {
                 self.check_enum_constraints(&table_def, &row).await?;
             }
 
-            // Check UNIQUE / PRIMARY KEY constraints
+            // Check UNIQUE / PRIMARY KEY constraints. Take this row's slots
+            // FIRST: the check is only atomic with the write if nothing else
+            // can take the key between them.
+            unique_guard
+                .take(&self.unique_slots_for_row(&table_name, &table_def, &row))
+                .await
+                .map_err(ExecError::Storage)?;
             match self
                 .check_unique_constraints(&table_name, &table_def, &row, None)
                 .await
@@ -691,6 +710,13 @@ impl Executor {
                         })?;
                 }
             }
+        }
+        // Written. In autocommit the rows are visible to anyone else's
+        // constraint check now, so the guard's drop below hands the keys back.
+        // Inside a transaction they are not visible until COMMIT, so the slots
+        // pass to the transaction and are released by `release_unique_slots`.
+        if self.in_explicit_txn().await {
+            unique_guard.keep_for_transaction();
         }
         if conflict_updated {
             // ON CONFLICT DO UPDATE rewrote a row in place, bypassing the staged
@@ -2038,6 +2064,7 @@ impl Executor {
         selection: Option<&ast::Expr>,
         checks: ConstraintChecks,
         unique_col_sets: Option<&[Vec<usize>]>,
+        unique_guard: &mut super::unique_gate::GateGuard<'_>,
     ) -> Result<usize, ExecError> {
         // Contention is resolved by re-reading, so an attempt only repeats when
         // some other session committed in the window — it is progress, not a
@@ -2126,6 +2153,13 @@ impl Executor {
                     crate::security::PolicyCommand::Update,
                     &new_row,
                 )?;
+                // A retry re-derives the new row against a freshly read
+                // current, so `SET id = id + 1` can land on a different key
+                // each attempt. Take the new key's slot before re-checking it.
+                unique_guard
+                    .take(&self.unique_slots_for_row(table_name, table_def, &new_row))
+                    .await
+                    .map_err(ExecError::Storage)?;
                 self.enforce_constraints(table_name, table_def, &new_row, Some(pos), checks)
                     .await?;
 
@@ -2162,6 +2196,12 @@ impl Executor {
         }
 
         let table_def = self.get_table(&table_name).await?;
+
+        // Same gate as INSERT, for the same reason: an UPDATE that changes a
+        // UNIQUE / PRIMARY KEY column checks a snapshot and writes afterwards.
+        // See `unique_gate`.
+        let gate_session = super::unique_gate::gate_session_id();
+        let mut unique_guard = super::unique_gate::GateGuard::new(&self.unique_gate, gate_session);
 
         // Reject UPDATE on append-only tables.
         if table_def.append_only {
@@ -2344,6 +2384,16 @@ impl Executor {
                     &new_row,
                 )?;
 
+                // Same window as INSERT: this check reads a snapshot and the
+                // write happens after the loop, so the new key has to be held
+                // across both. An UPDATE that MOVES a row onto an existing key
+                // is the half of NU-254 the INSERT gate does not cover —
+                // measured at 18 of 20 rounds before this.
+                unique_guard
+                    .take(&self.unique_slots_for_row(&table_name, &table_def, &new_row))
+                    .await
+                    .map_err(ExecError::Storage)?;
+
                 // Enforce all constraints on the updated row
                 self.enforce_constraints(
                     &table_name,
@@ -2491,6 +2541,7 @@ impl Executor {
                     enum_cols: has_enum_columns,
                 },
                 Some(&unique_col_sets),
+                &mut unique_guard,
             )
             .await
             .map_err(|e| match e {
@@ -2517,9 +2568,17 @@ impl Executor {
                     enum_cols: has_enum_columns,
                 },
                 None,
+                &mut unique_guard,
             )
             .await?
         };
+
+        // Written. Same hand-off as INSERT: in autocommit the new keys are
+        // visible now and the guard's drop returns them; in a transaction they
+        // are not visible until COMMIT, so the transaction keeps them.
+        if self.in_explicit_txn().await {
+            unique_guard.keep_for_transaction();
+        }
 
         // Rebuild zone map stats — column values may have changed, making
         // min/max bounds stale. A bare clear would leave the map to be

@@ -130,6 +130,7 @@ mod session;
 mod spill;
 mod txn;
 mod types;
+mod unique_gate;
 
 pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
 use helpers::*;
@@ -307,6 +308,9 @@ pub struct Executor {
     /// and fall back to the materialized path.
     self_ref: std::sync::OnceLock<std::sync::Weak<Executor>>,
     catalog: Arc<Catalog>,
+    /// Serializes check-then-write for UNIQUE / PRIMARY KEY. The engines the
+    /// server runs enforce neither atomically — see `unique_gate`.
+    unique_gate: unique_gate::UniqueGate,
     views: RwLock<HashMap<String, ViewDef>>,
     sequences: parking_lot::RwLock<HashMap<String, parking_lot::Mutex<SequenceDef>>>,
     storage: Arc<dyn StorageEngine>,
@@ -594,6 +598,7 @@ impl Executor {
         Self {
             self_ref: std::sync::OnceLock::new(),
             catalog,
+            unique_gate: unique_gate::UniqueGate::new(),
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
             data_dir: None,
@@ -2545,6 +2550,11 @@ impl Executor {
                 self.metrics.open_transactions.dec();
             }
         }
+        // A client that disconnects mid-transaction never reaches COMMIT or
+        // ROLLBACK. Without this, its UNIQUE / PRIMARY KEY slots would be held
+        // by a session that no longer exists and every other inserter of those
+        // keys would wait out the full timeout, forever.
+        self.release_unique_slots(id);
         self.storage.drop_storage_session(id);
     }
 
