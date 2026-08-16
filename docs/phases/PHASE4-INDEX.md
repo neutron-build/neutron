@@ -271,13 +271,16 @@ Before moving to Week 1:
 - [RUNBOOK.md](../operations/RUNBOOK.md) — How to respond to incidents
 
 ### Implementation
-- [nucleus/src/config/optimizations.rs](nucleus/src/config/optimizations.rs) — Feature flags
-- [nucleus/src/metrics/optimizations.rs](nucleus/src/metrics/optimizations.rs) — Metrics
+- [nucleus/src/config/optimizations.rs](../../nucleus/src/config/optimizations.rs) — Feature flags
+- [nucleus/src/metrics/optimizations.rs](../../nucleus/src/metrics/optimizations.rs) — Metrics
 
 ### CI/CD
-- [.github/workflows/binary_protocol.yml](.github/workflows/binary_protocol.yml)
-- [.github/workflows/analytics_optimization.yml](.github/workflows/analytics_optimization.yml)
-- [.github/workflows/full_regression.yml](.github/workflows/full_regression.yml)
+- `.github/workflows/binary_protocol.yml` — **removed.** The binary TLV protocol was
+  cut in `71ad0bf0` ("pgwire/RESP/embedded are the doors") and its workflow went with
+  it. GitHub still lists the workflow as active and serves its last 2026-07-27 run as
+  green forever; `workflow_health.py` now excludes and names such phantoms.
+- [.github/workflows/analytics_optimization.yml](../../.github/workflows/analytics_optimization.yml)
+- [.github/workflows/full_regression.yml](../../.github/workflows/full_regression.yml)
 
 ## Version History
 

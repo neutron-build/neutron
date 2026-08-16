@@ -30,6 +30,10 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import date, datetime
+from pathlib import Path
+
+# Repo root, derived from this script's own location (.github/scripts/).
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "neutron-build/neutron")
 BRANCH = os.environ.get("HEALTH_BRANCH", "main")
@@ -77,6 +81,23 @@ def main() -> int:
     # must never do is drown the workflows it exists to report on.
     active = [w for w in active if not w["path"].endswith(SELF)]
 
+    # Drop workflows GitHub still lists as active whose FILE no longer exists.
+    #
+    # Deleting a workflow file does not retire it from the API. It stays
+    # `state: active` and keeps serving the conclusion of its last historical
+    # run — forever, because it can never run again. That is a green this check
+    # counted and nobody could ever turn red.
+    #
+    # Found 2026-08-16: `m3_binary_protocol_tests.yml` was deleted in 71ad0bf0
+    # ("remove the binary TLV protocol"), and three weeks later this check was
+    # still reporting its 2026-07-27 success as part of the green total. The
+    # phantom is harmless on its own — nothing is unmonitored, the thing does
+    # not exist — but the mechanism is not: a workflow deleted BY ACCIDENT
+    # disappears from CI and keeps reporting green here, which is precisely the
+    # blind spot this script was written to close.
+    phantom = [w for w in active if not (REPO_ROOT / w["path"]).exists()]
+    active = [w for w in active if (REPO_ROOT / w["path"]).exists()]
+
     green: list[str] = []
     red: list[tuple[str, str, str]] = []
     excused: list[tuple[str, str]] = []
@@ -118,12 +139,21 @@ def main() -> int:
     print(f"  red:       {len(red)}")
     print(f"  excused:   {len(excused)}")
     print(f"  never ran: {len(never_ran)}")
+    if phantom:
+        print(f"  phantom:   {len(phantom)} (listed by the API, no file in the repo)")
     print()
 
     for path, reason in excused:
         print(f"::warning::{path} is red under a recorded exception: {reason}")
     for path in never_ran:
         print(f"::notice::{path} has no completed run on {BRANCH} (tag/dispatch only?)")
+    for wf in phantom:
+        print(
+            f"::warning::{wf['path']} is listed as an active workflow but the file is not in "
+            "the repo. Its last run's conclusion is frozen and it can never run again — "
+            "excluded from the counts. If the deletion was intentional this is cosmetic; if it "
+            "was not, CI has silently lost this workflow."
+        )
     for path, expiry in expired:
         print(f"::error::{path} exception expired on {expiry} — fix it or re-justify it")
     for path, conclusion, url in red:
