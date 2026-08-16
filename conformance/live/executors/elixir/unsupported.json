@@ -1,15 +1,10 @@
 {
   "why": [
     "A case listed here is one the Elixir client has no surface for, not one that fails. Each reason names the missing function, so the entry stops being true the moment the SDK grows it and the case starts reporting a real status.",
-    "None of these were reached on 2026-08-13: Postgrex cannot complete a connection to Nucleus at all (its type bootstrap selects from pg_range, which the engine's pg_catalog does not implement), so every case fails before its first statement. They are recorded from reading elixir/lib/nucleus/models/, and become live results the moment the connection works."
+    "None of these were reached on 2026-08-13: Postgrex cannot complete a connection to Nucleus at all (its type bootstrap selects from pg_range, which the engine's pg_catalog does not implement), so every case fails before its first statement. They are recorded from reading elixir/lib/nucleus/models/, and become live results the moment the connection works.",
+    "2026-08-15: six of the seven entries removed after the missing SDK surface was implemented — Document.find/find_one/update_where/delete_where/path_all, Blob bucket forms + exists, Vector.count, TimeSeries.aggregate. They are now live results, not declarations. timeseries.range_query remains: raw point retrieval is a cross-SDK contract question (three SDKs give three answers), not a missing Elixir function."
   ],
   "cases": {
-    "document.round_trip": "Nucleus.Models.Document has no filter-based update or delete — update_in/4 and delete_in/3 address a document by id, so the spec's update(collection, filter, patch) cannot be expressed.",
-    "document.get_path_returns_a_decoded_scalar": "Document.path_in/4 takes exactly ONE key, while the engine's DOC_PATH_IN is variadic and the spec asks for the nested path (user, name). A multi-key path has no Elixir surface.",
-    "document.find_by_filter": "Document has no find_one: query_in/3 answers with matching ids, and there is nothing that returns a single matching document.",
-    "timeseries.range_query": "TimeSeries exposes range_count/4 and range_avg/4 but nothing that returns the points in a range, so there is no equivalent of the spec's timeseries.query.",
-    "timeseries.aggregate_over_a_bucket": "TimeSeries.time_bucket/3 truncates ONE timestamp to a bucket; there is no aggregate over a range with a window, which is what the spec's timeseries.aggregate is.",
-    "blob.round_trip": "Nucleus.Models.Blob has no exists/2. (It also has no bucket dimension at all — store/get/meta/delete take a key only — which the executor works around by dropping the bucket; the missing existence check is what cannot be worked around.)",
-    "vector.insert_and_search": "Nucleus.Models.Vector has no count/2. create_collection, insert, search, delete, dims and distance exist; counting a collection does not."
+    "timeseries.range_query": "TimeSeries exposes range_count/4 and range_avg/4 but nothing that returns the points in a range, so there is no equivalent of the spec's timeseries.query."
   }
 }

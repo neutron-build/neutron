@@ -118,8 +118,30 @@ defmodule Nucleus.Client do
   def query(client, sql, params \\ []) do
     case Process.get(:nucleus_tx_conn) do
       nil -> GenServer.call(client, {:query, sql, params})
-      conn -> Postgrex.query(conn, sql, params)
+      conn -> safe_query(conn, sql, params)
     end
+  end
+
+  # Postgrex RETURNS server errors as {:error, %Postgrex.Error{}} but RAISES
+  # client-side encode failures: parameter encoding happens before anything is
+  # sent, so a value the type module cannot encode — a UUID given as a dashed
+  # string rather than the raw 16 bytes, most commonly — comes back as a thrown
+  # DBConnection.EncodeError.
+  #
+  # Uncaught inside handle_call/3 that raise terminated this GenServer, which
+  # takes the connection with it. In a Phoenix app one bad parameter from one
+  # request killed the client process shared by every other request. It also
+  # made the error unrecoverable for the caller, who had asked for a tuple and
+  # instead had their own process exit via the GenServer link.
+  #
+  # Encode failures are now returned in the same shape as server errors, so the
+  # documented {:ok, _} | {:error, _} contract holds for the whole function
+  # rather than for most of it.
+  defp safe_query(conn, sql, params) do
+    Postgrex.query(conn, sql, params)
+  rescue
+    e in DBConnection.EncodeError -> {:error, e}
+    e in ArgumentError -> {:error, e}
   end
 
   @doc "Executes a raw SQL query, raising on error."
@@ -207,8 +229,7 @@ defmodule Nucleus.Client do
 
   @impl true
   def handle_call({:query, sql, params}, _from, state) do
-    result = Postgrex.query(state.conn, sql, params)
-    {:reply, result, state}
+    {:reply, safe_query(state.conn, sql, params), state}
   end
 
   @impl true

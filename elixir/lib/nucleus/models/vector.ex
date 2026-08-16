@@ -128,6 +128,25 @@ defmodule Nucleus.Models.Vector do
     end
   end
 
+  @doc """
+  Counts the vectors in `collection`.
+
+  A collection is a table, so this is a plain COUNT(*) rather than a VECTOR_*
+  function — there is no engine primitive for it. The identifier is validated
+  before interpolation for the same reason as `delete/3`: it cannot be bound as
+  a parameter.
+  """
+  @spec count(client(), String.t()) :: {:ok, integer()} | {:error, term()}
+  def count(client, collection) do
+    with :ok <- Nucleus.Client.require_nucleus(client, "Vector.count"),
+         :ok <- validate_identifier(collection) do
+      case Nucleus.Client.query(client, "SELECT COUNT(*) FROM #{collection}", []) do
+        {:ok, %{rows: [[n]]}} -> {:ok, n}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
   @doc "Returns the dimensionality of a vector."
   @spec dims(client(), [float()]) :: {:ok, integer()} | {:error, term()}
   def dims(client, vector) do

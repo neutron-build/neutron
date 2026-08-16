@@ -14,6 +14,58 @@ defmodule Nucleus.Models.Blob do
 
   @type client :: Nucleus.Client.t()
 
+  # ── Buckets ────────────────────────────────────────────────────────────────
+  #
+  # The engine has no bucket dimension: BLOB_STORE and friends take one flat
+  # key. Buckets are a client-side convention — "bucket/key" — and every SDK
+  # implements them the same way, so a blob written from Python is readable from
+  # Elixir and vice versa. Diverging on the separator would partition the
+  # keyspace silently, which is why this is spelled out rather than inlined.
+  #
+  # The `_in` functions below are the bucket-scoped forms. The unscoped ones are
+  # unchanged and address the flat keyspace directly.
+  defp scoped(bucket, key) when is_binary(bucket) and bucket != "", do: "#{bucket}/#{key}"
+  defp scoped(_bucket, key), do: key
+
+  @doc "Stores binary data (hex-encoded) in `bucket`."
+  @spec store_in(client(), String.t(), String.t(), String.t(), String.t()) ::
+          {:ok, boolean()} | {:error, term()}
+  def store_in(client, bucket, key, data_hex, content_type \\ "application/octet-stream"),
+    do: store(client, scoped(bucket, key), data_hex, content_type)
+
+  @doc "Retrieves hex-encoded blob data from `bucket`."
+  @spec get_in_bucket(client(), String.t(), String.t()) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def get_in_bucket(client, bucket, key), do: get(client, scoped(bucket, key))
+
+  @doc "Deletes a blob from `bucket`."
+  @spec delete_in(client(), String.t(), String.t()) :: {:ok, boolean()} | {:error, term()}
+  def delete_in(client, bucket, key), do: delete(client, scoped(bucket, key))
+
+  @doc "Returns metadata for a blob in `bucket`."
+  @spec meta_in(client(), String.t(), String.t()) :: {:ok, map() | nil} | {:error, term()}
+  def meta_in(client, bucket, key), do: meta(client, scoped(bucket, key))
+
+  @doc """
+  Whether a blob exists.
+
+  There is no BLOB_EXISTS: this asks BLOB_META and reports whether it answered.
+  Metadata rather than BLOB_GET on purpose — `get` would pull the whole payload
+  across the wire to answer a boolean.
+  """
+  @spec exists(client(), String.t()) :: {:ok, boolean()} | {:error, term()}
+  def exists(client, key) do
+    case meta(client, key) do
+      {:ok, nil} -> {:ok, false}
+      {:ok, _meta} -> {:ok, true}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc "Whether a blob exists in `bucket`."
+  @spec exists_in(client(), String.t(), String.t()) :: {:ok, boolean()} | {:error, term()}
+  def exists_in(client, bucket, key), do: exists(client, scoped(bucket, key))
+
   @doc "Stores binary data (hex-encoded)."
   @spec store(client(), String.t(), String.t(), String.t()) ::
           {:ok, boolean()} | {:error, term()}

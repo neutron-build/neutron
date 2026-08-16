@@ -197,6 +197,170 @@ defmodule Nucleus.Models.Document do
   @spec count(client()) :: {:ok, integer()} | {:error, term()}
   def count(client), do: count_in(client, "")
 
+  # ── Filter-based operations ────────────────────────────────────────────────
+  #
+  # The engine indexes documents but only DOC_QUERY takes a filter, and it
+  # answers with ids. Update-by-filter, delete-by-filter and find therefore
+  # resolve ids first and act per id, which is exactly what the Python client
+  # does — the contract is defined by behaviour, not by where the loop runs.
+  #
+  # These did not exist until 2026-08-15. Their absence was invisible for as
+  # long as Elixir could not connect to Nucleus at all; the live conformance
+  # suite reported them the day it first ran.
+
+  @doc """
+  Finds documents in `collection` matching `filter`.
+
+  `filter` is the same JSON query expression `query_in/3` takes. Returns whole
+  documents rather than ids.
+  """
+  @spec find(client(), String.t(), map() | String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def find(client, collection, filter, opts \\ []) do
+    with {:ok, pairs} <- find_with_ids(client, collection, filter, opts) do
+      {:ok, Enum.map(pairs, fn {_id, doc} -> doc end)}
+    end
+  end
+
+  @doc """
+  Finds the first document in `collection` matching `filter`, or `nil`.
+
+  `{:ok, nil}` for no match — absence is not an error, matching `get_in_collection/3`.
+  """
+  @spec find_one(client(), String.t(), map() | String.t()) ::
+          {:ok, map() | nil} | {:error, term()}
+  def find_one(client, collection, filter) do
+    with {:ok, pairs} <- find_with_ids(client, collection, filter, limit: 1) do
+      case pairs do
+        [{_id, doc} | _] -> {:ok, doc}
+        [] -> {:ok, nil}
+      end
+    end
+  end
+
+  @doc """
+  Merges `patch` into every document in `collection` matching `filter`.
+  Returns the number updated.
+
+  This is a PARTIAL update: fields in `patch` overwrite, fields absent from it
+  survive. `update_in/4` replaces a whole document by id and is a different
+  operation despite the shared name root.
+  """
+  @spec update_where(client(), String.t(), map() | String.t(), map()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def update_where(client, collection, filter, patch) do
+    with {:ok, pairs} <- find_with_ids(client, collection, filter, limit: 10_000) do
+      Enum.reduce_while(pairs, {:ok, 0}, fn {id, existing}, {:ok, n} ->
+        merged = Map.merge(existing, stringify_keys(patch))
+
+        case update_in(client, collection, id, merged) do
+          {:ok, true} -> {:cont, {:ok, n + 1}}
+          {:ok, _} -> {:cont, {:ok, n}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  @doc """
+  Deletes every document in `collection` matching `filter`. Returns the number
+  deleted.
+  """
+  @spec delete_where(client(), String.t(), map() | String.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def delete_where(client, collection, filter) do
+    with {:ok, pairs} <- find_with_ids(client, collection, filter, limit: 10_000) do
+      Enum.reduce_while(pairs, {:ok, 0}, fn {id, _doc}, {:ok, n} ->
+        case delete_in(client, collection, id) do
+          {:ok, true} -> {:cont, {:ok, n + 1}}
+          {:ok, _} -> {:cont, {:ok, n}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  @doc """
+  Extracts a value at a nested path. Accepts any number of keys.
+
+  `path_in/4` takes exactly one key; the engine's DOC_PATH is variadic, so a
+  nested path was unreachable from Elixir. Sending zero keys would build
+  `DOC_PATH($1, )` — a malformed statement whose error names a syntax problem
+  rather than the empty path that caused it — so it is refused here.
+  """
+  @spec path_all(client(), String.t(), integer(), [String.t()]) ::
+          {:ok, term()} | {:error, term()}
+  def path_all(_client, _collection, _id, []), do: {:error, :empty_path}
+
+  def path_all(client, collection, id, keys) when is_list(keys) do
+    with :ok <- Nucleus.Client.require_nucleus(client, "Document.path") do
+      # $1 (and $2 when scoped) are taken; the key tail starts after them.
+      offset = if collection == "", do: 1, else: 2
+
+      placeholders =
+        keys
+        |> Enum.with_index(offset + 1)
+        |> Enum.map_join(", ", fn {_k, i} -> "$#{i}" end)
+
+      {sql, params} =
+        if collection == "",
+          do:
+            {"SELECT DOC_PATH($1, #{placeholders})", [doc_id(id) | keys]},
+            else: {"SELECT DOC_PATH_IN($1, $2, #{placeholders})", [collection, doc_id(id) | keys]}
+
+      case Nucleus.Client.query(client, sql, params) do
+        {:ok, %{rows: [[val]]}} -> {:ok, decode_path_value(val)}
+        {:ok, %{rows: []}} -> {:ok, nil}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  # DOC_PATH hands back raw JSON, so a stored string arrives as ~s("ada").
+  # S22 decided the cross-SDK contract: get_path returns the VALUE.
+  defp decode_path_value(nil), do: nil
+
+  defp decode_path_value(raw) when is_binary(raw) do
+    case Jason.decode(raw) do
+      {:ok, decoded} -> decoded
+      {:error, _} -> raw
+    end
+  end
+
+  defp decode_path_value(other), do: other
+
+  # Atom keys in a patch would serialise fine but never match the string keys a
+  # decoded document carries, so a merge would add a duplicate field rather
+  # than overwrite.
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
+      {k, v} -> {k, v}
+    end)
+  end
+
+  defp find_with_ids(client, collection, filter, opts) do
+    limit = Keyword.get(opts, :limit, 100)
+    skip = Keyword.get(opts, :skip, 0)
+
+    with {:ok, ids} <- query_in(client, collection, filter) do
+      ids
+      |> Enum.drop(skip)
+      |> Enum.take(limit)
+      |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
+        case get_in_collection(client, collection, id) do
+          {:ok, nil} -> {:cont, {:ok, acc}}
+          {:ok, doc} -> {:cont, {:ok, [{id, doc} | acc]}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, acc} -> {:ok, Enum.reverse(acc)}
+        other -> other
+      end
+    end
+  end
+
   @doc "Returns the number of documents in `collection`."
   @spec count_in(client(), String.t()) :: {:ok, integer()} | {:error, term()}
   def count_in(client, collection) do

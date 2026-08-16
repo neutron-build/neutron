@@ -236,11 +236,20 @@ defmodule Live.Ops do
 
   defp dispatch(c, "document.countIn", [coll]), do: unwrap(Document.count_in(c, coll))
 
-  # Document.query_in is the client's filter surface. It answers with matching
-  # ids rather than documents; `find_one` cannot be synthesised from it without
-  # this executor becoming the client, so that op is left unmapped.
   defp dispatch(c, "document.find", [coll, filter]),
-    do: unwrap(Document.query_in(c, coll, filter))
+    do: unwrap(Document.find(c, coll, filter))
+
+  defp dispatch(c, "document.findOne", [coll, filter]),
+    do: unwrap(Document.find_one(c, coll, filter))
+
+  defp dispatch(c, "document.update", [coll, filter, patch]),
+    do: unwrap(Document.update_where(c, coll, filter, patch))
+
+  defp dispatch(c, "document.delete", [coll, filter]),
+    do: unwrap(Document.delete_where(c, coll, filter))
+
+  defp dispatch(c, "document.getPathIn", [coll, id | keys]),
+    do: unwrap(Document.path_all(c, coll, id, keys))
 
   # ── graph ────────────────────────────────────────────────────────────
   # Graph.add_node takes ONE label where the spec passes a label list; the first
@@ -295,6 +304,22 @@ defmodule Live.Ops do
   end
 
   defp dispatch(c, "timeseries.count", [series]), do: unwrap(TimeSeries.count(c, series))
+
+  # start/end are OFFSETS from the spec's base instant, like the points written
+  # above; the window is a DURATION and must not be shifted. Passing the offsets
+  # through raw sent the engine a negative timestamp, which it rejects.
+  defp dispatch(c, "timeseries.aggregate", [series, start_ms, end_ms, window_ms]),
+    do:
+      unwrap(
+        TimeSeries.aggregate(
+          c,
+          series,
+          ts_base_ms() + start_ms,
+          ts_base_ms() + end_ms,
+          window_ms,
+          :avg
+        )
+      )
   defp dispatch(c, "timeseries.last", [series]), do: unwrap(TimeSeries.last(c, series))
 
   # ── streams ──────────────────────────────────────────────────────────
@@ -319,15 +344,16 @@ defmodule Live.Ops do
     do: unwrap(apply(Streams, :xack, [c, s, g, entry_id]))
 
   # ── blobs ────────────────────────────────────────────────────────────
-  # Blob.store/get take a key only — there is no bucket dimension in the Elixir
-  # client — and carry the payload hex-encoded rather than as bytes.
-  defp dispatch(c, "blob.put", [_bucket, key, payload_b64]) do
+  # Buckets are a client-side "bucket/key" convention shared with every other
+  # SDK; the engine has one flat keyspace. The payload crosses hex-encoded
+  # rather than as bytes.
+  defp dispatch(c, "blob.put", [bucket, key, payload_b64]) do
     hex = payload_b64 |> Base.decode64!() |> Base.encode16(case: :lower)
-    unwrap(Blob.store(c, key, hex))
+    unwrap(Blob.store_in(c, bucket, key, hex))
   end
 
-  defp dispatch(c, "blob.get", [_bucket, key]) do
-    case unwrap(Blob.get(c, key)) do
+  defp dispatch(c, "blob.get", [bucket, key]) do
+    case unwrap(Blob.get_in_bucket(c, bucket, key)) do
       nil ->
         nil
 
@@ -343,8 +369,9 @@ defmodule Live.Ops do
     end
   end
 
-  defp dispatch(c, "blob.getMeta", [_bucket, key]), do: unwrap(Blob.meta(c, key))
-  defp dispatch(c, "blob.delete", [_bucket, key]), do: unwrap(Blob.delete(c, key))
+  defp dispatch(c, "blob.getMeta", [bucket, key]), do: unwrap(Blob.meta_in(c, bucket, key))
+  defp dispatch(c, "blob.delete", [bucket, key]), do: unwrap(Blob.delete_in(c, bucket, key))
+  defp dispatch(c, "blob.exists", [bucket, key]), do: unwrap(Blob.exists_in(c, bucket, key))
 
   # ── cdc ──────────────────────────────────────────────────────────────
   defp dispatch(c, "cdc.read", [after_seq, limit]), do: unwrap(CDC.read(c, after_seq, limit))
@@ -370,6 +397,8 @@ defmodule Live.Ops do
 
   defp dispatch(c, "vector.insert", [coll, id, values]),
     do: unwrap(Vector.insert(c, coll, id, values))
+
+  defp dispatch(c, "vector.count", [coll]), do: unwrap(Vector.count(c, coll))
 
   defp dispatch(c, "vector.search", [coll, values, k]),
     do: unwrap(Vector.search(c, coll, values, limit: k))
