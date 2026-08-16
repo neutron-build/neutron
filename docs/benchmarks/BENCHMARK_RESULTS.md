@@ -1,5 +1,32 @@
 # Nucleus Multi-Database Competitive Benchmark Results
 
+> [!WARNING]
+> **These numbers are not safe to cite. Verified unreliable on 2026-08-15.**
+>
+> They were produced by `nucleus/src/bin/compete.rs`, which hard-wires the
+> RAM-resident `MvccStorageAdapter` with no flag to change it — so they do not
+> measure the engine `nucleus serve` runs (`BufferedDiskEngine(DiskEngine)`,
+> `main.rs:1022`). Its `Stats` struct has no error field, and Nucleus statements
+> are timed as `let _ = …await` **inside** the measured region while the
+> comparison system's are `.unwrap()`, so failed operations are recorded as fast
+> successes.
+>
+> The contradiction is direct: this directory reports single-row `INSERT` as a
+> 1.2× **win** for Nucleus, while `nucleus/docs/BENCH_VS_POSTGRES.md:413` measures
+> the same workload on the real engine at **0.03× — PostgreSQL roughly 34×
+> faster**.
+>
+> **Use `nucleus/docs/BENCH_VS_POSTGRES.md` instead.** It is the careful
+> document: it attributes the write loss to fsync and warns against comparing
+> its table against another batch term by term. The read and aggregate wins
+> there are genuine; the write wins here are an artifact.
+>
+> Retained rather than deleted so the claims stay traceable to what produced
+> them. Regenerate on the real engine, with errors excluded from timing, before
+> republishing anything from this directory. Context:
+> `_internal/v20/PHASE_C_FINDINGS.md`.
+
+
 **Execution Date**: 2026-03-14 at 09:36 UTC
 **Binary**: compete v1.0 (24MB release build)
 **Dataset**: 50,000 users + 250,000 orders
