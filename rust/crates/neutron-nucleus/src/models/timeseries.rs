@@ -41,7 +41,7 @@ impl TimeSeriesModel {
             .query_one("SELECT TS_LAST($1)", &[&series])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<Option<f64>>(0)?)
+        row.get_ck::<Option<f64>>(0)
     }
 
     /// Return the raw data points stored in `[start_ms, end_ms]`.
@@ -89,7 +89,7 @@ impl TimeSeriesModel {
             .query_one("SELECT TS_COUNT($1)", &[&series])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return the number of data points in a time range.
@@ -108,7 +108,7 @@ impl TimeSeriesModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return the average value of data points in a time range.
@@ -127,7 +127,7 @@ impl TimeSeriesModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<Option<f64>>(0)?)
+        row.get_ck::<Option<f64>>(0)
     }
 
     /// Set the global time-series retention policy.
@@ -167,7 +167,7 @@ impl TimeSeriesModel {
             .query_one("SELECT TIME_BUCKET($1, $2)", &[&bucket_ms, &timestamp_ms])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Aggregate a series into fixed windows across a range.

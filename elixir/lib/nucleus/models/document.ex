@@ -304,9 +304,8 @@ defmodule Nucleus.Models.Document do
 
       {sql, params} =
         if collection == "",
-          do:
-            {"SELECT DOC_PATH($1, #{placeholders})", [doc_id(id) | keys]},
-            else: {"SELECT DOC_PATH_IN($1, $2, #{placeholders})", [collection, doc_id(id) | keys]}
+          do: {"SELECT DOC_PATH($1, #{placeholders})", [doc_id(id) | keys]},
+          else: {"SELECT DOC_PATH_IN($1, $2, #{placeholders})", [collection, doc_id(id) | keys]}
 
       case Nucleus.Client.query(client, sql, params) do
         {:ok, %{rows: [[val]]}} -> {:ok, decode_path_value(val)}

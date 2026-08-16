@@ -134,7 +134,7 @@ impl FtsModel {
             .query_one("SELECT $1::text @@ $2::text", &[&text, &query])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Score a text value against a query with BM25.
@@ -190,7 +190,7 @@ impl FtsModel {
             .query_one("SELECT FTS_INDEX($1, $2)", &[&doc_id, &text])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Perform an exact full-text search.
@@ -237,7 +237,7 @@ impl FtsModel {
             .query_one("SELECT FTS_REMOVE($1)", &[&doc_id])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Return the number of indexed documents.
@@ -248,7 +248,7 @@ impl FtsModel {
             .query_one("SELECT FTS_DOC_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return the number of indexed terms.
@@ -259,7 +259,7 @@ impl FtsModel {
             .query_one("SELECT FTS_TERM_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 }
 

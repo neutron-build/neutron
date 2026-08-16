@@ -88,7 +88,7 @@ impl ColumnarModel {
             .query_one("SELECT COLUMNAR_COUNT($1)", &[&table])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return the sum of a column.
@@ -102,7 +102,7 @@ impl ColumnarModel {
             .query_one("SELECT COLUMNAR_SUM($1, $2)", &[&table, &column])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 
     /// Return the average of a column.
@@ -116,7 +116,7 @@ impl ColumnarModel {
             .query_one("SELECT COLUMNAR_AVG($1, $2)", &[&table, &column])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 
     /// Return the minimum value of a column (as a string for type flexibility).
@@ -130,7 +130,7 @@ impl ColumnarModel {
             .query_one("SELECT COLUMNAR_MIN($1, $2)::TEXT", &[&table, &column])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Return the maximum value of a column (as a string for type flexibility).
@@ -144,6 +144,6 @@ impl ColumnarModel {
             .query_one("SELECT COLUMNAR_MAX($1, $2)::TEXT", &[&table, &column])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 }

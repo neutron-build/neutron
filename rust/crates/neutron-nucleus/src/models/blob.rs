@@ -60,7 +60,7 @@ impl BlobModel {
                 .await
                 .map_err(NucleusError::Query)?
         };
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Retrieve a blob as raw bytes. Returns `None` if not found.
@@ -90,7 +90,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_DELETE($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Return metadata for a blob.
@@ -140,7 +140,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_TAG($1, $2, $3)", &[&key, &tag_key, &tag_value])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// List blob keys matching an optional prefix.
@@ -171,7 +171,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return the deduplication ratio.
@@ -182,7 +182,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_DEDUP_RATIO()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 }
 

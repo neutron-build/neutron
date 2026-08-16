@@ -39,7 +39,7 @@ impl GeoModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 
     /// Calculate the Euclidean distance between two points.
@@ -53,7 +53,7 @@ impl GeoModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 
     /// Check if point `b` is within `radius_meters` of point `a`.
@@ -72,7 +72,7 @@ impl GeoModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Create a PostGIS-compatible point from longitude and latitude.
@@ -84,7 +84,7 @@ impl GeoModel {
             .query_one("SELECT ST_MAKEPOINT($1, $2)::TEXT", &[&lon, &lat])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Extract the X coordinate (longitude) from a point created by `make_point`.
@@ -95,7 +95,7 @@ impl GeoModel {
             .query_one("SELECT ST_X(ST_MAKEPOINT($1, $2))", &[&lon, &lat])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 
     /// Extract the Y coordinate (latitude) from a point created by `make_point`.
@@ -106,7 +106,7 @@ impl GeoModel {
             .query_one("SELECT ST_Y(ST_MAKEPOINT($1, $2))", &[&lon, &lat])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 }
 

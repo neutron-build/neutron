@@ -69,7 +69,7 @@ impl VectorModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<f64>(0)?)
+        row.get_ck::<f64>(0)
     }
 
     /// Return the dimensionality of a vector.
@@ -82,7 +82,7 @@ impl VectorModel {
             .query_one("SELECT VECTOR_DIMS(VECTOR($1))", &[&vec_json])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Create a vector collection (table with id, embedding, metadata columns).
@@ -203,7 +203,7 @@ impl VectorModel {
             .query_one(&format!("SELECT COUNT(*) FROM {collection}"), &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     pub async fn delete(&self, collection: &str, id: &str) -> Result<bool, NucleusError> {

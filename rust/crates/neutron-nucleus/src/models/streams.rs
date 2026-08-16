@@ -63,7 +63,7 @@ impl StreamModel {
             .query_one(&sql, &query_params)
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Return the number of entries in a stream.
@@ -74,7 +74,7 @@ impl StreamModel {
             .query_one("SELECT STREAM_XLEN($1)", &[&stream])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return entries in a stream between start and end timestamps (inclusive).
@@ -134,7 +134,7 @@ impl StreamModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Read entries from a consumer group.
@@ -181,7 +181,7 @@ impl StreamModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 }
 

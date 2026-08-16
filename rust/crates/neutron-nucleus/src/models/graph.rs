@@ -72,7 +72,7 @@ impl GraphModel {
                 .await
                 .map_err(NucleusError::Query)?
         };
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Create a new edge between two nodes. Returns the edge ID.
@@ -103,7 +103,7 @@ impl GraphModel {
                 .await
                 .map_err(NucleusError::Query)?
         };
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Delete a node by ID.
@@ -114,7 +114,7 @@ impl GraphModel {
             .query_one("SELECT GRAPH_DELETE_NODE($1)", &[&node_id])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Delete an edge by ID.
@@ -125,7 +125,7 @@ impl GraphModel {
             .query_one("SELECT GRAPH_DELETE_EDGE($1)", &[&edge_id])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Execute a Cypher-style graph query.
@@ -189,7 +189,7 @@ impl GraphModel {
             .query_one("SELECT GRAPH_NODE_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return the total number of edges.
@@ -200,7 +200,7 @@ impl GraphModel {
             .query_one("SELECT GRAPH_EDGE_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 }
 

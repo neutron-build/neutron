@@ -76,7 +76,7 @@ impl CdcModel {
             .query_one("SELECT CDC_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Read up to `limit` CDC events for a specific table after the given

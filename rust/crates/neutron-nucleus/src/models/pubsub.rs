@@ -22,7 +22,7 @@ impl PubSubModel {
             .query_one("SELECT PUBSUB_PUBLISH($1, $2)", &[&channel, &message])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Return active PubSub channels matching an optional pattern.
@@ -54,6 +54,6 @@ impl PubSubModel {
             .query_one("SELECT PUBSUB_SUBSCRIBERS($1)", &[&channel])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 }

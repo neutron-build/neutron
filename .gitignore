@@ -111,8 +111,11 @@ mojo/reports/
 mojo/study/
 mojo/specs/
 
-# Turbo internal
-**/.turbo-ls-normalized.json
+# NOT ignored: typescript/.turbo-ls-normalized.json. It looks like turbo cache
+# and was filed here as "Turbo internal", but it is the authored BASELINE that
+# `pnpm run ci:workspace` compares the workspace graph against. Ignoring it made
+# the check fail on every CI run with "Missing snapshot file" — a gate that can
+# only pass on the laptop that generated it is not a gate.
 
 # Scratch / dev tooling files
 **/do_edit.py

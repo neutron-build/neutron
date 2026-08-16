@@ -24,7 +24,7 @@ impl DatalogModel {
             .query_one("SELECT DATALOG_ASSERT($1)", &[&fact])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Retract a fact from the Datalog knowledge base.
@@ -36,7 +36,7 @@ impl DatalogModel {
             .query_one("SELECT DATALOG_RETRACT($1)", &[&fact])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Define a Datalog rule. The head and body are joined into the engine's
@@ -49,7 +49,7 @@ impl DatalogModel {
             .query_one("SELECT DATALOG_RULE($1)", &[&rule])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Evaluate a Datalog query. Returns results as a JSON array of arrays.
@@ -60,7 +60,7 @@ impl DatalogModel {
             .query_one("SELECT DATALOG_QUERY($1)", &[&pattern])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Clear all facts and rules for a predicate.
@@ -72,7 +72,7 @@ impl DatalogModel {
             .query_one("SELECT DATALOG_CLEAR($1)", &[&predicate])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 
     /// Import all graph edges as facts: `predicate(from_id, edge_type, to_id)`.
@@ -84,6 +84,6 @@ impl DatalogModel {
             .query_one("SELECT DATALOG_IMPORT_GRAPH($1)", &[&predicate])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<String>(0)?)
+        row.get_ck::<String>(0)
     }
 }

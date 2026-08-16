@@ -54,7 +54,7 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
 
     /// Retrieve a document by ID from the default collection.
@@ -123,7 +123,7 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Delete a document by ID from the default collection.
@@ -146,7 +146,7 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<bool>(0)?)
+        row.get_ck::<bool>(0)
     }
 
     /// Query the default collection. Returns matching document IDs.
@@ -236,7 +236,7 @@ impl DocumentModel {
             .query_one(&sql, &query_params)
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<Option<String>>(0)?)
+        row.get_ck::<Option<String>>(0)
     }
 
     /// Number of documents in the default collection.
@@ -255,7 +255,7 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get_ck::<i64>(0)?)
+        row.get_ck::<i64>(0)
     }
     /// Find whole documents matching `filter` in `collection`.
     ///

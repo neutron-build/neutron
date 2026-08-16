@@ -119,7 +119,11 @@ pub(super) fn pg_type_io_names(typname: &str) -> (String, String, String, String
         "varbit",
         "record",
     ];
-    let sep = if UNDERSCORED.contains(&typname) { "_" } else { "" };
+    let sep = if UNDERSCORED.contains(&typname) {
+        "_"
+    } else {
+        ""
+    };
     // `recv` and `in` are not symmetrical with `send`/`out`: PostgreSQL spells
     // them `uuid_recv` / `uuid_in`, never `uuid_receive` / `uuid_input`.
     (
