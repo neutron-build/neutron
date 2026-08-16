@@ -81,10 +81,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk: [python, go, typescript]
-        # S15/S17-S19 add rust, elixir, zig and julia here as their executors
-        # land. An SDK absent from this list is UNPROVEN, and the drift job
-        # below says so out loud rather than counting it as agreement.
+        sdk: [python, go, typescript, elixir]
+        # elixir joined 2026-08-15, once it could connect at all. Its executor
+        # existed since S17 and reported 42/42 failing, because Postgrex's type
+        # bootstrap died on `ARRAY (SELECT ...)`; with that fixed it runs
+        # 32 pass / 7 unsupported / 3 xfail / 0 fail.
+        #
+        # S15/S18/S19 add rust, zig and julia here as their executors land. An
+        # SDK absent from this list is UNPROVEN, and the drift job below says so
+        # out loud rather than counting it as agreement.
     steps:
       - uses: actions/checkout@v4
 
@@ -135,6 +140,20 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm --filter @neutron-build/nucleus build
+
+      - uses: erlef/setup-beam@v1
+        if: matrix.sdk == 'elixir'
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      # The executor compiles the in-repo `elixir/` app with its own mix and
+      # loads it off _build, so the client under test is the one the SDK ships
+      # rather than a copy resolved from Hex.
+      - name: Fetch Elixir deps
+        if: matrix.sdk == 'elixir'
+        working-directory: elixir
+        run: mix deps.get
 
       - name: Start Nucleus
         run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live
@@ -192,15 +211,19 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @neutron-build/nucleus build
 
-      # Elixir is deliberately NOT installed yet. Its executor exists and is
-      # correct, but Postgrex still cannot complete a connection: the engine now
-      # has pg_range and pg_type.typsend/typreceive/typoutput (fixed 2026-08-13,
-      # which moved the error on), and the remaining blocker is that the type
-      # bootstrap uses `ARRAY (SELECT ...)`, which the engine answers with
-      # "subquery in function args". Installing the toolchain to run 42 cases
-      # that all fail at connect would spend CI minutes to restate a gap already
-      # recorded. Add this back with the same setup-beam step the moment the
-      # engine supports ARRAY(subquery).
+      # Elixir was deliberately not installed here while Postgrex could not
+      # complete a connection at all — running 42 cases that all fail at connect
+      # spends CI minutes to restate a gap already recorded. That blocker is
+      # gone: the engine gained `ARRAY (SELECT ...)` and correct irregular
+      # pg_type I/O names (`uuid_send`, not `uuidsend`) on 2026-08-15, and the
+      # suite now runs 32 pass / 7 unsupported / 3 xfail / 0 fail. Installed as
+      # the note said to.
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+      - working-directory: elixir
+        run: mix deps.get
 
       - name: Start Nucleus
         run: sh conformance/live/scripts/start-engine.sh 55432 /tmp/nucleus-live

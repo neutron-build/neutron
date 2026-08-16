@@ -80,6 +80,56 @@ pub(super) const BASE_PG_TYPES: &[(i32, &str, i32, &str, &str)] = &[
     (1042, "bpchar", -1, "b", "S"),
 ];
 
+/// The four `pg_type` I/O function names for a type: `(in, out, recv, send)`.
+///
+/// These are **not** derivable by concatenation, and clients match on them
+/// exactly. PostgreSQL's own naming is irregular for historical reasons: `int4`
+/// uses `int4send` with no separator while `uuid` uses `uuid_send` with one.
+/// Nucleus previously generated all four as `format!("{typname}send")`, which is
+/// right for about half the catalog and wrong for the other half.
+///
+/// The cost of that was not cosmetic. Postgrex selects its decoding extension by
+/// matching the send-function name, so `uuidsend` meant no extension matched and
+/// every query touching a UUID failed with "type `uuid` can not be handled by
+/// the types module Postgrex.DefaultTypes" — after connecting successfully,
+/// which made it look like a query bug rather than a catalog one.
+///
+/// Unknown types fall back to concatenation. That is the right default (it is
+/// what the majority of PostgreSQL's own types do) but it is a guess, so new
+/// types belong in the table rather than relying on it.
+pub(super) fn pg_type_io_names(typname: &str) -> (String, String, String, String) {
+    // Types whose I/O functions carry an underscore in real PostgreSQL.
+    const UNDERSCORED: &[&str] = &[
+        "json",
+        "jsonb",
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "numeric",
+        "uuid",
+        "xml",
+        "point",
+        "inet",
+        "cidr",
+        "macaddr",
+        "bit",
+        "varbit",
+        "record",
+    ];
+    let sep = if UNDERSCORED.contains(&typname) { "_" } else { "" };
+    // `recv` and `in` are not symmetrical with `send`/`out`: PostgreSQL spells
+    // them `uuid_recv` / `uuid_in`, never `uuid_receive` / `uuid_input`.
+    (
+        format!("{typname}{sep}in"),
+        format!("{typname}{sep}out"),
+        format!("{typname}{sep}recv"),
+        format!("{typname}{sep}send"),
+    )
+}
+
 /// Return (unit, category, short_desc) metadata for a setting name.
 pub(super) fn pg_setting_metadata(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {

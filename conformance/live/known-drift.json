@@ -1,20 +1,45 @@
 {
-  "$comment": "Cross-SDK disagreements that are known, understood, and being worked. Every entry needs a reason and a hard expiry. NEW drift fails the run; an expired entry fails the run; and a recorded entry whose SDKs now AGREE also fails, because a note describing a state that no longer exists is the same rot as a stale finding. Baseline taken 2026-08-13 from the first three-SDK run (python, go, typescript). Nothing here is acceptable \u2014 it is the work list. 2026-08-13 later the same day: nine entries removed after the TypeScript int8 coercion, pathIn decode and datalog arity fixes landed \u2014 the runner refuses to keep an entry whose SDKs now agree. 2026-08-13, third pass: the four SQL/vector entries removed after the engine fixes landed \u2014 dimensionless-VECTOR row omission and the statement-Describe column typing. The three that remain are SDK-side work, not engine defects.",
+  "$comment": "Cross-SDK disagreements that are known, understood, and being worked. Every entry needs a reason and a hard expiry. NEW drift fails the run; an expired entry fails the run; and a recorded entry whose SDKs now AGREE also fails, because a note describing a state that no longer exists is the same rot as a stale finding. Baseline taken 2026-08-13 from the first three-SDK run (python, go, typescript). Nothing here is acceptable — it is the work list. 2026-08-13 later the same day: nine entries removed after the TypeScript int8 coercion, pathIn decode and datalog arity fixes landed — the runner refuses to keep an entry whose SDKs now agree. 2026-08-13, third pass: the four SQL/vector entries removed after the engine fixes landed — dimensionless-VECTOR row omission and the statement-Describe column typing. The three that remain are SDK-side work, not engine defects. 2026-08-15: elixir joined the matrix once the engine gained ARRAY(subquery) and correct irregular pg_type I/O names, taking it from 42/42 failing at connect to 32 pass / 0 fail. Its arrival surfaced five NEW disagreements, every one an Elixir SDK method that does not exist rather than an engine defect — they were invisible while the SDK could not connect at all.",
   "baselineDate": "2026-08-13",
   "drift": [
     {
       "case": "document.get_path_returns_a_decoded_scalar",
-      "reason": "S22 decided the contract \u2014 get_path returns the VALUE \u2014 and landed it in Python only. Go (document.go PathIn) and TypeScript (pathIn) still return the engine's raw JSON text, so a string arrives as '\"ada\"'. Port the decode.",
+      "reason": "S22 decided the contract — get_path returns the VALUE — and landed it in Python only. Go (document.go PathIn) and TypeScript (pathIn) still return the engine's raw JSON text, so a string arrives as '\"ada\"'. Port the decode.",
       "expires": "2026-09-30"
     },
     {
       "case": "timeseries.range_query",
-      "reason": "Three different answers to the same question. Python synthesizes raw point retrieval from 60 bucketed TS_RANGE_AVG calls. Go's TimeSeries.Query refuses outright with 'raw point retrieval is not supported by the engine' \u2014 which is false, since Python does it on the same primitives. TypeScript has no raw point read at all. Decide once whether the SDK owns this synthesis, then make all three agree.",
+      "reason": "Three different answers to the same question. Python synthesizes raw point retrieval from 60 bucketed TS_RANGE_AVG calls. Go's TimeSeries.Query refuses outright with 'raw point retrieval is not supported by the engine' — which is false, since Python does it on the same primitives. TypeScript has no raw point read at all. Decide once whether the SDK owns this synthesis, then make all three agree.",
       "expires": "2026-09-30"
     },
     {
       "case": "cdc.read_returns_a_list",
       "reason": "Go and TypeScript both return CDC events as a raw JSON STRING rather than a list; Go has no CDCEvent type at all. Latent false green risk: a non-empty string is truthy, so a nonEmpty assertion would pass on an empty result.",
+      "expires": "2026-09-30"
+    },
+    {
+      "case": "document.round_trip",
+      "reason": "Elixir only. Nucleus.Models.Document has no filter-based update or delete — update_in/4 and delete_in/3 address a document by id, so the spec's update(collection, filter, patch) cannot be expressed. python/go/typescript pass. Needs new SDK surface, not an engine change.",
+      "expires": "2026-09-30"
+    },
+    {
+      "case": "document.find_by_filter",
+      "reason": "Elixir only. Document has no find_one: query_in/3 answers with matching ids and nothing returns a single matching document. python/go/typescript pass.",
+      "expires": "2026-09-30"
+    },
+    {
+      "case": "timeseries.aggregate_over_a_bucket",
+      "reason": "Elixir only. TimeSeries.time_bucket/3 truncates ONE timestamp to a bucket; there is no aggregate over a range with a window, which is what the spec asks for. python/go/typescript pass.",
+      "expires": "2026-09-30"
+    },
+    {
+      "case": "blob.round_trip",
+      "reason": "Elixir only. Nucleus.Models.Blob has no exists/2, and no bucket dimension at all — store/get/meta/delete take a key only, which the executor works around by dropping the bucket. python/go/typescript pass.",
+      "expires": "2026-09-30"
+    },
+    {
+      "case": "vector.insert_and_search",
+      "reason": "Elixir only. Nucleus.Models.Vector has no count/2. create_collection, insert, search, delete, dims and distance exist; counting a collection does not. python/go/typescript pass.",
       "expires": "2026-09-30"
     }
   ]

@@ -106,18 +106,96 @@ async fn pg_type_carries_all_four_io_function_columns() {
     };
     assert!(!rows.is_empty(), "pg_type must expose the base types");
 
-    // The values follow Postgres's naming so a client that matches on them
-    // (prisma keys array detection off 'array_in') keeps working.
+    // The values must follow PostgreSQL's ACTUAL naming, which is irregular:
+    // `int4send` has no separator, `uuid_send` does. Clients match on these
+    // exactly — prisma keys array detection off `array_in`, and Postgrex picks
+    // its decoding extension off the send name.
+    //
+    // This assertion used to read `format!("{name}send")` for every type, which
+    // matched the engine because the engine generated the names the same naive
+    // way. Test and implementation shared one wrong assumption, so the test
+    // passed and pinned the bug: UUID columns were undecodable from Elixir with
+    // "type `uuid` can not be handled by the types module Postgrex.DefaultTypes"
+    // while this file reported the catalog correct.
     let text = |v: &nucleus::types::Value| match v {
         nucleus::types::Value::Text(s) => s.clone(),
         other => panic!("expected text, got {other:?}"),
     };
+    let underscored = [
+        "json",
+        "jsonb",
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "numeric",
+        "uuid",
+    ];
     for row in &rows {
         let name = text(&row[0]);
-        assert_eq!(text(&row[1]), format!("{name}in"));
-        assert_eq!(text(&row[2]), format!("{name}out"));
-        assert_eq!(text(&row[3]), format!("{name}recv"));
-        assert_eq!(text(&row[4]), format!("{name}send"));
+        let sep = if underscored.contains(&name.as_str()) {
+            "_"
+        } else {
+            ""
+        };
+        assert_eq!(text(&row[1]), format!("{name}{sep}in"), "typinput/{name}");
+        assert_eq!(text(&row[2]), format!("{name}{sep}out"), "typoutput/{name}");
+        assert_eq!(
+            text(&row[3]),
+            format!("{name}{sep}recv"),
+            "typreceive/{name}"
+        );
+        assert_eq!(text(&row[4]), format!("{name}{sep}send"), "typsend/{name}");
+    }
+}
+
+/// The exact spellings Postgrex matches its decoding extensions against, named
+/// one by one rather than derived — a rule and its test derived from the same
+/// formula agree with each other whether or not either is right.
+#[tokio::test]
+async fn the_irregular_io_names_match_postgresql_exactly() {
+    let db = db().await;
+    let rows = match db
+        .execute("SELECT t.typname, t.typsend FROM pg_type t")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        ExecResult::Select { rows, .. } => rows,
+        o => panic!("{o:?}"),
+    };
+    let text = |v: &nucleus::types::Value| match v {
+        nucleus::types::Value::Text(s) => s.clone(),
+        other => panic!("expected text, got {other:?}"),
+    };
+    let by_name: std::collections::HashMap<String, String> = rows
+        .iter()
+        .map(|r| (text(&r[0]), text(&r[1])))
+        .collect();
+
+    for (typname, expected_send) in [
+        ("uuid", "uuid_send"),
+        ("jsonb", "jsonb_send"),
+        ("numeric", "numeric_send"),
+        ("date", "date_send"),
+        ("timestamp", "timestamp_send"),
+        ("timestamptz", "timestamptz_send"),
+        ("int4", "int4send"),
+        ("int8", "int8send"),
+        ("int2", "int2send"),
+        ("bool", "boolsend"),
+        ("text", "textsend"),
+        ("bytea", "byteasend"),
+        ("float4", "float4send"),
+        ("float8", "float8send"),
+        ("varchar", "varcharsend"),
+    ] {
+        if let Some(actual) = by_name.get(typname) {
+            assert_eq!(actual, expected_send, "typsend for {typname}");
+        }
     }
 }
 
@@ -137,4 +215,54 @@ async fn the_bootstrap_join_shape_runs() {
         .expect("Postgrex's bootstrap join shape must run");
     let cols = columns_of(r);
     assert_eq!(cols.len(), 7, "bootstrap projection shape: {cols:?}");
+}
+
+/// The REAL bootstrap query, verbatim from Postgrex, including the
+/// `ARRAY (SELECT ...)` composite-attribute projection.
+///
+/// The three tests above assert the catalog's shape and pass — while Elixir
+/// still could not connect, because none of them drives the construct that
+/// actually failed. A shape test that stops one clause short of the real query
+/// is indistinguishable from a passing bootstrap right up until a client tries.
+#[tokio::test]
+async fn the_verbatim_postgrex_bootstrap_query_runs() {
+    let db = db().await;
+    let r = db
+        .execute(
+            "SELECT t.oid, t.typname, t.typsend, t.typreceive, t.typoutput, t.typinput, \
+                    t.typelem, t.typbasetype, t.typrelid, \
+                    coalesce(d.typelem, t.typelem), \
+                    coalesce(r.rngsubtype, 0), \
+                    ARRAY ( \
+                      SELECT a.atttypid \
+                      FROM pg_attribute AS a \
+                      WHERE a.attrelid = t.typrelid AND a.attnum > 0 \
+                        AND NOT a.attisdropped \
+                      ORDER BY a.attnum \
+                    ) \
+             FROM pg_type AS t \
+             LEFT JOIN pg_type AS d ON t.typbasetype = d.oid \
+             LEFT JOIN pg_range AS r ON r.rngtypid = t.oid",
+        )
+        .await
+        .expect("Postgrex's verbatim bootstrap query must run");
+    let cols = columns_of(r);
+    assert_eq!(cols.len(), 12, "bootstrap projection shape: {cols:?}");
+}
+
+/// `ARRAY (SELECT ...)` on its own, so a failure points at the construct
+/// rather than at the 12-column query around it.
+#[tokio::test]
+async fn array_constructor_from_subquery_runs() {
+    let db = db().await;
+    let r = db
+        .execute("SELECT ARRAY (SELECT oid FROM pg_type ORDER BY oid)")
+        .await
+        .expect("ARRAY (SELECT ...) must evaluate");
+    match r.into_iter().next_back().unwrap() {
+        ExecResult::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1, "array constructor yields exactly one row");
+        }
+        o => panic!("expected SELECT, got {o:?}"),
+    }
 }

@@ -5,20 +5,27 @@ description: Using all 14 Nucleus data models from Elixir.
 
 The Elixir Nucleus client provides access to all 14 data models over the PostgreSQL wire protocol. Connections are managed via a GenServer-backed pool with OTP supervision.
 
-> **Status: none of this page runs yet.** The connection shown below cannot be
-> established against Nucleus today, so everything here is API reference rather
-> than working code.
+> **Status: verified against a running engine, with seven known gaps.** As of
+> 2026-08-15 Elixir is in the `sdk-live` CI matrix and the connection below
+> works. It could not connect at all before that date — Postgrex's type
+> bootstrap needs `ARRAY (SELECT ...)`, which the engine rejected.
 >
-> Postgrex's type-bootstrap query fails at connect time on `ARRAY (SELECT ...)`
-> in a function argument — `ERROR 0A000 subquery in function args`. The pool
-> retries, so it presents as a hang rather than an error. Postgrex's
-> `disable_composite_types: true` avoids the query client-side, but that hides an
-> engine gap behind an SDK flag, so it is deliberately not recommended here.
+> Live results: **32 pass, 0 fail, 7 unsupported, 3 expected-fail.** The seven
+> unsupported are methods this SDK has not implemented:
 >
-> These shapes are also **not covered by the live conformance suite** — the
-> `sdk-live` CI matrix runs python, go and typescript only. They are taken from
-> the SDK source and have not been executed against a running engine. Verified
-> 2026-08-15.
+> - `Document` — no filter-based update or delete (`update_in/4` and
+>   `delete_in/3` address a document by id), and no `find_one`.
+> - `Document.path_in/4` takes exactly one key, so nested paths are unreachable.
+> - `TimeSeries` — no range point retrieval, and no aggregate over a range with
+>   a window (`time_bucket/3` truncates a single timestamp).
+> - `Blob` — no `exists/2`, and no bucket dimension at all; `store`/`get`/`meta`/
+>   `delete` take a key only.
+> - `Vector` — no `count/2`.
+>
+> Everything else on this page is exercised on every CI run.
+>
+> One caveat specific to Postgrex: **UUID parameters are raw 16-byte binaries**,
+> not dashed strings. `Ecto.UUID.dump/1` converts.
 
 ## Connection
 

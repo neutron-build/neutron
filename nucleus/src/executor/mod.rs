@@ -7400,6 +7400,7 @@ impl Executor {
                             Value::Text(n) => n.clone(),
                             _ => String::new(),
                         };
+                        let (tin, tout, trecv, tsend) = pg_type_io_names(&typname);
                         row.extend([
                             Value::Bool(false),
                             Value::Int32(0),
@@ -7408,10 +7409,10 @@ impl Executor {
                             Value::Int32(0),
                             Value::Int32(0),
                             Value::Text(",".into()),
-                            Value::Text(format!("{typname}in")),
-                            Value::Text(format!("{typname}out")),
-                            Value::Text(format!("{typname}recv")),
-                            Value::Text(format!("{typname}send")),
+                            Value::Text(tin),
+                            Value::Text(tout),
+                            Value::Text(trecv),
+                            Value::Text(tsend),
                         ]);
                     }
                 };

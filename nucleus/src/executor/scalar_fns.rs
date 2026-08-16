@@ -28,6 +28,30 @@ impl Executor {
         row: &Row,
         col_meta: &[ColMeta],
     ) -> Result<Value, ExecError> {
+        // `ARRAY (SELECT ...)` is an array constructor, not a call with
+        // arguments — but sqlparser models it as a Function whose arguments are
+        // a bare Subquery, so it arrives here and used to die in
+        // `extract_fn_args` as Unsupported("subquery in function args").
+        //
+        // Postgrex's type bootstrap issues exactly this shape to collect a
+        // composite type's attribute oids, so the gap locked every Elixir, Ecto
+        // and Phoenix application out of Nucleus at connect time — and because
+        // Postgrex retries the bootstrap rather than surfacing the error, it
+        // presented as a `DBConnection` queue timeout naming nothing.
+        //
+        // Handled before `extract_fn_args` because that is the call that fails;
+        // any other function receiving a bare subquery still rejects, but now
+        // names itself.
+        if let ast::FunctionArguments::Subquery(subquery) = &func.args {
+            let bare = fname.strip_prefix("PG_CATALOG.").unwrap_or(fname);
+            if bare.eq_ignore_ascii_case("ARRAY") {
+                return self.eval_array_subquery(subquery, row, col_meta);
+            }
+            return Err(ExecError::Unsupported(format!(
+                "subquery argument to {bare}()"
+            )));
+        }
+
         let args = self.extract_fn_args(func, row, col_meta)?;
 
         // SECURITY ORDERING: strip the schema qualifier BEFORE any policy check
@@ -6076,6 +6100,42 @@ impl Executor {
                 parts[parts.len() - 1].value.clone(),
             )),
             _ => None,
+        }
+    }
+
+    /// `ARRAY (SELECT ...)` — collect the first column of every row the
+    /// subquery returns into a single array value.
+    ///
+    /// Matches PostgreSQL: row order is whatever the subquery's own ORDER BY
+    /// produces, an empty result is an **empty array rather than NULL** (the
+    /// distinction matters to Postgrex, which indexes the result directly), and
+    /// only the first projected column participates.
+    ///
+    /// Correlation is supported the same way scalar subqueries do it, by
+    /// substituting outer references before execution — Postgrex's bootstrap is
+    /// correlated on `t.typrelid`, so an uncorrelated-only implementation would
+    /// have returned every attribute in the catalog for every row.
+    fn eval_array_subquery(
+        &self,
+        subquery: &ast::Query,
+        row: &Row,
+        col_meta: &[ColMeta],
+    ) -> Result<Value, ExecError> {
+        self.check_subquery_depth()?;
+        let resolved = substitute_outer_refs_in_query(subquery, row, col_meta);
+        let sub_result = sync_block_on(self.execute_query(resolved));
+        self.query_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        match sub_result? {
+            ExecResult::Select { rows, .. } => Ok(Value::Array(
+                rows.into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .collect(),
+            )),
+            // A non-SELECT cannot appear here (the parser only accepts a query),
+            // but an empty array is the safe reading if one ever does: it keeps
+            // the "never NULL" contract the caller indexes against.
+            _ => Ok(Value::Array(Vec::new())),
         }
     }
 

@@ -376,8 +376,8 @@ defmodule Live.Ops do
 
   # ── raw sql ──────────────────────────────────────────────────────────
   defp dispatch(c, "sql.queryScalar", [query, params]) do
-    case unwrap(Nucleus.Client.query(c, query, params)) do
-      %{rows: [row | _]} when is_list(row) and row != [] -> hd(row)
+    case unwrap(Nucleus.Client.query(c, query, pg_params(query, params))) do
+      %{rows: [row | _]} when is_list(row) and row != [] -> row |> hd() |> pg_value()
       _ -> nil
     end
   end
@@ -385,11 +385,52 @@ defmodule Live.Ops do
   defp dispatch(c, "sql.execute", [query, params]) do
     # Postgrex reports the command tag's row count as num_rows; the spec
     # compares row counts.
-    case unwrap(Nucleus.Client.query(c, query, params)) do
+    case unwrap(Nucleus.Client.query(c, query, pg_params(query, params))) do
       %{num_rows: n} -> n
       other -> other
     end
   end
+
+  # Postgrex's UUID extension encodes and decodes the RAW 16 bytes, not the
+  # dashed text form. pgx, node-postgres and asyncpg all accept the string, so
+  # the shared spec is written with strings and each executor adapts — this is
+  # the Elixir adaptation, not a spec deviation.
+  #
+  # This only became necessary once the engine started reporting `uuid_send`
+  # instead of `uuidsend`: before that no Postgrex extension matched the type,
+  # every UUID fell through as text, and the string form "worked" by accident.
+  # The case was recorded as failing for the wrong reason.
+  defp pg_params(query, params) when is_binary(query) and is_list(params) do
+    if String.contains?(query, "::uuid") do
+      Enum.map(params, &uuid_to_binary/1)
+    else
+      params
+    end
+  end
+
+  defp pg_params(_query, params), do: params
+
+  defp uuid_to_binary(
+         <<a::binary-8, "-", b::binary-4, "-", c::binary-4, "-", d::binary-4, "-",
+           e::binary-12>> = s
+       ) do
+    case Base.decode16(a <> b <> c <> d <> e, case: :mixed) do
+      {:ok, bin} when byte_size(bin) == 16 -> bin
+      _ -> s
+    end
+  end
+
+  defp uuid_to_binary(other), do: other
+
+  # The mirror of the above on the read side, so the spec's string comparison
+  # holds. A 16-byte binary coming back from a uuid column is rendered in the
+  # canonical dashed form.
+  defp pg_value(<<a::binary-4, b::binary-2, c::binary-2, d::binary-2, e::binary-6>>) do
+    [a, b, c, d, e]
+    |> Enum.map_join("-", &Base.encode16(&1, case: :lower))
+  end
+
+  defp pg_value(other), do: other
 
   defp dispatch(c, "sql.begin", []), do: unwrap(Nucleus.Client.query(c, "BEGIN", []))
   defp dispatch(c, "sql.rollback", []), do: unwrap(Nucleus.Client.query(c, "ROLLBACK", []))

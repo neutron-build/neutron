@@ -5,20 +5,16 @@ description: OTP-based backend framework with Plug, Bandit, and 14 Nucleus data 
 
 Neutron for Elixir is a fault-tolerant backend framework built on OTP. Plug-based routing, Bandit HTTP server, and a full Nucleus client for all 14 data models.
 
-> **Status: the Nucleus client cannot connect yet.** The framework half — Plug
-> routing, Bandit, supervisors, channels — works. Anything needing a database
-> connection does not, including every example on the
-> [Nucleus Client](/docs/elixir/nucleus) page.
+> **Status: connects, with gaps in the model coverage.** Postgrex could not
+> complete a connection to Nucleus at all until 2026-08-15 — its type bootstrap
+> needed `ARRAY (SELECT ...)`, which the engine rejected, so every Elixir, Ecto
+> and Phoenix application timed out at connect with no cause named. That is
+> fixed, and Elixir now runs in the live conformance suite: 32 of 42 cases pass,
+> none fail.
 >
-> Postgrex runs a type-bootstrap query on connect that Nucleus cannot yet answer.
-> Two of the three causes are fixed (`pg_range` and
-> `pg_type.typsend`/`typreceive`/`typoutput` were added to the catalog); the
-> remaining one is a real SQL gap — `ARRAY (SELECT ...)` in a function argument
-> returns `ERROR 0A000 subquery in function args`. The pool retries, so the
-> caller sees a queue timeout that never names the cause.
->
-> This affects **every Elixir, Ecto and Phoenix application**, not a subset of
-> features. Verified against the engine 2026-08-15.
+> The remaining 7 are model methods this SDK does not implement yet — see
+> [Nucleus Client](/docs/elixir/nucleus) for the list. Verified against a running
+> engine 2026-08-15.
 
 ## Features
 
