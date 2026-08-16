@@ -93,8 +93,19 @@ defmodule Neutron.OpenAPI do
                       "schema" => %{
                         "type" => "object",
                         "properties" => %{
-                          "status" => %{"type" => "string", "enum" => ["ok"]},
-                          "nucleus" => %{"type" => "boolean"},
+                          # FRAMEWORK_CONTRACT §7. `status` degrades when a
+                          # configured nucleus is unreachable, and `nucleus` is
+                          # a tri-state string — this schema said boolean,
+                          # matching the old implementation, so the published
+                          # OpenAPI document described the endpoint wrongly too.
+                          "status" => %{
+                            "type" => "string",
+                            "enum" => ["ok", "degraded"]
+                          },
+                          "nucleus" => %{
+                            "type" => "string",
+                            "enum" => ["connected", "disconnected", "unconfigured"]
+                          },
                           "version" => %{"type" => "string"}
                         }
                       }

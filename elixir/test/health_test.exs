@@ -33,17 +33,39 @@ defmodule Neutron.HealthTest do
 
       body = Jason.decode!(conn.resp_body)
       assert body["status"] == "ok"
-      assert is_boolean(body["nucleus"])
+
+      # FRAMEWORK_CONTRACT.md §7 wants a tri-state STRING here, not a boolean.
+      # This assertion used to read `assert is_boolean(body["nucleus"])`, which
+      # is the shape the implementation happened to have — so the test passed
+      # and guarded the defect instead of catching it.
+      assert body["nucleus"] in ["connected", "disconnected", "unconfigured"]
       assert body["version"] == Neutron.version()
     end
 
-    test "nucleus is false when Nucleus.Client is not running" do
+    test "nucleus is \"unconfigured\" when Nucleus.Client is not running" do
       conn =
         conn(:get, "/health")
         |> Health.call([])
 
       body = Jason.decode!(conn.resp_body)
-      assert body["nucleus"] == false
+
+      # No client process means no nucleus is configured for this service.
+      # §7 calls that "not an error", so `status` stays "ok".
+      assert body["nucleus"] == "unconfigured"
+      assert body["status"] == "ok"
+    end
+
+    test "nucleus is not feature detection" do
+      # §7: "Feature detection (is the connected DB a Nucleus instance vs plain
+      # Postgres) is §1, not /health." The old implementation returned
+      # `Nucleus.Client.is_nucleus?/1` straight into this field, which answered
+      # a different question in the wrong type.
+      conn =
+        conn(:get, "/health")
+        |> Health.call([])
+
+      body = Jason.decode!(conn.resp_body)
+      refute is_boolean(body["nucleus"])
     end
 
     test "passes through non-health requests" do
