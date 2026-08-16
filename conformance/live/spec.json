@@ -29,20 +29,89 @@
       "model": "core",
       "why": "If this reports PostgreSQL then every specialty assertion below tested the wrong server and is silently meaningless.",
       "steps": [
-        { "op": "features.isNucleus", "args": [], "expect": { "equals": true } }
+        {
+          "op": "features.isNucleus",
+          "args": [],
+          "expect": {
+            "equals": true
+          }
+        }
       ]
     },
-
     {
       "id": "document.round_trip",
       "model": "document",
       "steps": [
-        { "op": "document.insert", "args": ["@coll", { "title": "hello", "n": 1 }], "bind": "docId" },
-        { "op": "document.getIn", "args": ["@coll", "$docId"], "expect": { "key": "title", "equals": "hello" } },
-        { "op": "document.update", "args": ["@coll", { "title": "hello" }, { "title": "changed" }], "expect": { "equals": 1 } },
-        { "op": "document.getIn", "args": ["@coll", "$docId"], "expect": { "key": "title", "equals": "changed" } },
-        { "op": "document.delete", "args": ["@coll", { "title": "changed" }], "expect": { "equals": 1 } },
-        { "op": "document.getIn", "args": ["@coll", "$docId"], "expect": { "isNull": true } }
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "title": "hello",
+              "n": 1
+            }
+          ],
+          "bind": "docId"
+        },
+        {
+          "op": "document.getIn",
+          "args": [
+            "@coll",
+            "$docId"
+          ],
+          "expect": {
+            "key": "title",
+            "equals": "hello"
+          }
+        },
+        {
+          "op": "document.update",
+          "args": [
+            "@coll",
+            {
+              "title": "hello"
+            },
+            {
+              "title": "changed"
+            }
+          ],
+          "expect": {
+            "equals": 1
+          }
+        },
+        {
+          "op": "document.getIn",
+          "args": [
+            "@coll",
+            "$docId"
+          ],
+          "expect": {
+            "key": "title",
+            "equals": "changed"
+          }
+        },
+        {
+          "op": "document.delete",
+          "args": [
+            "@coll",
+            {
+              "title": "changed"
+            }
+          ],
+          "expect": {
+            "equals": 1
+          }
+        },
+        {
+          "op": "document.getIn",
+          "args": [
+            "@coll",
+            "$docId"
+          ],
+          "expect": {
+            "isNull": true
+          }
+        }
       ]
     },
     {
@@ -50,8 +119,27 @@
       "model": "document",
       "why": "Document ids must go over pgwire as text. Sent as an integer the server types the parameter differently and the row is never found — the bug that produced GO-055.",
       "steps": [
-        { "op": "document.insert", "args": ["@coll", { "k": "v" }], "bind": "docId" },
-        { "op": "document.getIn", "args": ["@coll", "$docId"], "expect": { "key": "k", "equals": "v" } }
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "k": "v"
+            }
+          ],
+          "bind": "docId"
+        },
+        {
+          "op": "document.getIn",
+          "args": [
+            "@coll",
+            "$docId"
+          ],
+          "expect": {
+            "key": "k",
+            "equals": "v"
+          }
+        }
       ]
     },
     {
@@ -59,8 +147,25 @@
       "model": "document",
       "why": "A document in one collection must read as absent from the default collection, not leak into it.",
       "steps": [
-        { "op": "document.insert", "args": ["@coll", { "k": "v" }], "bind": "docId" },
-        { "op": "document.get", "args": ["$docId"], "expect": { "isNull": true } }
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "k": "v"
+            }
+          ],
+          "bind": "docId"
+        },
+        {
+          "op": "document.get",
+          "args": [
+            "$docId"
+          ],
+          "expect": {
+            "isNull": true
+          }
+        }
       ]
     },
     {
@@ -69,51 +174,224 @@
       "why": "L2. DOC_PATH returns raw JSON and the Python client hands it back undecoded, so a string value arrives as '\"ada\"' rather than 'ada'. The contract is that get_path yields the VALUE. Until every SDK decodes, this is the drift the suite exists to surface.",
       "issue": "L2",
       "steps": [
-        { "op": "document.insert", "args": ["@coll", { "user": { "name": "ada" } }], "bind": "docId" },
-        { "op": "document.getPathIn", "args": ["@coll", "$docId", "user", "name"], "expect": { "equals": "ada" } }
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "user": {
+                "name": "ada"
+              }
+            }
+          ],
+          "bind": "docId"
+        },
+        {
+          "op": "document.getPathIn",
+          "args": [
+            "@coll",
+            "$docId",
+            "user",
+            "name"
+          ],
+          "expect": {
+            "equals": "ada"
+          }
+        }
       ]
     },
     {
       "id": "document.count_in_collection",
       "model": "document",
       "steps": [
-        { "op": "document.insert", "args": ["@coll", { "i": 1 }] },
-        { "op": "document.insert", "args": ["@coll", { "i": 2 }] },
-        { "op": "document.countIn", "args": ["@coll"], "expect": { "equals": 2 } }
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "i": 1
+            }
+          ]
+        },
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "i": 2
+            }
+          ]
+        },
+        {
+          "op": "document.countIn",
+          "args": [
+            "@coll"
+          ],
+          "expect": {
+            "equals": 2
+          }
+        }
       ]
     },
     {
       "id": "document.find_by_filter",
       "model": "document",
       "steps": [
-        { "op": "document.insert", "args": ["@coll", { "tag": "x", "n": 1 }] },
-        { "op": "document.insert", "args": ["@coll", { "tag": "x", "n": 2 }] },
-        { "op": "document.insert", "args": ["@coll", { "tag": "y", "n": 3 }] },
-        { "op": "document.find", "args": ["@coll", { "tag": "x" }], "expect": { "length": 2 } },
-        { "op": "document.findOne", "args": ["@coll", { "tag": "y" }], "expect": { "key": "n", "equals": 3 } }
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "tag": "x",
+              "n": 1
+            }
+          ]
+        },
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "tag": "x",
+              "n": 2
+            }
+          ]
+        },
+        {
+          "op": "document.insert",
+          "args": [
+            "@coll",
+            {
+              "tag": "y",
+              "n": 3
+            }
+          ]
+        },
+        {
+          "op": "document.find",
+          "args": [
+            "@coll",
+            {
+              "tag": "x"
+            }
+          ],
+          "expect": {
+            "length": 2
+          }
+        },
+        {
+          "op": "document.findOne",
+          "args": [
+            "@coll",
+            {
+              "tag": "y"
+            }
+          ],
+          "expect": {
+            "key": "n",
+            "equals": 3
+          }
+        }
       ]
     },
-
     {
       "id": "graph.neighbors_and_shortest_path",
       "model": "graph",
       "why": "GRAPH_NEIGHBORS and GRAPH_SHORTEST_PATH both described zero result columns, so the client refused every response. Neither had ever returned a value.",
       "steps": [
-        { "op": "graph.addNode", "args": [["person"], { "name": "a" }], "bind": "a" },
-        { "op": "graph.addNode", "args": [["person"], { "name": "b" }], "bind": "b" },
-        { "op": "graph.addEdge", "args": ["knows", "$a", "$b"] },
-        { "op": "graph.neighbors", "args": ["$a", "out"], "expect": { "nonEmpty": true } },
-        { "op": "graph.shortestPath", "args": ["$a", "$b"], "expect": { "nonEmpty": true } }
+        {
+          "op": "graph.addNode",
+          "args": [
+            [
+              "person"
+            ],
+            {
+              "name": "a"
+            }
+          ],
+          "bind": "a"
+        },
+        {
+          "op": "graph.addNode",
+          "args": [
+            [
+              "person"
+            ],
+            {
+              "name": "b"
+            }
+          ],
+          "bind": "b"
+        },
+        {
+          "op": "graph.addEdge",
+          "args": [
+            "knows",
+            "$a",
+            "$b"
+          ]
+        },
+        {
+          "op": "graph.neighbors",
+          "args": [
+            "$a",
+            "out"
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        },
+        {
+          "op": "graph.shortestPath",
+          "args": [
+            "$a",
+            "$b"
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        }
       ]
     },
     {
       "id": "graph.counts_and_deletes",
       "model": "graph",
       "steps": [
-        { "op": "graph.addNode", "args": [["tmp"], { "name": "z" }], "bind": "n" },
-        { "op": "graph.nodeCount", "args": [], "expect": { "type": "int" } },
-        { "op": "graph.edgeCount", "args": [], "expect": { "type": "int" } },
-        { "op": "graph.deleteNode", "args": ["$n"], "expect": { "equals": true } }
+        {
+          "op": "graph.addNode",
+          "args": [
+            [
+              "tmp"
+            ],
+            {
+              "name": "z"
+            }
+          ],
+          "bind": "n"
+        },
+        {
+          "op": "graph.nodeCount",
+          "args": [],
+          "expect": {
+            "type": "int"
+          }
+        },
+        {
+          "op": "graph.edgeCount",
+          "args": [],
+          "expect": {
+            "type": "int"
+          }
+        },
+        {
+          "op": "graph.deleteNode",
+          "args": [
+            "$n"
+          ],
+          "expect": {
+            "equals": true
+          }
+        }
       ]
     },
     {
@@ -121,52 +399,228 @@
       "model": "graph",
       "why": "'in' is the direction nothing exercised; an edge is directional and a wrong-way traversal is a wrong answer, not an error.",
       "steps": [
-        { "op": "graph.addNode", "args": [["person"], { "name": "src" }], "bind": "a" },
-        { "op": "graph.addNode", "args": [["person"], { "name": "dst" }], "bind": "b" },
-        { "op": "graph.addEdge", "args": ["knows", "$a", "$b"] },
-        { "op": "graph.neighbors", "args": ["$b", "in"], "expect": { "nonEmpty": true } }
+        {
+          "op": "graph.addNode",
+          "args": [
+            [
+              "person"
+            ],
+            {
+              "name": "src"
+            }
+          ],
+          "bind": "a"
+        },
+        {
+          "op": "graph.addNode",
+          "args": [
+            [
+              "person"
+            ],
+            {
+              "name": "dst"
+            }
+          ],
+          "bind": "b"
+        },
+        {
+          "op": "graph.addEdge",
+          "args": [
+            "knows",
+            "$a",
+            "$b"
+          ]
+        },
+        {
+          "op": "graph.neighbors",
+          "args": [
+            "$b",
+            "in"
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        }
       ]
     },
-
     {
       "id": "kv.scalar_and_ttl",
       "model": "kv",
       "steps": [
-        { "op": "kv.set", "args": ["@key", "v"] },
-        { "op": "kv.get", "args": ["@key"], "expect": { "equals": "v" } },
-        { "op": "kv.exists", "args": ["@key"], "expect": { "equals": true } },
-        { "op": "kv.expire", "args": ["@key", 60], "expect": { "equals": true } },
-        { "op": "kv.ttl", "args": ["@key"], "expect": { "type": "int" } },
-        { "op": "kv.delete", "args": ["@key"], "expect": { "equals": true } },
-        { "op": "kv.get", "args": ["@key"], "expect": { "isNull": true } }
+        {
+          "op": "kv.set",
+          "args": [
+            "@key",
+            "v"
+          ]
+        },
+        {
+          "op": "kv.get",
+          "args": [
+            "@key"
+          ],
+          "expect": {
+            "equals": "v"
+          }
+        },
+        {
+          "op": "kv.exists",
+          "args": [
+            "@key"
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "kv.expire",
+          "args": [
+            "@key",
+            60
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "kv.ttl",
+          "args": [
+            "@key"
+          ],
+          "expect": {
+            "type": "int"
+          }
+        },
+        {
+          "op": "kv.delete",
+          "args": [
+            "@key"
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "kv.get",
+          "args": [
+            "@key"
+          ],
+          "expect": {
+            "isNull": true
+          }
+        }
       ]
     },
     {
       "id": "kv.incr",
       "model": "kv",
       "steps": [
-        { "op": "kv.incr", "args": ["@key", 5], "expect": { "equals": 5 } },
-        { "op": "kv.incr", "args": ["@key", 3], "expect": { "equals": 8 } }
+        {
+          "op": "kv.incr",
+          "args": [
+            "@key",
+            5
+          ],
+          "expect": {
+            "equals": 5
+          }
+        },
+        {
+          "op": "kv.incr",
+          "args": [
+            "@key",
+            3
+          ],
+          "expect": {
+            "equals": 8
+          }
+        }
       ]
     },
     {
       "id": "kv.list_range_reads",
       "model": "kv",
       "steps": [
-        { "op": "kv.rpush", "args": ["@list", "a"] },
-        { "op": "kv.rpush", "args": ["@list", "b"] },
-        { "op": "kv.llen", "args": ["@list"], "expect": { "equals": 2 } },
-        { "op": "kv.lrange", "args": ["@list", 0, 10], "expect": { "equals": ["a", "b"] } },
-        { "op": "kv.lindex", "args": ["@list", 0], "expect": { "equals": "a" } }
+        {
+          "op": "kv.rpush",
+          "args": [
+            "@list",
+            "a"
+          ]
+        },
+        {
+          "op": "kv.rpush",
+          "args": [
+            "@list",
+            "b"
+          ]
+        },
+        {
+          "op": "kv.llen",
+          "args": [
+            "@list"
+          ],
+          "expect": {
+            "equals": 2
+          }
+        },
+        {
+          "op": "kv.lrange",
+          "args": [
+            "@list",
+            0,
+            10
+          ],
+          "expect": {
+            "equals": [
+              "a",
+              "b"
+            ]
+          }
+        },
+        {
+          "op": "kv.lindex",
+          "args": [
+            "@list",
+            0
+          ],
+          "expect": {
+            "equals": "a"
+          }
+        }
       ]
     },
     {
       "id": "kv.sorted_set_range_reads",
       "model": "kv",
       "steps": [
-        { "op": "kv.zadd", "args": ["@zset", 1.0, "one"] },
-        { "op": "kv.zadd", "args": ["@zset", 2.0, "two"] },
-        { "op": "kv.zrange", "args": ["@zset", 0, 10], "expect": { "length": 2 } }
+        {
+          "op": "kv.zadd",
+          "args": [
+            "@zset",
+            1.0,
+            "one"
+          ]
+        },
+        {
+          "op": "kv.zadd",
+          "args": [
+            "@zset",
+            2.0,
+            "two"
+          ]
+        },
+        {
+          "op": "kv.zrange",
+          "args": [
+            "@zset",
+            0,
+            10
+          ],
+          "expect": {
+            "length": 2
+          }
+        }
       ]
     },
     {
@@ -175,9 +629,34 @@
       "why": "L3 said KV_LRANGE and KV_ZRANGE both take -1 literally and return nothing. Measured against current main on 2026-08-13, LRANGE handles it correctly — that half of the note is stale. Pinned so it stays fixed.",
       "issue": "L3",
       "steps": [
-        { "op": "kv.rpush", "args": ["@list", "a"] },
-        { "op": "kv.rpush", "args": ["@list", "b"] },
-        { "op": "kv.lrange", "args": ["@list", 0, -1], "expect": { "equals": ["a", "b"] } }
+        {
+          "op": "kv.rpush",
+          "args": [
+            "@list",
+            "a"
+          ]
+        },
+        {
+          "op": "kv.rpush",
+          "args": [
+            "@list",
+            "b"
+          ]
+        },
+        {
+          "op": "kv.lrange",
+          "args": [
+            "@list",
+            0,
+            -1
+          ],
+          "expect": {
+            "equals": [
+              "a",
+              "b"
+            ]
+          }
+        }
       ]
     },
     {
@@ -185,33 +664,145 @@
       "model": "kv",
       "why": "The half of L3 that is still true. ZRANGE(0, 10) returns both members and ZRANGE(0, -1) returns nothing, so -1 is still read literally here. Redis semantics everywhere else in this surface make that a wrong answer rather than a documented limit.",
       "issue": "L3",
-      "xfail": { "reason": "KV_ZRANGE reads -1 literally. LRANGE was fixed and ZRANGE was not; S23 is narrower than its note claims." },
+      "xfail": {
+        "reason": "KV_ZRANGE reads -1 literally. LRANGE was fixed and ZRANGE was not; S23 is narrower than its note claims."
+      },
       "steps": [
-        { "op": "kv.zadd", "args": ["@zset", 1.0, "one"] },
-        { "op": "kv.zadd", "args": ["@zset", 2.0, "two"] },
-        { "op": "kv.zrange", "args": ["@zset", 0, -1], "expect": { "length": 2 } }
+        {
+          "op": "kv.zadd",
+          "args": [
+            "@zset",
+            1.0,
+            "one"
+          ]
+        },
+        {
+          "op": "kv.zadd",
+          "args": [
+            "@zset",
+            2.0,
+            "two"
+          ]
+        },
+        {
+          "op": "kv.zrange",
+          "args": [
+            "@zset",
+            0,
+            -1
+          ],
+          "expect": {
+            "length": 2
+          }
+        }
       ]
     },
     {
       "id": "kv.hash_reads",
       "model": "kv",
       "steps": [
-        { "op": "kv.hset", "args": ["@hash", "f", "v"] },
-        { "op": "kv.hget", "args": ["@hash", "f"], "expect": { "equals": "v" } },
-        { "op": "kv.hexists", "args": ["@hash", "f"], "expect": { "equals": true } },
-        { "op": "kv.hgetall", "args": ["@hash"], "expect": { "key": "f", "equals": "v" } },
-        { "op": "kv.hlen", "args": ["@hash"], "expect": { "equals": 1 } },
-        { "op": "kv.hdel", "args": ["@hash", "f"], "expect": { "equals": true } }
+        {
+          "op": "kv.hset",
+          "args": [
+            "@hash",
+            "f",
+            "v"
+          ]
+        },
+        {
+          "op": "kv.hget",
+          "args": [
+            "@hash",
+            "f"
+          ],
+          "expect": {
+            "equals": "v"
+          }
+        },
+        {
+          "op": "kv.hexists",
+          "args": [
+            "@hash",
+            "f"
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "kv.hgetall",
+          "args": [
+            "@hash"
+          ],
+          "expect": {
+            "key": "f",
+            "equals": "v"
+          }
+        },
+        {
+          "op": "kv.hlen",
+          "args": [
+            "@hash"
+          ],
+          "expect": {
+            "equals": 1
+          }
+        },
+        {
+          "op": "kv.hdel",
+          "args": [
+            "@hash",
+            "f"
+          ],
+          "expect": {
+            "equals": true
+          }
+        }
       ]
     },
     {
       "id": "kv.set_members",
       "model": "kv",
       "steps": [
-        { "op": "kv.sadd", "args": ["@set", "m1"], "expect": { "equals": true } },
-        { "op": "kv.sadd", "args": ["@set", "m2"], "expect": { "equals": true } },
-        { "op": "kv.smembers", "args": ["@set"], "expect": { "length": 2 } },
-        { "op": "kv.srem", "args": ["@set", "m1"], "expect": { "equals": true } }
+        {
+          "op": "kv.sadd",
+          "args": [
+            "@set",
+            "m1"
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "kv.sadd",
+          "args": [
+            "@set",
+            "m2"
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "kv.smembers",
+          "args": [
+            "@set"
+          ],
+          "expect": {
+            "length": 2
+          }
+        },
+        {
+          "op": "kv.srem",
+          "args": [
+            "@set",
+            "m1"
+          ],
+          "expect": {
+            "equals": true
+          }
+        }
       ]
     },
     {
@@ -219,35 +810,150 @@
       "model": "kv",
       "why": "conformance/README.md records a comma-split bug as CONFIRMED across Go, Python, Rust and TypeScript: KV reads come back comma-separated and every client splits on ',', so a member containing a comma is silently torn in two. Measured against current main on 2026-08-13 with the DISCRIMINATING shape — two members, one containing a comma, so a naive split yields three — Python returns both members intact for lrange, smembers and hgetall. The finding is stale for Python. The other six executors are how we learn whether it is stale for them.",
       "steps": [
-        { "op": "kv.rpush", "args": ["@list", "a,b"] },
-        { "op": "kv.rpush", "args": ["@list", "c"] },
-        { "op": "kv.lrange", "args": ["@list", 0, 10], "expect": { "equals": ["a,b", "c"] } },
-        { "op": "kv.sadd", "args": ["@set", "x,y"] },
-        { "op": "kv.sadd", "args": ["@set", "z"] },
-        { "op": "kv.smembers", "args": ["@set"], "expect": { "length": 2 } },
-        { "op": "kv.hset", "args": ["@hash", "f1", "v,1"] },
-        { "op": "kv.hset", "args": ["@hash", "f2", "v2"] },
-        { "op": "kv.hgetall", "args": ["@hash"], "expect": { "key": "f1", "equals": "v,1" } }
+        {
+          "op": "kv.rpush",
+          "args": [
+            "@list",
+            "a,b"
+          ]
+        },
+        {
+          "op": "kv.rpush",
+          "args": [
+            "@list",
+            "c"
+          ]
+        },
+        {
+          "op": "kv.lrange",
+          "args": [
+            "@list",
+            0,
+            10
+          ],
+          "expect": {
+            "equals": [
+              "a,b",
+              "c"
+            ]
+          }
+        },
+        {
+          "op": "kv.sadd",
+          "args": [
+            "@set",
+            "x,y"
+          ]
+        },
+        {
+          "op": "kv.sadd",
+          "args": [
+            "@set",
+            "z"
+          ]
+        },
+        {
+          "op": "kv.smembers",
+          "args": [
+            "@set"
+          ],
+          "expect": {
+            "length": 2
+          }
+        },
+        {
+          "op": "kv.hset",
+          "args": [
+            "@hash",
+            "f1",
+            "v,1"
+          ]
+        },
+        {
+          "op": "kv.hset",
+          "args": [
+            "@hash",
+            "f2",
+            "v2"
+          ]
+        },
+        {
+          "op": "kv.hgetall",
+          "args": [
+            "@hash"
+          ],
+          "expect": {
+            "key": "f1",
+            "equals": "v,1"
+          }
+        }
       ]
     },
     {
       "id": "kv.zrange_members_are_not_delimiter_joined",
       "model": "kv",
-      "why": "The delimiter bug that IS still live, in a different place than the note says. ZRANGE returns 'member:score' as one string, so a member containing ':' is indistinguishable from the score separator. Same bug class as the comma split, one surface later.",
-      "xfail": { "reason": "KV_ZRANGE joins member and score with ':' and returns one string per entry, so any member containing ':' is ambiguous. Needs the same contract-level encoding decision the comma split needed." },
+      "why": "MISATTRIBUTED until 2026-08-15, and the correction is the point. The note blamed KV_ZRANGE for joining member and score with ':'. The engine does no such thing — it answers with clean JSON pairs, [[\"a:b\",1.0]] — and four CLIENTS parsed those pairs and then re-joined them with ':', reintroducing the ambiguity themselves. Rust returned members all along, which is how the misattribution surfaced: a fifth SDK passing a case four others xfail is evidence about the note, not about the SDK. Fixed in python, go, typescript and elixir; the xfail is gone because the bug is.",
       "steps": [
-        { "op": "kv.zadd", "args": ["@zset", 1.0, "a:b"] },
-        { "op": "kv.zrange", "args": ["@zset", 0, 10], "expect": { "index": 0, "equals": "a:b" } }
+        {
+          "op": "kv.zadd",
+          "args": [
+            "@zset",
+            1.0,
+            "a:b"
+          ]
+        },
+        {
+          "op": "kv.zrange",
+          "args": [
+            "@zset",
+            0,
+            10
+          ],
+          "expect": {
+            "index": 0,
+            "equals": "a:b"
+          }
+        }
       ]
     },
-
     {
       "id": "timeseries.write_and_count",
       "model": "timeseries",
       "steps": [
-        { "op": "timeseries.write", "args": ["@measurement", [{ "t": 0, "v": 10.0 }, { "t": 1000, "v": 20.0 }]] },
-        { "op": "timeseries.count", "args": ["@measurement"], "expect": { "equals": 2 } },
-        { "op": "timeseries.last", "args": ["@measurement"], "expect": { "notNull": true } }
+        {
+          "op": "timeseries.write",
+          "args": [
+            "@measurement",
+            [
+              {
+                "t": 0,
+                "v": 10.0
+              },
+              {
+                "t": 1000,
+                "v": 20.0
+              }
+            ]
+          ]
+        },
+        {
+          "op": "timeseries.count",
+          "args": [
+            "@measurement"
+          ],
+          "expect": {
+            "equals": 2
+          }
+        },
+        {
+          "op": "timeseries.last",
+          "args": [
+            "@measurement"
+          ],
+          "expect": {
+            "notNull": true
+          }
+        }
       ]
     },
     {
@@ -255,8 +961,33 @@
       "model": "timeseries",
       "why": "TS_RANGE_COUNT and TS_RANGE_AVG both described zero result columns and took their bounds as TEXT.",
       "steps": [
-        { "op": "timeseries.write", "args": ["@measurement", [{ "t": 0, "v": 10.0 }, { "t": 1000, "v": 20.0 }]] },
-        { "op": "timeseries.query", "args": ["@measurement", -60000, 60000], "expect": { "nonEmpty": true } }
+        {
+          "op": "timeseries.write",
+          "args": [
+            "@measurement",
+            [
+              {
+                "t": 0,
+                "v": 10.0
+              },
+              {
+                "t": 1000,
+                "v": 20.0
+              }
+            ]
+          ]
+        },
+        {
+          "op": "timeseries.query",
+          "args": [
+            "@measurement",
+            -60000,
+            60000
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        }
       ]
     },
     {
@@ -265,54 +996,222 @@
       "why": "L1. The SDK calls TIME_BUCKET($1, $2) with an interval NAME ('hour') while the engine's TIME_BUCKET takes bucket_millis. It has never worked in Python and every other SDK needs checking against the same shape.",
       "issue": "L1",
       "steps": [
-        { "op": "timeseries.write", "args": ["@measurement", [{ "t": 0, "v": 10.0 }, { "t": 1000, "v": 20.0 }]] },
-        { "op": "timeseries.aggregate", "args": ["@measurement", -60000, 60000, 60000], "expect": { "notNull": true } }
+        {
+          "op": "timeseries.write",
+          "args": [
+            "@measurement",
+            [
+              {
+                "t": 0,
+                "v": 10.0
+              },
+              {
+                "t": 1000,
+                "v": 20.0
+              }
+            ]
+          ]
+        },
+        {
+          "op": "timeseries.aggregate",
+          "args": [
+            "@measurement",
+            -60000,
+            60000,
+            60000
+          ],
+          "expect": {
+            "notNull": true
+          }
+        }
       ]
     },
-
     {
       "id": "streams.append_and_range",
       "model": "streams",
       "why": "XRANGE and XREAD both described zero result columns.",
       "steps": [
-        { "op": "streams.xadd", "args": ["@stream", { "v": "1" }] },
-        { "op": "streams.xadd", "args": ["@stream", { "v": "2" }] },
-        { "op": "streams.xlen", "args": ["@stream"], "expect": { "equals": 2 } },
-        { "op": "streams.xrange", "args": ["@stream", 0, 9999999999999, 10], "expect": { "length": 2 } }
+        {
+          "op": "streams.xadd",
+          "args": [
+            "@stream",
+            {
+              "v": "1"
+            }
+          ]
+        },
+        {
+          "op": "streams.xadd",
+          "args": [
+            "@stream",
+            {
+              "v": "2"
+            }
+          ]
+        },
+        {
+          "op": "streams.xlen",
+          "args": [
+            "@stream"
+          ],
+          "expect": {
+            "equals": 2
+          }
+        },
+        {
+          "op": "streams.xrange",
+          "args": [
+            "@stream",
+            0,
+            9999999999999,
+            10
+          ],
+          "expect": {
+            "length": 2
+          }
+        }
       ]
     },
     {
       "id": "streams.xread_after_a_sequence",
       "model": "streams",
       "steps": [
-        { "op": "streams.xadd", "args": ["@stream", { "v": "1" }] },
-        { "op": "streams.xread", "args": ["@stream", 0, 10], "expect": { "nonEmpty": true } }
+        {
+          "op": "streams.xadd",
+          "args": [
+            "@stream",
+            {
+              "v": "1"
+            }
+          ]
+        },
+        {
+          "op": "streams.xread",
+          "args": [
+            "@stream",
+            0,
+            10
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        }
       ]
     },
     {
       "id": "streams.consumer_group_round_trip",
       "model": "streams",
       "why": "NEW, found by this suite on 2026-08-13 and in no prior finding list. xadd returns an entry id as a string ('1786606665529-0'), and xack's signature is (stream, group, id_ms: int, id_seq: int). The client cannot feed its own xadd output back into its own xack — the natural round trip does not typecheck, so the consumer-group surface has never been usable end to end from Python. Not one of the 18 known never-worked shapes.",
-      "xfail": { "reason": "xack takes (id_ms, id_seq) integers while xadd returns a single 'ms-seq' string. The two halves of the same API do not compose." },
+      "xfail": {
+        "reason": "xack takes (id_ms, id_seq) integers while xadd returns a single 'ms-seq' string. The two halves of the same API do not compose."
+      },
       "steps": [
-        { "op": "streams.xadd", "args": ["@stream", { "v": "1" }], "bind": "entryId" },
-        { "op": "streams.xgroupCreate", "args": ["@stream", "@group", 0] },
-        { "op": "streams.xreadgroup", "args": ["@stream", "@group", "c1", 10], "expect": { "nonEmpty": true } },
-        { "op": "streams.xack", "args": ["@stream", "@group", "$entryId"], "expect": { "type": "int" } }
+        {
+          "op": "streams.xadd",
+          "args": [
+            "@stream",
+            {
+              "v": "1"
+            }
+          ],
+          "bind": "entryId"
+        },
+        {
+          "op": "streams.xgroupCreate",
+          "args": [
+            "@stream",
+            "@group",
+            0
+          ]
+        },
+        {
+          "op": "streams.xreadgroup",
+          "args": [
+            "@stream",
+            "@group",
+            "c1",
+            10
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        },
+        {
+          "op": "streams.xack",
+          "args": [
+            "@stream",
+            "@group",
+            "$entryId"
+          ],
+          "expect": {
+            "type": "int"
+          }
+        }
       ]
     },
-
     {
       "id": "blob.round_trip",
       "model": "blob",
       "why": "BLOB_GET and BLOB_META both described zero result columns.",
       "steps": [
-        { "op": "blob.put", "args": ["@bucket", "@key", "cGF5bG9hZA=="] },
-        { "op": "blob.get", "args": ["@bucket", "@key"], "expect": { "equals": "cGF5bG9hZA==" } },
-        { "op": "blob.getMeta", "args": ["@bucket", "@key"], "expect": { "notNull": true } },
-        { "op": "blob.exists", "args": ["@bucket", "@key"], "expect": { "equals": true } },
-        { "op": "blob.delete", "args": ["@bucket", "@key"], "expect": { "equals": true } },
-        { "op": "blob.get", "args": ["@bucket", "@key"], "expect": { "isNull": true } }
+        {
+          "op": "blob.put",
+          "args": [
+            "@bucket",
+            "@key",
+            "cGF5bG9hZA=="
+          ]
+        },
+        {
+          "op": "blob.get",
+          "args": [
+            "@bucket",
+            "@key"
+          ],
+          "expect": {
+            "equals": "cGF5bG9hZA=="
+          }
+        },
+        {
+          "op": "blob.getMeta",
+          "args": [
+            "@bucket",
+            "@key"
+          ],
+          "expect": {
+            "notNull": true
+          }
+        },
+        {
+          "op": "blob.exists",
+          "args": [
+            "@bucket",
+            "@key"
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "blob.delete",
+          "args": [
+            "@bucket",
+            "@key"
+          ],
+          "expect": {
+            "equals": true
+          }
+        },
+        {
+          "op": "blob.get",
+          "args": [
+            "@bucket",
+            "@key"
+          ],
+          "expect": {
+            "isNull": true
+          }
+        }
       ],
       "notes": "Payloads are base64 in the spec because JSON has no byte-string literal. Executors decode before calling the client and re-encode before comparing."
     },
@@ -321,72 +1220,248 @@
       "model": "blob",
       "why": "A payload containing NUL and high bytes is where a text-vs-binary encoding mistake shows up. 'payload' round-trips through a broken encoder; this does not.",
       "steps": [
-        { "op": "blob.put", "args": ["@bucket", "@key", "AAECg/z/AA=="] },
-        { "op": "blob.get", "args": ["@bucket", "@key"], "expect": { "equals": "AAECg/z/AA==" } }
+        {
+          "op": "blob.put",
+          "args": [
+            "@bucket",
+            "@key",
+            "AAECg/z/AA=="
+          ]
+        },
+        {
+          "op": "blob.get",
+          "args": [
+            "@bucket",
+            "@key"
+          ],
+          "expect": {
+            "equals": "AAECg/z/AA=="
+          }
+        }
       ]
     },
-
     {
       "id": "cdc.read_returns_a_list",
       "model": "cdc",
       "why": "CDC_READ described zero result columns, so the client refused every response. The value matters less than the call surviving the wire.",
       "steps": [
-        { "op": "cdc.read", "args": [0, 10], "expect": { "type": "list" } },
-        { "op": "cdc.count", "args": [], "expect": { "type": "int" } }
+        {
+          "op": "cdc.read",
+          "args": [
+            0,
+            10
+          ],
+          "expect": {
+            "type": "list"
+          }
+        },
+        {
+          "op": "cdc.count",
+          "args": [],
+          "expect": {
+            "type": "int"
+          }
+        }
       ]
     },
-
     {
       "id": "datalog.assert_and_query",
       "model": "datalog",
       "why": "DATALOG_QUERY described zero result columns.",
       "steps": [
-        { "op": "datalog.assertFact", "args": ["@pred(alice, bob)"] },
-        { "op": "datalog.query", "args": ["@pred(X, Y)"], "expect": { "nonEmpty": true } },
-        { "op": "datalog.clear", "args": ["@pred"] }
+        {
+          "op": "datalog.assertFact",
+          "args": [
+            "@pred(alice, bob)"
+          ]
+        },
+        {
+          "op": "datalog.query",
+          "args": [
+            "@pred(X, Y)"
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        },
+        {
+          "op": "datalog.clear",
+          "args": [
+            "@pred"
+          ]
+        }
       ]
     },
-
     {
       "id": "fts.index_and_search",
       "model": "fts",
       "steps": [
-        { "op": "fts.indexDoc", "args": ["@index", "1", { "body": "the quick brown fox" }] },
-        { "op": "fts.search", "args": ["@index", "quick", 10], "expect": { "nonEmpty": true } }
+        {
+          "op": "fts.indexDoc",
+          "args": [
+            "@index",
+            "1",
+            {
+              "body": "the quick brown fox"
+            }
+          ]
+        },
+        {
+          "op": "fts.search",
+          "args": [
+            "@index",
+            "quick",
+            10
+          ],
+          "expect": {
+            "nonEmpty": true
+          }
+        }
       ]
     },
     {
       "id": "fts.search_misses_return_empty_not_error",
       "model": "fts",
       "steps": [
-        { "op": "fts.indexDoc", "args": ["@index", "1", { "body": "the quick brown fox" }] },
-        { "op": "fts.search", "args": ["@index", "aardvark", 10], "expect": { "length": 0 } }
+        {
+          "op": "fts.indexDoc",
+          "args": [
+            "@index",
+            "1",
+            {
+              "body": "the quick brown fox"
+            }
+          ]
+        },
+        {
+          "op": "fts.search",
+          "args": [
+            "@index",
+            "aardvark",
+            10
+          ],
+          "expect": {
+            "length": 0
+          }
+        }
       ]
     },
-
     {
       "id": "vector.insert_and_search",
       "model": "vector",
       "why": "FIXED 2026-08-13, engine-side. Was not a vector bug at all — silent data loss. A VECTOR column declared with NO dimension produces tuples the storage layer cannot deserialize; the engine logs `failed to deserialize tuple on page 2 (slot 0); row omitted from scan` and every scan that touches the heap drops every row, while PK/index-only reads still report them. Measured in psql: on such a table `SELECT id` returns 2 rows and `COUNT(*)` returns 2, while `SELECT *`, `SELECT embedding`, `SELECT metadata` and `SELECT id, metadata` each return 0. With `VECTOR(3)` everything returns both rows through every client. Two reads disagreeing about how many rows a table holds, with no error raised, is the worst failure mode this engine has. VECTOR_DISTANCE was a red herring — `SELECT *` loses the data just as thoroughly. Reached from Python because its create_collection accepted a dimension and emitted a bare VECTOR column; fixed on the SDK side, but the engine defect stands.",
-            "steps": [
-        { "op": "vector.createCollection", "args": ["@coll", 3] },
-        { "op": "vector.insert", "args": ["@coll", "v1", [1.0, 0.0, 0.0]] },
-        { "op": "vector.insert", "args": ["@coll", "v2", [0.0, 1.0, 0.0]] },
-        { "op": "vector.count", "args": ["@coll"], "expect": { "equals": 2 } },
-        { "op": "vector.search", "args": ["@coll", [1.0, 0.0, 0.0], 1], "expect": { "length": 1 } }
+      "steps": [
+        {
+          "op": "vector.createCollection",
+          "args": [
+            "@coll",
+            3
+          ]
+        },
+        {
+          "op": "vector.insert",
+          "args": [
+            "@coll",
+            "v1",
+            [
+              1.0,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        {
+          "op": "vector.insert",
+          "args": [
+            "@coll",
+            "v2",
+            [
+              0.0,
+              1.0,
+              0.0
+            ]
+          ]
+        },
+        {
+          "op": "vector.count",
+          "args": [
+            "@coll"
+          ],
+          "expect": {
+            "equals": 2
+          }
+        },
+        {
+          "op": "vector.search",
+          "args": [
+            "@coll",
+            [
+              1.0,
+              0.0,
+              0.0
+            ],
+            1
+          ],
+          "expect": {
+            "length": 1
+          }
+        }
       ]
     },
-
     {
       "id": "sql.scalar_text_parameter",
       "model": "sql",
       "why": "S25/P10. Binary TEXT, VARCHAR and JSONB parameters were silently stored as integers at lengths 2, 4 and 8 — the exact widths where a byte string is indistinguishable from a fixed-width integer on the wire. This ran live for two months. A test that binds 'hello' (5 bytes) passes against the bug, which is why nothing caught it.",
       "issue": "P10",
       "steps": [
-        { "op": "sql.queryScalar", "args": ["SELECT $1::text", ["ab"]], "expect": { "equals": "ab" } },
-        { "op": "sql.queryScalar", "args": ["SELECT $1::text", ["abcd"]], "expect": { "equals": "abcd" } },
-        { "op": "sql.queryScalar", "args": ["SELECT $1::text", ["abcdefgh"]], "expect": { "equals": "abcdefgh" } },
-        { "op": "sql.queryScalar", "args": ["SELECT $1::text", ["hello"]], "expect": { "equals": "hello" } }
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::text",
+            [
+              "ab"
+            ]
+          ],
+          "expect": {
+            "equals": "ab"
+          }
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::text",
+            [
+              "abcd"
+            ]
+          ],
+          "expect": {
+            "equals": "abcd"
+          }
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::text",
+            [
+              "abcdefgh"
+            ]
+          ],
+          "expect": {
+            "equals": "abcdefgh"
+          }
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::text",
+            [
+              "hello"
+            ]
+          ],
+          "expect": {
+            "equals": "hello"
+          }
+        }
       ]
     },
     {
@@ -394,9 +1469,42 @@
       "model": "sql",
       "issue": "P10",
       "steps": [
-        { "op": "sql.queryScalar", "args": ["SELECT $1::varchar", ["ab"]], "expect": { "equals": "ab" } },
-        { "op": "sql.queryScalar", "args": ["SELECT $1::varchar", ["abcd"]], "expect": { "equals": "abcd" } },
-        { "op": "sql.queryScalar", "args": ["SELECT $1::varchar", ["abcdefgh"]], "expect": { "equals": "abcdefgh" } }
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::varchar",
+            [
+              "ab"
+            ]
+          ],
+          "expect": {
+            "equals": "ab"
+          }
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::varchar",
+            [
+              "abcd"
+            ]
+          ],
+          "expect": {
+            "equals": "abcd"
+          }
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::varchar",
+            [
+              "abcdefgh"
+            ]
+          ],
+          "expect": {
+            "equals": "abcdefgh"
+          }
+        }
       ]
     },
     {
@@ -404,8 +1512,22 @@
       "model": "sql",
       "why": "NEW and the most severe thing this suite has found. `SELECT $1::jsonb` over the EXTENDED protocol describes the statement as returning ZERO result columns and then executes it returning one, so a strict client (asyncpg, and by construction pgx and JDBC) aborts with a protocol error. This is the same defect class as the 18 known never-worked shapes, except it is plain SQL rather than a specialty function — which means it is not a gap in a Nucleus extension, it is a gap in 'any PostgreSQL client works'. psql does not catch it because psql does not validate the described column count against the row it receives, and because \\bind is answered by substituting the parameter into the query text.",
       "issue": "P11",
-            "steps": [
-        { "op": "sql.queryScalar", "args": ["SELECT $1::jsonb", ["{\"a\":1}"]], "expect": { "jsonDecode": true, "equals": { "a": 1 } } }
+      "steps": [
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::jsonb",
+            [
+              "{\"a\":1}"
+            ]
+          ],
+          "expect": {
+            "jsonDecode": true,
+            "equals": {
+              "a": 1
+            }
+          }
+        }
       ]
     },
     {
@@ -413,8 +1535,19 @@
       "model": "sql",
       "why": "Same Describe defect, two more types. Recorded separately so a partial fix is visible as a partial fix.",
       "issue": "P11",
-            "steps": [
-        { "op": "sql.queryScalar", "args": ["SELECT $1::uuid", ["00000000-0000-0000-0000-000000000000"]], "expect": { "equals": "00000000-0000-0000-0000-000000000000" } }
+      "steps": [
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::uuid",
+            [
+              "00000000-0000-0000-0000-000000000000"
+            ]
+          ],
+          "expect": {
+            "equals": "00000000-0000-0000-0000-000000000000"
+          }
+        }
       ]
     },
     {
@@ -422,18 +1555,61 @@
       "model": "sql",
       "why": "WORSE than the Describe defect above, because it does not raise. `SELECT $1::int` bound with 1 comes back as the four raw big-endian bytes of that integer, delivered as a text value: '\\x00\\x00\\x00\\x01'. No error, no protocol complaint — the caller simply receives the wrong value in the right shape. This is the exact signature of the binary-parameter corruption that ran live for two months, on the read side.",
       "issue": "P11",
-            "steps": [
-        { "op": "sql.queryScalar", "args": ["SELECT $1::int", [1]], "expect": { "equals": 1 } }
+      "steps": [
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT $1::int",
+            [
+              1
+            ]
+          ],
+          "expect": {
+            "equals": 1
+          }
+        }
       ]
     },
     {
       "id": "sql.round_trips_a_table",
       "model": "sql",
       "steps": [
-        { "op": "sql.execute", "args": ["CREATE TABLE @table (id INT PRIMARY KEY, name TEXT)", []] },
-        { "op": "sql.execute", "args": ["INSERT INTO @table (id, name) VALUES ($1, $2)", [1, "ada"]] },
-        { "op": "sql.queryScalar", "args": ["SELECT name FROM @table WHERE id = $1", [1]], "expect": { "equals": "ada" } },
-        { "op": "sql.execute", "args": ["DROP TABLE @table", []] }
+        {
+          "op": "sql.execute",
+          "args": [
+            "CREATE TABLE @table (id INT PRIMARY KEY, name TEXT)",
+            []
+          ]
+        },
+        {
+          "op": "sql.execute",
+          "args": [
+            "INSERT INTO @table (id, name) VALUES ($1, $2)",
+            [
+              1,
+              "ada"
+            ]
+          ]
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT name FROM @table WHERE id = $1",
+            [
+              1
+            ]
+          ],
+          "expect": {
+            "equals": "ada"
+          }
+        },
+        {
+          "op": "sql.execute",
+          "args": [
+            "DROP TABLE @table",
+            []
+          ]
+        }
       ]
     },
     {
@@ -441,11 +1617,54 @@
       "model": "sql",
       "why": "Concurrent UPDATE has silently lost writes while replying UPDATE 1. This is the single-threaded floor: the reply count and the stored value must agree.",
       "steps": [
-        { "op": "sql.execute", "args": ["CREATE TABLE @table (id INT PRIMARY KEY, n INT)", []] },
-        { "op": "sql.execute", "args": ["INSERT INTO @table (id, n) VALUES ($1, $2)", [1, 0]] },
-        { "op": "sql.execute", "args": ["UPDATE @table SET n = n + 1 WHERE id = $1", [1]], "expect": { "equals": 1 } },
-        { "op": "sql.queryScalar", "args": ["SELECT n FROM @table WHERE id = $1", [1]], "expect": { "equals": 1 } },
-        { "op": "sql.execute", "args": ["DROP TABLE @table", []] }
+        {
+          "op": "sql.execute",
+          "args": [
+            "CREATE TABLE @table (id INT PRIMARY KEY, n INT)",
+            []
+          ]
+        },
+        {
+          "op": "sql.execute",
+          "args": [
+            "INSERT INTO @table (id, n) VALUES ($1, $2)",
+            [
+              1,
+              0
+            ]
+          ]
+        },
+        {
+          "op": "sql.execute",
+          "args": [
+            "UPDATE @table SET n = n + 1 WHERE id = $1",
+            [
+              1
+            ]
+          ],
+          "expect": {
+            "equals": 1
+          }
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT n FROM @table WHERE id = $1",
+            [
+              1
+            ]
+          ],
+          "expect": {
+            "equals": 1
+          }
+        },
+        {
+          "op": "sql.execute",
+          "args": [
+            "DROP TABLE @table",
+            []
+          ]
+        }
       ]
     },
     {
@@ -453,20 +1672,54 @@
       "model": "sql",
       "why": "A table created inside a transaction was once unreadable from within it. Fixed in c46d85e; this keeps it fixed.",
       "steps": [
-        { "op": "sql.begin", "args": [] },
-        { "op": "sql.execute", "args": ["CREATE TABLE @table (id INT)", []] },
-        { "op": "sql.execute", "args": ["INSERT INTO @table (id) VALUES ($1)", [7]] },
-        { "op": "sql.queryScalar", "args": ["SELECT id FROM @table", []], "expect": { "equals": 7 } },
-        { "op": "sql.rollback", "args": [] }
+        {
+          "op": "sql.begin",
+          "args": []
+        },
+        {
+          "op": "sql.execute",
+          "args": [
+            "CREATE TABLE @table (id INT)",
+            []
+          ]
+        },
+        {
+          "op": "sql.execute",
+          "args": [
+            "INSERT INTO @table (id) VALUES ($1)",
+            [
+              7
+            ]
+          ]
+        },
+        {
+          "op": "sql.queryScalar",
+          "args": [
+            "SELECT id FROM @table",
+            []
+          ],
+          "expect": {
+            "equals": 7
+          }
+        },
+        {
+          "op": "sql.rollback",
+          "args": []
+        }
       ]
     },
-
     {
       "id": "connection.close_terminates_cleanly",
       "model": "core",
       "why": "N25. The server ignored Terminate and never closed the socket, so a client's close hung forever. Every executor closes its pool at the end of the run; this makes the close an assertion rather than a hope.",
       "steps": [
-        { "op": "connection.closeAndReconnect", "args": [], "expect": { "equals": true } }
+        {
+          "op": "connection.closeAndReconnect",
+          "args": [],
+          "expect": {
+            "equals": true
+          }
+        }
       ]
     }
   ]

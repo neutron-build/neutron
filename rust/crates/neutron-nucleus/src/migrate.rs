@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
 
 /// Apply all pending migrations from `dir` to the pool.
@@ -45,8 +46,8 @@ pub async fn migrate(pool: &NucleusPool, dir: impl AsRef<Path>) -> Result<(), Nu
         .await
         .map_err(NucleusError::Query)?
         .into_iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
+        .map(|r| r.get_ck::<String>(0))
+        .collect::<Result<_, _>>()?;
 
     // Read and sort migration files.
     let mut files = read_sql_files(dir.as_ref())?;

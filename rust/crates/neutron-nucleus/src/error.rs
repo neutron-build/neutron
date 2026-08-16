@@ -25,6 +25,19 @@ pub enum NucleusError {
     InvalidIdentifier(String),
     /// A Nucleus-specific feature was called against plain PostgreSQL.
     NucleusRequired { feature: String },
+    /// A result column could not be decoded as the expected Rust type.
+    ///
+    /// This exists because the alternative was a panic. Every model method read
+    /// its columns with `row.get()`, which panics when the server's declared
+    /// type does not match the requested one — 85 call sites, no `try_get`
+    /// anywhere. A library must not abort the caller's process because a server
+    /// described a column differently than expected; that is an error value.
+    /// Found when `TS_LAST` was declared `varchar` while returning a float, and
+    /// the Rust client panicked mid-run rather than reporting it.
+    Decode {
+        column: usize,
+        source: tokio_postgres::Error,
+    },
     /// TLS setup failed (root store, crypto provider, or handshake config).
     /// Distinct from `Connect` (which wraps the postgres-level handshake error)
     /// so callers can tell a TLS misconfiguration from a network/auth failure.
@@ -45,6 +58,9 @@ impl fmt::Display for NucleusError {
                 f,
                 "{feature} requires Nucleus database, but connected to plain PostgreSQL"
             ),
+            Self::Decode { column, source } => {
+                write!(f, "Nucleus decode: column {column}: {source}")
+            }
             Self::Tls(msg) => write!(f, "Nucleus TLS: {msg}"),
         }
     }
@@ -60,6 +76,7 @@ impl std::error::Error for NucleusError {
             Self::PoolExhausted => None,
             Self::Serde(_) => None,
             Self::InvalidIdentifier(_) => None,
+            Self::Decode { source, .. } => Some(source),
             Self::NucleusRequired { .. } => None,
             Self::Tls(_) => None,
         }

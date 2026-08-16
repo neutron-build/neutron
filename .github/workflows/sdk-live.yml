@@ -81,13 +81,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk: [python, go, typescript, elixir]
+        sdk: [python, go, typescript, elixir, rust]
         # elixir joined 2026-08-15, once it could connect at all. Its executor
         # existed since S17 and reported 42/42 failing, because Postgrex's type
         # bootstrap died on `ARRAY (SELECT ...)`; with that fixed it runs
         # 32 pass / 7 unsupported / 3 xfail / 0 fail.
         #
-        # S15/S18/S19 add rust, zig and julia here as their executors land. An
+        # rust joined 2026-08-15 with its executor (S15). Writing it found four
+        # defects nothing else could have: TS_LAST declared varchar while
+        # returning float8, Vector.insert bound metadata as String into a jsonb
+        # parameter, TimeSeries.time_bucket took an interval NAME the engine
+        # never accepted, and 85 row.get() calls panicked on any type mismatch.
+        #
+        # S18/S19 add zig and julia here as their executors land. An
         # SDK absent from this list is UNPROVEN, and the drift job below says so
         # out loud rather than counting it as agreement.
     steps:
@@ -140,6 +146,9 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm --filter @neutron-build/nucleus build
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.sdk == 'rust'
 
       - uses: erlef/setup-beam@v1
         if: matrix.sdk == 'elixir'
@@ -218,6 +227,8 @@ jobs:
       # pg_type I/O names (`uuid_send`, not `uuidsend`) on 2026-08-15, and the
       # suite now runs 32 pass / 7 unsupported / 3 xfail / 0 fail. Installed as
       # the note said to.
+      - uses: dtolnay/rust-toolchain@stable
+
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.18"

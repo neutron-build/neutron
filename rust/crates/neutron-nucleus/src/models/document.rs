@@ -15,6 +15,7 @@
 use serde_json;
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
 
 /// Handle for document store operations.
@@ -53,7 +54,7 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Retrieve a document by ID from the default collection.
@@ -122,7 +123,7 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Delete a document by ID from the default collection.
@@ -145,7 +146,7 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Query the default collection. Returns matching document IDs.
@@ -235,7 +236,7 @@ impl DocumentModel {
             .query_one(&sql, &query_params)
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, Option<String>>(0))
+        Ok(row.get_ck::<Option<String>>(0)?)
     }
 
     /// Number of documents in the default collection.
@@ -254,6 +255,122 @@ impl DocumentModel {
                 .await
         }
         .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
+    /// Find whole documents matching `filter` in `collection`.
+    ///
+    /// `query_in` answers with ids; the engine has no filter surface that
+    /// returns documents, so this resolves ids and fetches each one. That is
+    /// what the Python and Elixir clients do — the cross-SDK contract is
+    /// defined by behaviour, not by where the loop runs.
+    pub async fn find(
+        &self,
+        collection: &str,
+        filter: &serde_json::Value,
+        limit: usize,
+        skip: usize,
+    ) -> Result<Vec<serde_json::Value>, NucleusError> {
+        Ok(self
+            .find_with_ids(collection, filter, limit, skip)
+            .await?
+            .into_iter()
+            .map(|(_id, doc)| doc)
+            .collect())
+    }
+
+    /// Find the first document matching `filter`, or `None`.
+    ///
+    /// Absence is `Ok(None)`, not an error — matching `get_in`.
+    pub async fn find_one(
+        &self,
+        collection: &str,
+        filter: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, NucleusError> {
+        Ok(self
+            .find_with_ids(collection, filter, 1, 0)
+            .await?
+            .into_iter()
+            .next()
+            .map(|(_id, doc)| doc))
+    }
+
+    /// Merge `patch` into every document matching `filter`. Returns the count.
+    ///
+    /// A PARTIAL update: keys in `patch` overwrite, keys absent from it
+    /// survive. `update_in` replaces a whole document by id and is a different
+    /// operation despite the shared name root.
+    pub async fn update_where(
+        &self,
+        collection: &str,
+        filter: &serde_json::Value,
+        patch: &serde_json::Value,
+    ) -> Result<usize, NucleusError> {
+        let pairs = self.find_with_ids(collection, filter, 10_000, 0).await?;
+        let mut n = 0;
+        for (id, existing) in pairs {
+            let mut merged = existing;
+            if let (Some(dst), Some(src)) = (merged.as_object_mut(), patch.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            let ok = if collection.is_empty() {
+                self.update(id, &merged).await?
+            } else {
+                self.update_in(collection, id, &merged).await?
+            };
+            if ok {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Delete every document matching `filter`. Returns the count.
+    pub async fn delete_where(
+        &self,
+        collection: &str,
+        filter: &serde_json::Value,
+    ) -> Result<usize, NucleusError> {
+        let pairs = self.find_with_ids(collection, filter, 10_000, 0).await?;
+        let mut n = 0;
+        for (id, _doc) in pairs {
+            let ok = if collection.is_empty() {
+                self.delete(id).await?
+            } else {
+                self.delete_in(collection, id).await?
+            };
+            if ok {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn find_with_ids(
+        &self,
+        collection: &str,
+        filter: &serde_json::Value,
+        limit: usize,
+        skip: usize,
+    ) -> Result<Vec<(i64, serde_json::Value)>, NucleusError> {
+        let ids = if collection.is_empty() {
+            self.query(filter).await?
+        } else {
+            self.query_in(collection, filter).await?
+        };
+        let mut out = Vec::new();
+        for id in ids.into_iter().skip(skip).take(limit) {
+            let doc = if collection.is_empty() {
+                self.get(id).await?
+            } else {
+                self.get_in(collection, id).await?
+            };
+            if let Some(d) = doc {
+                out.push((id, d));
+            }
+        }
+        Ok(out)
+    }
+
 }

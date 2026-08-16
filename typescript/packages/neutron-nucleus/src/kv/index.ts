@@ -395,14 +395,14 @@ class KVModelImpl implements KVModel {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGE($1, $2, $3)', [key, start, stop]);
     if (!raw) return [];
-    return (JSON.parse(raw) as Array<[string, number]>).map(([member, score]) => `${member}:${score}`);
+    return (JSON.parse(raw) as Array<[string, number]>).map(([member]) => member);
   }
 
   async zrangeByScore(key: string, min: number, max: number): Promise<string[]> {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGEBYSCORE($1, $2, $3)', [key, min, max]);
     if (!raw) return [];
-    return (JSON.parse(raw) as Array<[string, number]>).map(([member, score]) => `${member}:${score}`);
+    return (JSON.parse(raw) as Array<[string, number]>).map(([member]) => member);
   }
 
   async zrem(key: string, member: string): Promise<boolean> {

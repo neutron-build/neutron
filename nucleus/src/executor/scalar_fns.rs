@@ -6331,6 +6331,16 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         "TIME_BUCKET" => DataType::Int64,
         "TS_RANGE_AVG" => DataType::Float64,
         "TS_RANGE_COUNT" => DataType::Int64,
+        // TS_LAST returns Value::Float64 and TS_COUNT Value::Int64, but both
+        // were absent from this map, so Describe fell through to the default and
+        // declared them `varchar`. A client that believes Describe — as any
+        // statically typed one must — then asks for the wrong Rust type and
+        // fails to deserialize. This is the same defect class as the
+        // statement-Describe typing fixed in 89d90e9: the declared type and the
+        // executed type disagreeing, which is invisible to a client that decodes
+        // everything as text and fatal to one that does not.
+        "TS_LAST" => DataType::Float64,
+        "TS_COUNT" => DataType::Int64,
         _ => return None,
     };
     Some(dt)

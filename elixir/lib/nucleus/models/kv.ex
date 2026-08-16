@@ -504,11 +504,17 @@ defmodule Nucleus.Models.KV do
   end
 
   # Engine sorted-set functions return a JSON array of [member, score] pairs.
+  # Members only, like Redis ZRANGE without WITHSCORES.
+  #
+  # This joined member and score with ':'. KV_ZRANGE answers with clean JSON
+  # pairs, so the ENGINE never had the delimiter problem the conformance note
+  # blamed it for — this function reintroduced it, and a member containing ':'
+  # became indistinguishable from the separator.
   defp decode_scored_list(raw) do
     raw
     |> decode_json_list()
     |> Enum.flat_map(fn
-      [member, score] -> ["#{member}:#{score}"]
+      [member, _score] -> [to_string(member)]
       _ -> []
     end)
   end

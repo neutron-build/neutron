@@ -511,7 +511,11 @@ func TestKVZRangeJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"alice:1", "bob,x:2.5"}
+	// Members only. This asserted []string{"alice:1", "bob,x:2.5"} — the joined
+	// form — so the test and the implementation shared one wrong assumption and
+	// the test passed while pinning the bug. The engine returns clean JSON
+	// pairs; joining them here is what made a member containing ':' ambiguous.
+	want := []string{"alice", "bob,x"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("got %v, want %v", got, want)
 	}
@@ -523,7 +527,7 @@ func TestKVZRangeByScoreJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"a:10", "b:20.25"}
+	want := []string{"a", "b"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("got %v, want %v", got, want)
 	}

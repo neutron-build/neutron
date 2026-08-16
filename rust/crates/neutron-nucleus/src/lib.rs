@@ -75,6 +75,7 @@ pub mod migrate;
 pub mod models;
 pub mod pool;
 pub mod retry;
+pub(crate) mod row_ext;
 
 pub use client::{Features, NucleusClient};
 pub use db::{Db, NucleusTransaction};

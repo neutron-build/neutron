@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
 
 /// Handle for key-value operations.
@@ -29,7 +30,7 @@ impl KvModel {
             .query_one("SELECT KV_GET($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, Option<String>>(0))
+        Ok(row.get_ck::<Option<String>>(0)?)
     }
 
     /// Store a value. Optionally set a TTL.
@@ -63,7 +64,7 @@ impl KvModel {
             .query_one("SELECT KV_SETNX($1, $2)", &[&key, &value])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Delete a key. Returns `true` if the key existed.
@@ -74,7 +75,7 @@ impl KvModel {
             .query_one("SELECT KV_DEL($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Check whether a key exists.
@@ -85,7 +86,7 @@ impl KvModel {
             .query_one("SELECT KV_EXISTS($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Atomically increment a key's integer value. Returns the new value.
@@ -102,7 +103,7 @@ impl KvModel {
                 .await
                 .map_err(NucleusError::Query)?
         };
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Get remaining TTL in seconds. Returns -1 for no TTL, -2 for missing key.
@@ -113,7 +114,7 @@ impl KvModel {
             .query_one("SELECT KV_TTL($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Set a TTL on an existing key.
@@ -125,7 +126,7 @@ impl KvModel {
             .query_one("SELECT KV_EXPIRE($1, $2)", &[&key, &ttl_secs])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return the total number of keys.
@@ -136,7 +137,7 @@ impl KvModel {
             .query_one("SELECT KV_DBSIZE()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Delete all keys.
@@ -159,7 +160,7 @@ impl KvModel {
             .query_one("SELECT KV_LPUSH($1, $2)", &[&key, &value])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Append a value to a list. Returns the new list length.
@@ -170,7 +171,7 @@ impl KvModel {
             .query_one("SELECT KV_RPUSH($1, $2)", &[&key, &value])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Remove and return the first element of a list.
@@ -181,7 +182,7 @@ impl KvModel {
             .query_one("SELECT KV_LPOP($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, Option<String>>(0))
+        Ok(row.get_ck::<Option<String>>(0)?)
     }
 
     /// Remove and return the last element of a list.
@@ -192,7 +193,7 @@ impl KvModel {
             .query_one("SELECT KV_RPOP($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, Option<String>>(0))
+        Ok(row.get_ck::<Option<String>>(0)?)
     }
 
     /// Return elements from a list between start and stop (inclusive).
@@ -220,7 +221,7 @@ impl KvModel {
             .query_one("SELECT KV_LLEN($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Return the element at the given index in a list.
@@ -231,7 +232,7 @@ impl KvModel {
             .query_one("SELECT KV_LINDEX($1, $2)", &[&key, &index])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, Option<String>>(0))
+        Ok(row.get_ck::<Option<String>>(0)?)
     }
 
     // --- Hash Operations ---
@@ -244,7 +245,7 @@ impl KvModel {
             .query_one("SELECT KV_HSET($1, $2, $3)", &[&key, &field, &value])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Get a field value from a hash.
@@ -255,7 +256,7 @@ impl KvModel {
             .query_one("SELECT KV_HGET($1, $2)", &[&key, &field])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, Option<String>>(0))
+        Ok(row.get_ck::<Option<String>>(0)?)
     }
 
     /// Delete a field from a hash.
@@ -266,7 +267,7 @@ impl KvModel {
             .query_one("SELECT KV_HDEL($1, $2)", &[&key, &field])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Check if a field exists in a hash.
@@ -277,7 +278,7 @@ impl KvModel {
             .query_one("SELECT KV_HEXISTS($1, $2)", &[&key, &field])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return all fields and values from a hash.
@@ -306,7 +307,7 @@ impl KvModel {
             .query_one("SELECT KV_HLEN($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     // --- Set Operations ---
@@ -319,7 +320,7 @@ impl KvModel {
             .query_one("SELECT KV_SADD($1, $2)", &[&key, &member])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Remove a member from a set.
@@ -330,7 +331,7 @@ impl KvModel {
             .query_one("SELECT KV_SREM($1, $2)", &[&key, &member])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return all members of a set.
@@ -353,7 +354,7 @@ impl KvModel {
             .query_one("SELECT KV_SISMEMBER($1, $2)", &[&key, &member])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return the number of members in a set.
@@ -364,7 +365,7 @@ impl KvModel {
             .query_one("SELECT KV_SCARD($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     // --- Sorted Set Operations ---
@@ -377,7 +378,7 @@ impl KvModel {
             .query_one("SELECT KV_ZADD($1, $2, $3)", &[&key, &score, &member])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return members in a sorted set between start and stop ranks.
@@ -426,7 +427,7 @@ impl KvModel {
             .query_one("SELECT KV_ZREM($1, $2)", &[&key, &member])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return the number of members in a sorted set.
@@ -437,7 +438,7 @@ impl KvModel {
             .query_one("SELECT KV_ZCARD($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     // --- HyperLogLog ---
@@ -450,7 +451,7 @@ impl KvModel {
             .query_one("SELECT KV_PFADD($1, $2)", &[&key, &element])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return the approximate distinct count from a HyperLogLog.
@@ -461,6 +462,6 @@ impl KvModel {
             .query_one("SELECT KV_PFCOUNT($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 }

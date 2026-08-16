@@ -4,6 +4,7 @@
 use serde_json;
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::models::is_valid_identifier;
 use crate::pool::NucleusPool;
 
@@ -68,7 +69,7 @@ impl VectorModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, f64>(0))
+        Ok(row.get_ck::<f64>(0)?)
     }
 
     /// Return the dimensionality of a vector.
@@ -81,7 +82,7 @@ impl VectorModel {
             .query_one("SELECT VECTOR_DIMS(VECTOR($1))", &[&vec_json])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Create a vector collection (table with id, embedding, metadata columns).
@@ -128,15 +129,19 @@ impl VectorModel {
         }
         let vec_json =
             serde_json::to_string(vector).map_err(|e| NucleusError::Serde(e.to_string()))?;
-        let meta_json =
-            serde_json::to_string(metadata).map_err(|e| NucleusError::Serde(e.to_string()))?;
         let conn = self.pool.get().await?;
         let sql = format!(
             "INSERT INTO {} (id, embedding, metadata) VALUES ($1, VECTOR($2), $3)",
             collection
         );
+        // `metadata` is bound as a serde_json::Value, not as a pre-serialized
+        // String. The engine declares the third parameter `jsonb`, and
+        // tokio-postgres refuses to serialize a String into a jsonb parameter —
+        // every insert carrying metadata failed with "error serializing
+        // parameter 2". It was invisible because nothing exercised the Rust
+        // client against a live engine until 2026-08-15.
         conn.client()
-            .execute(&sql, &[&id, &vec_json, &meta_json])
+            .execute(&sql, &[&id, &vec_json, metadata])
             .await
             .map_err(NucleusError::Query)?;
         Ok(())
@@ -182,6 +187,25 @@ impl VectorModel {
     }
 
     /// Delete a vector by ID from a collection.
+    /// Count the vectors in a collection.
+    ///
+    /// A collection is a table, so this is a plain `COUNT(*)` — there is no
+    /// `VECTOR_*` primitive for it. The identifier is validated before
+    /// interpolation for the same reason as the other methods here: it cannot
+    /// be bound as a parameter.
+    pub async fn count(&self, collection: &str) -> Result<i64, NucleusError> {
+        if !is_valid_identifier(collection) {
+            return Err(NucleusError::InvalidIdentifier(collection.to_string()));
+        }
+        let conn = self.pool.get().await?;
+        let row = conn
+            .client()
+            .query_one(&format!("SELECT COUNT(*) FROM {collection}"), &[])
+            .await
+            .map_err(NucleusError::Query)?;
+        Ok(row.get_ck::<i64>(0)?)
+    }
+
     pub async fn delete(&self, collection: &str, id: &str) -> Result<bool, NucleusError> {
         if !is_valid_identifier(collection) {
             return Err(NucleusError::InvalidIdentifier(collection.to_string()));

@@ -1,6 +1,7 @@
 //! PubSub model — PUBSUB_PUBLISH, PUBSUB_CHANNELS, PUBSUB_SUBSCRIBERS.
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
 
 /// Handle for PubSub operations.
@@ -21,7 +22,7 @@ impl PubSubModel {
             .query_one("SELECT PUBSUB_PUBLISH($1, $2)", &[&channel, &message])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Return active PubSub channels matching an optional pattern.
@@ -53,6 +54,6 @@ impl PubSubModel {
             .query_one("SELECT PUBSUB_SUBSCRIBERS($1)", &[&channel])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 }

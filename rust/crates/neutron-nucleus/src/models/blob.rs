@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
 
 /// Metadata about a stored blob.
@@ -59,7 +60,7 @@ impl BlobModel {
                 .await
                 .map_err(NucleusError::Query)?
         };
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Retrieve a blob as raw bytes. Returns `None` if not found.
@@ -89,7 +90,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_DELETE($1)", &[&key])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Return metadata for a blob.
@@ -118,6 +119,15 @@ impl BlobModel {
     }
 
     /// Set a metadata tag on a blob.
+    /// Whether a blob exists.
+    ///
+    /// Asks `BLOB_META` and reports whether it answered. Metadata rather than
+    /// `BLOB_GET` on purpose: `get` would pull the whole payload across the
+    /// wire to answer a boolean.
+    pub async fn exists(&self, key: &str) -> Result<bool, NucleusError> {
+        Ok(self.meta(key).await?.is_some())
+    }
+
     pub async fn tag(
         &self,
         key: &str,
@@ -130,7 +140,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_TAG($1, $2, $3)", &[&key, &tag_key, &tag_value])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// List blob keys matching an optional prefix.
@@ -161,7 +171,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Return the deduplication ratio.
@@ -172,7 +182,7 @@ impl BlobModel {
             .query_one("SELECT BLOB_DEDUP_RATIO()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, f64>(0))
+        Ok(row.get_ck::<f64>(0)?)
     }
 }
 

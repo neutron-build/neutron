@@ -210,7 +210,27 @@ class KVModel:
         )
         if not raw:
             return []
-        return [f"{member}:{score}" for member, score in json.loads(raw)]
+        # Members only, like Redis ZRANGE without WITHSCORES.
+        #
+        # This used to return f"{member}:{score}". KV_ZRANGE answers with clean
+        # JSON pairs — [["a:b", 1.0]] — so the ENGINE never had the delimiter
+        # problem the conformance note blamed it for; this line reintroduced it,
+        # making a member containing ':' indistinguishable from the separator.
+        # Rust returned members all along, which is how the misattribution was
+        # found. Use zrange_with_scores when the scores are wanted.
+        return [member for member, _score in json.loads(raw)]
+
+    async def zrange_with_scores(
+        self, key: str, start: int, stop: int
+    ) -> list[tuple[str, float]]:
+        """Members with their scores, unambiguous for any member text."""
+        self._require()
+        raw = await self._exec.fetchval(
+            "SELECT KV_ZRANGE($1, $2, $3)", key, start, stop
+        )
+        if not raw:
+            return []
+        return [(member, float(score)) for member, score in json.loads(raw)]
 
     async def zrangebyscore(
         self, key: str, min_score: float, max_score: float
@@ -221,7 +241,7 @@ class KVModel:
         )
         if not raw:
             return []
-        return [f"{member}:{score}" for member, score in json.loads(raw)]
+        return [member for member, _score in json.loads(raw)]
 
     async def zrem(self, key: str, member: str) -> bool:
         self._require()

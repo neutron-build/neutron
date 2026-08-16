@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -518,9 +517,15 @@ func decodeZMembers(op, raw string) ([]string, error) {
 	if len(pairs) == 0 {
 		return nil, nil
 	}
+	// Members only, like Redis ZRANGE without WITHSCORES.
+	//
+	// This returned Member + ":" + Score. KV_ZRANGE answers with clean JSON
+	// pairs, so the ENGINE never had the delimiter problem the conformance note
+	// blamed it for — this loop reintroduced it, and a member containing ':'
+	// became indistinguishable from the separator.
 	out := make([]string, len(pairs))
 	for i, p := range pairs {
-		out[i] = p.Member + ":" + strconv.FormatFloat(p.Score, 'g', -1, 64)
+		out[i] = p.Member
 	}
 	return out, nil
 }

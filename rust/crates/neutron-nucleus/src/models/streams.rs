@@ -6,6 +6,7 @@ use serde_json;
 use std::collections::HashMap;
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
 
 /// A single entry in a stream.
@@ -62,7 +63,7 @@ impl StreamModel {
             .query_one(&sql, &query_params)
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, String>(0))
+        Ok(row.get_ck::<String>(0)?)
     }
 
     /// Return the number of entries in a stream.
@@ -73,7 +74,7 @@ impl StreamModel {
             .query_one("SELECT STREAM_XLEN($1)", &[&stream])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Return entries in a stream between start and end timestamps (inclusive).
@@ -133,7 +134,7 @@ impl StreamModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get_ck::<bool>(0)?)
     }
 
     /// Read entries from a consumer group.
@@ -175,7 +176,7 @@ impl StreamModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 }
 

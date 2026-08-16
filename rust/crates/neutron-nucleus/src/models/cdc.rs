@@ -1,6 +1,7 @@
 //! Change Data Capture model — CDC_READ, CDC_COUNT, CDC_TABLE_READ.
 
 use crate::error::NucleusError;
+use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
 
 /// Handle for CDC (Change Data Capture) operations.
@@ -22,7 +23,7 @@ impl CdcModel {
             .query_one("SELECT CDC_READ($1, $2)", &[&after_sequence, &limit])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, String>(0))
+        Ok(row.get_ck::<String>(0)?)
     }
 
     /// Return the total number of CDC events.
@@ -33,7 +34,7 @@ impl CdcModel {
             .query_one("SELECT CDC_COUNT()", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get_ck::<i64>(0)?)
     }
 
     /// Read up to `limit` CDC events for a specific table after the given
@@ -53,6 +54,6 @@ impl CdcModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, String>(0))
+        Ok(row.get_ck::<String>(0)?)
     }
 }
