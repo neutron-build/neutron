@@ -55,16 +55,25 @@ Tracked (release evidence):
   numbers. **Read before hunting a correctness bug** — most real bugs here were
   found by these, not by unit tests.
 
-- `PARITY-COMPARISON.md` -- Feature-by-feature against competing engines
 - `AUDIT_FINDINGS.md` (+ `AUDIT_FINDINGS_RAW.json`) -- 2026-06 audit findings
   log. A **record, not a work list**: fixed / refuted / deferred with evidence.
   What to do next lives in `_internal/OPEN_WORK.md`.
 
-Those seven files are the whole of `nucleus/`'s root documentation, and each
-answers a different question. Adding an eighth is fine when it answers one none
-of them do. Adding a second status document, a second next-work list, or an
+Those six files are the whole of `nucleus/`'s **tracked** root documentation, and
+each answers a different question. Adding a seventh is fine when it answers one
+none of them do. Adding a second status document, a second next-work list, or an
 undated audit snapshot is not — that is what produced the 18-file root this
 replaced (see `archive/README.md`).
+
+Local-only (gitignored, never committed):
+
+- `PARITY-COMPARISON.md` -- Feature-by-feature against competing engines. Its own
+  first line says "Local-only reference (gitignored)" and it carries a
+  re-verify-before-external-use caveat on competitor claims. It was listed here
+  as tracked release evidence until 2026-08-15 and had in fact been **public on
+  the GitHub mirror since 2026-07-20** — this list said one thing, `.gitignore`
+  said another, and git followed neither because the file was already tracked
+  when the rule was written. Untracked 2026-08-15.
 
 `archive/` -- superseded docs, **not a work list**. Verified-stale before being
 moved there: `AUDIT-REPORT.md`'s sampled criticals were 6-for-6 already fixed,

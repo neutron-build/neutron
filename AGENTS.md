@@ -86,6 +86,40 @@ Neutron's docs and marketing have a history of drifting ahead of the code
   a reader who catches one wrong number distrusts every number.
 - Keep numbers in as few places as possible; prefer generating them.
 
+## Working notes stay out of this repo
+
+This is a public repository, mirrored to GitHub. **Planning docs, session notes,
+audit scratch, handoffs and status write-ups do not belong in it** — not in a
+subdirectory, not "temporarily".
+
+Do not create them here in the first place. If you need one, use a name the
+ignore rules already cover, and it will never be committed by accident:
+
+| Shape | Examples |
+|---|---|
+| Anything under a private tree | `_internal/`, `_notes/`, `_scratch/` |
+| Session / handoff / progress | `SESSION_*.md`, `HANDOFF*.md`, `PROGRESS.md`, `OPEN_WORK.md` |
+| Scratch / draft / research | `SCRATCH*.md`, `WIP*.md`, `DRAFT*.md`, `NOTES.md`, `*_NOTES.md` |
+| **Escape hatch — prefer this** | `anything.local.md`, `anything.local.json` |
+
+The `.local.` infix is the general answer: it makes any file local-only without
+editing `.gitignore`. Reach for it before adding a new rule.
+
+Two things to know about why this is enforced rather than trusted:
+
+- **`.gitignore` does not untrack.** A rule added after a file is committed does
+  nothing, silently and permanently. `nucleus/PARITY-COMPARISON.md` said
+  "Local-only reference (gitignored)" in its own first line and was public on the
+  GitHub mirror for four weeks; 21 files under `mojo/specs/`, `mojo/study/` and
+  `mojo/reports/` were public for five months after being marked internal.
+- **CI checks it.** `.github/scripts/check_ignored_not_tracked.py` fails the build
+  if any tracked path matches an ignore rule, so the two cannot drift apart
+  again. If it fails on your change, either `git rm --cached` the file (it stays
+  on disk) or narrow the rule — but make the call explicitly.
+
+What *is* welcome: documentation that helps someone use or change Neutron. The
+test is audience, not format — a reader you don't know, versus you next week.
+
 ## Docs & the site
 
 The docs site (`typescript/apps/site/`) dogfoods Neutron's own TS framework and

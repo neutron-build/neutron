@@ -160,7 +160,66 @@ Cargo.lock
 *.rmeta
 *.rcgu.o
 
-# Private notes — local only, never committed
+# ---------------------------------------------------------------------------
+# Working docs, notes and context — local only, never committed
+# ---------------------------------------------------------------------------
+# Everything above this block is a DENYLIST OF EXACT FILENAMES, added reactively
+# one name at a time. That shape cannot hold: a working note is tracked by
+# default until somebody remembers to add its exact name here, and the rule only
+# ever arrives after the file already exists. It also does nothing to a file that
+# is already tracked -- `.gitignore` does not untrack -- which is how
+# `nucleus/PARITY-COMPARISON.md` sat public on the GitHub mirror from 2026-07-20
+# while both the ignore list and the document's own first line called it
+# local-only.
+#
+# The patterns below are CONVENTIONS instead: name a note in any of these shapes
+# and it is ignored the moment it is created, without an edit here. Prefer them
+# for anything new.
+#
+# `.github/scripts/check_ignored_not_tracked.py` enforces the whole file: it
+# fails if any tracked path matches an ignore rule, so intent and reality cannot
+# drift apart again silently.
+
+# Private planning trees. `_internal/` is its own private git repo (Forgejo
+# `Tyler/neutron-internal`) — gitignored here so the public repo never sees it,
+# versioned there so it is not single-copy on one laptop.
 /_internal/
-/INTERNAL.md
+**/_internal/
+**/_notes/
+**/_scratch/
+**/.notes/
+
+# Note/context/session filename conventions
+**/INTERNAL.md
+**/NOTES.md
+**/*_NOTES.md
+**/*-NOTES.md
+**/NOTES-*.md
+**/SESSION_*.md
+**/SESSION-*.md
+**/HANDOFF*.md
+**/*_HANDOFF.md
+**/SCRATCH*.md
+**/WIP*.md
+**/DRAFT*.md
+**/TODO.md
+**/TODO-*.md
+**/BRAINSTORM*.md
+**/RESEARCH-*.md
+**/*-RESEARCH.md
+**/POSTMORTEM*.md
+**/RETRO*.md
+**/DECISIONS.md
+**/OPEN_WORK.md
+**/PROGRESS.md
+**/ORCHESTRATION.md
+**/GROUND_TRUTH.md
+
+# The universal escape hatch: any file may be made local-only by adding `.local`
+# before its extension. Use this instead of extending the denylist above.
+**/*.local.md
+**/*.local.txt
+**/*.local.json
+**/*.local.*
+
 uv.lock

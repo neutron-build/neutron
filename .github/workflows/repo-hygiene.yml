@@ -1,0 +1,24 @@
+name: Repo Hygiene
+
+# Deliberately NOT path-filtered. The thing being checked is "did a file that
+# should be private get committed", and the answer depends on every path in the
+# tree, not on a subset. Path filters are also what let five workflows sit red
+# for months and what kept the doc-metrics check from ever seeing README.md --
+# this repo has been bitten by them twice, so this one runs on everything.
+#
+# The job is a few seconds of Python against `git ls-files`; running it on every
+# push costs nothing worth optimising.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ignored-not-tracked:
+    name: No tracked file is matched by an ignore rule
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check .gitignore intent matches reality
+        run: python3 .github/scripts/check_ignored_not_tracked.py
