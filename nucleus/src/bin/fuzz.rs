@@ -22,6 +22,16 @@
 //!   cargo run --release --features "server rusqlite" --bin fuzz
 //!   cargo run --release --features "server rusqlite" --bin fuzz -- --seed 42 --iterations 5000
 //!   cargo run --release --features "server rusqlite" --bin fuzz -- --engine buffered-disk
+//!   cargo run --release --features "server rusqlite" --bin fuzz -- --stream
+//!
+//! `--stream` sets `stream_results = on` for every candidate, so the oracle
+//! compares the STREAMING executor against SQLite instead of the materialized
+//! one. Until this existed the streaming path had only Nucleus-vs-Nucleus unit
+//! tests behind it — a metamorphic check against the very implementation it is
+//! meant to be validating. Because the streaming path silently declines on
+//! shapes it cannot serve (RLS, CTEs, some ORDER BY forms) and is answered
+//! materialized instead, the run ASSERTS `stream_path_served` moved: otherwise
+//! `--stream` could report a clean sweep of the path it never entered.
 //!
 //! `--engine` selects which storage engine the oracle runs against. It defaults
 //! to `mvcc` (RAM-resident, no WAL) purely for speed, and that default is a
@@ -597,11 +607,27 @@ fn canon_sqlite(v: &rusqlite::types::Value) -> String {
 /// `Err("PANIC: ..")` so the caller can treat them as always-fatal bugs.
 fn run_nucleus(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let rt = tokio::runtime::Handle::current();
+    // `Executor::execute` does NOT materialize — under `SET stream_results = on`
+    // it hands back an `ExecResult::SelectStream` whose rows are still lazy.
+    // Matching only on `Select` therefore turned every streamed query into a
+    // "non-select result" error and dropped it from the comparison: the first
+    // `--stream` run reported 1159 streams served, 0 divergences and 48 such
+    // errors, which together mean the streamed rows were never compared to
+    // SQLite at all. Draining here is what makes streaming mode an oracle
+    // rather than a very slow way to test the materialized path.
     let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        tokio::task::block_in_place(|| rt.block_on(ex.execute(sql)))
+        tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let mut results = ex.execute(sql).await?;
+                match results.pop() {
+                    Some(r) => r.materialize().await.map(Some),
+                    None => Ok(None),
+                }
+            })
+        })
     }));
     match res {
-        Ok(Ok(mut results)) => match results.pop() {
+        Ok(Ok(result)) => match result {
             Some(ExecResult::Select { rows, .. }) => Ok(rows
                 .iter()
                 .map(|r| r.iter().map(canon_nucleus).collect())
@@ -702,6 +728,14 @@ fn dump_inserts(schema: &Schema, rows: &[Vec<String>]) -> String {
 
 /// Monotonic suffix so concurrently-live temp directories never collide.
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Set by `--stream`; read when each candidate's executor is opened.
+static STREAM_RESULTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Streams actually handed back, summed across every candidate.
+///
+/// Each candidate gets its own executor and so its own metrics registry, so the
+/// total has to be accumulated as candidates are dropped rather than read once
+/// at the end.
+static STREAMS_SERVED: AtomicU64 = AtomicU64::new(0);
 
 /// One Nucleus instance under test, owning any on-disk directory it needs.
 ///
@@ -715,6 +749,10 @@ struct NucleusUnderTest {
 
 impl Drop for NucleusUnderTest {
     fn drop(&mut self) {
+        STREAMS_SERVED.fetch_add(
+            self.ex.metrics().stream_path_served.get(),
+            Ordering::Relaxed,
+        );
         self.db.take();
         if let Some(dir) = &self.dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -733,8 +771,10 @@ fn open_nucleus(kind: Option<EngineKind>) -> Option<NucleusUnderTest> {
     let Some(kind) = kind else {
         let cat = Arc::new(Catalog::new());
         let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+        let ex = Arc::new(Executor::new(cat, st));
+        enable_streaming(&ex);
         return Some(NucleusUnderTest {
-            ex: Arc::new(Executor::new(cat, st)),
+            ex,
             db: None,
             dir: None,
         });
@@ -750,11 +790,24 @@ fn open_nucleus(kind: Option<EngineKind>) -> Option<NucleusUnderTest> {
         rt.block_on(HarnessDb::open(kind, &dir, EngineConfig::default()))
     })
     .ok()?;
+    let ex = db.executor().clone();
+    enable_streaming(&ex);
     Some(NucleusUnderTest {
-        ex: db.executor().clone(),
+        ex,
         db: Some(db),
         dir: Some(dir),
     })
+}
+
+/// Opt this candidate's session into streaming, when `--stream` was passed.
+///
+/// Per candidate rather than once: paged engines open a fresh executor — and so
+/// a fresh session — for every iteration, and the setting lives on the session.
+fn enable_streaming(ex: &Arc<Executor>) {
+    if !STREAM_RESULTS.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = exec_nucleus(ex, "SET stream_results = on");
 }
 
 /// Replay an op sequence on a fresh Nucleus + fresh SQLite, run `q` on both,
@@ -850,6 +903,9 @@ fn main_impl() {
             "--rows" => {
                 i += 1;
                 fixed_rows = args[i].parse().unwrap();
+            }
+            "--stream" => {
+                STREAM_RESULTS.store(true, Ordering::Relaxed);
             }
             "--engine" => {
                 i += 1;
@@ -1144,6 +1200,23 @@ fn main_impl() {
     println!("RESULT divergences : {divergences}");
     println!("PANICS             : {panics}");
     println!("nucleus-only errors: {nuc_errors} (SQLite accepted; may be unsupported features)");
+    // `--stream` is a request the executor may decline on any given query. If it
+    // declined on ALL of them the run just re-tested the materialized path and a
+    // clean result would be evidence of nothing — the exact silent-success shape
+    // this suite keeps finding elsewhere. So the mode asserts it was entered.
+    if STREAM_RESULTS.load(Ordering::Relaxed) {
+        let served = STREAMS_SERVED.load(Ordering::Relaxed);
+        println!("streams served     : {served}");
+        if served == 0 {
+            println!(
+                "\nFAIL: --stream was requested and the streaming path never ran, so this \n\
+                 run compared the materialized executor against SQLite and proved nothing \n\
+                 about streaming. Check that `SET stream_results = on` is still accepted \n\
+                 and that the generated queries are eligible for the streaming path."
+            );
+            std::process::exit(1);
+        }
+    }
     if divergences == 0 && panics == 0 {
         println!("\nNo divergences, no panics vs SQLite. 🎯");
     } else {

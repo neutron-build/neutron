@@ -254,6 +254,15 @@ pub struct MetricsRegistry {
     /// index looks identical to one that never had it, in a system whose whole
     /// failure mode is "answers stayed correct and only cost changed".
     pub index_scan_fallbacks: Counter,
+    /// SELECTs actually handed back as a stream.
+    ///
+    /// `SET stream_results = on` is a request, not an outcome: the streaming
+    /// path declines on RLS, CTEs and several ORDER BY shapes, and each decline
+    /// is answered materialized — correctly, and with nothing to see. Without
+    /// this counter a session that opted in could run entirely materialized and
+    /// look identical, which also means a differential run in "streaming mode"
+    /// could be re-testing the path it was meant to leave.
+    pub stream_path_served: Counter,
     /// SELECTs answered by the plan executor.
     ///
     /// The counterpart to `plan_path_fallbacks`, which alone cannot tell
@@ -327,6 +336,10 @@ impl MetricsRegistry {
             queries_update: Counter::new("nucleus_queries_update_total", "Total UPDATE queries"),
             queries_delete: Counter::new("nucleus_queries_delete_total", "Total DELETE queries"),
             rows_scanned: Counter::new("nucleus_rows_scanned_total", "Total rows scanned"),
+            stream_path_served: Counter::new(
+                "nucleus_stream_path_served_total",
+                "SELECTs returned as a stream rather than materialized",
+            ),
             update_rmw_retries: Counter::new(
                 "nucleus_update_rmw_retries_total",
                 "Rows an UPDATE re-read and re-evaluated after losing a race to a concurrent write",
@@ -480,6 +493,7 @@ impl MetricsRegistry {
         render_counter(&mut out, &self.queries_update);
         render_counter(&mut out, &self.queries_delete);
         render_counter(&mut out, &self.rows_scanned);
+        render_counter(&mut out, &self.stream_path_served);
         render_counter(&mut out, &self.update_rmw_retries);
         render_counter(&mut out, &self.values_scanned);
         render_counter(&mut out, &self.rows_returned);
@@ -566,6 +580,7 @@ impl MetricsRegistry {
         add_counter(&mut rows, &self.queries_update);
         add_counter(&mut rows, &self.queries_delete);
         add_counter(&mut rows, &self.rows_scanned);
+        add_counter(&mut rows, &self.stream_path_served);
         add_counter(&mut rows, &self.update_rmw_retries);
         add_counter(&mut rows, &self.values_scanned);
         add_counter(&mut rows, &self.rows_returned);
@@ -814,13 +829,13 @@ mod tests {
         reg.active_connections.set(3);
 
         let rows = reg.as_rows();
-        // 29 counters + 8 gauges + 1 uptime + 2 histograms = 40.
+        // 30 counters + 8 gauges + 1 uptime + 2 histograms = 41.
         // The count is asserted deliberately: `as_rows` is SHOW METRICS, and a
         // metric added to the registry but not to the render/rows lists is
         // silently invisible to every operator — the same declared-but-unwired
         // shape as the rest of this engine. Update this number ONLY alongside
         // adding the metric to both `render_prometheus` and `as_rows`.
-        assert_eq!(rows.len(), 40);
+        assert_eq!(rows.len(), 41);
 
         // Check a counter row
         let qt = rows

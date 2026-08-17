@@ -37,6 +37,7 @@ sh scripts/metrics.sh --check                      # doc numbers still true
 cargo run --release --features "server rusqlite" --bin probe_joins -- --iterations 3000
 cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 1500
 cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 --engine buffered-disk
+cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 --stream
 cargo run --release --features server --bin probe_engines
 cargo run --release --features server --bin probe_index_coherence
 ```
@@ -49,6 +50,19 @@ hand-formatted closures failed the gates *before a single test ran*. Every
 probe below had been run locally and proved nothing about those two runs. A
 formatting failure is the cheapest possible red — and it masks the whole gate
 behind it.
+
+**`--stream` is the same argument one layer up.** `SET stream_results = on`
+routes SELECTs down a different executor path, and until 2026-08-17 that path
+had only Nucleus-vs-Nucleus unit tests behind it — a metamorphic check against
+the implementation it is meant to validate. `--stream` aims the SQLite oracle at
+it. It reports `streams served` and **fails when that is zero**, because the
+streaming path declines silently on shapes it cannot serve (RLS, CTEs, some
+ORDER BY forms) and is answered materialized instead: without the assertion, a
+clean `--stream` run could be a clean run of the path it was meant to leave.
+That is not hypothetical — the first version of this mode dropped every streamed
+query as a "non-select result" and still printed 0 divergences, because
+`Executor::execute` does not materialize and `run_nucleus` matched only
+`ExecResult::Select`.
 
 **The `--engine buffered-disk` line is not optional.** The default `mvcc` engine
 has no paged storage, so a default-engine fuzz run covers nothing `DiskEngine`

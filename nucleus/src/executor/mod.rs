@@ -247,8 +247,16 @@ impl ExecResult {
     /// Collapse a [`ExecResult::SelectStream`] into a materialized
     /// [`ExecResult::Select`] by draining its batch iterator; all other variants
     /// pass through unchanged. This is the adapter every not-yet-streaming
-    /// consumer uses, and what the [`Executor::execute`] boundary applies so the
-    /// default result path is always materialized.
+    /// consumer uses.
+    ///
+    /// **`Executor::execute` does not apply it.** This comment used to say it
+    /// did, and that is worth stating plainly because the claim is load-bearing
+    /// for anyone writing a consumer: under `SET stream_results = on`, `execute`
+    /// returns a live `SelectStream`, and a caller that matches only on
+    /// `ExecResult::Select` silently loses the result. The pgwire layer handles
+    /// the variant; `embedded.rs` does not, and the differential fuzzer did not
+    /// until it was caught dropping 48 streamed queries as "non-select result"
+    /// while reporting zero divergences.
     pub async fn materialize(self) -> Result<ExecResult, ExecError> {
         match self {
             ExecResult::SelectStream {

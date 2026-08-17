@@ -1587,6 +1587,14 @@ impl Executor {
         if let Some(indices) = proj_indices {
             source = Box::new(super::scan_stream::ProjectBatchIter::new(source, indices));
         }
+        // The streaming path declines for many reasons — RLS, CTEs, an
+        // ineligible ORDER BY — and every one of them returns `Ok(None)` and is
+        // answered materialized instead, correctly and invisibly. So a caller
+        // that opted into streaming and silently got the materialized path back
+        // has no way to know, and a differential run in "streaming mode" could
+        // be re-testing the path it was meant to leave. Counted here, at the one
+        // place a stream is actually handed back.
+        self.metrics.stream_path_served.inc();
         Ok(Some(ExecResult::SelectStream { columns, source }))
     }
 
