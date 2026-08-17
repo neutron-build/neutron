@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -411,12 +411,26 @@ impl LargeObjectState {
     }
 }
 
-/// Global OID counter for large objects.
-static NEXT_LO_OID: AtomicU32 = AtomicU32::new(100_000);
+/// First OID handed out for a large object, matching PostgreSQL's practice of
+/// keeping user objects clear of the system range.
+const FIRST_LO_OID: u32 = 100_000;
 
 /// Format a large object OID into its BlobStore key.
 fn lo_blob_key(oid: u32) -> String {
     format!("_lo/{oid}")
+}
+
+/// Does this statement call the large-object API?
+///
+/// Only used to give a legible refusal inside a transaction. The large-object
+/// path auto-commits, so both protocols decline it in a transaction block —
+/// and declining meant falling through to the SQL executor, which has no such
+/// functions and answered `unknown function: LO_OPEN`. That reads as "large
+/// objects are not implemented", sends the reader to the wrong place, and
+/// aborts their transaction on the way. Say what is actually true instead.
+fn is_large_object_call(sql: &str) -> bool {
+    let trimmed = sql.trim();
+    trimmed.len() >= 10 && trimmed[..10.min(trimmed.len())].eq_ignore_ascii_case("select lo_")
 }
 
 // ============================================================================
@@ -574,6 +588,20 @@ pub struct NucleusHandler {
     // ── Large Objects ────────────────────────────────────────────────────
     /// Per-connection large object descriptors: peer addr → LargeObjectState.
     lo_state: parking_lot::Mutex<std::collections::HashMap<String, LargeObjectState>>,
+    /// Next large-object OID to try, and the lock that makes "is this OID free?"
+    /// followed by "claim it" one step.
+    ///
+    /// This was a process-global `static AtomicU32` seeded at 100_000, which
+    /// meant every restart started handing out OIDs that already existed on
+    /// disk — and `lo_creat` wrote an empty blob at the OID it picked without
+    /// checking. Measured on a real server: create OID 100000, write
+    /// "PAYLOAD", restart, read it back fine, then `lo_creat` returns 100000
+    /// again and the payload is gone. The first large-object creation after
+    /// any restart destroyed the oldest large object, deterministically.
+    /// A hint rather than a source of truth: the store is authoritative, and
+    /// `lo_creat` skips any OID already present, so a stale or shared hint
+    /// costs a few probes and can never overwrite. (NU-102)
+    lo_next_oid: parking_lot::Mutex<u32>,
 
     // ── Query cancellation (wire CancelRequest) ──────────────────────────
     /// Cancel keys handed out in BackendKeyData: pid → (secret, session_id).
@@ -610,6 +638,7 @@ impl NucleusHandler {
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
             lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lo_next_oid: parking_lot::Mutex::new(FIRST_LO_OID),
             cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
             cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
@@ -679,6 +708,7 @@ impl NucleusHandler {
             notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
             lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lo_next_oid: parking_lot::Mutex::new(FIRST_LO_OID),
             cancel_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
             cancel_notifies: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
@@ -1583,6 +1613,13 @@ impl SimpleQueryHandler for NucleusHandler {
         let rls_active = self.executor.session_has_active_rls(session_id);
 
         // ── Large Objects fast path: intercept lo_* function calls ───────
+        if in_txn && is_large_object_call(query) {
+            return Err(exec_error_to_pgwire(ExecError::Unsupported(
+                "large objects are not transactional: call lo_* outside a \
+                 transaction block (they auto-commit and would survive ROLLBACK)"
+                    .into(),
+            )));
+        }
         if !in_txn
             && !rls_active
             && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query)
@@ -1976,9 +2013,23 @@ impl ExtendedQueryHandler for NucleusHandler {
         };
         let peer_addr_str = client.socket_addr().to_string();
         let rls_active = self.executor.session_has_active_rls(session_id);
+        // The simple-query path has always excluded this fast path inside a
+        // transaction, because it auto-commits and so survives ROLLBACK. This
+        // path did not test it, which made large-object atomicity depend on
+        // which pgwire protocol the driver happened to use: Parse/Bind/Execute
+        // could BEGIN, lo_write, ROLLBACK, and keep the write. (NU-104)
+        let in_txn = self.executor.session_in_transaction(session_id);
 
         // ── Large Objects fast path (extended query) ────────────────────
-        if !rls_active
+        if in_txn && is_large_object_call(&parsed_stmt.sql) {
+            return Err(exec_error_to_pgwire(ExecError::Unsupported(
+                "large objects are not transactional: call lo_* outside a \
+                 transaction block (they auto-commit and would survive ROLLBACK)"
+                    .into(),
+            )));
+        }
+        if !in_txn
+            && !rls_active
             && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, &parsed_stmt.sql)
         {
             self.flush_pending_notifications(client).await?;
@@ -2487,10 +2538,30 @@ impl NucleusHandler {
 
     /// lo_creat — create a new large object, return its OID.
     fn lo_creat(&self, _peer_addr: &str) -> ExecResult {
-        let oid = NEXT_LO_OID.fetch_add(1, Ordering::Relaxed);
+        // Claim the first OID the store does not already hold. The lock spans
+        // the probe AND the write, so two concurrent creators cannot agree on
+        // the same free OID; the probe means a restarted (or shared) hint can
+        // never overwrite a durable object, which is what NU-102 was.
+        let mut next = self.lo_next_oid.lock();
+        let mut oid = (*next).max(FIRST_LO_OID);
+        while self.executor.blob_store_exists(&lo_blob_key(oid)) {
+            match oid.checked_add(1) {
+                Some(n) => oid = n,
+                // Refusing is the right answer here: wrapping would hand back
+                // an OID whose object belongs to someone else.
+                None => {
+                    return ExecResult::Select {
+                        columns: vec![("lo_creat".to_string(), DataType::Int32)],
+                        rows: vec![vec![Value::Int32(-1)]],
+                    };
+                }
+            }
+        }
         let key = lo_blob_key(oid);
         // Create an empty blob in the store.
         self.executor.blob_store_put(&key, b"", None);
+        *next = oid.saturating_add(1);
+        drop(next);
         ExecResult::Select {
             columns: vec![("lo_creat".to_string(), DataType::Int32)],
             rows: vec![vec![Value::Int32(oid as i32)]],
@@ -2569,10 +2640,24 @@ impl NucleusHandler {
                 rows: vec![vec![Value::Null]],
             };
         }
-        let data = self
+        // `None` here means the object is gone or unreadable — NOT that it is
+        // empty. Returning an empty bytea for it told the client "read
+        // succeeded, zero bytes", which is indistinguishable from reaching the
+        // end of the object and is how a storage failure became silent
+        // truncation. Report NULL and leave the offset alone so the read stays
+        // retryable. (NU-103)
+        let data = match self
             .executor
             .blob_store_get_range(&desc.key, desc.offset, len as u64)
-            .unwrap_or_default();
+        {
+            Some(d) => d,
+            None => {
+                return ExecResult::Select {
+                    columns: vec![("lo_read".to_string(), DataType::Bytea)],
+                    rows: vec![vec![Value::Null]],
+                };
+            }
+        };
         desc.offset += data.len() as u64;
         ExecResult::Select {
             columns: vec![("lo_read".to_string(), DataType::Bytea)],
@@ -2609,7 +2694,21 @@ impl NucleusHandler {
             };
         }
         // Read existing data, splice in the write, put back.
-        let mut existing = self.executor.blob_store_get(&desc.key).unwrap_or_default();
+        //
+        // `unwrap_or_default()` here was the data-loss half of NU-103: if the
+        // read failed, the write was spliced into an EMPTY vector and stored,
+        // replacing however many megabytes the object held with just the newly
+        // written range — and the client was told the write succeeded. An
+        // object that cannot be read cannot be safely rewritten, so refuse.
+        let mut existing = match self.executor.blob_store_get(&desc.key) {
+            Some(d) => d,
+            None => {
+                return ExecResult::Select {
+                    columns: vec![("lo_write".to_string(), DataType::Int32)],
+                    rows: vec![vec![Value::Int32(-1)]],
+                };
+            }
+        };
         let offset = desc.offset as usize;
         if offset > existing.len() {
             existing.resize(offset, 0);
@@ -6096,6 +6195,143 @@ mod security_tests {
     }
 
     // ── Large Objects API tests ─────────────────────────────────────
+
+    /// Extract the single Int32 out of an `lo_*` result.
+    fn lo_int(result: ExecResult) -> i32 {
+        match result {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(v) => v,
+                ref other => panic!("expected Int32, got {other:?}"),
+            },
+            _ => panic!("expected Select result"),
+        }
+    }
+
+    /// NU-102: `lo_creat` must never hand back an OID that already has an
+    /// object, and must never write over one.
+    ///
+    /// The allocator was a process-global `static AtomicU32` seeded at
+    /// 100_000, so every restart began re-issuing OIDs that existed on disk —
+    /// and creation wrote an empty blob at the OID it chose without looking.
+    /// Measured on a real server before the fix: create 100000, write
+    /// "PAYLOAD", restart, read it back fine, `lo_creat` returns 100000
+    /// again, payload gone. Deterministic, not a race, and it destroyed the
+    /// OLDEST object every time.
+    ///
+    /// A fresh handler over a store that already holds `_lo/100000` is
+    /// exactly the state a restart produces.
+    #[test]
+    fn lo_creat_never_overwrites_an_existing_object() {
+        let executor = make_executor();
+        executor.blob_store_put(&lo_blob_key(FIRST_LO_OID), b"PAYLOAD", None);
+        executor.blob_store_put(&lo_blob_key(FIRST_LO_OID + 1), b"SECOND", None);
+
+        let handler = NucleusHandler::new(executor.clone());
+        let oid = lo_int(handler.lo_creat("peer1")) as u32;
+
+        assert!(
+            oid > FIRST_LO_OID + 1,
+            "lo_creat returned {oid}, which already holds an object"
+        );
+        assert_eq!(
+            executor
+                .blob_store_get(&lo_blob_key(FIRST_LO_OID))
+                .as_deref(),
+            Some(&b"PAYLOAD"[..]),
+            "creation destroyed an existing large object"
+        );
+        assert_eq!(
+            executor
+                .blob_store_get(&lo_blob_key(FIRST_LO_OID + 1))
+                .as_deref(),
+            Some(&b"SECOND"[..]),
+        );
+    }
+
+    /// Two handlers over one store — the shape a second connection or a
+    /// second server instance produces — must not collide either. The old
+    /// counter was global, so this passed for the wrong reason; now the store
+    /// is the authority and the counter is only a hint.
+    #[test]
+    fn lo_creat_across_handlers_allocates_distinct_oids() {
+        let executor = make_executor();
+        let a = NucleusHandler::new(executor.clone());
+        let b = NucleusHandler::new(executor.clone());
+        let first = lo_int(a.lo_creat("peer1")) as u32;
+        let second = lo_int(b.lo_creat("peer2")) as u32;
+        assert_ne!(first, second, "two handlers agreed on one OID");
+    }
+
+    /// NU-103: an unreadable object must not read back as an empty one.
+    ///
+    /// `blob_store_get_range(...).unwrap_or_default()` reported a missing or
+    /// failed read to the client as a successful zero-length read, which is
+    /// indistinguishable from reaching the end of the object.
+    #[test]
+    fn lo_read_reports_a_missing_object_rather_than_empty_bytes() {
+        let executor = make_executor();
+        let handler = NucleusHandler::new(executor.clone());
+        let oid = lo_int(handler.lo_creat("peer1")) as u32;
+        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE));
+        assert!(fd > 0);
+
+        // The object disappears underneath an open descriptor.
+        executor.blob_store_delete(&lo_blob_key(oid));
+
+        match handler.lo_read("peer1", fd, 100) {
+            ExecResult::Select { rows, .. } => assert_eq!(
+                rows[0][0],
+                Value::Null,
+                "a vanished object read back as a successful empty read"
+            ),
+            _ => panic!("expected Select result"),
+        }
+    }
+
+    /// NU-103, the data-loss half: a write must never rebuild an object from
+    /// an empty vector.
+    ///
+    /// `blob_store_get(...).unwrap_or_default()` meant a failed read turned
+    /// the next write into "replace the whole object with just this range",
+    /// and the client was told the write succeeded.
+    #[test]
+    fn lo_write_refuses_when_the_object_cannot_be_read() {
+        let executor = make_executor();
+        let handler = NucleusHandler::new(executor.clone());
+        let oid = lo_int(handler.lo_creat("peer1")) as u32;
+        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE));
+        executor.blob_store_delete(&lo_blob_key(oid));
+
+        assert_eq!(
+            lo_int(handler.lo_write("peer1", fd, b"partial")),
+            -1,
+            "write reported success against an unreadable object"
+        );
+        assert!(
+            executor.blob_store_get(&lo_blob_key(oid)).is_none(),
+            "the refused write resurrected the object as a truncated one"
+        );
+    }
+
+    /// The ordinary path still works: writes land, reads return them, and the
+    /// descriptor offset advances. Without this the three tests above could
+    /// all pass against an implementation that refuses everything.
+    #[test]
+    fn lo_write_then_read_roundtrips() {
+        let executor = make_executor();
+        let handler = NucleusHandler::new(executor.clone());
+        let oid = lo_int(handler.lo_creat("peer1")) as u32;
+        let fd = lo_int(handler.lo_open("peer1", oid, INV_READ | INV_WRITE));
+        assert_eq!(lo_int(handler.lo_write("peer1", fd, b"PAYLOAD")), 7);
+
+        let read_fd = lo_int(handler.lo_open("peer1", oid, INV_READ));
+        match handler.lo_read("peer1", read_fd, 100) {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Bytea(b"PAYLOAD".to_vec()))
+            }
+            _ => panic!("expected Select result"),
+        }
+    }
 
     #[test]
     fn lo_creat_returns_oid() {

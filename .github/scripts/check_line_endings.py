@@ -80,12 +80,21 @@ def main() -> int:
         if a == "--range" and i + 1 < len(args):
             rev_range = args[i + 1]
 
+    working_tree = False
     if rev_range:
         code, out = run(["git", "diff", "--name-only", "--diff-filter=M", rev_range])
         base = rev_range.split("..")[0]
     else:
         code, out = run(["git", "diff", "--cached", "--name-only", "--diff-filter=M"])
         base = "HEAD"
+        # Nothing staged is not the same as nothing changed, and treating it
+        # that way prints "OK: no file changed its line-ending style" over a
+        # working tree full of flips. That false green is not hypothetical: it
+        # is how a flipped .mdx reached CI on 2026-08-17 after this very script
+        # was run first. Fall back to the working tree.
+        if code == 0 and not out.strip():
+            code, out = run(["git", "diff", "--name-only", "--diff-filter=M"])
+            working_tree = True
     if code != 0:
         print("FAIL: could not list changed files", file=sys.stderr)
         return 1
@@ -102,6 +111,11 @@ def main() -> int:
             after_code, after = run(["git", "show", f"{rev_range.split('..')[-1]}:{path}"])
             if after_code != 0:
                 continue
+        elif working_tree:
+            try:
+                after = open(path, "rb").read()
+            except OSError:
+                continue
         else:
             after_code, after = run(["git", "show", f":{path}"])
             if after_code != 0:
@@ -114,7 +128,8 @@ def main() -> int:
         if b != a:
             flips.append((path, b, a))
 
-    print(f"Checked line endings on {checked} modified text file(s).")
+    scope = "unstaged working tree" if working_tree else ("range" if rev_range else "staged")
+    print(f"Checked line endings on {checked} modified text file(s) ({scope}).")
     if not flips:
         print("OK: no file changed its line-ending style.")
         return 0
