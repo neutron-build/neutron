@@ -279,6 +279,30 @@ fn vals_to_coldata(vals: Vec<Value>) -> ColumnData {
                 })
                 .collect(),
         ),
+        // A batch infers its width from its OWN first non-null value, so two
+        // batches of the same column can disagree — one Int32, one Int64 — and
+        // any re-encode spanning both lands here with Int64s present. Every
+        // UPDATE and DELETE re-encodes the whole table (`batches_to_rows` then
+        // `rows_to_batch`), so this is reached constantly.
+        //
+        // The old arm had `_ => None`, which turned every Int64 in an
+        // Int32-typed column into NULL. That is silent data loss on a written
+        // value, found by `fuzz --table-engine mergetree` (N30): an UPDATE
+        // matching neither row blanked a column on rows it never touched, once
+        // enough parts existed for two batches to disagree. Widen instead —
+        // an i32 always fits in an i64, so promoting is lossless and narrowing
+        // never happens.
+        Some(Value::Int32(_)) if vals.iter().any(|v| matches!(v, Value::Int64(_))) => {
+            ColumnData::Int64(
+                vals.into_iter()
+                    .map(|v| match v {
+                        Value::Int64(n) => Some(n),
+                        Value::Int32(n) => Some(i64::from(n)),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        }
         Some(Value::Int32(_)) => ColumnData::Int32(
             vals.into_iter()
                 .map(|v| match v {

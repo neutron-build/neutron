@@ -1241,37 +1241,20 @@ async fn test_fuzzer_table_engine_ddl_actually_routes() {
     }
 }
 
-// ============================================================================
-// CHARACTERIZATION — this pins a DATA-LOSS BUG (N30). It is not correct
-// behaviour and it is not a design trade-off.
-// ============================================================================
-
-/// **`engine='mergetree'` loses a written column value on UPDATE.** N30.
+/// **N30 regression: mergetree must not blank a column on UPDATE.**
 ///
-/// An `UPDATE` that matches neither row still blanks `c5` on rows 15 and 16.
-/// The same sequence on the row heap keeps both values, and SQLite agrees with
-/// the heap. Found by `fuzz --table-engine mergetree` (seed 305419896), which
-/// was the first differential run ever aimed at a per-table analytics engine:
-/// 20 divergences in 300 iterations, against 0 for heap, columnar and lsm.
+/// An `UPDATE` whose predicate matched neither row used to blank `c5` on ids 15
+/// and 16 — 20 divergences in 300 fuzz iterations against 0 for heap, columnar
+/// and lsm. Root cause was not in mergetree at all: `vals_to_coldata` picked a
+/// column's type from its **first non-null value**, and the `Int32` arm mapped
+/// everything else to `None`. Each batch infers its own width independently, so
+/// two batches of one column can disagree (Int32 vs Int64) — and every UPDATE
+/// re-encodes the whole table across all batches, turning the Int64s into NULL.
 ///
-/// Bisected, so the next person does not have to:
-///   * removing the UPDATE       -> correct, so the UPDATE is the corrupting step
-///   * removing the DELETE       -> still wrong, so tombstones are irrelevant
-///   * removing the 12-row seed  -> correct
-///   * removing two single-row inserts -> correct
-/// It needs several parts and then a rewrite, which points at the merge path
-/// rather than at UPDATE itself. `ENGINE_PERFORMANCE_PROGRAM.md` §7 is the
-/// reading: batches name columns POSITIONALLY, and its own note warns that a
-/// merge "silently drops every column the first time an old part merges with a
-/// new one".
-///
-/// **This matters beyond the fuzzer**: production registers `audit_events` as
-/// mergetree, and §4 of that document recommends mergetree for time-ordered
-/// analytics.
-///
-/// **Delete this test when N30 is fixed.** It asserts the bug, so it must fail.
+/// It needs several parts before two batches disagree, which is why a
+/// three-statement version of this passes and this one did not.
 #[tokio::test]
-async fn test_mergetree_update_still_blanks_an_untouched_column() {
+async fn test_mergetree_update_keeps_an_untouched_column() {
     let seed = "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES \
         (1,20,'str1','blue','str3',-1),(2,8,'str2','green','red',13),\
         (3,14,'str1','str1','str0',NULL),(4,16,'red','green','green',10),\
@@ -1294,6 +1277,8 @@ async fn test_mergetree_update_still_blanks_an_untouched_column() {
         .await;
         for m in [
             seed,
+            // 13 and 14 carry NULL in c5, so this batch types the column from
+            // a later value and can disagree with the seed batch's width.
             "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES (13,0,'str2','str1',NULL,NULL)",
             "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES (14,9,'amber','str1','str2',NULL)",
             "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES (15,-1,'green',NULL,'red',1)",
@@ -1315,18 +1300,54 @@ async fn test_mergetree_update_still_blanks_an_untouched_column() {
             .collect()
     }
 
-    // The heap is the control AND the correct answer — SQLite agrees with it.
+    // The heap is the control and the correct answer — SQLite agrees with it.
     assert_eq!(
         run("", seed, update).await,
         vec![Some(1), Some(2)],
         "the row heap must keep both written values; if this fails the fixture \
          drifted and the assertion below proves nothing"
     );
-
     assert_eq!(
         run(" WITH (engine='mergetree') ORDER BY (id)", seed, update).await,
-        vec![None, None],
-        "N30 appears to be FIXED — mergetree kept the values. Delete this test \
-         and the N30 entry in _internal/OPEN_WORK.md."
+        vec![Some(1), Some(2)],
+        "mergetree blanked a column on rows the UPDATE never matched (N30)"
+    );
+}
+
+/// The same defect at its root, without any engine in the way.
+///
+/// A column re-encoded from a mix of `Int32` and `Int64` — which is what every
+/// analytics-engine UPDATE does across batches that inferred different widths —
+/// must keep every value. The old code chose the type from the first non-null
+/// value and mapped the rest to `None`.
+#[tokio::test]
+async fn test_mixed_int_widths_survive_a_columnar_re_encode() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER) WITH (engine='columnar')",
+    )
+    .await;
+    // Two appends, so two batches that can type `v` differently.
+    exec(&ex, "INSERT INTO m VALUES (1, 10), (2, 20)").await;
+    exec(&ex, "INSERT INTO m VALUES (3, 30)").await;
+    // Any UPDATE re-encodes every batch through one `vals_to_coldata`.
+    exec(&ex, "UPDATE m SET v = 11 WHERE id = 1").await;
+
+    ex.clear_all_query_caches();
+    let r = exec(&ex, "SELECT id, v FROM m ORDER BY id").await;
+    let got: Vec<Option<i64>> = rows(&r[0])
+        .iter()
+        .map(|row| match row[1] {
+            Value::Int32(n) => Some(i64::from(n)),
+            Value::Int64(n) => Some(n),
+            Value::Null => None,
+            ref o => panic!("unexpected v: {o:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![Some(11), Some(20), Some(30)],
+        "a re-encode dropped a value: mixing Int32 and Int64 in one column must widen, not NULL"
     );
 }
