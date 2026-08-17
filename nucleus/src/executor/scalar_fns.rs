@@ -5340,7 +5340,17 @@ impl Executor {
                     result
                 };
                 match result {
-                    Ok(msg) => Ok(Value::Text(msg)),
+                    Ok(msg) => {
+                        // Append to the Datalog WAL. Startup opens this WAL and
+                        // restores from it, but nothing ever wrote to it, so the
+                        // model looked durable in review, its direct WAL tests
+                        // passed, and every fact asserted through SQL vanished on
+                        // restart. Failing the statement is the point: a silent
+                        // append failure is the same defect one layer down.
+                        // (NU-013)
+                        self.log_datalog(|wal| wal.log_assert(&input))?;
+                        Ok(Value::Text(msg))
+                    }
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
             }
@@ -5362,7 +5372,17 @@ impl Executor {
                     result
                 };
                 match result {
-                    Ok(msg) => Ok(Value::Text(msg)),
+                    Ok(msg) => {
+                        // Append to the Datalog WAL. Startup opens this WAL and
+                        // restores from it, but nothing ever wrote to it, so the
+                        // model looked durable in review, its direct WAL tests
+                        // passed, and every fact asserted through SQL vanished on
+                        // restart. Failing the statement is the point: a silent
+                        // append failure is the same defect one layer down.
+                        // (NU-013)
+                        self.log_datalog(|wal| wal.log_rule(&input))?;
+                        Ok(Value::Text(msg))
+                    }
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
             }
@@ -5396,7 +5416,17 @@ impl Executor {
                     result
                 };
                 match result {
-                    Ok(msg) => Ok(Value::Text(msg)),
+                    Ok(msg) => {
+                        // Append to the Datalog WAL. Startup opens this WAL and
+                        // restores from it, but nothing ever wrote to it, so the
+                        // model looked durable in review, its direct WAL tests
+                        // passed, and every fact asserted through SQL vanished on
+                        // restart. Failing the statement is the point: a silent
+                        // append failure is the same defect one layer down.
+                        // (NU-013)
+                        self.log_datalog(|wal| wal.log_retract(&input))?;
+                        Ok(Value::Text(msg))
+                    }
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
             }
@@ -5418,7 +5448,17 @@ impl Executor {
                     result
                 };
                 match result {
-                    Ok(msg) => Ok(Value::Text(msg)),
+                    Ok(msg) => {
+                        // Append to the Datalog WAL. Startup opens this WAL and
+                        // restores from it, but nothing ever wrote to it, so the
+                        // model looked durable in review, its direct WAL tests
+                        // passed, and every fact asserted through SQL vanished on
+                        // restart. Failing the statement is the point: a silent
+                        // append failure is the same defect one layer down.
+                        // (NU-013)
+                        self.log_datalog(|wal| wal.log_clear(&pred))?;
+                        Ok(Value::Text(msg))
+                    }
                     Err(e) => Err(ExecError::Unsupported(e)),
                 }
             }

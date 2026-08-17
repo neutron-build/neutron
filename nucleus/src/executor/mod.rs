@@ -3917,6 +3917,29 @@ impl Executor {
         removed
     }
 
+    /// Append one Datalog mutation to the Datalog WAL, if the database is
+    /// durable at all.
+    ///
+    /// `None` is the in-memory configuration and is not a failure. An append
+    /// that FAILS is: the store has already been mutated, so returning success
+    /// would leave a change that no restart can reproduce — which is exactly
+    /// the state NU-013 shipped, one level up, by never appending at all.
+    #[allow(dead_code)]
+    pub(crate) fn log_datalog<F>(&self, f: F) -> Result<(), ExecError>
+    where
+        F: FnOnce(&crate::datalog::DatalogWal) -> std::io::Result<()>,
+    {
+        let Some(ref wal) = self.datalog_wal else {
+            return Ok(());
+        };
+        f(wal).map_err(|e| {
+            ExecError::Runtime(format!(
+                "datalog mutation applied in memory but its WAL append failed ({e}); \
+                 it would not survive a restart"
+            ))
+        })
+    }
+
     /// Get a reference to the datalog store.
     pub fn datalog_store(&self) -> &parking_lot::RwLock<crate::datalog::DatalogStore> {
         &self.datalog_store

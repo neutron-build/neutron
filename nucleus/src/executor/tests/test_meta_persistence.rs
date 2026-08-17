@@ -503,3 +503,48 @@ async fn nextval_refuses_a_value_it_cannot_make_durable() {
         "the failed value must be burned, not reused: got {next} after {first}"
     );
 }
+
+// ======================================================================
+// NU-013: the Datalog WAL was opened, replayed, and never written
+//
+// Startup opens `DatalogWal`, restores state from it, and stores the handle —
+// and nothing ever appended to it. `log_assert` / `log_rule` / `log_retract` /
+// `log_clear` had no callers outside the datalog module's own tests, so the
+// implementation reads as durable, its direct WAL tests pass, and every fact
+// asserted through SQL disappears on restart.
+// ======================================================================
+
+#[tokio::test]
+async fn datalog_facts_and_rules_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "SELECT DATALOG_ASSERT('edge(a,b)')").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('edge(b,c)')").await;
+        exec(&ex, "SELECT DATALOG_RULE('path(X,Y) :- edge(X,Y)')").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('doomed(x)')").await;
+        exec(&ex, "SELECT DATALOG_RETRACT('doomed(x)')").await;
+        let before = scalar(&exec(&ex, "SELECT DATALOG_QUERY('path(X,Y)')").await[0]).to_string();
+        assert!(
+            before.contains('a'),
+            "fixture did not derive a path: {before}"
+        );
+    }
+
+    let ex = open_executor(dir.path()).await;
+    let facts = scalar(&exec(&ex, "SELECT DATALOG_QUERY('edge(X,Y)')").await[0]).to_string();
+    assert!(
+        facts.contains('a') && facts.contains('c'),
+        "asserted facts did not survive restart: {facts}"
+    );
+    let derived = scalar(&exec(&ex, "SELECT DATALOG_QUERY('path(X,Y)')").await[0]).to_string();
+    assert!(
+        derived.contains('a'),
+        "the rule did not survive restart, so nothing derives: {derived}"
+    );
+    let retracted = scalar(&exec(&ex, "SELECT DATALOG_QUERY('doomed(X)')").await[0]).to_string();
+    assert!(
+        !retracted.contains('x'),
+        "a retracted fact came back after restart: {retracted}"
+    );
+}
