@@ -23,6 +23,15 @@
 //!   cargo run --release --features "server rusqlite" --bin fuzz -- --seed 42 --iterations 5000
 //!   cargo run --release --features "server rusqlite" --bin fuzz -- --engine buffered-disk
 //!   cargo run --release --features "server rusqlite" --bin fuzz -- --stream
+//!   cargo run --release --features "server rusqlite" --bin fuzz -- --table-engine columnar
+//!
+//! `--table-engine` puts the generated table on a per-table analytics engine
+//! (`columnar`, `mergetree`, `lsm`) instead of the default row heap. This is a
+//! different axis from `--engine`, which selects the STORAGE engine underneath:
+//! before it existed, the primary find-anything harness only ever built heap
+//! tables, so columnar and mergetree execution — genuinely separate scan,
+//! pruning and aggregate paths — had no external oracle at all, only
+//! Nucleus-vs-Nucleus cross-checks in `probe_engines`.
 //!
 //! `--stream` sets `stream_results = on` for every candidate, so the oracle
 //! compares the STREAMING executor against SQLite instead of the materialized
@@ -639,8 +648,31 @@ fn run_nucleus(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
     }
 }
 
+/// Route the CREATE TABLE onto a per-table analytics engine, Nucleus side only.
+///
+/// The oracle's op-log has to stay SQLite-executable — it is replayed on both
+/// sides during shrinking — so the engine clause is applied here, at the single
+/// point every Nucleus statement passes through, rather than baked into the
+/// generated SQL. `mergetree` additionally needs a declared sort key; `id` is
+/// the one column guaranteed to exist and to be NOT NULL.
+fn to_nucleus_sql(sql: &str) -> std::borrow::Cow<'_, str> {
+    let Some(engine) = TABLE_ENGINE.get() else {
+        return std::borrow::Cow::Borrowed(sql);
+    };
+    if !sql.starts_with("CREATE TABLE t (") {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    let suffix = if engine == "mergetree" {
+        " WITH (engine='mergetree') ORDER BY (id)".to_string()
+    } else {
+        format!(" WITH (engine='{engine}')")
+    };
+    std::borrow::Cow::Owned(format!("{sql}{suffix}"))
+}
+
 /// Run a non-SELECT (DML/DDL) on Nucleus. `Ok(())` on any success.
 fn exec_nucleus(ex: &Executor, sql: &str) -> Result<(), String> {
+    let sql = &*to_nucleus_sql(sql);
     let rt = tokio::runtime::Handle::current();
     let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
         tokio::task::block_in_place(|| rt.block_on(ex.execute(sql)))
@@ -730,6 +762,8 @@ fn dump_inserts(schema: &Schema, rows: &[Vec<String>]) -> String {
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Set by `--stream`; read when each candidate's executor is opened.
 static STREAM_RESULTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by `--table-engine`; applied to the CREATE TABLE on the Nucleus side only.
+static TABLE_ENGINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// Streams actually handed back, summed across every candidate.
 ///
 /// Each candidate gets its own executor and so its own metrics registry, so the
@@ -906,6 +940,20 @@ fn main_impl() {
             }
             "--stream" => {
                 STREAM_RESULTS.store(true, Ordering::Relaxed);
+            }
+            "--table-engine" => {
+                i += 1;
+                let want = args[i].to_ascii_lowercase();
+                if !matches!(want.as_str(), "heap" | "columnar" | "mergetree" | "lsm") {
+                    println!(
+                        "unknown --table-engine {:?}; expected one of: heap, columnar, mergetree, lsm",
+                        args[i]
+                    );
+                    std::process::exit(2);
+                }
+                if want != "heap" {
+                    let _ = TABLE_ENGINE.set(want);
+                }
             }
             "--engine" => {
                 i += 1;

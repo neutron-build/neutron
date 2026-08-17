@@ -1176,3 +1176,67 @@ async fn test_analytics_engines_narrow_columns() {
         }
     }
 }
+
+/// The differential fuzzer's `--table-engine` DDL must actually route.
+///
+/// `fuzz --table-engine columnar` appends `WITH (engine='columnar')` to a
+/// `CREATE TABLE t (id INTEGER PRIMARY KEY, …)`. If that clause were accepted
+/// and discarded — not hypothetical, `CREATE TABLE IF NOT EXISTS` silently
+/// dropped exactly this clause until `cf98287` — the fuzz run would exercise
+/// the row heap while reporting a clean sweep of columnar, which is the same
+/// silent-success shape as the rest of this file.
+///
+/// The discriminator is column materialization, not row pruning. **Row pruning
+/// cannot tell these engines apart on this schema**: the first version of this
+/// test ranged over `id`, and its control caught it immediately — `id` is the
+/// PRIMARY KEY, so the heap serves that range from the PK index and reads 5
+/// rows too. The analytics engines answer an aggregate inside the engine
+/// without materializing the column at all, and the heap cannot.
+#[tokio::test]
+async fn test_fuzzer_table_engine_ddl_actually_routes() {
+    const N: i64 = 1_000;
+
+    async fn seeded(suffix: &str) -> Executor {
+        let ex = test_executor();
+        exec(
+            &ex,
+            &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER, c2 TEXT){suffix}"),
+        )
+        .await;
+        for i in 0..N {
+            exec(
+                &ex,
+                &format!("INSERT INTO t VALUES ({i}, {}, 'v{i}')", i % 7),
+            )
+            .await;
+        }
+        ex
+    }
+
+    let agg = "SELECT AVG(c1) FROM t WHERE c1 >= 0";
+
+    let heap = seeded("").await;
+    heap.clear_all_query_caches();
+    let (heap_values, _) = value_cost(&heap, agg).await;
+    assert!(
+        heap_values > 0,
+        "control: the row heap must materialize the column to aggregate it, \
+         materialized {heap_values} — if this is 0 the discriminator is dead and \
+         the assertions below prove nothing"
+    );
+
+    for suffix in [
+        " WITH (engine='columnar')",
+        " WITH (engine='mergetree') ORDER BY (id)",
+    ] {
+        let ex = seeded(suffix).await;
+        ex.clear_all_query_caches();
+        let (values, _) = value_cost(&ex, agg).await;
+        assert!(
+            values < heap_values,
+            "the fuzzer's DDL `{suffix}` materialized {values} values against the \
+             heap's {heap_values} — the engine clause was accepted and discarded, so \
+             `fuzz --table-engine` would be testing the row heap under another name"
+        );
+    }
+}

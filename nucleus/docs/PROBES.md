@@ -75,6 +75,58 @@ about the production path.
 
 ---
 
+## Oracle coverage per data model
+
+Nucleus ships 14 data models. This is which of them an *external* oracle checks
+for wrong answers, and where none exists, why. Assembled 2026-08-17 by reading
+the binaries rather than the table below, because a probe that exists is not the
+same as a model that is covered.
+
+| Model | Oracle | Where |
+|---|---|---|
+| SQL | SQLite | `fuzz`, `probe_sqlext`, `probe_joins`, `probe_types` |
+| KV | reference impl | `probe_kv`, `probe_kv_coll` |
+| Vector | brute-force f32 | `probe_vector`, `probe_vector_recall` |
+| TimeSeries | reference impl | `probe_tsdoc` |
+| Document | reference impl | `probe_tsdoc` |
+| Graph | reference impl | `probe_graph`, `probe_graph_algo` |
+| FTS | reference impl | `probe_fts`, `probe_fts_rank` |
+| Geo | reference impl | `probe_geo` |
+| Blob | differential + crash | `probe_blob` |
+| Datalog | reference impl | `probe_datalog`, `probe_datalog_rich` |
+| Columnar | SQLite | `fuzz --table-engine columnar` (added 2026-08-17) |
+| **Streams** | **none — structural only** | `probe_streams` asserts shape, not answers |
+| **PubSub** | **none — structural only** | same binary, same limitation |
+| **CDC** | **none — structural only** | same binary, same limitation |
+
+The three gaps are the same three S51 names, and they share a reason rather than
+three: `probe_streams` checks structural properties across Streams/PubSub/CDC/Blob,
+so it finds crashes and self-inconsistency but cannot find a wrong answer. Blob
+is covered because `probe_blob` additionally has a real differential; the other
+three have nothing behind the invariant checks.
+
+### `--table-engine` and what it found immediately
+
+`--engine` selects the STORAGE engine (paged, MVCC, memory). `--table-engine`
+selects the per-table analytics engine — a different axis, and until 2026-08-17
+the primary find-anything harness only ever built default heap tables. So
+columnar and mergetree execution, which tonight's cost tests confirm are
+genuinely separate scan/pruning/aggregate paths, had no external oracle at all.
+
+Pointing SQLite at them found a wrong-answer bug on the first run:
+
+| `--table-engine` | 300 iterations |
+|---|---|
+| heap | 0 divergences |
+| columnar | 0 divergences |
+| lsm | 0 divergences |
+| **mergetree** | **20 divergences** |
+
+Reproduce: `--seed 305419896 --iterations 95 --table-engine mergetree`. Rows come
+back with a trailing column NULL where SQLite has a value. Plain inserts are
+fine — a hand-written minimal case passes — so it needs the mutation sequence,
+which points at part merging rather than the write path. Filed as N30.
+
 ## Differential fuzzers (external oracle)
 
 The oracle is an independent implementation, so a divergence is a real
