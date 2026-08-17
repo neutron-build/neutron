@@ -1093,6 +1093,60 @@ impl Executor {
         }
     }
 
+    /// Rewrite `GROUP BY <n>` to the n-th output column, as PostgreSQL does.
+    ///
+    /// Without this the integer is evaluated as a *constant*, which is the same
+    /// value for every row, so every row lands in one group. That is a silent
+    /// wrong answer whenever the referenced item is an expression
+    /// (`SELECT v IS NULL, count(*) ... GROUP BY 1` returned a single row) and a
+    /// misleading error when it is a column ("column g must appear in the GROUP
+    /// BY clause" — it did appear, by position). `ORDER BY <n>` was already
+    /// handled; `GROUP BY` was not. Found by `compat/pgregress`.
+    ///
+    /// Only a bare integer literal is positional, matching PostgreSQL: `GROUP BY
+    /// 1 + 0` is an expression over a constant, not ordinal 1.
+    pub(super) fn resolve_group_by_ordinals(query: &mut ast::Query) -> Result<(), ExecError> {
+        let SetExpr::Select(select) = &mut *query.body else {
+            return Ok(());
+        };
+        let ast::GroupByExpr::Expressions(exprs, _) = &mut select.group_by else {
+            return Ok(());
+        };
+        if exprs.is_empty() {
+            return Ok(());
+        }
+        // Resolve against a snapshot: a projection item is never itself a
+        // GROUP BY ordinal, so there is no ordering dependency between rewrites.
+        let projection = select.projection.clone();
+        for expr in exprs.iter_mut() {
+            let Expr::Value(v) = &*expr else { continue };
+            let ast::Value::Number(n, _) = &v.value else {
+                continue;
+            };
+            let Ok(pos) = n.parse::<usize>() else {
+                continue;
+            };
+            if pos == 0 || pos > projection.len() {
+                return Err(ExecError::Unsupported(format!(
+                    "GROUP BY position {pos} is not in select list"
+                )));
+            }
+            match &projection[pos - 1] {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    *expr = e.clone();
+                }
+                // `GROUP BY 1` against `SELECT *` has no single expression to
+                // name; PostgreSQL rejects it too, with the same shape.
+                _ => {
+                    return Err(ExecError::Unsupported(format!(
+                        "GROUP BY position {pos} is not in select list"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Extract aggregate function names from projection items.
     /// Returns names like "COUNT(*)", "SUM(amount)", etc.
     pub(super) fn extract_aggregate_names(projection: &[SelectItem]) -> Vec<String> {
@@ -1787,6 +1841,26 @@ impl Executor {
                     if Self::expr_has_unsupported(expr) {
                         return false;
                     }
+                    // The plan path carries aggregates as STRINGS and re-reads
+                    // them with `parse_agg_spec`, which understands only
+                    // `NAME(arg)`. Any other clause inside the call survives
+                    // stringification and is dropped on the way back — silently,
+                    // as a confident wrong answer.
+                    //
+                    // FILTER is the case that fires today: `count(*) FILTER
+                    // (WHERE v = 1)` returned the unfiltered count, and routing
+                    // here fixes it because `aggregate::eval_aggregate_fn`
+                    // honours `func.filter`. The within-aggregate ORDER BY arm
+                    // is DEFENSIVE, not load-bearing — measured by disabling it,
+                    // and `string_agg`/`array_agg` are not plan-supported
+                    // functions today, so they already take the AST path. It is
+                    // here because the hazard is the stringification, not the
+                    // clause: the day one of those becomes plan-supported, its
+                    // ORDER BY would be dropped exactly as FILTER was.
+                    // Found by `compat/pgregress`.
+                    if Self::expr_has_plan_unsafe_aggregate(expr) {
+                        return false;
+                    }
                 }
                 SelectItem::Wildcard(_) => {}
                 // Qualified wildcards like t.* need special handling
@@ -1801,7 +1875,8 @@ impl Executor {
         }
         // No unsupported features in HAVING
         if let Some(ref having_expr) = select.having
-            && Self::expr_has_unsupported(having_expr)
+            && (Self::expr_has_unsupported(having_expr)
+                || Self::expr_has_plan_unsafe_aggregate(having_expr))
         {
             return false;
         }
@@ -1900,6 +1975,35 @@ impl Executor {
     }
 
     /// Check if an expression contains features unsupported by plan execution.
+    /// Does this expression contain an aggregate the plan path cannot
+    /// represent — one carrying `FILTER (WHERE …)` or a within-aggregate
+    /// `ORDER BY` — anywhere inside it?
+    ///
+    /// Both are clauses the plan path drops rather than refuses: it carries
+    /// aggregates as STRINGS and re-reads them with `parse_agg_spec`, which
+    /// understands only `NAME(arg)`. See the call site in
+    /// `query_eligible_for_plan`.
+    pub(super) fn expr_has_plan_unsafe_aggregate(expr: &Expr) -> bool {
+        let mut found = false;
+        let _ = sqlparser::ast::visit_expressions(expr, |e| {
+            if let Expr::Function(func) = e {
+                if func.filter.is_some() {
+                    found = true;
+                }
+                if let ast::FunctionArguments::List(list) = &func.args
+                    && list
+                        .clauses
+                        .iter()
+                        .any(|c| matches!(c, ast::FunctionArgumentClause::OrderBy(_)))
+                {
+                    found = true;
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        found
+    }
+
     pub(super) fn expr_has_unsupported(expr: &Expr) -> bool {
         match expr {
             // Aggregate functions in SELECT/HAVING are supported.
@@ -5324,6 +5428,8 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>,
     > {
         Box::pin(async move {
+            let mut query = query;
+            Self::resolve_group_by_ordinals(&mut query)?;
             let saved_plan_cache_key_hint = plan_cache_key;
             // Every optimization below can bypass ordinary row materialization.
             // Until it consumes secured scans directly, route RLS queries through
@@ -6629,6 +6735,14 @@ impl Executor {
                             Some(ast::DuplicateTreatment::Distinct)
                         )
                     {
+                        return Ok(None);
+                    }
+                    // Same reasoning one clause over, and it had been missed:
+                    // FILTER (WHERE …) restricts which rows feed the aggregate,
+                    // and every fast path below counts or sums a whole column.
+                    // Taking one here returns the UNFILTERED aggregate with no
+                    // error — `count(*) FILTER (WHERE v = 1)` answered 6 of 6.
+                    if func.filter.is_some() {
                         return Ok(None);
                     }
                     // Extract the single column-reference argument, if present

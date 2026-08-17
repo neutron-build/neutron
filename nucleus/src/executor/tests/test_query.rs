@@ -1904,3 +1904,131 @@ async fn test_percentile_and_median() {
             .is_err()
     );
 }
+
+// ======================================================================
+// PostgreSQL aggregate/grouping semantics — three clauses that parsed,
+// were carried as strings, and were then dropped.
+//
+// The plan path represents each aggregate as `format!("{expr}")` and reads it
+// back with `parse_agg_spec`, which understands only `NAME(arg)`. Anything
+// else inside the call — FILTER, a within-aggregate ORDER BY — survived
+// stringification and was discarded on the way back, so the query returned a
+// confident wrong answer. `GROUP BY <n>` was a different shape of the same
+// problem: the ordinal was evaluated as a constant, which is one group.
+// All three were found by `compat/pgregress` on 2026-08-17.
+// ======================================================================
+
+async fn agg_semantics_fixture(ex: &Executor, table: &str) {
+    exec(ex, &format!("CREATE TABLE {table} (g TEXT, v INT, t TEXT)")).await;
+    exec(
+        ex,
+        &format!(
+            "INSERT INTO {table} VALUES ('a',1,'x'),('a',1,'y'),('a',NULL,NULL),\
+             ('b',2,'z'),('b',5,'z'),(NULL,7,'w')"
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn aggregate_filter_clause_restricts_the_rows_it_aggregates() {
+    let ex = test_executor();
+    agg_semantics_fixture(&ex, "aggf").await;
+
+    // Alone: the shape that went through the columnar fast aggregate, which
+    // checked DISTINCT and OVER but never FILTER.
+    let r = exec(&ex, "SELECT count(*) FILTER (WHERE v = 1) FROM aggf").await;
+    assert_eq!(
+        rows(&r[0])[0][0],
+        Value::Int64(2),
+        "unfiltered count returned"
+    );
+
+    // Beside an unfiltered aggregate: both must be computed separately.
+    let r = exec(
+        &ex,
+        "SELECT count(*), count(*) FILTER (WHERE v = 1) FROM aggf",
+    )
+    .await;
+    assert_eq!(rows(&r[0])[0][0], Value::Int64(6));
+    assert_eq!(rows(&r[0])[0][1], Value::Int64(2));
+
+    // A filtered SUM, which took a different fast path than COUNT.
+    let r = exec(&ex, "SELECT sum(v) FILTER (WHERE g = 'b') FROM aggf").await;
+    assert_eq!(rows(&r[0])[0][0], Value::Int64(7));
+
+    // Grouped.
+    let r = exec(
+        &ex,
+        "SELECT g, count(*) FILTER (WHERE v IS NOT NULL) FROM aggf GROUP BY g ORDER BY g",
+    )
+    .await;
+    let got = rows(&r[0]);
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0][1], Value::Int64(2), "group 'a' has one NULL v");
+}
+
+#[tokio::test]
+async fn within_aggregate_order_by_fixes_the_order() {
+    let ex = test_executor();
+    agg_semantics_fixture(&ex, "aggo").await;
+
+    // Scan order here is x,y,z,z,w — so an ignored ORDER BY is visible as the
+    // insertion order rather than as a plausible-looking sort.
+    let r = exec(&ex, "SELECT string_agg(t, ',' ORDER BY t) FROM aggo").await;
+    assert_eq!(rows(&r[0])[0][0], Value::Text("w,x,y,z,z".into()));
+
+    let r = exec(&ex, "SELECT string_agg(t, ',' ORDER BY t DESC) FROM aggo").await;
+    assert_eq!(rows(&r[0])[0][0], Value::Text("z,z,y,x,w".into()));
+
+    // DISTINCT and ORDER BY together.
+    let r = exec(
+        &ex,
+        "SELECT string_agg(DISTINCT t, ',' ORDER BY t) FROM aggo",
+    )
+    .await;
+    assert_eq!(rows(&r[0])[0][0], Value::Text("w,x,y,z".into()));
+
+    // Ordering by a column that is not the aggregated one.
+    let r = exec(&ex, "SELECT string_agg(t, ',' ORDER BY v) FROM aggo").await;
+    assert_eq!(rows(&r[0])[0][0], Value::Text("x,y,z,z,w".into()));
+}
+
+#[tokio::test]
+async fn group_by_ordinal_names_the_output_column() {
+    let ex = test_executor();
+    agg_semantics_fixture(&ex, "aggg").await;
+
+    // The dangerous case: grouping by an EXPRESSION via its ordinal. Treating
+    // the literal as a constant put all six rows in one group and returned a
+    // single row, with no error.
+    let r = exec(
+        &ex,
+        "SELECT v IS NULL AS isnull, count(*) FROM aggg GROUP BY 1 ORDER BY 1",
+    )
+    .await;
+    let got = rows(&r[0]);
+    assert_eq!(got.len(), 2, "expression ordinal collapsed into one group");
+    assert_eq!(got[0][1], Value::Int64(5));
+    assert_eq!(got[1][1], Value::Int64(1));
+
+    // The loud case: grouping by a COLUMN via its ordinal errored with
+    // "column g must appear in the GROUP BY clause" — it did, by position.
+    let r = exec(&ex, "SELECT g, count(*) FROM aggg GROUP BY 1 ORDER BY 1").await;
+    assert_eq!(rows(&r[0]).len(), 3);
+
+    // Out of range is an error, with PostgreSQL's wording.
+    let err = ex
+        .execute("SELECT g, count(*) FROM aggg GROUP BY 99")
+        .await
+        .expect_err("ordinal past the select list must be rejected");
+    assert!(
+        format!("{err}").contains("GROUP BY position 99"),
+        "unexpected error: {err}"
+    );
+
+    // A non-ordinal constant expression is NOT positional, matching PostgreSQL.
+    // `GROUP BY 1 + 0` groups by a constant, i.e. one group.
+    let r = exec(&ex, "SELECT count(*) FROM aggg GROUP BY 1 + 0").await;
+    assert_eq!(rows(&r[0]).len(), 1);
+}

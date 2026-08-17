@@ -945,6 +945,90 @@ impl Executor {
             _ => false,
         };
 
+        // Within-aggregate ORDER BY: `string_agg(t, ',' ORDER BY t)`.
+        //
+        // This is the only thing that fixes the ORDER of an order-sensitive
+        // aggregate — without it `string_agg`/`array_agg` concatenate in scan
+        // order, which is arbitrary and was silently wrong rather than
+        // unsupported: the clause parsed, and the result came back in table
+        // order. Found by `compat/pgregress`. Applied before FILTER only in
+        // the sense that the sort is computed here and the filter narrows the
+        // same index list below; both compose because sorting preserves
+        // membership.
+        let agg_order_by: &[ast::OrderByExpr] = match &func.args {
+            ast::FunctionArguments::List(list) => list
+                .clauses
+                .iter()
+                .find_map(|c| match c {
+                    ast::FunctionArgumentClause::OrderBy(obs) => Some(obs.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&[]),
+            _ => &[],
+        };
+        let ordered_indices: Vec<usize>;
+        let indices: &[usize] = if agg_order_by.is_empty() {
+            indices
+        } else {
+            let mut sorted = indices.to_vec();
+            let mut err: Option<ExecError> = None;
+            sorted.sort_by(|&a, &b| {
+                if err.is_some() {
+                    return std::cmp::Ordering::Equal;
+                }
+                for ob in agg_order_by {
+                    let asc = ob.options.asc.unwrap_or(true);
+                    // PostgreSQL's default: NULLs last for ASC, first for DESC.
+                    let nulls_first = ob.options.nulls_first.unwrap_or(!asc);
+                    let va = match self.eval_row_expr(&ob.expr, &all_rows[a], col_meta) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            err = Some(e);
+                            return std::cmp::Ordering::Equal;
+                        }
+                    };
+                    let vb = match self.eval_row_expr(&ob.expr, &all_rows[b], col_meta) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            err = Some(e);
+                            return std::cmp::Ordering::Equal;
+                        }
+                    };
+                    let ord = match (&va, &vb) {
+                        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                        (Value::Null, _) => {
+                            if nulls_first {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            }
+                        }
+                        (_, Value::Null) => {
+                            if nulls_first {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            }
+                        }
+                        _ => {
+                            let base = super::helpers::compare_values(&va, &vb)
+                                .unwrap_or(std::cmp::Ordering::Equal);
+                            if asc { base } else { base.reverse() }
+                        }
+                    };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+            ordered_indices = sorted;
+            &ordered_indices
+        };
+
         // Apply FILTER clause if present — only aggregate over matching indices
         let filtered_indices: Vec<usize>;
         let effective_indices: &[usize] = if let Some(ref filter_expr) = func.filter {

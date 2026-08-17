@@ -14,13 +14,21 @@ Requires `postgres`/`initdb`/`pg_ctl` on PATH (Homebrew `postgresql@17`) and
 `node` (free-port picker). PostgreSQL is booted with `--locale=C` so text sort
 order is byte-order on both sides.
 
-## Status: 12/12 core scripts pass (2026-07-23)
+## Status: 15/15 core scripts pass (2026-08-17)
+
+Runs in CI on every push touching `nucleus/` — `.github/workflows/pgregress.yml`.
+It did not until 2026-08-17, and the line above used to read "12/12 (2026-07-23)":
+a pass count from three weeks earlier, presented as current status, for a
+harness that only ran when somebody remembered to run it.
 
 Coverage: integer/float/numeric/text/datetime types, NULL three-valued logic,
 joins (inner/left/right/full/self/anti/semi), aggregates + GROUP BY + HAVING,
 scalar/correlated/quantified subqueries, CTEs (incl. recursive) + set ops,
 window functions, constraints + transactions, DML edges (ON CONFLICT,
-DISTINCT ON, RETURNING, LIMIT/OFFSET).
+DISTINCT ON, RETURNING, LIMIT/OFFSET), ORDER BY/NULLS/LIMIT forms
+(`ordering_limit`), three-valued boolean and conditional expressions
+(`bool_compare`), and aggregate corners — DISTINCT, FILTER, within-aggregate
+ORDER BY, bool_and/bool_or, string_agg (`agg_extras`).
 
 ## What normalization hides (and doesn't)
 
@@ -38,6 +46,27 @@ Genuine behavioral differences (documented, not bugs) live in `DEVIATIONS.md`
 and their statements in `known_deviations.sql` (run manually, not gated):
 SMALLINT range, decimal-literal typing, NUMERIC 96-bit ceiling, window-over-
 aggregate, C-only collation.
+
+## Bugs the three new scripts found and fixed (2026-08-17)
+
+Three axes added, three wrong-answer bugs on their first run — all of them the
+same shape, and all of them silent:
+
+- **Aggregate `FILTER (WHERE …)` was parsed and dropped.** `count(*) FILTER
+  (WHERE v = 1)` returned the unfiltered count. Two independent paths did it:
+  the columnar fast aggregate checked DISTINCT and OVER but never FILTER, and
+  the plan path carries aggregates as STRINGS and re-reads them with
+  `parse_agg_spec`, which understands only `NAME(arg)`.
+- **Within-aggregate `ORDER BY` was parsed and dropped.** `string_agg(t, ','
+  ORDER BY t)` concatenated in scan order.
+- **`GROUP BY <n>` was evaluated as a constant**, so every row landed in one
+  group — a silent single-row answer when the item is an expression, and a
+  misleading "column must appear in the GROUP BY clause" when it is a column.
+
+The through-line is worth keeping: a clause that carries a *guarantee* was
+accepted and discarded. That is the same bug class as `FOR UPDATE SKIP LOCKED`
+being parsed and never read, and it is invisible to any test that checks only
+that the query succeeds.
 
 ## Bugs this harness found and fixed (2026-07-23)
 

@@ -77,3 +77,12 @@ exactly (12/12 core scripts pass).
 - `SET statement_timeout = N` now follows PostgreSQL: a bare `N` is
   **milliseconds** (with `ms`/`s`/`min`/`h` suffixes accepted). Earlier
   Nucleus builds read it as seconds.
+
+## Predicates
+
+- **`BETWEEN SYMMETRIC` is not parsed.** PostgreSQL accepts `x BETWEEN
+  SYMMETRIC a AND b`, which swaps the bounds when `a > b`; Nucleus fails at
+  parse time (`Expected: AND, found: …`). The failure is loud, immediate and
+  at parse time — no query silently returns the wrong rows — and the plain
+  `BETWEEN` / `NOT BETWEEN` forms match PostgreSQL exactly, including their
+  NULL behaviour. Added 2026-08-17 by `sql/bool_compare.sql`.

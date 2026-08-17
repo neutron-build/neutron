@@ -1,0 +1,81 @@
+name: PostgreSQL Differential
+
+# Runs `nucleus/compat/pgregress`: a curated SQL corpus executed through the
+# SAME psql client against a real PostgreSQL 17 and a release Nucleus, with the
+# outputs normalized and diffed. A script passes only when the two agree.
+#
+# It is here because it was not. The harness found roughly 35 real correctness
+# defects when it was written (2026-07-23) and then ran only when somebody
+# remembered to, which for this repo is the documented way a gate stops being
+# one — its own README recorded a pass count from three weeks earlier as
+# current status. Its first CI run found four more: a silently ignored
+# aggregate FILTER, a silently ignored within-aggregate ORDER BY, `GROUP BY <n>`
+# grouping every row into one bucket, and unparsed `BETWEEN SYMMETRIC`.
+#
+# PostgreSQL is installed from PGDG rather than using the runner's preinstalled
+# server: the corpus is diffed against 17 specifically, and a different minor
+# family changes enough output detail (error wording, numeric display) to make
+# a deviation ambiguous — which is the one thing a differential harness may not
+# be.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/pgregress.yml"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/pgregress.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: 1
+
+jobs:
+  pgregress:
+    name: Nucleus vs PostgreSQL 17
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: Install PostgreSQL 17
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Confirm the server under test is really 17
+        run: |
+          set -euo pipefail
+          # R8: an unpinned `postgres` on PATH is how this would silently diff
+          # against the runner's preinstalled 16 and report deviations that are
+          # version differences. Assert before running anything.
+          which initdb pg_ctl psql
+          initdb --version
+          initdb --version | grep -q ' 17\.' || {
+            echo "expected PostgreSQL 17 on PATH, got: $(initdb --version)"; exit 1; }
+
+      - name: Run the differential corpus
+        run: sh run.sh
+        working-directory: nucleus/compat/pgregress
+
+      - name: Upload deviation diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgregress-diffs-${{ github.run_id }}
+          path: nucleus/compat/pgregress/last_*.diff
+          if-no-files-found: ignore
+          retention-days: 30

@@ -12,3 +12,4 @@ CREATE TABLE dw (grp TEXT, v INT);
 INSERT INTO dw VALUES ('a', 50), ('b', 5);
 SELECT grp, SUM(v) AS s, rank() OVER (ORDER BY SUM(v) DESC NULLS LAST) FROM dw GROUP BY grp ORDER BY grp;  -- window over aggregate: unsupported
 DROP TABLE dw;
+SELECT 5 BETWEEN SYMMETRIC 10 AND 1;          -- BETWEEN SYMMETRIC: parse error, the parser has no such form
