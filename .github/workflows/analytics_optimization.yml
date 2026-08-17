@@ -1,6 +1,14 @@
 name: Analytics Optimizations
 
+# `workflow_dispatch` is not optional on a path-filtered workflow. This one went
+# red on a commit that touched `executor/mod.rs`, was fixed by the very next
+# commit, and then had no way to be re-run — the fix touched only docs, which
+# its filter excludes, so it would have sat red on main until something happened
+# to edit one of six specific files. That is the same mechanism that hid five
+# red workflows for three months (ORCHESTRATION §5a); the check being correct
+# does not help if it cannot be re-run on demand.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
