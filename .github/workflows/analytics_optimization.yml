@@ -68,11 +68,34 @@ jobs:
         run: cargo bench --bench phase4_bench -- --verbose
         working-directory: nucleus
 
-      - name: Alert if performance regresses
-        if: failure()
-        uses: actions/github-script@v7
+      # The benchmark has run on every qualifying push for months and has never
+      # been compared against its own past: criterion writes estimates under
+      # target/criterion, and the runner is reclaimed with them still on it. So
+      # collect them into one file and keep it.
+      #
+      # This deliberately does NOT gate yet. Arming a wall-clock threshold before
+      # measuring the noise is a guess, and on shared runners the noise dominates
+      # — arming the TypeScript gate turned up at least two GitHub performance
+      # classes, worth 40% on I/O-bound work, and its old 20% threshold would
+      # have fired on three of eight green runs. The equivalent number for these
+      # benchmarks is simply unknown, because nothing has ever recorded it.
+      #
+      # Once five or more of these artifacts exist, derive the per-benchmark
+      # noise floor and arm from it. typescript/benchmarks/scripts/
+      # measure-gate-noise.mjs is the worked example of that method.
+      - name: Collect benchmark estimates
+        if: always()
+        run: sh scripts/collect-bench-estimates.sh bench-estimates.json
+        working-directory: nucleus
+
+      - name: Upload benchmark estimates
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          script: core.setFailed('Analytics optimization tests failed')
+          name: nucleus-bench-estimates-${{ github.run_id }}
+          path: nucleus/bench-estimates.json
+          if-no-files-found: warn
+          retention-days: 90
 
   clippy:
     name: Clippy (Analytics)

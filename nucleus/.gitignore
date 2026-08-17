@@ -13,3 +13,4 @@
 
 # Scratch repro SQL (padded-row workloads etc.) — never commit
 ins*.sql
+bench-estimates.json
