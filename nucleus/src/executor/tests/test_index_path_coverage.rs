@@ -1240,3 +1240,93 @@ async fn test_fuzzer_table_engine_ddl_actually_routes() {
         );
     }
 }
+
+// ============================================================================
+// CHARACTERIZATION — this pins a DATA-LOSS BUG (N30). It is not correct
+// behaviour and it is not a design trade-off.
+// ============================================================================
+
+/// **`engine='mergetree'` loses a written column value on UPDATE.** N30.
+///
+/// An `UPDATE` that matches neither row still blanks `c5` on rows 15 and 16.
+/// The same sequence on the row heap keeps both values, and SQLite agrees with
+/// the heap. Found by `fuzz --table-engine mergetree` (seed 305419896), which
+/// was the first differential run ever aimed at a per-table analytics engine:
+/// 20 divergences in 300 iterations, against 0 for heap, columnar and lsm.
+///
+/// Bisected, so the next person does not have to:
+///   * removing the UPDATE       -> correct, so the UPDATE is the corrupting step
+///   * removing the DELETE       -> still wrong, so tombstones are irrelevant
+///   * removing the 12-row seed  -> correct
+///   * removing two single-row inserts -> correct
+/// It needs several parts and then a rewrite, which points at the merge path
+/// rather than at UPDATE itself. `ENGINE_PERFORMANCE_PROGRAM.md` §7 is the
+/// reading: batches name columns POSITIONALLY, and its own note warns that a
+/// merge "silently drops every column the first time an old part merges with a
+/// new one".
+///
+/// **This matters beyond the fuzzer**: production registers `audit_events` as
+/// mergetree, and §4 of that document recommends mergetree for time-ordered
+/// analytics.
+///
+/// **Delete this test when N30 is fixed.** It asserts the bug, so it must fail.
+#[tokio::test]
+async fn test_mergetree_update_still_blanks_an_untouched_column() {
+    let seed = "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES \
+        (1,20,'str1','blue','str3',-1),(2,8,'str2','green','red',13),\
+        (3,14,'str1','str1','str0',NULL),(4,16,'red','green','green',10),\
+        (5,1,'str2','str3',NULL,17),(6,10,'str0','str2','red',8),\
+        (7,16,'str1','str0',NULL,20),(8,10,'str1','red','blue',6),\
+        (9,-5,'str0','str2','str1',-1),(10,0,'str1',NULL,NULL,-2),\
+        (11,5,'amber','str1',NULL,3),(12,-2,'red','amber',NULL,5)";
+    // Matches only the two `amber` rows — never 15 or 16.
+    let update = "UPDATE t SET c1 = 11 WHERE (c2 > 'str3' OR NOT (c2 >= 'blue'))";
+
+    async fn run(engine: &str, seed: &str, update: &str) -> Vec<Option<i64>> {
+        let ex = test_executor();
+        exec(
+            &ex,
+            &format!(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL, c2 TEXT NOT NULL, \
+                 c3 TEXT, c4 TEXT, c5 INTEGER){engine}"
+            ),
+        )
+        .await;
+        for m in [
+            seed,
+            "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES (13,0,'str2','str1',NULL,NULL)",
+            "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES (14,9,'amber','str1','str2',NULL)",
+            "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES (15,-1,'green',NULL,'red',1)",
+            "INSERT INTO t (id,c1,c2,c3,c4,c5) VALUES (16,17,'blue','str3',NULL,2)",
+            update,
+        ] {
+            exec(&ex, m).await;
+        }
+        ex.clear_all_query_caches();
+        let r = exec(&ex, "SELECT id, c5 FROM t WHERE id IN (15,16) ORDER BY id").await;
+        rows(&r[0])
+            .iter()
+            .map(|row| match row[1] {
+                Value::Int32(n) => Some(i64::from(n)),
+                Value::Int64(n) => Some(n),
+                Value::Null => None,
+                ref o => panic!("unexpected c5: {o:?}"),
+            })
+            .collect()
+    }
+
+    // The heap is the control AND the correct answer — SQLite agrees with it.
+    assert_eq!(
+        run("", seed, update).await,
+        vec![Some(1), Some(2)],
+        "the row heap must keep both written values; if this fails the fixture \
+         drifted and the assertion below proves nothing"
+    );
+
+    assert_eq!(
+        run(" WITH (engine='mergetree') ORDER BY (id)", seed, update).await,
+        vec![None, None],
+        "N30 appears to be FIXED — mergetree kept the values. Delete this test \
+         and the N30 entry in _internal/OPEN_WORK.md."
+    );
+}
