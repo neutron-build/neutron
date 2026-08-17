@@ -226,6 +226,21 @@ impl TxnState {
 /// the `Executor`.
 pub struct Session {
     pub(super) txn_state: RwLock<TxnState>,
+    /// Mirror of `txn_state.active`, readable without taking the lock.
+    ///
+    /// It exists because the wire layer must answer "is this session in a
+    /// transaction?" from synchronous code (`sync_transaction_status`, a
+    /// `Drop` impl) while `txn_state` is a *tokio* lock. The old probe used
+    /// `try_read().unwrap_or(false)`, so lock contention was reported as "not
+    /// in a transaction" — and the callers are precisely the guards that
+    /// disable autocommit fast paths inside a transaction. Contention could
+    /// therefore let a concurrent request on the same session bypass the
+    /// snapshot and survive ROLLBACK. (NU-217)
+    ///
+    /// Every write to `txn_state.active` sets this in the same critical
+    /// section; `txn_active_mirrors_state` asserts they agree across BEGIN,
+    /// COMMIT, ROLLBACK and reset.
+    pub(super) txn_active: std::sync::atomic::AtomicBool,
     /// Per-session cross-model write-set for the open transaction (`None`
     /// outside a transaction). Deliberately a `parking_lot` mutex, not part of
     /// the async `txn_state`: every specialty mutation site is synchronous, and
@@ -300,6 +315,7 @@ impl Session {
 
         Self {
             txn_state: RwLock::new(TxnState::new()),
+            txn_active: std::sync::atomic::AtomicBool::new(false),
             cross_model: parking_lot::Mutex::new(None),
             prepared_stmts: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
@@ -349,6 +365,8 @@ impl Session {
         {
             let mut txn = self.txn_state.write().await;
             txn.active = false;
+            self.txn_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             txn.snapshot = None;
             txn.savepoints.clear();
             txn.gin_dirty = false;

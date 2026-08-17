@@ -67,6 +67,9 @@ impl Executor {
         txn.aborted = false;
 
         txn.active = true;
+        // Mirror kept in the same critical section — see `Session::txn_active`.
+        sess.txn_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.metrics.open_transactions.inc();
 
         Ok(ExecResult::Command {
@@ -163,6 +166,8 @@ impl Executor {
         // duplicate itself. Released only after the commit, never before.
         self.release_unique_slots(super::unique_gate::gate_session_id());
         txn.active = false;
+        sess.txn_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         txn.snapshot = None;
         txn.savepoints.clear();
         txn.engine_savepoints.clear();
@@ -230,6 +235,8 @@ impl Executor {
         // exist, so the keys are free.
         self.release_unique_slots(super::unique_gate::gate_session_id());
         txn.active = false;
+        sess.txn_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         txn.snapshot = None;
         txn.savepoints.clear();
         txn.security_snapshot = None;

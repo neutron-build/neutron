@@ -2876,12 +2876,20 @@ impl Executor {
     /// auto-commit writes the transaction must be able to ROLLBACK and break
     /// read-your-own-writes for fast-path reads.
     pub fn session_in_transaction(&self, session_id: u64) -> bool {
+        // A BLOCKING read, deliberately. This was `try_read().unwrap_or(false)`,
+        // which answers "not in a transaction" whenever the state happens to be
+        // write-locked — so a concurrent request on the same session could take
+        // an autocommit fast path *while* an explicit transaction was open,
+        // bypassing the snapshot and surviving ROLLBACK. Contention is not
+        // information about the transaction; converting it into an answer is
+        // how a safety guard silently opens. (NU-217)
+        //
+        // Waiting is safe here: every caller is at a statement boundary and
+        // none holds this lock, and the write side only holds it to flip
+        // BEGIN/COMMIT/ROLLBACK state. Blocking to learn the truth is the
+        // correct trade against guessing the unsafe answer.
         let session = self.get_session(session_id);
-        session
-            .txn_state
-            .try_read()
-            .map(|t| t.active)
-            .unwrap_or(false)
+        session.txn_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a wire session must avoid every transport-level bypass path.
@@ -2892,11 +2900,26 @@ impl Executor {
         if ctx.bypass_rls || ctx.has_role("superuser") {
             return false;
         }
-        if let Ok(txn) = session.txn_state.try_read()
-            && txn.active
-            && let Some(pending) = txn.security_pending.as_ref()
-        {
-            return pending.rls.any_enabled();
+        // Blocking, for the same reason as `session_in_transaction`: under
+        // contention `try_read` fell through to the committed global state and
+        // ignored a transaction's PENDING security changes, so a session that
+        // had just enabled RLS inside its transaction could be reported as
+        // having none — and the guard this feeds disables the fast paths that
+        // bypass RLS. Reporting "no RLS" on contention fails OPEN. (NU-217)
+        if session.txn_active.load(std::sync::atomic::Ordering::SeqCst) {
+            match session.txn_state.try_read() {
+                Ok(txn) => {
+                    if let Some(pending) = txn.security_pending.as_ref() {
+                        return pending.rls.any_enabled();
+                    }
+                }
+                // Contention, inside a transaction whose pending security state
+                // we cannot read. The old code fell through to the committed
+                // global state, which reports "no RLS" for a session that has
+                // just enabled it — and this answer GATES the fast paths that
+                // bypass RLS, so falling through fails OPEN. Assume guarded.
+                Err(_) => return true,
+            }
         }
         self.security.read().rls.any_enabled()
     }

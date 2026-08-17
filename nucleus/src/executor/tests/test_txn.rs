@@ -683,3 +683,87 @@ async fn idle_sweep_skips_executing_session() {
         "transaction must remain open"
     );
 }
+
+// ======================================================================
+// NU-217: lock contention is not information about the transaction
+//
+// `session_in_transaction` used `txn_state.try_read().unwrap_or(false)`, so a
+// write-locked state answered "not in a transaction". Its callers are exactly
+// the guards that disable the wire layer's autocommit fast paths inside a
+// transaction — paths that write straight to storage and survive ROLLBACK — so
+// contention could open the guard on a session that was mid-transaction.
+//
+// It cannot simply take the lock: `txn_state` is a tokio lock and two of the
+// three callers are synchronous (`sync_transaction_status` and a `Drop` impl).
+// The answer is an atomic mirror written in the same critical section.
+// ======================================================================
+
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn in_transaction_probe_is_correct_while_the_state_is_write_locked() {
+    let ex = test_executor();
+    let sid = ex.create_session();
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    assert!(ex.session_in_transaction(sid));
+
+    // Hold the write lock, exactly as a concurrent BEGIN/COMMIT would.
+    let session = ex.get_session(sid);
+    let guard = session.txn_state.write().await;
+    assert!(
+        ex.session_in_transaction(sid),
+        "a write-locked transaction state was reported as no transaction — \
+         the wire layer would take an autocommit fast path inside this txn"
+    );
+    drop(guard);
+
+    ex.execute_with_session(sid, "ROLLBACK").await.unwrap();
+    assert!(!ex.session_in_transaction(sid));
+}
+
+/// The mirror is only safe while it agrees with the state it mirrors. Every
+/// path that ends a transaction is exercised here; a new one that forgets to
+/// update the flag fails this test rather than silently opening the guard.
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn txn_active_mirrors_state() {
+    async fn agrees(ex: &Executor, sid: u64, expect: bool, where_: &str) {
+        let session = ex.get_session(sid);
+        let under_lock = session.txn_state.read().await.active;
+        let mirror = ex.session_in_transaction(sid);
+        assert_eq!(under_lock, expect, "txn_state.active after {where_}");
+        assert_eq!(mirror, expect, "mirror after {where_}");
+    }
+
+    let ex = test_executor();
+    let sid = ex.create_session();
+    ex.execute_with_session(sid, "CREATE TABLE m217 (id INT)")
+        .await
+        .unwrap();
+    agrees(&ex, sid, false, "session creation").await;
+
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    agrees(&ex, sid, true, "BEGIN").await;
+    ex.execute_with_session(sid, "COMMIT").await.unwrap();
+    agrees(&ex, sid, false, "COMMIT").await;
+
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    ex.execute_with_session(sid, "INSERT INTO m217 VALUES (1)")
+        .await
+        .unwrap();
+    ex.execute_with_session(sid, "ROLLBACK").await.unwrap();
+    agrees(&ex, sid, false, "ROLLBACK").await;
+
+    // Session reset (connection reuse) also clears it.
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    agrees(&ex, sid, true, "BEGIN before reset").await;
+    ex.get_session(sid).reset().await;
+    agrees(&ex, sid, false, "Session::reset").await;
+
+    // And the idle-in-transaction sweep, which rolls back from outside.
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    ex.get_session(sid)
+        .last_activity_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(ex.sweep_idle_in_transaction(1).await, 1);
+    agrees(&ex, sid, false, "the idle-in-transaction sweep").await;
+}
