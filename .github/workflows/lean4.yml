@@ -42,8 +42,14 @@ jobs:
       # every proof with `lake build`.
       # `lake build` going green does not by itself mean anything was CHECKED.
       # A workflow that restores a cache and compiles nothing looks identical
-      # to one that verified 68 theorems. The canary hands Lean a proposition
+      # to one that verified 92 theorems. The canary hands Lean a proposition
       # that must not typecheck and fails if it is accepted.
+      #
+      # ci.sh then runs the axiom audit, which answers the other half: a proof
+      # that elaborates can still rest on an axiom, and until 2026-08-17 two of
+      # this suite's headline results rested on axioms that were FALSE. The
+      # audit walks every theorem and fails on any dependency outside a
+      # three-entry allow-list.
       - name: Canary (the checker must reject a false proposition)
         run: bash scripts/canary.sh
         working-directory: lean4

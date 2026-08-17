@@ -37,7 +37,7 @@ opaque sha256 : Block → Block
 axiom sha256_output_len (m : Block) : (sha256 m).length = HASH_SIZE
 
 /-- SHA-256 is deterministic. -/
-axiom sha256_deterministic (m : Block) : sha256 m = sha256 m
+theorem sha256_deterministic (m : Block) : sha256 m = sha256 m := rfl
 
 /-- Pad or hash the key to BLOCK_SIZE. -/
 def prepareKey (key : Block) : Block :=

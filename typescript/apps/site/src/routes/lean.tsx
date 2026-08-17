@@ -6,7 +6,7 @@ import CodeBlock from "../components/CodeBlock";
 export function head() {
   return {
     title: "Lean 4 Proofs - Neutron",
-    description: "Machine-checked Lean 4 proofs of the algorithms behind Nucleus. 26 files, 68 theorems, zero sorry. MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU &mdash; the designs proven correct, not just tested.",
+    description: "Machine-checked Lean 4 proofs of the algorithms behind Nucleus. 26 files, 92 theorems, zero sorry. MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU &mdash; the designs proven correct, not just tested.",
   };
 }
 
@@ -14,7 +14,7 @@ export default function LeanPage() {
   return (
     <ProductPage
       title="Lean 4 Proofs"
-      description="Machine-checked correctness proofs for the algorithms Nucleus is built on. 26 files, 68 theorems, zero uses of sorry. Each proof covers a Lean model of the algorithm &mdash; MVCC, B-tree, WAL, Raft and more &mdash; correct for every input, not just the cases a test happened to try."
+      description="Machine-checked correctness proofs for the algorithms Nucleus is built on. 26 files, 92 theorems, zero uses of sorry. Each proof covers a Lean model of the algorithm &mdash; MVCC, B-tree, WAL, Raft and more &mdash; correct for every input, not just the cases a test happened to try."
       category="tool"
       status="available"
       accent="var(--accent-lean)"
@@ -22,14 +22,14 @@ export default function LeanPage() {
       heroTagline="Don't just test. Prove."
       stats={[
         { value: '26', label: 'Model Files' },
-        { value: '68', label: 'Theorems' },
+        { value: '92', label: 'Theorems' },
         { value: '0', label: 'Uses of sorry' },
-        { value: 'Lean 4', label: 'Prover' },
+        { value: '3', label: 'Axioms' },
       ]}
     >
       <section>
         <h2>The algorithms that can't get this wrong.</h2>
-        <p>Nucleus handles your transactions, replicates your data, and signs your tokens &mdash; tests alone aren't enough for that kind of code. Neutron's Lean 4 suite contains machine-checked proofs of the core algorithms: MVCC snapshot isolation, B-tree invariants, write-ahead log durability, Raft safety, HMAC verification, Bloom filter false-positive bounds, LRU eviction correctness, and sliding-window rate limiting. Every proof compiles with zero use of <code>sorry</code> &mdash; against precise Lean models of each algorithm, with a handful of foundational facts (like SHA-256 collision resistance) declared as explicit, auditable axioms.</p>
+        <p>Nucleus handles your transactions, replicates your data, and signs your tokens &mdash; tests alone aren't enough for that kind of code. Neutron's Lean 4 suite contains machine-checked proofs of the core algorithms: MVCC snapshot isolation, B-tree invariants, write-ahead log durability, Raft safety, HMAC verification, Bloom filter false-positive bounds, LRU eviction correctness, and sliding-window rate limiting. Every proof compiles with zero use of <code>sorry</code> &mdash; against precise Lean models of each algorithm, resting on nothing but Lean&rsquo;s own axioms and three stated assumptions about SHA-256, which no proof can discharge.</p>
       </section>
 
       <CodeBlock filename="proofs/MVCC.lean" annotation="A sample of what's in the suite. The full file proves snapshot isolation.">
@@ -90,7 +90,7 @@ end Nucleus.MVCC`}</code></pre>
 
       <section>
         <h3>What the proofs do not cover</h3>
-        <p>Two limits worth stating plainly, because a proof that is oversold is worse than no proof. First, the models are hand-written Lean, not extracted from the Rust &mdash; so a proof guarantees the <em>design</em> is sound, and keeping the implementation faithful to the design is still ordinary engineering work done by tests and review. Second, 25 declarations in the suite are <code>axiom</code>s rather than derived results. Most are foundational or standard cryptographic assumptions, but a handful in the Bloom filter and LRU models are genuine open obligations &mdash; the property is assumed rather than proven. Discharging those is tracked work, and until it is done the honest statement is "machine-checked modulo explicit, auditable axioms", not "proven".</p>
+        <p>Two limits worth stating plainly, because a proof that is oversold is worse than no proof. First, the models are hand-written Lean, not extracted from the Rust &mdash; so a proof guarantees the <em>design</em> is sound, and keeping the implementation faithful to the design is still ordinary engineering work done by tests and review. Second, 3 declarations in the suite are <code>axiom</code>s rather than derived results, and all three are assumptions about an opaque SHA-256 &mdash; its output length, collision resistance, and HMAC's PRF security &mdash; which no proof can discharge. The structural obligations in the Bloom filter and LRU models were open until August 2026 and are now proven; a script walks every theorem and fails the build if one rests on an axiom outside that list of three.</p>
       </section>
 
       <section>

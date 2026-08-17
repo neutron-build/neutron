@@ -40,15 +40,20 @@ TIERED_FILES=$(find "$SRC" -type f -name 'tiered.rs' | wc -l | tr -d ' ')
 # checked modulo explicit, auditable axioms", and that sentence is only true for
 # as long as somebody knows the number.
 LEAN_DIR="$ROOT/../lean4"
+# `scripts/` holds tooling, not proofs (`AxiomAudit.lean` is the axiom gate);
+# counting it would inflate "N Lean proof files" with a file containing none.
+# Spelled out at each call site on purpose: this script is `#!/bin/sh`, and a
+# shell array would work on macOS (bash in POSIX mode) and fail in CI, where
+# /bin/sh is dash.
 if [ -d "$LEAN_DIR" ]; then
-    LEAN_FILES=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' | wc -l | tr -d ' ')
-    LEAN_THEOREMS=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -exec grep -Ehc \
+    LEAN_FILES=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -not -path '*/scripts/*' | wc -l | tr -d ' ')
+    LEAN_THEOREMS=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -not -path '*/scripts/*' -exec grep -Ehc \
         '^[[:space:]]*(private |protected )*(theorem|lemma) ' {} + 2>/dev/null \
         | awk '{n+=$1} END {print n+0}')
-    LEAN_AXIOMS=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -exec grep -Ehc \
+    LEAN_AXIOMS=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -not -path '*/scripts/*' -exec grep -Ehc \
         '^[[:space:]]*(private |protected )*axiom ' {} + 2>/dev/null \
         | awk '{n+=$1} END {print n+0}')
-    LEAN_SORRY=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -exec grep -Ehc \
+    LEAN_SORRY=$(find "$LEAN_DIR" -type f -name '*.lean' -not -path '*/.lake/*' -not -path '*/scripts/*' -exec grep -Ehc \
         '(^|[^A-Za-z_])sorry([^A-Za-z_]|$)' {} + 2>/dev/null \
         | awk '{n+=$1} END {print n+0}')
 else

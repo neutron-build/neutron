@@ -95,4 +95,4 @@ So the guarantees are **modulo these axioms**. The MVCC, WAL, and Raft models ar
 
 ## Status
 
-All 26 files compile with **0 `sorry`** across **68 theorems**. The proofs cover Lean models of the algorithms listed above; they do not (yet) prove properties of the production Rust directly. The open threads are discharging the remaining structural axioms and moving from hand-written models toward Aeneas-generated ones.
+All 26 files compile with **0 `sorry`** across **92 theorems**, and `scripts/axioms.sh` checks what those proofs rest on: nothing beyond Lean's own axioms and **3 stated assumptions about an opaque SHA-256**. The structural axioms were discharged on 2026-08-17. The proofs cover Lean models of the algorithms listed above; they do not prove properties of the production Rust directly, and that remains the open thread — moving from hand-written models toward Aeneas-generated ones.

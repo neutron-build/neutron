@@ -11,38 +11,39 @@ namespace Nucleus.Crypto
 def shortCircuitEq (a b : Block) : Bool :=
   a == b
 
-/-! ### Bitwise axioms for Nat XOR and OR
+/-! ### Bitwise lemmas for Nat XOR and OR
 
-    These are standard properties of bitwise operations on natural numbers.
-    In Lean 4, `Nat.xor` is defined via `Nat.bitwise bne` and `Nat.or` via
-    `Nat.bitwise or`. The properties below hold at every bit position by the
-    truth tables of XOR and OR, but proving them formally requires unfolding
-    `Nat.bitwise` and doing binary induction, which would need Mathlib's
-    `Nat.bitwise_eq_zero_iff`, `Nat.xor_self`, etc.
+    These were four `axiom`s until 2026-08-17, on the stated grounds that
+    proving them "would need Mathlib's `Nat.bitwise_eq_zero_iff`,
+    `Nat.xor_self`, etc." That is no longer true and had not been for some
+    time: `Nat.xor_self`, `Nat.zero_or`, `Nat.xor_assoc`, `Nat.testBit_or` and
+    `Nat.le_of_testBit` are all in the Lean 4 core library this project already
+    builds against. Each is now a one- or three-line proof.
 
-    We state them as axioms here to keep the proofs self-contained on the Lean
-    core library (no Mathlib dependency). Each axiom is mathematically trivial:
-    - XOR(x, x) = 0 at every bit: b XOR b = false for b ∈ {0, 1}
-    - XOR(x, y) = 0 ⟹ x = y: if all bits match, the numbers are equal
-    - OR(0, x) = x: 0-bits contribute nothing to OR
-    - x ≤ x OR y: OR can only set bits, never clear them
+    The lesson is not about these four lemmas. An axiom justified by "the
+    library does not have it" silently becomes proof debt the moment the
+    library grows it, and nothing re-checks the justification — so the
+    assumption outlives its reason. `scripts/axioms.sh` now fails on any
+    theorem resting on an axiom that is not explicitly allow-listed.
 -/
 
 /-- XOR self-cancellation: `n ^^^ n = 0` for all natural numbers. -/
-axiom nat_xor_self (n : Nat) : n ^^^ n = 0
+theorem nat_xor_self (n : Nat) : n ^^^ n = 0 := Nat.xor_self n
 
-/-- XOR equals zero implies equality: `a ^^^ b = 0 → a = b`.
-    Proof sketch: if every bit of a XOR b is 0, then a and b agree at every
-    bit position, so they are equal as natural numbers. -/
-axiom nat_xor_eq_zero_imp_eq (a b : Nat) : a ^^^ b = 0 → a = b
+/-- XOR equals zero implies equality: every bit of `a ^^^ b` being 0 means `a`
+    and `b` agree at every bit position. -/
+theorem nat_xor_eq_zero_imp_eq (a b : Nat) : a ^^^ b = 0 → a = b := by
+  intro h
+  have := congrArg (· ^^^ b) h
+  simpa [Nat.xor_assoc] using this
 
 /-- OR with zero is identity: `0 ||| n = n`. -/
-axiom nat_zero_or (n : Nat) : 0 ||| n = n
+theorem nat_zero_or (n : Nat) : 0 ||| n = n := Nat.zero_or n
 
-/-- OR is monotone: `a ≤ a ||| b`.
-    Proof sketch: OR can only set bits that are already set in either operand,
-    so the result is at least as large as either input. -/
-axiom nat_le_or (a b : Nat) : a ≤ a ||| b
+/-- OR is monotone: OR can only set bits, never clear them, so every bit set
+    in `a` is still set in `a ||| b`. -/
+theorem nat_le_or (a b : Nat) : a ≤ a ||| b :=
+  Nat.le_of_testBit fun i h => by simp [Nat.testBit_or, h]
 
 /-! ### List-level lemmas built on the bitwise axioms -/
 
