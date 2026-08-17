@@ -1862,3 +1862,135 @@ async fn test_query_memory_limit_wiring() {
     ex.set_query_memory_limit(0);
     assert_eq!(ex.query_memory_limit(), u64::MAX, "0 configures no limit");
 }
+
+// ======================================================================
+// Stream cursors — a millisecond cannot address an entry
+//
+// `STREAM_XADD` returns `<ms>-<seq>`, and until 2026-08-17 `STREAM_XREAD`
+// accepted only the millisecond half. A bare millisecond can only mean
+// "strictly after that whole millisecond", so a consumer that read up to
+// `<ms>-0` and resumed with `<ms>` was never served `<ms>-1`: every entry
+// appended in the millisecond it last read became unreachable, silently.
+// `STREAM_XACK` had already grown the full-id form for the same reason (the
+// two ends of the same API did not compose); there it cost convenience, here
+// it cost entries. Found by `probe_streams_oracle`.
+// ======================================================================
+
+/// Append until two entries share a millisecond, and return that pair.
+///
+/// Appends are sub-microsecond, so consecutive ones collide almost always —
+/// but "almost always" is not a test, and a test that quietly skips when the
+/// condition it needs does not arise is worse than no test. This fails loudly
+/// instead.
+async fn stext(ex: &Executor, sql: &str) -> String {
+    match scalar(&exec(ex, sql).await[0]) {
+        Value::Text(t) => t.clone(),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+async fn same_millisecond_pair(ex: &Executor, stream: &str) -> (String, String) {
+    let mut ids: Vec<String> = Vec::new();
+    for i in 0..200 {
+        ids.push(stext(ex, &format!("SELECT STREAM_XADD('{stream}', 'i', '{i}')")).await);
+        if ids.len() >= 2 {
+            let (a, b) = (&ids[ids.len() - 2], &ids[ids.len() - 1]);
+            let ms = |s: &String| s.split('-').next().unwrap_or_default().to_string();
+            if ms(a) == ms(b) {
+                return (a.clone(), b.clone());
+            }
+        }
+    }
+    panic!(
+        "200 consecutive appends produced no two entries in the same millisecond — either the \
+         clock or the id scheme changed, and this test no longer tests what it claims"
+    );
+}
+
+#[tokio::test]
+async fn xread_from_a_bare_millisecond_skips_the_rest_of_that_millisecond() {
+    // The historical form's meaning is unchanged and is asserted here so the
+    // reason the id form exists stays visible: this is the loss, pinned.
+    let ex = test_executor();
+    let (first, second) = same_millisecond_pair(&ex, "cursor_ms").await;
+    let ms = first.split('-').next().unwrap();
+
+    let served = stext(&ex, &format!("SELECT STREAM_XREAD('cursor_ms', {ms}, 100)")).await;
+    assert!(
+        !served.contains(&format!("\"{second}\"")),
+        "a bare millisecond cursor means 'after that millisecond', so {second} is not served \
+         (got {served})"
+    );
+    assert!(
+        !served.contains(&format!("\"{first}\"")),
+        "nor is {first}, which shares it"
+    );
+}
+
+#[tokio::test]
+async fn xread_from_a_full_id_resumes_exactly_after_that_entry() {
+    let ex = test_executor();
+    let (first, second) = same_millisecond_pair(&ex, "cursor_id").await;
+
+    let served = stext(
+        &ex,
+        &format!("SELECT STREAM_XREAD('cursor_id', '{first}', 100)"),
+    )
+    .await;
+    assert!(
+        served.contains(&format!("\"{second}\"")),
+        "a consumer resuming from {first} must be served {second}, which was appended after it \
+         in the same millisecond (got {served})"
+    );
+    assert!(
+        !served.contains(&format!("\"{first}\"")),
+        "and must not be served {first} again (got {served})"
+    );
+}
+
+#[tokio::test]
+async fn xrange_bounds_accept_a_full_id() {
+    let ex = test_executor();
+    let (first, second) = same_millisecond_pair(&ex, "range_id").await;
+
+    let from_second = stext(
+        &ex,
+        &format!("SELECT STREAM_XRANGE('range_id', '{second}', '{second}', 100)"),
+    )
+    .await;
+    assert!(
+        from_second.contains(&format!("\"{second}\""))
+            && !from_second.contains(&format!("\"{first}\"")),
+        "an id-bounded window must select exactly that entry (got {from_second})"
+    );
+
+    // The bare-millisecond form keeps its meaning: start at 0, end after MAX.
+    let ms = first.split('-').next().unwrap();
+    let whole_ms = stext(
+        &ex,
+        &format!("SELECT STREAM_XRANGE('range_id', {ms}, {ms}, 100)"),
+    )
+    .await;
+    assert!(
+        whole_ms.contains(&format!("\"{first}\"")) && whole_ms.contains(&format!("\"{second}\"")),
+        "a bare millisecond window still covers the whole millisecond (got {whole_ms})"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_stream_cursor_is_refused() {
+    // The failure mode to avoid is a cursor that does not parse being read as
+    // zero: that silently re-delivers the entire stream to a consumer who
+    // asked to resume, which looks like duplication rather than a bad argument.
+    let ex = test_executor();
+    exec(&ex, "SELECT STREAM_XADD('bad_cursor', 'k', 'v')").await;
+    for cursor in ["'12-abc'", "'-4'", "'abc'"] {
+        let r = ex
+            .execute(&format!("SELECT STREAM_XREAD('bad_cursor', {cursor}, 10)"))
+            .await;
+        assert!(
+            r.is_err(),
+            "{cursor} must be refused, not read as position 0"
+        );
+    }
+}

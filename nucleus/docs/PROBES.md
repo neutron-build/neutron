@@ -40,7 +40,17 @@ cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 
 cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 --stream
 cargo run --release --features server --bin probe_engines
 cargo run --release --features server --bin probe_index_coherence
+cargo run --release --features server --bin probe_streams_oracle -- --iterations 120
 ```
+
+**`probe_streams_oracle` carries its own control.** `--negative-control
+<streams|pubsub|cdc>` runs the probe twice at one seed — clean, then with that
+section's model perturbed the way an engine bug would perturb it — and passes
+only if the perturbation adds divergences to that section and none to the other
+two. Run all three after touching the file. The first version of that control
+compared against nothing and declared success on a divergence that was already
+present; two of its three perturbations had in fact never been applied, because
+they were keyed to an op index rather than to an eligible event.
 
 **`cargo fmt --check` is first because it runs first in CI.** It was missing
 from this list while sitting in the release checklist, and on 2026-08-11 it cost
@@ -95,15 +105,33 @@ same as a model that is covered.
 | Blob | differential + crash | `probe_blob` |
 | Datalog | reference impl | `probe_datalog`, `probe_datalog_rich` |
 | Columnar | SQLite | `fuzz --table-engine columnar` (added 2026-08-17) |
-| **Streams** | **none — structural only** | `probe_streams` asserts shape, not answers |
-| **PubSub** | **none — structural only** | same binary, same limitation |
-| **CDC** | **none — structural only** | same binary, same limitation |
+| Streams | reference impl | `probe_streams_oracle` (added 2026-08-17) |
+| PubSub | reference impl | same binary, section 2 |
+| CDC | reference impl | same binary, section 3 |
 
-The three gaps are the same three S51 names, and they share a reason rather than
-three: `probe_streams` checks structural properties across Streams/PubSub/CDC/Blob,
-so it finds crashes and self-inconsistency but cannot find a wrong answer. Blob
-is covered because `probe_blob` additionally has a real differential; the other
-three have nothing behind the invariant checks.
+**All 14 models now have an external oracle.** The last three were closed on
+2026-08-17 by `probe_streams_oracle`; before that they shared one reason rather
+than three — `probe_streams` checks structural properties across
+Streams/PubSub/CDC/Blob, so it finds crashes and self-inconsistency but cannot
+find a wrong answer, and Blob was covered only because `probe_blob`
+additionally has a real differential. Both binaries are kept: structure and
+answers are different questions, and the structural one is far cheaper to run.
+
+### What the streams oracle found immediately
+
+`STREAM_XREAD` took a bare millisecond as its cursor while `STREAM_XADD`
+returns `<ms>-<seq>`. A millisecond cannot address an entry, so a consumer that
+read up to `<ms>-0` and resumed with `<ms>` was served only entries from a
+*later* millisecond — everything else appended in the millisecond it last read
+was unreachable, silently and permanently. It reproduced on **120 of 120**
+iterations, because sub-microsecond appends share a millisecond constantly.
+
+`STREAM_XACK` had already grown a full-id form for the same composition failure
+(the note in `scalar_fns.rs` is explicit that the two ends of the same API did
+not compose); there it cost convenience, here it cost entries. Fixed by
+accepting both forms in `XREAD` and `XRANGE`. The oracle's no-gap check now
+resumes from each entry's id and requires the next one, so a regression is
+caught by the probe that found it.
 
 ### `--table-engine` and what it found immediately
 
@@ -149,6 +177,7 @@ wrong-answer bug rather than a violated assumption. `rusqlite` required.
 | `probe_datalog` | reference | `DATALOG_ASSERT` / `RULE` / `QUERY` / `RETRACT` / `CLEAR`. |
 | `probe_datalog_rich` | reference | Richer Datalog programs. |
 | `probe_tsdoc` | reference | TimeSeries and Document, two sections in one binary. |
+| `probe_streams_oracle` | reference | Streams, PubSub and CDC, three sections in one binary — full result comparison, not shape. Carries `--negative-control`. |
 | `probe_engines` | Nucleus vs Nucleus | Identical SQL on two storage engines — oracle-free but cross-checked. |
 | `probe_recover_engines` | round-trip | Persistence/recovery for durable engines other than durable-MVCC. |
 

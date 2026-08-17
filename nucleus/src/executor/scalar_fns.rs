@@ -3773,20 +3773,19 @@ impl Executor {
                 Ok(Value::Int64(len as i64))
             }
             "STREAM_XRANGE" => {
-                // stream_xrange(stream, start_ms, end_ms, count) → entries as text
+                // stream_xrange(stream, start, end, count) → entries as text
+                // Bounds are a bare millisecond or a full "<ms>-<seq>" id.
                 require_args(fname, &args, 4)?;
                 let stream_name = match &args[0] {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let start_ms = val_to_u64(&args[1], "STREAM_XRANGE start")?;
-                let end_ms = val_to_u64(&args[2], "STREAM_XRANGE end")?;
+                let start_id = stream_cursor_arg(&args[1], 0, "STREAM_XRANGE start")?;
+                let end_id = stream_cursor_arg(&args[2], u64::MAX, "STREAM_XRANGE end")?;
                 let count = val_to_u64(&args[3], "STREAM_XRANGE count")? as usize;
                 let streams = self.streams.read();
                 match streams.get(&stream_name) {
                     Some(stream) => {
-                        let start_id = crate::pubsub::StreamEntryId::new(start_ms, 0);
-                        let end_id = crate::pubsub::StreamEntryId::new(end_ms, u64::MAX);
                         let entries = stream.xrange(&start_id, &end_id, Some(count));
                         Ok(Value::Text(stream_entries_to_json(&entries)))
                     }
@@ -3794,18 +3793,26 @@ impl Executor {
                 }
             }
             "STREAM_XREAD" => {
-                // stream_xread(stream, last_id_ms, count) → entries as text
+                // stream_xread(stream, last_id, count) → entries as text
+                //
+                // `last_id` is a bare millisecond or the full "<ms>-<seq>" id
+                // STREAM_XADD returns — the same composition fix STREAM_XACK
+                // carries below, and here it is not a convenience. A bare
+                // millisecond can only mean "strictly after that millisecond",
+                // so a consumer that read up to `<ms>-0` and polls again with
+                // `<ms>` is never served `<ms>-1`: entries appended in the
+                // millisecond it last read are unreachable, silently, forever.
+                // Found by `probe_streams_oracle`.
                 require_args(fname, &args, 3)?;
                 let stream_name = match &args[0] {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let last_id_ms = val_to_u64(&args[1], "STREAM_XREAD last_id")?;
+                let last_id = stream_cursor_arg(&args[1], u64::MAX, "STREAM_XREAD last_id")?;
                 let count = val_to_u64(&args[2], "STREAM_XREAD count")? as usize;
                 let streams = self.streams.read();
                 match streams.get(&stream_name) {
                     Some(stream) => {
-                        let last_id = crate::pubsub::StreamEntryId::new(last_id_ms, u64::MAX);
                         let entries = stream.xread(&last_id, count);
                         Ok(Value::Text(stream_entries_to_json(&entries)))
                     }
@@ -6254,6 +6261,42 @@ impl Executor {
 /// the previous ad-hoc `id:k=v;k=v,...` text broke every one of them the
 /// moment a field value contained `,`, `;`, or `=` — unparseable by
 /// construction for JSON payloads.
+/// Parse a stream position argument: either a bare millisecond (the historical
+/// BIGINT form) or the full `"<ms>-<seq>"` id `STREAM_XADD` returns.
+///
+/// `default_seq` is what a bare millisecond means at this call site — the
+/// sequence to fill in when the caller only named a millisecond. `XREAD`'s
+/// cursor and `XRANGE`'s end bound take `u64::MAX` (after / through the whole
+/// millisecond); `XRANGE`'s start bound takes 0 (from its beginning).
+///
+/// The two forms are not interchangeable and that is the point: a millisecond
+/// cannot address an entry, so a caller resuming from one either re-reads or
+/// skips whatever else landed in it. Accepting the id the API itself hands out
+/// is what makes resuming exact.
+fn stream_cursor_arg(
+    v: &Value,
+    default_seq: u64,
+    context: &str,
+) -> Result<crate::pubsub::StreamEntryId, ExecError> {
+    if let Value::Text(t) = v
+        && let Some((ms, seq)) = t.trim().split_once('-')
+    {
+        let ms = ms
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ExecError::Unsupported(format!("{context}: {t:?} is not <ms>-<seq>")))?;
+        let seq = seq
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ExecError::Unsupported(format!("{context}: {t:?} is not <ms>-<seq>")))?;
+        return Ok(crate::pubsub::StreamEntryId::new(ms, seq));
+    }
+    Ok(crate::pubsub::StreamEntryId::new(
+        val_to_u64(v, context)?,
+        default_seq,
+    ))
+}
+
 fn stream_entries_to_json(entries: &[&crate::pubsub::StreamEntry]) -> String {
     let items: Vec<serde_json::Value> = entries
         .iter()

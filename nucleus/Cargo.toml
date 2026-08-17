@@ -349,6 +349,11 @@ path = "src/bin/probe_streams.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "probe_streams_oracle"
+path = "src/bin/probe_streams_oracle.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "probe_tsdoc"
 path = "src/bin/probe_tsdoc.rs"
 required-features = ["server"]

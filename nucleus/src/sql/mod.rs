@@ -892,9 +892,22 @@ mod tests {
     use proptest::prelude::*;
 
     /// Strategy for valid SQL identifiers: starts with a lowercase letter,
-    /// followed by 0..20 lowercase alphanumeric or underscore characters.
+    /// followed by 0..20 lowercase alphanumeric or underscore characters, and
+    /// is not a reserved word.
+    ///
+    /// The keyword filter is not decoration. Without it this generator produced
+    /// `SELECT top FROM a`, which is not valid SQL in this dialect (`TOP` takes
+    /// a count) — so the property failed on a query the parser is *right* to
+    /// reject, and every one of the five round-trip properties below could fail
+    /// the same way on any run. It never fired in CI because the seed is random
+    /// per run; it fired locally on 2026-08-17, and proptest then persisted the
+    /// case, which is the only reason a latent dice roll became visible at all.
+    /// Filtering against sqlparser's own list keeps this correct as the dialect
+    /// grows keywords, which a hand-written exclusion list would not.
     fn ident_strategy() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_]{0,20}".prop_map(|s| s)
+        "[a-z][a-z0-9_]{0,20}".prop_filter("SQL keywords are not bare identifiers", |s| {
+            !sqlparser::keywords::ALL_KEYWORDS.contains(&s.to_uppercase().as_str())
+        })
     }
 
     /// Strategy for integer literal values.

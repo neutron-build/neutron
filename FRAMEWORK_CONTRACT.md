@@ -242,14 +242,22 @@ Direction: `'out'` (default), `'in'`, `'both'`
 |-------------|-----------|---------|
 | `STREAM_XADD` | `STREAM_XADD(stream TEXT, field1 TEXT, val1 ANY, ...)` | TEXT (entry ID) |
 | `STREAM_XLEN` | `STREAM_XLEN(stream TEXT)` | BIGINT |
-| `STREAM_XRANGE` | `STREAM_XRANGE(stream TEXT, start_ms BIGINT, end_ms BIGINT, count BIGINT)` | TEXT (JSON) |
-| `STREAM_XREAD` | `STREAM_XREAD(stream TEXT, last_id_ms BIGINT, count BIGINT)` | TEXT (JSON) |
+| `STREAM_XRANGE` | `STREAM_XRANGE(stream TEXT, start BIGINT\|TEXT, end BIGINT\|TEXT, count BIGINT)` | TEXT (JSON) |
+| `STREAM_XREAD` | `STREAM_XREAD(stream TEXT, last_id BIGINT\|TEXT, count BIGINT)` | TEXT (JSON) |
 | `STREAM_XGROUP_CREATE` | `STREAM_XGROUP_CREATE(stream TEXT, group TEXT, start_id BIGINT)` | BOOLEAN |
 | `STREAM_XREADGROUP` | `STREAM_XREADGROUP(stream TEXT, group TEXT, consumer TEXT, count BIGINT)` | TEXT |
 | `STREAM_XACK` | `STREAM_XACK(stream TEXT, group TEXT, id_ms BIGINT, id_seq BIGINT)` | BIGINT (count acknowledged) |
 
 Reads on a nonexistent stream return an empty string (`''`), not `'[]'` — clients must treat
 empty text as an empty result before JSON-parsing.
+
+**Positions take either form, and they are not equivalent.** A BIGINT is a bare millisecond;
+a TEXT `'<ms>-<seq>'` is the id `STREAM_XADD` returned. Ids carry a sequence, so several
+entries can share a millisecond, and a millisecond therefore cannot address one: `XREAD` from
+a bare millisecond resumes after that *whole* millisecond and will not serve entries still
+inside it. **A consumer resuming from its last-seen position must pass the id, not the
+millisecond** — passing the millisecond silently loses every entry appended alongside the one
+it last read. `STREAM_XACK` accepts both forms for the same reason.
 
 ### 3.10 PubSub
 
