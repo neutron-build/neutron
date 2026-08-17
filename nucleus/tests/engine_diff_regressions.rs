@@ -345,3 +345,46 @@ async fn temporal_values_and_arithmetic_match_across_engines() {
         );
     }
 }
+
+/// NU-251: a repeated `create_table` must never discard the rows already there.
+///
+/// `MemoryEngine` used `HashMap::insert`, which replaced the table with an
+/// empty one and returned success — so a duplicate, replayed or raced CREATE
+/// emptied a populated table with no error anywhere, and this engine is what
+/// the shipped embedded API uses for `StorageMode::Memory`. Every other engine
+/// already treated a repeat create as a no-op that keeps its rows; asserted
+/// across all four here so they cannot diverge on it again.
+#[tokio::test]
+async fn repeat_create_table_preserves_rows_on_every_engine() {
+    let engines: Vec<(&str, Arc<dyn StorageEngine>)> = vec![
+        ("mvcc", Arc::new(MvccStorageAdapter::new())),
+        ("memory", Arc::new(MemoryEngine::new())),
+        ("lsm", Arc::new(LsmStorageEngine::new())),
+        ("columnar", Arc::new(ColumnarStorageEngine::new())),
+    ];
+    for (name, storage) in engines {
+        storage.create_table("t251").await.unwrap();
+        storage
+            .insert("t251", vec![Value::Int64(1), Value::Text("keep".into())])
+            .await
+            .unwrap();
+        storage
+            .insert("t251", vec![Value::Int64(2), Value::Text("keep".into())])
+            .await
+            .unwrap();
+        let before = storage.scan("t251").await.unwrap().len();
+        assert_eq!(before, 2, "{name}: fixture");
+
+        // The duplicate create, exactly as a catalog race or a recovery replay
+        // would issue it.
+        storage.create_table("t251").await.unwrap();
+
+        let after = storage.scan("t251").await.unwrap().len();
+        assert_eq!(
+            after,
+            before,
+            "{name}: a repeated CREATE TABLE discarded {} row(s) and reported success",
+            before - after
+        );
+    }
+}

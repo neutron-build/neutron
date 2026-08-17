@@ -990,7 +990,19 @@ impl std::fmt::Debug for MemoryEngine {
 impl StorageEngine for MemoryEngine {
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         let mut tables = self.tables.write().await;
-        tables.insert(table.to_string(), Vec::new());
+        // `insert` here REPLACED the table, discarding every row, and returned
+        // success — so a duplicate, replayed or raced CREATE emptied a
+        // populated table with no error anywhere. This is reachable through
+        // the shipped embedded API (`StorageMode::Memory`), not only in tests.
+        //
+        // Idempotent rather than `TableAlreadyExists`, deliberately: every
+        // other engine already treats a repeat create as a no-op that keeps
+        // its rows (`MvccEngine` and the columnar store use `or_insert`,
+        // `LsmEngine` returns early on `contains_key`, `DiskEngine` checks
+        // whether the table was already restored), and recovery paths replay
+        // creates. Erroring here would make this one engine reject what the
+        // other four accept. (NU-251)
+        tables.entry(table.to_string()).or_default();
         Ok(())
     }
 
