@@ -77,12 +77,34 @@ async function bootAndTest(sdk) {
 
   const child = spawn(command, args, { env, stdio: ["ignore", "ignore", "inherit"] });
   let exited = false;
+  // A spawn failure — a missing binary, a non-executable file — arrives on the
+  // child's 'error' event, NOT as a throw from spawn(). Without this listener
+  // it is an unhandled error that kills the runner outright: no matrix, no
+  // results for the SDKs that did run, just a stack trace. Hit for real after
+  // `cargo clean` removed the Rust conformance binary and the runner was asked
+  // to spawn it with --no-build. Captured here so it becomes an ordinary
+  // `broken` row like any other SDK that could not be exercised.
+  let spawnError = null;
+  child.on("error", (e) => {
+    spawnError = e;
+    exited = true;
+  });
   child.on("exit", () => {
     exited = true;
   });
 
   try {
     const ready = await waitForHealth(base, 30000);
+    if (spawnError) {
+      return {
+        booted: false,
+        results: [],
+        note:
+          spawnError.code === "ENOENT"
+            ? `could not start "${command}" — no such file. Was it built? (this run used --no-build)`
+            : `could not start "${command}": ${spawnError.message}`,
+      };
+    }
     if (!ready || exited) {
       return { booted: false, results: [], note: "server did not become healthy" };
     }

@@ -24,19 +24,18 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(_REPO, "python"))
+sys.path.insert(0, _HERE)  # for the generated contract surface
 
 from pydantic import BaseModel, Field  # noqa: E402
 
 from neutron import App, Router  # noqa: E402
-from neutron.error import (  # noqa: E402
-    bad_request,
-    conflict,
-    forbidden,
-    internal_error,
-    not_found,
-    rate_limited,
-    unauthorized,
-)
+from neutron.error import AppError  # noqa: E402
+
+# The contract surface, GENERATED from conformance/contract-ir.json (S43). The
+# error taxonomy is not transcribed here — adding or changing a standard error
+# is an edit to the contract document, which the IR is checked against and this
+# module is generated from.
+from _generated_contract import probed_errors  # noqa: E402
 from neutron.middleware import (  # noqa: E402
     CompressionMiddleware,
     CORSMiddleware,
@@ -68,39 +67,25 @@ async def create_item(body: NewItem) -> Item:
     return Item(id=1, name=body.name, price=body.price)
 
 
-@router.get("/errors/bad-request")
-async def err_bad_request() -> dict:
-    raise bad_request("forced bad request")
+# One forced-error route per standard error, built from the generated taxonomy
+# rather than written out seven times. `AppError(status, code, title, detail)`
+# is a generic constructor, so no per-code helper mapping is needed and adding a
+# ninth error to FRAMEWORK_CONTRACT.md would produce its endpoint here with no
+# edit to this file.
+def _register_error_routes() -> None:
+    for status, code, title, probe_path in probed_errors():
+
+        def handler(status: int = status, code: str = code, title: str = title):
+            async def forced() -> dict:
+                raise AppError(status, code, title, f"forced {code}")
+
+            forced.__name__ = f"err_{code.replace('-', '_')}"
+            return forced
+
+        router.get(probe_path)(handler())
 
 
-@router.get("/errors/unauthorized")
-async def err_unauthorized() -> dict:
-    raise unauthorized("forced unauthorized")
-
-
-@router.get("/errors/forbidden")
-async def err_forbidden() -> dict:
-    raise forbidden("forced forbidden")
-
-
-@router.get("/errors/not-found")
-async def err_not_found() -> dict:
-    raise not_found("forced not found")
-
-
-@router.get("/errors/conflict")
-async def err_conflict() -> dict:
-    raise conflict("forced conflict")
-
-
-@router.get("/errors/rate-limited")
-async def err_rate_limited() -> dict:
-    raise rate_limited("forced rate limited")
-
-
-@router.get("/errors/internal")
-async def err_internal() -> dict:
-    raise internal_error("forced internal error")
+_register_error_routes()
 
 
 def build() -> App:

@@ -55,3 +55,8 @@ jobs:
       # SDK, so it costs a few seconds.
       - name: contract-ir.json matches FRAMEWORK_CONTRACT.md
         run: node conformance/runner/validate-ir.mjs
+
+      # A generator nobody re-runs is a one-off transcription with extra steps.
+      # This fails when the IR has moved and the generated surface has not.
+      - name: Generated contract surfaces are current
+        run: node conformance/generate-app.mjs python --check
