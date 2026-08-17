@@ -5911,9 +5911,62 @@ impl Executor {
     // Vector index maintenance
     // ========================================================================
 
+    /// Does this ORDER BY ask for a similarity ordering?
+    ///
+    /// Only the shape, deliberately: it is the question "did the caller want
+    /// the vector index?", which is what makes an attempt worth counting. Every
+    /// other reason `try_vector_index_scan` declines — no index on the column,
+    /// an unusable IvfFlat, an empty registry after reopen — is a fallback the
+    /// operator needs to see, and folding them in with "this query was not
+    /// about vectors at all" is what made the whole path invisible.
+    fn is_similarity_ordering(ob: &ast::OrderBy) -> bool {
+        let ast::OrderByKind::Expressions(exprs) = &ob.kind else {
+            return false;
+        };
+        let [expr] = exprs.as_slice() else {
+            return false;
+        };
+        if expr.options.asc == Some(false) {
+            return false;
+        }
+        matches!(&expr.expr, Expr::Function(f)
+            if f.name.to_string().eq_ignore_ascii_case("VECTOR_DISTANCE"))
+    }
+
     /// Try to use a vector index for ORDER BY VECTOR_DISTANCE(...) LIMIT k.
     /// Returns Some(reordered_rows) if optimization applied, None otherwise.
+    ///
+    /// Counted on the same three counters as every other index path. Until this
+    /// wrapper existed, a similarity query that silently fell back to sorting
+    /// the whole table by brute force was indistinguishable from one the index
+    /// served — no counter moved either way, and the answers are identical
+    /// because HNSW returns the same top-k as an exact sort at these sizes. A
+    /// cost test could not tell the two apart, which is precisely the blind
+    /// spot `index_scan_fallbacks` was introduced to close for B-trees.
     fn try_vector_index_scan(
+        &self,
+        ob: &ast::OrderBy,
+        limit_clause: &Option<ast::LimitClause>,
+        rows: &[Row],
+        col_meta: &[ColMeta],
+    ) -> Option<Vec<Row>> {
+        if !Self::is_similarity_ordering(ob) {
+            return None;
+        }
+        self.metrics.index_scan_attempts.inc();
+        match self.try_similarity_index_scan(ob, limit_clause, rows, col_meta) {
+            Some(reordered) => {
+                self.metrics.index_scan_served.inc();
+                Some(reordered)
+            }
+            None => {
+                self.metrics.index_scan_fallbacks.inc();
+                None
+            }
+        }
+    }
+
+    fn try_similarity_index_scan(
         &self,
         ob: &ast::OrderBy,
         limit_clause: &Option<ast::LimitClause>,
