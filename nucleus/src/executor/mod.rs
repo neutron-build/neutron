@@ -349,6 +349,10 @@ pub struct Executor {
     extensions: parking_lot::RwLock<HashMap<String, ExtensionDef>>,
     /// Path to the catalog JSON file for persistence (None = no persistence).
     catalog_path: Option<std::path::PathBuf>,
+    /// Set when `sequences.json` exists but could not be read at startup.
+    /// While set, NEXTVAL/SETVAL refuse: resuming from a default would reissue
+    /// values already handed out. See `load_sequences_sync`. (NU-165)
+    sequence_state_unreadable: std::sync::atomic::AtomicBool,
     /// Live vector indexes keyed by index name.
     vector_indexes: parking_lot::RwLock<HashMap<String, VectorIndexEntry>>,
     /// Optional vector WAL for durable vector index persistence.
@@ -642,6 +646,7 @@ impl Executor {
                 m
             }),
             catalog_path: None,
+            sequence_state_unreadable: std::sync::atomic::AtomicBool::new(false),
             vector_indexes: parking_lot::RwLock::new(HashMap::new()),
             vector_wal: None,
             streams_wal: None,
@@ -1119,13 +1124,23 @@ impl Executor {
     ///
     /// Called after every `nextval`/`setval` to ensure sequence values survive restart.
     /// Uses a parking_lot (sync) lock snapshot so this can be called from non-async code.
-    pub(crate) fn persist_sequences_sync(&self) {
+    /// Returns an error if the new sequence state did not reach disk.
+    ///
+    /// Every step used to be discarded — `File::create` behind an `if let Ok`,
+    /// `write_all`/`sync_all`/`rename` behind `let _ =` — and `NEXTVAL`
+    /// returned its value regardless. So a client could be handed a sequence
+    /// value that no restart would remember, and the same value would be
+    /// issued again: duplicate SERIAL primary keys, and external identifiers
+    /// believed unique that are not. Skipping values is harmless; reusing one
+    /// is not, so the caller now burns the value and reports the failure.
+    /// (NU-165)
+    pub(crate) fn persist_sequences_sync(&self) -> std::io::Result<()> {
         let Some(ref cp) = self.catalog_path else {
-            return;
+            return Ok(());
         };
         let dir = match cp.parent() {
             Some(d) => d,
-            None => return,
+            None => return Ok(()),
         };
         let path = dir.join("sequences.json");
 
@@ -1145,20 +1160,23 @@ impl Executor {
             .collect();
         drop(sequences);
 
-        let json = match serde_json::to_string_pretty(&data) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!("persist_sequences_sync serialize: {e}");
-                return;
-            }
-        };
+        let json = serde_json::to_string_pretty(&data)
+            .map_err(|e| std::io::Error::other(format!("serialize sequences: {e}")))?;
         let tmp = path.with_extension("json.tmp");
-        if let Ok(mut f) = std::fs::File::create(&tmp) {
+        {
             use std::io::Write as _;
-            let _ = f.write_all(json.as_bytes());
-            let _ = f.sync_all();
-            let _ = std::fs::rename(&tmp, &path);
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
         }
+        std::fs::rename(&tmp, &path)?;
+        // Fsync the DIRECTORY too: the rename is what makes the new state
+        // visible, and without this a crash can lose the rename while the
+        // file contents it points at are perfectly durable.
+        if let Ok(d) = std::fs::File::open(dir) {
+            d.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Load persisted executor metadata (views, sequences, triggers, roles, functions) at startup.
@@ -1325,14 +1343,42 @@ impl Executor {
     /// durable database reset every SERIAL to 1 on reopen; with PK
     /// enforcement now also restored across reopen, that would turn every
     /// post-restart SERIAL insert into a loud duplicate-key error.
+    /// A file that exists but cannot be read or parsed POISONS the sequence
+    /// surface instead of being skipped.
+    ///
+    /// Skipping was the dangerous behaviour: every guard here was an
+    /// `if let Ok`, so a corrupt or unreadable `sequences.json` left every
+    /// sequence at its catalog default and the next `NEXTVAL` returned 1
+    /// again — guaranteed reuse of values already handed out, silently, at
+    /// startup. Now `NEXTVAL`/`SETVAL` refuse until an operator resolves it,
+    /// which is recoverable; duplicate primary keys are not. (NU-165)
     pub fn load_sequences_sync(&self) {
         if let Some(ref cp) = self.catalog_path
             && let Some(dir) = cp.parent()
         {
             let seq_path = dir.join("sequences.json");
-            if seq_path.exists()
-                && let Ok(json) = std::fs::read_to_string(&seq_path)
-                && let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+            if !seq_path.exists() {
+                return;
+            }
+            let parsed = std::fs::read_to_string(&seq_path)
+                .map_err(|e| e.to_string())
+                .and_then(|json| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&json).map_err(|e| e.to_string())
+                });
+            let arr = match parsed {
+                Ok(arr) => arr,
+                Err(e) => {
+                    tracing::error!(
+                        target: "nucleus::sequences",
+                        "sequences.json exists but could not be read ({e}); sequence values \
+                         cannot be resumed and NEXTVAL/SETVAL will refuse rather than reissue \
+                         values that may already have been used"
+                    );
+                    self.sequence_state_unreadable
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            };
             {
                 let mut seqs = self.sequences.write();
                 for item in &arr {
@@ -1356,6 +1402,15 @@ impl Executor {
                 }
             }
         }
+    }
+
+    /// Whether persisted sequence state could not be read at startup.
+    ///
+    /// While true, handing out a sequence value would risk reissuing one that
+    /// a previous run already gave to a client, so `NEXTVAL`/`SETVAL` refuse.
+    pub(crate) fn sequence_state_unreadable(&self) -> bool {
+        self.sequence_state_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Rebuild IvfFlat and encrypted specialty indexes from table data at startup.

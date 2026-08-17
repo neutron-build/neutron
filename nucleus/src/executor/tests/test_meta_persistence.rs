@@ -385,3 +385,121 @@ async fn test_all_metadata_survives_restart() {
         );
     }
 }
+
+// ======================================================================
+// NU-165: a sequence value that was acknowledged must never be issued twice
+//
+// `persist_sequences_sync` discarded every failure — `File::create` behind an
+// `if let Ok`, `write_all`/`sync_all`/`rename` behind `let _ =` — and NEXTVAL
+// returned its value regardless. And the loader skipped a `sequences.json` it
+// could not parse, leaving every sequence at its catalog default so the next
+// NEXTVAL returned 1 again. Both end in the same place: duplicate SERIAL keys
+// and reused external identifiers.
+//
+// Skipping values is fine. Reusing one is not.
+// ======================================================================
+
+#[tokio::test]
+async fn sequence_values_are_never_reissued_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let issued: Vec<i64>;
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE SEQUENCE s165").await;
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            match scalar(&exec(&ex, "SELECT NEXTVAL('s165')").await[0]) {
+                Value::Int64(n) => v.push(*n),
+                other => panic!("expected Int64, got {other:?}"),
+            }
+        }
+        issued = v;
+    }
+    let ex = open_executor(dir.path()).await;
+    let after = match scalar(&exec(&ex, "SELECT NEXTVAL('s165')").await[0]) {
+        Value::Int64(n) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert!(
+        !issued.contains(&after),
+        "NEXTVAL reissued {after} after restart; already handed out {issued:?}"
+    );
+    assert!(
+        after > *issued.last().unwrap(),
+        "the sequence went backwards across restart: {after} after {issued:?}"
+    );
+}
+
+/// An unreadable `sequences.json` must poison the surface, not silently reset
+/// it. Resuming from the default is the one behaviour guaranteed to reissue.
+#[tokio::test]
+async fn unreadable_sequence_state_refuses_rather_than_restarting_from_one() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE SEQUENCE s165c").await;
+        for _ in 0..5 {
+            exec(&ex, "SELECT NEXTVAL('s165c')").await;
+        }
+    }
+    // Corrupt the persisted state the way a torn write or a bad disk would.
+    std::fs::write(dir.path().join("sequences.json"), b"{not json at all").unwrap();
+
+    let ex = open_executor(dir.path()).await;
+    let err = ex
+        .execute("SELECT NEXTVAL('s165c')")
+        .await
+        .expect_err("NEXTVAL must refuse when sequence state could not be read");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("could not be read"),
+        "the refusal must say why: {msg}"
+    );
+    // SETVAL is refused for the same reason.
+    assert!(ex.execute("SELECT SETVAL('s165c', 99)").await.is_err());
+    // Reads of everything else keep working — poisoning one surface must not
+    // take the database down.
+    assert!(ex.execute("SELECT 1").await.is_ok());
+}
+
+/// The value is burned, not returned, when it cannot be made durable.
+///
+/// Arranged by putting a DIRECTORY where the temp file must be written, which
+/// fails `File::create` on every platform. Before the fix every step of the
+/// write was discarded (`let _ =`) and NEXTVAL returned the value anyway — so
+/// a client held a number that no restart would remember, and the next run
+/// handed the same number to someone else.
+#[tokio::test]
+async fn nextval_refuses_a_value_it_cannot_make_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(&ex, "CREATE SEQUENCE s165d").await;
+    let first = match scalar(&exec(&ex, "SELECT NEXTVAL('s165d')").await[0]) {
+        Value::Int64(n) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+
+    // Block the atomic-write temp path.
+    std::fs::create_dir(dir.path().join("sequences.json.tmp")).unwrap();
+
+    let err = ex
+        .execute("SELECT NEXTVAL('s165d')")
+        .await
+        .expect_err("a value that cannot be persisted must not be issued");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("could not be made durable"),
+        "the error must say the value was consumed but not durable: {msg}"
+    );
+
+    // Unblock it: the burned value is skipped, never reissued.
+    std::fs::remove_dir(dir.path().join("sequences.json.tmp")).unwrap();
+    let next = match scalar(&exec(&ex, "SELECT NEXTVAL('s165d')").await[0]) {
+        Value::Int64(n) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert!(
+        next > first + 1,
+        "the failed value must be burned, not reused: got {next} after {first}"
+    );
+}

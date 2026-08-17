@@ -2045,6 +2045,18 @@ impl Executor {
             }
 
             // -- Sequence functions --
+            "NEXTVAL" | "SETVAL" if self.sequence_state_unreadable() => {
+                // Startup could not read sequences.json. Resuming from a
+                // default would reissue values already handed out, so refuse
+                // until an operator resolves it — recoverable, unlike
+                // duplicate primary keys. (NU-165)
+                Err(ExecError::Runtime(
+                    "sequence state could not be read at startup (sequences.json unreadable); \
+                     refusing to issue values that may already have been used. Restore or \
+                     remove the file and restart."
+                        .into(),
+                ))
+            }
             "NEXTVAL" => {
                 require_args(fname, &args, 1)?;
                 let seq_name = match &args[0] {
@@ -2064,7 +2076,20 @@ impl Executor {
                     drop(seq);
                     drop(seqs);
                     // Persist sequence state synchronously so it survives restart.
-                    self.persist_sequences_sync();
+                    //
+                    // The value is BURNED if this fails: it stays consumed in
+                    // memory and is never returned. A sequence may skip values
+                    // — every implementation does, on rollback — but handing
+                    // out a value a restart will hand out again produces
+                    // duplicate SERIAL keys and repeats identifiers the caller
+                    // was told were unique. Failing loudly is the only answer
+                    // that keeps the promise. (NU-165)
+                    self.persist_sequences_sync().map_err(|e| {
+                        ExecError::Runtime(format!(
+                            "sequence {seq_name}: value {val} was consumed but could not be \
+                             made durable ({e}); it will not be issued. Retry NEXTVAL."
+                        ))
+                    })?;
                     Ok(Value::Int64(val))
                 } else {
                     Err(ExecError::Unsupported(format!(
@@ -2101,7 +2126,13 @@ impl Executor {
                     seq.current = new_val;
                     drop(seq);
                     drop(seqs);
-                    self.persist_sequences_sync();
+                    self.persist_sequences_sync().map_err(|e| {
+                        ExecError::Runtime(format!(
+                            "sequence {seq_name}: SETVAL to {new_val} could not be made \
+                             durable ({e}); the in-memory value changed but a restart \
+                             would not see it"
+                        ))
+                    })?;
                     Ok(Value::Int64(new_val))
                 } else {
                     Err(ExecError::Unsupported(format!(
