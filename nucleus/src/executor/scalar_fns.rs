@@ -6312,6 +6312,86 @@ fn stream_entries_to_json(entries: &[&crate::pubsub::StreamEntry]) -> String {
     serde_json::Value::Array(items).to_string()
 }
 
+/// Every scalar function that writes durable state, as one list.
+///
+/// This is the authority two other places used to restate by hand:
+/// `side_effecting_return_type` below (so pgwire's Describe never
+/// probe-executes a mutator) and `admission::scalar_fn_mutates` (so a
+/// read-only server refuses one). They drifted, in both directions —
+/// `NEXTVAL`, `SETVAL`, `RETENTION_SET`, `STREAM_XREADGROUP`, `SUBSCRIBE` and
+/// `UNSUBSCRIBE` were declared side-effecting here yet admitted while
+/// degraded, while `CYPHER`, `VERSION_BRANCH` and `VERSION_COMMIT` were
+/// refused while degraded yet unknown to Describe. `mutating_registries_agree`
+/// derives both directions from this list, so the next mutator added in one
+/// place fails a test instead of shipping. (NU-216)
+#[cfg(feature = "server")]
+pub(crate) const SIDE_EFFECTING_FN_NAMES: &[&str] = &[
+    "BLOB_DELETE",
+    "BLOB_STORE",
+    "BLOB_TAG",
+    "COLUMNAR_INSERT",
+    "CYPHER",
+    "DATALOG_ASSERT",
+    "DATALOG_CLEAR",
+    "DATALOG_IMPORT",
+    "DATALOG_IMPORT_GRAPH",
+    "DATALOG_IMPORT_NODES",
+    "DATALOG_RETRACT",
+    "DATALOG_RULE",
+    "DB_BRANCH_CREATE",
+    "DB_BRANCH_DELETE",
+    "DB_BRANCH_MERGE",
+    "DOC_DELETE",
+    "DOC_INSERT",
+    "DOC_UPDATE",
+    "FTS_INDEX",
+    "FTS_INDEX_FACETED",
+    "FTS_REMOVE",
+    "GRAPH_ADD_EDGE",
+    "GRAPH_ADD_NODE",
+    "GRAPH_DELETE_EDGE",
+    "GRAPH_DELETE_NODE",
+    "KV_CDEL",
+    "KV_CEXPIRE",
+    "KV_DEL",
+    "KV_EXPIRE",
+    "KV_FLUSHDB",
+    "KV_HDEL",
+    "KV_HSET",
+    "KV_INCR",
+    "KV_LPOP",
+    "KV_LPUSH",
+    "KV_PFADD",
+    "KV_PFMERGE",
+    "KV_RPOP",
+    "KV_RPUSH",
+    "KV_SADD",
+    "KV_SET",
+    "KV_SETNX",
+    "KV_SREM",
+    "KV_ZADD",
+    "KV_ZREM",
+    "NEXTVAL",
+    "PROC_DROP",
+    "PROC_REGISTER",
+    "PUBSUB_PUBLISH",
+    "RETENTION_SET",
+    "SETVAL",
+    "SPARSE_INSERT",
+    "SPARSE_REMOVE",
+    "STREAM_XACK",
+    "STREAM_XADD",
+    "STREAM_XGROUP_CREATE",
+    "STREAM_XREADGROUP",
+    "SUBSCRIBE",
+    "TENSOR_STORE",
+    "TS_INSERT",
+    "TS_RETENTION",
+    "UNSUBSCRIBE",
+    "VERSION_BRANCH",
+    "VERSION_COMMIT",
+];
+
 /// Return type of a *side-effecting* built-in scalar function, or `None`
 /// for pure ones. This is the registry the pgwire Describe path uses to
 /// answer "what columns would this SELECT produce?" WITHOUT executing:
@@ -6357,6 +6437,15 @@ pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::Dat
         | "PROC_DROP"
         | "UNSUBSCRIBE"
         | "STREAM_XGROUP_CREATE" => DataType::Bool,
+        // `VERSION_BRANCH` writes and returns 'OK'; it was gated by read-only
+        // admission but missing from THIS registry, which is the other half of
+        // the same defect — Describe probe-executes anything it does not know
+        // to be side-effecting, and that is how KV_SETNX once ran twice per
+        // client Execute (see this function's header).
+        "VERSION_BRANCH" => DataType::Text,
+        "VERSION_COMMIT" => DataType::Int64,
+        // CYPHER runs an arbitrary Cypher statement, which may CREATE or DELETE.
+        "CYPHER" => DataType::Text,
         // -- integers: ids, counts, sequence values --
         "NEXTVAL" | "SETVAL" | "KV_INCR" | "KV_LPUSH" | "KV_RPUSH" | "STREAM_XACK"
         | "PUBSUB_PUBLISH" | "DOC_INSERT" | "GRAPH_ADD_NODE" | "GRAPH_ADD_EDGE" | "SUBSCRIBE"

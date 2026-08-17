@@ -82,7 +82,7 @@ pub(super) fn statement_label(stmt: &Statement) -> &'static str {
 /// parses as an ordinary query. Listed explicitly rather than pattern-matched
 /// so a read never gets refused by accident and, more importantly, so adding
 /// a new mutating function is a deliberate edit here.
-const MUTATING_SCALAR_FNS: [&str; 55] = [
+pub(super) const MUTATING_SCALAR_FNS: [&str; 55] = [
     "BLOB_DELETE",
     "BLOB_STORE",
     "BLOB_TAG",
@@ -142,7 +142,7 @@ const MUTATING_SCALAR_FNS: [&str; 55] = [
 
 /// Additional mutating functions that do not fit the sorted array above
 /// (kept separate so the array stays a compile-time-checked constant list).
-const MUTATING_SCALAR_FNS_EXTRA: [&str; 5] = [
+pub(super) const MUTATING_SCALAR_FNS_EXTRA: [&str; 5] = [
     "TS_RETENTION",
     "VECTOR_DELETE",
     "VECTOR_INSERT",
@@ -152,9 +152,31 @@ const MUTATING_SCALAR_FNS_EXTRA: [&str; 5] = [
 
 /// Whether a built-in scalar function mutates durable state.
 /// `fname` is the upper-cased function name used by the dispatcher.
+///
+/// The two arrays above are no longer the only authority: anything
+/// `scalar_fns::SIDE_EFFECTING_FN_NAMES` declares as writing is refused too.
+/// Those two lists answered the same question and had drifted apart in both
+/// directions — six functions (NEXTVAL, SETVAL, RETENTION_SET,
+/// STREAM_XREADGROUP, SUBSCRIBE, UNSUBSCRIBE) were declared side-effecting
+/// there and admitted here, so a server that had just refused an INSERT for
+/// want of disk would still allocate a durable identifier or claim stream
+/// entries. `mutating_registries_agree` now checks both directions. (NU-216)
 pub(super) fn scalar_fn_mutates(fname: &str) -> bool {
     MUTATING_SCALAR_FNS.binary_search(&fname).is_ok()
         || MUTATING_SCALAR_FNS_EXTRA.binary_search(&fname).is_ok()
+        || side_effecting(fname)
+}
+
+#[cfg(feature = "server")]
+fn side_effecting(fname: &str) -> bool {
+    super::scalar_fns::SIDE_EFFECTING_FN_NAMES
+        .binary_search(&fname)
+        .is_ok()
+}
+
+#[cfg(not(feature = "server"))]
+fn side_effecting(_fname: &str) -> bool {
+    false
 }
 
 impl Executor {

@@ -288,3 +288,131 @@ async fn disk_guard_degradation_reaches_real_sql() {
     guard.evaluate();
     assert!(ex.execute("INSERT INTO t VALUES (4, 'd')").await.is_ok());
 }
+
+// ======================================================================
+// NU-216: the degraded gate is only as complete as its list
+//
+// `SELECT kv_set(...)` parses as a Query, so the statement-level gate — which
+// is otherwise fail-closed — cannot see it. A second list, `MUTATING_SCALAR_FNS`,
+// carries the specialty-store mutators, and a third registry in `scalar_fns.rs`
+// (`side_effecting_return_type`) independently declares which functions WRITE
+// so pgwire's Describe never probe-executes one.
+//
+// Diffing the two on 2026-08-17 found six functions the side-effect registry
+// declares as writing that the admission list did not gate: NEXTVAL, SETVAL,
+// RETENTION_SET, STREAM_XREADGROUP, SUBSCRIBE, UNSUBSCRIBE. Every one could
+// allocate durable state, advance an identifier, or claim stream entries on a
+// server that had just refused an INSERT for want of disk.
+//
+// `mutating_registries_agree` is the part that matters: it derives the answer
+// from the second registry instead of from a human noticing, so the next
+// mutator added in one place fails here rather than in production.
+// ======================================================================
+
+#[tokio::test]
+async fn degraded_server_refuses_sequence_and_stream_mutators() {
+    let (ex, service) = degradable_executor();
+    exec(&ex, "CREATE SEQUENCE s216").await;
+    exec(&ex, "SELECT STREAM_XADD('s216_stream', 'k', 'v')").await;
+    exec(&ex, "SELECT STREAM_XGROUP_CREATE('s216_stream', 'g', 0)").await;
+    service.enter_read_only(DegradeReason::DiskWatermark, "only 1.20% free on /data");
+
+    for sql in [
+        // Allocates a durable identifier that can never be handed out again.
+        "SELECT NEXTVAL('s216')",
+        "SELECT SETVAL('s216', 100)",
+        // Advances a consumer group's cursor and records pending entries:
+        // a read in name only.
+        "SELECT STREAM_XREADGROUP('s216_stream', 'g', 'c', 10)",
+        // Installs durable retention policy.
+        "SELECT RETENTION_SET('t', 3600)",
+    ] {
+        let err = ex
+            .execute(sql)
+            .await
+            .expect_err(&format!("{sql} must be refused while degraded"));
+        assert!(
+            matches!(err, ExecError::DiskFull(_)),
+            "{sql}: expected DiskFull, got {err:?}"
+        );
+        assert_eq!(sqlstate(&err), "53100", "{sql}");
+    }
+}
+
+/// A degraded server must still answer reads, including reads of the very
+/// models whose mutators are refused above. Without this the test above could
+/// be satisfied by refusing everything.
+#[tokio::test]
+async fn degraded_server_still_serves_specialty_reads() {
+    let (ex, service) = degradable_executor();
+    exec(&ex, "SELECT KV_SET('k216', 'v')").await;
+    exec(&ex, "SELECT STREAM_XADD('s216_read', 'k', 'v')").await;
+    service.enter_read_only(DegradeReason::DiskWatermark, "only 1.20% free on /data");
+
+    for sql in [
+        "SELECT KV_GET('k216')",
+        "SELECT KV_EXISTS('k216')",
+        "SELECT STREAM_XLEN('s216_read')",
+        "SELECT STREAM_XRANGE('s216_read', 0, 9999999999999, 10)",
+        "SELECT CURRVAL('s216_missing')",
+    ] {
+        let r = ex.execute(sql).await;
+        if let Err(e) = &r {
+            assert!(
+                !matches!(e, ExecError::DiskFull(_)),
+                "{sql} is a read and must not be refused as a write"
+            );
+        }
+    }
+}
+
+/// The registries answer the same question — "does this function write?" — and
+/// had drifted apart in both directions. Both directions are checked here.
+#[test]
+fn mutating_registries_agree() {
+    use crate::executor::admission::{
+        MUTATING_SCALAR_FNS, MUTATING_SCALAR_FNS_EXTRA, scalar_fn_mutates,
+    };
+    use crate::executor::scalar_fns::{SIDE_EFFECTING_FN_NAMES, side_effecting_return_type};
+
+    assert!(
+        SIDE_EFFECTING_FN_NAMES.windows(2).all(|w| w[0] < w[1]),
+        "the list is binary-searched, so it must stay sorted and unique"
+    );
+
+    for name in SIDE_EFFECTING_FN_NAMES.iter().copied() {
+        // Describe must know it writes, or pgwire probe-executes it — the
+        // defect that made KV_SETNX run twice per client Execute.
+        assert!(
+            side_effecting_return_type(name).is_some(),
+            "{name} writes but Describe does not know its type, so Describe \
+             will probe-execute it"
+        );
+        // A degraded server must refuse it.
+        assert!(
+            scalar_fn_mutates(name),
+            "{name} writes durable state but is not gated by read-only \
+             admission — a degraded server would still execute it"
+        );
+    }
+
+    // The reverse direction: nothing the old hand-maintained arrays gate may
+    // be missing from the authority, or the authority is not one.
+    for name in MUTATING_SCALAR_FNS
+        .iter()
+        .chain(MUTATING_SCALAR_FNS_EXTRA.iter())
+        .copied()
+    {
+        // VECTOR_INSERT / VECTOR_DELETE are gated but do not exist as
+        // functions at all (recorded in MODEL_SEMANTICS.md); gating a
+        // phantom is harmless, so they are excused rather than added.
+        if matches!(name, "VECTOR_INSERT" | "VECTOR_DELETE") {
+            continue;
+        }
+        assert!(
+            SIDE_EFFECTING_FN_NAMES.binary_search(&name).is_ok(),
+            "{name} is refused while degraded but missing from \
+             SIDE_EFFECTING_FN_NAMES, so Describe may probe-execute it"
+        );
+    }
+}
