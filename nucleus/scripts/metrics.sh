@@ -141,6 +141,12 @@ if [ -f "$TRUTH" ]; then
     }
     assert_truth_value "LOC" "$LOC" || fail=1
     assert_truth_value "unit tests" "$UNIT_DECLARED" || fail=1
+    # Added 2026-08-17: the sheet carried 361 integration tests while the tree
+    # had 377 and DATABASE_COMPLETION.md had 376, and --check passed clean the
+    # whole time because this row was simply never asserted. A number on the
+    # ground-truth sheet that the checker does not read is exactly the rot the
+    # sheet exists to prevent, one level up.
+    assert_truth_value "integration tests" "$INTEGRATION_DECLARED" || fail=1
     assert_truth_value "modules" "$MODULES" || fail=1
     assert_truth_value "rs files" "$RS_FILES" || fail=1
     if [ "$LEAN_FILES" -gt 0 ]; then
