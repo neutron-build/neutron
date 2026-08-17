@@ -15,6 +15,12 @@ if (!args.baseline) {
 const baseline = await readJson(baselinePath);
 const candidate = await readJson(candidatePath);
 
+// Per-scenario thresholds, when a file is supplied. Absent, every scenario uses
+// the global --fail-* values and behaviour is unchanged.
+const SCENARIO_THRESHOLDS = args.thresholds
+  ? (await readJson(path.resolve(cwd, args.thresholds))).scenarios || {}
+  : {};
+
 const rows = buildDiffRows(baseline, candidate, args.framework);
 if (rows.length === 0) {
   console.error("No comparable summary rows were found.");
@@ -31,7 +37,8 @@ if (Number.isFinite(args.failRpsDropPct)) {
   const failures = findRpsFailures(rows, args.failRpsDropPct, args.framework);
   if (failures.length > 0) {
     console.error(
-      `Regression gate failed: ${failures.length} row(s) dropped more than ${args.failRpsDropPct}% RPS.`,
+      `Regression gate failed: ${failures.length} row(s) dropped past their RPS limit ` +
+        `(${failures.map((f) => `${f.scenario} ${f.rpsDeltaPct}% vs -${f.rpsLimitPct}%`).join(", ")}).`,
     );
     console.table(failures);
     process.exit(2);
@@ -42,7 +49,8 @@ if (Number.isFinite(args.failP95IncreasePct)) {
   const failures = findP95Failures(rows, args.failP95IncreasePct, args.framework);
   if (failures.length > 0) {
     console.error(
-      `Regression gate failed: ${failures.length} row(s) exceeded ${args.failP95IncreasePct}% p95 latency increase.`,
+      `Regression gate failed: ${failures.length} row(s) exceeded their p95 limit ` +
+        `(${failures.map((f) => `${f.scenario} +${f.p95DeltaPct}% vs +${f.p95LimitPct}%`).join(", ")}).`,
     );
     console.table(failures);
     process.exit(3);
@@ -56,6 +64,7 @@ function parseArgs(argv) {
     framework: "",
     failRpsDropPct: NaN,
     failP95IncreasePct: NaN,
+    thresholds: "",
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -63,6 +72,11 @@ function parseArgs(argv) {
     const next = argv[i + 1];
     if (token === "--baseline" && next) {
       parsed.baseline = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--thresholds" && next) {
+      parsed.thresholds = next;
       i += 1;
       continue;
     }
@@ -161,7 +175,9 @@ function findRpsFailures(rows, thresholdPct, frameworkFilter) {
     if (frameworkFilter && String(row.framework).toLowerCase() !== frameworkFilter) {
       return false;
     }
-    return Number.isFinite(row.rpsDeltaPct) && row.rpsDeltaPct < -threshold;
+    const limit = scenarioLimit(row.scenario, "rpsDropPct", threshold);
+    row.rpsLimitPct = limit;
+    return Number.isFinite(row.rpsDeltaPct) && row.rpsDeltaPct < -limit;
   });
 }
 
@@ -171,6 +187,20 @@ function findP95Failures(rows, thresholdPct, frameworkFilter) {
     if (frameworkFilter && String(row.framework).toLowerCase() !== frameworkFilter) {
       return false;
     }
-    return Number.isFinite(row.p95DeltaPct) && row.p95DeltaPct > threshold;
+    const limit = scenarioLimit(row.scenario, "p95IncreasePct", threshold);
+    row.p95LimitPct = limit;
+    return Number.isFinite(row.p95DeltaPct) && row.p95DeltaPct > limit;
   });
+}
+
+/// A per-scenario override, or the global threshold when none is set.
+///
+/// One threshold across every scenario has to be set for the noisiest one, and
+/// on shared runners that is ~43% (see `bench-gate-thresholds.json` for the
+/// measurement). Setting the whole gate there throws away the scenarios that
+/// are stable enough to catch something smaller.
+function scenarioLimit(scenario, field, fallback) {
+  const perScenario = SCENARIO_THRESHOLDS[scenario];
+  const value = perScenario && perScenario[field];
+  return Number.isFinite(value) ? Math.abs(value) : fallback;
 }

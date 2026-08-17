@@ -4,10 +4,21 @@ import path from "node:path";
 import process from "node:process";
 
 const cwd = process.cwd();
-const baseline = process.env.BENCH_GATE_BASELINE || "results/baseline.json";
+
+// Thresholds and the baseline they were derived against travel together — a
+// threshold is only meaningful against the baseline whose noise produced it.
+// `bench-gate-thresholds.json` carries the measurement that set both.
+const thresholdsFile = process.env.BENCH_GATE_THRESHOLDS || "bench-gate-thresholds.json";
+const tuning = JSON.parse(await readFile(path.resolve(cwd, thresholdsFile), "utf8"));
+
+const baseline =
+  process.env.BENCH_GATE_BASELINE || tuning.baseline || "results/baseline.json";
 const framework = process.env.BENCH_GATE_FRAMEWORK || "neutron";
-const failRpsDropPct = process.env.BENCH_GATE_FAIL_RPS_DROP_PCT || "20";
-const failP95IncreasePct = process.env.BENCH_GATE_FAIL_P95_INCREASE_PCT || "35";
+const failRpsDropPct =
+  process.env.BENCH_GATE_FAIL_RPS_DROP_PCT || String(tuning.global?.rpsDropPct ?? 20);
+const failP95IncreasePct =
+  process.env.BENCH_GATE_FAIL_P95_INCREASE_PCT ||
+  String(tuning.global?.p95IncreasePct ?? 35);
 
 // Refuse to compare runs taken under different profiles.
 //
@@ -50,10 +61,18 @@ await runNode("./compare-results.mjs", [
   failRpsDropPct,
   "--fail-p95-increase-pct",
   failP95IncreasePct,
+  "--thresholds",
+  thresholdsFile,
 ]);
 
+const tight = Object.entries(tuning.scenarios || {})
+  .map(([s, t]) => `${s} <= ${t.rpsDropPct}%`)
+  .join(", ");
 console.log(
-  `Smoke regression gate passed for ${framework} (RPS drop <= ${failRpsDropPct}%, p95 increase <= ${failP95IncreasePct}%).`
+  `Smoke regression gate passed for ${framework} ` +
+    `(RPS drop <= ${failRpsDropPct}%, p95 increase <= ${failP95IncreasePct}%` +
+    (tight ? `; tightened: ${tight}` : "") +
+    `).`
 );
 
 function runNode(scriptPath, args) {

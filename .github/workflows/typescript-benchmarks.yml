@@ -98,14 +98,28 @@ jobs:
       - name: Run smoke benchmark
         run: pnpm --dir benchmarks run compare:quick
 
-      # Exit 1 is a real regression and fails the job. Exit 2 means the gate
-      # could not compare — the committed baseline was taken under a different
-      # profile (100 conn / 20s / 5 runs, February, on other hardware) than the
-      # CI smoke run (80 / 5s / 1). That is reported loudly and does not fail,
-      # because a red light for "the baseline is incomparable" is indistinguishable
-      # from a red light for "the code got slower", and the second one is the
-      # one that has to be believed. Record a smoke-profile baseline on this
-      # runner class and point BENCH_GATE_BASELINE at it to arm the gate.
+      # ARMED 2026-08-17. The baseline is `results/ci-smoke-baseline.json` — the
+      # per-row median of 8 consecutive CI runs on this runner class, not a
+      # single sample of one — and the thresholds in `bench-gate-thresholds.json`
+      # come from measuring what the runner does to an unchanged request path.
+      # Re-derive both with `node scripts/measure-gate-noise.mjs`.
+      #
+      # What that measurement found, and it decided the design: GitHub's shared
+      # pool has at least two performance classes. Five of the eight runs landed
+      # within 1.4% of the median and three landed 39-43% below it, on commits
+      # that never touched the request path. So the I/O-bound scenarios cannot
+      # see anything under ~2x here, and `compute` — CPU-bound, 99-109% across
+      # every run including the slow ones — is the only one that can gate
+      # tightly. It does, at 25%; everything else gates at 60%. Validated by
+      # replaying all 8 historical runs through the armed gate: 0 false
+      # positives. A deliberate 10x regression fails it, and so does a 30% drop
+      # on `compute`.
+      #
+      # Exit 1 is a real regression and fails the job. Exit 2 still means the
+      # gate could not compare — a baseline recorded under a different profile —
+      # and is reported loudly without failing, because a red light for "the
+      # baseline is incomparable" is indistinguishable from a red light for "the
+      # code got slower", and the second one is the one that has to be believed.
       - name: Enforce smoke regression gate
         run: |
           set +e
@@ -113,7 +127,7 @@ jobs:
           code=$?
           set -e
           if [ "$code" = "2" ]; then
-            echo "::warning::benchmark gate not armed — no baseline matching this profile"
+            echo "::warning::benchmark gate could not compare — baseline profile does not match this run"
             exit 0
           fi
           exit "$code"

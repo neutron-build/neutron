@@ -1,0 +1,48 @@
+{
+  "$comment": [
+    "Per-scenario regression thresholds for the CI smoke gate, DERIVED FROM MEASUREMENT",
+    "rather than chosen. Re-derive them with scripts/measure-gate-noise.mjs if the",
+    "profile, the runner image, or the scenario set changes; do not hand-tune them.",
+    "",
+    "Method: 8 consecutive TypeScript Benchmarks runs on ubuntu-latest (2026-08-16/17,",
+    "runs 31966981572 .. 32002271589) over commits that did not touch the request path,",
+    "compared against the per-row median of those same 8 runs. Any deviation there is",
+    "the runner, not the code.",
+    "",
+    "What the data showed, and it is not noise around a mean: five runs landed within",
+    "1.4% of the median and three landed 39-43% below it. GitHub's shared pool has at",
+    "least two performance classes. The tell is that `compute` is UNAFFECTED on those",
+    "same three runs (99-109% throughout) while every I/O-bound scenario collapses --",
+    "a slower per-request path, not a slower CPU.",
+    "",
+    "Normalising against another framework in the same run does not rescue it: on the",
+    "worst run Neutron drops 43% while Astro drops 17%, because the two do not have",
+    "the same sensitivity to per-request cost. So there is no arithmetic that recovers",
+    "sensitivity here -- the I/O-bound scenarios simply cannot see anything under ~2x",
+    "on this infrastructure, and pretending otherwise produces a gate that cries wolf.",
+    "",
+    "Hence: `compute` gates tightly because it demonstrably can, everything else gates",
+    "at catastrophe level. A 10x regression is a 90% drop and is caught everywhere.",
+    "",
+    "Worst observed deviation vs this baseline: 42.8% rps drop, 33.3% p95 increase."
+  ],
+  "profile": "80 connections / 5s / 1 run, ubuntu-latest",
+  "baseline": "results/ci-smoke-baseline.json",
+  "derivedFrom": {
+    "runs": 8,
+    "worstObservedRpsDropPct": 42.8,
+    "worstObservedP95IncreasePct": 33.3,
+    "recorded": "2026-08-17"
+  },
+  "global": {
+    "rpsDropPct": 60,
+    "p95IncreasePct": 90
+  },
+  "scenarios": {
+    "compute": {
+      "rpsDropPct": 25,
+      "p95IncreasePct": 40,
+      "$why": "CPU-bound and provably insensitive to the runner class: 99-109% of median across all 8 runs, including the three that lost 40% everywhere else. Worst observed drop 1.0%, so 25% is a 25x margin. This is the only scenario here that can catch a sub-2x regression."
+    }
+  }
+}
