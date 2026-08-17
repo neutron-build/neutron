@@ -59,6 +59,16 @@ PROBES=(
   "probe_tsdoc|--iterations $((2000 * M))"
   "probe_datalog|--iterations $((2000 * M))"
   "probe_streams|--iterations $((2000 * M))"
+  "probe_streams_oracle|--iterations $((240 * M)) --ops 60|streams-oracle"
+  # The oracle's own controls. Each perturbs one section's model the way an
+  # engine bug would and requires that section — and only that section — to
+  # report; they cost about a second each and they are the only thing standing
+  # between "the oracle is clean" and "the oracle stopped looking". The first
+  # version of this control passed while two of its three perturbations were
+  # never applied, which is precisely the failure they now guard against.
+  "probe_streams_oracle|--negative-control streams --ops 40|streams-oracle-control-streams"
+  "probe_streams_oracle|--negative-control pubsub --ops 40|streams-oracle-control-pubsub"
+  "probe_streams_oracle|--negative-control cdc --ops 40|streams-oracle-control-cdc"
   "probe_meta|--iterations $((2000 * M))"
   "probe_concurrency|"
   "probe_efficiency|"
