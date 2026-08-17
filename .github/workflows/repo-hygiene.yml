@@ -41,6 +41,15 @@ jobs:
             python3 .github/scripts/check_line_endings.py --range "HEAD~1..HEAD"
           fi
 
+      # A documented function that does not exist is the worst documentation
+      # bug there is: the reader copies the first example and gets `unknown
+      # function`. It has been found by hand three times, months apart — most
+      # recently the public Key-Value page opening with `KV_DELETE` (the real
+      # name is `KV_DEL`) and documenting four set/TTL functions that are not
+      # implemented at all.
+      - name: Every documented Nucleus function exists
+        run: python3 .github/scripts/check_documented_functions.py
+
   contract-ir:
     name: The contract IR agrees with the prose contract
     runs-on: ubuntu-latest

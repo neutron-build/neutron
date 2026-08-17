@@ -15,7 +15,7 @@ SELECT KV_SET('user:1:session', 'abc123', 3600);
 SELECT KV_GET('user:1:session');
 
 -- Delete a key
-SELECT KV_DELETE('user:1:session');
+SELECT KV_DEL('user:1:session');
 
 -- Check if a key exists
 SELECT KV_EXISTS('user:1:session');
@@ -29,9 +29,6 @@ SELECT KV_SET('cache:homepage', '<html>...</html>', 300);
 
 -- Get remaining TTL
 SELECT KV_TTL('cache:homepage');
-
--- Remove TTL (persist forever)
-SELECT KV_PERSIST('cache:homepage');
 
 -- Set TTL on existing key
 SELECT KV_EXPIRE('cache:homepage', 600);
@@ -86,11 +83,16 @@ SELECT KV_SISMEMBER('tags:post:1', 'rust');
 -- Get all members
 SELECT KV_SMEMBERS('tags:post:1');
 
--- Set operations
-SELECT KV_SINTER('tags:post:1', 'tags:post:2');
-SELECT KV_SUNION('tags:post:1', 'tags:post:2');
-SELECT KV_SDIFF('tags:post:1', 'tags:post:2');
+-- Remove a member
+SELECT KV_SREM('tags:post:1', 'rust');
+
+-- Cardinality
+SELECT KV_SCARD('tags:post:1');
 ```
+
+Set-to-set operations (`SINTER`/`SUNION`/`SDIFF`) and TTL removal (`PERSIST`)
+are not implemented. Intersect two tag sets in SQL against `KV_SMEMBERS` until
+they are.
 
 ## Sorted Sets
 

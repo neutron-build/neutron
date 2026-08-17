@@ -49,7 +49,15 @@ trap cleanup EXIT INT TERM
 echo "== initdb + start postgres 17 (port $PG_PORT) =="
 initdb -D "$WORK/pgdata" -A trust -U nucleus --locale=C --encoding=UTF8 >"$WORK/initdb.log" 2>&1 || {
     echo "initdb failed"; tail -5 "$WORK/initdb.log"; exit 1; }
-pg_ctl -D "$WORK/pgdata" -o "-p $PG_PORT -c listen_addresses=127.0.0.1" \
+# `unix_socket_directories` is set explicitly because its compiled-in default
+# differs by platform and the Linux one is not writable by an ordinary user:
+# Homebrew builds default to /tmp, Debian/Ubuntu builds to /var/run/postgresql,
+# and on a CI runner that is `FATAL: could not create lock file … Permission
+# denied` — a failure that looks nothing like a socket-directory problem and
+# arrives after a seven-minute release build. Everything here connects over
+# TCP on 127.0.0.1, so the directory only has to exist and be writable.
+pg_ctl -D "$WORK/pgdata" \
+    -o "-p $PG_PORT -c listen_addresses=127.0.0.1 -c unix_socket_directories=$WORK" \
     -l "$WORK/pg.log" start >/dev/null 2>&1 || { echo "pg start failed"; tail -5 "$WORK/pg.log"; exit 1; }
 createdb -h 127.0.0.1 -p "$PG_PORT" -U nucleus nucleus >/dev/null 2>&1
 

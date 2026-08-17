@@ -1,0 +1,60 @@
+name: Go SDK
+
+# The `go/` SDK — the Go framework + Nucleus client — had no workflow at all
+# until 2026-08-17. `cli.yml` runs `go test` in `cli/`, which is a different
+# module, so 48 `_test.go` files across 8 packages had never run in CI. They
+# pass; nothing was broken. That is the point: nothing would have said so.
+#
+# Found by the S54 completeness pass, which asked one question per pillar —
+# "are the tests that exist actually executed?" — and got three noes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "go/**"
+      - ".github/workflows/go.yml"
+  pull_request:
+    paths:
+      - "go/**"
+      - ".github/workflows/go.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build, vet and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go/go.sum
+
+      - name: Build
+        run: go build ./...
+        working-directory: go
+
+      - name: Vet
+        run: go vet ./...
+        working-directory: go
+
+      # -race because the SDK ships a job scheduler, a response cache and a
+      # realtime subscriber; a data race in any of them is a production bug
+      # that a serial test run cannot see.
+      - name: Test
+        run: go test -race ./...
+        working-directory: go
+
+      # A `go test ./...` that matches no packages exits 0. Assert the suite
+      # actually ran something before believing this job (R8).
+      - name: Assert the suite was not empty
+        run: |
+          set -euo pipefail
+          n=$(go test -race ./... 2>&1 | grep -c '^ok  ' || true)
+          echo "packages with tests: $n"
+          [ "$n" -ge 8 ] || { echo "expected at least 8 tested packages, got $n"; exit 1; }
+        working-directory: go

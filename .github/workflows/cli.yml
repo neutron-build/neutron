@@ -32,6 +32,12 @@ jobs:
           node-version: 24
       - run: npm ci
         working-directory: studio
+      # Studio's own suite — 27 files, 321 tests — passed locally and had never
+      # run in CI: this job built the dist and shipped it without executing a
+      # single one of them. Found by the S54 completeness pass, 2026-08-17.
+      - name: Test Studio
+        run: npm test
+        working-directory: studio
       - run: npm run build
         working-directory: studio
       - uses: actions/upload-artifact@v4
