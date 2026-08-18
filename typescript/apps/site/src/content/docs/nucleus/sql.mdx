@@ -168,9 +168,19 @@ SELECT CURRVAL('order_seq');
 
 ## Triggers
 
+`CREATE TRIGGER` and `DROP TRIGGER` are accepted and the definition is stored
+and matched against the right table, timing and event:
+
 ```sql
-CREATE TRIGGER update_timestamp
-BEFORE UPDATE ON users
+CREATE TRIGGER audit_writes
+AFTER INSERT ON users
 FOR EACH ROW
-SET NEW.updated_at = NOW();
+EXECUTE FUNCTION audit_users();
 ```
+
+**Trigger bodies do not execute yet.** A trigger fires at the right moment and
+its body is not run, so nothing observable happens — verified against a live
+engine on 2026-08-17. Do not use a trigger to enforce an invariant, write an
+audit row, or maintain a derived table; use the application, or a statement
+that does the work explicitly. The `SET NEW.col = …` body form shown here
+previously does not parse at all.

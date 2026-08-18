@@ -1590,3 +1590,104 @@ async fn test_begin_does_not_copy_untouched_per_table_engines() {
         base * 1000.0
     );
 }
+
+// ======================================================================
+// NU-246: an AFTER trigger must not fire for a row that was never written
+//
+// The INSERT path fired row-level AFTER triggers while the row was still
+// STAGED — `inserted_rows.push(row)` happens after the trigger, and the
+// storage write is a batch at the end of the statement. So any later failure
+// (a NOT NULL violation on a subsequent row, a storage error, a unique
+// violation) left the AFTER effects of earlier rows behind for rows that never
+// existed. It also contradicts what AFTER means.
+// ======================================================================
+
+/// CHARACTERIZATION, not a guarantee: a trigger body does not execute at all.
+///
+/// Written while fixing NU-246, whose premise is that AFTER effects can leak
+/// for rows that were never written. The control for that test — "does a
+/// trigger do anything on a SUCCESSFUL insert?" — failed, and instrumenting
+/// showed why: `CREATE TRIGGER … BEGIN INSERT INTO audit VALUES (1); END`
+/// stores the body verbatim *including the BEGIN/END wrapper* and hands the
+/// whole string to `execute()`, which parses `BEGIN` as a transaction start and
+/// then fails on `INSERT`. The failure goes to `eprintln!` and is swallowed, so
+/// the trigger fires, does nothing, and reports nothing.
+///
+/// The `EXECUTE FUNCTION f()` form stores just `f`, which is not a statement
+/// either. And the form in the published docs
+/// (`… FOR EACH ROW SET NEW.updated_at = NOW()`) does not parse at all.
+///
+/// So NU-246's user-visible impact is currently **zero** — there are no AFTER
+/// effects to leak. The ordering fix is still made, because the trap is real
+/// the moment bodies execute. Filed as its own finding; this test exists so
+/// that whoever implements trigger bodies is told immediately that a test
+/// asserts they do not.
+///
+/// **This test should FAIL when trigger bodies start executing.** Delete it
+/// then, and restore the control it replaced.
+#[tokio::test]
+async fn trigger_bodies_currently_do_not_execute() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE base246 (id INT PRIMARY KEY, v TEXT NOT NULL)",
+    )
+    .await;
+    exec(&ex, "CREATE TABLE audit246 (n INT)").await;
+    exec(
+        &ex,
+        "CREATE TRIGGER t246 AFTER INSERT ON base246 FOR EACH ROW \
+         BEGIN INSERT INTO audit246 VALUES (1); END",
+    )
+    .await;
+
+    exec(&ex, "INSERT INTO base246 VALUES (1, 'ok')").await;
+    assert_eq!(
+        rows(&exec(&ex, "SELECT id FROM base246").await[0]).len(),
+        1,
+        "the insert itself must succeed"
+    );
+    assert_eq!(
+        rows(&exec(&ex, "SELECT n FROM audit246").await[0]).len(),
+        0,
+        "a trigger body executed — that is GOOD news, and this characterization \
+         test is now wrong. Delete it and restore the real AFTER-ordering test."
+    );
+
+    // The documented spelling does not even parse.
+    assert!(
+        ex.execute(
+            "CREATE TRIGGER doc246 BEFORE UPDATE ON base246 FOR EACH ROW \
+             SET NEW.v = 'x'"
+        )
+        .await
+        .is_err(),
+        "the trigger form shown in the published docs now parses — update the docs"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_insert_statement_writes_no_rows() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE base246b (id INT PRIMARY KEY, v TEXT NOT NULL)",
+    )
+    .await;
+
+    // Row 1 is valid; row 2 violates NOT NULL, so the statement fails and
+    // NOTHING is written — including row 1. This is the property the AFTER
+    // trigger ordering depends on: staged rows are not written, so anything
+    // fired during staging is fired for a row that never existed.
+    assert!(
+        ex.execute("INSERT INTO base246b VALUES (1, 'ok'), (2, NULL)")
+            .await
+            .is_err(),
+        "the NOT NULL violation must fail the statement"
+    );
+    assert_eq!(
+        rows(&exec(&ex, "SELECT id FROM base246b").await[0]).len(),
+        0,
+        "a failed statement wrote rows"
+    );
+}

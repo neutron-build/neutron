@@ -358,6 +358,10 @@ impl Executor {
         let mut count = 0;
         let mut returned_rows = Vec::new();
         let mut inserted_rows: Vec<Row> = Vec::new();
+        // Rows whose AFTER-INSERT row-level triggers are owed, fired only once
+        // the base write has succeeded. Cloned only when triggers exist, so a
+        // table without them pays nothing. (NU-246)
+        let mut after_insert_rows: Vec<Row> = Vec::new();
         // Set when an ON CONFLICT DO UPDATE rewrites an existing row in place.
         // That path bypasses the staged-insert index bookkeeping, so its derived
         // indexes must be rebuilt. Plain appends maintain indexes incrementally
@@ -445,18 +449,16 @@ impl Executor {
                     self.update_vector_indexes_on_insert(&table_name, &row, &table_def)?;
                     self.update_encrypted_indexes_on_insert(&table_name, &row, &table_def);
                     self.update_fts_indexes_on_insert(&table_name, &row, &table_def);
-                    // Fire AFTER INSERT row-level triggers (only if triggers exist)
+                    // AFTER means after. This used to fire here, while the row
+                    // was still STAGED — `inserted_rows` is not written until
+                    // the batch at the end of the statement — so any later
+                    // failure (a NOT NULL violation on a subsequent row, a
+                    // storage error, a unique violation) left the AFTER effects
+                    // of earlier rows behind for rows that never existed.
+                    // Queued and fired below, once the write has succeeded.
+                    // (NU-246)
                     if has_triggers {
-                        self.fire_triggers(
-                            &table_name,
-                            TriggerTiming::After,
-                            TriggerEvent::Insert,
-                            None,
-                            Some(&row),
-                            &col_meta,
-                            true,
-                        )
-                        .await;
+                        after_insert_rows.push(row.clone());
                     }
                     inserted_rows.push(row);
                     count += 1;
@@ -726,6 +728,21 @@ impl Executor {
             // Plain appends already maintained vector/encrypted indexes inline;
             // only the GIN/FTS postings need the incremental refresh.
             self.refresh_gin_after_write(&table_name).await;
+        }
+
+        // The base write has succeeded. Row-level AFTER triggers first, then
+        // statement-level, matching PostgreSQL's order.
+        for row in &after_insert_rows {
+            self.fire_triggers(
+                &table_name,
+                TriggerTiming::After,
+                TriggerEvent::Insert,
+                None,
+                Some(row),
+                &col_meta,
+                true,
+            )
+            .await;
         }
 
         // Fire AFTER INSERT statement-level triggers
@@ -2341,6 +2358,10 @@ impl Executor {
         }
 
         let mut updates = Vec::new();
+        // (old, new) pairs whose AFTER-UPDATE row-level triggers are owed,
+        // fired only once the base write has succeeded. Cloned only when
+        // triggers exist, so a table without them pays nothing. (NU-246)
+        let mut after_update_rows: Vec<(Row, Row)> = Vec::new();
         let mut returned_rows = Vec::new();
         for (pos, row) in &all_rows {
             // If pre_filtered, all rows already match the WHERE clause
@@ -2413,18 +2434,11 @@ impl Executor {
                     returned_rows.push(returned);
                 }
 
-                // Fire AFTER UPDATE row-level triggers
+                // Queued, not fired: the update is only STAGED here and the
+                // storage write is below, so firing now leaves AFTER effects
+                // behind for a row the statement may never write. (NU-246)
                 if has_triggers {
-                    self.fire_triggers(
-                        &table_name,
-                        TriggerTiming::After,
-                        TriggerEvent::Update,
-                        Some(row),
-                        Some(&new_row),
-                        &col_meta,
-                        true,
-                    )
-                    .await;
+                    after_update_rows.push((row.clone(), new_row.clone()));
                 }
 
                 updates.push((*pos, new_row));
@@ -2602,6 +2616,21 @@ impl Executor {
             } else {
                 self.rebuild_table_derived_state(&table_name).await;
             }
+        }
+
+        // The base write has succeeded. Row-level AFTER triggers first, then
+        // statement-level, matching PostgreSQL's order.
+        for (old_row, new_row) in &after_update_rows {
+            self.fire_triggers(
+                &table_name,
+                TriggerTiming::After,
+                TriggerEvent::Update,
+                Some(old_row),
+                Some(new_row),
+                &col_meta,
+                true,
+            )
+            .await;
         }
 
         // Fire AFTER UPDATE statement-level triggers
