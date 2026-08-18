@@ -124,6 +124,21 @@ async def test_stacked_middleware():
         assert "x-request-id" in resp.headers
 
 
+def test_bare_middleware_class_rejected():
+    """A middleware class passed un-instantiated is rejected at construction,
+    not silently dropped (the quickstart used to do exactly this and got an
+    app with no request ids and no logging)."""
+    with pytest.raises(TypeError, match=r"RequestIDMiddleware\(\)"):
+        App(title="MW Test", middleware=[RequestIDMiddleware])
+
+
+def test_unrecognised_middleware_rejected():
+    """Any entry that is neither a Neutron middleware instance nor a
+    starlette.middleware.Middleware is rejected at construction."""
+    with pytest.raises(TypeError, match="not middleware"):
+        App(title="MW Test", middleware=["not middleware"])
+
+
 # --------------------------------------------------------------------------
 # Per-IP Rate Limiting Tests
 # --------------------------------------------------------------------------

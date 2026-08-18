@@ -115,8 +115,8 @@ from neutron.middleware import (
 app = App(
     title="My API",
     middleware=[
-        RequestIDMiddleware,
-        LoggingMiddleware,
+        RequestIDMiddleware(),
+        LoggingMiddleware(),
         CORSMiddleware(allow_origins=["*"]),
         CompressionMiddleware(minimum_size=500),
         RateLimitMiddleware(rps=100, burst=200),

@@ -61,6 +61,29 @@ async def _dependency_reachable(db: Any, *, timeout: float = 2.0) -> bool:
     return True
 
 
+def _middleware_type_error(entry: Any) -> TypeError:
+    """Error for a ``middleware=`` entry App cannot use.
+
+    Bare middleware classes are rejected rather than auto-instantiated:
+    zero-argument construction is not guaranteed for every middleware
+    (e.g. JWTMiddleware requires a secret), so adapting would just move the
+    failure into a confusing ``__init__`` traceback. Every documented
+    example and ``default_stack`` passes configured instances — keep that
+    contract explicit.
+    """
+    if isinstance(entry, type) and issubclass(entry, _NeutronMiddleware):
+        return TypeError(
+            f"Invalid middleware entry: {entry.__name__} is a class, not an "
+            f"instance. Construct it with your configuration, e.g. "
+            f"{entry.__name__}()."
+        )
+    return TypeError(
+        f"Invalid middleware entry: {entry!r}. Expected a Neutron middleware "
+        f"instance (e.g. RequestIDMiddleware()) or a "
+        f"starlette.middleware.Middleware instance."
+    )
+
+
 class App:
     """Neutron application.
 
@@ -121,6 +144,13 @@ class App:
             self._middleware_config.insert(
                 0, TrailingSlashMiddleware(action=trailing_slash)
             )
+
+        # Reject unrecognised middleware at construction. _build_app used to
+        # silently drop anything it did not recognise, so a typo'd or bare
+        # class entry vanished with no error while the app served without it.
+        for mw in self._middleware_config:
+            if not isinstance(mw, (_NeutronMiddleware, Middleware)):
+                raise _middleware_type_error(mw)
 
     def on_stop(
         self, func: Callable[[], Coroutine[Any, Any, None]],
@@ -213,6 +243,8 @@ class App:
                 starlette_middleware.append(mw.as_starlette_middleware())
             elif isinstance(mw, Middleware):
                 starlette_middleware.append(mw)
+            else:
+                raise _middleware_type_error(mw)
 
         # Exception handlers
         exception_handlers: dict[Any, Callable] = {
