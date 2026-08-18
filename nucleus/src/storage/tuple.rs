@@ -920,6 +920,18 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
                 u32::from_le_bytes([data[apos], data[apos + 1], data[apos + 2], data[apos + 3]])
                     as usize;
             apos += 4;
+            // A file-supplied count straight into `with_capacity` ABORTS the
+            // process through `handle_alloc_error` on Linux — no unwind, no
+            // Err, no log — while macOS overcommits and quietly succeeds, so
+            // this survived every local run and only showed up as exit 134 in
+            // CI. The full-row path and `value_codec` were both guarded when
+            // that class was swept; this one was missed, which is the same
+            // full-vs-projected asymmetry NU-239 had. Every element costs at
+            // least its tag byte, so a count larger than the array's remaining
+            // span cannot be real.
+            if elem_count > arr_end.saturating_sub(apos) {
+                return None;
+            }
             let mut elems = Vec::with_capacity(elem_count);
             for _ in 0..elem_count {
                 if apos >= arr_end {
@@ -1505,5 +1517,41 @@ mod tests {
         // Get only the vector
         let projected = deserialize_row_projected(&bytes, &types, &[1]).unwrap();
         assert_eq!(projected, vec![Value::Vector(vec![1.0, 2.0, 3.0])]);
+    }
+
+    /// A decoded element count must never reach `Vec::with_capacity` unchecked.
+    /// On Linux that aborts the process through `handle_alloc_error` — no
+    /// unwind, no `Err`, no log — while macOS overcommits and succeeds, so the
+    /// projected path's missing guard passed every local run and surfaced only
+    /// as exit 134 in CI. Both read paths must REFUSE.
+    ///
+    /// **Read this before trusting a local pass.** This test does not
+    /// discriminate on macOS: without the guard the unbounded reservation just
+    /// succeeds, the element loop then runs out of span, and the function
+    /// returns `None` anyway — the same answer, after reserving ~137 GB. The
+    /// only portable observable is the allocation itself, which needs an
+    /// allocator hook to see. It is a genuine regression pin on Linux (an
+    /// abort kills the test binary) and a documentation of intent everywhere
+    /// else. Do not "verify" this one by running it here.
+    #[test]
+    fn absurd_array_element_count_is_refused_not_allocated() {
+        let types = vec![DataType::Array(Box::new(DataType::Text))];
+        // One column: [null bitmap][total_len: u32][elem_count: u32][elements]
+        let mut bytes = vec![0u8]; // bitmap, nothing null
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // array span = 8 bytes
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // element count = 4.29e9
+        bytes.extend_from_slice(&[4, 0, 0, 0]); // 4 bytes of would-be element data
+
+        assert_eq!(deserialize_row(&bytes, &types), None);
+        assert_eq!(deserialize_row_projected(&bytes, &types, &[0]), None);
+
+        // And the honest case still decodes, so the guard is not just "always
+        // refuse arrays".
+        let good = serialize_row(
+            &vec![Value::Array(vec![Value::Text("a".into()), Value::Int32(2)])],
+            &types,
+        );
+        assert!(deserialize_row(&good, &types).is_some());
+        assert!(deserialize_row_projected(&good, &types, &[0]).is_some());
     }
 }
