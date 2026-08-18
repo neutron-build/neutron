@@ -45,7 +45,14 @@ cargo run --release --features "server rusqlite" --bin probe_recover_engines -- 
 cargo run --release --features "server rusqlite" --bin probe_io_faults
 cargo run --release --features "server rusqlite" --bin probe_blob
 cargo run --release --features server --bin probe_sessions
+cargo run --release --features server --bin probe_decode_honesty
+cargo run --release --features server --bin probe_ddl_recreate
 ```
+
+`probe_decode_honesty` gates every read path's decoder, so run it after ANY
+change to `storage/tuple.rs` — including one that looks like a pure
+refactor. `probe_ddl_recreate` opens all five engines, so run it after any
+change to DDL registration or to a `StorageEngine` implementation.
 
 **`probe_recover_engines` does not currently pass, and that is not your
 change.** Its `vector` and `catalog` sections report divergences for two live
@@ -164,9 +171,41 @@ caught by the probe that found it.
 
 ### What the S35 probes found immediately
 
-Two live findings, both found on the first runs. Neither is a regression from
-the Phase C fixes — both are *adjacent* defects the fixed bugs' probes exposed
-once they existed.
+Five live findings so far, every one on a first run. None is a regression from
+the Phase C fixes — all are *adjacent* defects the fixed bugs' probes exposed
+once they existed, which is the argument for writing a probe per class rather
+than a test per finding.
+
+Three of the five were found by the two class probes added on 2026-08-18 and
+are **already fixed**, so those probes ship green:
+
+**3. Any non-zero byte decoded as boolean `true`.** `Value::Bool(data[pos] !=
+0)` in all four bool decode sites accepted the 254 byte values the encoder can
+never produce. 165 of `probe_decode_honesty`'s first 182 divergences were this
+one defect. Strict now (`0`/`1`, anything else reports).
+
+**4. An array's byte span and its element count were never checked against
+each other.** They are the encoding's only redundancy, and the decoder trusted
+the count and jumped to the end of the span — so a damaged count read 36 bytes
+of live elements back as an EMPTY array and reported success, in both the
+full-row and the projected path. They must agree now.
+
+**5. `CREATE SEQUENCE` on an existing name silently rewound it, on all five
+engines.** `execute_create_sequence` inserted a fresh `SequenceDef` at
+`start - increment` over the live one and returned success: a sequence
+advanced to 3 answered 0 afterwards, then handed out primary keys that already
+existed. `IF NOT EXISTS` did it too, because the flag was discarded by a `..`
+at the call site — the worse half, since that is the form idempotent
+migrations use precisely because it is supposed to be safe. NU-251's class,
+different object, and the sequence surface is the one where the damage is
+silent rather than an error.
+
+Also observed by `probe_ddl_recreate`, recorded but NOT failed because nothing
+is destroyed: a duplicate `CREATE VIEW` and a duplicate `CREATE ROLE` both
+succeed where PostgreSQL raises `relation already exists`, so a client written
+against PostgreSQL never sees the error it handles.
+
+The first two findings remain open:
 
 **1. Vector WAL recovery is not faithful — in both directions.** The `vector`
 section of `probe_recover_engines` reports a recovered HNSW live-vector count
@@ -217,8 +256,8 @@ Phase C closed 15 Criticals; S35 added or extended one probe per *class*
 | Corrupt persisted state treated as empty and written back | NU-163, NU-165 | `probe_recover_engines` `catalog` section |
 | Permissive default on the failure path (sessions, guards) | NU-217, NU-218 | `probe_sessions` |
 | Side-effecting fns admitted while degraded / Describe disagreement | NU-216 | **not covered** — registry-level agreement is unit-tested (`mutating_registries_agree`); a behavioral probe is future work |
-| Invalid persisted bytes decode as valid | NU-239 | **not covered** — unit-tested in `tuple.rs`; no adversarial probe yet |
-| Duplicate DDL destroys rows | NU-251 | **not covered** — asserted across four engines in unit tests |
+| Invalid persisted bytes decode as valid | NU-239 | `probe_decode_honesty` — `canonical` (encode∘decode identity over every `DataType`) + `agreement` (full vs projected read path on the same damaged column) |
+| Duplicate DDL destroys rows | NU-251 | `probe_ddl_recreate` — table/index/view/sequence/type/role/policy re-registration across all five engines |
 | Trigger fires against a row never written | NU-246 | **not covered** — queue/fire regression exists; note the separate finding that trigger bodies never execute at all |
 | Unique/PK not enforced under concurrency | NU-254 | **not covered** as a probe — `tests/concurrent_unique_paged_regression.rs` is a 6-test negative-tested integration suite, the lowest marginal value for a probe |
 
@@ -236,6 +275,12 @@ cargo run --release --features "server rusqlite" --bin probe_io_faults -- --nega
 cargo run --release --features server --bin probe_sessions
 cargo run --release --features server --bin probe_sessions -- --negative-control authority
 cargo run --release --features server --bin probe_sessions -- --negative-control guards
+cargo run --release --features server --bin probe_decode_honesty
+cargo run --release --features server --bin probe_decode_honesty -- --negative-control canonical
+cargo run --release --features server --bin probe_decode_honesty -- --negative-control agreement
+cargo run --release --features server --bin probe_ddl_recreate
+cargo run --release --features server --bin probe_ddl_recreate -- --negative-control tables
+cargo run --release --features server --bin probe_ddl_recreate -- --negative-control objects
 ```
 
 What each control perturbs:
@@ -256,6 +301,28 @@ What each control perturbs:
   fallback session (the NU-218 shape).
 - `guards` — the model expects at least one guard observation to answer the
   unsafe direction under contention (the NU-217 shape).
+- `canonical` / `agreement` — the decoder is wrapped in an adapter that answers
+  reported corruption with a plausible value (all-NULL) instead, which is the
+  NU-239 shape with the type abstracted away. Both controls fire in **every**
+  corpus row — scalars, text, temporal, binary, array, vector and both JSONB
+  arms — so it is nine independent checks observed discriminating, not one.
+- `tables` / `objects` — the state is deliberately damaged BETWEEN the two
+  observations rather than the expectation being inverted. That is the thing
+  most likely to be silently wrong in a probe like this: not what it expects,
+  but whether its observation can see loss at all.
+
+Two notes on `probe_decode_honesty`'s oracle, both of which cost a wrong result
+first:
+
+- The `agreement` check originally compared `Value`s with `==` and reported
+  three divergences that were `Float64(NaN) != Float64(NaN)` — damaging eight
+  bytes of a double produces a NaN routinely. It compares canonical
+  **encodings** now.
+- JSONB is deliberately EXEMPT from the `encode ∘ decode = identity` oracle and
+  checked against `serde_json` instead. Its stored form is JSON text, which has
+  many byte representations of one value, so reordering two map keys makes the
+  re-encoding differ while nothing was invented. Applying a byte oracle to a
+  non-canonical encoding produces confident false positives.
 
 Note on the io-fault fault points: `datalog.wal_append` and `vector.wal_append`
 were added to `ALL_IO_POINTS` for this, so the existing matrix sweeps them
@@ -327,6 +394,8 @@ crashes, hangs, and self-inconsistency rather than wrong answers.
 | `probe_concurrency_threads` | Same, but real OS threads on one shared `Executor`. |
 | `probe_serializable` | Outcome matches *some* serial order — the only true serializability oracle here. |
 | `probe_sessions` | Session authority and guard state (S35): authority never installs onto the fallback session for an unknown/stale id (NU-218), and `session_in_transaction` / `session_has_active_rls` never answer the unsafe direction under concurrent churn (NU-217). Carries `--negative-control <authority\|guards>`. |
+| `probe_decode_honesty` | A decoder never returns a value it cannot reproduce (S35, NU-239 class): `encode ∘ decode = identity` over every `DataType` under byte-level damage, plus full-vs-projected agreement on the same damaged column. JSONB is checked against `serde_json` instead, since its stored form is not canonical. Carries `--negative-control <canonical\|agreement>`. |
+| `probe_ddl_recreate` | A duplicate CREATE never destroys what the first one made (S35, NU-251 class): table, index, view, sequence, enum type, role and policy re-registration on **all five** engines, checking the state survives the second and third attempt whatever the statement answers. Carries `--negative-control <tables\|objects>`. |
 
 ## Crash, durability, and fault injection
 

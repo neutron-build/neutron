@@ -185,7 +185,16 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos >= data.len() {
                     return None;
                 }
-                row.push(Value::Bool(data[pos] != 0));
+                // Only 0 and 1 are encodings of a bool. `!= 0` accepted the
+                // 254 byte values the encoder can never produce and answered
+                // `true` for every one of them, so a damaged bool byte read
+                // back as a plausible value rather than a reported corruption
+                // — NU-239's shape with a different type in it.
+                row.push(Value::Bool(match data[pos] {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                }));
                 pos += 1;
             }
             DataType::Int32 => {
@@ -389,7 +398,11 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                             if pos >= arr_end {
                                 return None;
                             }
-                            elems.push(Value::Bool(data[pos] != 0));
+                            elems.push(Value::Bool(match data[pos] {
+                                0 => false,
+                                1 => true,
+                                _ => return None,
+                            }));
                             pos += 1;
                         }
                         1 => {
@@ -468,8 +481,15 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                         _ => return None, // Unknown tag
                     }
                 }
+                // The array carries BOTH a byte span and an element count,
+                // and they are the only redundancy in the encoding. Trusting
+                // the count alone and jumping to `arr_end` meant a damaged
+                // count decoded 36 bytes of live elements as an EMPTY array
+                // and reported success. They must agree.
+                if pos != arr_end {
+                    return None;
+                }
                 row.push(Value::Array(elems));
-                pos = arr_end;
             }
             DataType::Vector(_) => {
                 // Deserialize packed floats.
@@ -733,7 +753,11 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             if pos >= data.len() {
                 return None;
             }
-            Some(Value::Bool(data[pos] != 0))
+            match data[pos] {
+                0 => Some(Value::Bool(false)),
+                1 => Some(Value::Bool(true)),
+                _ => None,
+            }
         }
         DataType::Int32 => {
             if pos + 4 > data.len() {
@@ -908,7 +932,11 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
                         if apos >= arr_end {
                             return None;
                         }
-                        elems.push(Value::Bool(data[apos] != 0));
+                        elems.push(Value::Bool(match data[apos] {
+                            0 => false,
+                            1 => true,
+                            _ => return None,
+                        }));
                         apos += 1;
                     }
                     1 => {
@@ -981,6 +1009,10 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
                     }
                     _ => return None,
                 }
+            }
+            // Same span/count agreement as the full-row path above.
+            if apos != arr_end {
+                return None;
             }
             Some(Value::Array(elems))
         }

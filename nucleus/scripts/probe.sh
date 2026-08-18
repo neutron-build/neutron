@@ -102,6 +102,16 @@ PROBES=(
   # If they are still here after 2026-09-30, that is the bug, not the backlog.
   "probe_recover_engines|--iterations $((300 * M)) --skip-section vector --skip-section catalog"
   "probe_blob|"
+  # ── S35 class probes (2026-08-18) ──
+  # Both carry their own negative controls, and both are cheap, so the controls
+  # run here too. A class probe that stopped discriminating looks exactly like
+  # a class that stopped having bugs.
+  "probe_decode_honesty|--iterations $((200 * M))|decode-honesty"
+  "probe_decode_honesty|--negative-control canonical|decode-honesty-control-canonical"
+  "probe_decode_honesty|--negative-control agreement|decode-honesty-control-agreement"
+  "probe_ddl_recreate||ddl-recreate"
+  "probe_ddl_recreate|--negative-control tables|ddl-recreate-control-tables"
+  "probe_ddl_recreate|--negative-control objects|ddl-recreate-control-objects"
   # All Tier 1/2 findings are fixed and gated. Remaining open items (tracked in
   # tests/tier_findings_open.rs) are #4 (READ COMMITTED per-statement snapshot —
   # LOW, currently stricter-than-spec/safe), which has no dedicated probe.

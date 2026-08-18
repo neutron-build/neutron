@@ -3512,7 +3512,30 @@ impl Executor {
         &self,
         name: &str,
         options: &[ast::SequenceOptions],
+        if_not_exists: bool,
     ) -> Result<ExecResult, ExecError> {
+        // A sequence's POSITION is its state, and this used to overwrite it.
+        // Re-issuing `CREATE SEQUENCE s` inserted a fresh `SequenceDef` at
+        // `start - increment` over the live one and returned success, so a
+        // sequence advanced to 3 answered 0 afterwards and then handed out
+        // primary keys that already existed. `IF NOT EXISTS` did it too — the
+        // flag was discarded by the `..` at the call site — which is the worse
+        // half, because that is the form idempotent migrations use precisely
+        // because it is supposed to be safe. NU-251 with a different object in
+        // it; found by `probe_ddl_recreate`, on all five engines.
+        if self.sequences.read().contains_key(name) {
+            return if if_not_exists {
+                Ok(ExecResult::Command {
+                    tag: "CREATE SEQUENCE".into(),
+                    rows_affected: 0,
+                })
+            } else {
+                Err(ExecError::Runtime(format!(
+                    "relation \"{name}\" already exists"
+                )))
+            };
+        }
+
         let mut start = 1i64;
         let mut increment = 1i64;
         let mut min_val = 1i64;

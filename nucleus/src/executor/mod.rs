@@ -5602,9 +5602,10 @@ impl Executor {
             Statement::CreateSequence {
                 name,
                 sequence_options,
+                if_not_exists,
                 ..
             } => {
-                self.execute_create_sequence(&name.to_string(), &sequence_options)
+                self.execute_create_sequence(&name.to_string(), &sequence_options, if_not_exists)
                     .await
             }
             Statement::Grant(grant) => {
