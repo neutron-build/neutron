@@ -7,6 +7,7 @@ import {
   discoverRoutes,
   adapterCloudflare,
   adapterDocker,
+  adapterNetlify,
   adapterStatic,
   adapterVercel,
   prepareContentCollections,
@@ -1006,7 +1007,7 @@ function writeStaticHeadersMetadata(
 }
 
 interface BuildArgs {
-  preset: "vercel" | "cloudflare" | "docker" | "static" | null;
+  preset: "vercel" | "cloudflare" | "docker" | "netlify" | "static" | null;
   cloudflareMode: "pages" | "workers";
 }
 
@@ -1053,14 +1054,14 @@ function parseBuildArgs(argv: string[]): BuildArgs {
     const arg = argv[i];
     if (arg === "--preset" && argv[i + 1]) {
       const value = argv[++i];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
     }
     if (arg.startsWith("--preset=")) {
       const value = arg.split("=")[1];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
@@ -1089,6 +1090,9 @@ function resolveAdapterForBuild(
 ): NeutronAdapter | undefined {
   if (args.preset === "vercel") {
     return adapterVercel();
+  }
+  if (args.preset === "netlify") {
+    return adapterNetlify();
   }
   if (args.preset === "cloudflare") {
     return adapterCloudflare({ mode: args.cloudflareMode });

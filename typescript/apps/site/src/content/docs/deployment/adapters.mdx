@@ -1,6 +1,6 @@
 ---
 title: Adapters
-description: Deploying Neutron to any platform.
+description: Deploying Neutron to supported platforms.
 ---
 
 Neutron uses an **Adapter** system to build your application for different deployment targets. By changing a few lines of configuration, you can switch from a Node.js server to a Cloudflare Worker or a Docker container.
@@ -22,4 +22,5 @@ npx @neutron-build/cli build --preset vercel
 -   `--preset docker`: long-running Node server (produces `dist/server.mjs` + Dockerfile).
 -   `--preset cloudflare`: Cloudflare Workers / Pages.
 -   `--preset vercel`: Vercel Serverless / Edge Functions.
+-   `--preset netlify`: Netlify Functions v2 + static publish.
 -   `--preset static`: pure static-site output (SSG).

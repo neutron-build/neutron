@@ -14,6 +14,14 @@
 //                 artifact + runtime bundle, but no Vercel platform (routing,
 //                 filesystem handling) is emulated. No vercel CLI exists in
 //                 this workspace and none is added.
+//   - netlify:    the generated functions/__neutron.mjs handler is a Functions
+//                 v2 style (Request) => Response function; it is invoked
+//                 in-process with real Request objects. Real requests flow
+//                 through the generated artifact + runtime bundle, but no
+//                 Netlify platform behavior (static-file shadowing of the
+//                 _redirects rewrite, function bundling via zip-it-and-ship-it,
+//                 netlify.toml interpretation) is emulated. No netlify CLI
+//                 exists in this workspace and none is added.
 //   - cloudflare: STATIC CHECKS ONLY, labelled [static] below. The workers
 //                 runtime bundle (dist/server/worker/entry.js) is mixed-module
 //                 output (ESM import/export statements plus a top-level
@@ -86,6 +94,49 @@ async function verifyVercel() {
   assert(compute.body.includes("value="), "vercel: /compute SSR body missing rendered loader value");
 
   console.log("[boot] vercel: invoked generated handler (in-process) — /api/cache 200 JSON, /compute 200 SSR");
+}
+
+async function verifyNetlify() {
+  const functionPath = path.join(DIST_DIR, "functions", "__neutron.mjs");
+  assert(fs.existsSync(functionPath), "netlify: dist/functions/__neutron.mjs missing after build");
+  const handler = (await import(pathToFileURL(functionPath))).default;
+  assert(typeof handler === "function", "netlify: functions/__neutron.mjs default export is not a function");
+
+  const call = async (url) => {
+    const response = await handler(new Request(`http://localhost${url}`));
+    assert(response instanceof Response, `netlify: handler for ${url} did not return a Response`);
+    return { status: response.status, body: await response.text(), headers: response.headers };
+  };
+
+  const cache = await call("/api/cache");
+  assert(cache.status === 200, `netlify: GET /api/cache via generated function returned ${cache.status}`);
+  assert(
+    (cache.headers.get("content-type") || "").includes("application/json"),
+    `netlify: /api/cache content-type mismatch: ${cache.headers.get("content-type")}`
+  );
+  assert(cache.body.includes(`"ok":true`), `netlify: /api/cache body missing ok:true: ${cache.body.slice(0, 80)}`);
+
+  const compute = await call("/compute");
+  assert(compute.status === 200, `netlify: GET /compute via generated function returned ${compute.status}`);
+  assert(compute.body.includes("value="), "netlify: /compute SSR body missing rendered loader value");
+
+  // Publish-dir artifacts Netlify itself reads. Shape checks on exact emitted
+  // content, labelled as such — interpreting them is Netlify's job, not ours.
+  const redirectsRaw = fs.readFileSync(path.join(DIST_DIR, "_redirects"), "utf-8");
+  assert(
+    redirectsRaw.includes("/*  /.netlify/functions/__neutron  200"),
+    `netlify [static]: _redirects missing SSR rewrite, got: ${redirectsRaw.trim()}`
+  );
+  const tomlRaw = fs.readFileSync(path.join(DIST_DIR, "netlify.toml"), "utf-8");
+  assert(tomlRaw.includes("[functions]"), "netlify [static]: netlify.toml missing [functions] section");
+  assert(tomlRaw.includes("[[redirects]]"), "netlify [static]: netlify.toml missing redirect for SSR fallback");
+
+  console.log("[boot] netlify: invoked generated function (in-process) — /api/cache 200 JSON, /compute 200 SSR");
+  console.log(
+    "[boot] netlify [static]: _redirects rewrite + netlify.toml shape checked; " +
+      "NOT booted on the Netlify platform — no static-file shadowing / function bundling / " +
+      "netlify CLI in this workspace."
+  );
 }
 
 function verifyCloudflareStatic() {
@@ -242,6 +293,9 @@ async function main() {
   buildPreset("vercel");
   await verifyVercel();
 
+  buildPreset("netlify");
+  await verifyNetlify();
+
   buildPreset("cloudflare");
   verifyCloudflareStatic();
 
@@ -249,7 +303,7 @@ async function main() {
   await verifyDocker();
 
   console.log("\n[boot] Deploy preset boot smoke passed.");
-  console.log("[boot] Coverage: docker=booted as a process (HTTP + SIGTERM drain); vercel=generated handler invoked in-process; cloudflare=static checks only (see labels above).");
+  console.log("[boot] Coverage: docker=booted as a process (HTTP + SIGTERM drain); vercel=generated handler invoked in-process; netlify=generated function invoked in-process; cloudflare=static checks only (see labels above).");
 }
 
 main().catch((error) => {

@@ -20,7 +20,7 @@ Builds client/server output and static pages.
 
 Options:
 
-- `--preset vercel|cloudflare|docker|static`
+- `--preset vercel|netlify|cloudflare|docker|static`
 - `--cloudflare-mode pages|workers` (when `--preset cloudflare`)
 
 Notes:
@@ -54,7 +54,7 @@ Validates adapter artifacts after build.
 
 Options:
 
-- `--preset vercel|cloudflare|docker|static`
+- `--preset vercel|netlify|cloudflare|docker|static`
 - `--dist <dir>` (default `dist`)
 
 `--preset` is optional; when omitted, Neutron detects built adapter metadata in `dist/`.
@@ -68,7 +68,7 @@ Runs:
 
 Options:
 
-- `--preset vercel|cloudflare|docker|static`
+- `--preset vercel|netlify|cloudflare|docker|static`
 - `--dist <dir>` (default `dist`)
 
 ## Notes

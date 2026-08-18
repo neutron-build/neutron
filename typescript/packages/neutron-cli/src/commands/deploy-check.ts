@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-type DeployPreset = "vercel" | "cloudflare" | "docker" | "static";
+type DeployPreset = "vercel" | "cloudflare" | "docker" | "netlify" | "static";
 
 interface DeployCheckArgs {
   preset: DeployPreset | null;
@@ -31,7 +31,7 @@ export async function deployCheck(): Promise<void> {
   const presets = args.preset ? [args.preset] : detectPresetsFromDist(distDir);
   if (presets.length === 0) {
     console.error(
-      "No deployment preset detected. Pass --preset vercel|cloudflare|docker|static or run a preset build first."
+      "No deployment preset detected. Pass --preset vercel|cloudflare|docker|netlify|static or run a preset build first."
     );
     process.exit(1);
   }
@@ -63,14 +63,14 @@ function parseDeployCheckArgs(argv: string[]): DeployCheckArgs {
     const arg = argv[i];
     if (arg === "--preset" && argv[i + 1]) {
       const value = argv[++i];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
     }
     if (arg.startsWith("--preset=")) {
       const value = arg.split("=")[1];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
@@ -97,6 +97,9 @@ function detectPresetsFromDist(distDir: string): DeployPreset[] {
   }
   if (fs.existsSync(path.join(distDir, ".neutron-adapter-docker.json"))) {
     output.push("docker");
+  }
+  if (fs.existsSync(path.join(distDir, ".neutron-adapter-netlify.json"))) {
+    output.push("netlify");
   }
   if (fs.existsSync(path.join(distDir, ".neutron-adapter-static.json"))) {
     output.push("static");
@@ -139,6 +142,16 @@ function runChecksForPreset(preset: DeployPreset, distDir: string): string[] {
     requireFile("server.mjs");
     const metadata = readMetadata(path.join(distDir, ".neutron-adapter-docker.json"));
     if ((metadata.routes?.app || 0) > 0) {
+      requireFile("server/node/entry.js");
+    }
+  }
+
+  if (preset === "netlify") {
+    requireFile("netlify.toml");
+    const metadata = readMetadata(path.join(distDir, ".neutron-adapter-netlify.json"));
+    if ((metadata.routes?.app || 0) > 0) {
+      requireFile("_redirects");
+      requireFile("functions/__neutron.mjs");
       requireFile("server/node/entry.js");
     }
   }

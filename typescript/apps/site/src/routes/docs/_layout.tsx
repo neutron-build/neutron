@@ -136,6 +136,7 @@ export const docsNavigation = [
       { label: "Node.js", link: "/docs/deployment/node" },
       { label: "Cloudflare", link: "/docs/deployment/cloudflare" },
       { label: "Vercel", link: "/docs/deployment/vercel" },
+      { label: "Netlify", link: "/docs/deployment/netlify" },
       { label: "Docker", link: "/docs/deployment/docker" },
       {
         label: "Static Hosting",

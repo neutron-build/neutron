@@ -1,0 +1,50 @@
+---
+title: Netlify
+description: Deploying to Netlify.
+---
+
+Deploying to Netlify uses the bundled Netlify adapter — no separate install needed; the adapter ships inside `@neutron-build/core` and is selected at build time via the CLI's `--preset` flag.
+
+## Usage
+
+1.  Build with the Netlify preset:
+    ```bash
+    npx @neutron-build/cli build --preset netlify
+    ```
+
+2.  Deploy with the Netlify CLI (publishes `dist/` and its functions):
+    ```bash
+    npx netlify deploy --prod --dir dist --functions dist/functions
+    ```
+
+    The publish directory carries its own routing (`_redirects`) and headers
+    (`_headers`) files, so no other configuration is required for this flow.
+
+## Git integration
+
+If you deploy through Netlify's git integration instead of the CLI, copy
+`dist/netlify.toml` to your project root. It sets the build command, the
+publish directory (`dist`), the functions directory (`dist/functions`), and
+the SSR fallback redirect.
+
+## How SSR routing works
+
+The adapter writes `dist/functions/__neutron.mjs`, a Netlify Functions v2
+handler, plus a `_redirects` file with a non-forced rewrite:
+
+```
+/*  /.netlify/functions/__neutron  200
+```
+
+Netlify serves a static file when one matches the request path; only
+non-matching requests (your `mode: "app"` routes) fall through to the
+function. Static-only sites can also use the simpler
+[static hosting](/docs/deployment/static-hosting) flow.
+
+## Limitations
+
+The function runs on Netlify's Node.js runtime and is bundled by Netlify at
+deploy time. Neutron's build checks the generated artifacts, but only a real
+deploy exercises Netlify's routing and function bundling — run
+`npx @neutron-build/cli deploy-check --preset netlify` after building to
+catch missing artifacts before you push.

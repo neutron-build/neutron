@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { adapterCloudflare } from "./cloudflare.js";
 import { adapterDocker } from "./docker.js";
+import { adapterNetlify } from "./netlify.js";
 import { adapterStatic } from "./static.js";
 import { adapterVercel } from "./vercel.js";
 
@@ -154,6 +155,77 @@ describe("platform adapters", () => {
     });
 
     expect(fs.existsSync(path.join(outDir, "api/__neutron.mjs"))).toBe(true);
+  });
+
+  it("netlify adapter writes netlify config, headers and metadata for static routes", async () => {
+    const outDir = createTempOutDir();
+    writeStaticHeaders(outDir, {
+      "/about": { "X-Test": "1" },
+    });
+
+    const adapter = adapterNetlify();
+    await adapter.adapt({
+      rootDir: outDir,
+      outDir,
+      routes: { total: 1, static: 1, app: 0 },
+      log: () => {},
+    });
+
+    const netlifyConfigPath = path.join(outDir, "netlify.toml");
+    const metadataPath = path.join(outDir, ".neutron-adapter-netlify.json");
+    expect(fs.existsSync(netlifyConfigPath)).toBe(true);
+    expect(fs.existsSync(metadataPath)).toBe(true);
+    expect(fs.existsSync(path.join(outDir, "_headers"))).toBe(true);
+    expect(fs.existsSync(path.join(outDir, "_redirects"))).toBe(false);
+    expect(fs.existsSync(path.join(outDir, "functions"))).toBe(false);
+
+    const netlifyConfig = fs.readFileSync(netlifyConfigPath, "utf-8");
+    expect(netlifyConfig).toContain('publish = "');
+    expect(netlifyConfig).not.toContain("[[redirects]]");
+  });
+
+  it("netlify adapter throws for app routes by default", async () => {
+    const outDir = createTempOutDir();
+    const adapter = adapterNetlify();
+    await expect(
+      adapter.adapt({
+        rootDir: outDir,
+        outDir,
+        routes: { total: 1, static: 0, app: 1 },
+        log: () => {},
+      })
+    ).rejects.toThrow(/runtime bundle support/i);
+  });
+
+  it("netlify adapter writes function and redirects for app routes", async () => {
+    const outDir = createTempOutDir();
+    const adapter = adapterNetlify();
+    await adapter.adapt({
+      rootDir: outDir,
+      outDir,
+      routes: { total: 1, static: 0, app: 1 },
+      ensureRuntimeBundle: async () => ({
+        target: "node",
+        outDir: path.join(outDir, "server/node"),
+        entryPath: path.join(outDir, "server/node/entry.js"),
+        entryRelativePath: "server/node/entry.js",
+      }),
+      log: () => {},
+    });
+
+    const functionPath = path.join(outDir, "functions/__neutron.mjs");
+    expect(fs.existsSync(functionPath)).toBe(true);
+
+    const functionSource = fs.readFileSync(functionPath, "utf-8");
+    expect(functionSource).toContain('from "../server/node/entry.js"');
+    expect(/export\s+default/.test(functionSource)).toBe(true);
+
+    const redirects = fs.readFileSync(path.join(outDir, "_redirects"), "utf-8");
+    expect(redirects).toContain("/*  /.netlify/functions/__neutron  200");
+
+    const netlifyConfig = fs.readFileSync(path.join(outDir, "netlify.toml"), "utf-8");
+    expect(netlifyConfig).toContain("[[redirects]]");
+    expect(netlifyConfig).toContain('to = "/.netlify/functions/__neutron"');
   });
 
   it("docker adapter writes docker deploy files", async () => {

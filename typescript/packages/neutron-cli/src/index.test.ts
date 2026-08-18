@@ -18,7 +18,7 @@ import * as os from "node:os";
 // -- build.ts: parseBuildArgs ------------------------------------------------
 
 interface BuildArgs {
-  preset: "vercel" | "cloudflare" | "docker" | "static" | null;
+  preset: "vercel" | "cloudflare" | "docker" | "netlify" | "static" | null;
   cloudflareMode: "pages" | "workers";
 }
 
@@ -30,14 +30,14 @@ function parseBuildArgs(argv: string[]): BuildArgs {
     const arg = argv[i];
     if (arg === "--preset" && argv[i + 1]) {
       const value = argv[++i];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
     }
     if (arg.startsWith("--preset=")) {
       const value = arg.split("=")[1];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
@@ -141,7 +141,7 @@ function escapeJsString(value: string): string {
 
 // -- deploy-check.ts: parseDeployCheckArgs -----------------------------------
 
-type DeployPreset = "vercel" | "cloudflare" | "docker" | "static";
+type DeployPreset = "vercel" | "cloudflare" | "docker" | "netlify" | "static";
 
 interface DeployCheckArgs {
   preset: DeployPreset | null;
@@ -156,14 +156,14 @@ function parseDeployCheckArgs(argv: string[]): DeployCheckArgs {
     const arg = argv[i];
     if (arg === "--preset" && argv[i + 1]) {
       const value = argv[++i];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
     }
     if (arg.startsWith("--preset=")) {
       const value = arg.split("=")[1];
-      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "static") {
+      if (value === "vercel" || value === "cloudflare" || value === "docker" || value === "netlify" || value === "static") {
         preset = value;
       }
       continue;
@@ -192,6 +192,9 @@ function detectPresetsFromDist(distDir: string): DeployPreset[] {
   }
   if (fs.existsSync(path.join(distDir, ".neutron-adapter-docker.json"))) {
     output.push("docker");
+  }
+  if (fs.existsSync(path.join(distDir, ".neutron-adapter-netlify.json"))) {
+    output.push("netlify");
   }
   if (fs.existsSync(path.join(distDir, ".neutron-adapter-static.json"))) {
     output.push("static");
@@ -346,6 +349,11 @@ describe("parseBuildArgs", () => {
   it("parses --preset static", () => {
     const result = parseBuildArgs(["--preset", "static"]);
     assert.equal(result.preset, "static");
+  });
+
+  it("parses --preset netlify", () => {
+    const result = parseBuildArgs(["--preset", "netlify"]);
+    assert.equal(result.preset, "netlify");
   });
 
   it("ignores invalid preset values", () => {
@@ -578,8 +586,13 @@ describe("parseDeployCheckArgs", () => {
     assert.equal(result.distDir, "out");
   });
 
-  it("ignores invalid preset", () => {
+  it("parses --preset netlify", () => {
     const result = parseDeployCheckArgs(["--preset", "netlify"]);
+    assert.equal(result.preset, "netlify");
+  });
+
+  it("ignores invalid preset", () => {
+    const result = parseDeployCheckArgs(["--preset", "deno"]);
     assert.equal(result.preset, null);
   });
 });
@@ -616,9 +629,10 @@ describe("detectPresetsFromDist", () => {
       fs.writeFileSync(path.join(tmpDir, ".neutron-adapter-vercel.json"), "{}");
       fs.writeFileSync(path.join(tmpDir, ".neutron-adapter-cloudflare.json"), "{}");
       fs.writeFileSync(path.join(tmpDir, ".neutron-adapter-docker.json"), "{}");
+      fs.writeFileSync(path.join(tmpDir, ".neutron-adapter-netlify.json"), "{}");
       fs.writeFileSync(path.join(tmpDir, ".neutron-adapter-static.json"), "{}");
       const result = detectPresetsFromDist(tmpDir);
-      assert.deepEqual(result, ["vercel", "cloudflare", "docker", "static"]);
+      assert.deepEqual(result, ["vercel", "cloudflare", "docker", "netlify", "static"]);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

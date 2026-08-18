@@ -7,6 +7,7 @@
 
 - `static`: static-host output with `_headers`, precompressed assets (`.br`/`.gz`), static policy metadata.
 - `vercel`: Node runtime bundle + Vercel config.
+- `netlify`: Netlify Functions v2 handler + `_redirects`/`_headers`/`netlify.toml`.
 - `cloudflare`: Workers/Pages runtime bundle + Wrangler config.
 - `docker`: self-hosted Node runtime bundle + Dockerfile.
 
@@ -32,6 +33,7 @@ neutron deploy-check --preset vercel
 
 Equivalent for other targets:
 
+- `--preset netlify`
 - `--preset cloudflare`
 - `--preset docker`
 
@@ -40,7 +42,7 @@ Equivalent for other targets:
 Project-level:
 
 ```bash
-neutron release-check --preset <static|vercel|cloudflare|docker>
+neutron release-check --preset <static|vercel|netlify|cloudflare|docker>
 ```
 
 Monorepo-level:

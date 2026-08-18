@@ -127,6 +127,10 @@ export {
   type VercelAdapterOptions,
 } from "./adapters/vercel.js";
 export {
+  adapterNetlify,
+  type NetlifyAdapterOptions,
+} from "./adapters/netlify.js";
+export {
   adapterDocker,
   type DockerAdapterOptions,
 } from "./adapters/docker.js";

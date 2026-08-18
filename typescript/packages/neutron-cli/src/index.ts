@@ -39,19 +39,19 @@ async function main() {
 Usage:
   neutron-ts dev      Start development server
   neutron-ts build    Build for production
-    --preset vercel|cloudflare|docker|static
+    --preset vercel|cloudflare|docker|netlify|static
     --cloudflare-mode pages|workers
   neutron-ts start    Start production server
   neutron-ts preview  Preview production build
   neutron-ts release-check
-    --preset vercel|cloudflare|docker|static
+    --preset vercel|cloudflare|docker|netlify|static
     --dist dist
   neutron-ts worker   Run background worker module
     --entry src/worker.ts
     --mode development|production
     --once
   neutron-ts deploy-check
-    --preset vercel|cloudflare|docker|static
+    --preset vercel|cloudflare|docker|netlify|static
     --dist dist
 
 NOTE: The global 'neutron' command is the universal CLI.
