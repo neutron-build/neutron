@@ -55,6 +55,10 @@ export const docsNavigation = [
         label: "Error Boundaries",
         link: "/docs/routing/error-boundaries",
       },
+      {
+        label: "Internationalization",
+        link: "/docs/routing/internationalization",
+      },
     ],
   },
   {

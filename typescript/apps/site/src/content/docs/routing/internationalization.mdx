@@ -1,0 +1,132 @@
+---
+title: Internationalization
+description: Locale-prefixed URLs — resolution, redirects, and link helpers.
+---
+
+Neutron's i18n utilities handle locale-prefixed URLs: resolving the locale from a pathname, redirecting to canonical paths, and building locale-aware links.
+
+This is routing only. Neutron does not include a translation system — there is no message catalogue, no translation lookup, and no formatting or pluralisation helpers. Locale resolution is URL-based; the `Accept-Language` header is not consulted.
+
+## Setup
+
+Add the i18n middleware in your `src/middleware.ts` file.
+
+```ts
+// src/middleware.ts
+import { createI18nMiddleware } from "@neutron-build/core";
+
+export const middleware = [
+  createI18nMiddleware({
+    locales: ["en", "es", "fr"],
+    defaultLocale: "en",
+  }),
+];
+```
+
+The middleware resolves the locale from the URL on every request and puts two values on the request context:
+
+-   `context.locale` — the resolved locale (for example `"es"`)
+-   `context.pathWithoutLocale` — the pathname with the locale prefix removed (for example `/docs`)
+
+## Strategies
+
+The default strategy is `prefix-except-default`: every locale is prefixed except the default one.
+
+| URL            | Resolved locale | Redirect         |
+| -------------- | --------------- | ---------------- |
+| `/pricing`     | `en`            | —                |
+| `/es/pricing`  | `es`            | —                |
+| `/en/pricing`  | `en`            | 307 → `/pricing` |
+
+Set `strategy: "prefix"` to prefix every locale, including the default:
+
+```ts
+createI18nMiddleware({
+  locales: ["en", "es"],
+  defaultLocale: "en",
+  strategy: "prefix",
+});
+```
+
+| URL            | Resolved locale | Redirect                  |
+| -------------- | --------------- | ------------------------- |
+| `/pricing`     | `en`            | 307 → `/en/pricing`       |
+| `/en/pricing`  | `en`            | —                         |
+| `/es/pricing`  | `es`            | —                         |
+
+Redirects are issued for `GET` and `HEAD` requests only. The middleware also runs before prebuilt (static) pages are served, so the canonical redirects apply to them too.
+
+## Reading the Locale in a Loader
+
+The context values set by the middleware arrive in your `loader` (and `action`).
+
+```tsx
+// src/routes/[...slug].tsx
+import type { LoaderArgs } from "@neutron-build/core";
+
+export async function loader({ context }: LoaderArgs) {
+  const locale = context.locale as string;
+  const path = context.pathWithoutLocale as string;
+
+  return { locale, path };
+}
+```
+
+The example uses a catch-all route because of the next section.
+
+## Route Matching Is Not Rewritten
+
+The middleware annotates the context and issues redirects — it does not rewrite the URL before routing. Route matching sees the full pathname, prefix included, so `/es/pricing` needs a route that matches it (a `[locale]` path segment or a catch-all such as `[...slug]`) or the request 404s.
+
+## Building Locale-Aware Links
+
+`withLocalePath` prefixes a path with a locale according to your strategy. In `prefix-except-default`, the default locale gets no prefix.
+
+```ts
+import { withLocalePath } from "@neutron-build/core";
+
+const options = {
+  locales: ["en", "es", "fr"],
+  defaultLocale: "en",
+};
+
+withLocalePath("/pricing", "es", options); // "/es/pricing"
+withLocalePath("/pricing", "en", options); // "/pricing"
+withLocalePath("/", "es", options); // "/es"
+```
+
+It throws if the locale is not in `locales`.
+
+## Resolving Paths Directly
+
+`resolveLocalePath` returns everything the middleware derives from a pathname.
+
+```ts
+import { resolveLocalePath, stripLocalePrefix } from "@neutron-build/core";
+
+const options = {
+  locales: ["en", "es", "fr"],
+  defaultLocale: "en",
+};
+
+resolveLocalePath("/es/pricing", options);
+// {
+//   locale: "es",
+//   pathname: "/es/pricing",
+//   pathWithoutLocale: "/pricing",
+//   hasLocalePrefix: true
+// }
+
+stripLocalePrefix("/es/pricing", options); // "/pricing"
+```
+
+Both `resolveLocalePath` and `withLocalePath` throw if `defaultLocale` is not in `locales`.
+
+## What Is Not Included
+
+-   No message catalogue or translation lookup — there is no `t()` function.
+-   No formatting or pluralisation for dates, numbers, or plurals.
+-   No locale negotiation from request headers — resolution is purely URL-based.
+-   No URL rewriting for route matching — see [Route Matching Is Not Rewritten](#route-matching-is-not-rewritten).
+
+If you need translated content, pair this module with a translation library and look messages up by `context.locale` in your loaders.
