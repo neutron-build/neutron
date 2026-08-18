@@ -124,8 +124,49 @@ if ! cargo build "${build_args[@]}"; then
   echo "BUILD FAILED"; exit 2
 fi
 
+# Per-harness watchdog. A hanging probe used to consume the ENTIRE CI job and
+# produce no signal at all: on 2026-08-18 the scheduled Nucleus Probe Suite run
+# died at exactly 60m27s — the workflow's `timeout-minutes: 60` — with
+# `probe_fts_rank` as the last PASS and `probe_concurrency_threads` running.
+# GitHub reports that as "cancelled", which reads like a human cancelled it,
+# and every harness AFTER the hung one never ran while the summary said
+# nothing. A gate whose failure mode is silence is not a gate.
+#
+# The default is deliberately ABOVE the slowest measured pass (that same probe
+# took 33m25s in the run that succeeded, 06:17:40 -> 06:51:05) so this changes
+# no outcome that is green today — it only converts a silent job death into a
+# named TIMEOUT with a non-zero exit. The 33 minutes are themselves the bug
+# (~70% of the suite's wall clock for one harness); that is filed separately,
+# not papered over by lowering its round count here.
+PROBE_TIMEOUT_SECS="${PROBE_TIMEOUT_SECS:-2700}"
+
+# macOS ships no coreutils `timeout`, so this is a portable watchdog.
+run_with_timeout() {
+  local secs="$1" logfile="$2"; shift 2
+  "$@" >>"$logfile" 2>&1 &
+  local pid=$!
+  (
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ "$waited" -ge "$secs" ]; then
+        kill -9 "$pid" 2>/dev/null
+        exit 0
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+  ) &
+  local watchdog=$!
+  wait "$pid"
+  local rc=$?
+  kill -9 "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null
+  return $rc
+}
+
 fail=0
 passed=0
+timed_out=0
 echo
 echo "==> Running ${#PROBES[@]} harnesses"
 for entry in "${PROBES[@]}"; do
@@ -134,7 +175,7 @@ for entry in "${PROBES[@]}"; do
   log="$LOG_DIR/${label}.log"
   printf 'scale=%s\ncommand=%s/%s %s\n' "${PROBE_SCALE:-ci}" "$BIN" "$name" "$args" >"$log"
   # shellcheck disable=SC2086
-  if "$BIN/$name" $args >>"$log" 2>&1; then
+  if run_with_timeout "$PROBE_TIMEOUT_SECS" "$log" "$BIN/$name" $args; then
     echo "  PASS  $label"
     passed=$((passed + 1))
     # The log is KEPT on pass. It used to be deleted here, which meant a green
@@ -144,7 +185,15 @@ for entry in "${PROBES[@]}"; do
     # Set PROBE_KEEP_PASS_LOGS=0 to restore the old behaviour.
     [ "${PROBE_KEEP_PASS_LOGS:-1}" = "1" ] || rm -f "$log"
   else
-    echo "  FAIL  $name  (exit $?)"
+    rc=$?
+    # SIGKILL (128+9) here means the watchdog fired, not that the harness
+    # found something. Say which, because they need opposite responses.
+    if [ "$rc" -eq 137 ]; then
+      echo "  TIMEOUT  $label  (killed after ${PROBE_TIMEOUT_SECS}s — it did not finish, it did not fail)"
+      timed_out=$((timed_out + 1))
+    else
+      echo "  FAIL  $label  (exit $rc)"
+    fi
     sed 's/^/        /' "$log" | tail -25
     fail=1
   fi
@@ -155,5 +204,6 @@ if [ "$fail" -eq 0 ]; then
   echo "==> ALL ${#PROBES[@]} probe harnesses passed."
 else
   echo "==> $passed/${#PROBES[@]} passed; some harnesses reported findings (see output above)."
+  [ "$timed_out" -gt 0 ] && echo "==> $timed_out harness(es) TIMED OUT — that is a hang to diagnose, not a finding to read."
 fi
 exit $fail
