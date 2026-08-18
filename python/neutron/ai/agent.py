@@ -8,7 +8,7 @@ from typing import Any, Callable, cast
 from pydantic import BaseModel
 
 from neutron.ai.providers import LLM, LLMResponse, Message
-from neutron.ai.tools import Tool, resolve_tool_call, tools_to_openai_schema
+from neutron.ai.tools import Tool, resolve_tool_call
 
 
 class AgentResult(BaseModel):
@@ -92,16 +92,10 @@ class Agent:
             conversation.insert(0, {"role": "system", "content": self.system_prompt})
         conversation.append({"role": "user", "content": prompt})
 
-        tool_defs = tools_to_openai_schema(all_tools) if all_tools else None
         total_tool_calls = 0
 
         for _turn in range(self.max_turns):
-            response = await self.llm._provider.chat(
-                conversation,
-                tools=tool_defs,
-                temperature=self.llm.temperature,
-                max_tokens=self.llm.max_tokens,
-            )
+            response = await self.llm.chat(conversation, tools=all_tools)
 
             if not response.tool_calls:
                 # Final response — no more tool calls

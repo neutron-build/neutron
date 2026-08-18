@@ -442,6 +442,40 @@ class TestAgent:
         tool_msg = [m for m in messages if m.get("role") == "tool"][0]
         assert "Something broke" in tool_msg["content"]
 
+    async def test_agent_routes_through_llm_chat(self):
+        """Agent.run must call LLM.chat, never the private provider."""
+
+        class SpyLLM(LLM):
+            def __init__(self):
+                super().__init__(provider="openai", model="gpt-4o", api_key="test")
+                self.chat_calls = 0
+                self._provider.chat = AsyncMock(
+                    side_effect=AssertionError("Agent bypassed LLM.chat")
+                )
+
+            async def chat(self, messages, *, tools=None, **kwargs):
+                self.chat_calls += 1
+                if self.chat_calls == 1:
+                    return LLMResponse(
+                        content="",
+                        tool_calls=[
+                            {"id": "c1", "name": "spy_tool", "arguments": {}}
+                        ],
+                    )
+                return LLMResponse(content="done via LLM.chat")
+
+        @tool
+        async def spy_tool() -> str:
+            """No-op for the spy test."""
+            return "ok"
+
+        spy = SpyLLM()
+        agent = Agent(llm=spy)
+        result = await agent.run("Go", tools=[spy_tool])
+        assert spy.chat_calls == 2
+        assert result.content == "done via LLM.chat"
+        assert result.tool_calls_made == 1
+
 
 # ============================================================================
 # Handoffs
@@ -1039,6 +1073,48 @@ class TestMCPServerHTTP:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/resources/unknown://foo")
             assert resp.status_code == 404
+
+    async def test_asgi_app_built_once(self, monkeypatch):
+        """The Starlette app is cached across requests, not rebuilt per call."""
+        import httpx
+        import starlette.applications as starlette_applications
+
+        calls = []
+        real_starlette = starlette_applications.Starlette
+
+        def counting_starlette(*args, **kwargs):
+            calls.append(1)
+            return real_starlette(*args, **kwargs)
+
+        monkeypatch.setattr(starlette_applications, "Starlette", counting_starlette)
+
+        mcp = self._build_mcp()
+        transport = httpx.ASGITransport(app=mcp)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/")
+            assert resp.status_code == 200
+            resp = await client.get("/tools")
+            assert resp.status_code == 200
+
+        assert len(calls) == 1
+
+    async def test_tool_registered_after_first_request(self):
+        """Tools registered after the first request are still served."""
+        import httpx
+
+        mcp = self._build_mcp()
+        transport = httpx.ASGITransport(app=mcp)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/tools")
+            assert [t["name"] for t in resp.json()["tools"]] == ["add"]
+
+            @mcp.tool()
+            async def late_tool(x: str) -> str:
+                """Registered after serving started."""
+                return x
+
+            resp = await client.get("/tools")
+            assert [t["name"] for t in resp.json()["tools"]] == ["add", "late_tool"]
 
 
 # ============================================================================

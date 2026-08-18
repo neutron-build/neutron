@@ -47,6 +47,7 @@ class MCPServer:
         self.version = version
         self._tools: dict[str, Tool] = {}
         self._resources: dict[str, _ResourceDef] = {}
+        self._asgi_app: Any = None
 
     def tool(self, name: str | None = None) -> Callable:
         """Decorator to register a function as an MCP tool."""
@@ -79,6 +80,15 @@ class MCPServer:
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         """ASGI interface — route MCP requests."""
+        # The route table binds to live bound-methods of self (the handlers
+        # read self._tools / self._resources at request time), so one cached
+        # app serves every request and still sees tools/resources registered
+        # after the first request.
+        if self._asgi_app is None:
+            self._asgi_app = self._build_asgi_app()
+        await self._asgi_app(scope, receive, send)
+
+    def _build_asgi_app(self) -> Any:
         from starlette.applications import Starlette
         from starlette.routing import Route
 
@@ -93,8 +103,7 @@ class MCPServer:
                 methods=["GET"],
             ),
         ]
-        app = Starlette(routes=routes)
-        await app(scope, receive, send)
+        return Starlette(routes=routes)
 
     async def _handle_root(self, request: Request) -> JSONResponse:
         """Server info / capabilities."""

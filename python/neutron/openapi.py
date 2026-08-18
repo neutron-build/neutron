@@ -93,6 +93,18 @@ def generate_openapi(
             "status": {"type": "integer"},
             "detail": {"type": "string"},
             "instance": {"type": "string"},
+            "errors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string"},
+                        "message": {"type": "string"},
+                        "value": {},
+                    },
+                    "required": ["field", "message"],
+                },
+            },
         },
         "required": ["type", "title", "status", "detail"],
     }

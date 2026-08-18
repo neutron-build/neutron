@@ -146,3 +146,43 @@ def test_summary_and_tags():
     get_op = spec["paths"]["/items/{item_id}"]["get"]
     assert get_op["summary"] == "Get an item by ID"
     assert get_op["tags"] == ["items"]
+
+
+def test_problem_detail_schema_matches_real_422_payload():
+    """The documented 422 body must describe what the app actually returns."""
+    from neutron import App, Router
+    from neutron.test import SyncTestClient
+
+    class StrictInput(BaseModel):
+        name: str
+        age: int
+
+    router = Router()
+
+    @router.post("/things")
+    async def create_thing(input: StrictInput) -> dict:
+        return {"ok": True}
+
+    app = App(title="Test", version="1.0.0")
+    app.include_router(router)
+
+    spec = app.openapi
+    schema = spec["components"]["schemas"]["ProblemDetail"]
+
+    with SyncTestClient(app) as client:
+        resp = client.post("/things", json={"name": 123, "age": "NaN"})
+    assert resp.status_code == 422
+    payload = resp.json()
+
+    props = schema["properties"]
+    for key in payload:
+        assert key in props, f"payload key {key!r} missing from ProblemDetail"
+    for key in schema["required"]:
+        assert key in payload, f"required key {key!r} missing from payload"
+
+    errors_schema = props["errors"]["items"]
+    for err in payload["errors"]:
+        for key in err:
+            assert key in errors_schema["properties"]
+        for key in errors_schema["required"]:
+            assert key in err

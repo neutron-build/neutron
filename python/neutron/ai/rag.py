@@ -127,7 +127,6 @@ class RAGPipeline:
         question: str,
         *,
         k: int = 10,
-        rerank: bool = False,
     ) -> RAGAnswer:
         """Query the knowledge base with RAG.
 
@@ -162,11 +161,7 @@ class RAGPipeline:
             if chunk_text:
                 context_parts.append(chunk_text)
 
-        # 3. Rerank (simple re-scoring via LLM if requested)
-        if rerank and len(sources) > 1:
-            sources.sort(key=lambda s: s.score)
-
-        # 4. Generate
+        # 3. Generate
         context = "\n\n---\n\n".join(context_parts)
         system_prompt = (
             "You are a helpful assistant. Answer the user's question based on "
