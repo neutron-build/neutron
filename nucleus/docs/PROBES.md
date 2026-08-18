@@ -79,6 +79,17 @@ The `datalog` section is NOT held out and still gates. If it goes red, that
 one is yours. This note exists because a gate that fails for a known reason,
 unmarked at the point where it is run, teaches people to ignore the gate.
 
+**`probe_concurrency_threads` blocks at a random round, and that is filed, not
+yours.** It takes ~10s per round and hung the scheduled CI probe suite on
+2026-08-18 — the run ended at exactly 60m27s, the workflow's `timeout-minutes`,
+which GitHub reports as "cancelled" rather than "failure". `probe.sh` now runs
+every harness under a watchdog (`PROBE_TIMEOUT_SECS`, 15 min at ci scale) and
+prints `TIMEOUT <name>` before continuing, so one blocked harness no longer
+consumes the job and silently skips everything after it. Expect that TIMEOUT
+intermittently on this one name until `_internal/OPEN_WORK.md` §0a is resolved.
+A TIMEOUT is a hang; a concurrency violation exits 1 and prints the violation.
+They need opposite responses, which is why the script distinguishes them.
+
 **`probe_streams_oracle` carries its own control.** `--negative-control
 <streams|pubsub|cdc>` runs the probe twice at one seed — clean, then with that
 section's model perturbed the way an engine bug would perturb it — and passes

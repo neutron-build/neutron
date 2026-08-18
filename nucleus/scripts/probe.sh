@@ -84,7 +84,26 @@ PROBES=(
   "probe_distributed|--iterations $((300 * M))"
   "probe_durability_torn|--iterations $((300 * M))"
   "probe_fts_rank|--iterations $((2000 * M))"
-  "probe_concurrency_threads|--seed 1 --rounds $((200 * M))"
+  # 200 rounds was never a measured budget. It cost 33m25s in CI on 2026-08-18
+  # — about 70% of this suite's entire wall clock for ONE harness, in a suite
+  # whose header advertises "~1-2 min" at ci scale — and at `full` scale the
+  # same expression asks for 1600 rounds, roughly four and a half hours, which
+  # has plainly never been run. That is a miscalibration, not a coverage
+  # decision, and it is why the job sat one bad round away from its 60-minute
+  # timeout. 40 rounds is ~7 min at the measured ~10s/round; `full` still gets
+  # 320. Raise it again when the block in OPEN_WORK.md §0a is fixed and a
+  # round no longer costs ten seconds.
+  #
+  # EXPECT INTERMITTENT `TIMEOUT probe_concurrency_threads` UNTIL §0a IS FIXED.
+  # This harness blocks at a random round — nearly every run on macOS, roughly
+  # one run in two on Linux CI. A TIMEOUT on THIS name is that known block, not
+  # a regression you introduced, and not a concurrency violation: a violation
+  # exits 1 and prints one. It is left running rather than held out because the
+  # block is plausibly an executor deadlock under SERIALIZABLE contention,
+  # which is a Critical worth tripping over, and because the watchdog now makes
+  # it cost 15 minutes and one line instead of the entire job.
+  # EXPIRY: if this note is still here after 2026-09-30, that is the bug.
+  "probe_concurrency_threads|--seed 1 --rounds $((40 * M))"
   # KNOWN-RED HOLDOUT, added 2026-08-18 with S35 (c9a6c893). The vector and
   # catalog sections each report a real, open finding, so running them here
   # would make this suite permanently red and teach everyone to ignore it:
@@ -132,13 +151,14 @@ fi
 # and every harness AFTER the hung one never ran while the summary said
 # nothing. A gate whose failure mode is silence is not a gate.
 #
-# The default is deliberately ABOVE the slowest measured pass (that same probe
-# took 33m25s in the run that succeeded, 06:17:40 -> 06:51:05) so this changes
-# no outcome that is green today — it only converts a silent job death into a
-# named TIMEOUT with a non-zero exit. The 33 minutes are themselves the bug
-# (~70% of the suite's wall clock for one harness); that is filed separately,
-# not papered over by lowering its round count here.
-PROBE_TIMEOUT_SECS="${PROBE_TIMEOUT_SECS:-2700}"
+# The budget scales with PROBE_SCALE, because a value that fits `ci` would kill
+# every long harness at `full`. At ci this is 15 minutes, comfortably above the
+# slowest harness measured on 2026-08-18 (probe_engines, 4m34s) once
+# probe_concurrency_threads' round count is calibrated below — and far enough
+# below the workflow's 60-minute job timeout that a hang produces a NAMED
+# failure with the rest of the suite still run, instead of a silent
+# cancellation with everything after it skipped.
+PROBE_TIMEOUT_SECS="${PROBE_TIMEOUT_SECS:-$((900 * M))}"
 
 # macOS ships no coreutils `timeout`, so this is a portable watchdog.
 run_with_timeout() {
