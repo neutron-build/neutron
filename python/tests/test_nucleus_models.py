@@ -164,6 +164,53 @@ class TestKV:
         mock_conn.fetchval.assert_called_with("SELECT KV_DEL($1)", "k")
 
     @pytest.mark.asyncio
+    async def test_setnx_without_ttl(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        kv = KVModel(_make_exec(mock_conn), nucleus_features)
+        assert await kv.setnx("lock", "owner1") is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT KV_SETNX($1, $2)", "lock", "owner1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_setnx_with_ttl(self, mock_conn, nucleus_features):
+        # Atomic lock acquire: value AND expiry in one call (contract §3.1).
+        mock_conn.fetchval.return_value = True
+        kv = KVModel(_make_exec(mock_conn), nucleus_features)
+        assert await kv.setnx("lock", "owner1", ttl=30) is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT KV_SETNX($1, $2, $3)", "lock", "owner1", 30
+        )
+
+    @pytest.mark.asyncio
+    async def test_cdel(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        kv = KVModel(_make_exec(mock_conn), nucleus_features)
+        assert await kv.cdel("lock", "owner1") is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT KV_CDEL($1, $2)", "lock", "owner1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cexpire(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        kv = KVModel(_make_exec(mock_conn), nucleus_features)
+        assert await kv.cexpire("lock", "owner1", 3600) is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT KV_CEXPIRE($1, $2, $3)", "lock", "owner1", 3600
+        )
+
+    @pytest.mark.asyncio
+    async def test_lock_pattern_setnx_cdel(self, mock_conn, nucleus_features):
+        # The contract's lock pattern end-to-end at the SQL layer:
+        # acquire with SETNX+TTL, release with CDEL only if still ours.
+        kv = KVModel(_make_exec(mock_conn), nucleus_features)
+        mock_conn.fetchval.return_value = True
+        assert await kv.setnx("lease", "token-a", ttl=30) is True
+        mock_conn.fetchval.return_value = False  # someone else holds it now
+        assert await kv.cdel("lease", "token-b") is False
+
+    @pytest.mark.asyncio
     async def test_exists(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = True
         kv = KVModel(_make_exec(mock_conn), nucleus_features)

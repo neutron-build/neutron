@@ -58,13 +58,31 @@ class KVModel:
     ) -> None:
         await self.set(key, value.model_dump_json(), ttl=ttl)
 
-    async def setnx(self, key: str, value: str) -> bool:
+    async def setnx(
+        self, key: str, value: str, *, ttl: int | None = None
+    ) -> bool:
+        """Set only if absent. With ``ttl`` this is the atomic lock acquire."""
         self._require()
+        if ttl is not None:
+            return cast(
+                "bool",
+                await self._exec.fetchval(
+                    "SELECT KV_SETNX($1, $2, $3)", key, value, ttl
+                ),
+            )
         return cast("bool", await self._exec.fetchval("SELECT KV_SETNX($1, $2)", key, value))
 
     async def delete(self, key: str) -> bool:
         self._require()
         return cast("bool", await self._exec.fetchval("SELECT KV_DEL($1)", key))
+
+    async def cdel(self, key: str, expected: str) -> bool:
+        """Delete only if the value matches — the safe lock release."""
+        self._require()
+        return cast(
+            "bool",
+            await self._exec.fetchval("SELECT KV_CDEL($1, $2)", key, expected),
+        )
 
     async def exists(self, key: str) -> bool:
         self._require()
@@ -81,6 +99,16 @@ class KVModel:
     async def expire(self, key: str, ttl: int) -> bool:
         self._require()
         return cast("bool", await self._exec.fetchval("SELECT KV_EXPIRE($1, $2)", key, ttl))
+
+    async def cexpire(self, key: str, expected: str, ttl: int) -> bool:
+        """Set a new TTL only if the value matches — the lease renewal."""
+        self._require()
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT KV_CEXPIRE($1, $2, $3)", key, expected, ttl
+            ),
+        )
 
     async def dbsize(self) -> int:
         self._require()
