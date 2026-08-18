@@ -47,7 +47,8 @@ capability that had already shipped.
 
 ## Index
 
-Statuses verified against source on 2026-08-08.
+Statuses verified against source on 2026-08-08 (A-001..A-022) and 2026-08-18
+(A-023, A-024).
 
 | # | Finding | Area | Sev | Tag | Status |
 |---|---|---|---|---|---|
@@ -73,6 +74,8 @@ Statuses verified against source on 2026-08-08.
 | A-020 | Static-route `middleware` never runs when a prebuilt file exists | TS routing | HIGH | `REAL-BUG` | FIXED |
 | A-021 | `useNavigation()` throws `window is not defined` during SSR | TS routing | MED | `REAL-BUG` | FIXED |
 | A-022 | A pure-static app never loads `src/middleware.ts` at all | TS routing | MED | `REAL-BUG` | FIXED |
+| A-023 | Python `Migrator` races concurrent first boot | Python | HIGH | `REAL-BUG` | FIXED |
+| A-024 | Router-generated 404/405 responses were text/plain, not RFC 7807 | Python | MED | `SPEC-GAP` | FIXED |
 
 Open: none. Every finding filed so far is closed.
 
@@ -532,6 +535,68 @@ exported router hooks were rendered server-side; `useNavigation` was the only
 one that threw, so there was no sibling defect to fix. `router-providers.test.ts`
 now pins that as a standing assertion, so a new hook reading `window` at render
 time is caught here rather than by an adopter.
+
+## A-023 — Python `Migrator` races concurrent first boot
+**Python · HIGH · `REAL-BUG` · FIXED**
+
+Omni Analyst v2 runs API and scheduler as separate containers; against a fresh
+database both boot, both run `Migrator.run_migrations` in startup, and before
+this fix both read an empty `_neutron_migrations`, both executed migration
+001's DDL, and the loser died on a duplicate object or the version primary
+key. Omni's runbook had absorbed the workaround as deployed doctrine — "for
+the very first boot of a brand-new database, run a single API replica until
+healthy" — which is the framework pushing a concurrency constraint into every
+adopter's deploy procedure.
+
+The reproduction is now `tests/test_migrate_live.py` (two pools, one
+migration containing `pg_sleep(0.25)` to force the interleave): pre-fix the
+second client raises `UniqueViolationError`; post-fix one applies and the
+other no-ops. `tests/test_migrate.py` pins the statement order as a unit
+contract — one transaction, `pg_advisory_xact_lock` first, versions re-read
+inside the lock — and that contract was committed (in `6ee102da`) before the
+implementation, failing on main until this fix landed.
+
+Design notes worth keeping:
+
+- **The lock is transaction-scoped and the whole run is one transaction.**
+  The second boot waits for the first to commit, re-reads, and finds nothing
+  left to do. A run that dies mid-migration rolls back to a clean boundary
+  rather than recording partial progress — previously each migration
+  committed separately, so a crash left an arbitrary prefix applied.
+- **Nucleus has no advisory locks at all** (`pg_advisory_lock` does not exist;
+  only `pg_advisory_unlock_all` is accepted, because asyncpg issues it on pool
+  reset). An unconditional lock would have broken every Nucleus migration run
+  at its first statement. The failure is caught for SQLSTATE 42883/0A000 only
+  and the run proceeds unlocked — the concurrent-replica shape the lock
+  defends is a Postgres deployment shape. Any other lock failure propagates
+  (both paths tested).
+
+## A-024 — router-generated 404/405 responses were text/plain, not RFC 7807
+**Python · MED · `SPEC-GAP` · FIXED**
+
+`neutron.error` ships full Problem Details machinery and `App` registers
+`AppError: handle_app_error`, so handler-raised errors answered
+`application/problem+json`. But unmatched paths and wrong methods never reach
+a handler: Starlette's routing raises its own `HTTPException(404/405)` and
+the default rendering is a `PlainTextResponse`. A client got two formats for
+the same class of answer depending on whether a handler was involved. The Go
+SDK had already been fixed the same way (`c06450b3`, "RFC 7807 on every HTTP
+error path"), leaving the SDKs inconsistent with each other.
+
+Found through the Omni Analyst v2 adoption audit, which cited both this and
+A-023 as "Neutron adoption findings" before they were filed here — the IDs
+match those cross-references.
+
+**Resolved:** `handle_http_exception` in `neutron/error.py` renders
+framework-raised `HTTPException` as Problem Details — `type` from a status
+map (`not-found`, `method-not-allowed`), `title` from the HTTP phrase,
+`detail` preserved, `instance` set to the request path, and `exc.headers`
+passed through so the 405's `Allow` header survives. Registered for the
+`HTTPException` class in `App._build_app`, so user-raised HTTPExceptions get
+the same treatment: one format, every error path. Guarded by
+`test_unmatched_path_is_problem_json_not_plain_text` and
+`test_wrong_method_is_problem_json_and_keeps_allow`, both written red first
+and both failing on `text/plain` before the fix.
 
 ## A-014 — English stemmer: singular and plural of the same noun never match
 **Nucleus / FTS · HIGH · `REAL-BUG` · FIXED**

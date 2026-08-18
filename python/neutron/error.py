@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import http
 from typing import Any
 
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -96,3 +98,40 @@ def internal_error(detail: str) -> AppError:
 async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
     """Starlette exception handler for AppError."""
     return exc.to_response(instance=str(request.url.path))
+
+
+_HTTP_TYPE_BY_STATUS: dict[int, str] = {
+    404: "not-found",
+    405: "method-not-allowed",
+}
+
+
+async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+    """Render framework-raised HTTPException as Problem Details.
+
+    Starlette's routing raises these itself — unmatched path (404) and wrong
+    method (405, carrying ``Allow``) — and its default rendering is a
+    PlainTextResponse, so a Neutron app answered the same question in two
+    formats depending on whether a handler was involved. The ``Allow`` header
+    must survive the conversion: it is the only machine-readable statement of
+    what would have worked.
+    """
+    status = exc.status_code
+    code = _HTTP_TYPE_BY_STATUS.get(status, f"http-{status}")
+    try:
+        title = http.HTTPStatus(status).phrase
+    except ValueError:
+        title = "HTTP Error"
+    body: dict[str, Any] = {
+        "type": f"https://neutron.dev/errors/{code}",
+        "title": title,
+        "status": status,
+        "detail": exc.detail,
+        "instance": str(request.url.path),
+    }
+    return JSONResponse(
+        status_code=status,
+        content=body,
+        media_type="application/problem+json",
+        headers=getattr(exc, "headers", None),
+    )

@@ -112,6 +112,31 @@ async def test_get_user_not_found():
 
 
 @pytest.mark.asyncio
+async def test_unmatched_path_is_problem_json_not_plain_text():
+    async with TestClient(app) as client:
+        resp = await client.get("/definitely/not/a/route")
+    assert resp.status_code == 404
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    data = resp.json()
+    assert data["type"] == "https://neutron.dev/errors/not-found"
+    assert data["status"] == 404
+    assert data["instance"] == "/definitely/not/a/route"
+
+
+@pytest.mark.asyncio
+async def test_wrong_method_is_problem_json_and_keeps_allow():
+    async with TestClient(app) as client:
+        resp = await client.delete("/health")
+    assert resp.status_code == 405
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    assert "GET" in resp.headers.get("allow", "")
+    data = resp.json()
+    assert data["type"] == "https://neutron.dev/errors/method-not-allowed"
+    assert data["status"] == 405
+    assert data["instance"] == "/health"
+
+
+@pytest.mark.asyncio
 async def test_validation_error_missing_field():
     async with TestClient(app) as client:
         resp = await client.post("/api/users", json={"name": "Alice"})
