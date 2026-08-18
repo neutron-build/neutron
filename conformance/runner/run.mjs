@@ -174,7 +174,29 @@ async function main() {
   }
 
   let sdks = SDKS;
-  if (opts.only.length) sdks = SDKS.filter((s) => opts.only.includes(s.name));
+  if (opts.only.length) {
+    // Reject an unknown selector rather than filtering to nothing. Passing a
+    // name that matches no SDK used to print an empty matrix and exit 0 -- a
+    // green run that exercised nothing. `typescript` is the specific trap:
+    // it is the adapter's own directory name (`adapters/typescript/`) while
+    // the SDK is registered as `ts`, so the obvious guess silently passed.
+    // `sdk-live.yml`'s matrix spells this SDK `typescript`, this runner
+    // registers it as `ts`, and the adapter directory is `adapters/typescript`.
+    // Two of the three say typescript, so accept it rather than make the
+    // majority spelling the wrong one.
+    const ALIASES = { typescript: "ts" };
+    opts.only = opts.only.map((n) => ALIASES[n] || n);
+    const known = SDKS.map((s) => s.name);
+    const unknown = opts.only.filter((n) => !known.includes(n));
+    if (unknown.length) {
+      console.error(
+        `unknown SDK ${unknown.map((n) => JSON.stringify(n)).join(", ")}; ` +
+          `known: ${known.join(", ")}`
+      );
+      process.exit(2);
+    }
+    sdks = SDKS.filter((s) => opts.only.includes(s.name));
+  }
 
   const report = [];
   for (const sdk of sdks) {
