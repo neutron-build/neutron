@@ -20,6 +20,7 @@
     "ci:deploy-presets": "pnpm --dir apps/playground run build:vercel && pnpm --dir apps/playground run deploy-check:vercel && pnpm --dir apps/playground run build:cloudflare && pnpm --dir apps/playground run deploy-check:cloudflare && pnpm --dir apps/playground run build:docker && pnpm --dir apps/playground run deploy-check:docker",
     "ci:deploy-presets:boot": "node ./scripts/deploy-preset-boot-smoke.mjs",
     "ci:runtime-compat": "node ./scripts/runtime-compat-smoke.mjs",
+    "ci:aliased-install": "node ./scripts/aliased-install-smoke.mjs",
     "ci:data-profiles": "node ./scripts/data-profile-smoke.mjs",
     "ci:naming": "node ./scripts/naming-check.mjs",
     "ci:workspace": "node ./scripts/workspace-graph-check.mjs",

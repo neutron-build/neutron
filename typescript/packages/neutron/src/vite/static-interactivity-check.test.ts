@@ -141,8 +141,9 @@ describe("formatStaticInteractivityWarning", () => {
   });
 
   // A diagnostic that names the problem but not the fix just makes people
-  // search the docs. Both escape hatches belong in the message.
-  it("names the file and both fixes", () => {
+  // search the docs. Both escape hatches belong in the message, and the
+  // <Island> fix has to name where Island is imported from.
+  it("names the file, both fixes, and the Island import source", () => {
     const text = formatStaticInteractivityWarning(
       [{ routeFile: "/root/src/routes/index.tsx", sourceFile: "/root/src/components/Nav.tsx" }],
       "/root"
@@ -150,6 +151,7 @@ describe("formatStaticInteractivityWarning", () => {
     expect(text).toContain("src/routes/index.tsx");
     expect(text).toContain("src/components/Nav.tsx");
     expect(text).toContain("<Island>");
+    expect(text).toContain("@neutron-build/core/client");
     expect(text).toContain("hydrate: true");
   });
 });

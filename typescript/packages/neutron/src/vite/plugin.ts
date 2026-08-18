@@ -94,6 +94,33 @@ const ISLAND_VIRTUAL_ID = "virtual:neutron-islands";
 const ISLAND_VIRTUAL_RESOLVED_ID = "\0virtual:neutron-islands";
 const ISLAND_SCRIPT_EXTENSIONS = [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs"];
 
+// Every virtual module this plugin serves (`virtual:neutron-islands`,
+// `virtual:neutron/routes`, `virtual:neutron/manifest`,
+// `virtual:neutron/dev-toolbar`) shares the `virtual:neutron` namespace.
+const VIRTUAL_NAMESPACE_FILTER = /^virtual:neutron/;
+
+// esbuild — used by Vite's dep optimizer for scanning and pre-bundling —
+// resolves without Vite plugins, so it cannot load this plugin's virtual
+// modules; an unresolvable id aborts the optimization and takes the dev
+// server down with it. Marking the whole namespace external makes esbuild
+// leave those imports in place, and Vite's import analysis resolves them
+// through this plugin when the module is served. Structurally typed: vite
+// passes this straight through to esbuild in both optimizer passes.
+const virtualNamespaceExternalPlugin = {
+  name: "neutron:virtual-namespace-external",
+  setup(build: {
+    onResolve: (
+      options: { filter: RegExp },
+      callback: (args: { path: string }) => { path: string; external: true }
+    ) => void;
+  }): void {
+    build.onResolve({ filter: VIRTUAL_NAMESPACE_FILTER }, (args) => ({
+      path: args.path,
+      external: true,
+    }));
+  },
+};
+
 interface LoaderResult {
   routeId: string;
   data: unknown;
@@ -203,15 +230,30 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     // already-lowered `h(Island, { component: X })` form.
     enforce: "pre",
 
-    // The client runtime imports `virtual:neutron-islands`, which only this
-    // plugin can resolve. Vite's dep optimizer pre-bundles bare-specifier
-    // imports with esbuild, which runs outside the plugin pipeline and fails
-    // the whole dev server on the unresolvable id. Excluding the runtime keeps
-    // it on Vite's own resolver, where the virtual module exists.
+    // The client runtime imports `virtual:neutron-islands` (and friends),
+    // which only this plugin can resolve. Vite's dep optimizer pre-bundles
+    // dependencies with esbuild, which runs outside Vite's plugin pipeline
+    // and fails the whole dev server on ids it cannot resolve. Two layers,
+    // because the optimizer can reach the runtime two ways:
+    //
+    // - `exclude` keeps the runtime on Vite's own resolver when it is imported
+    //   by its registry specifier. It is keyed on that specifier, so it does
+    //   nothing for installs that change it — a `file:` install, a pnpm
+    //   `link:`, a `resolve.alias` to a local checkout, or an
+    //   `optimizeDeps.include` entry all route around the literal.
+    // - The esbuild-level plugin closes that gap for every install shape at
+    //   once: whatever path esbuild enters the runtime by, it leaves
+    //   `virtual:neutron*` imports unresolved-but-external instead of failing
+    //   (Vite's import analysis resolves them through this plugin when the
+    //   chunk is served). Vite runs `optimizeDeps.esbuildOptions.plugins` in
+    //   both the dependency scanner and the pre-bundler.
     config() {
       return {
         optimizeDeps: {
           exclude: ["@neutron-build/core"],
+          esbuildOptions: {
+            plugins: [virtualNamespaceExternalPlugin],
+          },
         },
       };
     },

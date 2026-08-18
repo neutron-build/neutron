@@ -157,8 +157,9 @@ export function formatStaticInteractivityWarning(
     "",
     "  Two ways to fix it:",
     "",
-    "    1. Wrap the interactive component in <Island> — ships only that",
-    "       component's code, and is the reason a static page can cost zero JS.",
+    "    1. Wrap the interactive component in <Island> — import it from",
+    "       \"@neutron-build/core/client\". Ships only that component's code,",
+    "       and is the reason a static page can cost zero JS.",
     "    2. Add `hydrate: true` to the route's config to hydrate the whole tree,",
     "       which is what every static route did before client tiering.",
     ""

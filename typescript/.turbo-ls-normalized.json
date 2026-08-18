@@ -1,7 +1,7 @@
 {
   "packageManager": "pnpm9",
   "packages": {
-    "count": 23,
+    "count": 24,
     "items": [
       {
         "name": "@neutron-build/agents",
@@ -58,6 +58,10 @@
       {
         "name": "@neutron-build/workflow",
         "path": "packages/neutron-workflow"
+      },
+      {
+        "name": "@neutron/aliased-smoke",
+        "path": "apps/aliased-smoke"
       },
       {
         "name": "@neutron/compat-matrix",

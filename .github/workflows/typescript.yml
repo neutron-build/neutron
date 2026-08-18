@@ -80,6 +80,15 @@ jobs:
         run: pnpm run ci:data-profiles
         working-directory: typescript
 
+      # The only coverage of the esbuild dep-optimizer failure class: an app
+      # that reaches the runtime by an alias rather than by its registry
+      # specifier used to take the dev server down on an unresolvable
+      # `virtual:neutron-islands`. Bounded and self-cleaning; fails as a
+      # failure, not a cancellation.
+      - name: Aliased install smoke (dev server survives aliased installs)
+        run: pnpm run ci:aliased-install
+        working-directory: typescript
+
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
