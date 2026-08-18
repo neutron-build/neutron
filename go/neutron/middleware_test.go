@@ -286,3 +286,165 @@ func TestDefaultStackEnforcesContractOrder(t *testing.T) {
 		t.Error("request_id empty in log — RequestID must precede Logging")
 	}
 }
+
+// TestDefaultStackAllLayersInContractOrder pins the full DefaultStack order
+// (contract §5) by observation rather than by inspecting the slice, so a
+// reorder in middleware.go fails here instead of drifting silently. The
+// injected Auth layer is the reference point: everything the contract places
+// before it must have left its mark by the time Auth runs, and everything
+// after it must not have.
+//
+// Adjacencies not pinned here: Timeout↔OTel. The two layers have no
+// cross-observable effect (a context deadline is invisible to OTel; a trace
+// id is invisible to Timeout), so no black-box test can distinguish their
+// order — swapping them changes nothing any client can see.
+func TestDefaultStackAllLayersInContractOrder(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	var authCalls int
+	var sawRequestID, sawCORS, sawContentEncoding, sawDeadlineAtAuth, sawTraceAtAuth bool
+
+	auth := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authCalls++
+			sawRequestID = w.Header().Get("X-Request-Id") != ""
+			sawCORS = w.Header().Get("Access-Control-Allow-Origin") != ""
+			sawContentEncoding = w.Header().Get("Content-Encoding") != ""
+			_, sawDeadlineAtAuth = r.Context().Deadline()
+			sawTraceAtAuth = TraceIDFromContext(r.Context()) != ""
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	stack := DefaultStack(DefaultStackConfig{
+		Logger:    logger,
+		CORS:      &CORSOptions{AllowOrigins: []string{"https://example.com"}},
+		Compress:  true,
+		RateLimit: &RateLimitConfig{RPS: 0, Burst: 1},
+		Auth:      auth,
+		Timeout:   time.Second,
+		OTel:      &OTelOptions{ServiceName: "test"},
+	})
+	if len(stack) != 9 {
+		t.Fatalf("stack has %d layers, want 9 (all configured)", len(stack))
+	}
+
+	var handlerSawTrace, handlerSawDeadline bool
+	var wrapped http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerSawTrace = TraceIDFromContext(r.Context()) != ""
+		_, handlerSawDeadline = r.Context().Deadline()
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped = Chain(stack...)(wrapped)
+
+	// Request 1: normal request through every layer.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Accept-Encoding", "gzip")
+	wrapped.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request 1: status = %d, want 200", rec.Code)
+	}
+	if authCalls != 1 {
+		t.Fatalf("request 1: auth called %d times, want 1", authCalls)
+	}
+	if !sawRequestID {
+		t.Error("RequestID did not run before Auth (no X-Request-Id header at Auth)")
+	}
+	if !sawCORS {
+		t.Error("CORS did not run before Auth (no Access-Control-Allow-Origin at Auth)")
+	}
+	if !sawContentEncoding {
+		t.Error("Compress did not run before Auth (no Content-Encoding at Auth)")
+	}
+	if sawDeadlineAtAuth {
+		t.Error("Timeout ran before Auth — contract places Timeout after Auth")
+	}
+	if sawTraceAtAuth {
+		t.Error("OTel ran before Auth — contract places OpenTelemetry after Auth")
+	}
+	if !handlerSawDeadline {
+		t.Error("Timeout did not run after Auth (handler saw no deadline)")
+	}
+	if !handlerSawTrace {
+		t.Error("OTel did not run after Auth (handler saw no trace id)")
+	}
+	if id := RequestIDFromContext(req.Context()); id != "" {
+		t.Error("outer middleware must not mutate the original request context")
+	}
+	if out := logBuf.String(); !strings.Contains(out, "request_id=") || strings.Contains(out, `request_id=""`) {
+		t.Errorf("log line missing non-empty request_id — RequestID must precede Logging: %q", out)
+	}
+
+	// Request 2: token bucket drained (RPS 0, burst 1), so RateLimit rejects.
+	// Auth must not run, and the layers outer than RateLimit must still act.
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("GET", "/", nil)
+	req2.Header.Set("Origin", "https://example.com")
+	req2.Header.Set("Accept-Encoding", "gzip")
+	wrapped.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("request 2: status = %d, want 429", rec2.Code)
+	}
+	if authCalls != 1 {
+		t.Errorf("request 2: auth called %d times total — RateLimit must run before Auth", authCalls)
+	}
+	if ct := rec2.Header().Get("Content-Type"); !strings.Contains(ct, "application/problem+json") {
+		t.Errorf("request 2: Content-Type = %q, want application/problem+json", ct)
+	}
+	if rec2.Header().Get("Access-Control-Allow-Origin") == "" {
+		t.Error("request 2: no CORS header on 429 — CORS must run before RateLimit")
+	}
+	if rec2.Header().Get("Content-Encoding") != "gzip" {
+		t.Error("request 2: 429 not compressed — Compress must run before RateLimit")
+	}
+
+	// Request 3: preflight. CORS answers OPTIONS itself without calling inner
+	// layers (middleware.go:190-193), so an uncompressed 204 proves CORS wraps
+	// Compress — had Compress run, Content-Encoding would be set on the header
+	// map before CORS's WriteHeader froze it.
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodOptions, "/", nil)
+	req3.Header.Set("Origin", "https://example.com")
+	req3.Header.Set("Accept-Encoding", "gzip")
+	wrapped.ServeHTTP(rec3, req3)
+
+	if rec3.Code != http.StatusNoContent {
+		t.Fatalf("preflight: status = %d, want 204", rec3.Code)
+	}
+	if rec3.Header().Get("Content-Encoding") != "" {
+		t.Error("preflight 204 is compressed — CORS must run before Compress and answer without it")
+	}
+	if authCalls != 1 {
+		t.Errorf("preflight: auth called %d times total — CORS must short-circuit before RateLimit/Auth", authCalls)
+	}
+
+	// Panic probe: a panic in Auth (innermost user layer) is caught by Recover
+	// and written as RFC 7807, while Logger — outer than Recover — still logs
+	// the request.
+	var panicBuf bytes.Buffer
+	panicLogger := slog.New(slog.NewTextHandler(&panicBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	panicStack := DefaultStack(DefaultStackConfig{
+		Logger: panicLogger,
+		Auth: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { panic("boom") })
+		},
+	})
+	rec4 := httptest.NewRecorder()
+	Chain(panicStack...)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).
+		ServeHTTP(rec4, httptest.NewRequest("GET", "/", nil))
+
+	if rec4.Code != http.StatusInternalServerError {
+		t.Fatalf("panic: status = %d, want 500", rec4.Code)
+	}
+	if ct := rec4.Header().Get("Content-Type"); !strings.Contains(ct, "application/problem+json") {
+		t.Errorf("panic: Content-Type = %q, want application/problem+json", ct)
+	}
+	if out := panicBuf.String(); !strings.Contains(out, "status=500") {
+		t.Errorf("panic: no request log line — Logger must run outside Recover: %q", out)
+	}
+}
