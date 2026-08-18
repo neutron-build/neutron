@@ -5,3 +5,5 @@ dist/
 .DS_Store
 benchmarks/results/latest.json
 benchmarks/results/run-*.json
+apps/playground/test-results/
+apps/playground/playwright-report/

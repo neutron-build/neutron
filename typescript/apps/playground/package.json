@@ -11,6 +11,7 @@
     "build:docker": "neutron-ts build --preset docker",
     "start": "neutron-ts start",
     "preview": "neutron-ts preview",
+    "test:e2e": "playwright test",
     "worker": "neutron-ts worker",
     "db:generate": "drizzle-kit generate --config drizzle.config.mjs",
     "db:migrate": "drizzle-kit migrate --config drizzle.config.mjs",
@@ -27,6 +28,7 @@
     "preact-render-to-string": "^6.6.5"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@preact/preset-vite": "^2.9.4",
     "drizzle-kit": "^0.31.5",
     "typescript": "^5.7.2",

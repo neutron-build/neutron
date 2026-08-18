@@ -108,3 +108,43 @@ jobs:
 
       - run: pnpm typecheck
         working-directory: typescript
+
+  # Browser e2e: the only tests that verify in a real browser that routing,
+  # actions, and island hydration actually work end-to-end. Chromium only —
+  # the suite checks framework behaviour, not cross-browser rendering, and
+  # every extra engine costs a browser download per CI run.
+  e2e:
+    name: Browser e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: typescript/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - run: pnpm install
+
+      - run: pnpm build
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('typescript/pnpm-lock.yaml') }}
+
+      - name: Install Chromium
+        run: pnpm --filter @neutron/playground exec playwright install --with-deps chromium
+
+      - name: Run e2e suite
+        run: pnpm --filter @neutron/playground run test:e2e
