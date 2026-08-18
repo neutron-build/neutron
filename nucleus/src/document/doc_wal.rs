@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::storage::wal_util::WalSync;
+
 // ─── Entry type tags ────────────────────────────────────────────────────────
 
 const ENTRY_INSERT: u8 = 0x01;
@@ -59,6 +61,12 @@ pub struct DocWalState {
 pub struct DocWal {
     path: PathBuf,
     writer: Mutex<File>,
+    /// Append/sync bookkeeping for group commit. Before this existed the
+    /// appends below ended in `Write::flush`, which for a bare `std::fs::File`
+    /// is documented to do nothing at all -- so an acknowledged document write
+    /// lived only in the kernel page cache and did not survive power loss,
+    /// while reading exactly like a durable write. NU-006.
+    syncer: WalSync,
 }
 
 impl DocWal {
@@ -84,9 +92,31 @@ impl DocWal {
             Self {
                 path,
                 writer: Mutex::new(file),
+                syncer: WalSync::new(),
             },
             state,
         ))
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     /// Log an INSERT operation (insert or replace).
@@ -96,7 +126,9 @@ impl DocWal {
         w.write_all(&doc_id.to_le_bytes())?;
         w.write_all(&(json_bytes.len() as u32).to_le_bytes())?;
         w.write_all(json_bytes)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log an INSERT that places the document in a named collection.
@@ -121,7 +153,9 @@ impl DocWal {
         w.write_all(coll)?;
         w.write_all(&(json_bytes.len() as u32).to_le_bytes())?;
         w.write_all(json_bytes)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a DELETE operation.
@@ -129,7 +163,9 @@ impl DocWal {
         let mut w = self.writer.lock();
         w.write_all(&[ENTRY_DELETE])?;
         w.write_all(&doc_id.to_le_bytes())?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Write the complete current state of all documents as a single SNAPSHOT
@@ -354,6 +390,20 @@ fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An append is un-fsynced until `group_sync` covers it. NU-006: these
+    /// appends used to end at `Write::flush`, a documented no-op on a bare
+    /// `File`, so the write was acked while living only in the page cache.
+    #[test]
+    fn group_sync_marks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = DocWal::open(dir.path()).unwrap();
+        assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
+        wal.log_insert(1, b"a").unwrap();
+        assert!(wal.is_dirty(), "an append is uncovered until fsync");
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
+    }
 
     #[test]
     fn test_insert_replay() {

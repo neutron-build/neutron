@@ -106,6 +106,33 @@ impl SyncMode {
             _ => SyncMode::Fsync, // default
         }
     }
+
+    /// Force this mode's durability barrier on `file`.
+    ///
+    /// The caller must have flushed any userspace buffer (a `BufWriter`) first
+    /// — this only issues the kernel/device barrier, and syncing a file whose
+    /// bytes are still sitting in a `BufWriter` is a no-op that looks like
+    /// durability.
+    ///
+    /// This is the one place the mode is interpreted. It exists because the
+    /// same four-arm match was written out at each call site, and the specialty
+    /// WALs (document, FTS, CDC) had no arm at all: they ended their appends
+    /// with `Write::flush`, which for a bare `std::fs::File` is defined to do
+    /// nothing whatsoever. An ack meant "the kernel has it" at best and
+    /// "nothing has it" at worst, while reading exactly like a durable write.
+    /// Returns whether a barrier was actually issued -- `false` only for
+    /// [`SyncMode::None`]. Callers count the `true`s, so that a "syncs" metric
+    /// means barriers reached rather than calls made. Counting calls would
+    /// report a healthy sync rate for a database configured never to sync,
+    /// which is the failure this whole change is about.
+    pub fn apply(self, file: &std::fs::File) -> std::io::Result<bool> {
+        match self {
+            SyncMode::Fsync => file.sync_all().map(|()| true),
+            SyncMode::Fdatasync => file.sync_data().map(|()| true),
+            SyncMode::FlushOs => flush_to_os(file).map(|()| true),
+            SyncMode::None => Ok(false),
+        }
+    }
 }
 
 /// Header size for a WAL record (before page data).
@@ -472,12 +499,7 @@ impl Wal {
         let mut writer = self.writer.lock();
         let covered = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
         writer.flush()?;
-        match self.sync_mode {
-            SyncMode::Fsync => writer.get_ref().sync_all()?,
-            SyncMode::Fdatasync => writer.get_ref().sync_data()?,
-            SyncMode::FlushOs => flush_to_os(writer.get_ref())?,
-            SyncMode::None => {} // skip sync entirely
-        }
+        let _ = self.sync_mode.apply(writer.get_ref())?;
         self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(covered)
     }
@@ -1113,12 +1135,7 @@ impl SegmentedWal {
         let mut active = self.active.lock();
         let covered = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
         active.writer.flush()?;
-        match self.sync_mode {
-            SyncMode::Fsync => active.writer.get_ref().sync_all()?,
-            SyncMode::Fdatasync => active.writer.get_ref().sync_data()?,
-            SyncMode::FlushOs => flush_to_os(active.writer.get_ref())?,
-            SyncMode::None => {} // skip sync entirely
-        }
+        let _ = self.sync_mode.apply(active.writer.get_ref())?;
         self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(covered)
     }

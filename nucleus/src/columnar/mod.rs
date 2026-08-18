@@ -711,6 +711,19 @@ impl Drop for ColumnarStore {
 }
 
 impl ColumnarStore {
+    /// Whether the WAL has appends no completed fsync covers yet.
+    pub fn wal_is_dirty(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.is_dirty())
+    }
+
+    /// Group-commit fsync the WAL, so every appended columnar mutation is durable
+    /// before the transaction that made it is acked. No-op in memory-only mode.
+    pub fn wal_group_sync(&self) -> std::io::Result<()> {
+        match self.wal {
+            Some(ref wal) => wal.group_sync(),
+            None => Ok(()),
+        }
+    }
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),

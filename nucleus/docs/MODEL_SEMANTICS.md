@@ -35,21 +35,21 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | SQL / relational | **fsync** | yes | **yes** | n/a (is the SQL commit) | **enforced** (policies) |
 | KV (scalar) | fsync | yes | yes, **session-scoped** | **no** | yes (SQL); **no** over RESP |
 | KV collections | fsync | yes | **no** | **no** | yes (SQL); **no** over RESP |
-| Document | **page cache** | yes | yes, **session-scoped** | **no** | yes |
+| Document | fsync (**2026-08-18**, NU-006) | yes | yes, **session-scoped** | **no** | yes |
 | Graph | fsync | yes | yes, **session-scoped** | **no** | yes |
 | FTS — table index (`USING FTS`, `@@`, `BM25`) | n/a — derived from rows | rebuilt from base rows at startup | **yes** (rebuilt from committed rows on abort) | n/a — the rows are the SQL commit | **enforced** (rows go through table policies) |
-| FTS — document store (`FTS_*`) | **page cache** | yes, via `fts_index.json` (see below) | partial (undo log, best-effort) | **no** | yes (refused while RLS active) |
+| FTS — document store (`FTS_*`) | fsync (**2026-08-18**, NU-006) | yes, via `fts_index.json` (see below) | partial (undo log, best-effort) | **no** | yes (refused while RLS active) |
 | Geo | **none** | n/a — no state | n/a | n/a | n/a (pure functions) |
 | Vector (HNSW) | fsync | yes | yes, **session-scoped** | **no** | decorative (see below) |
 | Vector (IvfFlat) | **none** (rebuilt) | rebuilt from base rows | via rebuild | n/a | decorative |
 | Time series | fsync | yes | yes, **session-scoped** | **no** | yes |
-| Columnar *store* (`COLUMNAR_*`) | **page cache** | yes | **no** | **no** | yes |
+| Columnar *store* (`COLUMNAR_*`) | fsync (**2026-08-18**, NU-006) | yes | **no** | **no** | yes |
 | Columnar *engine* (`engine='columnar'`) | **fsync** | yes | **yes** | yes | via table policies |
 | Datalog | fsync | yes (**fixed 2026-08-17**, NU-013) | yes (in-memory) | **no** | yes |
 | Streams (SQL `STREAM_*`) | fsync (entries only) | entries yes; **groups/acks no** | **no** | **no** | yes |
 | Streams (RESP `XADD`) | **none** | **NO** | **no** | **no** | **no** |
-| CDC | **page cache** (by design) | yes | **no** | **no** — emitted pre-commit | yes (metadata only) |
-| Blob / large objects | **page cache** | manifests yes; payload racy | yes, **session-scoped** | **no** | yes |
+| CDC | fsync (**2026-08-18**, NU-006) | yes | **no** | **no** — emitted pre-commit (NU-107 open) | yes (metadata only) |
+| Blob / large objects | fsync for manifests (**2026-08-18**, NU-006) | manifests yes; payload racy | yes, **session-scoped** | **no** | yes |
 | Pub/Sub | **none** | **NO** | **no** | **no** | yes |
 | Branch / version | **none** | **NO** | **no** | **no** | yes |
 | Tensor | **none** | **NO** | **no** | **no** | yes |
@@ -119,7 +119,7 @@ These claims in the current tracked docs are **wrong or stale**:
 |---|---|---|
 | `DURABILITY.md:25` | `geo/geo.wal` — "R-tree mutations / Replayed on open" | Nothing ever appends to it and the replayed state is discarded (`src/executor/mod.rs:809`). **[verified]** the file is 0 bytes on a live server after geo use. There is no R-tree in the executor at all. |
 | `DURABILITY.md:30` | `datalog/datalog.wal` — "Facts and rules / Replayed on open" | **Was false, FIXED 2026-08-17 (NU-013).** `datalog_wal` was opened, stored and **never written**; the file stayed 0 bytes after `DATALOG_ASSERT` and the facts were gone after restart. All four mutators (`ASSERT`/`RULE`/`RETRACT`/`CLEAR`) now append, and a failed append fails the statement. Pinned by `datalog_facts_and_rules_survive_restart`, which asserts through SQL across a restart — the only place the gap was visible. |
-| `DURABILITY.md:49` | `fsync` mode — "Data + metadata flushed before a commit is acknowledged / loses nothing acknowledged" | True for the SQL WAL and six specialty WALs. **False** for document, FTS, blob, the columnar store, and CDC — none is in `force_specialty_durability` (`src/executor/mod.rs:3074-3110`). `sync_mode` applies only to the segmented SQL WAL. |
+| ~~`DURABILITY.md:49`~~ | ~~`fsync` mode — "Data + metadata flushed before a commit is acknowledged"~~ | **RESOLVED 2026-08-18 (NU-006).** Document, FTS, blob, the columnar store and CDC are now in `force_specialty_durability`, and `acked_specialty_writes_are_fsync_durable` fails if any block is removed. `sync_mode` still applies only to the segmented SQL WAL — the specialty logs always full-`fsync`. |
 | `DURABILITY.md:12-13` | "anything absent from this list is derived and rebuildable" | Branch/version, tensor, sparse, and stored procedures are absent **and not rebuildable** — there is no authoritative source to rebuild them from. |
 | `RLS_SECURITY.md:64-66` | specialty surfaces "fail closed while RLS is active" | Holds for the unqualified names **[verified for 27 functions]**, but is defeated by the `pg_catalog.` prefix **[verified]**, and does not cover the RESP protocol at all. |
 | `src/executor/txn.rs:6-7` | "**All** specialty stores (KV, Graph, Doc, Datalog, FTS, TimeSeries, Blob, Vector) are snapshotted at BEGIN and restored on ROLLBACK" | **Corrected in M8.** The parenthetical list was accurate; the word "All" was not. KV *collections*, columnar store, streams, CDC, pub/sub, branch, version, tensor, sparse, and procedures are still outside the enlisted set and are never rolled back. |

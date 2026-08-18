@@ -100,12 +100,38 @@ contract `probe_crash_points` invariant 3 checks directly by comparing the
 child's last fsynced id against what recovery returns.
 
 **This mode applies to the SQL WAL only.** At the commit boundary
-`force_specialty_durability()` additionally fsyncs the KV, KV-collections, time
-series, vector, graph and streams logs. The document, FTS, blob and columnar
-logs are *not* fsynced on the commit path — they are `write` + `flush` into the
-OS page cache, so an acknowledged write to those models survives a process
-crash but not necessarily a power failure. CDC is excluded deliberately (it
-appends per changed row; its source rows are already durable in the SQL WAL).
+`force_specialty_durability()` fsyncs every specialty log: KV, KV-collections,
+time series, vector, graph, streams, and — since 2026-08-18, NU-006 —
+document, FTS, blob, columnar, geo and CDC. The specialty logs always take a
+full `sync_all`; `sync_mode` tunes the segmented SQL WAL only.
+
+Until then the last six were `write` + `flush` with no fsync anywhere on the
+commit path, so an acknowledged document, FTS, blob or columnar write survived
+a process crash but not a power failure. The `flush` is worth naming, because
+it is what made the gap invisible: on a bare `std::fs::File` `Write::flush` is
+documented to do *nothing at all*, and on a `BufWriter` it only hands bytes to
+the kernel. Both read like durability at the call site. Columnar was a
+different shape again — it had `group_sync` all along and was simply never
+called from the commit path.
+
+CDC was previously excluded deliberately, on the reasoning that its source rows
+are already durable in the SQL WAL. That is true of the *rows* and not of the
+*feed*: a consumer that has read to sequence N and crashes cannot tell whether N
+was durable, so the feed could silently rewind. It now syncs last within
+`force_specialty_durability`, which orders it after the other specialty logs —
+but not after the SQL WAL, because the whole specialty block is forced first by
+design (see the ordering rationale at the commit site: orphaned-but-harmless
+beats durably-referencing-nothing). So a crash in that window can still leave
+the feed ahead of the SQL rows it describes. That is the pre-existing trade-off
+and the substance of NU-107, which stays open. All that changes here is that a
+CDC ack now means fsynced rather than page-cached.
+
+**Geo is wired but inert.** `geo.wal` is opened and now participates in the
+commit boundary, but nothing in the executor ever appends to it — only its own
+unit tests do — so `is_dirty()` is always false in a running server. See the
+`DURABILITY.md:25` row in `docs/MODEL_SEMANTICS.md`: there is no R-tree in the
+executor at all. The wiring is there so that whenever geo does get a write
+path, it is durable by construction rather than by remembering.
 
 ## Crash-injection coverage
 

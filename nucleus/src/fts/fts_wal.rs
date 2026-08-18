@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::storage::wal_util::WalSync;
+
 // ─── Entry type tags ──────────────────────────────────────────────────────────
 
 const ENTRY_INDEX_DOC: u8 = 0x01;
@@ -44,6 +46,11 @@ pub struct FtsWalState {
 pub struct FtsWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Append/sync bookkeeping for group commit. These appends previously
+    /// ended at `BufWriter::flush`, which only moves bytes into the kernel --
+    /// so an acknowledged FTS write survived `kill -9` but not power loss, and
+    /// nothing in the code read as missing. NU-006.
+    syncer: WalSync,
 }
 
 impl std::fmt::Debug for FtsWal {
@@ -74,9 +81,31 @@ impl FtsWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: WalSync::new(),
             },
             state,
         ))
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     /// Log an INDEX_DOC operation (store original text).
@@ -87,7 +116,9 @@ impl FtsWal {
         w.write_all(&doc_id.to_le_bytes())?;
         w.write_all(&(text_bytes.len() as u32).to_le_bytes())?;
         w.write_all(text_bytes)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a REMOVE_DOC operation.
@@ -95,7 +126,9 @@ impl FtsWal {
         let mut w = self.writer.lock();
         w.write_all(&[ENTRY_REMOVE_DOC])?;
         w.write_all(&doc_id.to_le_bytes())?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Re-read the WAL file to get the current (doc_id, text) pairs.
@@ -250,6 +283,18 @@ fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An append is un-fsynced until `group_sync` covers it. NU-006.
+    #[test]
+    fn group_sync_marks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = FtsWal::open(dir.path()).unwrap();
+        assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
+        wal.log_index_doc(1, "hello world").unwrap();
+        assert!(wal.is_dirty(), "an append is uncovered until fsync");
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
+    }
 
     #[test]
     fn test_index_doc_replay() {

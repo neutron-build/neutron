@@ -3844,6 +3844,57 @@ impl Executor {
         {
             wal.group_sync().map_err(io_err)?;
         }
+        // NU-006: these six acknowledged their writes before any fsync. The
+        // document, FTS, blob and geo logs ended their appends at a
+        // `Write::flush` -- a no-op on a bare `File`, and only a kernel
+        // handoff on a `BufWriter` -- so a committed row survived `kill -9`
+        // but not a power cut. Columnar already had `group_sync` and was
+        // simply never called here. DURABILITY.md stated this exclusion as a
+        // property; it is no longer true and has been updated.
+        {
+            let s = self.doc_store.read();
+            if s.wal_is_dirty() {
+                s.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        {
+            let s = self.fts_index.read();
+            if s.wal_is_dirty() {
+                s.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        {
+            let s = self.blob_store.read();
+            if s.wal_is_dirty() {
+                s.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        {
+            let s = self.columnar_store.read();
+            if s.wal_is_dirty() {
+                s.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        if let Some(ref wal) = self.geo_wal
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        // CDC last *within this function*, so the specialty logs whose changes
+        // it describes are durable before it is. Note what that does and does
+        // not buy: it orders CDC against the other specialty models only. The
+        // whole block still runs BEFORE the SQL WAL is forced (deliberately --
+        // see the ordering rationale at the call site), so after a crash in
+        // that window the feed can still be ahead of the SQL rows it describes.
+        // That is the pre-existing orphan trade-off, not something this
+        // introduces, and it is the substance of the still-open question of
+        // whether CDC is transactional at all (NU-107). What changes here is
+        // only that a CDC ack now means fsynced rather than page-cached.
+        if let Some(ref wal) = self.cdc_wal
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
         Ok(())
     }
 

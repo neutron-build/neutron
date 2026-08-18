@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::storage::wal_util::WalSync;
+
 use super::{CdcLog, CdcLogEntry, ChangeType};
 
 // ---- Entry type tags --------------------------------------------------------
@@ -65,6 +67,12 @@ pub struct CdcWalState {
 pub struct CdcWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Append/sync bookkeeping for group commit. These appends previously
+    /// ended at `BufWriter::flush`, reaching the kernel but never the device --
+    /// an acknowledged change event survived `kill -9` but not power loss.
+    /// NU-006. Whether CDC should be *transactional* is a separate open
+    /// question (NU-107); this only makes the ack honest.
+    syncer: WalSync,
 }
 
 impl CdcWal {
@@ -91,9 +99,31 @@ impl CdcWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: WalSync::new(),
             },
             state,
         ))
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     /// Log a CDC append operation (new change event).
@@ -122,7 +152,9 @@ impl CdcWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a consumer position update (acknowledge).
@@ -134,7 +166,9 @@ impl CdcWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Write a full snapshot and truncate the log to just that snapshot.

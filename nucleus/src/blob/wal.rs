@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::storage::wal_util::WalSync;
+
 // ---- Entry type tags --------------------------------------------------------
 
 /// Legacy STORE with embedded chunk data (replay-only).
@@ -93,6 +95,11 @@ pub struct BlobMetaSnapshot<'a> {
 pub struct BlobWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Append/sync bookkeeping for group commit. These appends previously
+    /// ended at `BufWriter::flush`, which only moves bytes into the kernel, so
+    /// an acknowledged blob metadata write survived `kill -9` but not power
+    /// loss. NU-006.
+    syncer: WalSync,
 }
 
 fn encode_store_meta_body(
@@ -151,9 +158,31 @@ impl BlobWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: WalSync::new(),
             },
             state,
         ))
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     /// Log a STORE_META operation (blob put) — manifest only, no chunk data.
@@ -171,7 +200,9 @@ impl BlobWal {
         encode_store_meta_body(&mut buf, id, content_type, total_size, chunks, tags);
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a DELETE operation.
@@ -182,7 +213,9 @@ impl BlobWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a TAG operation.
@@ -195,7 +228,9 @@ impl BlobWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Write a full manifest snapshot and truncate the log to just that
@@ -258,7 +293,9 @@ impl BlobWal {
         }
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 }
 

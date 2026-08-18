@@ -99,3 +99,55 @@ async fn a_write_inside_a_transaction_defers_its_fsync_to_commit() {
     exec(&ex, "COMMIT").await;
     assert!(!wal.is_dirty(), "COMMIT must force it");
 }
+
+/// NU-006: an acked write to a *specialty* model must be fsync-durable too.
+///
+/// `force_specialty_durability` is the executor's commit point for the
+/// non-SQL models, and it covered six of them. The document, FTS, blob, geo
+/// and CDC logs were not in it, and their appends ended at a `Write::flush` —
+/// which is a documented no-op on a bare `std::fs::File` and only a kernel
+/// handoff on a `BufWriter`. So `DOC_INSERT` returned an id, the client
+/// treated the document as stored, and a power cut lost it. Columnar already
+/// had `group_sync` and was simply never called.
+///
+/// This asserts the property the models advertise rather than the mechanism:
+/// after the ack, nothing is left un-fsynced. It fails against the old code —
+/// remove any one block from `force_specialty_durability` and the matching
+/// assertion below goes red, which is how each was checked.
+#[tokio::test]
+async fn acked_specialty_writes_are_fsync_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _adapter) = open(dir.path());
+
+    exec(&ex, "SELECT DOC_INSERT('{\"a\":1}')").await;
+    assert!(
+        !ex.doc_store().read().wal_is_dirty(),
+        "DOC_INSERT acked with un-fsynced appends in the document WAL"
+    );
+
+    exec(&ex, "SELECT FTS_INDEX(1, 'hello world')").await;
+    assert!(
+        !ex.fts_index().read().wal_is_dirty(),
+        "FTS_INDEX acked with un-fsynced appends in the FTS WAL"
+    );
+
+    ex.blob_store_put("k", b"payload", None);
+    exec(&ex, "SELECT 1").await;
+    assert!(
+        !ex.blob_store().read().wal_is_dirty(),
+        "a blob write was left un-fsynced past the next commit"
+    );
+
+    assert!(
+        !ex.columnar_store().read().wal_is_dirty(),
+        "columnar had group_sync all along and was never called at commit"
+    );
+    assert!(
+        ex.geo_wal.as_ref().is_none_or(|w| !w.is_dirty()),
+        "geo WAL left un-fsynced past commit"
+    );
+    assert!(
+        ex.cdc_wal.as_ref().is_none_or(|w| !w.is_dirty()),
+        "CDC WAL left un-fsynced past commit"
+    );
+}
