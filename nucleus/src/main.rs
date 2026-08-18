@@ -2762,6 +2762,27 @@ fn cmd_restore_pitr(
                  (NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS), or at a clean shutdown. Anything \
                  written after the last such point was never archived and cannot be replayed."
             );
+            // The same discipline as the recovery point above, for the other
+            // thing this restore does not do. Replay reconstructs the SQL
+            // substrate's page WAL; the specialty-model logs come from the base
+            // snapshot as a byte copy and are not advanced. Restoring to a
+            // target after the base therefore leaves SQL at the target and
+            // these models at the base, and until now the command said nothing,
+            // so a partial restore printed exactly like a complete one.
+            if !report.specialty_logs_at_base.is_empty() {
+                println!(
+                    "  NOT replayed: {} specialty-model log(s) restored at the BASE snapshot's \
+                     point, not the target — {}",
+                    report.specialty_logs_at_base.len(),
+                    report.specialty_logs_at_base.join(", ")
+                );
+                println!(
+                    "  SQL is at LSN {}; those models are at the base. If the target is after \
+                     the base, they are stale relative to the relational data. Cross-model PITR \
+                     is DATABASE_COMPLETION.md M4 (NU-030) and is not implemented.",
+                    report.restored_lsn
+                );
+            }
             println!("  Start with: nucleus start --data {}", data.display());
         }
         Err(e) => {

@@ -49,6 +49,19 @@ pub struct PitrReport {
     pub restored_lsn: u64,
     /// Number of WAL segments written into the reconstructed WAL directory.
     pub segments_written: usize,
+    /// Specialty-model logs found in the restored directory, relative to it.
+    ///
+    /// These come from the base snapshot as a byte copy and are **not** advanced
+    /// by WAL replay: reconstruction covers the SQL substrate's page WAL and
+    /// nothing else. So a restore to a target after the base leaves SQL at the
+    /// target LSN and every model in this list at the base snapshot's point,
+    /// with no error. `backup.rs` states the equivalent limitation for the
+    /// snapshot path; this path said nothing at all, which made a partial
+    /// restore indistinguishable from a complete one.
+    ///
+    /// Empty means the restored directory has no specialty logs, not that the
+    /// models were replayed.
+    pub specialty_logs_at_base: Vec<String>,
     /// Wall-clock time (Unix seconds) at which the newest replayed segment was
     /// archived, when the archive index records it.
     ///
@@ -204,7 +217,41 @@ pub fn restore_pitr(
         restored_lsn,
         segments_written: (seq - 1) as usize,
         recovery_point_unix: recovery_point_of(archive_dir, restored_lsn),
+        specialty_logs_at_base: specialty_logs_in(out_data_dir, &wal_dir_name, &single_wal_name),
     })
+}
+
+/// Every `*.wal` under `root` that is not the SQL substrate's own WAL.
+///
+/// Discovered rather than listed, because a hardcoded set of model log names
+/// rots the moment a model is added -- and the failure mode of a stale list
+/// here is the silent one: a model missing from the list is a model the report
+/// does not warn about. `sql_wal_dir` and `sql_wal_file` are excluded because
+/// those are exactly what replay does reconstruct.
+fn specialty_logs_in(root: &Path, sql_wal_dir: &Path, sql_wal_file: &Path) -> Vec<String> {
+    fn walk(dir: &Path, rel: &Path, out: &mut Vec<String>, skip_dir: &Path, skip_file: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let child_rel = rel.join(&name);
+            if child_rel == skip_dir || child_rel == skip_file {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => walk(&entry.path(), &child_rel, out, skip_dir, skip_file),
+                Ok(ft) if ft.is_file() && child_rel.extension().is_some_and(|e| e == "wal") => {
+                    out.push(child_rel.to_string_lossy().into_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, Path::new(""), &mut out, sql_wal_dir, sql_wal_file);
+    out.sort();
+    out
 }
 
 /// Resolve a [`PitrTarget`] into a concrete inclusive LSN cutoff.
@@ -267,6 +314,59 @@ fn resolve_target_lsn(archive_dir: &Path, target: PitrTarget) -> io::Result<u64>
 mod tests {
     use super::*;
     use crate::storage::wal::{SegmentedWal, SyncMode};
+
+    /// The report must name the model logs a PITR restore does NOT advance.
+    ///
+    /// Replay reconstructs the SQL substrate's page WAL only; every other
+    /// model's log is restored as a byte copy of the base snapshot. Reporting
+    /// nothing made that indistinguishable from a complete restore. NU-030.
+    ///
+    /// The SQL WAL entries are the control: if they appeared in the list the
+    /// warning would be crying wolf about the one thing replay does handle.
+    #[test]
+    fn specialty_logs_are_listed_and_the_sql_wal_is_not() {
+        let root = tmp("specialty_scan");
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, file) in [
+            ("doc", "doc.wal"),
+            ("fts", "fts.wal"),
+            ("cdc", "cdc.wal"),
+            ("", "nucleus.wal"), // the SQL substrate's single-file WAL
+        ] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(file), b"x").unwrap();
+        }
+        // ...and the SQL substrate's segmented WAL directory.
+        std::fs::create_dir_all(root.join("nucleus.wal.d")).unwrap();
+        std::fs::write(root.join("nucleus.wal.d").join("000001.wal"), b"x").unwrap();
+        // A non-log file must not be swept in.
+        std::fs::write(root.join("catalog.json"), b"{}").unwrap();
+
+        let found = specialty_logs_in(&root, Path::new("nucleus.wal.d"), Path::new("nucleus.wal"));
+
+        assert!(
+            found.iter().any(|f| f.ends_with("doc.wal")),
+            "document log must be reported: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f.ends_with("fts.wal")),
+            "FTS log must be reported: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f.ends_with("cdc.wal")),
+            "CDC log must be reported: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.contains("nucleus.wal")),
+            "the SQL WAL IS replayed and must not be reported as stale: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.ends_with(".json")),
+            "only *.wal logs belong in this list: {found:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("nucleus_pitr_{tag}_{}", std::process::id()))
