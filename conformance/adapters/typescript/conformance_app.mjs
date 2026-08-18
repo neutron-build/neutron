@@ -1,24 +1,25 @@
 #!/usr/bin/env node
 // Canonical Neutron conformance app (TypeScript SDK).
 //
-// Boots the Neutron TS web/SSR server headless — no route tree, no DB — so the
-// cross-SDK conformance runner can assert the cross-cutting FRAMEWORK_CONTRACT.md
-// surfaces an SSR framework legitimately implements:
+// Boots the Neutron TS web/SSR server headless — no DB — so the cross-SDK
+// conformance runner can assert the FRAMEWORK_CONTRACT.md surfaces:
 //
-//   GET /health        §7 health shape {status, nucleus, version} (nucleus=unconfigured)
-//   x-request-id       §5.1 request-id middleware (response header, all routes)
-//   CORS               §5.4 preflight + Access-Control-Allow-Origin
-//   compression        §5.5 gzip (only when a compressible body is served)
+//   GET  /health            §7 health shape {status, nucleus, version} (nucleus=unconfigured)
+//   x-request-id            §5.1 request-id middleware (response header, all routes)
+//   CORS                    §5.4 preflight + Access-Control-Allow-Origin
+//   compression             §5.5 gzip (over the compressible /api/items body)
+//   GET  /errors/{code}     §2 forced standard errors, as RFC 7807 problem+json
+//   POST /api/items         §2 typed validation -> 422 problem+json with errors[]
+//   GET  /openapi.json      §4 OpenAPI 3.1 document generated from the route tree
+//   GET  /docs              §4 Swagger UI over that document
 //
-// The API-only dimensions (RFC 7807 forced-error endpoints, typed validation,
-// OpenAPI 3.1) are reported `skip`, recorded in conformance/known-skips.json
-// with a reason and an expiry. Note that "by design" is this adapter's claim,
-// not the contract's: FRAMEWORK_CONTRACT.md §2 says all frameworks MUST return
-// RFC 7807, and grants no SSR exemption. That disagreement is plan step S81 and
-// is recorded rather than settled here.
+// The API dimensions used to be recorded skips: the SDK had no RFC 7807
+// support, no typed validation helper and no OpenAPI generation at all
+// (S81). They are SDK features now — this app only wires them.
 //
 // Imports the built dist directly (no package resolution needed); the dist lives
-// inside the pnpm workspace so its own hono imports resolve. Requires the package
+// inside the pnpm workspace so its own hono imports resolve. Route files import
+// `@neutron-build/core` via the vite.config.mts alias. Requires the package
 // to be built first: `pnpm --filter @neutron-build/core build`.
 //
 // Listen address: PORT (required by the runner), HOST optional.
@@ -43,12 +44,12 @@ await createServer({
   port,
   host,
   version: "9.9.9",
-  // One route: `routes/api/items.tsx`, serving a compressible JSON body so the
-  // gzip probe has something to act on. It used to point at a path that does
-  // not exist — manifest.discoverRoutes tolerates a missing dir and returns []
-  // — which booted the contract middleware and /health but left
-  // `mw.compression` probing a 404 and reporting `skip`. The compression
-  // middleware was always enabled; nothing was being served through it.
+  // Two route modules: `routes/api/items.tsx` (GET list + POST validation —
+  // also the compressible body for the gzip probe) and
+  // `routes/errors/[code].tsx` (forced §2 errors). It used to point at a
+  // path that does not exist — manifest.discoverRoutes tolerates a missing
+  // dir and returns [] — which booted the contract middleware and /health
+  // but left `mw.compression` probing a 404 and reporting `skip`.
   rootDir: HERE,
   // No build output to serve; point distDir at an existing dir so the static
   // mounts don't log a "root path not found" warning. The runner never probes
@@ -57,4 +58,6 @@ await createServer({
   routesDir: "routes",
   cors: { origin: "*" },
   compress: true,
+  // §4: the OpenAPI 3.1 document and /docs, generated from the route tree.
+  openapi: { title: "Neutron Conformance API", version: "9.9.9" },
 });

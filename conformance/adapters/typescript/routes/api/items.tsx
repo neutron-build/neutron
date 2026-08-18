@@ -1,18 +1,30 @@
-// The one route the TypeScript conformance app serves.
+// The one substantive route the TypeScript conformance app serves.
 //
-// It exists so `mw.compression` has something to compress. The adapter
-// otherwise boots with no route tree, so the gzip probe hit a 404 and the
-// dimension reported `skip` — recorded in conformance/known-skips.json as the
-// one of TypeScript's seven that is an ADAPTER gap rather than an SDK gap:
-// `createServer` enables hono/compress by default and the middleware was
-// always there, the harness simply gave it nothing to act on.
+// GET  — the compressible JSON body (~50 repetitive records) that the
+//        `mw.compression` probe acts on; also the preflight target for
+//        `mw.cors` and the x-request-id carrier for `mw.requestid`.
+// POST — the canonical validation endpoint (FRAMEWORK_CONTRACT.md §2):
+//        an invalid body must answer 422 `application/problem+json` with a
+//        populated `errors[]`. The validation itself is the SDK's, not
+//        hand-rolled here — `validateJsonBody` + a zod schema — so the
+//        dimension exercises the framework feature (S81) rather than an
+//        adapter-shaped imitation of it.
 //
-// Deliberately the same path and shape the Go, Rust, Python and Elixir
-// conformance apps serve at /api/items, so the five are probed identically.
-// The body is ~50 repetitive records: comfortably over any compression
-// threshold and highly compressible, so a failure means the middleware did not
-// run rather than that the payload was not worth compressing.
+// Same path and shape the Go, Rust, Python and Elixir conformance apps serve
+// at /api/items, so the five are probed identically.
+import {
+  json,
+  validateJsonBody,
+  z,
+  type ActionArgs,
+} from "@neutron-build/core";
+
 export const config = { mode: "app" };
+
+const NewItem = z.object({
+  name: z.string().min(1),
+  price: z.number().gte(0),
+});
 
 export async function loader() {
   const items = Array.from({ length: 50 }, (_, i) => ({
@@ -28,4 +40,9 @@ export async function loader() {
       "Cache-Control": "no-store",
     },
   });
+}
+
+export async function action({ request }: ActionArgs) {
+  const item = await validateJsonBody(request, NewItem);
+  return json({ id: 1, name: item.name, price: item.price }, 201);
 }

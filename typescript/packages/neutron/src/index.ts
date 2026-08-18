@@ -9,6 +9,22 @@ export {
 export { renderStatic, renderToString } from "./core/render-static.js";
 export { assertRenderedFragment } from "./core/fragment-guard.js";
 export { redirect, safeRedirect, isSafeRedirect, json, notFound, isResponse, defer, isDeferredData, DeferredData } from "./core/response.js";
+export {
+  ProblemError,
+  isProblemError,
+  badRequest,
+  unauthorized,
+  forbidden,
+  notFoundError,
+  conflict,
+  validationError,
+  rateLimited,
+  internalError,
+  validateJsonBody,
+  PROBLEM_CONTENT_TYPE,
+  PROBLEM_TYPE_BASE,
+  type ProblemFieldError,
+} from "./core/problem.js";
 export { cache, clearCache, clearCacheByPrefix, resetRequestCache, revalidateTag, revalidateTags, getCacheTags, getCacheKeysByTag, type CacheOptions } from "./core/cache.js";
 export { generateFontHTML, validateFontConfig, type FontConfig, type FontSource } from "./core/fonts.js";
 export { route, type RoutePath, type RouteHref, type NeutronGeneratedRouteMap } from "./core/typed-routes.js";
@@ -70,6 +86,7 @@ export {
   type NeutronActionEndEvent,
   type NeutronErrorEvent,
 } from "./server/index.js";
+export type { NeutronOpenApiOptions } from "./server/index.js";
 export {
   defineConfig,
   resolveRuntime,

@@ -200,6 +200,7 @@ function createRoute(
       config,
       hasLoader: derived.hasLoader,
       hasMiddleware: derived.hasMiddleware,
+      hasAction: derived.hasAction,
       parentId,
       isLayout: true,
     };
@@ -219,6 +220,7 @@ function createRoute(
       config,
       hasLoader: derived.hasLoader,
       hasMiddleware: derived.hasMiddleware,
+      hasAction: derived.hasAction,
       parentId,
       isLayout: false,
       isNotFound: true,
@@ -237,6 +239,7 @@ function createRoute(
     config,
     hasLoader: derived.hasLoader,
     hasMiddleware: derived.hasMiddleware,
+    hasAction: derived.hasAction,
     parentId,
     isLayout: false,
   };
@@ -282,6 +285,12 @@ export interface RouteFacts {
    * gated route would be served ungated. See A-020.
    */
   hasMiddleware: boolean;
+  /**
+   * Whether the route source exports `action`. Read by OpenAPI generation,
+   * which runs at boot and cannot import the module: a POST operation is
+   * documented only when an action exists to serve it.
+   */
+  hasAction: boolean;
 }
 
 /**
@@ -303,9 +312,14 @@ export function parseRouteFacts(fileContent: string): RouteFacts {
   const middlewareDeclared =
     /export\s+(?:async\s+)?(?:function|const|let|var)\s+middleware\b/.test(fileContent);
   const middlewareNamed = /export\s*\{[^}]*\bmiddleware\b[^}]*\}/.test(fileContent);
+  // `action` powers the OpenAPI POST operation, same detection family.
+  const actionDeclared =
+    /export\s+(?:async\s+)?(?:function|const|let|var)\s+action\b/.test(fileContent);
+  const actionNamed = /export\s*\{[^}]*\baction\b[^}]*\}/.test(fileContent);
   return {
     hasLoader: declared || named,
     hasMiddleware: middlewareDeclared || middlewareNamed,
+    hasAction: actionDeclared || actionNamed,
   };
 }
 
@@ -314,7 +328,7 @@ function readRouteFacts(filePath: string): RouteFacts {
     return parseRouteFacts(fs.readFileSync(filePath, "utf-8"));
   } catch {
     // Unreadable source: assume the heavier path, and assume gated.
-    return { hasLoader: true, hasMiddleware: true };
+    return { hasLoader: true, hasMiddleware: true, hasAction: true };
   }
 }
 

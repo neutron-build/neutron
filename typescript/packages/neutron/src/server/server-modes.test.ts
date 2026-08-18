@@ -72,7 +72,7 @@ describe("server modes", () => {
     expect((await fetch(`${base}/nope`)).status).toBe(404);
   });
 
-  it("api mode: JSON 404, user routes still reachable (notFound, not a shadowing catch-all)", async () => {
+  it("api mode: RFC 7807 404, user routes still reachable (notFound, not a shadowing catch-all)", async () => {
     root = await emptyRoot();
     const port = await getFreePort();
     running = await createServer({
@@ -92,7 +92,15 @@ describe("server modes", () => {
 
     const missing = await fetch(`${base}/missing`);
     expect(missing.status).toBe(404);
-    expect(await missing.json()).toEqual({ error: "Not Found", path: "/missing" });
+    // FRAMEWORK_CONTRACT.md §2: errors are problem+json, not ad-hoc JSON.
+    expect(missing.headers.get("content-type")).toContain("application/problem+json");
+    expect(await missing.json()).toEqual({
+      type: "https://neutron.dev/errors/not-found",
+      title: "Not Found",
+      status: 404,
+      detail: "No route matches /missing",
+      instance: "/missing",
+    });
 
     expect((await fetch(`${base}/health`)).status).toBe(200);
   });

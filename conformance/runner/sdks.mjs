@@ -104,10 +104,12 @@ export const SDKS = [
     },
   },
   {
-    // Web/SSR meta-framework (Hono): implements the cross-cutting contract
-    // surfaces (health, request-id, CORS, compression). API-only dimensions
-    // (forced errors, validation, OpenAPI) are skip-by-design — see
-    // adapters/typescript/README.md.
+    // Web/SSR meta-framework (Hono). Implements the whole contract surface as
+    // of S81 (2026-08-18): health, request-id, CORS and compression, plus RFC
+    // 7807 problems, typed validation and OpenAPI 3.1. Those last three were
+    // "skip-by-design for an SSR framework" here until it was checked --
+    // FRAMEWORK_CONTRACT.md §2 grants no SSR exemption, so the design was
+    // self-exempting from a MUST rather than scoping one.
     name: "ts",
     portEnv: "PORT",
     hostEnv: "HOST",

@@ -63,6 +63,16 @@ describe("parseRouteFacts", () => {
     expect(parseRouteFacts("const loaderStyles = {};\nexport default () => null;").hasLoader).toBe(false);
     expect(parseRouteFacts("export const loaderData = 1;").hasLoader).toBe(false);
   });
+
+  // `action` feeds OpenAPI generation, which runs at boot against route
+  // source — same detection family, same failure modes.
+  it("detects the declaration forms an action is written in", () => {
+    expect(parseRouteFacts("export async function action() {}").hasAction).toBe(true);
+    expect(parseRouteFacts("export const action = async () => {};").hasAction).toBe(true);
+    expect(parseRouteFacts("const action = () => {};\nexport { action };").hasAction).toBe(true);
+    expect(parseRouteFacts("export default function Page() { return null; }").hasAction).toBe(false);
+    expect(parseRouteFacts("export const actionable = 1;").hasAction).toBe(false);
+  });
 });
 
 describe("renderSpeculationRules", () => {

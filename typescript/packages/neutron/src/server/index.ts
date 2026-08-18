@@ -41,6 +41,12 @@ import {
 } from "./cache-store.js";
 import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
 import { escapeHtml } from "../core/escape.js";
+import { isProblemError, notFoundError } from "../core/problem.js";
+import {
+  buildOpenApiSpec,
+  swaggerDocsHtml,
+  type NeutronOpenApiOptions,
+} from "./openapi.js";
 import { assertRenderedFragment, decodeChunkStart } from "../core/fragment-guard.js";
 import { neutronPlugin } from "../vite/plugin.js";
 import {
@@ -92,6 +98,7 @@ export { csrfMiddleware } from "./csrf.js";
 export type { CsrfOptions } from "./csrf.js";
 export { rateLimitMiddleware, apiRateLimit, imageRateLimit } from "./rate-limit.js";
 export type { RateLimitOptions } from "./rate-limit.js";
+export type { NeutronOpenApiOptions } from "./openapi.js";
 export { inputLimitsMiddleware } from "./input-limits.js";
 export type { InputLimitsOptions } from "./input-limits.js";
 export {
@@ -132,6 +139,16 @@ export interface NeutronServerOptions {
   version?: string;
   cors?: false | CorsOptions;
   securityHeaders?: false | { headers?: Record<string, string> };
+  /**
+   * Serve an OpenAPI 3.1 document (FRAMEWORK_CONTRACT.md §4) generated from
+   * the discovered app routes: GET per loader, POST per action, path params
+   * documented from the route pattern, and every operation referencing the
+   * shared RFC 7807 ProblemDetail schema for errors. Absent = the spec
+   * surface is not mounted. Per-operation enrichment (request bodies,
+   * response schemas) is merged in via `paths`/`components` — TS handlers
+   * carry no runtime type information to infer them from.
+   */
+  openapi?: NeutronOpenApiOptions;
   /**
    * Allow-list of Host header values this server will serve. When set, requests
    * with any other Host get a 400 — preventing Host-header injection into
@@ -313,6 +330,7 @@ export async function createServer(
     websocket,
     cors,
     securityHeaders,
+    openapi,
     trustedHosts,
     cache,
     routes: routeRules,
@@ -389,6 +407,18 @@ export async function createServer(
   }
 
   const app = new Hono<{ Variables: { requestId: string } }>();
+
+  // FRAMEWORK_CONTRACT.md §2: errors are RFC 7807 problem+json. A ProblemError
+  // thrown from a route mounted directly on the Hono app (api/raw mode, or
+  // app.get(...) calls on the returned handle) is converted here; errors
+  // thrown inside the SSR catch-all are converted there, where the request
+  // path is at hand. Anything else propagates to Hono's default 500.
+  app.onError((error, c) => {
+    if (isProblemError(error)) {
+      return error.toResponse(c.req.path);
+    }
+    throw error;
+  });
 
   // FRAMEWORK_CONTRACT.md §5: Request ID is middleware step 1 (outermost). Reuse an
   // inbound x-request-id for trace propagation, otherwise generate one. It is shared
@@ -481,6 +511,27 @@ export async function createServer(
         version: serverVersion,
       }),
     );
+  }
+
+  // FRAMEWORK_CONTRACT.md §4: /openapi.json + /docs. Like /health, suppressed
+  // when the app defines its own route at the same path — the user route wins.
+  const userDefinesSpecRoute = isSsr
+    ? routes.some(
+        (route) =>
+          (route.path === "/openapi.json" || route.path === "/docs") &&
+          !route.file.includes("_layout")
+      )
+    : false;
+  if (openapi && !userDefinesSpecRoute) {
+    const spec = buildOpenApiSpec(routes, {
+      title: openapi.title,
+      version: openapi.version ?? serverVersion,
+      description: openapi.description,
+      paths: openapi.paths,
+      components: openapi.components,
+    });
+    app.get("/openapi.json", (c) => c.json(spec));
+    app.get("/docs", (c) => c.html(swaggerDocsHtml(openapi.title)));
   }
 
   // SSR-only routes: static assets, image optimization, server islands, and the HTML
@@ -869,17 +920,25 @@ export async function createServer(
         source: "request",
         error: toError(error),
       });
+      // A ProblemError that escaped the render pipeline — e.g. thrown from
+      // route or global middleware, which runMiddlewareChain does not convert
+      // — answers as RFC 7807 (FRAMEWORK_CONTRACT.md §2), not a bare 500.
+      if (isProblemError(error)) {
+        return finalize(error.toResponse(requestTrace.pathname));
+      }
       return finalize(new Response("Internal Server Error", { status: 500 }));
     }
   });
   } // end if (isSsr)
 
-  // "api" mode answers a clean JSON 404 for anything the user didn't mount. Use
+  // "api" mode answers a clean 404 for anything the user didn't mount. Use
   // app.notFound (not an app.all("*") route) so it fires only when nothing matched —
   // an "*" route would shadow routes the caller mounts later on the returned `app`.
   // "raw" mode intentionally adds nothing — unmatched paths get Hono's default 404.
   if (mode === "api") {
-    app.notFound((c) => c.json({ error: "Not Found", path: c.req.path }, 404));
+    app.notFound((c) =>
+      notFoundError(`No route matches ${c.req.path}`).toResponse(c.req.path)
+    );
   }
 
   const server = serve({

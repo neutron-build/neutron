@@ -25,6 +25,7 @@ import {
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
+import { isProblemError } from "./problem.js";
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderToString } from "preact-render-to-string";
 import type {
@@ -699,6 +700,9 @@ export async function renderAppRoute(
           const result = await handler({ request, params: match.params, context });
           if (result instanceof Response) return result;
         } catch (error) {
+          if (isProblemError(error)) {
+            return error.toResponse(new URL(request.url).pathname);
+          }
           if (error instanceof Response) return error;
           throw error;
         }
@@ -754,6 +758,13 @@ export async function renderAppRoute(
           outcome: "success",
         });
       } catch (error) {
+        // A thrown ProblemError is an RFC 7807 response in error form: convert
+        // it here so the hook emission and early-return below treat it exactly
+        // like a returned Response, rather than rendering the HTML error
+        // boundary for what is an API error.
+        if (isProblemError(error)) {
+          error = error.toResponse(new URL(request.url).pathname);
+        }
         if (error instanceof Response) {
           const actionEndedAt = Date.now();
           emitHook(hooks?.onActionEnd, {
@@ -944,6 +955,9 @@ export async function renderAppRoute(
         return (result as { response: Response }).response;
       }
       if (result.error) {
+        if (isProblemError(result.error)) {
+          return result.error.toResponse(new URL(request.url).pathname);
+        }
         if (result.error instanceof Response) {
           return result.error;
         }

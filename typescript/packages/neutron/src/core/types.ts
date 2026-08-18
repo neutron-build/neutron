@@ -35,6 +35,13 @@ export interface Route {
    * static fast path is slow, one wrongly put on it is public. See A-020.
    */
   hasMiddleware?: boolean;
+  /**
+   * Whether the route source exports an `action`. Derived at discovery time
+   * like `hasLoader`; read by OpenAPI generation, which documents a POST
+   * operation only when an action exists to serve it. Absent means unknown,
+   * which callers must treat as "yes".
+   */
+  hasAction?: boolean;
   parentId: string | null;
   isLayout?: boolean;
   /**
