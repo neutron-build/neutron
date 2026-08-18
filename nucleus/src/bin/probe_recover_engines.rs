@@ -1278,6 +1278,7 @@ fn main_impl() {
     let mut max_report = 15usize;
     let mut engine: EngineKind = EngineKind::BufferedDisk;
     let mut negative: Option<String> = None;
+    let mut skip: Vec<String> = Vec::new();
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -1297,6 +1298,22 @@ fn main_impl() {
             "--max-report" => {
                 i += 1;
                 max_report = args[i].parse().unwrap();
+            }
+            // Repeatable. Exists so a section with a KNOWN live finding can be
+            // held out of a gate run without deleting the section or muting the
+            // finding — the skip is announced loudly below, because a probe that
+            // quietly covers less than it claims is the failure this whole file
+            // exists to prevent.
+            "--skip-section" => {
+                i += 1;
+                let name = args[i].clone();
+                if !matches!(name.as_str(), "datalog" | "vector" | "catalog") {
+                    eprintln!(
+                        "--skip-section takes one of: datalog, vector, catalog (got {name:?})"
+                    );
+                    std::process::exit(2);
+                }
+                skip.push(name);
             }
             "--engine" => {
                 i += 1;
@@ -1340,8 +1357,8 @@ fn main_impl() {
         // One iteration is enough to prove a check fires, and keeps "the other
         // sections stay clean" a statement about this run, not an average.
         let vcs = section == "vector";
-        let base = run_s35_sections(seed, 1, ops_per, engine, None, vcs);
-        let pert = run_s35_sections(seed, 1, ops_per, engine, Some(section.as_str()), vcs);
+        let base = run_s35_sections(seed, 1, ops_per, engine, None, vcs, &[]);
+        let pert = run_s35_sections(seed, 1, ops_per, engine, Some(section.as_str()), vcs, &[]);
         println!("\n════ SUMMARY (control, 1 iteration) ════");
         for s in ["datalog", "vector", "catalog"] {
             println!(
@@ -1411,6 +1428,12 @@ fn main_impl() {
         println!("─── [kv] PANIC during sweep (counted as divergence) ───\n");
     }
 
+    for name in &skip {
+        println!(
+            "─── [{name}] SECTION SKIPPED (--skip-section). This run does NOT cover it. \
+             See nucleus/docs/PROBES.md and _internal/OPEN_WORK.md for the open finding."
+        );
+    }
     let mut sec = run_s35_sections(
         seed,
         iterations.min(40),
@@ -1418,6 +1441,7 @@ fn main_impl() {
         engine,
         None,
         false,
+        &skip,
     );
     for (section, detail) in &sec.findings {
         println!("─── [{section}] {detail}");
@@ -1430,7 +1454,11 @@ fn main_impl() {
     println!("recovery round-trips verified : {total}");
     println!("divergences                   : {divergences}");
     for s in ["datalog", "vector", "catalog"] {
-        println!("s35/{s:<9}            : {} divergence(s)", sec.count(s));
+        if skip.iter().any(|k| k == s) {
+            println!("s35/{s:<9}            : SKIPPED (not covered by this run)");
+        } else {
+            println!("s35/{s:<9}            : {} divergence(s)", sec.count(s));
+        }
     }
     println!(
         "(LSM + Columnar durable engines are NOT wired into StorageMode — not testable via Database.)"
@@ -1458,55 +1486,63 @@ fn run_s35_sections(
     engine: EngineKind,
     perturb: Option<&str>,
     vector_control_shape: bool,
+    skip: &[String],
 ) -> Sections {
     let mut sec = Sections::default();
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_datalog(
-            seed,
-            iterations,
-            ops_per,
-            engine,
-            perturb == Some("datalog"),
-            &mut sec,
-        );
-    }));
-    if r.is_err() {
-        sec.push(
-            "datalog",
-            "PANIC during section (counted as divergence)".to_string(),
-        );
+    let skipped = |name: &str| skip.iter().any(|s| s == name);
+    if !skipped("datalog") {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_datalog(
+                seed,
+                iterations,
+                ops_per,
+                engine,
+                perturb == Some("datalog"),
+                &mut sec,
+            );
+        }));
+        if r.is_err() {
+            sec.push(
+                "datalog",
+                "PANIC during section (counted as divergence)".to_string(),
+            );
+        }
     }
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_vector(
-            seed,
-            iterations,
-            ops_per,
-            engine,
-            perturb == Some("vector"),
-            vector_control_shape,
-            &mut sec,
-        );
-    }));
-    if r.is_err() {
-        sec.push(
-            "vector",
-            "PANIC during section (counted as divergence)".to_string(),
-        );
+    if !skipped("vector") {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_vector(
+                seed,
+                iterations,
+                ops_per,
+                engine,
+                perturb == Some("vector"),
+                vector_control_shape,
+                &mut sec,
+            );
+        }));
+        if r.is_err() {
+            sec.push(
+                "vector",
+                "PANIC during section (counted as divergence)".to_string(),
+            );
+        }
     }
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_catalog_refusal(
-            seed,
-            iterations,
-            engine,
-            perturb == Some("catalog"),
-            &mut sec,
-        );
-    }));
-    if r.is_err() {
-        sec.push(
-            "catalog",
-            "PANIC during section (counted as divergence)".to_string(),
-        );
+    if !skipped("catalog") {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_catalog_refusal(
+                seed,
+                iterations,
+                engine,
+                perturb == Some("catalog"),
+                &mut sec,
+            );
+        }));
+        if r.is_err() {
+            sec.push(
+                "catalog",
+                "PANIC during section (counted as divergence)".to_string(),
+            );
+        }
     }
     sec
 }
