@@ -2,9 +2,11 @@ package neutronauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -519,6 +521,40 @@ func TestSessionStoreReadFailureIsNotAnAnonymousSession(t *testing.T) {
 	}
 	if c := sessionCookie(t, w, "session_id"); c != nil && c.Value != "" && c.Value != "real-session" {
 		t.Errorf("minted a new session ID (%q) during a store outage", c.Value)
+	}
+}
+
+// The default load-time error handler must speak RFC 7807 like the rest of
+// the framework (FRAMEWORK_CONTRACT.md §2), not bare http.Error text.
+func TestSessionStoreFailureIsProblem(t *testing.T) {
+	store := &failingStore{memoryStore: newMemoryStore(), failGet: errStoreDown}
+	handler := SessionMiddleware(store)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("handler must not run when the store is down")
+	}))
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "real-session"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+	}
+	var p struct {
+		Type   string `json:"type"`
+		Title  string `json:"title"`
+		Status int    `json:"status"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &p); err != nil {
+		t.Fatalf("body is not problem+json: %v (%q)", err, w.Body.String())
+	}
+	if p.Type != "https://neutron.dev/errors/internal" || p.Title != "Internal Server Error" ||
+		p.Status != http.StatusInternalServerError || p.Detail == "" {
+		t.Errorf("problem fields = %+v", p)
 	}
 }
 

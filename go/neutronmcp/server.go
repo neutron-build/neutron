@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+
+	"github.com/neutron-dev/neutron-go/neutron"
 )
 
 // maxRequestBody bounds an inbound JSON-RPC message. Tool arguments are small;
@@ -87,8 +89,10 @@ func (s *Server) logger() *slog.Logger {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		// HTTP-layer failure, before any JSON-RPC is spoken, so it carries
+		// the framework's RFC 7807 shape rather than a JSON-RPC error object.
 		w.Header().Set("Allow", "POST")
-		http.Error(w, "the MCP endpoint accepts POST only", http.StatusMethodNotAllowed)
+		neutron.WriteError(w, r, neutron.ErrMethodNotAllowed("the MCP endpoint accepts POST only"))
 		return
 	}
 
@@ -96,13 +100,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// unauthenticated caller should not be able to reach the decoder at all.
 	if s.Authorize == nil {
 		s.logger().Error("neutronmcp: refusing every request, no Authorizer is set", "server", s.Name)
-		http.Error(w, "server misconfigured", http.StatusInternalServerError)
+		neutron.WriteError(w, r, neutron.ErrInternal("server misconfigured"))
 		return
 	}
 	principal, ok := s.Authorize(r)
 	if !ok {
 		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer realm=%q", s.Name))
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		neutron.WriteError(w, r, neutron.ErrUnauthorized("unauthorized"))
 		return
 	}
 

@@ -3,6 +3,8 @@ package neutronrealtime
 import (
 	"fmt"
 	"net/http"
+
+	"github.com/neutron-dev/neutron-go/neutron"
 )
 
 // SSEHandler returns an http.Handler that serves Server-Sent Events.
@@ -11,7 +13,7 @@ func SSEHandler(stream func(ctx interface{ Done() <-chan struct{} }, send func(e
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			neutron.WriteError(w, r, neutron.ErrInternal("streaming not supported"))
 			return
 		}
 

@@ -358,3 +358,97 @@ func TestObjectSchemaHelpers(t *testing.T) {
 		t.Fatal("an empty required list must be omitted, not sent as []")
 	}
 }
+
+// The HTTP-layer failures (405, misconfigured 500, 401) happen before any
+// JSON-RPC is spoken, so the framework contract's RFC 7807 shape applies to
+// them — the JSON-RPC error object is only for in-band protocol errors.
+func TestHTTPLayerErrorsAreProblemJSON(t *testing.T) {
+	srv := NewServer("s", "1.0.0", func(*http.Request) (Principal, bool) {
+		return Principal{}, false
+	})
+	srv.Register(Tool{Name: "t", ReadOnly: true, Run: func(context.Context, map[string]any) (string, error) {
+		return "", nil
+	}})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	problems := make(chan problemJSON, 3)
+	post := func() *http.Response {
+		t.Helper()
+		resp, err := ts.Client().Post(ts.URL, "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+			t.Errorf("status %d: Content-Type = %q, want application/problem+json", resp.StatusCode, ct)
+		}
+		var p problemJSON
+		if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+			t.Fatalf("status %d: body is not problem+json: %v", resp.StatusCode, err)
+		}
+		problems <- p
+		return resp
+	}
+
+	// 401: refused credential. The WWW-Authenticate hint must survive the
+	// conversion — it is how a client learns which scheme to present.
+	resp := post()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+	if resp.Header.Get("WWW-Authenticate") == "" {
+		t.Error("WWW-Authenticate header was dropped; a 401 without it does not say how to authenticate")
+	}
+	if p := <-problems; p.Type != "https://neutron.dev/errors/unauthorized" || p.Title != "Unauthorized" ||
+		p.Status != http.StatusUnauthorized || p.Detail == "" {
+		t.Errorf("401 problem = %+v", p)
+	}
+
+	// 405: wrong method. Allow must survive (RFC 7231 §6.5.5).
+	resp, err := ts.Client().Get(ts.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", resp.StatusCode)
+	}
+	if resp.Header.Get("Allow") != "POST" {
+		t.Error("a 405 should say what is allowed")
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+		t.Errorf("405 Content-Type = %q, want application/problem+json", ct)
+	}
+
+	// 500: nil Authorizer fails closed, also as problem+json.
+	noAuth := &Server{Name: "unconfigured", Version: "0"}
+	ts2 := httptest.NewServer(noAuth)
+	defer ts2.Close()
+	resp, err = ts2.Client().Post(ts2.URL, "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+		t.Errorf("500 Content-Type = %q, want application/problem+json", ct)
+	}
+	var p problemJSON
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		t.Fatalf("500 body is not problem+json: %v", err)
+	}
+	if p.Type != "https://neutron.dev/errors/internal" || p.Title != "Internal Server Error" ||
+		p.Status != http.StatusInternalServerError || p.Detail == "" {
+		t.Errorf("500 problem = %+v", p)
+	}
+}
+
+type problemJSON struct {
+	Type   string `json:"type"`
+	Title  string `json:"title"`
+	Status int    `json:"status"`
+	Detail string `json:"detail"`
+}

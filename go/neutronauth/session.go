@@ -116,8 +116,9 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 	}
 
 	if o.onError == nil {
-		o.onError = func(w http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(w, "session store unavailable", http.StatusInternalServerError)
+		o.onError = func(w http.ResponseWriter, r *http.Request, _ error) {
+			// Generic detail: the raw store error can name hosts and DSNs.
+			neutron.WriteError(w, r, neutron.ErrInternal("session store unavailable"))
 		}
 	}
 	if o.onCommitError == nil {
@@ -325,11 +326,11 @@ func WithSessionErrorHandler(fn func(http.ResponseWriter, *http.Request, error))
 // fails while COMMITTING, after the handler has run.
 //
 // It deliberately receives no ResponseWriter. By that point the status is
-// already decided and the cookie has yet to be written, so anything that writes
-// to the response corrupts it — the default load-time handler calls
-// `http.Error`, which would commit a 500 and body and then silently drop the
-// rotated session cookie. Withholding the writer makes that mistake
-// unexpressible rather than merely documented.
+// already decided and the cookie has yet to be written, so anything that
+// writes to the response corrupts it — the default load-time handler writes
+// an error response, which would commit a 500 and body and then silently
+// drop the rotated session cookie. Withholding the writer makes that
+// mistake unexpressible rather than merely documented.
 //
 // Use it for logging and alerting. A commit failure is not recoverable in-band,
 // but it is worth knowing about: a failed delete of the previous session ID
