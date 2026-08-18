@@ -6430,7 +6430,12 @@ impl Executor {
     }
 
     /// Add a newly inserted row to any live vector indexes on the table.
-    fn update_vector_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
+    fn update_vector_indexes_on_insert(
+        &self,
+        table_name: &str,
+        row: &Row,
+        table_def: &TableDef,
+    ) -> Result<(), ExecError> {
         let pk_col = self.pk_col_for_incremental(table_name, table_def);
         let pk = pk_col.and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
@@ -6481,8 +6486,9 @@ impl Executor {
         }
         drop(indexes);
         for (idx_name, row_id, v) in wal_inserts {
-            self.wal_log_vector_insert(&idx_name, row_id, &v);
+            self.wal_log_vector_insert(&idx_name, row_id, &v)?;
         }
+        Ok(())
     }
 
     /// Save vector index name → (table, column) metadata sidecar for WAL recovery.
@@ -6519,21 +6525,42 @@ impl Executor {
     }
 
     /// Log a vector insert to WAL (no-op if WAL is not configured).
-    fn wal_log_vector_insert(&self, index_name: &str, id: u64, vector: &[f32]) {
-        if let Some(ref wal) = self.vector_wal
-            && let Err(e) = wal.log_insert(index_name, id, vector, "")
-        {
-            eprintln!("vector WAL: failed to log insert {index_name}/{id}: {e}");
+    ///
+    /// The error is RETURNED rather than printed. Both of these used to
+    /// `eprintln!` and carry on, so an acknowledged INSERT could leave a vector
+    /// that no restart would rebuild, and an acknowledged DELETE could leave one
+    /// that a restart would resurrect — with the client told the statement
+    /// succeeded either way. The in-memory index is already mutated by the time
+    /// this runs, so the honest report is that the statement's durability
+    /// failed, not a line in a log nobody reads. (NU-048)
+    fn wal_log_vector_insert(
+        &self,
+        index_name: &str,
+        id: u64,
+        vector: &[f32],
+    ) -> Result<(), ExecError> {
+        if let Some(ref wal) = self.vector_wal {
+            wal.log_insert(index_name, id, vector, "").map_err(|e| {
+                ExecError::Runtime(format!(
+                    "vector index {index_name}: row {id} was indexed in memory but its WAL \
+                     append failed ({e}); it would not survive a restart"
+                ))
+            })?;
         }
+        Ok(())
     }
 
     /// Log a vector delete to WAL (no-op if WAL is not configured).
-    fn wal_log_vector_delete(&self, index_name: &str, id: u64) {
-        if let Some(ref wal) = self.vector_wal
-            && let Err(e) = wal.log_delete(index_name, id)
-        {
-            eprintln!("vector WAL: failed to log delete {index_name}/{id}: {e}");
+    fn wal_log_vector_delete(&self, index_name: &str, id: u64) -> Result<(), ExecError> {
+        if let Some(ref wal) = self.vector_wal {
+            wal.log_delete(index_name, id).map_err(|e| {
+                ExecError::Runtime(format!(
+                    "vector index {index_name}: row {id} was removed in memory but its WAL \
+                     append failed ({e}); a restart would resurrect it"
+                ))
+            })?;
         }
+        Ok(())
     }
 
     /// Mark a row as deleted in any live vector indexes on the table. HNSW keys
@@ -6545,7 +6572,7 @@ impl Executor {
         row: &Row,
         row_position: usize,
         table_def: &TableDef,
-    ) {
+    ) -> Result<(), ExecError> {
         let pk = self
             .pk_col_for_incremental(table_name, table_def)
             .and_then(|pc| Self::stable_row_id(row, pc));
@@ -6574,8 +6601,9 @@ impl Executor {
         }
         drop(indexes);
         for (idx_name, id) in wal_deletes {
-            self.wal_log_vector_delete(&idx_name, id);
+            self.wal_log_vector_delete(&idx_name, id)?;
         }
+        Ok(())
     }
 
     /// Add a newly inserted row to any live table-attached FTS indexes.

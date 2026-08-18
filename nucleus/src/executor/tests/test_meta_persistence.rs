@@ -548,3 +548,57 @@ async fn datalog_facts_and_rules_survive_restart() {
         "a retracted fact came back after restart: {retracted}"
     );
 }
+
+/// NU-048: vector index changes are durable, and a failed WAL append fails the
+/// statement.
+///
+/// `wal_log_vector_insert` and `wal_log_vector_delete` used to `eprintln!` and
+/// carry on, so an acknowledged INSERT could leave a vector no restart would
+/// rebuild and an acknowledged DELETE one a restart would resurrect — the
+/// client told the statement succeeded either way. They return their error now
+/// and the DML path propagates it.
+///
+/// What this test asserts is the round-trip: inserts and deletes reach the WAL
+/// and survive a restart. It deliberately does NOT claim to exercise the
+/// failure branch — an append failure needs the open file handle to fail, which
+/// no portable in-process trick produces (replacing the file on disk leaves the
+/// unlinked inode writable). A first version of this test wrapped the assertion
+/// in `if let Err(...)` and passed without ever reaching it, which is worse than
+/// not testing it. Fault injection for the specialty WALs belongs in
+/// `probe_io_faults`; recorded as a gap rather than papered over.
+#[tokio::test]
+async fn vector_index_changes_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE v048 (id INT PRIMARY KEY, e VECTOR(3))").await;
+        exec(&ex, "CREATE INDEX v048_idx ON v048 USING HNSW (e)").await;
+        exec(&ex, "INSERT INTO v048 VALUES (1, VECTOR('[1,0,0]'))").await;
+        exec(&ex, "INSERT INTO v048 VALUES (2, VECTOR('[0,1,0]'))").await;
+        exec(&ex, "INSERT INTO v048 VALUES (3, VECTOR('[0,0,1]'))").await;
+        exec(&ex, "DELETE FROM v048 WHERE id = 2").await;
+    }
+
+    let ex = open_executor(dir.path()).await;
+    let found = rows(
+        &exec(
+            &ex,
+            "SELECT id FROM v048 ORDER BY VECTOR_DISTANCE(e, VECTOR('[1,0,0]')) LIMIT 5",
+        )
+        .await[0],
+    )
+    .len();
+    assert_eq!(
+        found, 2,
+        "the surviving vectors must be exactly the two that were not deleted"
+    );
+    let ids: Vec<i64> = rows(&exec(&ex, "SELECT id FROM v048 ORDER BY id").await[0])
+        .iter()
+        .filter_map(|r| match r[0] {
+            Value::Int32(n) => Some(n as i64),
+            Value::Int64(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 3], "a deleted row came back after restart");
+}

@@ -442,7 +442,7 @@ impl Executor {
                         let returned = self.eval_returning(returning_items, &row, &col_meta)?;
                         returned_rows.push(returned);
                     }
-                    self.update_vector_indexes_on_insert(&table_name, &row, &table_def);
+                    self.update_vector_indexes_on_insert(&table_name, &row, &table_def)?;
                     self.update_encrypted_indexes_on_insert(&table_name, &row, &table_def);
                     self.update_fts_indexes_on_insert(&table_name, &row, &table_def);
                     // Fire AFTER INSERT row-level triggers (only if triggers exist)
@@ -2461,7 +2461,7 @@ impl Executor {
                         self.remove_from_encrypted_indexes(&table_name, old_row, *pos, &table_def);
                     }
                     if has_vector_indexes {
-                        self.remove_from_vector_indexes(&table_name, old_row, *pos, &table_def);
+                        self.remove_from_vector_indexes(&table_name, old_row, *pos, &table_def)?;
                     }
                     // An UPDATE that moves the primary key leaves the old
                     // document orphaned unless it is dropped by its old key.
@@ -2473,7 +2473,7 @@ impl Executor {
                     self.update_encrypted_indexes_on_insert(&table_name, new_row, &table_def);
                 }
                 if has_vector_indexes {
-                    self.update_vector_indexes_on_insert(&table_name, new_row, &table_def);
+                    self.update_vector_indexes_on_insert(&table_name, new_row, &table_def)?;
                 }
                 if has_fts_indexes {
                     self.update_fts_indexes_on_insert(&table_name, new_row, &table_def);
@@ -2814,7 +2814,7 @@ impl Executor {
                             );
                         }
                         if has_vec {
-                            self.remove_from_vector_indexes(&table_name, old_row, pos, &table_def);
+                            self.remove_from_vector_indexes(&table_name, old_row, pos, &table_def)?;
                         }
                         if has_fts {
                             self.remove_from_fts_indexes(&table_name, old_row, &table_def);
