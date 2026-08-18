@@ -2,6 +2,9 @@
 # never read — workflows only run from the repository root. It had been sitting
 # there valid and unexecuted, which is why no generated deploy preset has ever
 # been validated by CI despite a job existing to do it.
+# 2026-08: presets are now also booted — docker as a real process, vercel's
+# generated handler invoked in-process, cloudflare static-only. See
+# typescript/scripts/deploy-preset-boot-smoke.mjs.
 name: TypeScript Deploy Presets
 
 on:
@@ -53,3 +56,9 @@ jobs:
 
       - name: Build and validate every preset
         run: pnpm run ci:deploy-presets
+
+      # Boots/invokes the generated artifacts: docker is started as a real
+      # process (requests + SIGTERM drain), vercel's generated handler is
+      # invoked in-process, cloudflare is static-only (see script header).
+      - name: Boot generated preset artifacts
+        run: pnpm run ci:deploy-presets:boot
