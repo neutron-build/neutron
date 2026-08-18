@@ -602,3 +602,38 @@ async fn vector_index_changes_survive_restart() {
         .collect();
     assert_eq!(ids, vec![1, 3], "a deleted row came back after restart");
 }
+
+/// A rolled-back Datalog assertion must not come back on replay.
+///
+/// Fixing NU-013 (the WAL was opened and never written) created this gap: the
+/// WAL now holds the appends, the in-memory undo reverts them, and replay
+/// would bring them back. The rollback checkpoints the log to the restored
+/// state — the same approach FTS takes with the file that wins on reopen.
+#[tokio::test]
+async fn a_rolled_back_datalog_assert_does_not_return_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "SELECT DATALOG_ASSERT('kept(1)')").await;
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('reverted(1)')").await;
+        exec(&ex, "ROLLBACK").await;
+        let live = scalar(&exec(&ex, "SELECT DATALOG_QUERY('reverted(X)')").await[0]).to_string();
+        assert!(
+            !live.contains('1'),
+            "the in-memory rollback did not revert the fact: {live}"
+        );
+    }
+
+    let ex = open_executor(dir.path()).await;
+    let after = scalar(&exec(&ex, "SELECT DATALOG_QUERY('reverted(X)')").await[0]).to_string();
+    assert!(
+        !after.contains('1'),
+        "a rolled-back fact came back on WAL replay: {after}"
+    );
+    let kept = scalar(&exec(&ex, "SELECT DATALOG_QUERY('kept(X)')").await[0]).to_string();
+    assert!(
+        kept.contains('1'),
+        "the committed fact was lost by the compensation: {kept}"
+    );
+}

@@ -45,7 +45,7 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Time series | fsync | yes | yes, **session-scoped** | **no** | yes |
 | Columnar *store* (`COLUMNAR_*`) | **page cache** | yes | **no** | **no** | yes |
 | Columnar *engine* (`engine='columnar'`) | **fsync** | yes | **yes** | yes | via table policies |
-| Datalog | **none** | **NO — lost on restart** | yes (in-memory) | **no** | yes |
+| Datalog | fsync | yes (**fixed 2026-08-17**, NU-013) | yes (in-memory) | **no** | yes |
 | Streams (SQL `STREAM_*`) | fsync (entries only) | entries yes; **groups/acks no** | **no** | **no** | yes |
 | Streams (RESP `XADD`) | **none** | **NO** | **no** | **no** | **no** |
 | CDC | **page cache** (by design) | yes | **no** | **no** — emitted pre-commit | yes (metadata only) |
@@ -98,8 +98,10 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
    document, graph, and time series now write compensating records as part of
    the revert, and FTS rewrites `fts_index.json` (the file that wins on reopen).
    **Vector and datalog are not covered**: the vector WAL still holds the
-   rolled-back HNSW inserts until the index is rebuilt, and datalog has no live
-   WAL to compensate (see the corrections table). **[verified]** copy the live
+   rolled-back HNSW inserts until the index is rebuilt, and datalog's WAL —
+   written since 2026-08-17 (NU-013) — is not compensated on rollback either,
+   so a rolled-back `DATALOG_ASSERT` can return on replay. Making the datalog
+   WAL real created that second gap; both are tracked together. **[verified]** copy the live
    data directory after `BEGIN; kv_set; ROLLBACK`, reopen it, and the key is
    absent; removing only the compensating records brings it back.
 
@@ -116,7 +118,7 @@ These claims in the current tracked docs are **wrong or stale**:
 | Doc | Claim | Reality |
 |---|---|---|
 | `DURABILITY.md:25` | `geo/geo.wal` — "R-tree mutations / Replayed on open" | Nothing ever appends to it and the replayed state is discarded (`src/executor/mod.rs:809`). **[verified]** the file is 0 bytes on a live server after geo use. There is no R-tree in the executor at all. |
-| `DURABILITY.md:30` | `datalog/datalog.wal` — "Facts and rules / Replayed on open" | `datalog_wal` is opened, stored, and **never written** (only 3 references in `src/`: decl `executor/mod.rs:411`, init `:623`, assign `:775`). **[verified]** file stays 0 bytes after `DATALOG_ASSERT`, and the facts are gone after restart. |
+| `DURABILITY.md:30` | `datalog/datalog.wal` — "Facts and rules / Replayed on open" | **Was false, FIXED 2026-08-17 (NU-013).** `datalog_wal` was opened, stored and **never written**; the file stayed 0 bytes after `DATALOG_ASSERT` and the facts were gone after restart. All four mutators (`ASSERT`/`RULE`/`RETRACT`/`CLEAR`) now append, and a failed append fails the statement. Pinned by `datalog_facts_and_rules_survive_restart`, which asserts through SQL across a restart — the only place the gap was visible. |
 | `DURABILITY.md:49` | `fsync` mode — "Data + metadata flushed before a commit is acknowledged / loses nothing acknowledged" | True for the SQL WAL and six specialty WALs. **False** for document, FTS, blob, the columnar store, and CDC — none is in `force_specialty_durability` (`src/executor/mod.rs:3074-3110`). `sync_mode` applies only to the segmented SQL WAL. |
 | `DURABILITY.md:12-13` | "anything absent from this list is derived and rebuildable" | Branch/version, tensor, sparse, and stored procedures are absent **and not rebuildable** — there is no authoritative source to rebuild them from. |
 | `RLS_SECURITY.md:64-66` | specialty surfaces "fail closed while RLS is active" | Holds for the unqualified names **[verified for 27 functions]**, but is defeated by the `pg_catalog.` prefix **[verified]**, and does not cover the RESP protocol at all. |

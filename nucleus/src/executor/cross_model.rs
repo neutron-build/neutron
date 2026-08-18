@@ -356,11 +356,27 @@ impl Executor {
                 .txn_restore_scoped(snap, &level.doc_touched);
         }
         if let Some(ref snap) = level.datalog {
-            self.datalog_store.write().txn_restore_scoped(
-                snap,
-                &level.datalog_touched,
-                &level.datalog_rules,
-            );
+            let mut store = self.datalog_store.write();
+            store.txn_restore_scoped(snap, &level.datalog_touched, &level.datalog_rules);
+            // Compensate the WAL, or the rollback is in-memory only.
+            //
+            // Until 2026-08-17 the datalog WAL was never written at all, so
+            // there was nothing to compensate — that was NU-013, and fixing it
+            // created this gap: the WAL now holds the appends this rollback
+            // just reverted, and replay would bring them back. Checkpointing
+            // rewrites the log to the restored state, which is the same
+            // approach FTS takes with `fts_index.json` (the file that wins on
+            // reopen). Cheaper than inverse records and correct by
+            // construction: the log after a rollback IS the state.
+            if let Some(ref wal) = self.datalog_wal
+                && let Err(e) = wal.checkpoint(&store)
+            {
+                tracing::error!(
+                    target: "nucleus::datalog",
+                    "datalog rollback could not compensate the WAL ({e}); a crash before the \
+                     next checkpoint could resurrect the rolled-back facts on replay"
+                );
+            }
         }
         if let Some(ref snap) = level.ts {
             self.ts_store

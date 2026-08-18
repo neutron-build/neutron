@@ -54,11 +54,12 @@ size across a single mutation on a live server.
 | Path | Reality |
 |------|---------|
 | `geo/geo.wal` | `GeoWal::open` runs once, its state is discarded into `_state`, and the handle is parked on the executor. Nothing appends or reads it. Geo is computational only (`GEO_DISTANCE`, `GEO_WITHIN`, `GEO_AREA`, `ST_*`); there is no `GEO_ADD`, so there is no state to persist. |
-| `datalog/datalog.wal` | Same pattern — declaration, `None` init, one assignment, no writer. Unlike geo, `DATALOG_ASSERT` *does* mutate state, so asserted facts are silently lost on restart. |
+| `datalog/datalog.wal` | **FIXED 2026-08-17 (NU-013) — no longer in this table's category.** It had the same shape as geo: declaration, `None` init, one assignment, no writer. Unlike geo, `DATALOG_ASSERT` *does* mutate state, so asserted facts were silently lost on restart. All four mutators (`ASSERT`/`RULE`/`RETRACT`/`CLEAR`) now append and a failed append fails the statement. Kept here as the record of what "opened but never written" looks like, because it is the shape this table exists to catch. |
 | `fts/fts.wal` | Opened and replayed at startup, but the SQL `FTS_*` path never appends to it, and `load_fts_index()` overwrites the replayed result with `fts_index.json` when that file parses. A corrupt snapshot fails silently and starts the server with a stale index. |
 
-No on-disk artifact at all: **datalog**, **sparse vectors**, and **tensors**
-accept writes and lose them on restart. See `docs/MODEL_SEMANTICS.md` for the
+No on-disk artifact at all: **sparse vectors** and **tensors** accept writes
+and lose them on restart. (Datalog was in this list until 2026-08-17; see the
+row above.) See `docs/MODEL_SEMANTICS.md` for the
 per-model durability, transaction and RLS matrix and the method behind it.
 
 The generalisable lesson, learned by getting this table wrong once: a file
@@ -322,5 +323,8 @@ limit, surfacing as "File name too long".
   document, graph, and time series now write compensating records as part of the
   revert, and FTS rewrites `fts_index.json` (the file that wins on reopen).
   `vector/vector.wal` is still **not** compensated: a rolled-back HNSW insert can
-  come back on replay until the index is rebuilt. Datalog needs no compensation
-  because `datalog/datalog.wal` is never written (see above).
+  come back on replay until the index is rebuilt. **Datalog now needs
+  compensation and does not have it**: as of 2026-08-17 its WAL is written
+  (NU-013), so a rolled-back `DATALOG_ASSERT` — which the in-memory undo does
+  reverse — can come back on replay. Fixing one gap opened this one; it is the
+  same shape as the vector case and is tracked with it.
