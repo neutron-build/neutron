@@ -163,12 +163,21 @@ def new(
 def dev(
     app_path: Annotated[str, cyclopts.Parameter(help="App import path (module:attribute)")] = "app:app",
     *,
-    host: Annotated[str, cyclopts.Parameter(help="Bind host")] = "0.0.0.0",
-    port: Annotated[int, cyclopts.Parameter(help="Bind port")] = 8000,
+    host: Annotated[str | None, cyclopts.Parameter(help="Bind host (default: NEUTRON_HOST, then 0.0.0.0)")] = None,
+    port: Annotated[int | None, cyclopts.Parameter(help="Bind port (default: NEUTRON_PORT, then 8000)")] = None,
     reload: Annotated[bool, cyclopts.Parameter(help="Enable auto-reload")] = True,
     server: Annotated[str, cyclopts.Parameter(help="Server: uvicorn or granian")] = "uvicorn",
 ) -> None:
     """Run the development server with auto-reload."""
+    from neutron.config import configure_logging, normalized_log_level, server_settings
+
+    config = server_settings()
+    if host is None:
+        host = config.host
+    if port is None:
+        port = config.port
+    configure_logging(config)
+
     if server == "granian":
         try:
             from granian import Granian
@@ -197,7 +206,7 @@ def dev(
             host=host,
             port=port,
             reload=reload,
-            log_level="info",
+            log_level=normalized_log_level(config.log_level),
         )
 
 
@@ -209,12 +218,23 @@ def dev(
 def run(
     app_path: Annotated[str, cyclopts.Parameter(help="App import path (module:attribute)")] = "app:app",
     *,
-    host: Annotated[str, cyclopts.Parameter(help="Bind host")] = "0.0.0.0",
-    port: Annotated[int, cyclopts.Parameter(help="Bind port")] = 8000,
-    workers: Annotated[int, cyclopts.Parameter(help="Number of worker processes")] = 1,
+    host: Annotated[str | None, cyclopts.Parameter(help="Bind host (default: NEUTRON_HOST, then 0.0.0.0)")] = None,
+    port: Annotated[int | None, cyclopts.Parameter(help="Bind port (default: NEUTRON_PORT, then 8000)")] = None,
+    workers: Annotated[int | None, cyclopts.Parameter(help="Number of worker processes (default: NEUTRON_WORKERS, then 1)")] = None,
     server: Annotated[str, cyclopts.Parameter(help="Server: uvicorn or granian")] = "uvicorn",
 ) -> None:
     """Run the production server."""
+    from neutron.config import configure_logging, normalized_log_level, server_settings
+
+    config = server_settings()
+    if host is None:
+        host = config.host
+    if port is None:
+        port = config.port
+    if workers is None:
+        workers = config.workers
+    configure_logging(config)
+
     if server == "granian":
         try:
             from granian import Granian
@@ -243,7 +263,7 @@ def run(
             host=host,
             port=port,
             workers=workers,
-            log_level="info",
+            log_level=normalized_log_level(config.log_level),
         )
 
 

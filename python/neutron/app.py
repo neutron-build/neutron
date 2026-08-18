@@ -400,23 +400,39 @@ class App:
 
     def run(
         self,
-        host: str = "0.0.0.0",
-        port: int = 8000,
+        host: str | None = None,
+        port: int | None = None,
         *,
         server: str = "uvicorn",
-        workers: int = 1,
+        workers: int | None = None,
         **kwargs: Any,
     ) -> None:
         """Run the application server.
 
         Args:
-            host: Bind address.
-            port: Bind port.
+            host: Bind address. Defaults to ``NEUTRON_HOST``, then ``0.0.0.0``.
+            port: Bind port. Defaults to ``NEUTRON_PORT``, then ``8000``.
             server: Server backend — ``"uvicorn"`` (default) or ``"granian"``
                 (Rust/Tokio, faster, HTTP/2 support).
-            workers: Number of worker processes.
+            workers: Number of worker processes. Defaults to
+                ``NEUTRON_WORKERS``, then ``1``.
             **kwargs: Passed through to the server.
+
+        Precedence is explicit argument > environment (``NEUTRON_`` prefix)
+        > default. Logging is configured from ``NEUTRON_LOG_LEVEL`` /
+        ``NEUTRON_LOG_FORMAT`` via :func:`neutron.config.configure_logging`.
         """
+        from neutron.config import configure_logging, server_settings
+
+        config = server_settings()
+        if host is None:
+            host = config.host
+        if port is None:
+            port = config.port
+        if workers is None:
+            workers = config.workers
+        configure_logging(config)
+
         if server == "granian":
             try:
                 from granian import Granian

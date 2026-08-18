@@ -54,7 +54,7 @@ class TestCLIDevConfig:
     """Test dev server configuration defaults."""
 
     def test_dev_defaults(self):
-        """Verify dev command has sensible defaults."""
+        """host/port default to None so NEUTRON_HOST/NEUTRON_PORT apply."""
         import inspect
         from neutron.cli import dev
 
@@ -62,13 +62,13 @@ class TestCLIDevConfig:
         params = sig.parameters
 
         assert params["app_path"].default == "app:app"
-        assert params["host"].default == "0.0.0.0"
-        assert params["port"].default == 8000
+        assert params["host"].default is None
+        assert params["port"].default is None
         assert params["reload"].default is True
         assert params["server"].default == "uvicorn"
 
     def test_run_defaults(self):
-        """Verify run command has sensible defaults."""
+        """host/port/workers default to None so NEUTRON_* env vars apply."""
         import inspect
         from neutron.cli import run
 
@@ -76,8 +76,68 @@ class TestCLIDevConfig:
         params = sig.parameters
 
         assert params["app_path"].default == "app:app"
-        assert params["workers"].default == 1
+        assert params["host"].default is None
+        assert params["port"].default is None
+        assert params["workers"].default is None
         assert params["server"].default == "uvicorn"
+
+
+class TestCLIEnvWiring:
+    """NEUTRON_ environment variables must reach the server command."""
+
+    def test_dev_env_port(self, monkeypatch):
+        """NEUTRON_PORT changes the port uvicorn is told to bind."""
+        from neutron.cli import dev
+
+        monkeypatch.setenv("NEUTRON_PORT", "9107")
+        with patch("uvicorn.run") as uvicorn_run:
+            dev("app:app", reload=False)
+        assert uvicorn_run.call_args.kwargs["port"] == 9107
+
+    def test_dev_explicit_port_beats_env(self, monkeypatch):
+        """An explicit --port wins over NEUTRON_PORT."""
+        from neutron.cli import dev
+
+        monkeypatch.setenv("NEUTRON_PORT", "9107")
+        with patch("uvicorn.run") as uvicorn_run:
+            dev("app:app", port=9377, reload=False)
+        assert uvicorn_run.call_args.kwargs["port"] == 9377
+
+    def test_run_env_host_and_workers(self, monkeypatch):
+        """NEUTRON_HOST and NEUTRON_WORKERS reach uvicorn."""
+        from neutron.cli import run
+
+        monkeypatch.setenv("NEUTRON_HOST", "127.0.0.1")
+        monkeypatch.setenv("NEUTRON_WORKERS", "4")
+        with patch("uvicorn.run") as uvicorn_run:
+            run("app:app")
+        assert uvicorn_run.call_args.kwargs["host"] == "127.0.0.1"
+        assert uvicorn_run.call_args.kwargs["workers"] == 4
+
+    def test_run_env_log_level(self, monkeypatch):
+        """NEUTRON_LOG_LEVEL is passed to uvicorn instead of hardcoded info."""
+        from neutron.cli import run
+
+        monkeypatch.setenv("NEUTRON_LOG_LEVEL", "warning")
+        with patch("uvicorn.run") as uvicorn_run:
+            run("app:app")
+        assert uvicorn_run.call_args.kwargs["log_level"] == "warning"
+
+    def test_run_env_log_level_uppercase_is_normalized(self, monkeypatch):
+        """An upper-case level must still be something uvicorn accepts.
+
+        structlog wants ``WARNING`` and uvicorn accepts only ``warning``, so
+        passing the raw value through configures logging correctly and then
+        raises on server startup.
+        """
+        from uvicorn.config import LOG_LEVELS
+
+        from neutron.cli import run
+
+        monkeypatch.setenv("NEUTRON_LOG_LEVEL", "WARNING")
+        with patch("uvicorn.run") as uvicorn_run:
+            run("app:app")
+        assert uvicorn_run.call_args.kwargs["log_level"] in LOG_LEVELS
 
 
 class TestCLIRoutes:

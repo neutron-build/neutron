@@ -1,5 +1,7 @@
 """Integration tests for the full Neutron application."""
 
+from unittest.mock import patch
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel
@@ -215,3 +217,67 @@ async def test_dependency_injection():
         resp = await client.get("/greet")
         assert resp.status_code == 200
         assert resp.json()["message"] == "Hello"
+
+
+# --- App.run configuration wiring ---
+
+
+def test_run_env_port():
+    """NEUTRON_PORT changes the port App.run binds."""
+    import os
+
+    os.environ["NEUTRON_PORT"] = "9107"
+    try:
+        run_app = App(title="Run Test")
+        with patch("uvicorn.run") as uvicorn_run:
+            run_app.run()
+        assert uvicorn_run.call_args.kwargs["port"] == 9107
+    finally:
+        del os.environ["NEUTRON_PORT"]
+
+
+def test_run_explicit_port_beats_env():
+    """An explicit port argument wins over NEUTRON_PORT."""
+    import os
+
+    os.environ["NEUTRON_PORT"] = "9107"
+    try:
+        run_app = App(title="Run Test")
+        with patch("uvicorn.run") as uvicorn_run:
+            run_app.run(port=9377)
+        assert uvicorn_run.call_args.kwargs["port"] == 9377
+    finally:
+        del os.environ["NEUTRON_PORT"]
+
+
+def test_run_env_host_and_workers():
+    """NEUTRON_HOST and NEUTRON_WORKERS reach uvicorn."""
+    import os
+
+    os.environ["NEUTRON_HOST"] = "127.0.0.1"
+    os.environ["NEUTRON_WORKERS"] = "3"
+    try:
+        run_app = App(title="Run Test")
+        with patch("uvicorn.run") as uvicorn_run:
+            run_app.run()
+        assert uvicorn_run.call_args.kwargs["host"] == "127.0.0.1"
+        assert uvicorn_run.call_args.kwargs["workers"] == 3
+    finally:
+        del os.environ["NEUTRON_HOST"]
+        del os.environ["NEUTRON_WORKERS"]
+
+
+def test_run_without_neutron_env_vars_uses_defaults():
+    """App.run works with no NEUTRON_* set (no database_url required)."""
+    import os
+
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("NEUTRON_")}
+    try:
+        run_app = App(title="Run Test")
+        with patch("uvicorn.run") as uvicorn_run:
+            run_app.run()
+        assert uvicorn_run.call_args.kwargs["host"] == "0.0.0.0"
+        assert uvicorn_run.call_args.kwargs["port"] == 8000
+        assert uvicorn_run.call_args.kwargs["workers"] == 1
+    finally:
+        os.environ.update(saved)
