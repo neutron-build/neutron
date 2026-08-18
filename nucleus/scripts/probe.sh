@@ -84,26 +84,22 @@ PROBES=(
   "probe_distributed|--iterations $((300 * M))"
   "probe_durability_torn|--iterations $((300 * M))"
   "probe_fts_rank|--iterations $((2000 * M))"
-  # 200 rounds was never a measured budget. It cost 33m25s in CI on 2026-08-18
-  # — about 70% of this suite's entire wall clock for ONE harness, in a suite
-  # whose header advertises "~1-2 min" at ci scale — and at `full` scale the
-  # same expression asks for 1600 rounds, roughly four and a half hours, which
-  # has plainly never been run. That is a miscalibration, not a coverage
-  # decision, and it is why the job sat one bad round away from its 60-minute
-  # timeout. 40 rounds is ~7 min at the measured ~10s/round; `full` still gets
-  # 320. Raise it again when the block in OPEN_WORK.md §0a is fixed and a
-  # round no longer costs ten seconds.
+  # Restored to 200 rounds on 2026-08-18 after the block behind OPEN_WORK.md
+  # §0a was found and fixed. It was never an executor deadlock: the harness's
+  # own `test_write_conflict` waited on a barrier AFTER its UPDATE had taken
+  # the row's unique-gate slot, so writer A sat at the barrier holding the slot
+  # while writer B blocked on it, and neither could move. Every round paid
+  # UniqueGate's 10s timeout to break its own deadlock — 150 * 10s is the
+  # 33m25s that looked like slowness, and 40 * 10s is exactly the 6m41s the
+  # calibrated run then measured. Moving that barrier before the UPDATE (both
+  # snapshots taken, neither holding anything) removed the wait entirely.
   #
-  # EXPECT INTERMITTENT `TIMEOUT probe_concurrency_threads` UNTIL §0a IS FIXED.
-  # This harness blocks at a random round — nearly every run on macOS, roughly
-  # one run in two on Linux CI. A TIMEOUT on THIS name is that known block, not
-  # a regression you introduced, and not a concurrency violation: a violation
-  # exits 1 and prints one. It is left running rather than held out because the
-  # block is plausibly an executor deadlock under SERIALIZABLE contention,
-  # which is a Critical worth tripping over, and because the watchdog now makes
-  # it cost 15 minutes and one line instead of the entire job.
-  # EXPIRY: if this note is still here after 2026-09-30, that is the bug.
-  "probe_concurrency_threads|--seed 1 --rounds $((40 * M))"
+  # Measured after the fix, on this laptop: 150 rounds in 3-7s across seeds
+  # 1/2/3/7/42/999, conflicts detected in 150 of 150 every time. The cost was
+  # the deadlock, not the coverage, so raising the count back buys real rounds
+  # for less wall clock than the calibrated 40 cost. `full` gets 1600 again,
+  # which is now ~40s rather than the four and a half hours nobody ever ran.
+  "probe_concurrency_threads|--seed 1 --rounds $((200 * M))"
   # KNOWN-RED HOLDOUT, added 2026-08-18 with S35 (c9a6c893). The vector and
   # catalog sections each report a real, open finding, so running them here
   # would make this suite permanently red and teach everyone to ignore it:

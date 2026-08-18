@@ -631,13 +631,20 @@ fn test_write_conflict(rng: &mut Rng, report: &mut Report, stats: &mut ConflictS
             let sid = ex.create_session();
             barrier.wait();
             let _ = run(&ex, &rt, sid, &format!("BEGIN ISOLATION LEVEL {iso}"));
+            // Both snapshots must exist before either UPDATE runs, or a writer
+            // that commits before its peer even BEGINs produces no conflict to
+            // observe. This barrier has to sit BEFORE the UPDATE, never after
+            // it: the engine blocks the second writer on the first writer's row
+            // lock (as PostgreSQL does), so a writer that takes the lock and
+            // then waits for its peer deadlocks against a peer blocked on that
+            // very lock. It did, reproducibly, and hung the whole suite.
+            barrier.wait();
             let upd = run(
                 &ex,
                 &rt,
                 sid,
                 &format!("UPDATE counter SET v={val} WHERE id=1"),
             );
-            barrier.wait(); // both attempt update before either commits
             if upd.is_err() {
                 let _ = run(&ex, &rt, sid, "ROLLBACK");
                 outcome[1].fetch_add(1, Ordering::Relaxed);
@@ -762,7 +769,31 @@ fn main_impl() {
                     }
                 }
             }
-            _ => {}
+            "--help" | "-h" => {
+                let names: Vec<&str> = EngineKind::ALL.iter().map(|k| k.name()).collect();
+                println!(
+                    "probe_concurrency_threads [--seed N] [--rounds N] [--max-report N] \
+                     [--engine <{}>]\n\n\
+                     Default engine is the in-process MVCC adapter, which has no paged\n\
+                     storage. Pass --engine to exercise a real one.",
+                    names.join("|")
+                );
+                std::process::exit(0);
+            }
+            // Unknown arguments are rejected rather than ignored. A silently
+            // dropped flag is the worst outcome this harness can produce: a
+            // typo'd `--enigne buffered-disk` would run the in-memory default
+            // and report a clean pass over an engine it never touched, which
+            // reads as coverage. `--help` previously fell in here too and ran
+            // the whole suite instead of printing anything.
+            other => {
+                println!(
+                    "unknown argument {other:?}; try --help\n\
+                     Refusing to run rather than silently ignore it: a dropped flag \
+                     here produces a pass over an engine that was never exercised."
+                );
+                std::process::exit(2);
+            }
         }
         i += 1;
     }

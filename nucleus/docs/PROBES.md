@@ -79,16 +79,33 @@ The `datalog` section is NOT held out and still gates. If it goes red, that
 one is yours. This note exists because a gate that fails for a known reason,
 unmarked at the point where it is run, teaches people to ignore the gate.
 
-**`probe_concurrency_threads` blocks at a random round, and that is filed, not
-yours.** It takes ~10s per round and hung the scheduled CI probe suite on
-2026-08-18 — the run ended at exactly 60m27s, the workflow's `timeout-minutes`,
-which GitHub reports as "cancelled" rather than "failure". `probe.sh` now runs
-every harness under a watchdog (`PROBE_TIMEOUT_SECS`, 15 min at ci scale) and
-prints `TIMEOUT <name>` before continuing, so one blocked harness no longer
-consumes the job and silently skips everything after it. Expect that TIMEOUT
-intermittently on this one name until `_internal/OPEN_WORK.md` §0a is resolved.
-A TIMEOUT is a hang; a concurrency violation exits 1 and prints the violation.
-They need opposite responses, which is why the script distinguishes them.
+**`probe_concurrency_threads` used to block at a random round. Fixed
+2026-08-18, and it was never an engine bug.** The harness deadlocked against
+itself: `test_write_conflict` waited on a `Barrier` AFTER its UPDATE had taken
+the row's `UniqueGate` slot, so writer A sat at the barrier still holding the
+slot while writer B blocked acquiring it, and neither could move. What broke
+the tie every round was `UniqueGate`'s 10s timeout firing — which is why the
+harness looked merely *slow* rather than deadlocked, and why the cost was so
+suspiciously round: 150 rounds x 10s is the 33m25s CI measurement, and 40
+rounds x 10s is exactly the 6m41s the round-count calibration then measured.
+Moving that barrier to before the UPDATE — both snapshots taken, neither
+transaction holding anything — removed the wait entirely. 150 rounds now run
+in 3-7s across seeds 1/2/3/7/42/999 with conflicts detected in 150 of 150, so
+the round count is back to 200 at ci and the test kept every bit of its
+discriminating power.
+
+The lesson worth keeping: a harness that waits on its own barrier while
+holding a database lock deadlocks against any engine that *blocks* writers
+rather than failing them immediately — which is what PostgreSQL does too. The
+10s escape hatch made it present as a performance problem, and it was
+"calibrated" once before it was diagnosed.
+
+`probe.sh` still runs every harness under a watchdog (`PROBE_TIMEOUT_SECS`,
+15 min at ci scale) and prints `TIMEOUT <name>` before continuing, so one
+blocked harness cannot consume the job and silently skip everything after it.
+That stays: it is worth having regardless of this one bug. A TIMEOUT is a
+hang; a concurrency violation exits 1 and prints the violation. They need
+opposite responses, which is why the script distinguishes them.
 
 **`probe_streams_oracle` carries its own control.** `--negative-control
 <streams|pubsub|cdc>` runs the probe twice at one seed — clean, then with that
