@@ -12,8 +12,13 @@ pip install neutron-py
 Or with extras:
 
 ```bash
-pip install "neutron-py[redis,otel]"
+pip install "neutron-py[ai]"   # AI providers, agents, RAG
+pip install "neutron-py[all]"  # every extra
 ```
+
+The full set is `ai`, `crypto`, `granian`, `rich`, `all` — plus `test` for
+development. There is no `redis` or `otel` extra; this block advertised both
+until 2026-08-17.
 
 ## Create a Project
 
