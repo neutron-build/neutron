@@ -2466,7 +2466,11 @@ impl NucleusHandler {
 
     /// Try to intercept a large object function call from a SQL query.
     /// Returns `Some(ExecResult)` if the query was handled, `None` otherwise.
-    fn try_handle_large_object(&self, peer_addr: &str, sql: &str) -> Option<ExecResult> {
+    ///
+    /// Public for `probe_blob`'s large-object phase, which drives this exact
+    /// string-parsing surface (argument decoding included) rather than the
+    /// private per-function methods.
+    pub fn try_handle_large_object(&self, peer_addr: &str, sql: &str) -> Option<ExecResult> {
         let trimmed = sql.trim();
         // Fast rejection: must start with "SELECT lo_" (case-insensitive).
         if trimmed.len() < 12 {

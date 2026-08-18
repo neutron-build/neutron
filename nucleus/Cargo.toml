@@ -344,6 +344,11 @@ path = "src/bin/probe_security.rs"
 required-features = ["server"]
 
 [[bin]]
+name = "probe_sessions"
+path = "src/bin/probe_sessions.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "probe_streams"
 path = "src/bin/probe_streams.rs"
 required-features = ["server"]

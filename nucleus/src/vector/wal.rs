@@ -176,6 +176,10 @@ impl VectorWal {
     }
 
     /// Log a vector insertion.
+    ///
+    /// The `vector.wal_append` fault point makes NU-048 testable from outside:
+    /// a failed append here must fail the originating DML statement, never be
+    /// printed-and-acknowledged.
     pub fn log_insert(
         &self,
         name: &str,
@@ -183,6 +187,9 @@ impl VectorWal {
         vector: &[f32],
         metadata: &str,
     ) -> io::Result<()> {
+        if let Some(e) = crate::storage::crashpoint::io_fault("vector.wal_append") {
+            return Err(e);
+        }
         let mut buf = Vec::new();
         let nb = name.as_bytes();
         buf.push(TAG_INSERT_VEC);
@@ -203,8 +210,13 @@ impl VectorWal {
         Ok(())
     }
 
-    /// Log a vector deletion (soft-delete in HNSW).
+    /// Log a vector deletion (soft-delete in HNSW). Same fault point as
+    /// `log_insert`: a deleted vector resurrecting across restart is the
+    /// other half of NU-048.
     pub fn log_delete(&self, name: &str, id: u64) -> io::Result<()> {
+        if let Some(e) = crate::storage::crashpoint::io_fault("vector.wal_append") {
+            return Err(e);
+        }
         let mut buf = Vec::new();
         let nb = name.as_bytes();
         buf.push(TAG_DELETE_VEC);

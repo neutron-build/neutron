@@ -914,6 +914,17 @@ impl HnswIndex {
         self.nodes.len()
     }
 
+    /// Ids of live (inserted, not tombstoned) vectors. `len` counts
+    /// tombstoned nodes too, so it cannot observe a resurrected delete —
+    /// which is exactly what a recovery probe needs to see.
+    pub fn live_ids(&self) -> std::collections::BTreeSet<u64> {
+        self.nodes
+            .keys()
+            .filter(|id| !self.deleted.contains(id))
+            .copied()
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

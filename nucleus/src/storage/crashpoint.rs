@@ -126,6 +126,13 @@ pub const ALL_IO_POINTS: &[&str] = &[
     // ordering directly testable: fail it and assert the SQL WAL was never
     // forced either, instead of trusting an unobservable crash race.
     "kv.wal_fsync",
+    // Datalog / vector WAL appends. Distinct from the fsync story above: the
+    // class these expose is a failed (or never-made) append being swallowed
+    // while the statement is acknowledged — NU-013 and NU-048. Failing the
+    // append must fail the statement, and only what was acknowledged may
+    // survive a restart.
+    "datalog.wal_append",
+    "vector.wal_append",
 ];
 
 fn io_armed() -> Option<&'static str> {

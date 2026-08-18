@@ -7,7 +7,13 @@
 //! For each armed I/O fault point the child:
 //!   1. writes rows until the injected failure fires,
 //!   2. records the last id it saw ACKNOWLEDGED (a successful commit+fsync),
-//!   3. keeps going, so a database that silently swallows the error is caught.
+//!   3. keeps going, so a database that silently swallows the error is caught,
+//!   4. runs the same acknowledged-or-errored discipline over the two
+//!      specialty durable logs the S35 campaign opened to fault injection:
+//!      Datalog WAL appends (`datalog.wal_append`) and vector WAL appends
+//!      (`vector.wal_append`). A failed append must fail the statement —
+//!      printed-and-acknowledged is exactly NU-013/NU-048 — and only what was
+//!      acknowledged may survive a restart.
 //!
 //! The parent then reopens and asserts:
 //!   A. The failure surfaced as an ERROR — a write that could not be made
@@ -16,6 +22,8 @@
 //!   B. Recovery contains every acknowledged row (nothing acknowledged is lost).
 //!   C. Recovery is a clean prefix with intact payloads — a failed write must
 //!      not leave a half-applied or corrupt record behind.
+//!   D. Every acknowledged DATALOG_ASSERT survives the reopen verbatim, and
+//!      the recovered HNSW index holds exactly the acknowledged vectors.
 //!
 //! Run: `cargo run --release --features server --bin probe_io_faults`
 #![cfg(feature = "server")]
@@ -37,6 +45,71 @@ const KINDS: &[&str] = &["full", "perm", "io"];
 
 fn marker_for(id: i64) -> i64 {
     id.wrapping_mul(2_654_435_761) % 1_000_003
+}
+
+/// Reopen and read the recovered Datalog facts of `iofault/2`.
+fn recover_datalog(dir: &Path) -> Result<Vec<(String, String)>, String> {
+    use nucleus::embedded::Database;
+    let db = Database::durable_mvcc(dir).map_err(|e| format!("reopen: {e:?}"))?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let res = rt.block_on(db.execute("SELECT DATALOG_QUERY('iofault(X,Y)')"));
+    let mut results = res.map_err(|e| format!("query: {e:?}"))?;
+    let text = match results.pop() {
+        Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+            Some(Value::Text(t)) => t.clone(),
+            other => return Err(format!("bad datalog result: {other:?}")),
+        },
+        other => return Err(format!("non-select: {other:?}")),
+    };
+    // Scan `["node1", "mark1"]` pairs out of the JSON array text.
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut first = String::new();
+            while let Some(&c2) = chars.peek() {
+                if c2 == '"' {
+                    break;
+                }
+                first.push(c2);
+                chars.next();
+            }
+            chars.next(); // closing quote
+            let mut second = String::new();
+            // Scan forward to the next quoted token in the same tuple.
+            while let Some(&c2) = chars.peek() {
+                if c2 == '"' {
+                    chars.next();
+                    break;
+                }
+                chars.next();
+            }
+            while let Some(&c2) = chars.peek() {
+                if c2 == '"' {
+                    break;
+                }
+                second.push(c2);
+                chars.next();
+            }
+            chars.next(); // closing quote
+            if !first.is_empty() && !second.is_empty() {
+                out.push((first, second));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reopen and read the recovered live-vector id set of the HNSW index.
+fn recover_vector_index(dir: &Path) -> Result<Vec<u64>, String> {
+    use nucleus::embedded::Database;
+    let db = Database::durable_mvcc(dir).map_err(|e| format!("reopen: {e:?}"))?;
+    Ok(db
+        .executor()
+        .hnsw_index_live_ids("iov_idx")
+        .ok_or_else(|| "HNSW index iov_idx did not survive reopen".to_string())?
+        .into_iter()
+        .collect())
 }
 
 fn child_main(dir: &str) -> ! {
@@ -72,6 +145,48 @@ fn child_main(dir: &str) -> ! {
         } else {
             saw_error = true;
             println!("ERRORED {id}");
+        }
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    // ── Datalog WAL: an append failure must fail the statement (NU-013) ──
+    // A failed CREATE TABLE above means the specialty stores may not be
+    // usable either; the parent treats zero DL_ACKED + zero DL_ERRORED as
+    // "fault point not reached by this workload" for this section.
+    for i in 1..=ROWS {
+        let sql = format!("SELECT DATALOG_ASSERT('iofault(node{i}, mark{i})')");
+        match rt.block_on(db.execute(&sql)) {
+            Ok(_) => println!("DL_ACKED {i}"),
+            Err(_) => {
+                saw_error = true;
+                println!("DL_ERRORED {i}");
+            }
+        }
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    // ── Vector WAL: an insert/delete the WAL could not log must fail the
+    //    statement, never be acknowledged (NU-048) ──
+    let vec_setup_ok = rt
+        .block_on(db.execute("CREATE TABLE IF NOT EXISTS iov (id INT PRIMARY KEY, x VECTOR(4))"))
+        .is_ok()
+        && rt
+            .block_on(db.execute("CREATE INDEX IF NOT EXISTS iov_idx ON iov USING HNSW (x)"))
+            .is_ok();
+    if !vec_setup_ok {
+        saw_error = true;
+        println!("V_SETUP_ERRORED");
+    }
+    for i in 1..=ROWS {
+        let sql = format!("INSERT INTO iov (id, x) VALUES ({i}, VECTOR('[{i},2,3,4]'))");
+        match rt.block_on(db.execute(&sql)) {
+            Ok(_) => println!("V_ACKED {i}"),
+            Err(_) => {
+                saw_error = true;
+                println!("V_ERRORED {i}");
+            }
         }
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -120,6 +235,10 @@ fn main() {
     if raw.len() >= 3 && raw[1] == "--child" {
         child_main(&raw[2]);
     }
+    let negative = raw.iter().any(|a| a == "--negative-control");
+    if negative {
+        negative_control_main();
+    }
 
     let exe = std::env::current_exe().expect("exe");
     let root = std::env::temp_dir().join(format!("nucleus-iofault-{}", std::process::id()));
@@ -140,67 +259,14 @@ fn main() {
             for &skip in SKIPS {
                 let label = format!("{point}/{kind}[skip={skip}]");
                 let dir = root.join(label.replace(['.', '/', '[', ']', '='], "_"));
-                let _ = std::fs::remove_dir_all(&dir);
-                let _ = std::fs::create_dir_all(&dir);
-
-                let out = Command::new(&exe)
-                    .arg("--child")
-                    .arg(dir.to_str().unwrap())
-                    .env("NUCLEUS_IOFAULT", point)
-                    .env("NUCLEUS_IOFAULT_KIND", kind)
-                    .env("NUCLEUS_IOFAULT_SKIP", skip.to_string())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .expect("spawn");
-                let stdout = String::from_utf8_lossy(&out.stdout);
-
-                let acked: Vec<i64> = stdout
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("ACKED "))
-                    .filter_map(|v| v.parse().ok())
-                    .collect();
-                let errored = stdout.lines().any(|l| l.starts_with("ERRORED "));
-
-                if !errored {
+                let (reached, case_findings) = run_case(&exe, &dir, point, kind, skip, None);
+                if !reached {
                     // The fault point was never reached by this workload.
                     unreached.push(label.clone());
-                    continue;
+                } else {
+                    exercised += 1;
+                    findings.extend(case_findings);
                 }
-                exercised += 1;
-
-                // (A) an unwritable commit must not be acknowledged: every id
-                // the child printed as ACKED had a successful write AND fsync.
-                // (B)+(C) verified against recovery below.
-                let rows = match recover(&dir) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        findings.push(format!("{label}: recovery FAILED: {e}"));
-                        continue;
-                    }
-                };
-                let recovered: std::collections::HashSet<i64> =
-                    rows.iter().map(|(id, _)| *id).collect();
-
-                for id in &acked {
-                    if !recovered.contains(id) {
-                        findings.push(format!(
-                            "{label}: ACKNOWLEDGED id {id} missing after recovery \
-                             (write reported success but was not durable)"
-                        ));
-                        break;
-                    }
-                }
-                for (id, m) in &rows {
-                    if *m != marker_for(*id) {
-                        findings.push(format!(
-                            "{label}: CORRUPT payload for id {id}: {m} != {}",
-                            marker_for(*id)
-                        ));
-                        break;
-                    }
-                }
-                let _ = std::fs::remove_dir_all(&dir);
             }
         }
     }
@@ -222,4 +288,207 @@ fn main() {
         println!("\nI/O FAULT FINDINGS PRESENT");
         std::process::exit(1);
     }
+}
+
+/// One child run plus recovery verification. `perturb` names a section whose
+/// MODEL is deliberately wrong for the negative control: `"datalog"` /
+/// `"vector"` treat that section's ERRORED operations as acknowledged — the
+/// exact NU-013/NU-048 bug shape (a failed WAL append acknowledged). Returns
+/// (fault reached, findings).
+fn run_case(
+    exe: &std::path::Path,
+    dir: &std::path::Path,
+    point: &str,
+    kind: &str,
+    skip: u64,
+    perturb: Option<&str>,
+) -> (bool, Vec<String>) {
+    let mut findings: Vec<String> = Vec::new();
+    let label = format!("{point}/{kind}[skip={skip}]");
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::create_dir_all(dir);
+
+    let out = Command::new(exe)
+        .arg("--child")
+        .arg(dir.to_str().unwrap())
+        .env("NUCLEUS_IOFAULT", point)
+        .env("NUCLEUS_IOFAULT_KIND", kind)
+        .env("NUCLEUS_IOFAULT_SKIP", skip.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let collect = |prefix: &str| -> Vec<i64> {
+        stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix(prefix))
+            .filter_map(|v| v.parse().ok())
+            .collect()
+    };
+    let acked = collect("ACKED ");
+    let mut dl_acked = collect("DL_ACKED ");
+    let mut v_acked = collect("V_ACKED ");
+    if perturb == Some("datalog") {
+        dl_acked.extend(collect("DL_ERRORED "));
+    }
+    if perturb == Some("vector") {
+        v_acked.extend(collect("V_ERRORED "));
+    }
+    let errored = stdout.lines().any(|l| {
+        l.starts_with("ERRORED ")
+            || l.starts_with("DL_ERRORED")
+            || l.starts_with("V_ERRORED")
+            || l.starts_with("V_SETUP_ERRORED")
+    });
+
+    if !errored {
+        // The fault point was never reached by this workload.
+        return (false, findings);
+    }
+
+    // (A) an unwritable commit must not be acknowledged: every id
+    // the child printed as ACKED had a successful write AND fsync.
+    // (B)+(C) verified against recovery below.
+    let rows = match recover(dir) {
+        Ok(r) => r,
+        Err(e) => {
+            findings.push(format!("{label}: recovery FAILED: {e}"));
+            return (true, findings);
+        }
+    };
+    let recovered: std::collections::HashSet<i64> = rows.iter().map(|(id, _)| *id).collect();
+
+    for id in &acked {
+        if !recovered.contains(id) {
+            findings.push(format!(
+                "{label}: ACKNOWLEDGED id {id} missing after recovery \
+                 (write reported success but was not durable)"
+            ));
+            break;
+        }
+    }
+    for (id, m) in &rows {
+        if *m != marker_for(*id) {
+            findings.push(format!(
+                "{label}: CORRUPT payload for id {id}: {m} != {}",
+                marker_for(*id)
+            ));
+            break;
+        }
+    }
+
+    // (D) specialty durable logs: only acknowledged mutations may
+    // survive. Verified whenever the child reached the section at
+    // all (any DL_*/V_* line), not only when it errored there —
+    // an append failure that was swallowed prints ACKED and is
+    // exactly what this catches.
+    let reached_dl = stdout
+        .lines()
+        .any(|l| l.starts_with("DL_ACKED") || l.starts_with("DL_ERRORED"));
+    let reached_v = stdout
+        .lines()
+        .any(|l| l.starts_with("V_ACKED") || l.starts_with("V_ERRORED"));
+    if reached_dl {
+        match recover_datalog(dir) {
+            Ok(facts) => {
+                let want: std::collections::HashSet<String> = dl_acked
+                    .iter()
+                    .map(|i| format!("node{i}, mark{i}"))
+                    .collect();
+                let got: std::collections::HashSet<String> =
+                    facts.iter().map(|(a, b)| format!("{a}, {b}")).collect();
+                if got != want {
+                    findings.push(format!(
+                        "{label}: datalog WAL: recovered {} facts, {} acknowledged — \
+                         acknowledged facts lost or unacknowledged survived (NU-013 class)",
+                        got.len(),
+                        want.len()
+                    ));
+                }
+            }
+            Err(e) => {
+                findings.push(format!("{label}: datalog recovery FAILED: {e}"));
+            }
+        }
+    }
+    if reached_v && !stdout.lines().any(|l| l == "V_SETUP_ERRORED") {
+        match recover_vector_index(dir) {
+            Ok(live) => {
+                // Count-based: PK-keyed HNSW logs internal monotonic
+                // node ids to the WAL (the pk→node registry is not
+                // persisted), so id SETS live in a different space
+                // than the inserted PKs — an off-by-one artifact,
+                // not a finding. The count is the faithful
+                // observable for this insert-only workload.
+                let got = live.len();
+                let want = v_acked.len();
+                if got != want {
+                    findings.push(format!(
+                        "{label}: vector WAL: recovered {got} live vectors, {want} \
+                         acknowledged — acknowledged inserts lost or unacknowledged \
+                         inserts survived (NU-048 class)"
+                    ));
+                }
+            }
+            Err(e) => {
+                findings.push(format!("{label}: vector recovery FAILED: {e}"));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    (true, findings)
+}
+
+/// Negative control: prove the (D) checks can discriminate. For each specialty
+/// log, run one faulted child twice — once with the honest acknowledged-set,
+/// once with the model of the bug (ERRORED treated as acknowledged) — and
+/// pass only if the honest model reports nothing and the perturbed model
+/// reports the swallowed-failure finding.
+fn negative_control_main() -> ! {
+    let exe = std::env::current_exe().expect("exe");
+    let root = std::env::temp_dir().join(format!("nucleus-iofault-ctl-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+
+    println!("== I/O fault negative control ==");
+    println!(
+        "model of the bug: a failed WAL append is treated as acknowledged (NU-013 / NU-048)\n"
+    );
+    let mut ok = true;
+    for (section, point) in [
+        ("datalog", "datalog.wal_append"),
+        ("vector", "vector.wal_append"),
+    ] {
+        let dir = root.join(format!("{section}_base"));
+        let (_, base) = run_case(&exe, &dir, point, "full", 2, None);
+        let dir = root.join(format!("{section}_pert"));
+        let (reached, pert) = run_case(&exe, &dir, point, "full", 2, Some(section));
+        println!(
+            "{section:<8}: honest model {} finding(s), perturbed model {} finding(s)",
+            base.len(),
+            pert.len()
+        );
+        if !reached {
+            println!("           REJECTED: fault point not reached — control is vacuous");
+            ok = false;
+        } else if base.is_empty() && !pert.is_empty() {
+            println!(
+                "           PASSED: the perturbation produced the finding the honest model does not"
+            );
+        } else {
+            println!("           FAILED: a check that cannot fail is not a check");
+            for f in &pert {
+                println!("             {f}");
+            }
+            ok = false;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    if ok {
+        println!("\nNEGATIVE CONTROL PASSED");
+        std::process::exit(0);
+    }
+    println!("\nNEGATIVE CONTROL FAILED");
+    std::process::exit(1);
 }

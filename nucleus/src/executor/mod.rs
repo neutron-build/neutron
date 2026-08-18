@@ -3945,6 +3945,19 @@ impl Executor {
         &self.datalog_store
     }
 
+    /// Live vector ids of a named HNSW index, or `None` if no such index
+    /// exists. A probe-facing accessor: HNSW indexes recover solely from the
+    /// vector WAL, so a restart that loses, duplicates or resurrects vectors
+    /// is only visible in the index itself — a SQL KNN query falls back to a
+    /// base-table scan and would mask it. (NU-048's class.)
+    pub fn hnsw_index_live_ids(&self, index_name: &str) -> Option<std::collections::BTreeSet<u64>> {
+        let indexes = self.vector_indexes.read();
+        match indexes.get(index_name).map(|e| &e.kind) {
+            Some(VectorIndexKind::Hnsw(h)) => Some(h.live_ids()),
+            _ => None,
+        }
+    }
+
     /// Get a reference to the pub/sub hub (async).
     pub fn pubsub(&self) -> &RwLock<crate::pubsub::PubSubHub> {
         &self.pubsub

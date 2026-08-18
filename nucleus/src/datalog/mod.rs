@@ -1728,7 +1728,14 @@ impl DatalogWal {
     }
 
     /// Write a single WAL entry.
+    ///
+    /// The `datalog.wal_append` fault point exists so a probe can fail exactly
+    /// this append: every NU-013 mutation path now treats a failed WAL append
+    /// as a failed statement, and `probe_io_faults` proves it stays that way.
     fn write_entry(&self, entry_type: u8, data: &[u8]) -> io::Result<()> {
+        if let Some(e) = crate::storage::crashpoint::io_fault("datalog.wal_append") {
+            return Err(e);
+        }
         let mut buf = Vec::with_capacity(1 + 4 + data.len());
         buf.push(entry_type);
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());

@@ -41,7 +41,24 @@ cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 
 cargo run --release --features server --bin probe_engines
 cargo run --release --features server --bin probe_index_coherence
 cargo run --release --features server --bin probe_streams_oracle -- --iterations 120
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30   # SEE BELOW: vector + catalog are KNOWN RED
+cargo run --release --features "server rusqlite" --bin probe_io_faults
+cargo run --release --features "server rusqlite" --bin probe_blob
+cargo run --release --features server --bin probe_sessions
 ```
+
+**`probe_recover_engines` does not currently pass, and that is not your
+change.** Its `vector` and `catalog` sections report divergences for two live
+findings S35 uncovered - unserialized HNSW tombstones, and the embedded
+builder never loading `meta.json`. Both are described under "What the S35
+probes found immediately" below, and each divergence line names its own
+mechanism. The `datalog` section IS clean and must stay clean.
+
+So: read the divergence lines before concluding anything. If they name those
+two mechanisms, the gate is repeating what it already knew. If they say
+anything else - or if `datalog` goes red - that one is yours. This note
+exists because a gate that fails for a known reason, unmarked at the point
+where it is run, teaches people to ignore the gate.
 
 **`probe_streams_oracle` carries its own control.** `--negative-control
 <streams|pubsub|cdc>` runs the probe twice at one seed — clean, then with that
@@ -133,6 +150,106 @@ accepting both forms in `XREAD` and `XRANGE`. The oracle's no-gap check now
 resumes from each entry's id and requires the next one, so a regression is
 caught by the probe that found it.
 
+### What the S35 probes found immediately
+
+Two live findings, both found on the first runs. Neither is a regression from
+the Phase C fixes — both are *adjacent* defects the fixed bugs' probes exposed
+once they existed.
+
+**1. Vector WAL recovery is not faithful — in both directions.** The `vector`
+section of `probe_recover_engines` reports a recovered HNSW live-vector count
+that disagrees with the acknowledged set on most iterations, sometimes larger
+(deletes resurrecting) and sometimes smaller (live vectors lost; one iteration
+recovered 9 of 16). Two mechanisms, both read at source level:
+
+- `HnswIndex::serialize` (`vector/mod.rs`) writes nodes but **not the
+  `deleted` tombstone set**, and `VectorWal::checkpoint`
+  (`vector/wal.rs:248`) snapshots through it — so every tombstone standing at
+  checkpoint time is silently dropped and the deleted vector resurrects on
+  the next reopen. The existing unit test (`test_hnsw_pk_keyed_recovery…`)
+  asserts through a SQL KNN query, which falls back to a base-table scan and
+  masks it.
+- `remove_from_vector_indexes` (`executor/mod.rs:6599-6608`) resolves the
+  tombstone id through the PK registry — which is deliberately not persisted
+  and empty after every reopen — so a post-reopen delete falls back to
+  tombstoning the **physical row position**, a different id space than the
+  WAL's node ids. The real node stays live in the WAL; a row position that
+  collides with a live node id deletes the wrong vector.
+
+The insert-only, single-reopen shape is faithful (the negative control runs
+there and is clean), which is why the unit tests pass. The section stays red
+until the tombstone set is serialized and the registry question is settled.
+
+**2. The embedded `Database` builder never loads `meta.json`.** Only
+`main.rs:1191` calls `load_meta_checked`; `DatabaseBuilder::build`
+(`embedded.rs`) loads catalog.json and sequences.json but no executor
+metadata. Through `Database::durable_mvcc`, roles, RLS policies, views,
+triggers, sequences *definitions* and masking silently vanish on reopen — and
+because DDL still calls `persist_catalog`, the first post-reopen DDL writes
+the emptied state back over `meta.json`, destroying the file it never read.
+That is precisely the NU-163 write-back, closed for the server path, still
+live through the shipped embedded API. The `catalog` section of
+`probe_recover_engines` demonstrates it end to end (meta arm, embedded); its
+server-shaped arm confirms the server path refuses and leaves the corrupt
+file untouched.
+
+### The S35 class map
+
+Phase C closed 15 Criticals; S35 added or extended one probe per *class*
+(rather than per finding), each carrying a negative control:
+
+| Class | Findings | Probe |
+|---|---|---|
+| Durable log opened but never written / append failure swallowed | NU-013, NU-048 | `probe_recover_engines` `datalog` + `vector` sections (round-trip); `probe_io_faults` (fault injection, via two new fault points) |
+| Large-object identity/IO honesty | NU-102, NU-103 | `probe_blob` phase 4 |
+| Corrupt persisted state treated as empty and written back | NU-163, NU-165 | `probe_recover_engines` `catalog` section |
+| Permissive default on the failure path (sessions, guards) | NU-217, NU-218 | `probe_sessions` |
+| Side-effecting fns admitted while degraded / Describe disagreement | NU-216 | **not covered** — registry-level agreement is unit-tested (`mutating_registries_agree`); a behavioral probe is future work |
+| Invalid persisted bytes decode as valid | NU-239 | **not covered** — unit-tested in `tuple.rs`; no adversarial probe yet |
+| Duplicate DDL destroys rows | NU-251 | **not covered** — asserted across four engines in unit tests |
+| Trigger fires against a row never written | NU-246 | **not covered** — queue/fire regression exists; note the separate finding that trigger bodies never execute at all |
+| Unique/PK not enforced under concurrency | NU-254 | **not covered** as a probe — `tests/concurrent_unique_paged_regression.rs` is a 6-test negative-tested integration suite, the lowest marginal value for a probe |
+
+Run them (always `--release`):
+
+```sh
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --negative-control datalog
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --negative-control vector
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --negative-control catalog
+cargo run --release --features "server rusqlite" --bin probe_blob
+cargo run --release --features "server rusqlite" --bin probe_blob -- --negative-control lo
+cargo run --release --features "server rusqlite" --bin probe_io_faults
+cargo run --release --features "server rusqlite" --bin probe_io_faults -- --negative-control
+cargo run --release --features server --bin probe_sessions
+cargo run --release --features server --bin probe_sessions -- --negative-control authority
+cargo run --release --features server --bin probe_sessions -- --negative-control guards
+```
+
+What each control perturbs:
+
+- `datalog` — one acknowledged fact is removed from the model's expected set
+  (the NU-013 shape: silently absent after restart).
+- `vector` — the model expects one fewer live vector (the NU-048 shape: an
+  acknowledged insert vanished). Runs in a control shape (insert-only, one
+  reopen) because the honest shape is currently red for real — see finding 1.
+- `catalog` — the model expects the OLD behaviour: corrupt `sequences.json`
+  silently resets NEXTVAL to 1, corrupt `catalog.json` opens.
+- `lo` — one durable object's expected payload is corrupted in the model
+  (byte-exact comparison must catch wrong bytes, not just missing objects).
+- `probe_io_faults --negative-control` — the model treats a section's ERRORED
+  operations as acknowledged, the exact swallowed-append shape NU-013/NU-048
+  fixed; the honest model must report nothing, the perturbed model must.
+- `authority` — the model expects the unknown-id bind to succeed against the
+  fallback session (the NU-218 shape).
+- `guards` — the model expects at least one guard observation to answer the
+  unsafe direction under contention (the NU-217 shape).
+
+Note on the io-fault fault points: `datalog.wal_append` and `vector.wal_append`
+were added to `ALL_IO_POINTS` for this, so the existing matrix sweeps them
+with every kind and skip — a failed append must surface as a statement error,
+and only acknowledged mutations may survive the reopen.
+
 ### `--table-engine` and what it found immediately
 
 `--engine` selects the STORAGE engine (paged, MVCC, memory). `--table-engine`
@@ -197,6 +314,7 @@ crashes, hangs, and self-inconsistency rather than wrong answers.
 | `probe_concurrency` | MVCC snapshot isolation via the storage adapter. |
 | `probe_concurrency_threads` | Same, but real OS threads on one shared `Executor`. |
 | `probe_serializable` | Outcome matches *some* serial order — the only true serializability oracle here. |
+| `probe_sessions` | Session authority and guard state (S35): authority never installs onto the fallback session for an unknown/stale id (NU-218), and `session_in_transaction` / `session_has_active_rls` never answer the unsafe direction under concurrent churn (NU-217). Carries `--negative-control <authority\|guards>`. |
 
 ## Crash, durability, and fault injection
 
@@ -207,11 +325,12 @@ crashes, hangs, and self-inconsistency rather than wrong answers.
 | `probe_txn_atomicity` | **Is a user transaction atomic across a crash on the paged engine the server runs?** |
 | `probe_crossmodel_commit_order` | Crash-injection proof for cross-model commit ordering (R3). |
 | `probe_durability_torn` | Torn-write / power-loss approximation. |
-| `probe_io_faults` | Disk-full, fsync failure, permission loss. |
+| `probe_io_faults` | Disk-full, fsync failure, permission loss — and, since S35, `datalog.wal_append` / `vector.wal_append` fault points whose failed appends must fail the statement (NU-013/NU-048 class). Carries `--negative-control`. |
 | `probe_recover` | WAL recovery round-trip. |
 | `probe_raft_crash` | Raft persistent state across reopen. |
 | `probe_distributed` | Raft consensus invariants in simulation. |
-| `probe_blob` | Blob chunk-store differential **and** crash consistency. |
+| `probe_blob` | Blob chunk-store differential **and** crash consistency — plus, since S35, phase 4: the served `lo_*` large-object surface (OID honesty across restarts and two handlers, no empty-read on an unreadable object, no resurrect from a refused write; NU-102/NU-103 class). Carries `--negative-control lo` and `--lo-minimal`. |
+| `probe_recover_engines` | Disk-SQL + durable-KV recovery — plus, since S35, three sections: `datalog` (every acknowledged Datalog mutation survives a reopen, per predicate and for rule-derived facts; NU-013 class), `vector` (an HNSW index recovers from its WAL with exactly the acknowledged live vectors; NU-048 class), `catalog` (corrupt `sequences.json` / `catalog.json` / `meta.json` refused, never treated as empty and written back; NU-163/NU-165 class). Carries `--negative-control <datalog\|vector\|catalog>`; `--engine` selects the durable engine (default `buffered-disk`). |
 | `probe_soak` | Sustained concurrent mixed-model load (T1.4 / M11). |
 
 ### `probe_txn_atomicity` is now a PASSING gate (was expected to fail)
