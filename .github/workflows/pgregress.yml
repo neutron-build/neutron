@@ -47,10 +47,27 @@ jobs:
         with:
           workspaces: nucleus
 
+      # Step-level timeout, deliberately well under the job's 40. On
+      # 2026-08-18 an Ubuntu mirror stalled mid-`apt-get update` and this step
+      # sat on it for 39 minutes until the JOB timeout cancelled the run — so a
+      # network hiccup in a dependency install consumed the entire budget and
+      # left a non-success run on main that looks exactly like a real
+      # deviation. Failing fast here is the difference between "the mirror was
+      # slow" and "the differential harness found something", which is the one
+      # distinction this workflow exists to make.
       - name: Install PostgreSQL 17
+        timeout-minutes: 8
         run: |
           set -euo pipefail
-          sudo apt-get update
+          # Retry the network-bound steps: a single stalled mirror should cost
+          # seconds, not the run.
+          for attempt in 1 2 3; do
+            if sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30; then
+              break
+            fi
+            echo "apt-get update failed (attempt $attempt), retrying"
+            sleep 5
+          done
           sudo apt-get install -y postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-17
