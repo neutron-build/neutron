@@ -25,7 +25,7 @@ behavior satisfies the relevant gate above.
 ## Current baseline
 
 - Source LOC: 305112; Source Rust files: 270; Top-level modules: 51.
-- Declared unit tests: 4314; Declared integration tests: 380; Ignored tests: 46.
+- Declared unit tests: 4314; Declared integration tests: 382; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -379,9 +379,17 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       a content fingerprint of the destination before and after). `verify_snapshot` is public so an
       archived snapshot can be validated without running a restore. Restore also refuses a
       destination a live instance holds, and refuses to overwrite a *different* database (identity
-      mismatch) even with `--force`. NOT DONE: automated disaster-recovery tests (scheduled
-      restore-and-verify runs), and logical comparison of restored contents across every durable
-      model.
+      mismatch) even with `--force`.
+      2026-08-18: `tests/backup_restore_all_models.rs` adds the logical-comparison half for
+      **4 of the 14 models** (SQL, KV, document, FTS): write, read back, physical backup, restore
+      into a clean directory, read again, compare. It reads each model BEFORE the backup and
+      fails if any produced nothing, because two matching empty reads would otherwise pass for a
+      model that silently no-ops. Proven to discriminate by deleting the restored `doc.wal` and
+      watching the document comparison fail. A second test corrupts a byte of a specialty log
+      inside a snapshot and requires the restore to refuse it -- the manifest fingerprints the
+      whole tree, and that is now asserted rather than assumed.
+      STILL NOT DONE: the other 10 models, and automated disaster-recovery runs (scheduled
+      restore-and-verify).
 - [ ] Document RPO/RTO controls and limitations.
 
 Exit gate:
