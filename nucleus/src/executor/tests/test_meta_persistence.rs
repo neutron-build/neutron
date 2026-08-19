@@ -637,3 +637,35 @@ async fn a_rolled_back_datalog_assert_does_not_return_after_restart() {
         "the committed fact was lost by the compensation: {kept}"
     );
 }
+
+/// A password deadline must survive a restart.
+///
+/// Expiry that lives only in memory is expiry that a restart removes, and a
+/// restart is exactly when nobody is watching. `RoleSer` carries it with
+/// `#[serde(default)]`, so a metadata file written before the field existed
+/// loads as "no expiry" — which is what those roles had.
+#[tokio::test]
+async fn role_password_deadline_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            "CREATE ROLE persisted LOGIN PASSWORD 'p' VALID UNTIL '2020-01-01 00:00:00'",
+        )
+        .await;
+        exec(&ex, "CREATE ROLE unexpiring LOGIN PASSWORD 'p'").await;
+        assert!(ex.scram_credentials("persisted").await.is_none());
+    }
+    {
+        let ex = open_executor(dir.path()).await;
+        assert!(
+            ex.scram_credentials("persisted").await.is_none(),
+            "an expired role must still be expired after a restart"
+        );
+        assert!(
+            ex.scram_credentials("unexpiring").await.is_some(),
+            "control: a role with no deadline must still authenticate"
+        );
+    }
+}

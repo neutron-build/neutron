@@ -81,6 +81,14 @@ pub(crate) struct RoleDef {
     pub is_superuser: bool,
     pub bypass_rls: bool,
     pub can_login: bool,
+    /// `VALID UNTIL` — UTC microseconds after which the password no longer
+    /// authenticates. `None` means no expiry, which is PostgreSQL's default
+    /// and what every role created before this field had.
+    ///
+    /// This is a password expiry, not a role expiry: an expired role still
+    /// exists, still owns its objects, and can still be granted to. Only its
+    /// ability to authenticate lapses.
+    pub valid_until: Option<i64>,
     /// Roles this role may assume via SET ROLE (transitively inherited).
     pub member_of: Vec<String>,
     pub privileges: HashMap<String, Vec<Privilege>>,

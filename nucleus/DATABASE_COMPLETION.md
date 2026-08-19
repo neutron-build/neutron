@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 305758; Source Rust files: 270; Top-level modules: 51.
-- Declared unit tests: 4320; Declared integration tests: 383; Ignored tests: 46.
+- Source LOC: 306168; Source Rust files: 271; Top-level modules: 51.
+- Declared unit tests: 4329; Declared integration tests: 383; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -463,8 +463,29 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
 
 ### Identity and roles
 
-- [ ] Complete password lifecycle: creation, rotation, expiration policy, lockout/rate limits, and
+- [x] Complete password lifecycle: creation, rotation, expiration policy, lockout/rate limits, and
       redacted diagnostics.
+      **Closed 2026-08-19 (S57/N16).** Creation, rotation, lockout/rate limits and redaction were
+      already there: SCRAM-SHA-256 verifiers with raw passwords never retained, `ALTER ROLE
+      ... PASSWORD` replacing the verifier, a per-source-IP `LoginRateLimiter` checked BEFORE
+      the credential is verified, and `ops::redact::redact_sql` scrubbing credential literals
+      out of logged SQL. **Expiration was the missing one, and it was worse than missing.**
+      `CREATE ROLE r LOGIN PASSWORD 'p' VALID UNTIL '2020-01-01'` parsed, succeeded, and the
+      deadline was DISCARDED — `CreateRole::valid_until` and `RoleOption::ValidUntil` both fell
+      through unmatched arms — so the role authenticated indefinitely while
+      `pg_roles.rolvaliduntil` and `pg_user.valuntil` reported NULL for every role because
+      nothing ever filled them. Same class as `FOR UPDATE SKIP LOCKED`: a clause carrying a
+      guarantee, accepted and dropped.
+      Now: `RoleDef.valid_until` (UTC microseconds), enforced at BOTH authentication gates --
+      `scram_credentials` and `bind_authenticated_session`, because paths that never ask for a
+      verifier would otherwise skip a check that lives only beside the password. An
+      unparseable deadline fails the statement rather than creating an unprotected role. It
+      persists across restart (`#[serde(default)]`, so older metadata loads as "no expiry"),
+      is emitted by the logical dump, and is reported by both catalog views.
+      `src/executor/tests/test_password_lifecycle.rs` is the adversarial suite (8 tests, each
+      with its control); disabling the deadline check fails 4 of the 8. Documented in
+      `RLS_SECURITY.md`, including what expiry deliberately does NOT do: it applies at login,
+      does not terminate live sessions, and does not block `SET ROLE`, matching PostgreSQL.
 - [ ] Add optional trusted JWT/OIDC/proxy claim verification if multi-tenant cloud mode is supported.
 - [ ] Authenticate cluster nodes with mTLS and authorize administrative RPCs.
 - [ ] Propagate authenticated principals through supported follower forwarding without impersonation.

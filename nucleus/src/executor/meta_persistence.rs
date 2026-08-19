@@ -120,6 +120,11 @@ struct RoleSer {
     #[serde(default)]
     bypass_rls: bool,
     can_login: bool,
+    /// `VALID UNTIL`, UTC microseconds. `#[serde(default)]` so a metadata file
+    /// written before password expiry existed loads as "no expiry", which is
+    /// what those roles had.
+    #[serde(default)]
+    valid_until: Option<i64>,
     #[serde(default)]
     member_of: Vec<String>,
     /// table → ["Select", "Insert", ...]
@@ -304,6 +309,7 @@ impl MetaPersistence {
                     is_superuser: r.is_superuser,
                     bypass_rls: r.bypass_rls,
                     can_login: r.can_login,
+                    valid_until: r.valid_until,
                     member_of: r.member_of.clone(),
                     privileges: r
                         .privileges
@@ -507,6 +513,7 @@ impl MetaPersistence {
                     is_superuser: r.is_superuser,
                     bypass_rls: r.bypass_rls,
                     can_login: r.can_login,
+                    valid_until: r.valid_until,
                     member_of: r.member_of,
                     privileges,
                 },

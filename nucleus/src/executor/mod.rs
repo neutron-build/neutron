@@ -100,6 +100,24 @@ pub(crate) fn store_password_literal(literal: &str) -> String {
     encode_scram_verifier(literal)
 }
 
+/// Has a role's `VALID UNTIL` passed?
+///
+/// `None` means no expiry. The comparison is against wall-clock UTC
+/// microseconds, the same unit `parse_timestamptz` produces, so a clock that
+/// jumps backwards can un-expire a password — which is PostgreSQL's behaviour
+/// too, and the alternative (a monotonic clock) cannot express a wall-clock
+/// deadline at all.
+pub(crate) fn password_expired(valid_until: Option<i64>) -> bool {
+    let Some(deadline) = valid_until else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    now >= deadline
+}
+
 mod admin;
 mod admission;
 mod aggregate;
@@ -598,6 +616,7 @@ impl Executor {
                 is_superuser: true,
                 bypass_rls: true,
                 can_login: true,
+                valid_until: None,
                 member_of: Vec::new(),
                 privileges: HashMap::new(),
             },
@@ -2654,12 +2673,13 @@ impl Executor {
         }
     }
 
-    /// Return stored SCRAM material only for a login-capable catalog role.
+    /// Return stored SCRAM material only for a login-capable catalog role
+    /// whose password has not expired.
     #[cfg(feature = "server")]
     pub async fn scram_credentials(&self, user: &str) -> Option<(Vec<u8>, Vec<u8>)> {
         let roles = self.roles.read().await;
         let role = roles.get(user)?;
-        if !role.can_login {
+        if !role.can_login || password_expired(role.valid_until) {
             return None;
         }
         decode_scram_verifier(role.password_hash.as_deref()?)
@@ -2669,15 +2689,27 @@ impl Executor {
     /// session principal.
     #[cfg(feature = "server")]
     pub async fn bind_authenticated_session(&self, id: u64, user: &str) -> Result<(), ExecError> {
-        let allowed = self
-            .roles
-            .read()
-            .await
-            .get(user)
-            .is_some_and(|r| r.can_login);
+        // Both conditions are checked HERE as well as in `scram_credentials`,
+        // not only there. That function is the SCRAM path; this one is the
+        // gate every authenticated session passes through, including trust
+        // and certificate authentication, which never ask for a verifier. A
+        // check that lives only beside the password covers only the
+        // password.
+        let (allowed, expired) = {
+            let roles = self.roles.read().await;
+            match roles.get(user) {
+                Some(r) => (r.can_login, password_expired(r.valid_until)),
+                None => (false, false),
+            }
+        };
         if !allowed {
             return Err(ExecError::PermissionDenied(format!(
                 "role '{user}' is not permitted to log in"
+            )));
+        }
+        if expired {
+            return Err(ExecError::PermissionDenied(format!(
+                "password for role '{user}' has expired"
             )));
         }
         // No fallback: an id naming no session must not authenticate. See
@@ -8394,7 +8426,13 @@ impl Executor {
                             Value::Bool(r.can_login),
                             // No per-role connection limits: -1 = unlimited.
                             Value::Int32(-1),
-                            Value::Null,
+                            // rolvaliduntil: NULL means no expiry, as in
+                            // PostgreSQL. It was NULL unconditionally while
+                            // the column existed and nothing filled it.
+                            match r.valid_until {
+                                Some(us) => Value::Text(Value::Timestamp(us).to_string()),
+                                None => Value::Null,
+                            },
                             Value::Bool(false),
                             Value::Bool(r.is_superuser),
                         ]
@@ -8771,7 +8809,12 @@ impl Executor {
                             Value::Bool(false),
                             Value::Bool(r.is_superuser),
                             Value::Text("********".into()),
-                            Value::Null,
+                            // valuntil, the pg_shadow spelling of the same
+                            // expiry pg_roles reports as rolvaliduntil.
+                            match r.valid_until {
+                                Some(us) => Value::Text(Value::Timestamp(us).to_string()),
+                                None => Value::Null,
+                            },
                             Value::Null,
                         ]
                     })

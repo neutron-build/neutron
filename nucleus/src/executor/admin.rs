@@ -749,6 +749,7 @@ impl Executor {
                 is_superuser: false,
                 bypass_rls: false,
                 can_login: false,
+                valid_until: None,
                 member_of: Vec::new(),
                 privileges: HashMap::new(),
             });
@@ -829,6 +830,13 @@ impl Executor {
         create_role: ast::CreateRole,
     ) -> Result<ExecResult, ExecError> {
         self.require_security_admin("create roles")?;
+        // Parse before taking the write lock, and before creating anything:
+        // `VALID UNTIL 'not a timestamp'` must fail the statement rather than
+        // create a role whose expiry silently did not apply.
+        let valid_until = match create_role.valid_until {
+            Some(ref expr) => parse_valid_until(expr)?,
+            None => None,
+        };
         let mut roles = self.roles.write().await;
         for name in &create_role.names {
             let role_name = name.to_string();
@@ -838,6 +846,7 @@ impl Executor {
                 is_superuser: create_role.superuser.unwrap_or(false),
                 bypass_rls: create_role.bypassrls.unwrap_or(false),
                 can_login: create_role.login.unwrap_or(false),
+                valid_until,
                 member_of: create_role
                     .in_role
                     .iter()
@@ -881,6 +890,9 @@ impl Executor {
                         ast::RoleOption::SuperUser(v) => role.is_superuser = *v,
                         ast::RoleOption::BypassRLS(v) => role.bypass_rls = *v,
                         ast::RoleOption::Login(v) => role.can_login = *v,
+                        ast::RoleOption::ValidUntil(expr) => {
+                            role.valid_until = parse_valid_until(expr)?;
+                        }
                         ast::RoleOption::Password(pwd) => match pwd {
                             ast::Password::Password(expr) => {
                                 let raw = expr.to_string().trim_matches('\'').to_string();
@@ -1074,4 +1086,24 @@ impl Executor {
             rows_affected: 0,
         })
     }
+}
+
+/// `VALID UNTIL <expr>` as UTC microseconds, or `None` for no expiry.
+///
+/// PostgreSQL takes a timestamptz here; `NULL` and `'infinity'` both mean "no
+/// expiry". A value that does not parse is an error rather than a silently
+/// dropped clause — the whole defect this replaced was a guarantee-carrying
+/// clause being accepted and discarded.
+fn parse_valid_until(expr: &ast::Expr) -> Result<Option<i64>, ExecError> {
+    let raw = expr.to_string();
+    let literal = raw.trim().trim_matches('\'').trim();
+    if literal.is_empty() || literal.eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
+    if literal.eq_ignore_ascii_case("infinity") {
+        return Ok(None);
+    }
+    crate::types::parse_timestamptz(literal)
+        .map(Some)
+        .map_err(|e| ExecError::Unsupported(format!("VALID UNTIL {raw}: {e}")))
 }

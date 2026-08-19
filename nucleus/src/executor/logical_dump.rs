@@ -291,7 +291,7 @@ fn topo_sort_tables(tables: &[std::sync::Arc<TableDef>]) -> Vec<std::sync::Arc<T
 /// (see `super::store_password_literal`), so credentials survive a round trip.
 /// Memberships are NOT emitted here — they become `GRANT` statements once every
 /// role exists.
-fn render_create_role(role: &RoleDef) -> String {
+pub(super) fn render_create_role(role: &RoleDef) -> String {
     let mut opts = vec![
         if role.can_login { "LOGIN" } else { "NOLOGIN" }.to_string(),
         if role.is_superuser {
@@ -309,6 +309,14 @@ fn render_create_role(role: &RoleDef) -> String {
     ];
     if let Some(hash) = &role.password_hash {
         opts.push(format!("PASSWORD {}", quote_str(hash)));
+    }
+    // A dump that drops the expiry restores a password that no longer expires,
+    // which is the failure direction that matters.
+    if let Some(us) = role.valid_until {
+        opts.push(format!(
+            "VALID UNTIL {}",
+            quote_str(&crate::types::Value::Timestamp(us).to_string())
+        ));
     }
     format!("CREATE ROLE {} WITH {};", role.name, opts.join(" "))
 }

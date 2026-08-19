@@ -141,6 +141,64 @@ Not covered by the in-process matrix: replica/follower reads (needs a live
 cluster) and the wire-level protocol surfaces, which `compat/` covers
 separately.
 
+## Password lifecycle
+
+Roles carry a SCRAM-SHA-256 verifier and an optional deadline:
+
+```sql
+CREATE ROLE app_user LOGIN PASSWORD 'secret' VALID UNTIL '2027-01-01 00:00:00';
+ALTER ROLE app_user PASSWORD 'rotated';           -- replaces the verifier
+ALTER ROLE app_user VALID UNTIL '2028-01-01';     -- moves the deadline
+ALTER ROLE app_user VALID UNTIL 'infinity';       -- removes it
+ALTER ROLE app_user PASSWORD NULL;                -- removes the credential
+```
+
+Enforced properties:
+
+- **A raw password is never retained.** `store_password_literal` encodes a SCRAM
+  verifier; an already-encoded verifier is stored verbatim so a logical dump
+  round-trips credentials without re-hashing them.
+- **The deadline is checked at both authentication gates**, not only beside the
+  password: `scram_credentials` (the SCRAM path) and
+  `bind_authenticated_session` (every authenticated session, including paths
+  that never ask for a verifier). A check that lives only next to the password
+  covers only the password.
+- **The deadline is a moment, not a flag.** A live role stops authenticating
+  when it passes, with no statement having run.
+- **An unparseable `VALID UNTIL` fails the statement.** It does not create a
+  role whose expiry silently did not apply, which is worse than an error
+  because it looks like it worked.
+- **It survives a restart and a dump.** `RoleSer` persists it (defaulting to
+  "no expiry" for metadata files written before the field existed) and
+  `CREATE ROLE` renders it.
+- **`pg_roles.rolvaliduntil` and `pg_user.valuntil` report it.** Both columns
+  existed and returned NULL for every role, which reads as "no role in this
+  database has an expiry".
+- **Lockout and rate limiting are per source IP**, checked BEFORE the credential
+  is verified (`wire::LoginRateLimiter`), so a locked-out address is refused
+  even with correct credentials.
+- **Credentials are scrubbed from logged SQL** by `ops::redact::redact_sql`
+  before any statement text is logged.
+
+`src/executor/tests/test_password_lifecycle.rs` is the adversarial suite:
+expired versus unexpired as controls in the same test, both gates checked
+independently, expiry-versus-NOLOGIN reported as distinct denials, rotation
+replacing the verifier, and the deadline surviving a restart.
+
+The defect the suite was written around: `VALID UNTIL` parsed, succeeded, and
+was **discarded** — `CreateRole::valid_until` and `RoleOption::ValidUntil` both
+fell through unmatched arms, so an expired role authenticated indefinitely and
+the catalog views said no role had a deadline. Same class as `FOR UPDATE SKIP
+LOCKED` being parsed and never read: a clause carrying a guarantee, accepted
+and dropped.
+
+Deliberate, matching PostgreSQL: expiry applies at **login**. It does not
+terminate sessions that are already connected, and it does not block `SET ROLE`
+into the role — an expired role still exists, still owns its objects, and can
+still be granted to. Only its ability to authenticate lapses. There is no
+password history, no complexity policy, and no forced-rotation interval;
+enforcing those belongs to whatever provisions the roles.
+
 ## Deliberate limitations
 
 - Constraint errors (for example unique and foreign-key checks) can reveal that a hidden key exists,
