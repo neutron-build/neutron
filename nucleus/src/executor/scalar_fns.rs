@@ -64,51 +64,7 @@ impl Executor {
         // function must see the same canonical name the dispatcher executes.
         let fname = fname.strip_prefix("PG_CATALOG.").unwrap_or(fname);
 
-        // Specialty stores do not yet carry table-policy metadata. When any
-        // RLS policy is active for this principal, allowing their direct SQL
-        // functions would create an alternate read/write channel around the
-        // secured relational access path. Fail closed until a store has native
-        // policy semantics.
-        let specialty_surface = [
-            "COLUMNAR_",
-            "DOC_",
-            "FTS_",
-            "GRAPH_",
-            "CDC_",
-            "KV_",
-            "TS_",
-            "STREAM_",
-            "BLOB_",
-            "SPARSE_",
-            "LO_",
-            "DATALOG_",
-            "ENCRYPTED_",
-            "DB_BRANCH_",
-            "VERSION_",
-            "TENSOR_",
-            "PUBSUB_",
-            "PROC_",
-            "SUBSCRIPTION_",
-        ]
-        .iter()
-        .any(|prefix| fname.starts_with(prefix))
-            || matches!(
-                fname,
-                "VECTOR_SEARCH"
-                    | "VECTOR_INSERT"
-                    | "VECTOR_DELETE"
-                    | "CYPHER"
-                    | "SUBSCRIBE"
-                    | "UNSUBSCRIBE"
-            );
-        // The text-search functions collide with the time-series `TS_` prefix
-        // without belonging to any specialty store: they are pure computations
-        // over the arguments they are handed, reaching no keyspace the secured
-        // relational path does not already cover. Gating them denied the
-        // PostgreSQL-compatible spelling of a plain expression under RLS.
-        let specialty_surface = specialty_surface
-            && !matches!(fname, "TS_MATCH" | "TS_RANK" | "TS_HEADLINE" | "FTS_RANK");
-        if specialty_surface && self.any_rls_active() {
+        if is_specialty_surface(fname) && self.any_rls_active() {
             return Err(ExecError::PermissionDenied(format!(
                 "{fname} is unavailable while row-level security is active because this specialty-store surface has no policy-aware access path"
             )));
@@ -6462,6 +6418,71 @@ pub(crate) const SIDE_EFFECTING_FN_NAMES: &[&str] = &[
     "VERSION_BRANCH",
     "VERSION_COMMIT",
 ];
+
+/// Does this function reach a specialty store, rather than computing over the
+/// arguments it was handed?
+///
+/// Specialty stores do not yet carry table-policy metadata, so while any RLS
+/// policy is active for a principal, their direct SQL functions would be an
+/// alternate read/write channel around the secured relational path. They fail
+/// closed until a store has native policy semantics — which is the option
+/// M5/N15 explicitly allows ("implement those boundaries OR keep each surface
+/// unavailable while protected relational state exists").
+///
+/// This is a `fn` rather than an inline expression so the RLS guard and the
+/// test that audits it cannot classify differently. The test
+/// (`test_specialty_surface_guard`) reads THIS file, finds every dispatch arm
+/// that touches a store field, and requires this function to return `true` for
+/// it — so a new specialty function is a failing test rather than a silent
+/// hole. That is how `RETENTION_SET`/`RETENTION_CHECK` were found: they touch
+/// `retention_engine` and matched no prefix.
+pub(crate) fn is_specialty_surface(fname: &str) -> bool {
+    // The text-search functions collide with the time-series `TS_` prefix
+    // without belonging to any specialty store: they are pure computations over
+    // their arguments, reaching no keyspace the secured relational path does not
+    // already cover. Gating them denied the PostgreSQL-compatible spelling of a
+    // plain expression under RLS.
+    if matches!(fname, "TS_MATCH" | "TS_RANK" | "TS_HEADLINE" | "FTS_RANK") {
+        return false;
+    }
+    const PREFIXES: [&str; 20] = [
+        "COLUMNAR_",
+        "DOC_",
+        "FTS_",
+        "GRAPH_",
+        "CDC_",
+        "KV_",
+        "TS_",
+        "STREAM_",
+        "BLOB_",
+        "SPARSE_",
+        "LO_",
+        "DATALOG_",
+        "ENCRYPTED_",
+        "DB_BRANCH_",
+        "VERSION_",
+        "TENSOR_",
+        "PUBSUB_",
+        "PROC_",
+        "SUBSCRIPTION_",
+        // Compliance retention: `RETENTION_SET` registers a deletion policy
+        // against a named TABLE and `RETENTION_CHECK` enumerates every table
+        // with an estimated row count — the second is a direct read of which
+        // protected tables exist and how big they are. Neither matched a
+        // prefix, so both were callable by any principal with RLS active.
+        "RETENTION_",
+    ];
+    PREFIXES.iter().any(|prefix| fname.starts_with(prefix))
+        || matches!(
+            fname,
+            "VECTOR_SEARCH"
+                | "VECTOR_INSERT"
+                | "VECTOR_DELETE"
+                | "CYPHER"
+                | "SUBSCRIBE"
+                | "UNSUBSCRIBE"
+        )
+}
 
 /// Return type of a *side-effecting* built-in scalar function, or `None`
 /// for pure ones. This is the registry the pgwire Describe path uses to

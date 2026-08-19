@@ -199,6 +199,30 @@ still be granted to. Only its ability to authenticate lapses. There is no
 password history, no complexity policy, and no forced-rotation interval;
 enforcing those belongs to whatever provisions the roles.
 
+## Specialty surfaces under RLS
+
+Specialty-store functions (`KV_*`, `DOC_*`, `GRAPH_*`, `FTS_*`, `TS_*`,
+`STREAM_*`, `BLOB_*`, `COLUMNAR_*`, `DATALOG_*`, `CDC_*`, `VECTOR_SEARCH`,
+`CYPHER`, `RETENTION_*`, …) are **refused while any RLS policy is active** for
+the principal. Those stores carry no table-policy metadata, so allowing them
+would be an alternate read/write channel around the secured relational path.
+Superusers are exempt, as they are from RLS itself.
+
+Pure computations that merely collide with a specialty prefix — `TS_MATCH`,
+`TS_RANK`, `TS_HEADLINE`, `FTS_RANK`, `GEO_DISTANCE`, `TIME_BUCKET`,
+`VECTOR_DISTANCE`, `BM25` — stay available: they reach no keyspace, and gating
+them would have removed the PostgreSQL-compatible spelling of a plain
+expression.
+
+The guard is a prefix list, which is a shape that cannot report what it missed.
+`test_specialty_surface_guard` therefore reads the dispatcher's source, finds
+every `match` arm whose body touches a store field, and requires
+`is_specialty_surface` to classify it — so a new specialty function fails the
+build rather than opening a hole. That audit found `RETENTION_SET` and
+`RETENTION_CHECK`, which reach the compliance retention engine and matched no
+prefix: under RLS, `RETENTION_CHECK` returned a protected table's name,
+deletion condition and row estimate.
+
 ## Security audit log
 
 Durable, bounded, append-only, at `<data-dir>/audit/audit.log` as JSON Lines.

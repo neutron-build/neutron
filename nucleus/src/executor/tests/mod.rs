@@ -71,6 +71,7 @@ mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration mat
 mod test_row_locks;
 mod test_scalar_fns;
 mod test_specialty_persistence;
+mod test_specialty_surface_guard; // N15: the specialty fail-closed guard, audited against the dispatcher
 mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
 mod test_sql_wal_ack_durability; // R4: an acked autocommit SQL write is fsync-durable
 mod test_ssi_census; // B1: end-to-end SSI anomaly census (gate for MVCC scan changes)

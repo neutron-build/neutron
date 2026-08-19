@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 308236; Source Rust files: 276; Top-level modules: 52.
-- Declared unit tests: 4359; Declared integration tests: 384; Ignored tests: 46.
+- Source LOC: 308510; Source Rust files: 277; Top-level modules: 52.
+- Declared unit tests: 4363; Declared integration tests: 384; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -589,8 +589,34 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
 
 - [ ] Define native ownership/tenant policy boundaries for KV, document, vector, graph, FTS,
       time-series, blob, streams, Datalog, tensor, branch/version, CDC, and pub/sub surfaces.
-- [ ] Implement those boundaries or keep each surface unavailable while protected relational state
+      **Deliberately not done — the second option below is taken instead**, and the two are
+      alternatives by the milestone's own wording. Native per-store policy semantics are a large
+      design (each store has a different key space, and RLS predicates are written against
+      relational columns), and until they exist the honest position is that these surfaces are
+      unavailable to a principal under RLS rather than available with no policy.
+- [x] Implement those boundaries or keep each surface unavailable while protected relational state
       exists; never silently use the bootstrap identity.
+      **Closed 2026-08-19 (S62/N15) by auditing the guard rather than trusting it.** The
+      fail-closed guard existed and was a list of NAME PREFIXES -- a shape that cannot tell you
+      what it missed, because a function whose name starts with none of them looks exactly like
+      one that was deliberately allowed.
+      `test_specialty_surface_guard` reads the dispatcher's own source, finds every `match` arm
+      whose body touches a store field, and requires `is_specialty_surface` to classify it. A new
+      specialty function is now a failing test rather than a hole. The classification itself moved
+      out of an inline expression into `is_specialty_surface` so the guard and its audit cannot
+      diverge.
+      It found two: **`RETENTION_SET` and `RETENTION_CHECK`**, which reach the compliance
+      retention engine and matched no prefix. `RETENTION_CHECK` under RLS returned the protected
+      table's name, its deletion condition and a row estimate; `RETENTION_SET` registered a
+      deletion policy against a named table for any principal. Both are now guarded.
+      The audit carries its own vacuity check -- it asserts it parsed >200 arms, that >50 touch a
+      store, and that every store field it looks for still exists on `Executor` -- because a
+      source-scanning test that silently matches nothing passes forever. Removing `RETENTION_`
+      from the guard fails it with both names.
+      Separately filed, not fixed: `RETENTION_SET` registers a policy that **nothing enforces**
+      (no caller reads `retention_engine` except `RETENTION_CHECK`), so it returns 'OK' for a
+      retention rule that will never delete anything. Undocumented everywhere, so nothing public
+      overclaims it -- `OPEN_WORK.md` §0f.
 
 Exit gate:
 
