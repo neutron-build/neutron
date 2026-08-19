@@ -17,6 +17,13 @@
 //! - **Matched index parameters.** Same `m`, same `ef_construction`, same
 //!   `ef_search`, same L2 metric. An HNSW comparison at mismatched `ef` is not a
 //!   comparison, it is a choice of operating point.
+//! - **One index per engine, swept.** `ef_search` is a query-time dial, so the
+//!   sweep varies it against a FIXED graph in both engines. Rebuilding per
+//!   point — which this harness used to do on both sides — measured a
+//!   different randomized graph at each ef, so recall was not monotonic in ef
+//!   and the curve meant nothing. `build_s` is therefore one measurement per
+//!   engine, repeated on each row, and it is a property of `ef_construction`
+//!   rather than of the point.
 //! - **The transport difference is measured, not hidden.** Nucleus runs
 //!   in-process; pgvector answers over a loopback socket. That gap is real and
 //!   it favours Nucleus, so the harness measures the round-trip floor with a
@@ -192,29 +199,40 @@ fn bench_nucleus(
     queries: &[Vector],
     truth_kth: &[f64],
 ) -> Vec<Measurement> {
+    // ONE index, swept. It used to be rebuilt per operating point, which made
+    // the curve uninterpretable: HNSW construction is randomized (layer
+    // assignment), so each rebuild is a different graph and recall at ef=64
+    // could beat ef=128 through graph luck alone. Recall must be monotonic in
+    // ef for a FIXED index — that is what the dial means — and comparing points
+    // measured on different graphs cannot show it. Building once also stops
+    // reporting a build time per point for an index built once per
+    // `ef_construction`, which is the parameter build cost actually depends on.
+    let index_cfg = HnswConfig {
+        m: cfg.m,
+        m_max0: cfg.m * 2,
+        ef_construction: cfg.ef_construction,
+        // Not the sweep value: every query below passes its beam explicitly.
+        ef_search: cfg.ef_search.first().copied().unwrap_or(64),
+        metric: DistanceMetric::L2,
+    };
+    let mut index = HnswIndex::new(index_cfg);
+    let t_build = Instant::now();
+    for (id, v) in corpus.iter().enumerate() {
+        index.insert(id as u64, v.clone());
+    }
+    let build_s = t_build.elapsed().as_secs_f64();
+
     let mut out = Vec::new();
     for &ef in &cfg.ef_search {
-        // Rebuilt per operating point so build time is attributed honestly and
-        // no state leaks between points.
-        let index_cfg = HnswConfig {
-            m: cfg.m,
-            m_max0: cfg.m * 2,
-            ef_construction: cfg.ef_construction,
-            ef_search: ef,
-            metric: DistanceMetric::L2,
-        };
-        let mut index = HnswIndex::new(index_cfg);
-        let t_build = Instant::now();
-        for (id, v) in corpus.iter().enumerate() {
-            index.insert(id as u64, v.clone());
-        }
-        let build_s = t_build.elapsed().as_secs_f64();
-
         let mut recalls = Vec::with_capacity(queries.len());
         let mut latencies = Vec::with_capacity(queries.len());
         for (qi, q) in queries.iter().enumerate() {
             let t0 = Instant::now();
-            let got = index.search(q, cfg.k);
+            // `search_ef`, not `search`: `search` raises the beam to
+            // `max(ef_search, min(n/2048, 512))`, so at 50k rows the reported
+            // ef and the ef actually used would differ. A sweep whose x-axis is
+            // not the value under test is not a sweep.
+            let got = index.search_ef(q, cfg.k, ef);
             latencies.push(t0.elapsed().as_nanos() as f64 / 1000.0);
             let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
             recalls.push(recall_by_distance(&ids, truth_kth[qi], corpus, q, cfg.k));
@@ -293,21 +311,25 @@ async fn bench_pgvector(
         loaded = end;
     }
 
+    // One index for the whole sweep, matching the Nucleus arm: `hnsw.ef_search`
+    // is a runtime setting, so rebuilding per point measured a different
+    // randomized graph at each ef and cost three index builds to learn nothing
+    // extra.
+    client
+        .batch_execute("DROP INDEX IF EXISTS bench_vectors_hnsw")
+        .await?;
+    let t_build = Instant::now();
+    client
+        .batch_execute(&format!(
+            "CREATE INDEX bench_vectors_hnsw ON bench_vectors \
+             USING hnsw (v vector_l2_ops) WITH (m = {}, ef_construction = {})",
+            cfg.m, cfg.ef_construction
+        ))
+        .await?;
+    let build_s = t_build.elapsed().as_secs_f64();
+
     let mut out = Vec::new();
     for &ef in &cfg.ef_search {
-        client
-            .batch_execute("DROP INDEX IF EXISTS bench_vectors_hnsw")
-            .await?;
-        let t_build = Instant::now();
-        client
-            .batch_execute(&format!(
-                "CREATE INDEX bench_vectors_hnsw ON bench_vectors \
-                 USING hnsw (v vector_l2_ops) WITH (m = {}, ef_construction = {})",
-                cfg.m, cfg.ef_construction
-            ))
-            .await?;
-        let build_s = t_build.elapsed().as_secs_f64();
-
         client
             .batch_execute(&format!("SET hnsw.ef_search = {ef}"))
             .await?;
@@ -448,6 +470,8 @@ fn main() {
         "{:<10} {:>10} {:>10} {:>9} {:>9} {:>8} {:>10} {:>10} {:>10}",
         "engine", "ef_search", "build_s", "recall", "min_rec", "zero_q", "p50_us", "p95_us", "qps"
     );
+    // `build_s` repeats down each engine's rows on purpose: one index is built
+    // per engine and swept, so it is the same measurement, not three.
     for r in &results {
         println!(
             "{:<10} {:>10} {:>10.1} {:>9.3} {:>9.3} {:>8} {:>10.0} {:>10.0} {:>10.0}",
