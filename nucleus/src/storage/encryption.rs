@@ -43,14 +43,25 @@ pub struct PageEncryptor {
     key_id: String,
 }
 
-/// First 16 hex characters of the SHA-256 of the key.
+/// First 16 hex characters of the BLAKE3 hash of the key.
 ///
 /// Truncated deliberately: this is an identity label, not an authenticator, and
 /// a full digest invites treating it as one. It cannot recover the key.
+///
+/// BLAKE3 rather than SHA-256 because `sha2` is an OPTIONAL dependency behind
+/// the `server` feature, while this module compiles in the embedded and WASM
+/// builds too -- reaching for it broke `--no-default-features` with
+/// `unresolved import sha2`. `blake3` is unconditional and is already what the
+/// backup manifest hashes files with, so this is the repo's existing choice
+/// rather than a new one.
 fn fingerprint(key: &[u8; 32]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(key);
-    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    let digest = blake3::hash(key);
+    digest
+        .as_bytes()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 impl PageEncryptor {
