@@ -61,11 +61,20 @@ jobs:
           set -euo pipefail
           # Retry the network-bound steps: a single stalled mirror should cost
           # seconds, not the run.
+          #
+          # Each attempt is wrapped in `timeout` because the retry loop alone was
+          # not enough. On 2026-08-19 this step died at its 8-minute cap while
+          # still inside attempt 1: a mirror that STALLS rather than fails never
+          # returns, so `if ...; then` never evaluates and attempts 2 and 3 are
+          # unreachable. `Acquire::http::Timeout` bounds a single connection, not
+          # an update that keeps trickling. Bounding the attempt itself is what
+          # makes the retry real -- 3 x 120s fits inside the 8-minute budget with
+          # room for the installs below.
           for attempt in 1 2 3; do
-            if sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30; then
+            if sudo timeout 120 apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30; then
               break
             fi
-            echo "apt-get update failed (attempt $attempt), retrying"
+            echo "apt-get update failed or stalled (attempt $attempt), retrying"
             sleep 5
           done
           sudo apt-get install -y postgresql-common
