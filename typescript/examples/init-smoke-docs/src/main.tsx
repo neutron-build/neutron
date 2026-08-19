@@ -1,8 +1,0 @@
-import { init, registerRoutes } from "@neutron-build/core/client";
-import { routes } from "virtual:neutron/routes";
-
-const saved = localStorage.getItem("docs-theme") || "dark";
-document.documentElement.setAttribute("data-theme", saved);
-
-registerRoutes(routes);
-void init();
