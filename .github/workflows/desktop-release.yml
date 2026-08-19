@@ -62,8 +62,26 @@ jobs:
         # libayatana-appindicator3-dev and makes apt exit 100. See the same
         # note in desktop.yml.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          set -euo pipefail
+          # Bounded and retried: a stalled apt mirror is the most common way
+          # these jobs die, and an unbounded `apt-get update` that trickles
+          # forever burns the whole job budget rather than failing. Same fix,
+          # and same reasoning, as `pgregress.yml`.
+          retry() {
+            local what="$1"; shift
+            local limit="$1"; shift
+            for attempt in 1 2 3; do
+              if sudo timeout "$limit" "$@"; then
+                return 0
+              fi
+              echo "$what failed or stalled (attempt $attempt of 3), retrying"
+              sleep 5
+            done
+            echo "::error::$what did not succeed in 3 bounded attempts -- apt mirror stall, not a build failure"
+            return 1
+          }
+          retry "apt-get update" 120 apt-get update
+          retry "install desktop build dependencies" 240 apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
