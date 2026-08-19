@@ -790,10 +790,14 @@ impl ColumnarStore {
             merge_running: Some(running),
         };
         // Replay recovered state: CREATE_TABLE entries first, then INSERT_ROWS.
+        // Column names come from the log when the writer recorded them; a table
+        // whose entries predate that (or came from the positional storage
+        // engine) rebuilds with "0", "1", … as before.
+        let recovered_names: HashMap<String, Vec<String>> = state.columns.into_iter().collect();
         for (table_name, rows) in state.tables {
             store.tables.entry(table_name.clone()).or_default();
             if !rows.is_empty() {
-                let batch = rows_to_batch(rows);
+                let batch = rows_to_batch_named(rows, recovered_names.get(&table_name));
                 store.tables.get_mut(&table_name).unwrap().push(batch);
             }
         }
@@ -809,7 +813,8 @@ impl ColumnarStore {
         self.poll_all_merge_results();
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
-            if let Err(e) = wal.log_insert_rows(table, &rows) {
+            let names = column_names(&batch);
+            if let Err(e) = wal.log_insert_rows_named(table, &names, &rows) {
                 eprintln!("columnar WAL: failed to log insert_rows for {table}: {e}");
             }
         }
@@ -1094,21 +1099,24 @@ impl ColumnarStore {
             return Ok(());
         };
         let names = self.table_names();
-        let rows_per_table: Vec<Vec<Row>> = names
+        // A checkpoint truncates the log to one snapshot entry, so the column
+        // names have to travel with it — otherwise checkpointing is itself the
+        // operation that loses them.
+        let per_table: Vec<(Vec<String>, Vec<Row>)> = names
             .iter()
             .map(|name| {
-                self.batches_all(name)
-                    .iter()
-                    .flat_map(batch_to_rows)
-                    .collect()
+                let batches = self.batches_all(name);
+                let cols = batches.first().map(column_names).unwrap_or_default();
+                (cols, batches.iter().flat_map(batch_to_rows).collect())
             })
             .collect();
-        let snapshot: Vec<(&str, Vec<Row>)> = names
+        let snapshot: Vec<(&str, Vec<String>, &[Row])> = names
             .iter()
             .map(String::as_str)
-            .zip(rows_per_table)
+            .zip(per_table.iter())
+            .map(|(name, (cols, rows))| (name, cols.clone(), rows.as_slice()))
             .collect();
-        wal.checkpoint(&snapshot)
+        wal.checkpoint_named(&snapshot)
     }
 }
 
@@ -1116,11 +1124,21 @@ impl ColumnarStore {
 // Row ↔ ColumnBatch conversion helpers (WAL persistence)
 // ============================================================================
 
-/// Convert a Vec<Row> into a single ColumnBatch.
+/// A batch's column names, in order.
+fn column_names(batch: &ColumnBatch) -> Vec<String> {
+    batch.columns.iter().map(|(n, _)| n.clone()).collect()
+}
+
+/// Convert a Vec<Row> into a single ColumnBatch, using `names` where the log
+/// recorded them.
 ///
-/// Column names are the zero-based string index ("0", "1", ...) matching the
-/// convention used by ColumnarStorageEngine.
-fn rows_to_batch(rows: Vec<Row>) -> ColumnBatch {
+/// Without names the columns take the zero-based string index ("0", "1", …),
+/// the convention `ColumnarStorageEngine` uses.
+///
+/// Falls back to the positional name for any column `names` does not cover, so
+/// a truncated or mismatched name list degrades to the old behaviour for the
+/// columns it cannot name rather than dropping them.
+fn rows_to_batch_named(rows: Vec<Row>, names: Option<&Vec<String>>) -> ColumnBatch {
     if rows.is_empty() {
         return ColumnBatch::new(Vec::new());
     }
@@ -1131,7 +1149,11 @@ fn rows_to_batch(rows: Vec<Row>) -> ColumnBatch {
                 .iter()
                 .map(|row| row.get(col_i).cloned().unwrap_or(Value::Null))
                 .collect();
-            (col_i.to_string(), vals_to_coldata(vals))
+            let name = names
+                .and_then(|n| n.get(col_i))
+                .cloned()
+                .unwrap_or_else(|| col_i.to_string());
+            (name, vals_to_coldata(vals))
         })
         .collect();
     ColumnBatch::new(columns)
@@ -2590,7 +2612,8 @@ impl ColumnarStore {
         self.poll_all_merge_results();
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
-            if let Err(e) = wal.log_insert_rows(table, &rows) {
+            let names = column_names(&batch);
+            if let Err(e) = wal.log_insert_rows_named(table, &names, &rows) {
                 eprintln!("columnar WAL: failed to log insert_rows (dict) for {table}: {e}");
             }
         }
@@ -6306,6 +6329,73 @@ mod tests {
                 store.row_count("mt"),
                 50,
                 "MergeTree rows must survive checkpoint"
+            );
+        }
+    }
+
+    /// A columnar table's column NAMES have to survive a restart, not only its
+    /// rows.
+    ///
+    /// `ColumnarStore`'s tables carry real names — `COLUMNAR_INSERT('t',
+    /// 'metric', 99)` — and every aggregate looks its column up by name, while
+    /// the WAL recorded rows and nothing else. So a reopened database kept the
+    /// right `COLUMNAR_COUNT` and answered `COLUMNAR_SUM`/`AVG`/`MIN`/`MAX`
+    /// with 0, because the columns had been renamed "0", "1", …. Both replay
+    /// paths are checked here: the incremental INSERT entries, and the single
+    /// SNAPSHOT entry a checkpoint leaves behind.
+    #[test]
+    fn column_names_survive_reopen_and_checkpoint() {
+        fn names(store: &ColumnarStore, table: &str) -> Vec<String> {
+            store
+                .batches_all(table)
+                .first()
+                .map(|b| b.columns.iter().map(|(n, _)| n.clone()).collect())
+                .unwrap_or_default()
+        }
+        fn sum(store: &ColumnarStore, table: &str, col: &str) -> f64 {
+            store
+                .batches_all(table)
+                .iter()
+                .map(|b| aggregate_sum(b, col))
+                .sum()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+
+        {
+            let mut store = ColumnarStore::open(p).unwrap();
+            store.append(
+                "metrics",
+                ColumnBatch::new(vec![
+                    ("metric".into(), ColumnData::Int64(vec![Some(99)])),
+                    ("host".into(), ColumnData::Text(vec![Some("a".into())])),
+                ]),
+            );
+            assert_eq!(sum(&store, "metrics", "metric"), 99.0, "control: live");
+        }
+
+        // Replay path 1: the incremental INSERT entries.
+        {
+            let mut store = ColumnarStore::open(p).unwrap();
+            assert_eq!(names(&store, "metrics"), vec!["metric", "host"]);
+            assert_eq!(
+                sum(&store, "metrics", "metric"),
+                99.0,
+                "an aggregate by column name must still find its column after a reopen"
+            );
+            store.checkpoint().unwrap();
+        }
+
+        // Replay path 2: the SNAPSHOT entry the checkpoint left behind. This is
+        // a separate encoder, and it dropped the names independently.
+        {
+            let store = ColumnarStore::open(p).unwrap();
+            assert_eq!(names(&store, "metrics"), vec!["metric", "host"]);
+            assert_eq!(
+                sum(&store, "metrics", "metric"),
+                99.0,
+                "a checkpoint must not be the operation that loses the column names"
             );
         }
     }

@@ -18,9 +18,33 @@
 //! | 0x02 | DROP_TABLE   | (empty)                                        |
 //! | 0x03 | INSERT_ROWS  | n_rows(u32) + rows…                            |
 //! | 0x04 | SNAPSHOT     | n_tables(u32) + (name_len + name + n_rows + rows…)… |
+//! | 0x05 | INSERT_ROWS_NAMED | n_cols(u32) + col names + n_rows(u32) + rows… |
+//! | 0x06 | SNAPSHOT_NAMED | n_tables(u32) + (name + n_cols + col names + n_rows + rows…)… |
 //!
 //! A SNAPSHOT resets all table state. After `checkpoint()` the file is
 //! truncated to a single SNAPSHOT entry so the log stays small.
+//!
+//! ## Why the `_NAMED` variants exist
+//!
+//! 0x03 and 0x04 record a table's rows and nothing else. `ColumnarStore`'s
+//! tables have *named* columns (`COLUMNAR_INSERT('t','metric',99)`), so
+//! replaying them rebuilt every table with columns renamed `"0"`, `"1"`, … —
+//! the rows were all there and `COLUMNAR_COUNT` was right, while
+//! `COLUMNAR_SUM`/`AVG`/`MIN`/`MAX`, which look a column up by name, returned
+//! 0 on a database that had just been restarted or restored. Silently, and
+//! for every columnar table written through SQL.
+//!
+//! `ColumnarStorageEngine` is unaffected because it names its columns "0",
+//! "1", … positionally by convention, which is also why the older entries
+//! carry no names: they were written by that path first.
+//!
+//! Both writers now emit the `_NAMED` forms, with an empty name list meaning
+//! "positional" — so the engine's behaviour is unchanged and old logs still
+//! replay through the 0x03/0x04 arms. The names are repeated in every insert
+//! entry rather than being declared once, so a truncated log still interprets
+//! whatever entries survive; checkpointing is what keeps that from growing.
+//! An OLDER binary reading a newer log skips the unknown tags and loses the
+//! rows in them — downgrade requires a checkpoint on the old version first.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -38,6 +62,8 @@ const ENTRY_CREATE_TABLE: u8 = 0x01;
 const ENTRY_DROP_TABLE: u8 = 0x02;
 const ENTRY_INSERT_ROWS: u8 = 0x03;
 const ENTRY_SNAPSHOT: u8 = 0x04;
+const ENTRY_INSERT_ROWS_NAMED: u8 = 0x05;
+const ENTRY_SNAPSHOT_NAMED: u8 = 0x06;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -45,6 +71,10 @@ const ENTRY_SNAPSHOT: u8 = 0x04;
 pub struct WalState {
     /// `(table_name, rows)` pairs — order unspecified.
     pub tables: Vec<(String, Vec<Row>)>,
+    /// `(table_name, column_names)` for every table whose log recorded them.
+    /// Absent for a table written by a positional caller, or by any writer
+    /// predating the `_NAMED` entries.
+    pub columns: Vec<(String, Vec<String>)>,
 }
 
 /// Append-only columnar WAL.
@@ -74,7 +104,10 @@ impl ColumnarWal {
             let data = std::fs::read(&path)?;
             replay(&data)
         } else {
-            WalState { tables: Vec::new() }
+            WalState {
+                tables: Vec::new(),
+                columns: Vec::new(),
+            }
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
@@ -134,17 +167,33 @@ impl ColumnarWal {
         self.append(ENTRY_DROP_TABLE, table, &[])
     }
 
-    /// Log a batch of newly inserted rows.
+    /// Log a batch of newly inserted rows whose columns are positional.
     pub fn log_insert_rows(&self, table: &str, rows: &[Row]) -> io::Result<()> {
+        self.log_insert_rows_named(table, &[], rows)
+    }
+
+    /// Log a batch of newly inserted rows together with their column names.
+    ///
+    /// An empty `columns` means the caller names columns positionally, which
+    /// is `ColumnarStorageEngine`'s convention. Anything that puts real names
+    /// on a batch must pass them, or the names do not survive a restart —
+    /// see this module's header.
+    pub fn log_insert_rows_named(
+        &self,
+        table: &str,
+        columns: &[String],
+        rows: &[Row],
+    ) -> io::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
         let mut payload = Vec::new();
+        encode_names(columns, &mut payload);
         payload.extend_from_slice(&(rows.len() as u32).to_le_bytes());
         for row in rows {
             encode_row(row, &mut payload);
         }
-        self.append(ENTRY_INSERT_ROWS, table, &payload)
+        self.append(ENTRY_INSERT_ROWS_NAMED, table, &payload)
     }
 
     /// Write the complete current state of all tables as a single SNAPSHOT
@@ -153,13 +202,23 @@ impl ColumnarWal {
     /// `tables` is a slice of `(table_name, all_rows)` covering every table
     /// that the engine currently knows about.
     pub fn checkpoint(&self, tables: &[(&str, Vec<Row>)]) -> io::Result<()> {
+        let named: Vec<(&str, Vec<String>, &[Row])> = tables
+            .iter()
+            .map(|(name, rows)| (*name, Vec::new(), rows.as_slice()))
+            .collect();
+        self.checkpoint_named(&named)
+    }
+
+    /// `checkpoint`, preserving each table's column names.
+    pub fn checkpoint_named(&self, tables: &[(&str, Vec<String>, &[Row])]) -> io::Result<()> {
         // Build snapshot payload.
         let mut payload = Vec::new();
         payload.extend_from_slice(&(tables.len() as u32).to_le_bytes());
-        for (name, rows) in tables {
+        for (name, columns, rows) in tables {
             let nb = name.as_bytes();
             payload.extend_from_slice(&(nb.len() as u32).to_le_bytes());
             payload.extend_from_slice(nb);
+            encode_names(columns, &mut payload);
             payload.extend_from_slice(&(rows.len() as u32).to_le_bytes());
             for row in rows.iter() {
                 encode_row(row, &mut payload);
@@ -176,7 +235,7 @@ impl ColumnarWal {
         // fsync + rename) so a crash between the truncate and the snapshot rewrite
         // can't leave a truncated or empty file.
         let mut contents: Vec<u8> = Vec::new();
-        write_entry(&mut contents, ENTRY_SNAPSHOT, "", &payload)?;
+        write_entry(&mut contents, ENTRY_SNAPSHOT_NAMED, "", &payload)?;
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
 
         // Re-open in append mode for future writes, and count the snapshot
@@ -209,6 +268,15 @@ fn write_entry<W: Write>(w: &mut W, entry_type: u8, name: &str, payload: &[u8]) 
     w.write_all(nb)?;
     w.write_all(&(payload.len() as u32).to_le_bytes())?;
     w.write_all(payload)
+}
+
+fn encode_names(names: &[String], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for name in names {
+        let b = name.as_bytes();
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+    }
 }
 
 fn encode_row(row: &Row, buf: &mut Vec<u8>) {
@@ -291,6 +359,8 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
 /// *last* SNAPSHOT (and subsequent incremental entries) matter in practice.
 fn replay(data: &[u8]) -> WalState {
     let mut tables: std::collections::HashMap<String, Vec<Row>> = std::collections::HashMap::new();
+    let mut columns: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let mut pos = 0usize;
 
     while pos < data.len() {
@@ -336,9 +406,24 @@ fn replay(data: &[u8]) -> WalState {
                 let rows = decode_rows(payload);
                 tables.entry(name).or_default().extend(rows);
             }
+            ENTRY_INSERT_ROWS_NAMED => {
+                let mut pos = 0usize;
+                let names = decode_names(payload, &mut pos);
+                let rows = decode_rows_at(payload, &mut pos);
+                if !names.is_empty() {
+                    columns.insert(name.clone(), names);
+                }
+                tables.entry(name).or_default().extend(rows);
+            }
             ENTRY_SNAPSHOT => {
                 tables.clear();
-                decode_snapshot_into(payload, &mut tables);
+                columns.clear();
+                decode_snapshot_into(payload, &mut tables, &mut columns, false);
+            }
+            ENTRY_SNAPSHOT_NAMED => {
+                tables.clear();
+                columns.clear();
+                decode_snapshot_into(payload, &mut tables, &mut columns, true);
             }
             _ => {} // Unknown entry types are skipped.
         }
@@ -346,18 +431,47 @@ fn replay(data: &[u8]) -> WalState {
 
     WalState {
         tables: tables.into_iter().collect(),
+        columns: columns.into_iter().collect(),
     }
 }
 
 fn decode_rows(data: &[u8]) -> Vec<Row> {
     let mut pos = 0;
-    let n = match read_u32(data, &mut pos) {
+    decode_rows_at(data, &mut pos)
+}
+
+/// Column names, as written by `encode_names`.
+fn decode_names(data: &[u8], pos: &mut usize) -> Vec<String> {
+    let Some(n) = read_u32(data, pos) else {
+        return Vec::new();
+    };
+    let n = n as usize;
+    let mut names = Vec::with_capacity(super::wal_util::bounded_capacity(n));
+    for _ in 0..n {
+        let Some(len) = read_u32(data, pos) else {
+            break;
+        };
+        let len = len as usize;
+        if *pos + len > data.len() {
+            break;
+        }
+        match std::str::from_utf8(&data[*pos..*pos + len]) {
+            Ok(s) => names.push(s.to_string()),
+            Err(_) => break,
+        }
+        *pos += len;
+    }
+    names
+}
+
+fn decode_rows_at(data: &[u8], pos: &mut usize) -> Vec<Row> {
+    let n = match read_u32(data, pos) {
         Some(n) => n as usize,
         None => return vec![],
     };
     let mut rows = Vec::with_capacity(super::wal_util::bounded_capacity(n));
     for _ in 0..n {
-        match decode_row(data, &mut pos) {
+        match decode_row(data, pos) {
             Some(r) => rows.push(r),
             None => break,
         }
@@ -365,7 +479,12 @@ fn decode_rows(data: &[u8]) -> Vec<Row> {
     rows
 }
 
-fn decode_snapshot_into(data: &[u8], tables: &mut std::collections::HashMap<String, Vec<Row>>) {
+fn decode_snapshot_into(
+    data: &[u8],
+    tables: &mut std::collections::HashMap<String, Vec<Row>>,
+    columns: &mut std::collections::HashMap<String, Vec<String>>,
+    named: bool,
+) {
     let mut pos = 0;
     let n_tables = match read_u32(data, &mut pos) {
         Some(n) => n as usize,
@@ -385,12 +504,23 @@ fn decode_snapshot_into(data: &[u8], tables: &mut std::collections::HashMap<Stri
             Err(_) => return,
         };
         pos += name_len;
+        // column names, in the 0x06 form only
+        if named {
+            let names = decode_names(data, &mut pos);
+            if !names.is_empty() {
+                columns.insert(name.clone(), names);
+            }
+        }
         // rows
         let n_rows = match read_u32(data, &mut pos) {
             Some(n) => n as usize,
             None => return,
         };
-        let mut rows = Vec::with_capacity(n_rows);
+        // `n_rows` comes off disk: a corrupt length must not reserve it. An
+        // unbounded `with_capacity` here aborts the process on Linux rather
+        // than returning an error, and silently succeeds on an overcommitting
+        // macOS, so this is not visible from a local run.
+        let mut rows = Vec::with_capacity(super::wal_util::bounded_capacity(n_rows));
         for _ in 0..n_rows {
             match decode_row(data, &mut pos) {
                 Some(r) => rows.push(r),
