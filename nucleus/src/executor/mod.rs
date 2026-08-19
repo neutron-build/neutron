@@ -356,6 +356,11 @@ pub struct Executor {
     /// Data directory for durable per-table engine storage + the engines.json
     /// sidecar (None = memory mode, per-table engines stay in-memory only).
     data_dir: Option<std::path::PathBuf>,
+    /// Durable, bounded security audit log. `None` for an executor with no
+    /// data directory (embedded and test executors), which have no
+    /// authentication boundary to audit.
+    #[cfg(feature = "server")]
+    audit: Option<std::sync::Arc<crate::audit::AuditSink>>,
     /// Server-wide default for synchronous_commit (config `wal.synchronous_commit`).
     /// Sessions override via `SET synchronous_commit = on|off`.
     sync_commit_default: AtomicBool,
@@ -645,6 +650,8 @@ impl Executor {
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
             data_dir: None,
+            #[cfg(feature = "server")]
+            audit: None,
             sync_commit_default: AtomicBool::new(true),
             views: RwLock::new(HashMap::new()),
             sequences: parking_lot::RwLock::new(HashMap::new()),
@@ -818,6 +825,22 @@ impl Executor {
         let mut exec = Self::new(catalog, storage);
         exec.catalog_path = catalog_path;
         exec.data_dir = data_dir.map(|d| d.to_path_buf());
+
+        // Security audit log. Opened before the model stores so a failure to
+        // open it is reported at the top of startup rather than after a page
+        // of store initialisation.
+        #[cfg(feature = "server")]
+        if let Some(dir) = data_dir {
+            let audit_dir = dir.join("audit");
+            match crate::audit::AuditSink::open_from_env(&audit_dir) {
+                Ok(sink) => exec.audit = Some(std::sync::Arc::new(sink)),
+                Err(e) => tracing::error!(
+                    target: "nucleus::startup",
+                    "audit log at {} failed to open: {e}. Security events will NOT be recorded.",
+                    audit_dir.display()
+                ),
+            }
+        }
 
         // Open durable multi-model stores when a data directory is provided
         if let Some(dir) = data_dir {
@@ -2679,6 +2702,33 @@ impl Executor {
         }
     }
 
+    /// Record a security audit event, if this executor has an audit log.
+    ///
+    /// A failed audit write is logged and does not fail the operation. The
+    /// alternative — fail closed — takes the database down when the audit
+    /// volume fills, and this codebase already answered that question the
+    /// other way for disk exhaustion, which degrades to read-only rather than
+    /// exiting.
+    #[cfg(feature = "server")]
+    pub fn audit(
+        &self,
+        kind: crate::audit::AuditKind,
+        principal: &str,
+        detail: &str,
+        source: Option<&str>,
+    ) {
+        let Some(sink) = self.audit.as_ref() else {
+            return;
+        };
+        if let Err(e) = sink.record(kind, principal, detail, source) {
+            tracing::error!(
+                target: "nucleus::audit",
+                "failed to record {} for {principal}: {e}",
+                kind.as_str()
+            );
+        }
+    }
+
     /// Return stored SCRAM material only for a login-capable catalog role
     /// whose password has not expired.
     #[cfg(feature = "server")]
@@ -2709,11 +2759,23 @@ impl Executor {
             }
         };
         if !allowed {
+            self.audit(
+                crate::audit::AuditKind::LoginRefused,
+                user,
+                "role is NOLOGIN or does not exist",
+                None,
+            );
             return Err(ExecError::PermissionDenied(format!(
                 "role '{user}' is not permitted to log in"
             )));
         }
         if expired {
+            self.audit(
+                crate::audit::AuditKind::LoginRefused,
+                user,
+                "password expired (VALID UNTIL)",
+                None,
+            );
             return Err(ExecError::PermissionDenied(format!(
                 "password for role '{user}' has expired"
             )));
@@ -2724,6 +2786,12 @@ impl Executor {
         *session.authenticated_user.write() = Some(user.to_string());
         *session.current_role.write() = None;
         self.recompute_session_context(&session);
+        self.audit(
+            crate::audit::AuditKind::LoginSucceeded,
+            user,
+            "session bound",
+            None,
+        );
         Ok(())
     }
 

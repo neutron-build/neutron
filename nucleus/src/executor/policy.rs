@@ -91,6 +91,9 @@ impl Executor {
             ));
         }
         let name = policy.name.value;
+        // Captured before the closure consumes them.
+        #[cfg(feature = "server")]
+        let (audited_name, audited_table) = (name.clone(), table.clone());
         self.with_mutable_security(|security| {
             if security.rls.policy(&table, &name).is_some() {
                 return Err(ExecError::Unsupported(format!(
@@ -109,6 +112,16 @@ impl Executor {
             Ok(())
         })??;
         self.bump_policy_gen();
+        #[cfg(feature = "server")]
+        self.audit(
+            crate::audit::AuditKind::PolicyChanged,
+            &audited_name,
+            &format!(
+                "by {}; CREATE POLICY on {audited_table}",
+                self.acting_principal()
+            ),
+            None,
+        );
         Ok(ExecResult::Command {
             tag: "CREATE POLICY".into(),
             rows_affected: 0,
@@ -132,6 +145,13 @@ impl Executor {
         }
         if removed {
             self.bump_policy_gen();
+            #[cfg(feature = "server")]
+            self.audit(
+                crate::audit::AuditKind::PolicyChanged,
+                &policy.name.value,
+                &format!("by {}; DROP POLICY on {table}", self.acting_principal()),
+                None,
+            );
         }
         Ok(ExecResult::Command {
             tag: "DROP POLICY".into(),

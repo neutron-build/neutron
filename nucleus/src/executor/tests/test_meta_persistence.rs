@@ -19,7 +19,7 @@ use crate::types::Value;
 /// Create (or reopen) a persistence-enabled executor from `dir`.
 /// Uses DiskEngine so table data survives the simulated restart.
 /// Mimics the startup sequence in `main.rs`.
-async fn open_executor(dir: &Path) -> Executor {
+pub(super) async fn open_executor(dir: &Path) -> Executor {
     let catalog_path = dir.join("catalog.json");
     let db_path = dir.join("nucleus.db");
     let catalog = Arc::new(Catalog::new());

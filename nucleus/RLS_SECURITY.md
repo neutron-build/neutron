@@ -199,6 +199,47 @@ still be granted to. Only its ability to authenticate lapses. There is no
 password history, no complexity policy, and no forced-rotation interval;
 enforcing those belongs to whatever provisions the roles.
 
+## Security audit log
+
+Durable, bounded, append-only, at `<data-dir>/audit/audit.log` as JSON Lines.
+It records logins and every change to authority: `login_succeeded`,
+`login_failed` (a credential was presented and rejected — carries the source
+address), `login_refused` (NOLOGIN, expired password, or a locked-out source),
+`role_created`, `role_altered`, `privilege_granted`, `privilege_revoked`,
+`policy_changed`.
+
+- **Durable**: every event is fsynced before `record` returns. Security events
+  are rare — logins and DDL, not statements — and the alternative fails in the
+  one case the log exists for: a machine that loses power during an intrusion
+  must not lose the record of it. The sink holds no buffered state, so a
+  `SIGKILL` and a dropped handle are the same thing.
+- **Bounded**: the active file is capped (`NUCLEUS_AUDIT_MAX_BYTES`, default
+  16 MiB) and rotated, with `NUCLEUS_AUDIT_KEEP` (default 4) retained files.
+  Total size is at most `max * (keep + 1)`, whatever the event rate. Rotation
+  discards the OLDEST events — a log that dropped the events happening now
+  because older ones filled the file would be the wrong failure.
+- **Bounded across a crash**, which is where a naive rotation fails: a process
+  killed between the rename and the prune leaves one file too many, and one
+  killed before the new file is created leaves none. `open` re-derives its
+  state from the directory — prunes on the way in, measures the real length —
+  so a restart converges to the bound wherever it was interrupted. Both
+  interrupted states are manufactured on disk and asserted in `audit::tests`.
+- **No credential material.** The log records that a password changed, never
+  what it changed to, and never the statement text — `CREATE ROLE ... PASSWORD
+  'x'` carries the credential in the clear. A test asserts no password literal
+  and no stored verifier ever appears, with a control proving the events are
+  there.
+- **Field injection is closed**: principals and details are JSON-escaped, so a
+  role named `eve","kind":"login_succeeded` cannot forge a record or a field.
+
+A failed audit write is logged and does not fail the operation. Failing closed
+would take the database down when the audit volume fills, and this codebase
+already answered that question the other way for disk exhaustion, which
+degrades to read-only rather than exiting.
+
+`security::AuditLog` — an in-memory `Vec` with no callers, nothing bounding it
+and nothing persisting it — is what this replaces.
+
 ## Cluster trust boundary
 
 Node-to-node traffic — the Raft transport and replication, which share one

@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 306400; Source Rust files: 271; Top-level modules: 51.
-- Declared unit tests: 4333; Declared integration tests: 383; Ignored tests: 46.
+- Source LOC: 307283; Source Rust files: 273; Top-level modules: 52.
+- Declared unit tests: 4344; Declared integration tests: 383; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -507,7 +507,25 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       cluster-wide name, so the configuration does not express a per-node certificate subject
       to bind a claimed `node_id` to. That convention is a decision, and it is filed.
 - [ ] Propagate authenticated principals through supported follower forwarding without impersonation.
-- [ ] Emit durable, bounded security audit events for login and authority changes.
+- [x] Emit durable, bounded security audit events for login and authority changes.
+      **Closed 2026-08-19 (S59/N18).** There was an `AuditLog` in `security::` with no callers
+      anywhere in the crate -- an in-memory `Vec` that nothing wrote to, nothing bounded and
+      nothing persisted -- so "who logged in, who failed, who changed authority" had no answer
+      at all. `src/audit/` replaces it: JSON Lines at `<data-dir>/audit/audit.log`, fsynced
+      before `record` returns, capped at `NUCLEUS_AUDIT_MAX_BYTES` (16 MiB) with
+      `NUCLEUS_AUDIT_KEEP` (4) retained files, so total size is at most `max * (keep + 1)`
+      whatever the event rate.
+      Boundedness survives a crash, which is the part a naive rotation gets wrong: a process
+      killed between the rename and the prune leaves one file too many, one killed before the
+      new file is created leaves none. `open` re-derives its state from the directory rather
+      than trusting it, and both interrupted states are manufactured on disk and asserted.
+      Recorded: `login_succeeded`, `login_failed` (with source address), `login_refused`
+      (NOLOGIN / expired / locked out, distinguishable), `role_created`, `role_altered`,
+      `privilege_granted`, `privilege_revoked`, `policy_changed`. Never recorded: password
+      literals, stored verifiers, or statement text -- asserted, with a control proving the
+      events themselves are present. Principals are JSON-escaped, so a role named
+      `eve","kind":"login_succeeded` cannot forge a record.
+      11 tests. Making the executor's `audit()` a no-op fails all four end-to-end ones.
 
 ### RLS and masking
 

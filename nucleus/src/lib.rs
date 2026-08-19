@@ -1,6 +1,7 @@
 // ── Data-model and core modules (available on all targets, including WASM) ──
 pub mod advisor;
 pub mod allocator;
+pub mod audit;
 pub mod backup;
 pub mod bench_hooks;
 pub mod bench_paired;

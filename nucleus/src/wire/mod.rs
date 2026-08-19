@@ -1516,6 +1516,16 @@ impl StartupHandler for NucleusHandler {
                     // ── Rate-limit check: reject if too many recent failures ──
                     let source_ip = client.socket_addr().ip();
                     if self.login_rate_limiter.is_locked_out(source_ip) {
+                        let user = LoginInfo::from_client_info(client)
+                            .user()
+                            .map(|u| u.to_owned())
+                            .unwrap_or_default();
+                        self.executor.audit(
+                            crate::audit::AuditKind::LoginRefused,
+                            &user,
+                            "source locked out after repeated failures",
+                            Some(&source_ip.to_string()),
+                        );
                         self.cleanup_session(&client.socket_addr().to_string());
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "FATAL".to_owned(),
@@ -1556,6 +1566,20 @@ impl StartupHandler for NucleusHandler {
                     };
 
                     if let Err(e) = result {
+                        let user = LoginInfo::from_client_info(client)
+                            .user()
+                            .map(|u| u.to_owned())
+                            .unwrap_or_default();
+                        // Recorded here rather than only in the executor: this
+                        // is the arm where a credential was PRESENTED and
+                        // rejected, and it is the only place the source
+                        // address is known.
+                        self.executor.audit(
+                            crate::audit::AuditKind::LoginFailed,
+                            &user,
+                            "credential rejected",
+                            Some(&source_ip.to_string()),
+                        );
                         self.login_rate_limiter.record_failure(source_ip);
                         self.cleanup_session(&client.socket_addr().to_string());
                         return Err(e);

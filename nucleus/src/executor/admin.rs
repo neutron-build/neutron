@@ -17,6 +17,13 @@ use super::schema_types::{CursorDef, RoleDef};
 use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
+    /// The principal an audit event should be attributed to: the effective
+    /// role of the session running the statement.
+    #[cfg(feature = "server")]
+    pub(super) fn acting_principal(&self) -> String {
+        self.current_session().session_context.read().user.clone()
+    }
+
     pub(super) fn require_security_admin(&self, action: &str) -> Result<(), ExecError> {
         let session = self.current_session();
         let effective = session.session_context.read().user.clone();
@@ -729,6 +736,20 @@ impl Executor {
                     }
                 }
             }
+            drop(roles);
+            #[cfg(feature = "server")]
+            for grantee in &grantees {
+                self.audit(
+                    crate::audit::AuditKind::PrivilegeGranted,
+                    &grantee_name(grantee),
+                    &format!(
+                        "by {}; membership of [{}]",
+                        self.acting_principal(),
+                        granted_roles.join(",")
+                    ),
+                    None,
+                );
+            }
             return Ok(ExecResult::Command {
                 tag: "GRANT ROLE".into(),
                 rows_affected: 0,
@@ -761,6 +782,26 @@ impl Executor {
                     }
                 }
             }
+        }
+
+        drop(roles);
+        #[cfg(feature = "server")]
+        for grantee in &grantees {
+            self.audit(
+                crate::audit::AuditKind::PrivilegeGranted,
+                &grantee_name(grantee),
+                &format!(
+                    "by {}; [{}] on [{}]",
+                    self.acting_principal(),
+                    privs
+                        .iter()
+                        .map(|p| format!("{p:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    object_names.join(",")
+                ),
+                None,
+            );
         }
 
         Ok(ExecResult::Command {
@@ -796,6 +837,20 @@ impl Executor {
                     role.member_of.retain(|parent| !revoked.contains(parent));
                 }
             }
+            drop(roles);
+            #[cfg(feature = "server")]
+            for grantee in &grantees {
+                self.audit(
+                    crate::audit::AuditKind::PrivilegeRevoked,
+                    &grantee_name(grantee),
+                    &format!(
+                        "by {}; membership of [{}]",
+                        self.acting_principal(),
+                        revoked.join(",")
+                    ),
+                    None,
+                );
+            }
             return Ok(ExecResult::Command {
                 tag: "REVOKE ROLE".into(),
                 rows_affected: 0,
@@ -817,6 +872,26 @@ impl Executor {
                     }
                 }
             }
+        }
+
+        drop(roles);
+        #[cfg(feature = "server")]
+        for grantee in &grantees {
+            self.audit(
+                crate::audit::AuditKind::PrivilegeRevoked,
+                &grantee_name(grantee),
+                &format!(
+                    "by {}; [{}] on [{}]",
+                    self.acting_principal(),
+                    privs
+                        .iter()
+                        .map(|p| format!("{p:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    object_names.join(",")
+                ),
+                None,
+            );
         }
 
         Ok(ExecResult::Command {
@@ -864,6 +939,20 @@ impl Executor {
                     ast::Password::NullPassword => {}
                 }
             }
+            #[cfg(feature = "server")]
+            self.audit(
+                crate::audit::AuditKind::RoleCreated,
+                &role_name,
+                &format!(
+                    "by {}; login={} superuser={} password={} valid_until={}",
+                    self.acting_principal(),
+                    role.can_login,
+                    role.is_superuser,
+                    role.password_hash.is_some(),
+                    valid_until.is_some(),
+                ),
+                None,
+            );
             roles.insert(role_name, role);
         }
         Ok(ExecResult::Command {
@@ -883,23 +972,40 @@ impl Executor {
             .get_mut(role_name)
             .ok_or_else(|| ExecError::Unsupported(format!("role '{role_name}' does not exist")))?;
 
+        // What changed, for the audit record. Names of the options only —
+        // never a password, not even its length.
+        #[cfg_attr(not(feature = "server"), allow(unused_mut, unused_variables))]
+        let mut changed: Vec<&'static str> = Vec::new();
+
         match operation {
             ast::AlterRoleOperation::WithOptions { options } => {
                 for opt in &options {
                     match opt {
-                        ast::RoleOption::SuperUser(v) => role.is_superuser = *v,
-                        ast::RoleOption::BypassRLS(v) => role.bypass_rls = *v,
-                        ast::RoleOption::Login(v) => role.can_login = *v,
+                        ast::RoleOption::SuperUser(v) => {
+                            role.is_superuser = *v;
+                            changed.push("superuser");
+                        }
+                        ast::RoleOption::BypassRLS(v) => {
+                            role.bypass_rls = *v;
+                            changed.push("bypassrls");
+                        }
+                        ast::RoleOption::Login(v) => {
+                            role.can_login = *v;
+                            changed.push("login");
+                        }
                         ast::RoleOption::ValidUntil(expr) => {
                             role.valid_until = parse_valid_until(expr)?;
+                            changed.push("valid_until");
                         }
                         ast::RoleOption::Password(pwd) => match pwd {
                             ast::Password::Password(expr) => {
                                 let raw = expr.to_string().trim_matches('\'').to_string();
                                 role.password_hash = Some(super::store_password_literal(&raw));
+                                changed.push("password");
                             }
                             ast::Password::NullPassword => {
                                 role.password_hash = None;
+                                changed.push("password_cleared");
                             }
                         },
                         _ => {} // Ignore unsupported role options
@@ -913,9 +1019,25 @@ impl Executor {
                 let mut role_data = roles.remove(role_name).unwrap();
                 role_data.name = new_name.clone();
                 roles.insert(new_name, role_data);
+                changed.push("renamed");
             }
             _ => {} // Ignore unsupported alter operations
         }
+
+        // Released before the audit write so a slow fsync cannot hold the role
+        // catalog's write lock.
+        drop(roles);
+        #[cfg(feature = "server")]
+        self.audit(
+            crate::audit::AuditKind::RoleAltered,
+            role_name,
+            &format!(
+                "by {}; changed=[{}]",
+                self.acting_principal(),
+                changed.join(",")
+            ),
+            None,
+        );
 
         Ok(ExecResult::Command {
             tag: "ALTER ROLE".into(),

@@ -34,6 +34,7 @@ pub(super) fn scalar(result: &ExecResult) -> &Value {
 
 mod test_2pl_census; // R6: serializable anomaly census for the DISK engine (strict 2PL)
 mod test_admin;
+mod test_audit_events; // N18: durable security audit events
 mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_collections;
 mod test_copy; // COPY FROM STDIN payload reconstruction
