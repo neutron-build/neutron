@@ -306,6 +306,31 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Delete archived WAL segments that lie entirely below an LSN.
+    ///
+    /// Continuous archiving never removed anything, so an archive grows until
+    /// the disk does not. This is the retention half, and it is deliberately
+    /// manual: there is no policy and no timer, because deleting recovery data
+    /// on a schedule -- with no knowledge of which base snapshots still exist
+    /// -- trades a disk-space problem for an unrecoverable one. Pick the
+    /// horizon from the `consistent_lsn` of the oldest base snapshot you still
+    /// intend to restore from, and run `--dry-run` first.
+    PruneArchive {
+        /// WAL archive directory (the per-database subdirectory of
+        /// `NUCLEUS_WAL_ARCHIVE_DIR`).
+        #[arg(short, long)]
+        archive: PathBuf,
+
+        /// Keep every segment that can serve a restore to this LSN or later.
+        /// A segment is removed only when ALL of its records are below it.
+        #[arg(long)]
+        keep_from_lsn: u64,
+
+        /// Report what would be deleted and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -460,6 +485,13 @@ async fn main() {
             force,
         }) => {
             cmd_restore_pitr(base, archive, data, db_file, lsn, time, force);
+        }
+        Some(Commands::PruneArchive {
+            archive,
+            keep_from_lsn,
+            dry_run,
+        }) => {
+            cmd_prune_archive(archive, keep_from_lsn, dry_run);
         }
         None => {
             // Default: start in server mode (same as `nucleus start`)
@@ -2787,6 +2819,77 @@ fn cmd_restore_pitr(
         }
         Err(e) => {
             eprintln!("PITR restore failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_prune_archive(archive: PathBuf, keep_from_lsn: u64, dry_run: bool) {
+    if dry_run {
+        // Read-only: report the same decision the real run would make, without
+        // touching anything. Worth having as the default habit -- every other
+        // destructive path here refuses a dirty target or stages through a temp
+        // file, and this one deletes recovery data outright.
+        match nucleus::storage::wal::plan_prune_archive(&archive, keep_from_lsn) {
+            Ok(plan) => {
+                println!(
+                    "Dry run: {} segment(s) would be removed, {} kept (horizon LSN {keep_from_lsn})",
+                    plan.removed.len(),
+                    plan.kept
+                );
+                if !plan.removed.is_empty() {
+                    println!("  Would remove: {:?}", plan.removed);
+                }
+                if !plan.skipped_unreadable.is_empty() {
+                    println!(
+                        "  Kept because their LSN range could not be read: {:?}",
+                        plan.skipped_unreadable
+                    );
+                }
+                match plan.oldest_retained_lsn {
+                    Some(lsn) => println!(
+                        "  After this the archive could serve a restore back to LSN {lsn}, no further."
+                    ),
+                    None => println!(
+                        "  WARNING: this would empty the archive. Nothing could be replayed \
+                         onto a base snapshot afterwards."
+                    ),
+                }
+            }
+            Err(e) => {
+                eprintln!("Prune archive failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    match nucleus::storage::wal::prune_archive(&archive, keep_from_lsn) {
+        Ok(report) => {
+            println!(
+                "Pruned {}: removed {} segment(s), freed {} bytes, kept {}",
+                archive.display(),
+                report.removed.len(),
+                report.bytes_freed,
+                report.kept
+            );
+            if !report.skipped_unreadable.is_empty() {
+                println!(
+                    "  Kept because their LSN range could not be read: {:?}",
+                    report.skipped_unreadable
+                );
+            }
+            match report.oldest_retained_lsn {
+                Some(lsn) => {
+                    println!("  The archive can now serve a restore back to LSN {lsn}, no further.")
+                }
+                None => println!(
+                    "  WARNING: the archive is now empty. Nothing can be replayed onto a base \
+                     snapshot."
+                ),
+            }
+        }
+        Err(e) => {
+            eprintln!("Prune archive failed: {e}");
             std::process::exit(1);
         }
     }

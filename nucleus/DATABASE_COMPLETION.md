@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 304711; Source Rust files: 270; Top-level modules: 51.
-- Declared unit tests: 4312; Declared integration tests: 377; Ignored tests: 46.
+- Source LOC: 305069; Source Rust files: 270; Top-level modules: 51.
+- Declared unit tests: 4314; Declared integration tests: 377; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -317,7 +317,23 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       fields `online` / `consistent_lsn` / `taken_while_in_use`. Restore compatibility now keys on
       the on-disk format version rather than the release string, so patch releases interoperate;
       manifests predating the field fall back to the old exact-version lock.
-- [ ] Add WAL archiving with monotonic positions and retention management.
+- [x] Add WAL archiving with monotonic positions and retention management.
+      Archiving with monotonic positions was already here: `archive_segment` copies each sealed
+      segment through a temp file + rename and appends `<seg> <min_lsn> <max_lsn> <unix>` to
+      `archive.index`. **Retention was the missing half and nothing ever deleted an archived
+      segment**, so continuous archiving grew the archive until the disk ran out.
+      `wal::prune_archive` closes it (2026-08-18), with `nucleus prune-archive --dry-run`.
+      Deliberately manual, no policy and no timer: deleting recovery data on a schedule, with no
+      knowledge of which base snapshots still exist, trades a disk-space problem for an
+      unrecoverable one. A segment goes only when ALL of its records are below the horizon;
+      bounds are read from the segment files rather than the index, which is documented as an
+      advisory optimization and must not become the authority on what is recoverable; a segment
+      whose bounds cannot be read is kept and reported. The dry run IS the real run minus the
+      deletions, so the preview cannot drift from what it previews.
+      `prune_archive_keeps_the_segment_containing_the_horizon` is the gate, and its first
+      version did not discriminate -- one LSN per segment meant the horizon could never fall
+      inside one, and it passed against a deliberately wrong `min_lsn` comparison. The fixture
+      now writes several records per segment and the wrong version fails it.
 - [ ] Add restore-to-latest and restore-to-time/position workflows.
       LIKELY DONE, needs an end-to-end gate: `pitr::PitrTarget` implements Lsn / Time / Latest and
       `restore_pitr` rebuilds the WAL dir truncated at the target. Left unchecked until a restore

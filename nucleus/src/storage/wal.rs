@@ -1737,6 +1737,136 @@ pub(crate) fn list_archive_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
     list_segments(dir)
 }
 
+/// What an archive prune removed and, more importantly, what it kept.
+#[derive(Debug, Clone, Default)]
+pub struct ArchivePruneReport {
+    /// Segment numbers deleted, ascending.
+    pub removed: Vec<u64>,
+    /// Segments still present afterwards.
+    pub kept: usize,
+    /// Lowest LSN still recoverable from the archive, if anything is left.
+    pub oldest_retained_lsn: Option<u64>,
+    /// Bytes reclaimed.
+    pub bytes_freed: u64,
+    /// Segments left alone because their LSN range could not be read. Never
+    /// deleted: a segment we cannot prove is below the horizon might be the one
+    /// a restore needs.
+    pub skipped_unreadable: Vec<u64>,
+}
+
+/// Delete archived WAL segments that lie entirely below `keep_from_lsn`.
+///
+/// Continuous archiving had no retention story at all: `archive_segment` copies
+/// every sealed segment in and nothing ever took one out, so an archive on a
+/// busy database grows until the disk does not. This is the missing half. It is
+/// deliberately **not** automatic and there is no default policy -- deleting
+/// recovery data on a timer, with no knowledge of which base backups still
+/// exist, trades a disk-space problem for an unrecoverable one.
+///
+/// Safety rules, in order of how badly each would hurt if wrong:
+///
+/// 1. A segment is removed only when its **max** LSN is strictly below
+///    `keep_from_lsn`. The segment *containing* the horizon is kept, because a
+///    restore to that LSN has to replay it.
+/// 2. Bounds come from the segment file itself, not the index. The index is
+///    documented as an optimization that a restore can do without; letting it
+///    decide deletions would promote an advisory file into the authority on
+///    what is recoverable.
+/// 3. A segment whose bounds cannot be read is kept and reported, never
+///    removed. Unreadable is not the same as unneeded.
+///
+/// The index is rewritten to match, so a later time-based restore does not
+/// resolve a target onto a segment that is gone.
+pub fn prune_archive(
+    archive_dir: &Path,
+    keep_from_lsn: u64,
+) -> std::io::Result<ArchivePruneReport> {
+    let report = plan_prune_archive(archive_dir, keep_from_lsn)?;
+    for seg in &report.removed {
+        std::fs::remove_file(segment_path(archive_dir, *seg))?;
+    }
+    if !report.removed.is_empty() {
+        rewrite_archive_index(archive_dir, &report.removed)?;
+    }
+    Ok(report)
+}
+
+/// Decide what [`prune_archive`] would remove, without removing it.
+///
+/// The real prune is this function plus the deletions, so a dry run cannot
+/// disagree with the run it is previewing. Computing the preview separately
+/// would make it a second implementation of the rule that decides whether
+/// recovery data is expendable, and the two would drift.
+pub fn plan_prune_archive(
+    archive_dir: &Path,
+    keep_from_lsn: u64,
+) -> std::io::Result<ArchivePruneReport> {
+    if !archive_dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("archive directory {} does not exist", archive_dir.display()),
+        ));
+    }
+    let mut report = ArchivePruneReport::default();
+    let mut retained_min: Option<u64> = None;
+
+    for seg in list_archive_segments(archive_dir)? {
+        let path = segment_path(archive_dir, seg);
+        match segment_lsn_bounds(&path) {
+            Some((min_lsn, max_lsn)) => {
+                if max_lsn < keep_from_lsn {
+                    report.bytes_freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    report.removed.push(seg);
+                } else {
+                    report.kept += 1;
+                    retained_min = Some(retained_min.map_or(min_lsn, |m: u64| m.min(min_lsn)));
+                }
+            }
+            None => {
+                report.kept += 1;
+                report.skipped_unreadable.push(seg);
+            }
+        }
+    }
+    report.removed.sort_unstable();
+    report.oldest_retained_lsn = retained_min;
+    Ok(report)
+}
+
+/// Drop `removed` segments from the archive index, atomically.
+///
+/// Written to a temp file and renamed, so a crash mid-rewrite leaves the old
+/// index rather than a half one -- the same discipline `atomic_replace_wal`
+/// applies to the logs themselves.
+fn rewrite_archive_index(archive_dir: &Path, removed: &[u64]) -> std::io::Result<()> {
+    let idx_path = archive_dir.join(ARCHIVE_INDEX_NAME);
+    let Ok(contents) = std::fs::read_to_string(&idx_path) else {
+        return Ok(()); // no index is a supported state
+    };
+    let gone: std::collections::HashSet<u64> = removed.iter().copied().collect();
+    let mut kept = String::new();
+    for line in contents.lines() {
+        let seg = line
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok());
+        match seg {
+            Some(n) if gone.contains(&n) => {}
+            // An unparseable line is kept rather than dropped: this rewrite
+            // exists to remove entries for files that are gone, not to tidy.
+            _ => {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+    }
+    let tmp = idx_path.with_extension("index.tmp");
+    std::fs::write(&tmp, kept.as_bytes())?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &idx_path)?;
+    Ok(())
+}
+
 /// Copy the byte-exact prefix of `src` holding every record with `lsn <=
 /// target_lsn` into `dst`, stopping at the first record beyond the target.
 ///
@@ -2981,6 +3111,131 @@ mod group_commit_tests {
 #[cfg(test)]
 mod archive_tests {
     use super::*;
+
+    /// Build an archive of several sealed segments and return their LSN bounds.
+    fn archived_segments(dir: &Path) -> (std::path::PathBuf, Vec<(u64, u64, u64)>) {
+        let wal_dir = dir.join("t.wal.d");
+        let archive = dir.join("archive");
+        // Segments must hold SEVERAL records, not one. With one LSN per segment
+        // a horizon can never fall strictly inside a segment, and the assertion
+        // this fixture exists to support -- that the segment CONTAINING the
+        // horizon survives -- passes against a deliberately wrong
+        // implementation. It did, on the first version of this test.
+        let wal =
+            SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::None, &archive).unwrap();
+        let page = [3u8; PAGE_SIZE];
+        for txn in 1..=18u64 {
+            wal.log_page_write(txn, txn as u32, &page).unwrap();
+            wal.log_commit(txn).unwrap();
+        }
+        wal.sync().unwrap();
+        wal.archive_active().unwrap();
+        let mut out = Vec::new();
+        for seg in list_archive_segments(&archive).unwrap() {
+            if let Some((lo, hi)) = segment_lsn_bounds(&segment_path(&archive, seg)) {
+                out.push((seg, lo, hi));
+            }
+        }
+        // Ascending by segment number. `list_archive_segments` does not promise
+        // an order, and assuming one made the first version of this test assert
+        // against the wrong segment.
+        out.sort_by_key(|(seg, _, _)| *seg);
+        (archive, out)
+    }
+
+    /// Pruning must never remove a segment a restore to the horizon needs.
+    ///
+    /// Continuous archiving copied every sealed segment in and nothing ever
+    /// took one out, so the archive grew without bound. That is the gap this
+    /// closes -- but the dangerous direction is the fix, not the bug: deleting
+    /// one segment too many turns a disk-space problem into an unrecoverable
+    /// one, silently, and only during an actual recovery.
+    ///
+    /// The load-bearing assertion is the *second* one. Removing everything
+    /// below the horizon is easy; keeping the segment that CONTAINS the horizon
+    /// is the part that a naive `max_lsn <= keep_from` would get wrong.
+    #[test]
+    fn prune_archive_keeps_the_segment_containing_the_horizon() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, segs) = archived_segments(dir.path());
+        assert!(
+            segs.len() >= 3,
+            "need several archived segments to prune between, got {segs:?}"
+        );
+
+        // Aim at an LSN in the middle of the second segment.
+        let (target_seg, lo, hi) = segs[1];
+        let horizon = lo + (hi - lo) / 2;
+
+        let report = prune_archive(&archive, horizon).unwrap();
+
+        assert!(
+            report.removed.contains(&segs[0].0),
+            "a segment entirely below the horizon must go: {report:?}"
+        );
+        assert!(
+            !report.removed.contains(&target_seg),
+            "the segment CONTAINING the horizon must be kept -- a restore to \
+             LSN {horizon} has to replay it: {report:?}"
+        );
+        for (seg, seg_lo, _) in &segs[2..] {
+            assert!(
+                !report.removed.contains(seg),
+                "segment {seg} starts at {seg_lo}, above the horizon, and must be kept"
+            );
+        }
+
+        // The files on disk agree with the report.
+        let left: std::collections::HashSet<u64> = list_archive_segments(&archive)
+            .unwrap()
+            .into_iter()
+            .collect();
+        for seg in &report.removed {
+            assert!(
+                !left.contains(seg),
+                "segment {seg} reported removed but still present"
+            );
+        }
+        assert_eq!(
+            left.len(),
+            report.kept,
+            "kept count disagrees with the directory"
+        );
+
+        // The index no longer refers to files that are gone, or a later
+        // time-based restore resolves onto a segment that does not exist.
+        let idx = std::fs::read_to_string(archive.join(ARCHIVE_INDEX_NAME)).unwrap_or_default();
+        for seg in &report.removed {
+            for line in idx.lines() {
+                let first = line
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok());
+                assert_ne!(first, Some(*seg), "index still lists removed segment {seg}");
+            }
+        }
+    }
+
+    /// A horizon below everything must delete nothing. The negative control:
+    /// without it, a prune that removed everything unconditionally would still
+    /// pass the test above.
+    #[test]
+    fn prune_archive_with_a_horizon_below_everything_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, segs) = archived_segments(dir.path());
+        let before = list_archive_segments(&archive).unwrap();
+
+        let report = prune_archive(&archive, 0).unwrap();
+
+        assert!(
+            report.removed.is_empty(),
+            "nothing is below LSN 0: {report:?}"
+        );
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(list_archive_segments(&archive).unwrap(), before);
+        let true_min = segs.iter().map(|(_, lo, _)| *lo).min().unwrap();
+        assert_eq!(report.oldest_retained_lsn, Some(true_min));
+    }
 
     // A segment that has not filled is not in the archive, so everything
     // committed into it is unreachable by PITR. That is the whole gap: at the
