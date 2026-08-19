@@ -5,6 +5,14 @@
  * transforms className into style props at build time.
  */
 
+// `export {}` makes this file a MODULE. Without it TypeScript treats it as a
+// script, so the `let` below is declared in the GLOBAL scope -- and the built
+// `dist/__tests__/babel-plugin.test.d.ts` declares the same name globally,
+// which failed the whole suite with TS2451 "Cannot redeclare block-scoped
+// variable". Deleting dist is not the fix: other packages import from it at
+// test time, and removing it takes 10 suites and 68 tests down with it.
+export {}
+
 // We need babel available for these tests
 let transformSync: typeof import('@babel/core').transformSync
 
