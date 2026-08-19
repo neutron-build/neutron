@@ -13,6 +13,27 @@
 //! That gap is worth closing now specifically: NU-006 (2026-08-18) changed when
 //! six of these models reach disk at all.
 //!
+//! ## Coverage: 12 of the 14 models, and why the other two are absent
+//!
+//! Covered: SQL, KV, document, FTS, vector, timeseries, graph, blob, streams,
+//! columnar, datalog, CDC.
+//!
+//! **Geo has no durable state to compare.** Its whole SQL surface —
+//! `GEO_DISTANCE`, `GEO_WITHIN`, `GEO_AREA` — is pure functions over literal
+//! arguments. `geo/wal.rs` exists and the executor opens and group-syncs it,
+//! but `log_insert`/`log_delete` have no callers outside that file's own unit
+//! tests, and nothing on the executor holds the `RTree` that
+//! `rebuild_rtree` would populate. There is no geo state a backup could lose.
+//!
+//! **PubSub is not durable by design.** `PUBSUB_PUBLISH` delivers to live
+//! subscribers; subscriptions are per-connection. Its durable sibling is
+//! Streams, which is covered above.
+//!
+//! One arm is weaker than it looks: FTS persists in two places — the WAL under
+//! `fts/` and a sidecar next to the catalog — so its read here is satisfied by
+//! either (NU-014). The other eleven were each shown to fail this comparison
+//! when their store was removed from the restored directory.
+//!
 //! Deliberately physical backup + restore, not PITR. PITR replays only the SQL
 //! substrate's page WAL and leaves the specialty logs at the base snapshot
 //! (NU-030) — a real limitation, reported by `restore-pitr`, and not what this
@@ -78,6 +99,27 @@ async fn scalar(ex: &Executor, sql: &str) -> String {
     }
 }
 
+/// Evidence that a read actually returned the model's data.
+///
+/// Emptiness alone is not enough. A count function returns the text `0` and a
+/// JSON read returns `[]` when the model came back empty, and both are
+/// non-empty strings — so a model whose state was silently lost would pass a
+/// bare `!is_empty()` check on both sides of the backup and the comparison
+/// would be vacuous. That is the same shape as the vacuous-pass this file's
+/// pre-backup read exists to prevent, one layer down.
+fn is_evidence(s: &str) -> bool {
+    !matches!(s.trim(), "" | "0" | "[]" | "{}" | "null" | "NULL" | "false")
+}
+
+/// Run every read in `reads` and pair each with its model name.
+async fn read_all(ex: &Executor, reads: &[(&'static str, String)]) -> Vec<(&'static str, String)> {
+    let mut out = Vec::with_capacity(reads.len());
+    for (model, sql) in reads {
+        out.push((*model, scalar(ex, sql).await));
+    }
+    out
+}
+
 #[tokio::test]
 async fn physical_backup_restore_preserves_every_model_it_touches() {
     let tmp = tempfile::tempdir().unwrap();
@@ -85,12 +127,17 @@ async fn physical_backup_restore_preserves_every_model_it_touches() {
     let snapshot = tmp.path().join("snap");
     let restored = tmp.path().join("restored");
 
+    // The reads are built once and executed in both phases, so the two sides
+    // cannot drift apart. Graph's read names a node id that its write returns,
+    // which is why this is a Vec of owned strings and not a const table.
+    let reads: Vec<(&'static str, String)>;
+
     // Write into each model, then read each back BEFORE the backup. The
     // pre-backup read is not redundant: it establishes that the model works at
     // all in this fixture, so a post-restore mismatch means the restore lost
     // it rather than the write never having happened. Without that, a model
     // that silently no-ops would produce two matching empty reads and pass.
-    let before: Vec<(&str, String)> = {
+    let before: Vec<(&'static str, String)> = {
         let (ex, _eng) = boot(&data).await;
 
         run(&ex, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
@@ -98,18 +145,53 @@ async fn physical_backup_restore_preserves_every_model_it_touches() {
         run(&ex, "SELECT KV_SET('k1', 'kv-value')").await;
         run(&ex, "SELECT DOC_INSERT('{\"tag\":\"doc-value\"}')").await;
         run(&ex, "SELECT FTS_INDEX(7, 'searchable fts phrase')").await;
+        run(&ex, "CREATE TABLE vec_t (id INT PRIMARY KEY, v VECTOR(3))").await;
+        run(&ex, "INSERT INTO vec_t VALUES (1, VECTOR('[1.0,2.0,3.0]'))").await;
+        run(&ex, "SELECT TS_INSERT('metric1', 1000, 42.0)").await;
+        run(&ex, "SELECT BLOB_STORE('blob_key', '6465616462656566')").await;
+        run(&ex, "SELECT STREAM_XADD('s1', 'key', 'stream-value')").await;
+        run(&ex, "SELECT COLUMNAR_INSERT('col_t', 'metric', 99)").await;
+        run(&ex, "SELECT DATALOG_ASSERT('parent(alice, bob)')").await;
 
-        let before = vec![
-            ("sql", scalar(&ex, "SELECT v FROM t WHERE id = 1").await),
-            ("kv", scalar(&ex, "SELECT KV_GET('k1')").await),
-            ("document", scalar(&ex, "SELECT DOC_GET(1)").await),
-            ("fts", scalar(&ex, "SELECT FTS_DOC_COUNT()").await),
+        // Graph ids are assigned by the store, so capture them rather than
+        // assuming a fresh database hands out 1 and 2.
+        let n1 = scalar(&ex, "SELECT GRAPH_ADD_NODE('person', '{\"name\":\"n1\"}')").await;
+        let n2 = scalar(&ex, "SELECT GRAPH_ADD_NODE('person', '{\"name\":\"n2\"}')").await;
+        run(&ex, &format!("SELECT GRAPH_ADD_EDGE({n1}, {n2}, 'knows')")).await;
+
+        reads = vec![
+            ("sql", "SELECT v FROM t WHERE id = 1".to_string()),
+            ("kv", "SELECT KV_GET('k1')".to_string()),
+            ("document", "SELECT DOC_GET(1)".to_string()),
+            ("fts", "SELECT FTS_SEARCH('searchable', 10)".to_string()),
+            ("vector", "SELECT v FROM vec_t WHERE id = 1".to_string()),
+            ("timeseries", "SELECT TS_LAST('metric1')".to_string()),
+            ("blob", "SELECT BLOB_GET('blob_key')".to_string()),
+            (
+                "streams",
+                "SELECT STREAM_XRANGE('s1', 0, 99999999999999, 10)".to_string(),
+            ),
+            (
+                "columnar",
+                "SELECT COLUMNAR_SUM('col_t', 'metric')".to_string(),
+            ),
+            (
+                "datalog",
+                "SELECT DATALOG_QUERY('parent(alice, X)')".to_string(),
+            ),
+            ("graph", format!("SELECT GRAPH_NEIGHBORS({n1}, 'out')")),
+            // CDC is not written directly: it records the SQL mutations above,
+            // which is exactly the property a restore has to preserve.
+            ("cdc", "SELECT CDC_READ(0, 100)".to_string()),
         ];
+
+        let before = read_all(&ex, &reads).await;
         for (model, got) in &before {
             assert!(
-                !got.is_empty(),
-                "{model} produced nothing BEFORE the backup — the fixture is not \
-                 exercising it, so any post-restore comparison would be vacuous"
+                is_evidence(got),
+                "{model} produced no evidence BEFORE the backup (got {got:?}) — the \
+                 fixture is not exercising it, so any post-restore comparison \
+                 would be vacuous"
             );
         }
         before
@@ -122,21 +204,23 @@ async fn physical_backup_restore_preserves_every_model_it_touches() {
         .unwrap();
 
     let (ex, _eng) = boot(&restored).await;
-    let after = [
-        ("sql", scalar(&ex, "SELECT v FROM t WHERE id = 1").await),
-        ("kv", scalar(&ex, "SELECT KV_GET('k1')").await),
-        ("document", scalar(&ex, "SELECT DOC_GET(1)").await),
-        ("fts", scalar(&ex, "SELECT FTS_DOC_COUNT()").await),
-    ];
+    let after = read_all(&ex, &reads).await;
 
+    let mut lost = Vec::new();
     for ((model, want), (model2, got)) in before.iter().zip(after.iter()) {
         assert_eq!(model, model2);
-        assert_eq!(
-            want, got,
-            "{model} did not survive backup + restore: had {want:?}, got {got:?} \
-             after restoring into a clean directory"
-        );
+        if want != got {
+            lost.push(format!("{model}: had {want:?}, got {got:?}"));
+        }
     }
+    assert!(
+        lost.is_empty(),
+        "{} of {} models did not survive backup + restore into a clean \
+         directory:\n  {}",
+        lost.len(),
+        before.len(),
+        lost.join("\n  ")
+    );
 }
 
 /// Restoring must refuse a corrupted snapshot rather than half-apply it.
