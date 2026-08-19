@@ -62,7 +62,7 @@ mod test_module_wiring;
 mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
-mod test_pk_write_cost; // S65: UPDATE/DELETE by PK must not scan the table
+mod test_pk_write_cost;
 mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross sessions
 mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_query;
@@ -84,5 +84,6 @@ mod test_streaming_metamorphic; // streaming ≡ materialized over random querie
 mod test_streaming_scan; // Phase 1.1: opt-in streaming scan (SET stream_results = on)
 mod test_table_engine_checkpoint; // R4: per-table engine WAL compaction is reachable, not just implemented
 mod test_temporal_predicates; // mixed temporal literal/column comparisons
+mod test_temporal_range_cost; // S66: TIMESTAMP/DATE range predicates must prune // S65: UPDATE/DELETE by PK must not scan the table
 mod test_txn;
 mod test_txn_lazy_snapshot; // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

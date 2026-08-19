@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 309423; Source Rust files: 278; Top-level modules: 52.
-- Declared unit tests: 4376; Declared integration tests: 384; Ignored tests: 47.
+- Source LOC: 309594; Source Rust files: 279; Top-level modules: 52.
+- Declared unit tests: 4378; Declared integration tests: 384; Ignored tests: 47.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -768,6 +768,30 @@ Still open in this milestone:
 - CDC still publishes change events for transactions that never committed (NU-107). The other
   non-participating surfaces are now refused rather than silently kept, per the entry above.
 - Vector rollback is not durable (no compensating record in `vector/vector.wal`).
+
+### Temporal range predicates prune again — verified 2026-08-19 (S66)
+
+A range on a `TIMESTAMP` or `DATE` column silently fell back to a full scan while the same
+predicate on `BIGINT` pruned correctly (measured 2026-07-28: 5 matched, **600 scanned**, with
+`EXPLAIN` claiming `Index Scan` in both cases). It no longer does.
+
+Measured on the same fixture the regression was found with -- 600 all-distinct rows, an index
+on the key column, a range selecting 5 -- with a counter of tuples actually decoded rather
+than matched:
+
+| column type | matched | tuples examined |
+|---|---|---|
+| `BIGINT` | 5 | 0 |
+| `TIMESTAMP` | 5 | 0 |
+| `DATE` | 5 | 0 |
+| `TIMESTAMPTZ` | 5 | 0 (it returned **0 rows** when the regression was recorded) |
+
+Zero rather than five because `index_only_scan` answers the aggregate from the B-tree without
+touching the heap. The control on the same tables -- an unindexed `plain > 10` -- examines all
+600, which is what makes those zeros mean something.
+
+`src/executor/tests/test_temporal_range_cost.rs` is the gate, written to fail on the old
+behaviour, and it carries the control in the same test.
 
 ### `BEGIN ISOLATION LEVEL SERIALIZABLE` was accepted and silently ignored on disk — FIXED
 

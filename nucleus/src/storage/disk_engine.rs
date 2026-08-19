@@ -2548,6 +2548,10 @@ impl StorageEngine for DiskEngine {
         let col_types = self.col_types(table)?;
         let pages = self.table_pages(table)?;
         let mut rows = Vec::new();
+        // Counted for the same reason `scan_addressed` is: a cost test needs to
+        // know how many tuples a statement really read, and every row-count
+        // metric the executor keeps reports MATCHES.
+        let mut examined = 0usize;
 
         // Parallel read-ahead: prefetch pages in batch windows (1 MB = 64 pages).
         // With parallel prefetch, refill the window every PREFETCH_WINDOW pages
@@ -2579,9 +2583,11 @@ impl StorageEngine for DiskEngine {
                     )));
                 };
                 rows.push(row);
+                examined += 1;
             }
         }
 
+        crate::bench_hooks::record_tuples_examined(examined);
         Ok(rows)
     }
 
@@ -2648,6 +2654,7 @@ impl StorageEngine for DiskEngine {
         let col_types = self.col_types(table)?;
         let pages = self.table_pages(table)?;
         let mut rows = Vec::new();
+        let mut examined = 0usize;
 
         const PREFETCH_WINDOW: usize = 64;
         if pages.len() > 1 {
@@ -2676,12 +2683,15 @@ impl StorageEngine for DiskEngine {
                     )));
                 };
                 rows.push(row);
+                examined += 1;
                 if limit.is_some_and(|n| rows.len() >= n) {
+                    crate::bench_hooks::record_tuples_examined(examined);
                     return Ok(rows);
                 }
             }
         }
 
+        crate::bench_hooks::record_tuples_examined(examined);
         Ok(rows)
     }
 
@@ -2718,6 +2728,7 @@ impl StorageEngine for DiskEngine {
                     .pool
                     .read_guard(page_id)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
+                crate::bench_hooks::record_tuples_examined(page::count_live_tuples(&pg));
                 // `filter_map` here dropped undecodable tuples without even a
                 // log line — the same silent shortening as the other scans,
                 // minus the evidence.
