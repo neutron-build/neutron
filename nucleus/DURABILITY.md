@@ -296,6 +296,70 @@ A destination inside the data directory is refused: the tree copy would
 otherwise descend into the snapshot it is writing until the path exceeded the OS
 limit, surfacing as "File name too long".
 
+## RPO / RTO controls and limitations
+
+What you can lose, what controls it, and what this engine does not do. Every
+figure below is a property of the code as it stands, not a target.
+
+### Recovery point (how much you can lose)
+
+| Scenario | Worst-case loss | Control |
+|---|---|---|
+| Process crash / `kill -9`, `synchronous_commit=on` | **Nothing acknowledged.** The SQL WAL and every specialty log are fsynced at the commit boundary | `wal.sync_mode`, `synchronous_commit` |
+| Power loss, `sync_mode = fsync` / `fdatasync` | Nothing acknowledged | default |
+| Power loss, `sync_mode = flush_os` | Writes in the drive's volatile cache. Survives OS panic and `kill -9`, **not** a power cut | `wal.sync_mode` |
+| Power loss, `sync_mode = none` | Everything the OS had not flushed | `wal.sync_mode` |
+| Restore from a physical snapshot | Everything committed after the snapshot | backup cadence |
+| PITR restore | Everything committed after the **last archived WAL segment** | `NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS` |
+
+**The PITR row is the one that surprises people, and it is the one to design
+around.** A segment reaches the archive when it FILLS, on the archive timeout,
+or at a clean shutdown -- not at commit. So on a quiet database at the default
+segment size, the gap between the last archived point and now can be large
+while every commit in it is durable locally. `restore-pitr` prints the recovery
+point in wall-clock terms for exactly this reason: an LSN alone reads as
+success. Lower `NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS` to bound it.
+
+### Recovery time (how long you are down)
+
+Restore is bounded by copying the base snapshot plus replaying the archived WAL
+from it, both disk-bound and single-pass. There is no incremental or
+differential backup, so restore time grows with total database size rather than
+with change volume, and a longer gap since the last base snapshot means more
+WAL to replay. Taking base snapshots more often is the only lever.
+
+`nucleus backup --online` snapshots a serving database. The offline path
+refuses a data directory a live instance holds, unless overridden.
+
+### Limitations, stated rather than implied
+
+- **PITR restores only the SQL substrate to the target.** The specialty-model
+  logs (document, FTS, blob, columnar, geo, CDC) come from the base snapshot as
+  a byte copy and are **not** replayed forward, so after a PITR to a point after
+  the base, relational data is at the target and those models are at the base.
+  `restore-pitr` now names them in its report. Cross-model PITR is M4 and
+  unbuilt (NU-030).
+- **Rolling BACK needs an older base.** Replay only moves forward. Restoring to
+  an LSN before the base snapshot cannot undo anything the base already
+  contains, and the command refuses rather than reporting a success it did not
+  achieve. That refusal depends on the snapshot's `consistent_lsn`, which the
+  offline path did not record until 2026-08-18 -- older snapshots taken by
+  `nucleus backup` carry 0 and will not trigger it.
+- **The WAL archive has no automatic retention.** It grows until you run
+  `nucleus prune-archive`. That is deliberate: deleting recovery data on a
+  timer, with no knowledge of which base snapshots still exist, converts a
+  disk-space problem into an unrecoverable one. The corollary is that archive
+  growth is an operator's responsibility, and an archive that fills the volume
+  takes the database read-only with it.
+- **No automated disaster-recovery drills.** Nothing schedules a
+  restore-and-verify. Restore verification exists and is strong -- every
+  manifest checksum is checked before the destination is touched, and a
+  corrupted or truncated snapshot is refused by name -- but it runs when you run
+  it. A backup you have never restored is a hypothesis.
+- **Logical restore verification covers 4 of the 14 models** (SQL, KV, document,
+  FTS) in `tests/backup_restore_all_models.rs`. The other ten are covered
+  bytewise by the manifest and not semantically.
+
 ## Known gaps
 
 - **Page publish/flush ordering race (pre-existing).** Traversing a page chain

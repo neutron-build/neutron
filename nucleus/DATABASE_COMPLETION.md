@@ -390,7 +390,14 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       whole tree, and that is now asserted rather than assumed.
       STILL NOT DONE: the other 10 models, and automated disaster-recovery runs (scheduled
       restore-and-verify).
-- [ ] Document RPO/RTO controls and limitations.
+- [x] Document RPO/RTO controls and limitations.
+      `DURABILITY.md` gains an RPO/RTO section (2026-08-18): a recovery-point table per failure
+      mode, what bounds recovery time, and the limitations stated rather than implied -- PITR
+      restores only the SQL substrate to the target (NU-030); rolling back needs an older base and
+      the guard depends on a `consistent_lsn` the offline path did not record before 2026-08-18;
+      the WAL archive has no automatic retention and grows until `nucleus prune-archive`; no
+      scheduled DR drills exist; logical restore verification covers 4 of 14 models. Every figure
+      is a property of the code, not a target.
 
 Exit gate:
 
