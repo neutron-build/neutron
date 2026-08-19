@@ -4512,8 +4512,13 @@ impl Executor {
                         estimated, doc_id
                     )));
                 }
+                // No checkpoint here: the write is durable through the FTS
+                // WAL (fsynced at the commit boundary since NU-006), and
+                // `fts_index.json` is a periodic CHECKPOINT rather than the
+                // store (NU-014). Rewriting the whole serialized index on
+                // every FTS_INDEX was O(index) per write and is what made the
+                // JSON the only durable copy in the first place.
                 self.fts_index.write().add_document(doc_id, &text);
-                self.save_fts_index();
                 // Record mutation for potential rollback
                 self.cross_model_fts_added(doc_id);
                 Ok(Value::Bool(true))
@@ -4557,7 +4562,6 @@ impl Executor {
                 self.fts_index
                     .write()
                     .add_document_with_facets(doc_id, &text, facets);
-                self.save_fts_index();
                 self.cross_model_fts_added(doc_id);
                 Ok(Value::Bool(true))
             }
@@ -4573,7 +4577,6 @@ impl Executor {
                 // Capture state before removal for potential rollback
                 self.cross_model_fts_removing(doc_id);
                 self.fts_index.write().remove_document(doc_id);
-                self.save_fts_index();
                 self.memory_allocator.lock().release("fts", 64);
                 Ok(Value::Bool(true))
             }

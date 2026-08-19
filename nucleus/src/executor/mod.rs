@@ -357,6 +357,9 @@ pub struct Executor {
     /// Data directory for durable per-table engine storage + the engines.json
     /// sidecar (None = memory mode, per-table engines stay in-memory only).
     data_dir: Option<std::path::PathBuf>,
+    /// WAL entries recovered at open, to be applied on top of the
+    /// `fts_index.json` checkpoint by `load_fts_index`. `None` once applied.
+    fts_wal_tail: Option<crate::fts::fts_wal::FtsWalState>,
     /// Durable, bounded security audit log. `None` for an executor with no
     /// data directory (embedded and test executors), which have no
     /// authentication boundary to audit.
@@ -651,6 +654,7 @@ impl Executor {
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
             data_dir: None,
+            fts_wal_tail: None,
             #[cfg(feature = "server")]
             audit: None,
             sync_commit_default: AtomicBool::new(true),
@@ -882,10 +886,17 @@ impl Executor {
             // FTS index: WAL-backed crash-recovery (open replays all logged operations)
             let fts_dir = dir.join("fts");
             std::fs::create_dir_all(&fts_dir).ok();
-            if let Some(idx) =
-                Self::open_durable("FTS", &fts_dir, fts::InvertedIndex::open(&fts_dir))
-            {
+            if let Some((idx, tail)) = Self::open_durable(
+                "FTS",
+                &fts_dir,
+                fts::InvertedIndex::open_with_tail(&fts_dir),
+            ) {
                 *exec.fts_index.write() = idx;
+                // Kept so `load_fts_index` can apply it on top of the
+                // `fts_index.json` checkpoint (NU-014). Without it the
+                // checkpoint would silently discard everything written since
+                // the last one.
+                exec.fts_wal_tail = Some(tail);
             }
 
             // Vector indexes: WAL + snapshot recovery
@@ -1084,12 +1095,30 @@ impl Executor {
         let Some(path) = self.fts_persist_path() else {
             return;
         };
-        if let Ok(json) = self.fts_index.read().to_json()
-            && let Err(e) = std::fs::write(&path, &json)
-        {
+        let index = self.fts_index.read();
+        let Ok(json) = index.to_json() else {
+            return;
+        };
+        if let Err(e) = std::fs::write(&path, &json) {
             eprintln!(
                 "executor: failed to save FTS index to {}: {e}",
                 path.display()
+            );
+            // Deliberately do NOT truncate: the tail is the only record of
+            // whatever this checkpoint failed to capture.
+            return;
+        }
+        // The checkpoint now contains everything the tail did, so the tail
+        // starts again from empty. Ordering matters and is the reason this is
+        // here rather than before the write: a crash between the two leaves a
+        // tail that is a SUBSET of the checkpoint, which replays harmlessly.
+        // The other order loses writes.
+        if let Err(e) = index.truncate_wal() {
+            tracing::warn!(
+                target: "nucleus::fts",
+                "FTS checkpoint written but its WAL tail could not be truncated: {e}. \
+                 The tail will be replayed on the checkpoint at next boot, which is \
+                 harmless — it is idempotent — but the log will keep growing."
             );
         }
     }
@@ -1125,7 +1154,19 @@ impl Executor {
     /// silently reverted FTS to whatever the stale WAL happened to hold, with
     /// no message anywhere. Given this file is the authoritative store, that is
     /// the same silent-empty-recovery shape as the rest of this class.
-    fn load_fts_index(&self) {
+    ///
+    /// **NU-014, 2026-08-19: the checkpoint/tail split above is now what
+    /// happens.** The two are no longer rivals. `fts_index.json` is loaded as
+    /// the base, the WAL handle is RE-ATTACHED to it (the `serde(skip)` is the
+    /// whole bug — a deserialized index had `wal: None` and every write site is
+    /// an `if let Some(wal)`), and the WAL's recovered state is applied on top
+    /// as a tail. `save_fts_index` then truncates the tail after each
+    /// checkpoint, so the two cannot diverge again.
+    ///
+    /// No migration: an existing deployment's JSON is the seed, exactly as
+    /// before, and its stale WAL contributes whatever it holds — which is a
+    /// subset of the JSON, so applying it is a no-op.
+    fn load_fts_index(&mut self) {
         let Some(path) = self.fts_persist_path() else {
             return;
         };
@@ -1144,16 +1185,33 @@ impl Executor {
             }
         };
         match fts::InvertedIndex::from_json(&data) {
-            Ok(idx) => {
-                let had_wal_state = self.fts_index.read().doc_count() > 0;
-                if had_wal_state {
-                    tracing::warn!(
+            Ok(mut idx) => {
+                // Carry the WAL handle across from the index the WAL built, so
+                // this session's writes are logged. Without this the
+                // checkpoint replaced a live index with a dead one.
+                let wal = self.fts_index.read().wal_handle();
+                match wal {
+                    Some(wal) => idx.attach_wal(wal),
+                    None => tracing::warn!(
                         target: "nucleus::startup",
-                        "FTS: legacy {} is replacing the WAL-backed index recovered from disk. \
-                         The replacement carries no WAL handle, so FTS writes this session will \
-                         NOT be logged to the WAL — the legacy file is the only durable copy.",
+                        "FTS: no WAL handle to re-attach after loading {}. Writes this session \
+                         will not be logged; the checkpoint file is the only durable copy.",
                         path.display()
-                    );
+                    ),
+                }
+                // Then the tail on top. Idempotent: re-applying an entry the
+                // checkpoint already holds re-indexes the same document.
+                if let Some(tail) = self.fts_wal_tail.take() {
+                    let (docs, removed) = (tail.docs.len(), tail.removed.len());
+                    idx.apply_wal_tail(&tail);
+                    if docs > 0 || removed > 0 {
+                        tracing::info!(
+                            target: "nucleus::startup",
+                            "FTS: applied a WAL tail of {docs} document(s) and {removed} \
+                             removal(s) on top of {}",
+                            path.display()
+                        );
+                    }
                 }
                 *self.fts_index.write() = idx;
             }

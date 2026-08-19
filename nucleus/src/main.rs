@@ -1737,6 +1737,13 @@ async fn cmd_start(cfg: StartConfig) {
                         if let Err(e) = executor_for_workers.doc_store().read().checkpoint() {
                             tracing::warn!("Document WAL checkpoint failed: {e}");
                         }
+                        // FTS is checkpoint + tail (NU-014): write
+                        // `fts_index.json` first, which then truncates the tail
+                        // it absorbed, and compact whatever is left. Order
+                        // matters — a crash between them leaves a tail that is
+                        // a subset of the checkpoint, which replays
+                        // idempotently.
+                        executor_for_workers.save_fts_index();
                         if let Err(e) = executor_for_workers.fts_index().read().checkpoint_wal() {
                             tracing::warn!("FTS WAL checkpoint failed: {e}");
                         }

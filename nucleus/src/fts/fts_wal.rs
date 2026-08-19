@@ -40,6 +40,14 @@ const ENTRY_SNAPSHOT: u8 = 0x04;
 pub struct FtsWalState {
     /// `(doc_id, original_text)` pairs for every live document.
     pub docs: Vec<(u64, String)>,
+    /// Documents whose LAST event in the log was a removal.
+    ///
+    /// Needed because the log is now a TAIL applied on top of the
+    /// `fts_index.json` checkpoint (NU-014), and a tail has to be able to
+    /// express a deletion. Collapsing the log to "live documents" alone loses
+    /// that: a doc removed in the tail but still present in the checkpoint
+    /// would come back on every boot.
+    pub removed: Vec<u64>,
 }
 
 /// Append-only FTS WAL.
@@ -74,7 +82,10 @@ impl FtsWal {
             let data = std::fs::read(&path)?;
             replay(&data)
         } else {
-            FtsWalState { docs: Vec::new() }
+            FtsWalState {
+                docs: Vec::new(),
+                removed: Vec::new(),
+            }
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
@@ -183,6 +194,7 @@ impl FtsWal {
 /// incremental entries) matter in practice.
 fn replay(data: &[u8]) -> FtsWalState {
     let mut docs: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut removed: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut pos = 0usize;
 
     while pos < data.len() {
@@ -208,6 +220,7 @@ fn replay(data: &[u8]) -> FtsWalState {
                     Err(_) => break,
                 };
                 pos += text_len;
+                removed.remove(&doc_id);
                 docs.insert(doc_id, text);
             }
             ENTRY_REMOVE_DOC => {
@@ -215,9 +228,11 @@ fn replay(data: &[u8]) -> FtsWalState {
                     break;
                 };
                 docs.remove(&doc_id);
+                removed.insert(doc_id);
             }
             ENTRY_SNAPSHOT => {
                 docs.clear();
+                removed.clear();
                 let Some(n_docs) = read_u32(data, &mut pos) else {
                     break;
                 };
@@ -259,6 +274,7 @@ fn replay(data: &[u8]) -> FtsWalState {
 
     FtsWalState {
         docs: docs.into_iter().collect(),
+        removed: removed.into_iter().collect(),
     }
 }
 

@@ -1,35 +1,40 @@
-//! **Characterization test for a defect that is deliberately still open (NU-014).**
+//! **Was a characterization test for NU-014. The defect is fixed; this is now
+//! the UPGRADE test, which is the half the fix had to get right.**
 //!
-//! Read this before "fixing" what it asserts. It pins CURRENT, WRONG behaviour
-//! on purpose, because the obvious correction destroys data on upgrade and the
-//! measurements below are what establish that.
-//!
-//! FTS has two persistence mechanisms:
+//! What it used to pin, and what was measured: FTS had two persistence
+//! mechanisms —
 //!
 //! * a WAL-backed `InvertedIndex` under `fts/`, opened through `open_durable`
 //!   and described in the code as "WAL-backed crash-recovery";
 //! * a legacy `fts_index.json`, written by `save_fts_index` after mutations.
 //!
-//! `new_with_persistence` opens the first and then calls `load_fts_index()`,
-//! which replaces it wholesale from the second. `InvertedIndex::wal` is
-//! `#[serde(skip)]`, so the replacement has `wal: None`, and all three WAL write
-//! sites are `if let Some(wal) = &self.wal`.
+//! `new_with_persistence` opened the first and then called `load_fts_index()`,
+//! which replaced it wholesale from the second. `InvertedIndex::wal` is
+//! `#[serde(skip)]`, so the replacement had `wal: None` and all three WAL write
+//! sites are `if let Some(wal) = &self.wal`. **From the second boot onward the
+//! FTS WAL received nothing**, silently, and the JSON was the only live durable
+//! copy.
 //!
-//! Measured consequence, asserted below: **from the second boot onward the FTS
-//! WAL receives nothing.** The legacy JSON is the only live durable copy.
+//! Why the obvious correction was refused, and still is:
 //!
-//! Why this is not simply corrected here:
-//!
-//! 1. Letting the WAL win would discard everything an existing deployment has
+//! 1. Letting the WAL win discards everything an existing deployment has
 //!    written since its own second boot, because their WAL went stale then.
 //! 2. It cannot be migrated by conversion. The WAL stores original document
 //!    text and replays it; the JSON stores derived postings and `DocInfo` keeps
-//!    only a token length. There is no text in the JSON to rebuild a WAL from,
-//!    so JSON -> WAL is a re-index from base tables, not a format change.
+//!    only a token length. There is no text in the JSON to rebuild a WAL from.
 //!
-//! That is a product decision with a migration attached. If you are changing
-//! this deliberately, this test SHOULD fail — update it along with the
-//! migration, and do not just delete the assertions.
+//! **The fix takes neither side.** `fts_index.json` is a CHECKPOINT, the WAL is
+//! the TAIL applied on top of it, and the WAL handle is re-attached to the
+//! index deserialized from the checkpoint. An existing deployment's JSON is
+//! therefore its seed and nothing is discarded — which is exactly what this
+//! file now tests, because a fix that loses a legacy deployment's data on
+//! upgrade would satisfy every test in `fts_checkpoint_and_tail.rs` and still
+//! be a disaster.
+//!
+//! `fts_checkpoint_and_tail.rs` covers the forward behaviour: writes reaching
+//! the WAL, the tail applying on top of the checkpoint, removals in the tail,
+//! and a write after the last checkpoint surviving a crash.
+
 #![cfg(feature = "server")]
 use std::path::Path;
 use std::sync::Arc;
@@ -86,74 +91,58 @@ fn dir_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// A data directory in the LEGACY state — a complete `fts_index.json` and a WAL
+/// that went stale behind it — must open with nothing lost, and must start
+/// logging again.
 #[tokio::test]
-async fn the_fts_wal_stops_receiving_writes_after_the_first_boot() {
+async fn a_legacy_directory_upgrades_without_losing_the_json_only_documents() {
     let dir = std::env::temp_dir().join(format!("fts-dual-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let json = dir.join("fts_index.json");
     let fts_dir = dir.join("fts");
 
-    // Session 1: no legacy JSON exists yet, so the WAL-backed index survives
-    // load_fts_index and stays attached. This write DOES reach the WAL.
+    // Build a directory that looks like one written by the old code: the
+    // checkpoint holds both documents, and the WAL is stale behind it. The
+    // truncation is the manufacture — under the old code the WAL simply stopped
+    // receiving anything after the first boot, which ends in the same place.
     {
         let ex = boot(&dir);
         run(&ex, "SELECT FTS_INDEX(1, 'the quick brown fox')").await;
-    }
-    assert!(
-        json.exists(),
-        "save_fts_index should have written the legacy file"
-    );
-    let wal_after_first = dir_bytes(&fts_dir);
-
-    // Proof that session 1's write reached the WAL: drop the JSON, reboot, and
-    // the document is still searchable.
-    {
-        let stash = std::fs::read(&json).unwrap();
-        std::fs::remove_file(&json).unwrap();
-        let ex = boot(&dir);
-        assert_eq!(
-            hits(&run(&ex, "SELECT FTS_SEARCH('quick', 10)").await),
-            1,
-            "the first session's write should be recoverable from the WAL alone"
-        );
-        std::fs::write(&json, stash).unwrap();
-    }
-
-    // Session 2: the legacy JSON now exists at startup, so load_fts_index
-    // replaces the index and the WAL handle goes with it.
-    {
-        let ex = boot(&dir);
         run(&ex, "SELECT FTS_INDEX(3, 'a quick silver hare')").await;
+        ex.save_fts_index();
     }
-    let wal_after_second = dir_bytes(&fts_dir);
+    std::fs::write(fts_dir.join("fts.wal"), b"").unwrap();
+    assert!(json.exists(), "the checkpoint must exist for this fixture");
+    let stale_wal = dir_bytes(&fts_dir);
 
+    // Upgrade: both documents are still there, from the checkpoint.
+    let ex = boot(&dir);
     assert_eq!(
-        wal_after_second, wal_after_first,
-        "CHARACTERIZATION (NU-014): the FTS WAL is expected to be BYTE-IDENTICAL after a \
-         second session's write, because the index loaded from the legacy JSON carries no \
-         WAL handle. If this now differs, the WAL was re-attached — read this file's header \
-         before assuming that is safe."
+        hits(&run(&ex, "SELECT FTS_SEARCH('quick', 10)").await),
+        2,
+        "opening a legacy directory lost documents that existed only in the \
+         checkpoint — this is the data the naive fix would have discarded"
     );
 
-    // With the legacy file present, both documents are there.
-    {
-        let ex = boot(&dir);
-        assert_eq!(
-            hits(&run(&ex, "SELECT FTS_SEARCH('quick', 10)").await),
-            2,
-            "the legacy JSON is the live durable copy and holds both documents"
-        );
-    }
+    // And the WAL is live again: this session's write reaches it.
+    run(&ex, "SELECT FTS_INDEX(5, 'quick as a fish')").await;
+    let after_write = dir_bytes(&fts_dir);
+    assert!(
+        after_write > stale_wal,
+        "a write after the upgrade did not reach the FTS WAL ({stale_wal} bytes \
+         before, {after_write} after) — the checkpoint-loaded index has no WAL \
+         handle, which is NU-014 itself"
+    );
 
-    // Without it, the second session's document is simply gone.
-    std::fs::remove_file(&json).unwrap();
+    // Crash before the next checkpoint: the tail carries the new document, and
+    // the checkpoint under it still carries the other two.
+    drop(ex);
     {
         let ex = boot(&dir);
         assert_eq!(
             hits(&run(&ex, "SELECT FTS_SEARCH('quick', 10)").await),
-            1,
-            "CHARACTERIZATION (NU-014): doc 3 never reached the WAL, so removing the legacy \
-             file loses it. This is the data the naive fix would discard on upgrade."
+            3,
+            "the document written after the upgrade was lost on reopen"
         );
     }
 

@@ -634,6 +634,17 @@ impl InvertedIndex {
     /// Reads the WAL file (if it exists), replays all entries, and re-indexes
     /// every document. Returns a fully populated index ready for queries.
     pub fn open(dir: &std::path::Path) -> std::io::Result<Self> {
+        Self::open_with_tail(dir).map(|(idx, _)| idx)
+    }
+
+    /// `open`, also returning the WAL's recovered state so a caller that loads
+    /// a checkpoint can apply the log as a TAIL on top of it.
+    ///
+    /// This is NU-014's shape: `fts_index.json` is the checkpoint and the WAL
+    /// is the tail. The index returned here is built from the WAL alone, which
+    /// is correct only when no checkpoint exists — `Executor::load_fts_index`
+    /// replaces it with the checkpoint and re-applies this state.
+    pub fn open_with_tail(dir: &std::path::Path) -> std::io::Result<(Self, fts_wal::FtsWalState)> {
         let (wal, state) = fts_wal::FtsWal::open(dir)?;
         let mut idx = Self {
             postings: HashMap::new(),
@@ -645,10 +656,63 @@ impl InvertedIndex {
             analyzer: Analyzer::English,
         };
         // Re-index every recovered document (re-tokenize from original text).
-        for (doc_id, text) in state.docs {
-            idx.index_document_internal(doc_id, &text);
+        for (doc_id, text) in &state.docs {
+            idx.index_document_internal(*doc_id, text);
         }
-        Ok(idx)
+        Ok((idx, state))
+    }
+
+    /// Hand this index the WAL handle another one opened.
+    ///
+    /// `wal` is `#[serde(skip)]`, so an index deserialized from
+    /// `fts_index.json` comes back with `wal: None` and every write site is an
+    /// `if let Some(wal)` — which is the whole of NU-014: from the second boot
+    /// onward the FTS WAL received nothing, silently, and the JSON became the
+    /// only durable copy. Re-attaching is what makes the log live again.
+    pub fn attach_wal(&mut self, wal: Arc<fts_wal::FtsWal>) {
+        self.wal = Some(wal);
+    }
+
+    /// Apply a WAL tail on top of this index, without logging it back.
+    ///
+    /// Idempotent by construction: `index_document_internal` removes a document
+    /// before re-indexing it, so replaying an entry the checkpoint already
+    /// contains changes nothing. That is what makes the crash window between
+    /// "checkpoint written" and "tail truncated" safe.
+    pub fn apply_wal_tail(&mut self, state: &fts_wal::FtsWalState) {
+        for doc_id in &state.removed {
+            if self.docs.contains_key(doc_id) {
+                self.remove_document_internal(*doc_id);
+            }
+        }
+        for (doc_id, text) in &state.docs {
+            self.index_document_internal(*doc_id, text);
+        }
+    }
+
+    /// Drop the tail: the checkpoint now contains everything the log did.
+    ///
+    /// Called after `fts_index.json` is written, and only after — so a crash
+    /// between the two leaves a tail that is a subset of the checkpoint, which
+    /// `apply_wal_tail` then replays harmlessly. The other order would lose
+    /// writes.
+    pub fn truncate_wal(&self) -> std::io::Result<()> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.checkpoint(&[]),
+            None => Ok(()),
+        }
+    }
+
+    /// The WAL handle this index holds, if any — so a checkpoint-loaded index
+    /// can take it over.
+    pub fn wal_handle(&self) -> Option<Arc<fts_wal::FtsWal>> {
+        self.wal.clone()
+    }
+
+    /// Whether this index has a live WAL handle. A `false` here on a persistent
+    /// executor means FTS writes are not being logged.
+    pub fn has_wal(&self) -> bool {
+        self.wal.is_some()
     }
 
     /// Serialize the index to JSON for persistence.

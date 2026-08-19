@@ -420,6 +420,11 @@ impl Executor {
             self.fts_index
                 .write()
                 .undo(crate::fts::FtsUndoLog { ops: fts_ops });
+            // This checkpoint STAYS, unlike the ones on the write path. A
+            // rollback is not logged to the FTS WAL — the undo is applied in
+            // memory — so without rewriting the checkpoint here, a crash after
+            // a successful ROLLBACK would replay the rolled-back writes from
+            // the tail and resurrect them. Rollbacks are rare; writes are not.
             #[cfg(feature = "server")]
             self.save_fts_index();
         }
