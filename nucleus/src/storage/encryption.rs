@@ -13,6 +13,8 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
 use argon2::Argon2;
 
+use std::path::Path;
+
 use super::page::{PAGE_SIZE, PageBuf};
 
 /// Size of AES-GCM nonce (96 bits).
@@ -62,6 +64,76 @@ fn fingerprint(key: &[u8; 32]) -> String {
         .take(8)
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Name of the sidecar that records which key a data directory is encrypted
+/// under. Contains the key's fingerprint and algorithm; never key material.
+pub const KEY_MARKER_FILE: &str = "encryption.json";
+
+/// What `KEY_MARKER_FILE` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedKey {
+    pub algorithm: String,
+    pub key_id: String,
+}
+
+/// Read the key marker beside `db_path`, if the database recorded one.
+///
+/// `None` means "nothing recorded", which is NOT the same as "not encrypted":
+/// a directory written before markers existed has none. Callers that report an
+/// encryption state must say which of the two they mean.
+pub fn read_key_marker(db_path: &Path) -> Option<RecordedKey> {
+    read_key_marker_in(db_path.parent()?)
+}
+
+/// `read_key_marker`, addressed by data directory rather than by data file —
+/// what an offline caller has.
+pub fn read_key_marker_in(data_dir: &Path) -> Option<RecordedKey> {
+    let raw = std::fs::read_to_string(data_dir.join(KEY_MARKER_FILE)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(RecordedKey {
+        algorithm: v.get("algorithm")?.as_str()?.to_string(),
+        key_id: v.get("key_id")?.as_str()?.to_string(),
+    })
+}
+
+/// Record which key this database is encrypted under, and refuse a different
+/// one.
+///
+/// Encryption is configured entirely at runtime (`NUCLEUS_ENCRYPT_KEY` /
+/// `NUCLEUS_ENCRYPT_PASSPHRASE`) and leaves no trace in the file itself, so
+/// opening an encrypted database with the wrong key decrypts pages into
+/// garbage and surfaces as `not a Nucleus database (bad magic bytes)` — which
+/// sends an operator looking for corruption during a recovery. It also left an
+/// OFFLINE backup with no way to know whether its source was encrypted, so
+/// every offline manifest claimed "not encrypted" whatever the truth.
+///
+/// The marker fixes both: a wrong key is named as a wrong key, and a backup
+/// taken with no engine running can read the source's encryption state off
+/// disk. It holds a fingerprint, not a key, so it is not a secret.
+pub fn record_key(db_path: &Path, key_id: &str) -> std::io::Result<()> {
+    if let Some(existing) = read_key_marker(db_path)
+        && existing.key_id != key_id
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{}: encrypted under key {} — the supplied key is {}. Restore with                  the key the snapshot names, or re-encrypt by restoring under the                  old key and taking a fresh backup under the new one.",
+                db_path.display(),
+                existing.key_id,
+                key_id
+            ),
+        ));
+    }
+    let Some(path) = marker_path(db_path) else {
+        return Ok(());
+    };
+    let body = format!("{{\"algorithm\":\"aes-256-gcm\",\"key_id\":\"{key_id}\"}}\n");
+    std::fs::write(path, body)
+}
+
+fn marker_path(db_path: &Path) -> Option<std::path::PathBuf> {
+    Some(db_path.parent()?.join(KEY_MARKER_FILE))
 }
 
 impl PageEncryptor {

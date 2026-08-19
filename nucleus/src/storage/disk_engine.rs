@@ -544,6 +544,18 @@ impl DiskEngine {
 
         let is_new = file_size == 0;
 
+        // Record which key this directory is encrypted under -- and refuse a
+        // different one, BEFORE the magic-bytes check below. Encryption leaves
+        // no trace in the file, so the wrong key decrypts page 0 into garbage
+        // and that check reports "not a Nucleus database", sending an operator
+        // hunting corruption during a recovery. The marker also gives an
+        // offline backup, which has no engine to ask, a way to read the
+        // source's encryption state off disk.
+        if let Some(ref enc) = encryptor {
+            super::encryption::record_key(path, enc.key_id())
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+        }
+
         // T1.1 / M3: validate the on-disk format BEFORE anything mutates the
         // database. This check used to live after WAL recovery, which meant a
         // foreign or future-format file had already had WAL records replayed
@@ -3765,6 +3777,49 @@ mod tests {
         let db_path = dir.join("test.db");
         let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
         (engine, catalog)
+    }
+
+    /// Opening encrypted records the key, and a second open under a different
+    /// key is refused BY NAME rather than as corruption.
+    ///
+    /// Without the marker the wrong key decrypts page 0 into garbage and the
+    /// format check reports "not a Nucleus database (bad magic bytes)" — which
+    /// during a recovery sends an operator looking for corruption that is not
+    /// there.
+    #[tokio::test]
+    async fn an_encrypted_open_records_its_key_and_refuses_another() {
+        use crate::storage::encryption::{KEY_MARKER_FILE, PageEncryptor, read_key_marker_in};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nucleus.db");
+        let a = PageEncryptor::from_key(&[3u8; 32]);
+        let b = PageEncryptor::from_key(&[4u8; 32]);
+
+        {
+            let catalog = Arc::new(Catalog::new());
+            let _engine = DiskEngine::open_encrypted(&db_path, catalog, a.clone()).unwrap();
+        }
+        assert!(dir.path().join(KEY_MARKER_FILE).exists());
+        assert_eq!(
+            read_key_marker_in(dir.path()).map(|r| r.key_id),
+            Some(a.key_id().to_string())
+        );
+
+        // Control: the same key reopens.
+        {
+            let catalog = Arc::new(Catalog::new());
+            DiskEngine::open_encrypted(&db_path, catalog, a.clone())
+                .expect("the recorded key must still open the database");
+        }
+
+        let catalog = Arc::new(Catalog::new());
+        let err = DiskEngine::open_encrypted(&db_path, catalog, b.clone())
+            .expect_err("a different key must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(a.key_id()) && msg.contains(b.key_id()),
+            "the refusal must name both keys, not report corruption; got: {msg}"
+        );
     }
 
     /// Register a simple two-column (id Int32, name Text) table in the catalog.

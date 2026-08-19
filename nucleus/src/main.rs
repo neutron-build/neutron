@@ -2625,12 +2625,17 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool, online: bool, allow_i
             }
             if manifest.encryption.encrypted {
                 println!(
-                    "  At rest:         encrypted ({}) — restoring needs the same key",
+                    "  At rest:         encrypted ({}) — restoring needs key {}",
                     manifest
                         .encryption
                         .algorithm
                         .as_deref()
-                        .unwrap_or("unknown")
+                        .unwrap_or("unknown"),
+                    // The whole point of `key_id`: an operator holding several
+                    // keys can tell which one this snapshot wants without
+                    // trying them. `unknown` means the source predates the
+                    // marker, not that the key is lost.
+                    manifest.encryption.key_id.as_deref().unwrap_or("unknown")
                 );
             }
             println!(

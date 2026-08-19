@@ -333,6 +333,23 @@ fn copy_dir_inner(
 /// Files that exist to coordinate a *live* process and must never be captured
 /// in a snapshot: restoring someone else's lock file would be meaningless at
 /// best and confusing at worst.
+/// The source's at-rest encryption, as recorded beside its data file.
+///
+/// `BackupEncryption::default()` (not encrypted) when nothing is recorded --
+/// see the call site for why that is the best available answer rather than a
+/// certain one.
+fn recorded_encryption(data_dir: &Path) -> BackupEncryption {
+    match crate::storage::encryption::read_key_marker_in(data_dir) {
+        Some(rec) => BackupEncryption {
+            encrypted: true,
+            compressed: false,
+            algorithm: Some(rec.algorithm),
+            key_id: Some(rec.key_id),
+        },
+        None => BackupEncryption::default(),
+    }
+}
+
 fn is_runtime_only(rel: &Path) -> bool {
     rel.file_name().is_some_and(|n| n == LOCK_NAME)
 }
@@ -484,7 +501,16 @@ pub fn backup_data_dir_opts(
         online: false,
         consistent_lsn,
         taken_while_in_use: in_use,
-        encryption: BackupEncryption::default(),
+        // Read off disk, because an offline backup has no engine to ask. This
+        // used to be `default()` -- i.e. "not encrypted" -- on every offline
+        // backup whatever the source was, and offline is the DEFAULT for
+        // `nucleus backup`. A byte copy of an encrypted database then restored
+        // cleanly and failed to OPEN, as a decryption error rather than as
+        // "this snapshot needs key X".
+        //
+        // A source that has not been opened since markers existed still has
+        // none, and reports unencrypted as before; one server start fixes it.
+        encryption: recorded_encryption(data_dir),
         files: fingerprint_tree(&snapshot_data)?,
     };
     write_manifest(output_dir, &manifest)?;
@@ -913,6 +939,77 @@ mod tests {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// An OFFLINE backup of an encrypted database must name the key it needs.
+    ///
+    /// Offline is the default for `nucleus backup` and had no engine to ask,
+    /// so it wrote `BackupEncryption::default()` — "not encrypted" — for every
+    /// source. Restoring such a snapshot succeeded and the database then
+    /// failed to open, as a decryption error rather than as a named key.
+    #[test]
+    fn an_offline_backup_names_the_key_its_source_is_encrypted_under() {
+        use crate::storage::encryption::{PageEncryptor, record_key};
+
+        let root = unique_tmp("offline_enc");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        let snap = root.join("snap");
+        write(&data, "catalog.json", b"{}");
+
+        // Control: with nothing recorded, the manifest reports unencrypted —
+        // which is what every offline backup reported unconditionally before.
+        let plain = backup_data_dir(&data, &snap, false, "0.1.6").unwrap();
+        assert!(!plain.encryption.encrypted);
+        assert_eq!(plain.encryption.key_id, None);
+
+        // Now the database records its key, as opening it encrypted does.
+        let enc = PageEncryptor::from_key(&[7u8; 32]);
+        record_key(&data.join("nucleus.db"), enc.key_id()).unwrap();
+
+        let snap2 = root.join("snap2");
+        let m = backup_data_dir(&data, &snap2, false, "0.1.6").unwrap();
+        assert!(m.encryption.encrypted, "an encrypted source must say so");
+        assert_eq!(
+            m.encryption.key_id.as_deref(),
+            Some(enc.key_id()),
+            "the manifest must name the key a restore will need"
+        );
+        assert_eq!(m.encryption.algorithm.as_deref(), Some("aes-256-gcm"));
+
+        // The marker travels with the snapshot, so a backup of a restored copy
+        // is still able to name the key.
+        assert!(snap2.join(DATA_SUBDIR).join("encryption.json").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Opening an encrypted database with the wrong key must say so.
+    #[test]
+    fn a_different_key_is_refused_by_name() {
+        use crate::storage::encryption::{PageEncryptor, record_key};
+
+        let root = unique_tmp("wrong_key");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        std::fs::create_dir_all(&data).unwrap();
+        let db = data.join("nucleus.db");
+
+        let a = PageEncryptor::from_key(&[1u8; 32]);
+        let b = PageEncryptor::from_key(&[2u8; 32]);
+        record_key(&db, a.key_id()).unwrap();
+
+        // The same key is accepted, repeatedly.
+        record_key(&db, a.key_id()).unwrap();
+
+        let err = record_key(&db, b.key_id()).expect_err("a different key must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(a.key_id()) && msg.contains(b.key_id()),
+            "the refusal must name both the recorded key and the supplied one; got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
