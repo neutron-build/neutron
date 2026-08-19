@@ -210,6 +210,18 @@ for entry in "${PROBES[@]}"; do
     else
       echo "  FAIL  $label  (exit $rc)"
     fi
+    # A fixed tail is not enough on its own. Several harnesses print their
+    # FAIL reason BEFORE a long summary block, so `tail -25` shows the verdict
+    # and cuts the cause: on 2026-08-19 probe_soak reported `SOAK FAILED` in CI
+    # with every visible statistic inside its limits, and the line saying which
+    # gate tripped had scrolled off. Diagnosing that cost a local rebuild and a
+    # rerun. Surface the reason lines from the WHOLE log first, then the tail.
+    reasons=$(grep -aE '^ *(FAIL:|LEAK GATE|[A-Z ]*FAILED)' "$log" 2>/dev/null | head -20)
+    if [ -n "$reasons" ]; then
+      echo "        ---- reason lines (grepped from the whole log) ----"
+      printf '%s\n' "$reasons" | sed 's/^/        /'
+      echo "        ---- last 25 lines ----"
+    fi
     sed 's/^/        /' "$log" | tail -25
     fail=1
   fi
