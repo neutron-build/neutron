@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 308510; Source Rust files: 277; Top-level modules: 52.
-- Declared unit tests: 4363; Declared integration tests: 384; Ignored tests: 46.
+- Source LOC: 308710; Source Rust files: 277; Top-level modules: 52.
+- Declared unit tests: 4365; Declared integration tests: 384; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -741,17 +741,32 @@ Evidence: `nucleus/tests/cross_model_txn_wire.rs` — eight end-to-end pgwire te
 crash recovery). Each fix was reverted individually and the matching test observed
 to fail.
 
+- [x] **A mutation `ROLLBACK` cannot revert is refused inside a transaction** (2026-08-19,
+      S63 slice). M8's exit gate allows implementing the boundary or failing loud; this is the
+      second, and it replaces the previous behaviour, which acknowledged the write and kept it
+      after a rollback the client was told had succeeded. Measured before fixing: `KV_HSET`,
+      `KV_LPUSH`, `KV_SADD` and `COLUMNAR_INSERT` all survived a `ROLLBACK`.
+      Refused inside an explicit transaction, with SQLSTATE `0A000` naming the store and no
+      change outside one: KV collection types, `COLUMNAR_INSERT`, `SPARSE_*`, `TENSOR_STORE`,
+      the Datalog bulk imports, retention setters, procedure registration, branch/version
+      operations, and pub/sub publish/subscribe. Sequences are the declared exception --
+      `NEXTVAL`/`SETVAL` do not roll back in PostgreSQL either and `SERIAL` depends on it.
+      The classification is enforced against the dispatcher's own source: every name in
+      `SIDE_EFFECTING_FN_NAMES` must be structurally enlisted, refused, or declared
+      non-transactional, so a new mutating function cannot quietly join the silent-loss set.
+
 Still open in this milestone:
 
-- No model is crash-atomic with the SQL commit. A COMMIT still fsyncs the SQL WAL
-  and the specialty logs as two ordered steps, and six specialty logs are not
-  fsynced at a commit boundary at all.
+- No model is crash-atomic with the SQL commit. The commit order was inverted so specialty
+  logs are fsynced BEFORE the SQL WAL (NU-006), which makes the partial deterministically the
+  safe half -- an orphaned specialty write rather than a durable SQL commit referencing
+  records that were never written -- but it is not atomicity. The shared commit record and
+  recovery filter (`M8_CROSS_MODEL_ATOMICITY.md` §3.4, steps S4/S6) are still unbuilt.
 - No isolation on specialty stores: one session reads another's uncommitted
   non-SQL writes, and two sessions writing the same key still conflict
   destructively.
-- KV collections, the columnar analytics store, streams, and CDC still do not
-  participate in transactions at all; their writes survive `ROLLBACK`, and CDC
-  publishes change events for transactions that never committed.
+- CDC still publishes change events for transactions that never committed (NU-107). The other
+  non-participating surfaces are now refused rather than silently kept, per the entry above.
 - Vector rollback is not durable (no compensating record in `vector/vector.wal`).
 
 ### `BEGIN ISOLATION LEVEL SERIALIZABLE` is accepted and silently ignored on disk

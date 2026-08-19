@@ -64,6 +64,16 @@ impl Executor {
         // function must see the same canonical name the dispatcher executes.
         let fname = fname.strip_prefix("PG_CATALOG.").unwrap_or(fname);
 
+        // A mutation this transaction could not undo must not be accepted
+        // inside one. See `refused_in_transaction`: ROLLBACK reverts a
+        // write-set that does not cover these stores, so before this they
+        // stayed written after a rollback the client was told had succeeded.
+        if let Some(reason) = refused_in_transaction(fname)
+            && self.session_in_txn()
+        {
+            return Err(ExecError::Unsupported(format!("{fname}: {reason}")));
+        }
+
         if is_specialty_surface(fname) && self.any_rls_active() {
             return Err(ExecError::PermissionDenied(format!(
                 "{fname} is unavailable while row-level security is active because this specialty-store surface has no policy-aware access path"
@@ -6483,6 +6493,91 @@ pub(crate) fn is_specialty_surface(fname: &str) -> bool {
                 | "UNSUBSCRIBE"
         )
 }
+
+/// Why a mutating specialty function is refused inside an explicit
+/// transaction, or `None` if it is allowed there.
+///
+/// ROLLBACK reverts a per-session cross-model write-set (`executor::cross_model`)
+/// that covers KV strings, graph, document, datalog, time-series points, blob,
+/// vector, streams and FTS. Everything else a specialty function can mutate is
+/// NOT in that write-set, and before this it stayed written after a ROLLBACK
+/// the client was told had succeeded — measured, not assumed: `KV_HSET`,
+/// `KV_LPUSH`, `KV_SADD` and `COLUMNAR_INSERT` all survived one.
+///
+/// Refusing them inside a transaction is M8's declared contract ("implement
+/// the boundaries or fail loud"), and it is the honest half: a client that
+/// cannot get the guarantee should be told, not acknowledged. Outside a
+/// transaction they behave exactly as before.
+///
+/// `test_specialty_surface_guard` requires every name in
+/// `SIDE_EFFECTING_FN_NAMES` to be either structurally enlisted (its dispatch
+/// arm records into the write-set), listed here, or listed in
+/// `NON_TRANSACTIONAL_BY_DESIGN` — so a new mutating function cannot quietly
+/// join the silent-loss set.
+pub(crate) fn refused_in_transaction(fname: &str) -> Option<&'static str> {
+    // KV collection types live in a separate keyspace from KV strings, and the
+    // transaction snapshot covers only the string store.
+    if matches!(
+        fname,
+        "KV_HSET"
+            | "KV_HDEL"
+            | "KV_LPUSH"
+            | "KV_RPUSH"
+            | "KV_LPOP"
+            | "KV_RPOP"
+            | "KV_SADD"
+            | "KV_SREM"
+            | "KV_ZADD"
+            | "KV_ZREM"
+            | "KV_PFADD"
+            | "KV_PFMERGE"
+    ) {
+        return Some(
+            "KV collection types (hashes, lists, sets, sorted sets, HyperLogLog) are not              covered by transaction rollback; call it outside an explicit transaction",
+        );
+    }
+    match fname {
+        "COLUMNAR_INSERT" => Some(
+            "the columnar store is not covered by transaction rollback; insert outside an              explicit transaction",
+        ),
+        "SPARSE_INSERT" | "SPARSE_REMOVE" => Some(
+            "the sparse index is not covered by transaction rollback; call it outside an              explicit transaction",
+        ),
+        "TENSOR_STORE" => Some(
+            "the tensor store is not covered by transaction rollback; store outside an              explicit transaction",
+        ),
+        "DATALOG_IMPORT" | "DATALOG_IMPORT_GRAPH" | "DATALOG_IMPORT_NODES" => Some(
+            "bulk Datalog import is not covered by transaction rollback (single-fact              DATALOG_ASSERT/RETRACT are); import outside an explicit transaction",
+        ),
+        "TS_RETENTION" | "RETENTION_SET" => Some(
+            "retention policy changes are not covered by transaction rollback; set them              outside an explicit transaction",
+        ),
+        "PROC_REGISTER" | "PROC_DROP" => Some(
+            "stored-procedure registration is not covered by transaction rollback; register              outside an explicit transaction",
+        ),
+        "DB_BRANCH_CREATE" | "DB_BRANCH_DELETE" | "DB_BRANCH_MERGE" | "VERSION_BRANCH"
+        | "VERSION_COMMIT" => Some(
+            "branch and version operations are not covered by transaction rollback; run them              outside an explicit transaction",
+        ),
+        "PUBSUB_PUBLISH" | "SUBSCRIBE" | "UNSUBSCRIBE" => Some(
+            "pub/sub delivery is immediate and cannot be un-published by a ROLLBACK;              publish or subscribe outside an explicit transaction",
+        ),
+        _ => None,
+    }
+}
+
+/// Mutating functions that are deliberately NOT transactional, with the reason.
+///
+/// Only sequences: PostgreSQL's `nextval`/`setval` do not roll back either —
+/// that is the documented contract, and every `SERIAL` column depends on it, so
+/// refusing them inside a transaction would break ordinary INSERTs.
+/// Read only by the enlistment audit — it is a declaration, and the audit is
+/// what makes the declaration load-bearing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NON_TRANSACTIONAL_BY_DESIGN: [(&str, &str); 2] = [
+    ("NEXTVAL", "sequences do not roll back in PostgreSQL either"),
+    ("SETVAL", "sequences do not roll back in PostgreSQL either"),
+];
 
 /// Return type of a *side-effecting* built-in scalar function, or `None`
 /// for pure ones. This is the registry the pgwire Describe path uses to

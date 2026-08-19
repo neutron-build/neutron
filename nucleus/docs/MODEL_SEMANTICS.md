@@ -34,7 +34,7 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 |---|---|---|---|---|---|
 | SQL / relational | **fsync** | yes | **yes** | n/a (is the SQL commit) | **enforced** (policies) |
 | KV (scalar) | fsync | yes | yes, **session-scoped** | **no** | yes (SQL); **no** over RESP |
-| KV collections | fsync | yes | **no** | **no** | yes (SQL); **no** over RESP |
+| KV collections | fsync | yes | **refused inside a transaction** (2026-08-19) | **no** | yes (SQL); **no** over RESP |
 | Document | fsync (**2026-08-18**, NU-006) | yes | yes, **session-scoped** | **no** | yes |
 | Graph | fsync | yes | yes, **session-scoped** | **no** | yes |
 | FTS — table index (`USING FTS`, `@@`, `BM25`) | n/a — derived from rows | rebuilt from base rows at startup | **yes** (rebuilt from committed rows on abort) | n/a — the rows are the SQL commit | **enforced** (rows go through table policies) |
@@ -43,19 +43,32 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Vector (HNSW) | fsync | yes | yes, **session-scoped** | **no** | decorative (see below) |
 | Vector (IvfFlat) | **none** (rebuilt) | rebuilt from base rows | via rebuild | n/a | decorative |
 | Time series | fsync | yes | yes, **session-scoped** | **no** | yes |
-| Columnar *store* (`COLUMNAR_*`) | fsync (**2026-08-18**, NU-006) | yes | **no** | **no** | yes |
+| Columnar *store* (`COLUMNAR_*`) | fsync (**2026-08-18**, NU-006) | yes | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Columnar *engine* (`engine='columnar'`) | **fsync** | yes | **yes** | yes | via table policies |
 | Datalog | fsync | yes (**fixed 2026-08-17**, NU-013) | yes (in-memory) | **no** | yes |
-| Streams (SQL `STREAM_*`) | fsync (entries only) | entries yes; **groups/acks no** | **no** | **no** | yes |
+| Streams (SQL `STREAM_*`) | fsync (entries only) | entries yes; **groups/acks no** | yes, **session-scoped** (`9820d85a`) | **no** | yes |
 | Streams (RESP `XADD`) | **none** | **NO** | **no** | **no** | **no** |
 | CDC | fsync (**2026-08-18**, NU-006) | yes | **no** | **no** — emitted pre-commit (NU-107 open) | yes (metadata only) |
 | Blob / large objects | fsync for manifests (**2026-08-18**, NU-006) | manifests yes; payload racy | yes, **session-scoped** | **no** | yes |
-| Pub/Sub | **none** | **NO** | **no** | **no** | yes |
-| Branch / version | **none** | **NO** | **no** | **no** | yes |
-| Tensor | **none** | **NO** | **no** | **no** | yes |
-| Sparse | **none** | **NO** | **no** | **no** | yes |
+| Pub/Sub | **none** | **NO** | **refused inside a transaction** (delivery is immediate) | **no** | yes |
+| Branch / version | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
+| Tensor | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
+| Sparse | **none** | **NO** | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Encrypted index | derived | rebuilt from plaintext rows | repaired by rebuild | n/a | yes |
-| Stored procedures | **none** | **NO** | **no** | **no** | partial (`CALL` ungated) |
+| Stored procedures | **none** | **NO** | **refused inside a transaction** (registration; `CALL` is not) | **no** | partial (`CALL` ungated) |
+
+**"Refused inside a transaction" (2026-08-19).** A mutation that `ROLLBACK`
+cannot revert is no longer accepted where a client would expect it to be
+revertible: it errors with SQLSTATE `0A000` naming the store, and works
+unchanged outside an explicit transaction. This is M8's declared contract —
+implement the boundary or fail loud — and it replaces the previous behaviour,
+which acknowledged the write and kept it after a rollback the client was told
+had succeeded. Sequences (`NEXTVAL`/`SETVAL`) are the deliberate exception:
+they do not roll back in PostgreSQL either, and `SERIAL` depends on that.
+
+`test_specialty_surface_guard` enforces the classification against the
+dispatcher's own source, so a new mutating function must be enlisted, refused,
+or declared non-transactional — it cannot quietly join the silent-loss set.
 
 ### The facts that matter most
 
