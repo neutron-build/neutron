@@ -265,6 +265,34 @@ pub fn database_id(data_dir: &Path) -> String {
 // Copying
 // ---------------------------------------------------------------------------
 
+/// Highest LSN across every WAL under `dir` (segmented directory or single
+/// file), or 0 when none is readable.
+///
+/// Deliberately tolerant: a WAL that cannot be parsed yields 0 rather than an
+/// error, because failing a backup over an unreadable log would trade a missing
+/// safety check for a missing backup. 0 restores the previous behaviour for
+/// that case -- the guard stays off -- rather than inventing a floor.
+fn max_wal_lsn(dir: &Path) -> u64 {
+    let mut max = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir && path.extension().is_some_and(|e| e == "d") {
+            for r in crate::storage::wal::read_wal_dir_records(&path).unwrap_or_default() {
+                max = max.max(r.lsn);
+            }
+        } else if !is_dir && path.extension().is_some_and(|e| e == "wal") {
+            for r in crate::storage::wal::read_wal_records(&path).unwrap_or_default() {
+                max = max.max(r.lsn);
+            }
+        }
+    }
+    max
+}
+
 /// Recursively copy a directory tree (files + subdirectories only; symlinks and
 /// other special files are skipped for safety).
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
@@ -431,6 +459,21 @@ pub fn backup_data_dir_opts(
     let snapshot_data = output_dir.join(DATA_SUBDIR);
     copy_dir_filtered(data_dir, &snapshot_data, &|rel| !is_runtime_only(rel))?;
 
+    // The highest LSN the copied WAL carries. This used to be hardcoded to 0,
+    // which quietly disabled a guard that matters: `restore_pitr` refuses a
+    // target older than the base only `if manifest.consistent_lsn > 0`, because
+    // replay moves forward and an older target silently returns the base
+    // unchanged while reporting success. The offline path is the DEFAULT for
+    // `nucleus backup` (`--online` is opt-in), so in practice that protection
+    // never fired: an operator restoring to an LSN before a destructive
+    // statement got "success" and the statement still there.
+    //
+    // A copy of a cleanly-closed database is consistent at its WAL's last LSN.
+    // If it was taken in use (`--allow-in-use`), this can OVERSTATE, and that
+    // is the safe direction: overstating makes the guard refuse a restore it
+    // might have allowed -- a loud refusal instead of a silent no-op rollback.
+    let consistent_lsn = max_wal_lsn(&snapshot_data);
+
     let manifest = BackupManifest {
         nucleus_version: nucleus_version.to_string(),
         format: FORMAT_V1.to_string(),
@@ -439,7 +482,7 @@ pub fn backup_data_dir_opts(
         format_version: crate::storage::page::DB_FORMAT_VERSION,
         database_id: db_id,
         online: false,
-        consistent_lsn: 0,
+        consistent_lsn,
         taken_while_in_use: in_use,
         encryption: BackupEncryption::default(),
         files: fingerprint_tree(&snapshot_data)?,

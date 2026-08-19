@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 305069; Source Rust files: 270; Top-level modules: 51.
-- Declared unit tests: 4314; Declared integration tests: 377; Ignored tests: 46.
+- Source LOC: 305112; Source Rust files: 270; Top-level modules: 51.
+- Declared unit tests: 4314; Declared integration tests: 380; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -334,10 +334,22 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       version did not discriminate -- one LSN per segment meant the horizon could never fall
       inside one, and it passed against a deliberately wrong `min_lsn` comparison. The fixture
       now writes several records per segment and the wrong version fails it.
-- [ ] Add restore-to-latest and restore-to-time/position workflows.
-      LIKELY DONE, needs an end-to-end gate: `pitr::PitrTarget` implements Lsn / Time / Latest and
-      `restore_pitr` rebuilds the WAL dir truncated at the target. Left unchecked until a restore
-      is verified from a clean directory rather than in-process.
+- [x] Add restore-to-latest and restore-to-time/position workflows.
+      Gated 2026-08-18 by `tests/pitr_cli_roundtrip.rs`, which drives the real binary
+      (`CARGO_BIN_EXE_nucleus`) as a subprocess and then opens what it produced: batch A lands in
+      a base snapshot, batch B only in the archived WAL, and a restore-to-latest into a clean
+      directory must return all 80 rows -- a restore that merely unpacked the base would pass
+      every other assertion and fail that one. Also covers the report an operator reads during a
+      recovery, and the two refusals (a target older than the base; `--lsn` with `--time`, which
+      must be rejected before any directory is created).
+      **Writing the gate found a live defect.** `restore_pitr` refuses a target older than the
+      base only `if manifest.consistent_lsn > 0`, and the OFFLINE backup path -- the default for
+      `nucleus backup`, since `--online` is opt-in -- hardcoded `consistent_lsn: 0`. So the guard
+      never fired for the backups most people take: an operator restoring to an LSN before a
+      destructive statement got "success" and the statement still there, which is exactly the
+      scenario the guard's own comment describes. Offline backups now record the highest LSN in
+      the copied WAL. An in-use copy can overstate it, and that is the safe direction: a loud
+      refusal beats a silent no-op rollback.
 - [x] Add logical schema/data dump and restore across compatible format versions.
       `dump_logical`/`restore_logical` now emit sequences (with setval), tables in FK-dependency
       order, data, views, materialized views, roles, RLS policies + row-security enablement, and
