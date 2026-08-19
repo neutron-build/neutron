@@ -769,7 +769,27 @@ Still open in this milestone:
   non-participating surfaces are now refused rather than silently kept, per the entry above.
 - Vector rollback is not durable (no compensating record in `vector/vector.wal`).
 
-### `BEGIN ISOLATION LEVEL SERIALIZABLE` is accepted and silently ignored on disk
+### `BEGIN ISOLATION LEVEL SERIALIZABLE` was accepted and silently ignored on disk — FIXED
+
+**Resolved. Verified 2026-08-19 (S64/N11), by running the census rather than reading the
+code.** `BufferedDiskEngine` implements `set_next_isolation_level`
+(`src/storage/buffered_engine.rs:1123`) and provides real SERIALIZABLE through **table-level
+strict two-phase locking** with wait-die deadlock prevention -- not SSI, which needs a stable
+read snapshot the paged engine has no versioning to provide. `test_2pl_census` is the anomaly
+census against that engine: 12 tests, including `no_update_is_lost` and
+`write_skew_does_not_survive`, the two anomalies the measurement below recorded. They pass.
+A losing transaction returns SQLSTATE 40001 and a lock wait that exceeds `lock_timeout`
+returns 55P03, deliberately distinct. `docs/MODEL_SEMANTICS.md` already describes both
+mechanisms accurately and needed no correction.
+
+The contract chosen is therefore the first option below -- implement it -- and the third
+engine that cannot provide the level (`MemoryEngine`) refuses it, which
+`test_ssi_census::test_an_engine_refuses_isolation_it_cannot_provide` pins.
+
+Original finding follows, kept because the defect SHAPE recurs: a trait method with a silent
+no-op default, overridden by exactly one engine, while `supports_mvcc()` advertised the
+capability. That is the same shape as the savepoint bug above, and both were found the same
+way -- by repointing an existing harness at the engine `main.rs` actually builds.
 
 Found 2026-07-25 by repointing the concurrency harnesses at the shipped engine.
 This is the same defect shape as the savepoint bug above — `BufferedDiskEngine`
@@ -803,13 +823,19 @@ Not introduced by this branch — the no-op default is on `main`
 that asserts isolation ran on `MvccStorageAdapter`, the one engine that
 implements the method.
 
-- [ ] Decide the contract: implement conflict detection on the paged engines, or
+- [x] Decide the contract: implement conflict detection on the paged engines, or
       reject `SERIALIZABLE`/`REPEATABLE READ` with a clear error instead of
       accepting and ignoring them. Silently downgrading is the one option that
       loses data without telling anyone.
-- [ ] Reconcile `docs/MODEL_SEMANTICS.md:263-271` with whichever is chosen — it
+      **Implemented, not refused.** Table-level strict 2PL on `BufferedDiskEngine`; SSI stays
+      on `MvccStorageAdapter`. An engine that can provide neither refuses the level.
+- [x] Reconcile `docs/MODEL_SEMANTICS.md:263-271` with whichever is chosen — it
       currently calls `SHOW transaction_isolation` "advisory" but does not say a
       requested level is discarded, or that lost updates follow.
+      Already reconciled: that section documents both mechanisms, that only SERIALIZABLE
+      transactions take locks, that the 2PL loser BLOCKS where the SSI loser fails at commit,
+      wait-die and its 40001, and the 55P03 timeout distinction. Verified against the code and
+      the census on 2026-08-19 rather than assumed.
 
 Exit gate:
 
