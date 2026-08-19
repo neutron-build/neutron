@@ -371,6 +371,20 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       policies, views, sequences, and functions were absent from the executor and the dump emitted
       nothing for them — the library tests passed while the shipped command stayed broken.
 - [ ] Define encrypted-backup key handling and key rotation.
+      Characterised 2026-08-18, not implemented -- it needs a design decision, not a patch.
+      Two concrete gaps. **(1) `key_id` is never populated on either path.** Its own doc comment
+      says it is the "operator-facing key identifier, so a restore can locate the key", and
+      `DiskEngine::encryption_info` hardcodes `key_id: None`. So the field that exists to let a
+      restore find the key is always empty, and there is no rotation story because nothing
+      identifies which key a snapshot was taken under. **(2) Offline backups always report
+      `BackupEncryption::default()`** -- i.e. "not encrypted" -- regardless of the source. The
+      online path is correct (`backup.rs:536` calls `encryption_info()`), but the offline path
+      reads a CLOSED database and has no engine to ask, so it would have to read the setting off
+      disk. Offline is the default for `nucleus backup`. Consequence: a byte copy of an
+      encrypted database restores fine and then fails to OPEN, with a decryption error rather
+      than "this snapshot needs key X".
+      The design question that blocks this: where do keys live (env, keyring, file, KMS), and
+      what does rotation mean for snapshots already taken under the old key.
 - [ ] Add restore verification, corruption detection, and automated disaster-recovery tests.
       PARTIAL (2026-07-24). DONE: `restore_data_dir` verifies every manifest checksum before it
       touches the destination and refuses a snapshot that is corrupted, truncated, missing a file,
