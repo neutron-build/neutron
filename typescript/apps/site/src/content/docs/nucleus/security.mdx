@@ -62,17 +62,38 @@ Users with the `superuser` role bypass all RLS policies.
 
 ## Column-Level Data Masking
 
-Not yet available. Nucleus carries an internal masking policy engine, but it has
-no SQL DDL and **no executor enforcement** — no query path applies a mask, so
-values are always returned unmasked.
+Mask a column's value for a role, without changing what is stored:
 
-Do not rely on column masking for isolation. Use RLS, which is enforced, to keep
-a role away from rows it must not read; to restrict access to particular
-*columns*, expose a view that omits them and grant the role access to the view
-rather than the base table. (Nucleus privileges are table-scoped — there is no
-column-level `GRANT`.)
+```sql
+CREATE MASKING POLICY ON people (ssn)   TO analyst USING REDACT '***';
+CREATE MASKING POLICY ON people (email) TO analyst USING EMAIL;
+CREATE MASKING POLICY ON cards  (pan)   TO support USING PARTIAL (0, 4, '*');
+CREATE MASKING POLICY ON people (name)  TO analyst USING HASH;
 
-This page will document the feature when it enforces.
+SHOW MASKING POLICIES;
+DROP MASKING POLICY ON people (ssn) TO analyst;
+```
+
+| Rule | Effect |
+|------|--------|
+| `REDACT '<text>'` | Replace the value with a constant |
+| `EMAIL` | `ada@example.com` → `a**@example.com` |
+| `PARTIAL (first, last [, 'char'])` | Keep the first and last N characters, mask the middle |
+| `HASH` | Replace with a stable digest, for pseudonymisation |
+| `NONE` | Pass through |
+
+A policy is identified by `(table, column, role)`; creating one for the same
+triple replaces it. Masking DDL requires superuser authority, participates in
+transactions with the rest of the security catalog, and survives restart.
+
+Masks apply to a role the session **has**, including through role membership,
+and they apply on every path a row leaves by — not just plain `SELECT`.
+Superusers are not masked.
+
+Two limits worth knowing. Masking is not a substitute for RLS: it changes the
+value returned, so a masked column can still be used in a `WHERE` clause to
+narrow rows. And there is no column-level `GRANT` — to remove a column from a
+role's reach entirely, expose a view that omits it.
 
 ## Encryption
 
@@ -155,13 +176,26 @@ Context properties available to RLS predicates and masking rules:
 
 ### Inter-Node TLS
 
-In clustered deployments, replication traffic is encrypted with TLS. Configure via:
+In clustered deployments, node-to-node traffic — Raft and replication — uses
+**mutual** TLS: each node presents its certificate and requires its peer to
+present one signed by the cluster CA, in both directions. A node without a
+valid certificate cannot join, and a node will not talk to a peer whose
+certificate the CA did not sign.
 
-```toml
-[cluster.tls]
-cert = "/path/to/node.crt"
-key = "/path/to/node.key"
-ca = "/path/to/ca.crt"
+Configure it with environment variables (there is no `[cluster.tls]` TOML
+section — this page previously showed one that does not exist):
+
+```bash
+NUCLEUS_INTERNAL_TLS=1
+NUCLEUS_INTERNAL_TLS_CERT=/path/to/node.crt
+NUCLEUS_INTERNAL_TLS_KEY=/path/to/node.key
+NUCLEUS_INTERNAL_TLS_CA=/path/to/ca.crt
+NUCLEUS_INTERNAL_TLS_SERVER_NAME=nucleus.internal   # optional, default "localhost"
 ```
+
+`NUCLEUS_CLUSTER_TOKEN` is still enforced at connection setup and is a second
+factor rather than a replacement. Node identity within an authenticated cluster
+is not yet bound to the certificate: a peer that completes the handshake is
+trusted for the node id it claims.
 
 All Raft messages, WAL streaming, and gossip use encrypted channels.

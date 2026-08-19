@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 307283; Source Rust files: 273; Top-level modules: 52.
-- Declared unit tests: 4344; Declared integration tests: 383; Ignored tests: 46.
+- Source LOC: 307944; Source Rust files: 275; Top-level modules: 52.
+- Declared unit tests: 4352; Declared integration tests: 384; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -541,7 +541,28 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       through `sync_block_on` and executed as the bootstrap superuser with RLS bypassed; and
       CURRENT_USER/CURRENT_ROLE/SESSION_USER returned a constant instead of the session principal.
       NOT covered in-process: replica/follower reads (needs a live cluster).
-- [ ] Implement column-masking DDL, catalog persistence, transactionality, and executor enforcement.
+- [x] Implement column-masking DDL, catalog persistence, transactionality, and executor enforcement.
+      **Closed 2026-08-19 (S60/N13).** Enforcement, persistence and transactionality already
+      landed and are covered by `test_masking`. The DDL did not exist: `MaskingEngine::add_policy`
+      is a Rust API, so a pgwire client -- which is every client -- could not create a policy.
+      An enforcement engine nobody can reach is a feature only the test suite has.
+      `CREATE MASKING POLICY ON <table> (<column>) TO <role> USING REDACT '<text>' | EMAIL |
+      PARTIAL (n, m [, '<char>']) | HASH | NONE`, plus `DROP MASKING POLICY ON ... TO ...` and
+      `SHOW MASKING POLICIES`, which renders each policy in the form that would recreate it.
+      Hand-parsed like the codebase's other non-standard statements (`BACKUP DATABASE TO`,
+      `SUBSCRIBE`, `CACHE_SET`). Identified by `(table, column, role)` because that is what the
+      engine stores and what `remove_policy` takes -- a policy NAME would be a second identity
+      the persisted form does not have.
+      Creation also resolves the stable column id, which nothing else could: `column_id` carried
+      the comment "masking has no CREATE DDL surface yet, so there is no statement at which to
+      resolve the id", leaving it unbound until a rename happened to stamp it -- so until then a
+      mask followed its column NAME, the direction that fails OPEN.
+      Refused rather than stored: a missing column, a missing table, a missing role, an unknown
+      rule, and every malformed shape of the grammar (9 cases, with a control asserting none of
+      them left a policy behind). Superuser-only, like RLS policy DDL.
+      `tests/masking_ddl_wire.rs` proves the gate over real pgwire in BOTH protocols -- the
+      extended one Parses and Describes before executing, and a non-standard statement has no
+      AST to describe.
 - [ ] Define policy-aware materialized-view refresh and invocation semantics.
 - [ ] Add policy alteration/introspection commands or explicitly constrain v1 to create/drop.
 - [ ] Preserve fail-closed behavior for unsupported policy expressions and protected specialty calls.

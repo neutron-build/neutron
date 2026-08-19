@@ -280,7 +280,9 @@ is admission to the cluster, which is what the shared token was carrying alone.
   as in PostgreSQL. RLS protects row contents, not all timing or existence side channels.
 - Physical backup, restore, and replication are privileged administrative surfaces over raw storage;
   they are not tenant-filtered exports.
-- Column masking has a persisted internal policy engine but no SQL DDL or executor enforcement yet.
-  Do not rely on column masking for isolation.
+- Column masking is enforced and has a SQL DDL surface (`CREATE MASKING POLICY ON <table>
+  (<column>) TO <role> USING ...`, `DROP MASKING POLICY`, `SHOW MASKING POLICIES`, superuser-only).
+  It changes the VALUE a role sees, not which rows exist, so a masked column can still narrow a
+  `WHERE` clause — use RLS for row isolation and masking for value redaction, not the reverse.
 - Specialty stores have their own data and policy boundaries. RLS prevents SQL/binary cross-model
   bypasses; it does not reinterpret relational table policies as RESP KV-key or graph-edge policies.

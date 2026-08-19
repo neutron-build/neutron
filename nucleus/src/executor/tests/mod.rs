@@ -53,7 +53,8 @@ mod test_join_plan_path; // which JOIN spellings actually reach the plan executo
 mod test_jsonb;
 mod test_logical_dump; // T2.1: logical (SQL-text) backup round-trip
 mod test_lost_update; // N22: concurrent UPDATEs must not silently lose writes
-mod test_masking; // column masking is enforced, not merely declared
+mod test_masking;
+mod test_masking_ddl; // N13: the CREATE MASKING POLICY surface
 mod test_memory_budget; // T1.2: query memory-budget enforcement (gating)
 mod test_meta_persistence;
 mod test_module_wiring;

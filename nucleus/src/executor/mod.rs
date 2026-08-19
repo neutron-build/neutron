@@ -136,6 +136,7 @@ mod expr;
 mod helpers;
 mod join;
 mod logical_dump;
+mod masking_ddl;
 #[cfg(feature = "server")]
 pub use logical_dump::open_persistent_executor;
 mod external_sort;
@@ -3219,7 +3220,7 @@ impl Executor {
     /// Read the security catalog visible to this SQL transaction. Policy DDL
     /// is staged per session, so other connections continue to see the
     /// committed catalog until COMMIT.
-    fn with_visible_security<R>(
+    pub(super) fn with_visible_security<R>(
         &self,
         f: impl FnOnce(&crate::security::SecurityManager) -> R,
     ) -> R {
@@ -4993,6 +4994,18 @@ impl Executor {
                     ));
                 }
                 return Ok(vec![self.execute_fetch_subscription(trimmed)?]);
+            }
+            // Column masking's DDL surface. Enforcement landed long before a way
+            // to declare a policy over the wire existed, so masking was
+            // reachable only from Rust — i.e. only from the test suite.
+            if upper.starts_with("CREATE MASKING POLICY") {
+                return Ok(vec![self.execute_create_masking_policy(trimmed)?]);
+            }
+            if upper.starts_with("DROP MASKING POLICY") {
+                return Ok(vec![self.execute_drop_masking_policy(trimmed)?]);
+            }
+            if upper == "SHOW MASKING POLICIES" || upper == "SHOW MASKING POLICIES;" {
+                return Ok(vec![self.execute_show_masking_policies()?]);
             }
             if upper == "SHOW MEMORY" || upper == "SHOW MEMORY;" {
                 return Ok(vec![self.execute_show_memory()]);
