@@ -87,6 +87,12 @@ pub async fn open_persistent_executor(
     // tests build executors that already hold this state in memory, so they
     // pass either way; only the CLI path exposes the gap.
     ex.load_meta().await;
+    // B-tree indexes live only in the engine's in-memory registry, so a
+    // freshly opened directory has none of them however many the catalog
+    // lists. Every caller of this helper — the CLI's dump/restore paths and
+    // the wire tests — otherwise runs with every index missing and every
+    // indexed query scanning.
+    ex.rebuild_persistent_indexes().await;
     Ok(ex)
 }
 

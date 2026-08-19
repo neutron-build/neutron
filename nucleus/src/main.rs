@@ -1243,6 +1243,14 @@ async fn cmd_start(cfg: StartConfig) {
     // Rebuild specialty indexes (IvfFlat, encrypted) from table data after restart.
     executor.rebuild_specialty_indexes().await;
 
+    // And the ordinary B-tree indexes, which this did NOT cover: they live in
+    // the engine's in-memory registry, so before this every restart left the
+    // catalog advertising indexes the engine did not have, and every indexed
+    // query silently fell back to a full scan. See
+    // `rebuild_persistent_indexes` for why it rebuilds rather than re-opening
+    // a persisted root.
+    executor.rebuild_persistent_indexes().await;
+
     // Resolve password: CLI arg takes priority, then NUCLEUS_PASSWORD env var.
     let resolved_password = password.or_else(|| std::env::var("NUCLEUS_PASSWORD").ok());
     let resolved_auth_method = auth_method

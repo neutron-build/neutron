@@ -309,6 +309,91 @@ impl Executor {
         }
     }
 
+    /// Rebuild the storage-engine B-tree indexes the catalog says exist.
+    ///
+    /// `DiskEngine::indexes` is an in-memory registry populated by
+    /// `create_index` at DDL time, and nothing rebuilt it at startup. So after
+    /// reopening a data directory the catalog still advertised every index and
+    /// the engine had none — `index_lookup(t, "t_pkey", …)` answered
+    /// `index 't_pkey' not found`, the read fast path swallowed that with
+    /// `.ok().flatten()`, and every indexed query silently degraded to a full
+    /// scan. Forever, with nothing in the log.
+    ///
+    /// This rebuilds them from the data pages, which is O(rows) per index and
+    /// therefore a real cost at boot on a large database. Measured on this
+    /// laptop: **0.44s for 10,000 rows and 4.91s for 100,000**, one index —
+    /// about 49us/row, linear. A 1M-row table with three indexes is therefore
+    /// ~2.5 minutes of startup, which is the number that argues for the O(1)
+    /// alternative below rather than against rebuilding at all: the status quo
+    /// was not a faster start, it was a database whose indexes did not
+    /// function. It is the honest
+    /// version rather than the cheap one: persisting each B-tree's root page id
+    /// and re-opening it would be O(1), but the root MOVES on a root split, so
+    /// a persisted id can name a page that is no longer a root — and reopening
+    /// there returns wrong answers rather than slow ones. Doing that safely
+    /// needs the root id updated atomically with the split, or a validity check
+    /// on open; until one exists, rebuilding is the option that cannot be
+    /// subtly wrong. `OPEN_WORK.md` §0g carries the trade-off.
+    ///
+    /// Synchronous, and before the server accepts connections: a background
+    /// rebuild would race concurrent inserts, and a row inserted after the
+    /// build's scan and before registration would be missing from the index —
+    /// wrong answers again.
+    pub async fn rebuild_persistent_indexes(&self) {
+        let started = std::time::Instant::now();
+        let mut rebuilt = 0usize;
+        let mut failed = 0usize;
+        for table in self.catalog.table_names().await {
+            let Some(table_def) = self.catalog.get_table(&table).await else {
+                continue;
+            };
+            for index in self.catalog.get_indexes(&table).await {
+                if !matches!(
+                    index.index_type,
+                    crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+                ) || index.options.contains_key("encryption_mode")
+                {
+                    continue;
+                }
+                let Some(column) = index.columns.first() else {
+                    continue;
+                };
+                let Some(col_idx) = table_def.column_index(column) else {
+                    continue;
+                };
+                match self
+                    .storage_for(&table)
+                    .create_index(&table, &index.name, col_idx)
+                    .await
+                {
+                    Ok(()) => {
+                        self.btree_indexes
+                            .insert((table.clone(), column.clone()), index.name.clone());
+                        rebuilt += 1;
+                    }
+                    Err(e) => {
+                        // Not fatal: the query paths fall back to a scan, which
+                        // is what they did for every index before this existed.
+                        tracing::warn!(
+                            target: "nucleus::startup",
+                            "index '{}' on '{table}' could not be rebuilt: {e}. Queries on \
+                             that column will use a sequential scan.",
+                            index.name
+                        );
+                        failed += 1;
+                    }
+                }
+            }
+        }
+        if rebuilt > 0 || failed > 0 {
+            tracing::info!(
+                target: "nucleus::startup",
+                "rebuilt {rebuilt} storage index(es) in {:.1}s ({failed} failed)",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+
     /// Migrate a per-table override engine (columnar / mergetree / lsm) from an
     /// old name to a new one during ALTER TABLE ... RENAME (T0.3). The override's
     /// on-disk directory, engines.json entry, routing-map key, and columnar

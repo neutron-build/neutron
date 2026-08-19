@@ -328,6 +328,29 @@ async fn a_write_after_restart_rebuilds_the_index_it_needs() {
 async fn pk_write_cost_measurement() {
     use std::time::Instant;
 
+    // What the startup index rebuild costs, since it is now paid on every boot.
+    for rows in [10_000i32, 100_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(crate::catalog::Catalog::new());
+        let engine = Arc::new(DiskEngine::open(&dir.path().join("r.db"), catalog.clone()).unwrap());
+        let buffered = Arc::new(BufferedDiskEngine::new(engine));
+        let ex = Arc::new(Executor::new(
+            catalog,
+            buffered as Arc<dyn crate::storage::StorageEngine>,
+        ));
+        exec(&ex, "CREATE TABLE r (id INT PRIMARY KEY, v TEXT)").await;
+        for chunk in (1..=rows).collect::<Vec<_>>().chunks(500) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("({i}, 'v{i}')")).collect();
+            exec(&ex, &format!("INSERT INTO r VALUES {}", values.join(", "))).await;
+        }
+        let t = Instant::now();
+        ex.rebuild_persistent_indexes().await;
+        println!(
+            "startup index rebuild: {rows} rows, 1 index, {:.2}s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+
     for rows in [5_000i32, 20_000] {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(crate::catalog::Catalog::new());
@@ -386,4 +409,80 @@ async fn pk_write_cost_measurement() {
             );
         }
     }
+}
+
+/// A restart must leave the READ path indexed too, not only the write path.
+///
+/// The write path repairs an index it finds missing (see above). The read path
+/// cannot: it resolves index NAMES through the executor's `btree_indexes` map,
+/// which is built at DDL time and empty after a restart, and then swallows a
+/// lookup error with `.ok().flatten()` and scans. So a restarted database
+/// answered every indexed query with a full scan, silently and permanently.
+///
+/// `rebuild_persistent_indexes` at startup is what closes that, and this is the
+/// test that says so: after a restart THROUGH THAT PATH, a point read examines
+/// no more than a point read should.
+#[tokio::test]
+async fn a_read_after_restart_is_still_indexed() {
+    use crate::storage::persistence::CatalogPersistence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().to_path_buf();
+    async fn boot(data: &std::path::Path, rebuild: bool) -> Arc<Executor> {
+        let catalog = Arc::new(crate::catalog::Catalog::new());
+        let catalog_path = data.join("catalog.json");
+        let _ = CatalogPersistence::new(&catalog_path)
+            .load_catalog(&catalog)
+            .await;
+        let engine = Arc::new(DiskEngine::open(&data.join("q.db"), catalog.clone()).unwrap());
+        for table in catalog.table_names().await {
+            let _ = engine.create_table(&table).await;
+        }
+        let buffered = Arc::new(BufferedDiskEngine::new(engine));
+        let ex = Arc::new(Executor::new_with_persistence(
+            catalog,
+            buffered as Arc<dyn crate::storage::StorageEngine>,
+            Some(catalog_path),
+            Some(data),
+        ));
+        ex.restore_table_engines().await;
+        if rebuild {
+            ex.rebuild_persistent_indexes().await;
+        }
+        ex
+    }
+
+    {
+        let ex = boot(&data, false).await;
+        exec(&ex, "CREATE TABLE q (id INT PRIMARY KEY, v TEXT)").await;
+        for chunk in (1..=ROWS).collect::<Vec<_>>().chunks(200) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("({i}, 'v{i}')")).collect();
+            exec(&ex, &format!("INSERT INTO q VALUES {}", values.join(", "))).await;
+        }
+    }
+
+    // Control: a restart WITHOUT the rebuild scans, which is what every
+    // restarted database did. If this ever stops scanning, the rebuild is no
+    // longer what makes the assertion below pass.
+    {
+        let ex = boot(&data, false).await;
+        bench_hooks::reset_tuples_examined();
+        let res = exec(&ex, "SELECT v FROM q WHERE id = 1000").await;
+        assert_eq!(rows(&res[0]).len(), 1);
+        assert!(
+            bench_hooks::tuples_examined() >= ROWS as u64,
+            "without the startup rebuild the read should scan the table"
+        );
+    }
+
+    let ex = boot(&data, true).await;
+    bench_hooks::reset_tuples_examined();
+    let res = exec(&ex, "SELECT v FROM q WHERE id = 1000").await;
+    assert_eq!(rows(&res[0]).len(), 1, "the row must still be found");
+    let examined = bench_hooks::tuples_examined();
+    assert!(
+        examined <= BOUND,
+        "after a restart with the index rebuild, a point read examined {examined} \
+         tuples of {ROWS} — the read path is still falling back to a scan"
+    );
 }
