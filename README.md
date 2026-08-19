@@ -27,7 +27,7 @@ Full guide: **[neutron.build/docs](https://neutron.build/docs)**.
 ## Why Neutron
 
 - **8 languages, one contract.** TypeScript, Rust, Go, Python, Elixir, Zig, Julia, and Mojo. Every SDK implements the same [framework contract](./FRAMEWORK_CONTRACT.md) — RFC 7807 errors, a standard middleware order, `GET /health`, graceful shutdown — so behavior is identical while the code stays idiomatic in each language.
-- **14 data models, one database.** Nucleus stands in for Postgres + Redis + a vector store + a search index + a graph DB: SQL, KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub — all over the Postgres wire protocol, so any Postgres client connects. 305,198 lines of Rust, 4,697 declared tests, MVCC + WAL crash recovery.
+- **14 data models, one database.** Nucleus stands in for Postgres + Redis + a vector store + a search index + a graph DB: SQL, KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub — all over the Postgres wire protocol, so any Postgres client connects. 305,298 lines of Rust, 4,698 declared tests, MVCC + WAL crash recovery.
 - **Fast.** The TypeScript framework averages ~18,500 req/s across 8 scenarios — roughly 2.7x Next.js and 1.7x Astro on the same hardware. These are representative numbers; run the reproducible harness in [`typescript/benchmarks/`](./typescript/benchmarks) on your own machine.
 - **Agent-native.** Ships [`llms.txt`](./llms.txt) + [`llms-full.txt`](https://neutron.build/llms-full.txt), a first-party MCP server (`neutron mcp` — 17 Nucleus tools plus `search_docs`/`get_doc`), and an `AGENTS.md` in every scaffolded app — so AI coding agents can build with Neutron from day one.
 

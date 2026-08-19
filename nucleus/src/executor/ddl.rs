@@ -3717,6 +3717,24 @@ impl Executor {
             body,
         };
         self.triggers.write().await.push(trigger);
+        // The definition is stored and matched against the right table, timing
+        // and event -- but the BODY never runs. Say so at the moment someone
+        // creates one, which is the only moment they are thinking about it.
+        //
+        // Deliberately a warning rather than an error. Rejecting would break two
+        // working things: `logical_dump` EMITS `CREATE TRIGGER`, so restoring
+        // any existing dump would fail, and ORM migrations that create triggers
+        // would hard-fail on a database that accepted them yesterday. The
+        // published docs already state this in bold (`docs/nucleus/sql.mdx`), so
+        // what remained was server-side silence, not an overclaim. There is no
+        // pgwire NOTICE channel yet; a log line is what is available today.
+        tracing::warn!(
+            trigger = %name,
+            table = %table_name,
+            "CREATE TRIGGER accepted and stored, but trigger BODIES DO NOT \
+             EXECUTE yet — this trigger will never run. Do not rely on it \
+             for an invariant, an audit row, or a derived table."
+        );
         Ok(ExecResult::Command {
             tag: "CREATE TRIGGER".into(),
             rows_affected: 0,

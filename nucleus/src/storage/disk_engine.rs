@@ -2288,7 +2288,10 @@ impl crate::backup::BackupCoordinator for DiskEngine {
             encrypted: disk.is_encrypted(),
             compressed: disk.is_compressed(),
             algorithm: disk.is_encrypted().then(|| "aes-256-gcm".to_string()),
-            key_id: None,
+            // Was hardcoded `None`, which made the field that exists so a
+            // restore can locate its key permanently empty -- and left key
+            // rotation with nothing to rotate against.
+            key_id: disk.encryption_key_id(),
         }
     }
 }

@@ -28,13 +28,44 @@ pub const ENCRYPTED_PAGE_SIZE: usize = PAGE_SIZE + ENCRYPTION_OVERHEAD;
 #[derive(Clone)]
 pub struct PageEncryptor {
     cipher: Aes256Gcm,
+    /// Short, non-reversible fingerprint of the key this encryptor holds.
+    ///
+    /// Exists so a backup manifest can say WHICH key a snapshot needs without
+    /// storing key material. `BackupEncryption::key_id` was documented as "the
+    /// operator-facing key identifier, so a restore can locate the key" and was
+    /// hardcoded `None` everywhere, which left an encrypted snapshot unable to
+    /// name its own key and gave key rotation nothing to rotate against.
+    ///
+    /// Derived, not configured: at-rest keys arrive as `NUCLEUS_ENCRYPT_KEY` /
+    /// `NUCLEUS_ENCRYPT_PASSPHRASE`, so asking the operator to also invent a
+    /// label would be a second thing to get wrong. A fingerprint is always
+    /// available and always correct.
+    key_id: String,
+}
+
+/// First 16 hex characters of the SHA-256 of the key.
+///
+/// Truncated deliberately: this is an identity label, not an authenticator, and
+/// a full digest invites treating it as one. It cannot recover the key.
+fn fingerprint(key: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key);
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 impl PageEncryptor {
     /// Create a new encryptor from a raw 256-bit key.
     pub fn from_key(key: &[u8; 32]) -> Self {
         let cipher = Aes256Gcm::new_from_slice(key).expect("valid 32-byte key");
-        Self { cipher }
+        Self {
+            cipher,
+            key_id: fingerprint(key),
+        }
+    }
+
+    /// Short non-reversible identifier for the key in use.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
     }
 
     /// Derive an encryption key from a passphrase and salt using Argon2id,
@@ -420,6 +451,47 @@ impl KeyManager {
 
 #[cfg(test)]
 mod tests {
+
+    /// `key_id` must identify the key, be stable, and never expose it.
+    ///
+    /// It exists because `BackupEncryption::key_id` -- documented as "the
+    /// operator-facing key identifier, so a restore can locate the key" -- was
+    /// hardcoded `None` on every path, so an encrypted snapshot could not name
+    /// the key it needed and rotation had nothing to rotate against.
+    #[test]
+    fn key_id_identifies_the_key_without_revealing_it() {
+        let key_a = [7u8; 32];
+        let key_b = [8u8; 32];
+        let a1 = PageEncryptor::from_key(&key_a);
+        let a2 = PageEncryptor::from_key(&key_a);
+        let b = PageEncryptor::from_key(&key_b);
+
+        assert_eq!(
+            a1.key_id(),
+            a2.key_id(),
+            "the same key must always fingerprint the same, or a restore cannot \
+             match a snapshot to a key"
+        );
+        assert_ne!(
+            a1.key_id(),
+            b.key_id(),
+            "different keys must fingerprint differently, or the id identifies nothing"
+        );
+        assert!(
+            !a1.key_id().is_empty(),
+            "an empty id is the bug this replaces"
+        );
+
+        // The control that matters: the label must not be the key. A hex dump
+        // of the key material would satisfy every assertion above.
+        let key_hex: String = key_a.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(
+            !key_hex.contains(a1.key_id()),
+            "the fingerprint appears inside the key's own hex -- it is derived \
+             from the key rather than hashed from it"
+        );
+        assert_eq!(a1.key_id().len(), 16, "16 hex chars of SHA-256, truncated");
+    }
     use super::*;
 
     #[test]

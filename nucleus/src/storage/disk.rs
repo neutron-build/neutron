@@ -285,6 +285,13 @@ impl DiskManager {
         self.encryptor.is_some()
     }
 
+    /// Short, non-reversible fingerprint of the at-rest key, when encrypted.
+    ///
+    /// Feeds `BackupEncryption::key_id` so a snapshot can name the key it needs.
+    pub fn encryption_key_id(&self) -> Option<String> {
+        self.encryptor.as_ref().map(|e| e.key_id().to_string())
+    }
+
     /// Check if compression is enabled.
     pub fn is_compressed(&self) -> bool {
         self.compression_enabled

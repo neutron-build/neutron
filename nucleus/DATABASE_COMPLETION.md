@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 305198; Source Rust files: 270; Top-level modules: 51.
-- Declared unit tests: 4315; Declared integration tests: 382; Ignored tests: 46.
+- Source LOC: 305298; Source Rust files: 270; Top-level modules: 51.
+- Declared unit tests: 4316; Declared integration tests: 382; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -371,7 +371,20 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       policies, views, sequences, and functions were absent from the executor and the dump emitted
       nothing for them — the library tests passed while the shipped command stayed broken.
 - [ ] Define encrypted-backup key handling and key rotation.
-      Characterised 2026-08-18, not implemented -- it needs a design decision, not a patch.
+      **Decided and half-implemented 2026-08-19.** The design question -- where keys live --
+      was already answered by the code: at-rest keys arrive as `NUCLEUS_ENCRYPT_KEY` or
+      `NUCLEUS_ENCRYPT_PASSPHRASE` (`main.rs`), so there is no keyring or KMS to invent.
+      `key_id` is therefore DERIVED rather than configured: the first 16 hex chars of the
+      SHA-256 of the key, computed in `PageEncryptor` and surfaced through
+      `DiskManager::encryption_key_id` into `encryption_info()`. Always available, never
+      leaks the key, and asking an operator to also invent a label would just be a second
+      thing to get wrong. Rotation follows from it: restore with the old key, re-backup
+      under the new one, and the manifest's `key_id` says which snapshots still need which.
+      STILL OPEN: the OFFLINE path writes `BackupEncryption::default()` -- i.e. asserts
+      "not encrypted" -- because it reads a CLOSED database with no engine to ask, and
+      offline is the default for `nucleus backup`. That assertion is a falsehood rather
+      than a gap and is the next thing to fix here.
+      Original characterisation follows.
       Two concrete gaps. **(1) `key_id` is never populated on either path.** Its own doc comment
       says it is the "operator-facing key identifier, so a restore can locate the key", and
       `DiskEngine::encryption_info` hardcodes `key_id: None`. So the field that exists to let a

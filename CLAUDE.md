@@ -38,7 +38,7 @@ mojo/       (Mojo/GPU)                   zig/    (12KB)    mobile-preview/   ver
 | `modelica/` | Python+Julia | Physics simulation, FMI 3.0 interop |
 | `native/` | TypeScript | Mobile framework — Preact components render to native iOS/Android views |
 | `desktop/` | Rust+TypeScript | Desktop apps via Tauri 2.0, ~10MB bundles, embedded Nucleus |
-| `mobile-preview/` | Go | Live preview app for mobile dev (like Expo Go but not SDK-versioned) |
+| `mobile-preview/` | Go | **EXPERIMENT, not a shipped pillar** (decided 2026-08-19 from evidence: zero tests, zero CI workflows, no README). Live preview app for mobile dev, like Expo Go but not SDK-versioned. Nothing public claims it — `llms.txt` and the site mention Expo Go only for `native/`'s device modules — so it is safe where it is. Do not cite it as a pillar until it has tests and a workflow. |
 | `cli/` | Go | Universal CLI — `neutron new`, `neutron db`, `neutron migrate`, `neutron studio` |
 | `typescript/apps/site/` | TypeScript | Marketing/docs site — dogfoods Neutron TS (live at neutron.build) |
 | `archive/` | Docs | Cross-language architecture docs and planning |
