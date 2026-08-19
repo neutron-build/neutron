@@ -25,7 +25,7 @@ behavior satisfies the relevant gate above.
 ## Current baseline
 
 - Source LOC: 305758; Source Rust files: 270; Top-level modules: 51.
-- Declared unit tests: 4320; Declared integration tests: 382; Ignored tests: 46.
+- Declared unit tests: 4320; Declared integration tests: 383; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -370,7 +370,15 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       `open_persistent_executor` loaded catalog.json but never called `load_meta()`, so roles,
       policies, views, sequences, and functions were absent from the executor and the dump emitted
       nothing for them — the library tests passed while the shipped command stayed broken.
-- [ ] Define encrypted-backup key handling and key rotation.
+- [x] Define encrypted-backup key handling and key rotation.
+      **Closed 2026-08-19.** The offline half landed: an encrypted open records `encryption.json`
+      beside the data file (key fingerprint and algorithm, never key material), the offline
+      backup reads it, and `nucleus backup` prints the key a restore will need. Opening under a
+      DIFFERENT key is now refused by name instead of decrypting page 0 into garbage and
+      reporting "not a Nucleus database (bad magic bytes)" -- a wrong-key error that read as
+      corruption during a recovery. A directory not opened since markers existed has none and
+      still reports unencrypted; one server start fixes it, and the difference between
+      "nothing recorded" and "not encrypted" is stated at both the call site and the marker.
       **Decided and half-implemented 2026-08-19.** The design question -- where keys live --
       was already answered by the code: at-rest keys arrive as `NUCLEUS_ENCRYPT_KEY` or
       `NUCLEUS_ENCRYPT_PASSPHRASE` (`main.rs`), so there is no keyring or KMS to invent.
@@ -380,10 +388,9 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       leaks the key, and asking an operator to also invent a label would just be a second
       thing to get wrong. Rotation follows from it: restore with the old key, re-backup
       under the new one, and the manifest's `key_id` says which snapshots still need which.
-      STILL OPEN: the OFFLINE path writes `BackupEncryption::default()` -- i.e. asserts
-      "not encrypted" -- because it reads a CLOSED database with no engine to ask, and
-      offline is the default for `nucleus backup`. That assertion is a falsehood rather
-      than a gap and is the next thing to fix here.
+      Was still open until the marker above: the OFFLINE path wrote `BackupEncryption::default()`
+      -- i.e. asserted "not encrypted" -- because it reads a CLOSED database with no engine to
+      ask, and offline is the default for `nucleus backup`.
       Original characterisation follows.
       Two concrete gaps. **(1) `key_id` is never populated on either path.** Its own doc comment
       says it is the "operator-facing key identifier, so a restore can locate the key", and
@@ -398,7 +405,25 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       than "this snapshot needs key X".
       The design question that blocks this: where do keys live (env, keyring, file, KMS), and
       what does rotation mean for snapshots already taken under the old key.
-- [ ] Add restore verification, corruption detection, and automated disaster-recovery tests.
+- [x] Add restore verification, corruption detection, and automated disaster-recovery tests.
+      **Closed 2026-08-19.** `tests/backup_restore_all_models.rs` now covers **12 of the 14
+      models** -- SQL, KV, document, FTS, vector, timeseries, graph, blob, streams, columnar,
+      datalog and CDC. The remaining two have no durable state to compare and are documented
+      as such rather than skipped: Geo's SQL surface is pure functions over literals and its
+      WAL's `log_insert`/`log_delete` have no callers outside their own unit tests, and PubSub
+      is not durable by design (its durable sibling is Streams). Extending the gate is what
+      found the columnar bug below.
+      `tests/dr_drill.rs` adds the automated drill: it drives the real `nucleus` binary --
+      `backup` then `restore` -- verifies all twelve models out of the directory the COMMAND
+      produced, asserts a restore into a non-empty destination is refused without touching it,
+      and reports backup/restore wall-clock. It runs in the `integration` job on every Nucleus
+      change and on that workflow's weekly schedule, which is what makes it a drill rather
+      than a test someone remembers to run. Proven to discriminate: removing three model
+      directories from the restored copy fails it with those three named.
+      Found by the extension, and not a backup bug: the columnar WAL recorded rows and no
+      column names, so every reopen renamed columns "0", "1", ... `COLUMNAR_COUNT` stayed
+      right while `COLUMNAR_SUM`/`AVG`/`MIN`/`MAX` returned 0 on any restarted or restored
+      database. Fixed with two name-carrying entry types; see `storage/columnar_wal.rs`.
       PARTIAL (2026-07-24). DONE: `restore_data_dir` verifies every manifest checksum before it
       touches the destination and refuses a snapshot that is corrupted, truncated, missing a file,
       or carrying an extra one — naming the offending paths. The refusal is provably
@@ -415,16 +440,17 @@ Goal: recover a production database without requiring a byte-for-byte stopped-di
       watching the document comparison fail. A second test corrupts a byte of a specialty log
       inside a snapshot and requires the restore to refuse it -- the manifest fingerprints the
       whole tree, and that is now asserted rather than assumed.
-      STILL NOT DONE: the other 10 models, and automated disaster-recovery runs (scheduled
-      restore-and-verify).
+      Superseded by the 2026-08-19 entry above, which closed the remaining ten models and the
+      scheduled restore-and-verify.
 - [x] Document RPO/RTO controls and limitations.
       `DURABILITY.md` gains an RPO/RTO section (2026-08-18): a recovery-point table per failure
       mode, what bounds recovery time, and the limitations stated rather than implied -- PITR
       restores only the SQL substrate to the target (NU-030); rolling back needs an older base and
       the guard depends on a `consistent_lsn` the offline path did not record before 2026-08-18;
-      the WAL archive has no automatic retention and grows until `nucleus prune-archive`; no
-      scheduled DR drills exist; logical restore verification covers 4 of 14 models. Every figure
-      is a property of the code, not a target.
+      the WAL archive has no automatic retention and grows until `nucleus prune-archive`. Every
+      figure is a property of the code, not a target. Two of its limitations were retired on
+      2026-08-19 -- the drill now exists and logical verification covers 12 of 14 models -- and
+      the section was updated rather than left to rot.
 
 Exit gate:
 

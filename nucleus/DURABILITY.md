@@ -351,14 +351,19 @@ refuses a data directory a live instance holds, unless overridden.
   disk-space problem into an unrecoverable one. The corollary is that archive
   growth is an operator's responsibility, and an archive that fills the volume
   takes the database read-only with it.
-- **No automated disaster-recovery drills.** Nothing schedules a
-  restore-and-verify. Restore verification exists and is strong -- every
-  manifest checksum is checked before the destination is touched, and a
-  corrupted or truncated snapshot is refused by name -- but it runs when you run
-  it. A backup you have never restored is a hypothesis.
-- **Logical restore verification covers 4 of the 14 models** (SQL, KV, document,
-  FTS) in `tests/backup_restore_all_models.rs`. The other ten are covered
-  bytewise by the manifest and not semantically.
+- **The DR drill runs against a fixture, not against your data.**
+  `tests/dr_drill.rs` drives the real `nucleus backup` and `nucleus restore` on
+  every Nucleus change and on the weekly schedule, and verifies twelve models
+  out of the directory the command produced -- so the commands and the restore
+  path are exercised continuously. What it cannot tell you is that YOUR
+  snapshots restore: nothing here schedules a restore of your archive. A backup
+  you have never restored is still a hypothesis.
+- **Logical restore verification covers 12 of the 14 models** (SQL, KV,
+  document, FTS, vector, timeseries, graph, blob, streams, columnar, datalog,
+  CDC) in `tests/backup_restore_all_models.rs`. The other two have no durable
+  state to verify rather than being skipped: Geo's SQL surface is pure functions
+  over literal arguments and nothing writes its WAL, and PubSub is not durable
+  by design -- its durable sibling is Streams, which is covered.
 
 ## Known gaps
 
