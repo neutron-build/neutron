@@ -62,6 +62,7 @@ mod test_module_wiring;
 mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
+mod test_pk_write_cost; // S65: UPDATE/DELETE by PK must not scan the table
 mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross sessions
 mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_query;

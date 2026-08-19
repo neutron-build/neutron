@@ -1182,6 +1182,71 @@ impl StorageEngine for BufferedDiskEngine {
         self.inner.index_lookup(table, index_name, value).await
     }
 
+    async fn index_lookup_positions(
+        &self,
+        table: &str,
+        index_name: &str,
+        col_idx: usize,
+        value: &Value,
+    ) -> Result<Option<Vec<(usize, Row)>>, StorageError> {
+        self.lock_read(table).await?;
+        let Some(base) = self
+            .inner
+            .index_lookup_positions(table, index_name, col_idx, value)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !self.is_in_txn() {
+            return Ok(Some(base));
+        }
+
+        // Inside a transaction the inner index describes the COMMITTED image
+        // only. Three corrections, all bounded by this transaction's own
+        // buffer rather than by the table:
+        //
+        //   deleted  — a position this transaction removed is not a match,
+        //              however the index still points at it;
+        //   updates  — a position this transaction rewrote must be judged on
+        //              the new row, which may no longer match at all;
+        //   inserts  — rows that exist only in this transaction have no index
+        //              entry, so they are scanned out of the buffer.
+        //
+        // Without this the statement would miss its own writes; with a plain
+        // decline it fell back to materialising the whole table, which is the
+        // O(table) cost this path exists to remove.
+        let bufs = self.txn_bufs.read();
+        let Some(overlay) = bufs
+            .get(&current_session_id())
+            .and_then(|b| b.overlays.get(table))
+        else {
+            return Ok(Some(base));
+        };
+        let mut out: Vec<(usize, Row)> = Vec::with_capacity(base.len());
+        for (pos, row) in base {
+            if overlay.deleted.contains(&pos) {
+                continue;
+            }
+            match overlay.updates.get(&pos) {
+                Some(updated) => {
+                    if updated.get(col_idx).is_some_and(|v| v.loose_eq(value)) {
+                        out.push((pos, updated.clone()));
+                    }
+                }
+                None => out.push((pos, row)),
+            }
+        }
+        for (pos, row) in &overlay.inserts {
+            if overlay.deleted.contains(pos) {
+                continue;
+            }
+            if row.get(col_idx).is_some_and(|v| v.loose_eq(value)) {
+                out.push((*pos, row.clone()));
+            }
+        }
+        Ok(Some(out))
+    }
+
     async fn index_lookup_range(
         &self,
         table: &str,

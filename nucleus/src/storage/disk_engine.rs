@@ -1761,6 +1761,9 @@ impl DiskEngine {
         let col_types = self.col_types(table)?;
         let pages = self.table_pages(table)?;
         let mut out = Vec::new();
+        // Tuples decoded and compared, as distinct from tuples RETURNED —
+        // see `bench_hooks::record_tuples_examined`.
+        let mut examined = 0usize;
         for page_id in pages {
             let pg = self
                 .pool
@@ -1787,7 +1790,9 @@ impl DiskEngine {
                 }
                 out.push((encode_row_pos(page_id, slot_idx), row));
             }
+            examined += slot_count as usize;
         }
+        crate::bench_hooks::record_tuples_examined(examined);
         Ok(out)
     }
 
@@ -3007,6 +3012,16 @@ impl StorageEngine for DiskEngine {
         Ok(Some(self.index_lookup_inner(table, index_name, value)?))
     }
 
+    async fn index_lookup_positions(
+        &self,
+        table: &str,
+        index_name: &str,
+        _col_idx: usize,
+        value: &Value,
+    ) -> Result<Option<Vec<(usize, Row)>>, StorageError> {
+        Ok(Some(self.index_positions_inner(table, index_name, value)?))
+    }
+
     fn index_lookup_range_sync(
         &self,
         table: &str,
@@ -3355,6 +3370,47 @@ impl DiskEngine {
             }
         }
         Ok(rows)
+    }
+
+    /// `index_lookup_inner`, keeping each row's physical address.
+    ///
+    /// The B-tree already stores `RowId { page_id, slot_idx }`, which is
+    /// exactly what `encode_row_pos` packs into the `usize` positions this
+    /// engine hands out — so the addresses cost nothing extra to produce, and
+    /// their absence is the only reason the UPDATE/DELETE path scanned.
+    fn index_positions_inner(
+        &self,
+        table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        let col_types = self.col_types(table)?;
+        let indexes = self.indexes.read();
+        let idx = indexes
+            .get(index_name)
+            .ok_or_else(|| StorageError::Io(format!("index '{index_name}' not found")))?;
+        if idx.table != table {
+            return Err(StorageError::Io(format!(
+                "index '{index_name}' is on table '{}', not '{table}'",
+                idx.table
+            )));
+        }
+        let key = serialize_index_key(value);
+        let row_ids = idx
+            .btree
+            .lookup(&key)
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let mut out = Vec::with_capacity(row_ids.len());
+        for rid in row_ids {
+            let pg = self
+                .pool
+                .read_guard(rid.page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types) {
+                out.push((encode_row_pos(rid.page_id, rid.slot_idx), row));
+            }
+        }
+        Ok(out)
     }
 
     /// Look up rows by an inclusive indexed key range.

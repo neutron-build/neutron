@@ -505,6 +505,35 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(None)
     }
+    /// Look up rows via a named index and return their tuple ADDRESSES as well
+    /// as their contents.
+    ///
+    /// `index_lookup` returns rows, which is enough for a `SELECT` and useless
+    /// for an `UPDATE`/`DELETE`: those hand a position back to `update()` /
+    /// `delete()`. Without this, the DML path had no way to use an index and
+    /// fell back to `scan_where_eq_positions` — a full page scan with an inline
+    /// filter — so a single-row `DELETE ... WHERE id = K` read the whole table,
+    /// once per statement, quadratic over a batch.
+    ///
+    /// `Ok(None)` means "this engine cannot answer that from an index", which
+    /// is NOT the same as "no rows matched" (`Ok(Some(vec![]))`). A caller that
+    /// conflates them turns an unsupported engine into an empty result set, so
+    /// every caller must fall back on `None` rather than treat it as empty.
+    ///
+    /// `col_idx` is the indexed column's position in the row. It is passed
+    /// rather than derived because a wrapping engine has to apply its own
+    /// uncommitted state to the answer — rows this transaction inserted have
+    /// no index entry at all — and it cannot ask the inner engine which column
+    /// an index is on.
+    async fn index_lookup_positions(
+        &self,
+        _table: &str,
+        _index_name: &str,
+        _col_idx: usize,
+        _value: &Value,
+    ) -> Result<Option<Vec<(usize, Row)>>, StorageError> {
+        Ok(None)
+    }
     /// Range-lookup rows via a named index.
     ///
     /// Bounds are `std::ops::Bound`, not a `&Value` pair, because SQL can ask

@@ -184,3 +184,60 @@ pub fn skip_index_insert() -> bool {
 pub fn skip_index_delete() -> bool {
     SKIP_INDEX_DELETE.load(Ordering::Relaxed)
 }
+
+/// Force `UPDATE`/`DELETE` by primary key back onto the full-scan path, so the
+/// index descent can be measured against the behaviour it replaced without
+/// rebuilding the binary. The scan is still CORRECT — it is what the engine
+/// did before — so this arm is safe to run, only slower.
+static SKIP_INDEX_DML: AtomicBool = AtomicBool::new(false);
+
+pub fn set_skip_index_dml(on: bool) {
+    SKIP_INDEX_DML.store(on, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn skip_index_dml() -> bool {
+    SKIP_INDEX_DML.load(Ordering::Relaxed)
+}
+
+// ============================================================================
+// Tuples examined by a physical scan
+// ============================================================================
+//
+// `rows_scanned` in the metrics counts MATCHES, not rows examined — which is
+// exactly what hid `UPDATE`/`DELETE` by primary key being O(table): a single-row
+// delete reported `rows_scanned = 1` while walking every tuple in the table.
+// A metric can be the reason a defect is invisible, so this counts the other
+// thing: how many tuples a physical scan actually decoded and compared.
+//
+// One relaxed atomic add per SCAN (not per row), so the cost is a rounding
+// error against decoding the tuples themselves.
+
+// Thread-local, not a process-global atomic: the test suite runs tests
+// concurrently in one process, and a shared counter measures whatever else
+// happened to be scanning at the time. A count that another test can move is
+// not a measurement.
+//
+// The trade-off is that work done on a different thread is not counted. That
+// direction is safe here because it can only make a scan look CHEAPER, and
+// every cost assertion is paired with a control that requires an unindexed
+// predicate to examine the whole table — so accounting that stopped working
+// fails the control instead of passing the bound.
+thread_local! {
+    static TUPLES_EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+pub fn record_tuples_examined(n: usize) {
+    TUPLES_EXAMINED.with(|c| c.set(c.get() + n as u64));
+}
+
+/// Tuples decoded and compared by physical scans on THIS thread since the last
+/// reset.
+pub fn tuples_examined() -> u64 {
+    TUPLES_EXAMINED.with(|c| c.get())
+}
+
+pub fn reset_tuples_examined() {
+    TUPLES_EXAMINED.with(|c| c.set(0));
+}

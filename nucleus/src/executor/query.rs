@@ -7215,7 +7215,7 @@ impl Executor {
 
     /// Coerce range bounds to the indexed column's data type.
     /// Coerce an index lookup value to the indexed column's data type.
-    fn coerce_index_value(
+    pub(super) fn coerce_index_value(
         val: Value,
         table: &str,
         index_name: &str,

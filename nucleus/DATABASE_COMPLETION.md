@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 308710; Source Rust files: 277; Top-level modules: 52.
-- Declared unit tests: 4365; Declared integration tests: 384; Ignored tests: 46.
+- Source LOC: 309423; Source Rust files: 278; Top-level modules: 52.
+- Declared unit tests: 4376; Declared integration tests: 384; Ignored tests: 47.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model

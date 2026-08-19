@@ -2230,29 +2230,36 @@ impl Executor {
         // Build column metadata for expression evaluation
         let col_meta = self.table_col_meta(&table_def);
 
-        // NOT a fast path, despite the name: `scan_where_eq_positions` is a
-        // FULL page scan that filters inline (`DiskEngine::scan_addressed`),
-        // and inside a transaction `BufferedDiskEngine` materialises the whole
-        // table on top of it. Measured by `attr_join`'s sibling `attr_delete`:
-        // 20,000 rows materialised per single-row DELETE on a 20k table, so the
-        // cost is O(table) per statement and quadratic over a batch.
-        // It stays until storage exposes an index -> POSITIONS lookup; the
-        // index preference used by the SELECT fast path in `executor/mod.rs`
-        // cannot be copied here because `index_lookup` returns rows, and
-        // UPDATE/DELETE need addresses.
-        // Fast path: PK/unique equality WHERE → filtered scan
+        // PK/unique equality WHERE → index descent when one can answer it,
+        // otherwise a filtered scan.
+        //
+        // `scan_where_eq_positions` is a FULL page scan that filters inline
+        // (`DiskEngine::scan_addressed`), and inside a transaction
+        // `BufferedDiskEngine` materialises the whole table on top of it — so
+        // it was O(table) per statement and quadratic over a batch, measured at
+        // 20,000 rows materialised per single-row DELETE on a 20k table. It is
+        // now the FALLBACK: `indexed_eq_positions` uses the index the PRIMARY
+        // KEY already creates, which `SELECT ... WHERE id = K` was already
+        // using while the write paths were not.
+        //
+        // `rows_scanned` below counts MATCHES, not rows examined, so it reads 1
+        // either way — do not use it as evidence that a statement used an
+        // index. `bench_hooks::tuples_examined` is the counter that can tell
+        // them apart, and `test_pk_write_cost` gates it.
         let (mut all_rows, pre_filtered) =
             match Self::extract_pk_eq_value(&update.selection, &table_def) {
                 Some((col_idx, eq_value)) => {
-                    let matches = self
-                        .storage_for(&table_name)
-                        .scan_where_eq_positions(&table_name, col_idx, &eq_value)
-                        .await?;
-                    // UNDERSTATES the real cost: this is the number of rows
-                    // MATCHED, while the scan above examined every row in the
-                    // table. `rows_scanned` reading 1 for a single-row DELETE
-                    // is what hid the O(table) behaviour above — do not read it
-                    // as evidence that this statement used an index.
+                    let matches = match self
+                        .indexed_eq_positions(&table_name, &table_def, col_idx, &eq_value)
+                        .await?
+                    {
+                        Some(found) => found,
+                        None => {
+                            self.storage_for(&table_name)
+                                .scan_where_eq_positions(&table_name, col_idx, &eq_value)
+                                .await?
+                        }
+                    };
                     self.metrics.rows_scanned.inc_by(matches.len() as u64);
                     (matches.into_iter().collect::<Vec<_>>(), true)
                 }
@@ -2714,14 +2721,23 @@ impl Executor {
 
         let col_meta = self.table_col_meta(&table_def);
 
-        // Fast path: PK/unique equality WHERE → filtered scan
+        // PK/unique equality WHERE → index descent when one can answer it,
+        // otherwise the filtered scan. See the same construction in
+        // `execute_update` for why the scan is a fallback rather than the path.
         let (mut all_rows, pre_filtered) =
             match Self::extract_pk_eq_value(&delete.selection, &table_def) {
                 Some((col_idx, eq_value)) => {
-                    let matches = self
-                        .storage_for(&table_name)
-                        .scan_where_eq_positions(&table_name, col_idx, &eq_value)
-                        .await?;
+                    let matches = match self
+                        .indexed_eq_positions(&table_name, &table_def, col_idx, &eq_value)
+                        .await?
+                    {
+                        Some(found) => found,
+                        None => {
+                            self.storage_for(&table_name)
+                                .scan_where_eq_positions(&table_name, col_idx, &eq_value)
+                                .await?
+                        }
+                    };
                     self.metrics.rows_scanned.inc_by(matches.len() as u64);
                     (matches, true)
                 }
@@ -3012,5 +3028,105 @@ impl Executor {
             return Some((col_idx, value));
         }
         None
+    }
+}
+
+impl Executor {
+    /// Positions of the rows an indexed equality predicate matches, or `None`
+    /// when no index can answer it and the caller must scan.
+    ///
+    /// This is what `UPDATE`/`DELETE` by primary key needed and did not have:
+    /// `index_lookup` returns rows, and DML needs addresses to feed back to
+    /// `update()`/`delete()`, so the PK path fell through to a full page scan
+    /// with an inline filter. A `PRIMARY KEY` already creates a unique index
+    /// (`<table>_pkey`), and `SELECT ... WHERE id = K` already used it — only
+    /// the write paths did not.
+    ///
+    /// Two properties this must preserve:
+    ///
+    /// * **`None` is not "no rows".** An engine that cannot answer from an
+    ///   index returns `None`, and so does a transaction whose buffered writes
+    ///   the index does not know about. Treating either as an empty match set
+    ///   would silently make the statement affect nothing.
+    /// * **The index proposes, the predicate decides.** Keys are compared in
+    ///   their encoded form, so an index can return a row whose key merely
+    ///   encodes alike; every candidate is re-checked against the original
+    ///   value before it is handed on.
+    async fn indexed_eq_positions(
+        &self,
+        table: &str,
+        table_def: &crate::catalog::TableDef,
+        col_idx: usize,
+        value: &crate::types::Value,
+    ) -> Result<Option<Vec<(usize, Row)>>, ExecError> {
+        if crate::bench_hooks::skip_index_dml() {
+            return Ok(None);
+        }
+        let Some(col_name) = table_def.columns.get(col_idx).map(|c| c.name.clone()) else {
+            return Ok(None);
+        };
+        let indexes = self.catalog.get_indexes_cached(table).unwrap_or_default();
+        // Prefer a unique index: it descends to at most one row, and a PK is
+        // the case this exists for.
+        let Some(index) = indexes
+            .iter()
+            .filter(|i| {
+                i.columns.len() == 1
+                    && i.columns
+                        .first()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+            })
+            .max_by_key(|i| i.unique)
+        else {
+            return Ok(None);
+        };
+        let coerced =
+            Self::coerce_index_value(value.clone(), table, &index.name, table_def, &self.catalog);
+        let storage = self.storage_for(table);
+        let mut found = storage
+            .index_lookup_positions(table, &index.name, col_idx, &coerced)
+            .await;
+
+        // The catalog can name an index the ENGINE does not have. B-tree
+        // indexes live in the engine's in-memory registry, built by
+        // `create_index` at DDL time and never rebuilt at startup, so after a
+        // restart every index the catalog advertises is missing from the
+        // engine until some DDL recreates it. Measured: after reopening a data
+        // directory, `index_lookup(t, "t_pkey", …)` returns
+        // `index 't_pkey' not found`.
+        //
+        // Rebuild it once, from the data pages, and retry. That costs O(rows)
+        // on the first such statement after a restart, against O(rows) on
+        // EVERY such statement if we simply scanned instead. A failure to
+        // rebuild is not an error either: fall through to the scan, which is
+        // always correct. Filed as `OPEN_WORK.md` §0g — persisting the index
+        // root so a restart re-opens rather than rebuilds is the real fix.
+        if found.is_err() {
+            if let Some(column) = index.columns.first()
+                && let Some(col_pos) = table_def.column_index(column)
+                && storage
+                    .create_index(table, &index.name, col_pos)
+                    .await
+                    .is_ok()
+            {
+                tracing::debug!(
+                    target: "nucleus::executor",
+                    "rebuilt index '{}' on '{table}': the catalog had it and the engine did not",
+                    index.name
+                );
+                found = storage
+                    .index_lookup_positions(table, &index.name, col_idx, &coerced)
+                    .await;
+            }
+            if found.is_err() {
+                return Ok(None);
+            }
+        }
+
+        Ok(found.unwrap_or(None).map(|rows| {
+            rows.into_iter()
+                .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v.loose_eq(value)))
+                .collect()
+        }))
     }
 }
