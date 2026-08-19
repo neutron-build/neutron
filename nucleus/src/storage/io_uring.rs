@@ -67,10 +67,27 @@ impl AsyncDiskOps for StandardDiskOps {
             .await?;
         file.seek(SeekFrom::Start(offset)).await?;
 
-        let bytes_read = file.read(buf).await?;
-        // Zero-fill the remainder if the file is shorter than the requested page.
-        if bytes_read < self.page_size {
-            buf[bytes_read..self.page_size].fill(0);
+        // Read until the page is full or the file genuinely ends. A single
+        // `read` is allowed to return fewer bytes than asked for -- that is a
+        // SHORT READ, not end of file -- and the previous code treated any
+        // short return as "the file is shorter than this page" and zero-filled
+        // the rest, reporting success. So a page whose tail arrived on a second
+        // syscall came back with zeros where its data should be. Its own test
+        // (`concurrent_read_write`) caught this intermittently on Linux CI.
+        // `write_page` below always used `write_all`; only the read half was
+        // missing the equivalent loop.
+        let mut total = 0usize;
+        while total < self.page_size {
+            let n = file.read(&mut buf[total..self.page_size]).await?;
+            if n == 0 {
+                break; // real EOF
+            }
+            total += n;
+        }
+        // Past a genuine EOF the rest of the page is zeros, which is the
+        // intended behaviour for a page beyond the end of the file.
+        if total < self.page_size {
+            buf[total..self.page_size].fill(0);
         }
         Ok(())
     }
@@ -173,38 +190,59 @@ impl AsyncDiskOps for IoUringDiskOps {
             let mut read_buf = vec![0u8; page_size];
             let fd = io_uring::types::Fd(file.as_raw_fd());
 
-            let read_e =
-                io_uring::opcode::Read::new(fd, read_buf.as_mut_ptr(), read_buf.len() as _)
-                    .offset(offset as _)
-                    .build()
-                    .user_data(0x42);
-
             let mut ring_guard = ring
                 .lock()
                 .map_err(|e| io::Error::other(format!("ring lock poisoned: {e}")))?;
 
-            // SAFETY: the SQE references read_buf, which is owned by this closure
-            // and outlives the operation — submit_and_wait(1) below blocks until
-            // the kernel finishes the read before read_buf is returned/dropped, so
-            // the buffer stays valid for the kernel's entire access.
-            unsafe {
-                ring_guard
-                    .submission()
-                    .push(&read_e)
-                    .map_err(|_| io::Error::other("io_uring SQ full"))?;
-            }
+            // Loop until the page is full or the file genuinely ends. A single
+            // io_uring Read may return fewer bytes than requested -- a SHORT
+            // READ, not EOF -- and treating that as EOF and zero-filling the
+            // rest silently replaces real page data with zeros while reporting
+            // success. Only `ret == 0` means end of file.
+            let mut total = 0usize;
+            while total < page_size {
+                let read_e = io_uring::opcode::Read::new(
+                    fd,
+                    // SAFETY: `total < page_size`, so this stays inside the
+                    // allocation; the pointer is derived from read_buf, which
+                    // this closure owns.
+                    unsafe { read_buf.as_mut_ptr().add(total) },
+                    (page_size - total) as _,
+                )
+                .offset((offset + total as u64) as _)
+                .build()
+                .user_data(0x42);
 
-            ring_guard.submit_and_wait(1)?;
+                // SAFETY: the SQE references read_buf, which is owned by this
+                // closure and outlives the operation -- submit_and_wait(1)
+                // below blocks until the kernel finishes the read before
+                // read_buf is returned/dropped, so the buffer stays valid for
+                // the kernel's entire access.
+                unsafe {
+                    ring_guard
+                        .submission()
+                        .push(&read_e)
+                        .map_err(|_| io::Error::other("io_uring SQ full"))?;
+                }
 
-            if let Some(cqe) = ring_guard.completion().next() {
+                ring_guard.submit_and_wait(1)?;
+
+                let Some(cqe) = ring_guard.completion().next() else {
+                    // No completion is not "read nothing"; failing loudly beats
+                    // returning a half-filled page as success.
+                    return Err(io::Error::other("io_uring: no completion for read"));
+                };
                 let ret = cqe.result();
                 if ret < 0 {
                     return Err(io::Error::from_raw_os_error(-ret));
                 }
-                let bytes_read = ret as usize;
-                if bytes_read < page_size {
-                    read_buf[bytes_read..page_size].fill(0);
+                if ret == 0 {
+                    break; // real EOF
                 }
+                total += ret as usize;
+            }
+            if total < page_size {
+                read_buf[total..page_size].fill(0);
             }
 
             Ok(read_buf)
@@ -700,6 +738,54 @@ mod tests {
         assert_eq!(cfg.page_size, 16384);
         assert!(!cfg.use_direct_io);
         assert_eq!(cfg.queue_depth, 256);
+    }
+
+    /// A page that is only partly on disk must read back as data + zeros, and
+    /// must NOT report an error.
+    ///
+    /// This is the path the short-read fix reroutes through, so it is the half
+    /// that can be tested deterministically. Only `read == 0` now means end of
+    /// file; previously ANY short return was treated as EOF, so a page whose
+    /// tail merely arrived on a second syscall came back zero-filled while
+    /// reporting success. That is what made `concurrent_read_write` fail
+    /// intermittently on Linux CI.
+    ///
+    /// The short read itself cannot be forced deterministically from here --
+    /// it is the kernel's choice -- so this test pins the EOF behaviour the fix
+    /// must preserve rather than the bug it removes.
+    #[tokio::test]
+    async fn partial_trailing_page_reads_as_data_then_zeros() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("short.db");
+        let ops = create_disk_ops(&path, TEST_PAGE_SIZE, false).unwrap();
+
+        ops.write_page(0, &vec![0xAB; TEST_PAGE_SIZE])
+            .await
+            .unwrap();
+        // Force the write to disk before truncating. `tokio::fs::File` flushes
+        // on drop asynchronously, so without this the `set_len` below can run
+        // first and the late flush then re-extends the file past `half` --
+        // which made the first version of this test pass alone and fail when
+        // the rest of the module ran beside it and the machine was busy.
+        ops.sync().await.unwrap();
+
+        // Leave only half a page on disk.
+        let half = TEST_PAGE_SIZE / 2;
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(half as u64).unwrap();
+        drop(f);
+
+        let mut buf = vec![0u8; TEST_PAGE_SIZE];
+        ops.read_page(0, &mut buf).await.unwrap();
+
+        assert!(
+            buf[..half].iter().all(|&b| b == 0xAB),
+            "the bytes that ARE on disk must come back intact"
+        );
+        assert!(
+            buf[half..].iter().all(|&b| b == 0),
+            "past a genuine EOF the rest of the page must be zeros"
+        );
     }
 
     #[tokio::test]
