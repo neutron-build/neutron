@@ -60,36 +60,7 @@ impl Executor {
                 check.bind_column_ids(&resolve);
             }
         }
-        let target_roles = policy
-            .to
-            .unwrap_or_default()
-            .into_iter()
-            .map(|owner| match owner {
-                ast::Owner::Ident(id) => id.value,
-                ast::Owner::CurrentRole | ast::Owner::CurrentUser => {
-                    self.current_session().session_context.read().user.clone()
-                }
-                ast::Owner::SessionUser => self
-                    .current_session()
-                    .authenticated_user
-                    .read()
-                    .clone()
-                    .unwrap_or_default(),
-            })
-            .collect::<Vec<_>>();
-        if let Ok(roles) = self.roles.try_read() {
-            for role in &target_roles {
-                if !role.eq_ignore_ascii_case("public") && !roles.contains_key(role) {
-                    return Err(ExecError::Unsupported(format!(
-                        "role '{role}' does not exist"
-                    )));
-                }
-            }
-        } else {
-            return Err(ExecError::Runtime(
-                "role catalog is busy; retry CREATE POLICY".into(),
-            ));
-        }
+        let target_roles = self.resolve_policy_roles(policy.to.unwrap_or_default())?;
         let name = policy.name.value;
         // Captured before the closure consumes them.
         #[cfg(feature = "server")]
@@ -126,6 +97,143 @@ impl Executor {
             tag: "CREATE POLICY".into(),
             rows_affected: 0,
         })
+    }
+
+    /// `ALTER POLICY <name> ON <table> { RENAME TO <new> | [TO roles] [USING (expr)]
+    /// [WITH CHECK (expr)] }`
+    ///
+    /// Without this, changing a policy meant DROP followed by CREATE — which
+    /// is not the same thing, because between the two statements the table is
+    /// unprotected by that policy. On a live system that window is the whole
+    /// problem: an operator tightening a predicate has to briefly loosen it.
+    ///
+    /// Every field is replaced in place on a clone and swapped back, so a
+    /// failure anywhere (a predicate that will not compile, a role that does
+    /// not exist) leaves the original policy exactly as it was.
+    pub(super) fn execute_alter_policy(
+        &self,
+        alter: ast::AlterPolicy,
+    ) -> Result<ExecResult, ExecError> {
+        self.require_security_admin("alter row security policies")?;
+        let table = alter.table_name.to_string();
+        let name = alter.name.value.clone();
+        let table_def = self
+            .catalog
+            .get_table_cached(&table)
+            .ok_or_else(|| ExecError::TableNotFound(table.clone()))?;
+
+        let mut policy = self
+            .with_visible_security(|security| security.rls.policy(&table, &name).cloned())
+            .ok_or_else(|| {
+                ExecError::Unsupported(format!(
+                    "policy '{name}' for table '{table}' does not exist"
+                ))
+            })?;
+
+        // Only read by the audit record, which is server-only.
+        #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+        let what: String = match alter.operation {
+            ast::AlterPolicyOperation::Rename { new_name } => {
+                let new_name = new_name.value;
+                if new_name == name {
+                    return Ok(ExecResult::Command {
+                        tag: "ALTER POLICY".into(),
+                        rows_affected: 0,
+                    });
+                }
+                if self.with_visible_security(|s| s.rls.policy(&table, &new_name).is_some()) {
+                    return Err(ExecError::Unsupported(format!(
+                        "policy '{new_name}' for table '{table}' already exists"
+                    )));
+                }
+                policy.name = new_name.clone();
+                format!("RENAME TO {new_name}")
+            }
+            ast::AlterPolicyOperation::Apply {
+                to,
+                using,
+                with_check,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(owners) = to {
+                    let roles = self.resolve_policy_roles(owners)?;
+                    policy.target_roles = roles;
+                    parts.push("TO".into());
+                }
+                if let Some(expr) = using {
+                    let mut predicate = Self::compile_rls_predicate(&expr)?;
+                    predicate.bind_column_ids(&|n: &str| table_def.column_id(n));
+                    policy.predicate = predicate;
+                    parts.push("USING".into());
+                }
+                if let Some(expr) = with_check {
+                    let mut predicate = Self::compile_rls_predicate(&expr)?;
+                    predicate.bind_column_ids(&|n: &str| table_def.column_id(n));
+                    policy.check_predicate = Some(predicate);
+                    parts.push("WITH CHECK".into());
+                }
+                if parts.is_empty() {
+                    return Err(ExecError::Unsupported(
+                        "ALTER POLICY requires RENAME TO, TO <roles>, USING (...) or WITH CHECK (...)"
+                            .into(),
+                    ));
+                }
+                parts.join(" + ")
+            }
+        };
+
+        self.with_mutable_security(|security| {
+            security.rls.remove_policy(&table, &name);
+            security.rls.add_policy(policy);
+        })?;
+        self.bump_policy_gen();
+        #[cfg(feature = "server")]
+        self.audit(
+            crate::audit::AuditKind::PolicyChanged,
+            &name,
+            &format!(
+                "by {}; ALTER POLICY on {table}: {what}",
+                self.acting_principal()
+            ),
+            None,
+        );
+        Ok(ExecResult::Command {
+            tag: "ALTER POLICY".into(),
+            rows_affected: 0,
+        })
+    }
+
+    /// `TO <owner>, …` as role names, resolving CURRENT_ROLE/CURRENT_USER/
+    /// SESSION_USER and refusing a role that does not exist — the same rules
+    /// `CREATE POLICY` applies, factored out so the two cannot drift.
+    fn resolve_policy_roles(&self, owners: Vec<ast::Owner>) -> Result<Vec<String>, ExecError> {
+        let roles: Vec<String> = owners
+            .into_iter()
+            .map(|owner| match owner {
+                ast::Owner::Ident(id) => id.value,
+                ast::Owner::CurrentRole | ast::Owner::CurrentUser => {
+                    self.current_session().session_context.read().user.clone()
+                }
+                ast::Owner::SessionUser => self
+                    .current_session()
+                    .authenticated_user
+                    .read()
+                    .clone()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let catalog = self
+            .roles
+            .try_read()
+            .map_err(|_| ExecError::Runtime("role catalog is busy; retry the statement".into()))?;
+        for role in &roles {
+            if !role.eq_ignore_ascii_case("public") && !catalog.contains_key(role) {
+                return Err(ExecError::Unsupported(format!(
+                    "role '{role}' does not exist"
+                )));
+            }
+        }
+        Ok(roles)
     }
 
     pub(super) fn execute_drop_policy(

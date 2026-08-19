@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 307944; Source Rust files: 275; Top-level modules: 52.
-- Declared unit tests: 4352; Declared integration tests: 384; Ignored tests: 46.
+- Source LOC: 308236; Source Rust files: 276; Top-level modules: 52.
+- Declared unit tests: 4359; Declared integration tests: 384; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -564,7 +564,24 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       extended one Parses and Describes before executing, and a non-standard statement has no
       AST to describe.
 - [ ] Define policy-aware materialized-view refresh and invocation semantics.
-- [ ] Add policy alteration/introspection commands or explicitly constrain v1 to create/drop.
+- [x] Add policy alteration/introspection commands or explicitly constrain v1 to create/drop.
+      **Closed 2026-08-19 (S61/N14) by shipping alteration, not by constraining v1.**
+      Introspection already existed and needed nothing: `pg_policies` and `pg_policy` are
+      populated from the live RLS engine. `ALTER POLICY <name> ON <table> { RENAME TO <new> |
+      [TO <roles>] [USING (expr)] [WITH CHECK (expr)] }` is now implemented; it previously
+      parsed and hit "statement type not yet supported", so the only route to a policy change
+      was DROP followed by CREATE.
+      That difference is the reason to build it rather than document it: between the drop and
+      the create the table is unprotected by that policy, so an operator TIGHTENING a predicate
+      has to briefly loosen it on a live system. `ALTER` mutates a clone and swaps it back, so
+      a predicate that will not compile, a role that does not exist, a missing policy, a
+      missing table, or a rename onto an existing name all leave the original exactly as it
+      was -- asserted for all five.
+      `CREATE POLICY`'s role resolution (CURRENT_ROLE/CURRENT_USER/SESSION_USER, refusing a
+      role that does not exist) is now shared with `ALTER`, so the two cannot drift apart.
+      7 tests, including a live session seeing the new predicate immediately (the policy
+      generation is bumped, so cached plans and results cannot outlive the change) and
+      `pg_policies` reflecting a rename.
 - [ ] Preserve fail-closed behavior for unsupported policy expressions and protected specialty calls.
 - [ ] Document constraint-existence, timing, administrator, and physical-backup side channels.
 

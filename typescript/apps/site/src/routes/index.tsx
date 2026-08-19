@@ -104,7 +104,7 @@ export default function HomePage() {
                 data-animate
                 style="--animate-delay: 0.3s"
               >
-                <span class="stats__number">4,736</span>
+                <span class="stats__number">4,743</span>
                 <span class="stats__label">Declared tests</span>
               </div>
             </div>

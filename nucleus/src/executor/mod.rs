@@ -5244,6 +5244,7 @@ impl Executor {
                             | Statement::Revoke(_)
                             | Statement::CreatePolicy(_)
                             | Statement::DropPolicy(_)
+                            | Statement::AlterPolicy(_)
                     ) || matches!(statement, Statement::AlterTable(alter) if alter.operations.iter().any(|op| matches!(
                         op,
                         ast::AlterTableOperation::EnableRowLevelSecurity
@@ -5484,11 +5485,14 @@ impl Executor {
                 | Statement::CreateTrigger(_)
                 | Statement::CreatePolicy(_)
                 | Statement::DropPolicy(_)
+                | Statement::AlterPolicy(_)
                 | Statement::CreateExtension(_)
                 | Statement::DropExtension(_)
         );
         let is_policy_ddl = match &stmt {
-            Statement::CreatePolicy(_) | Statement::DropPolicy(_) => true,
+            Statement::CreatePolicy(_) | Statement::DropPolicy(_) | Statement::AlterPolicy(_) => {
+                true
+            }
             Statement::AlterTable(alter) => alter.operations.iter().any(|op| {
                 matches!(
                     op,
@@ -5789,6 +5793,7 @@ impl Executor {
             Statement::CreateRole(create_role) => self.execute_create_role(create_role).await,
             Statement::CreatePolicy(policy) => self.execute_create_policy(policy),
             Statement::DropPolicy(policy) => self.execute_drop_policy(policy),
+            Statement::AlterPolicy(alter) => self.execute_alter_policy(alter),
             Statement::AlterRole { name, operation } => {
                 self.execute_alter_role(&name.to_string(), operation).await
             }
