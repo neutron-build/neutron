@@ -107,6 +107,12 @@ pub(crate) fn store_password_literal(literal: &str) -> String {
 /// jumps backwards can un-expire a password — which is PostgreSQL's behaviour
 /// too, and the alternative (a monotonic clock) cannot express a wall-clock
 /// deadline at all.
+///
+/// Server-only: both authentication gates are `server`-gated, and the embedded
+/// build has no authentication to expire — it runs as the trusted bootstrap
+/// identity. Without the cfg this is dead code in `--no-default-features`,
+/// which that build lints as an error.
+#[cfg(feature = "server")]
 pub(crate) fn password_expired(valid_until: Option<i64>) -> bool {
     let Some(deadline) = valid_until else {
         return false;

@@ -199,6 +199,40 @@ still be granted to. Only its ability to authenticate lapses. There is no
 password history, no complexity policy, and no forced-rotation interval;
 enforcing those belongs to whatever provisions the roles.
 
+## Cluster trust boundary
+
+Node-to-node traffic — the Raft transport and replication, which share one
+`InternalTlsConfig` — is **mutual TLS**. `NUCLEUS_INTERNAL_TLS=1` requires
+`_CERT`, `_KEY` and `_CA`; each node presents its certificate and requires its
+peer to present one the CA signed, in both directions.
+
+Both halves were previously absent. The acceptor was built with
+`with_no_client_auth()`, so a node served any TLS client that reached it, and
+the connector presented no certificate, so there was nothing to check even if a
+peer had looked. The CA was used only to verify the server side. Node identity
+therefore rested entirely on `NUCLEUS_CLUSTER_TOKEN`: one bearer secret, held
+by every node, which anyone who learns it can replay.
+
+`tls::mtls_tests` runs real handshakes over loopback rather than inspecting
+configuration: a CA-signed peer connects, a peer with **no** certificate is
+refused, a peer with a certificate from **another** CA is refused, and a
+*server* whose certificate the CA did not sign is refused by the client — so a
+rogue listener on a peer's address cannot collect replication traffic. With the
+verifier removed, the two refusal tests fail, which is how they were checked.
+
+`NUCLEUS_CLUSTER_TOKEN` remains and is still enforced at connection setup; mTLS
+is a second, cryptographic factor rather than a replacement. The startup guard
+that refuses a non-loopback cluster transport with no token is unchanged.
+
+**Not closed by this**: message-level node identity is still self-asserted. A
+peer that completes the handshake may claim any `node_id` in the envelopes it
+sends, because the configuration does not express per-node certificate identity
+— `NUCLEUS_INTERNAL_TLS_SERVER_NAME` is a single cluster-wide name, so
+certificates are not expected to carry a per-node subject. Binding a claimed
+`node_id` to the peer certificate needs that convention decided first; it is
+filed in `OPEN_WORK.md` rather than half-built here. The boundary this closes
+is admission to the cluster, which is what the shared token was carrying alone.
+
 ## Deliberate limitations
 
 - Constraint errors (for example unique and foreign-key checks) can reveal that a hidden key exists,

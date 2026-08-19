@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 306168; Source Rust files: 271; Top-level modules: 51.
-- Declared unit tests: 4329; Declared integration tests: 383; Ignored tests: 46.
+- Source LOC: 306400; Source Rust files: 271; Top-level modules: 51.
+- Declared unit tests: 4333; Declared integration tests: 383; Ignored tests: 46.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,190 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -487,7 +487,25 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       `RLS_SECURITY.md`, including what expiry deliberately does NOT do: it applies at login,
       does not terminate live sessions, and does not block `SET ROLE`, matching PostgreSQL.
 - [ ] Add optional trusted JWT/OIDC/proxy claim verification if multi-tenant cloud mode is supported.
-- [ ] Authenticate cluster nodes with mTLS and authorize administrative RPCs.
+- [x] Authenticate cluster nodes with mTLS and authorize administrative RPCs.
+      **Closed 2026-08-19 (S58/N17).** Node-to-node TLS existed; mutual TLS did not, in either
+      direction. The internal acceptor was built with `with_no_client_auth()`, so a node served
+      any TLS client that reached it, and the internal connector presented no certificate, so a
+      peer had nothing to verify. The CA was used only to check the server side. Node identity
+      rested entirely on `NUCLEUS_CLUSTER_TOKEN` -- one bearer secret held by every node.
+      `load_internal_tls_config` now builds its acceptor with the CA as the client-certificate
+      CA and its connector with `with_client_auth_cert`, so both directions verify. This is not
+      a compatibility break: that CA already signs the node certificates the connector
+      verifies, so it asks for nothing a working cluster does not have. The transport and
+      replication share the config, so one change covers both.
+      `tls::mtls_tests` runs real handshakes over loopback: CA-signed peer connects; **no**
+      certificate refused; certificate from **another** CA refused; and a *server* the CA did
+      not sign refused by the client, so a rogue listener on a peer's address cannot collect
+      replication traffic. Removing the verifier fails the two refusal tests.
+      NOT closed, and stated in `RLS_SECURITY.md` rather than half-built: message-level node
+      identity is still self-asserted. `NUCLEUS_INTERNAL_TLS_SERVER_NAME` is a single
+      cluster-wide name, so the configuration does not express a per-node certificate subject
+      to bind a claimed `node_id` to. That convention is a decision, and it is filed.
 - [ ] Propagate authenticated principals through supported follower forwarding without impersonation.
 - [ ] Emit durable, bounded security audit events for login and authority changes.
 

@@ -106,15 +106,29 @@ pub fn load_tls_config_with_client_ca(
     build_tls_acceptor(certs, key, client_ca_path)
 }
 
-/// Build internal node-to-node TLS config using one server cert/key and a CA
-/// bundle used by clients to verify peers.
+/// Build internal node-to-node TLS config: mutual TLS, in both directions.
+///
+/// Every node presents the certificate at `cert_path` and requires its peer to
+/// present one signed by `ca_path`. Neither half was true before: the acceptor
+/// was built with `with_no_client_auth()`, so a node accepted any TLS client at
+/// all, and the connector presented no certificate, so there was nothing for a
+/// peer to check even if it had looked. Node identity rested entirely on the
+/// shared `NUCLEUS_CLUSTER_TOKEN` — one secret, held by every node, that
+/// authorises joining the cluster and can be replayed by anyone who learns it.
+///
+/// This is not a compatibility break for a working deployment: the CA here is
+/// already the one that signs node server certificates (that is what makes the
+/// connector's verification succeed), so requiring client certificates from the
+/// same CA asks for nothing an operating cluster does not already have.
 pub fn load_internal_tls_config(
     cert_path: &Path,
     key_path: &Path,
     ca_path: &Path,
     server_name: impl Into<String>,
 ) -> Result<InternalTlsConfig, TlsError> {
-    let acceptor = load_tls_config(cert_path, key_path)?;
+    // The CA verifies peers in BOTH directions, so the acceptor gets it as its
+    // client-certificate CA rather than being built with no client auth.
+    let acceptor = load_tls_config_with_client_ca(cert_path, key_path, Some(ca_path))?;
 
     let file = File::open(ca_path)
         .map_err(|e| TlsError::ClientCaLoad(format!("{}: {e}", ca_path.display())))?;
@@ -135,9 +149,14 @@ pub fn load_internal_tls_config(
             .map_err(|e| TlsError::ClientAuthConfig(e.to_string()))?;
     }
 
+    // And the connector presents this node's own certificate, so the peer's
+    // verifier has something to verify.
+    let client_certs = load_cert_chain(cert_path)?;
+    let client_key = load_private_key(key_path)?;
     let client_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_client_auth_cert(client_certs, client_key)
+        .map_err(|e| TlsError::ClientAuthConfig(e.to_string()))?;
     let connector = TlsConnector::from(Arc::new(client_config));
 
     Ok(InternalTlsConfig {
@@ -447,5 +466,212 @@ mod tests {
         let key_path = write_temp_file(&dir, "key.pem", &other_key);
         let result = load_tls_config(&cert_path, &key_path);
         assert!(matches!(result, Err(TlsError::Config(_))));
+    }
+}
+
+/// Mutual-TLS tests for the internal (node-to-node) channel.
+///
+/// The gate for N17 is "a node without a valid cert is refused", which is a
+/// claim about a HANDSHAKE and cannot be checked by inspecting a config
+/// object. These run a real TLS handshake over a loopback socket against the
+/// acceptor the cluster transport uses.
+#[cfg(all(test, feature = "server"))]
+mod mtls_tests {
+    use super::*;
+    use std::io::Write;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct Ca {
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+        pem: String,
+    }
+
+    fn make_ca(name: &str) -> Ca {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem();
+        Ca { cert, key, pem }
+    }
+
+    /// A node certificate signed by `ca`, valid for `localhost` as both a
+    /// server and a client.
+    fn node_cert(ca: &Ca) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let cert = params.signed_by(&key, &ca.cert, &ca.key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    fn write(dir: &tempfile::TempDir, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        File::create(&path)
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        path
+    }
+
+    fn internal_config(dir: &tempfile::TempDir, ca: &Ca, tag: &str) -> InternalTlsConfig {
+        let (cert_pem, key_pem) = node_cert(ca);
+        let cert = write(dir, &format!("{tag}-cert.pem"), &cert_pem);
+        let key = write(dir, &format!("{tag}-key.pem"), &key_pem);
+        let ca_path = write(dir, &format!("{tag}-ca.pem"), &ca.pem);
+        load_internal_tls_config(&cert, &key, &ca_path, "localhost").unwrap()
+    }
+
+    /// Accept one connection with `acceptor` and report whether the handshake
+    /// completed. A failed client handshake shows up here as an accept error.
+    async fn serve_once(listener: TcpListener, acceptor: TlsAcceptor) -> bool {
+        let Ok((stream, _)) = listener.accept().await else {
+            return false;
+        };
+        match acceptor.accept(stream).await {
+            Ok(mut tls) => {
+                let _ = tls.write_all(b"ok").await;
+                let _ = tls.flush().await;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn client_says_ok(connector: &TlsConnector, addr: std::net::SocketAddr) -> bool {
+        let Ok(stream) = TcpStream::connect(addr).await else {
+            return false;
+        };
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let Ok(mut tls) = connector.connect(name, stream).await else {
+            return false;
+        };
+        let mut buf = [0u8; 2];
+        tls.read_exact(&mut buf).await.is_ok() && &buf == b"ok"
+    }
+
+    /// The control: two nodes holding certificates from the same CA connect.
+    #[tokio::test]
+    async fn a_node_with_a_cert_from_the_cluster_ca_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = make_ca("cluster-ca");
+        let server = internal_config(&dir, &ca, "server");
+        let client = internal_config(&dir, &ca, "client");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(serve_once(listener, server.acceptor));
+
+        assert!(
+            client_says_ok(&client.connector, addr).await,
+            "a node with a CA-signed certificate must be able to join"
+        );
+        assert!(accepted.await.unwrap());
+    }
+
+    /// The gate: a client presenting NO certificate is refused.
+    #[tokio::test]
+    async fn a_node_without_a_certificate_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = make_ca("cluster-ca");
+        let server = internal_config(&dir, &ca, "server");
+
+        // A client that trusts the cluster CA but presents nothing of its own —
+        // exactly what `load_internal_tls_config` used to build.
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut BufReader::new(ca.pem.as_bytes())) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let anonymous = TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(serve_once(listener, server.acceptor));
+
+        assert!(
+            !client_says_ok(&anonymous, addr).await,
+            "a peer presenting no client certificate must not be served"
+        );
+        assert!(
+            !accepted.await.unwrap(),
+            "the acceptor must reject the handshake rather than serving it"
+        );
+    }
+
+    /// A certificate from a DIFFERENT CA is refused. Holding *a* certificate is
+    /// not the property being checked; holding one this cluster issued is.
+    #[tokio::test]
+    async fn a_node_with_a_cert_from_another_ca_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = make_ca("cluster-ca");
+        let theirs = make_ca("some-other-ca");
+        let server = internal_config(&dir, &ours, "server");
+
+        // The intruder trusts our CA (so it will accept our server cert) but is
+        // signed by its own.
+        let (cert_pem, key_pem) = node_cert(&theirs);
+        let cert = write(&dir, "rogue-cert.pem", &cert_pem);
+        let key = write(&dir, "rogue-key.pem", &key_pem);
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut BufReader::new(ours.pem.as_bytes())) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let rogue = TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    load_cert_chain(&cert).unwrap(),
+                    load_private_key(&key).unwrap(),
+                )
+                .unwrap(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(serve_once(listener, server.acceptor));
+
+        assert!(
+            !client_says_ok(&rogue, addr).await,
+            "a certificate from another CA must not authenticate a peer"
+        );
+        assert!(!accepted.await.unwrap());
+    }
+
+    /// The other direction: a node refuses to talk to a SERVER whose
+    /// certificate the cluster CA did not sign, so a rogue listener cannot
+    /// collect replication traffic by answering on a peer's address.
+    #[tokio::test]
+    async fn a_server_with_a_cert_from_another_ca_is_refused_by_the_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = make_ca("cluster-ca");
+        let theirs = make_ca("some-other-ca");
+        let impostor = internal_config(&dir, &theirs, "impostor");
+        let client = internal_config(&dir, &ours, "client");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(serve_once(listener, impostor.acceptor));
+
+        assert!(
+            !client_says_ok(&client.connector, addr).await,
+            "a node must not accept a peer certificate its CA did not sign"
+        );
+        let _ = accepted.await;
     }
 }
