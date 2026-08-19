@@ -11,6 +11,8 @@
 // which failed the whole suite with TS2451 "Cannot redeclare block-scoped
 // variable". Deleting dist is not the fix: other packages import from it at
 // test time, and removing it takes 10 suites and 68 tests down with it.
+import neutronWindPlugin from '../babel-plugin'
+
 export {}
 
 // We need babel available for these tests
@@ -29,7 +31,13 @@ function transform(code: string, platform: string = 'all'): string | null | unde
   const result = transformSync(code, {
     plugins: [
       ['@babel/plugin-syntax-jsx', {}],
-      [require.resolve('../babel-plugin'), { platform }],
+      // Pass the plugin VALUE, not a path. `require.resolve` handed Babel a
+      // `.ts` file to load itself, and Babel only transpiles `.cts` configs
+      // and plugins -- so on CI this failed with "You are using a .ts config
+      // file" while passing locally, where resolution happened to land on the
+      // built `.js`. ts-jest has already compiled this module by the time the
+      // test runs, so handing over the function is both hermetic and correct.
+      [neutronWindPlugin, { platform }],
     ],
     filename: 'test.tsx',
   })

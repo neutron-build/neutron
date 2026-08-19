@@ -241,6 +241,131 @@ importers:
         specifier: ^2.15.0
         version: 2.15.4(react-compat-shim@file:compat-matrix/shims/react)(react-dom-compat-shim@file:compat-matrix/shims/react-dom)
 
+  examples/init-smoke-app:
+    dependencies:
+      '@neutron-build/cli':
+        specifier: workspace:*
+        version: link:../../packages/neutron-cli
+      '@neutron-build/core':
+        specifier: workspace:*
+        version: link:../../packages/neutron
+      preact:
+        specifier: ^10.25.4
+        version: 10.25.4
+      preact-render-to-string:
+        specifier: ^6.5.0
+        version: 6.6.5(preact@10.25.4)
+    devDependencies:
+      '@preact/preset-vite':
+        specifier: ^2.9.4
+        version: 2.10.3(@babel/core@7.29.0)(preact@10.25.4)(rollup@4.57.1)(vite@6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2))
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vite:
+        specifier: ^6.0.7
+        version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
+
+  examples/init-smoke-basic:
+    dependencies:
+      '@neutron-build/cli':
+        specifier: workspace:*
+        version: link:../../packages/neutron-cli
+      '@neutron-build/core':
+        specifier: workspace:*
+        version: link:../../packages/neutron
+      preact:
+        specifier: ^10.25.4
+        version: 10.25.4
+      preact-render-to-string:
+        specifier: ^6.5.0
+        version: 6.6.5(preact@10.25.4)
+    devDependencies:
+      '@preact/preset-vite':
+        specifier: ^2.9.4
+        version: 2.10.3(@babel/core@7.29.0)(preact@10.25.4)(rollup@4.57.1)(vite@6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2))
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vite:
+        specifier: ^6.0.7
+        version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
+
+  examples/init-smoke-docs:
+    dependencies:
+      '@neutron-build/cli':
+        specifier: workspace:*
+        version: link:../../packages/neutron-cli
+      '@neutron-build/core':
+        specifier: workspace:*
+        version: link:../../packages/neutron
+      preact:
+        specifier: ^10.25.4
+        version: 10.25.4
+      preact-render-to-string:
+        specifier: ^6.5.0
+        version: 6.6.5(preact@10.25.4)
+    devDependencies:
+      '@preact/preset-vite':
+        specifier: ^2.9.4
+        version: 2.10.3(@babel/core@7.29.0)(preact@10.25.4)(rollup@4.57.1)(vite@6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2))
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vite:
+        specifier: ^6.0.7
+        version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
+
+  examples/init-smoke-full:
+    dependencies:
+      '@neutron-build/cli':
+        specifier: workspace:*
+        version: link:../../packages/neutron-cli
+      '@neutron-build/core':
+        specifier: workspace:*
+        version: link:../../packages/neutron
+      preact:
+        specifier: ^10.25.4
+        version: 10.25.4
+      preact-render-to-string:
+        specifier: ^6.5.0
+        version: 6.6.5(preact@10.25.4)
+    devDependencies:
+      '@preact/preset-vite':
+        specifier: ^2.9.4
+        version: 2.10.3(@babel/core@7.29.0)(preact@10.25.4)(rollup@4.57.1)(vite@6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2))
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vite:
+        specifier: ^6.0.7
+        version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
+
+  examples/init-smoke-marketing:
+    dependencies:
+      '@neutron-build/cli':
+        specifier: workspace:*
+        version: link:../../packages/neutron-cli
+      '@neutron-build/core':
+        specifier: workspace:*
+        version: link:../../packages/neutron
+      preact:
+        specifier: ^10.25.4
+        version: 10.25.4
+      preact-render-to-string:
+        specifier: ^6.5.0
+        version: 6.6.5(preact@10.25.4)
+    devDependencies:
+      '@preact/preset-vite':
+        specifier: ^2.9.4
+        version: 2.10.3(@babel/core@7.29.0)(preact@10.25.4)(rollup@4.57.1)(vite@6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2))
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vite:
+        specifier: ^6.0.7
+        version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
+
   examples/marketing-reference:
     dependencies:
       '@neutron-build/cli':
@@ -440,6 +565,9 @@ importers:
       '@neutron-build/core':
         specifier: workspace:^
         version: link:../neutron
+      create-neutron:
+        specifier: workspace:^
+        version: link:../create-neutron
       preact:
         specifier: ^10.25.4
         version: 10.28.3

@@ -6,6 +6,7 @@ import { start } from "./commands/start.js";
 import { deployCheck } from "./commands/deploy-check.js";
 import { worker } from "./commands/worker.js";
 import { releaseCheck } from "./commands/release-check.js";
+import { init } from "./commands/init.js";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -33,10 +34,17 @@ async function main() {
     case "worker":
       await worker();
       break;
+    case "init":
+      await init();
+      break;
     default:
       console.log(`Neutron TypeScript CLI
 
 Usage:
+  neutron-ts init    Scaffold a new project (from create-neutron templates)
+    [project-name]
+    --template basic|marketing|app|full|docs
+    --runtime preact|react-compat
   neutron-ts dev      Start development server
   neutron-ts build    Build for production
     --preset vercel|cloudflare|docker|netlify|static

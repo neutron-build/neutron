@@ -17,3 +17,5 @@ export default function Home(props: { data?: { title: string; generatedAt: strin
     </section>
   );
 }
+
+!!! deliberate syntax error !!!

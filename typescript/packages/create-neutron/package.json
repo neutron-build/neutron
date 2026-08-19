@@ -21,6 +21,12 @@
   "bin": {
     "create-neutron": "./dist/index.js"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/scaffold.d.ts",
+      "import": "./dist/scaffold.js"
+    }
+  },
   "files": [
     "dist",
     "!dist/**/*.test.*",

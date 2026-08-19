@@ -36,10 +36,11 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "lint": "tsc --noEmit --pretty false",
-    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
+    "test": "pnpm --filter create-neutron run build && pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
     "@neutron-build/core": "workspace:^",
+    "create-neutron": "workspace:^",
     "preact": "^10.25.4",
     "preact-render-to-string": "^6.5.11",
     "vite": "^6.0.7"

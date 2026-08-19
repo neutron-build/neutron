@@ -314,7 +314,7 @@ function resolveDistFilePath(distDir: string, pathname: string): string | null {
 
 // -- index.ts: CLI dispatch --------------------------------------------------
 
-const VALID_COMMANDS = ["dev", "build", "preview", "start", "deploy-check", "release-check", "worker"];
+const VALID_COMMANDS = ["dev", "build", "preview", "start", "deploy-check", "release-check", "worker", "init"];
 
 // =========================================================================
 // Tests
@@ -837,8 +837,8 @@ describe("CLI command dispatch", () => {
     }
   });
 
-  it("has 7 valid commands", () => {
-    assert.equal(VALID_COMMANDS.length, 7);
+  it("has 8 valid commands", () => {
+    assert.equal(VALID_COMMANDS.length, 8);
   });
 
   it("includes dev, build, preview, start", () => {
@@ -852,6 +852,10 @@ describe("CLI command dispatch", () => {
     assert.ok(VALID_COMMANDS.includes("worker"));
     assert.ok(VALID_COMMANDS.includes("deploy-check"));
     assert.ok(VALID_COMMANDS.includes("release-check"));
+  });
+
+  it("includes init", () => {
+    assert.ok(VALID_COMMANDS.includes("init"));
   });
 });
 
@@ -887,6 +891,68 @@ describe("config file candidates", () => {
 // ---------------------------------------------------------------------------
 
 import { extractClientEntryScriptSrc } from "./client-entry.js";
+
+// `init.ts` is imported from source for the same reason client-entry.ts is:
+// it pulls in no build tooling (only the create-neutron scaffold library), so
+// the real parseInitArgs can be exercised instead of a mirror.
+import { parseInitArgs } from "./commands/init.js";
+
+describe("parseInitArgs", () => {
+  it("returns default options when no args provided", () => {
+    const result = parseInitArgs([]);
+    assert.ok(result);
+    assert.equal(result.targetDir, "neutron-app");
+    assert.equal(result.template, "basic");
+    assert.equal(result.runtime, "preact");
+  });
+
+  it("parses project name as positional arg", () => {
+    const result = parseInitArgs(["my-app"]);
+    assert.ok(result);
+    assert.equal(result.targetDir, "my-app");
+  });
+
+  it("parses --template flag with space", () => {
+    const result = parseInitArgs(["--template", "full"]);
+    assert.ok(result);
+    assert.equal(result.template, "full");
+  });
+
+  it("parses --template= format", () => {
+    const result = parseInitArgs(["--template=marketing"]);
+    assert.ok(result);
+    assert.equal(result.template, "marketing");
+  });
+
+  it("returns null for unsupported template", () => {
+    const result = parseInitArgs(["--template", "invalid"]);
+    assert.equal(result, null);
+  });
+
+  it("returns null for unsupported template in = format", () => {
+    const result = parseInitArgs(["--template=nonexistent"]);
+    assert.equal(result, null);
+  });
+
+  it("parses --runtime react-compat", () => {
+    const result = parseInitArgs(["--runtime", "react-compat"]);
+    assert.ok(result);
+    assert.equal(result.runtime, "react-compat");
+  });
+
+  it("returns null for unsupported runtime", () => {
+    const result = parseInitArgs(["--runtime", "solid"]);
+    assert.equal(result, null);
+  });
+
+  it("handles all options combined", () => {
+    const result = parseInitArgs(["my-project", "--template", "docs", "--runtime", "react-compat"]);
+    assert.ok(result);
+    assert.equal(result.targetDir, "my-project");
+    assert.equal(result.template, "docs");
+    assert.equal(result.runtime, "react-compat");
+  });
+});
 
 function scratchDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "neutron-client-entry-"));

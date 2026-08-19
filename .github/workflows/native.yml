@@ -24,7 +24,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 22, not 20: the `*.web.test.ts` suites drive a global
+          # `navigator`, which Node only provides from 21 onward. On 20 they
+          # throw at `Object.defineProperty(navigator, ...)` and 36 tests fail
+          # for a reason that has nothing to do with the code under test.
+          # 22 is also what 9 of this repo's other workflows already use, so
+          # this removes an outlier rather than introducing one.
+          node-version: '22'
           cache: 'pnpm'
           cache-dependency-path: native/pnpm-lock.yaml
 

@@ -5,9 +5,11 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
+import { scaffoldProject } from "./scaffold.js";
 
 // ---------------------------------------------------------------------------
-// Unit-testable functions extracted from create-neutron/src/index.ts
+// Unit-testable functions extracted from create-neutron/src/scaffold.ts
+// (the scaffolding library `index.ts` and `neutron-ts init` both call).
 // These mirror the source exactly so tests are self-contained.
 // ---------------------------------------------------------------------------
 
@@ -704,7 +706,7 @@ describe("detectPackageManager", () => {
   const cases: Array<[string, string]> = [
     ["npm/10.2.3 node/v22.0.0", "npm"],
     ["pnpm/8.15.0 node/v22.0.0", "pnpm"],
-    ["yarn/1.22.19 node/v22.0.0", "yarn"],
+    ["yarn/1.22.19", "yarn"],
     ["bun/1.1.0", "bun"],
     ["", "npm"],
   ];
@@ -721,4 +723,107 @@ describe("detectPackageManager", () => {
       }
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// scaffoldProject — the REAL export, not a mirror. This is the exact library
+// path `neutron-ts init` calls, so it must actually scaffold. Scratch dirs are
+// created inside the package (not os.tmpdir) and removed in finally blocks.
+// ---------------------------------------------------------------------------
+
+describe("scaffoldProject (real export)", () => {
+  function scratchPath(name: string): string {
+    return path.join(process.cwd(), `.scaffold-scratch-${name}-${process.pid}-${Date.now()}`);
+  }
+
+  function assertNoRawTokens(rootDir: string, context: string): void {
+    const visit = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          visit(entryPath);
+          continue;
+        }
+        if (entry.name.endsWith(".md") || entry.name === ".gitignore") {
+          continue;
+        }
+        const content = fs.readFileSync(entryPath, "utf8");
+        assert.ok(
+          !/__[A-Z0-9_]+__/.test(content),
+          `raw template token left behind in ${context}: ${entryPath}`,
+        );
+      }
+    };
+    visit(rootDir);
+  }
+
+  it("scaffolds the basic template with every token applied", async () => {
+    const targetDir = scratchPath("basic");
+    try {
+      const result = await scaffoldProject({
+        targetDir,
+        template: "basic",
+        runtime: "preact",
+      });
+
+      assert.equal(result.projectName, path.basename(targetDir));
+      assert.equal(result.targetDir, targetDir);
+      assert.equal(result.absoluteDir, path.resolve(process.cwd(), targetDir));
+      assert.equal(result.template, "basic");
+      assert.equal(result.runtime, "preact");
+
+      const pkg = JSON.parse(fs.readFileSync(path.join(targetDir, "package.json"), "utf8"));
+      assert.equal(pkg.name, result.packageName);
+      // Scaffolding inside this workspace links the local packages.
+      assert.equal(pkg.dependencies["@neutron-build/core"], "workspace:*");
+      assert.equal(pkg.dependencies["@neutron-build/cli"], "workspace:*");
+
+      // The basic home route renders __PROJECT_NAME__ as its title.
+      const home = fs.readFileSync(path.join(targetDir, "src", "routes", "index.tsx"), "utf8");
+      assert.ok(home.includes(`"${result.projectName}"`));
+      assert.ok(fs.existsSync(path.join(targetDir, ".gitignore")));
+      const config = fs.readFileSync(path.join(targetDir, "neutron.config.ts"), "utf8");
+      assert.ok(config.includes('"preact"'));
+
+      assertNoRawTokens(targetDir, "basic");
+    } finally {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scaffolds every template with the runtime token applied", async () => {
+    for (const template of ["marketing", "app", "full", "docs"] as const) {
+      const targetDir = scratchPath(template);
+      try {
+        const result = await scaffoldProject({
+          targetDir,
+          template,
+          runtime: "react-compat",
+        });
+        assert.equal(result.template, template);
+        assert.equal(result.runtime, "react-compat");
+        assertNoRawTokens(targetDir, template);
+        if (template !== "docs") {
+          const config = fs.readFileSync(path.join(targetDir, "neutron.config.ts"), "utf8");
+          assert.ok(config.includes('"react-compat"'), `${template} runtime token not applied`);
+        }
+      } finally {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("refuses to scaffold into a non-empty directory", async () => {
+    const targetDir = scratchPath("notempty");
+    try {
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(path.join(targetDir, "file.txt"), "hi");
+      await assert.rejects(
+        () => scaffoldProject({ targetDir, template: "basic", runtime: "preact" }),
+        /not empty/,
+      );
+    } finally {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    }
+  });
 });
