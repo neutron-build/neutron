@@ -157,3 +157,83 @@ async fn a_failing_query_reaches_an_extended_protocol_client() {
         "unhelpful error text: {message}"
     );
 }
+
+/// The specific shape the dispatch reported: an **RLS denial** through the
+/// extended protocol.
+///
+/// The guard that refuses specialty-store functions while row-level security is
+/// active returns `PermissionDenied`, and a client that receives "success, 0
+/// rows" instead cannot tell a denial from an empty result. That is worse than
+/// a loud failure: the application takes the empty answer as data.
+#[tokio::test]
+async fn an_rls_denial_reaches_an_extended_protocol_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(tmp.path()).await;
+    let c = connect(server.port).await;
+
+    c.simple_query("CREATE TABLE t (id INT PRIMARY KEY, owner TEXT)")
+        .await
+        .expect("create");
+    c.simple_query("CREATE ROLE reader LOGIN PASSWORD 'p'")
+        .await
+        .expect("role");
+    c.simple_query("SELECT KV_SET('k', 'v')")
+        .await
+        .expect("kv write before any policy exists");
+    c.simple_query("CREATE POLICY p ON t FOR SELECT TO reader USING (owner = 'ada')")
+        .await
+        .expect("policy");
+    c.simple_query("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable rls");
+
+    // The connection authenticates as `nucleus`, a superuser, for whom the
+    // guard is deliberately inactive — so this must still WORK. A test that
+    // asserted a denial here would be asserting the wrong thing.
+    c.query("SELECT KV_GET($1)", &[&"k"])
+        .await
+        .expect("a superuser is exempt from the specialty guard");
+
+    // Now the reported shape itself: a NON-superuser session. The connection
+    // authenticates as the bootstrap superuser, for whom the guard is inactive,
+    // so `SET ROLE` is how a wire client reaches the denial path without SCRAM
+    // configured.
+    c.simple_query("GRANT SELECT ON t TO reader")
+        .await
+        .expect("grant");
+    c.simple_query("SET ROLE reader").await.expect("set role");
+    let err = c.query("SELECT KV_GET($1)", &[&"k"]).await.expect_err(
+        "an RLS denial must reach an extended-protocol client, not arrive as \
+             a successful empty result — this is the reported shape",
+    );
+    let message = err
+        .as_db_error()
+        .map(|e| e.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(
+        message.to_lowercase().contains("row-level security")
+            || message.to_lowercase().contains("unavailable"),
+        "the denial reached the client without its reason: {message}"
+    );
+    c.simple_query("RESET ROLE").await.expect("reset role");
+
+    // And one that applies to everyone: a specialty call inside an explicit
+    // transaction that cannot be rolled back.
+    c.simple_query("BEGIN").await.expect("begin");
+    let err = c
+        .execute("SELECT KV_HSET('h', 'f', 'v')", &[])
+        .await
+        .expect_err(
+            "a refusal must reach an extended-protocol client, not arrive as a \
+             successful empty result",
+        );
+    let message = err
+        .as_db_error()
+        .map(|e| e.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(
+        message.to_lowercase().contains("rollback"),
+        "the refusal reached the client without its reason: {message}"
+    );
+    let _ = c.simple_query("ROLLBACK").await;
+}
