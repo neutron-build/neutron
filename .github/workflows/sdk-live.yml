@@ -81,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk: [python, go, typescript, elixir, rust, julia]
+        sdk: [python, go, typescript, elixir, rust, julia, zig]
         # elixir joined 2026-08-15, once it could connect at all. Its executor
         # existed since S17 and reported 42/42 failing, because Postgrex's type
         # bootstrap died on `ARRAY (SELECT ...)`; with that fixed it runs
@@ -101,8 +101,11 @@ jobs:
         # defect), execute! raised on any DDL or transaction control, and
         # zrange re-joined member:score.
         #
-        # S18 adds zig when its executor lands — blocked on a Zig toolchain
-        # migration, see the note in that executor's directory. An
+        # zig joined 2026-08-19. Its executor was blocked on the 0.14-vs-0.16
+        # toolchain wall; that ended when the SDK pinned 0.15.2 everywhere, and
+        # the executor was ported off the defunct 0.16-proposal APIs and
+        # registered in the runner. It has never been scored against a live
+        # engine — this job is the first run that can. An
         # SDK absent from this list is UNPROVEN, and the drift job below says so
         # out loud rather than counting it as agreement.
     steps:
@@ -167,6 +170,14 @@ jobs:
         if: matrix.sdk == 'julia'
         working-directory: julia
         run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+      # 0.15.2 — the one version the SDK's manifest, its own workflow and the
+      # local toolchain agree on. `run.sh` resolves a keg-only 0.15 ahead of a
+      # 0.16 on PATH locally; in CI this action is the only zig present.
+      - uses: mlugg/setup-zig@v1
+        if: matrix.sdk == 'zig'
+        with:
+          version: "0.15.2"
 
       - uses: erlef/setup-beam@v1
         if: matrix.sdk == 'elixir'
