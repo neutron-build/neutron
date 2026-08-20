@@ -129,9 +129,7 @@ impl<T: DeserializeOwned> Config<T> {
     ///
     /// Requires the `dotenv` feature.
     #[cfg(feature = "dotenv")]
-    pub fn from_dotenv_path(
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, ConfigError> {
+    pub fn from_dotenv_path(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         dotenvy::from_path(path.as_ref()).map_err(ConfigError::DotEnv)?;
         Self::from_env()
     }
@@ -144,12 +142,16 @@ impl<T: DeserializeOwned> Config<T> {
 
 impl<T> Deref for Config<T> {
     type Target = T;
-    fn deref(&self) -> &T { &self.inner }
+    fn deref(&self) -> &T {
+        &self.inner
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Config<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Config").field("inner", &self.inner).finish()
+        f.debug_struct("Config")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
@@ -161,6 +163,16 @@ impl<T: fmt::Debug> fmt::Debug for Config<T> {
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use std::sync::{Mutex, OnceLock};
+
+    // `clean()` alone cannot isolate these tests: `std::env` is process-global
+    // and tests run in parallel threads, so every env-mutating test must hold
+    // this lock for its whole body or `reads_set_vars` races
+    // `defaults_when_vars_absent`.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[derive(Deserialize, Debug, PartialEq)]
     struct TestCfg {
@@ -169,7 +181,9 @@ mod tests {
         neutron_test_optional: Option<String>,
     }
 
-    fn default_key() -> String { "default".into() }
+    fn default_key() -> String {
+        "default".into()
+    }
 
     // Guard against test-isolation issues with env vars.
     fn clean() {
@@ -179,6 +193,7 @@ mod tests {
 
     #[test]
     fn defaults_when_vars_absent() {
+        let _guard = env_lock().lock().unwrap();
         clean();
         let cfg = Config::<TestCfg>::from_env().unwrap();
         assert_eq!(cfg.neutron_test_key, "default");
@@ -187,6 +202,7 @@ mod tests {
 
     #[test]
     fn reads_set_vars() {
+        let _guard = env_lock().lock().unwrap();
         clean();
         std::env::set_var("NEUTRON_TEST_KEY", "hello");
         let cfg = Config::<TestCfg>::from_env().unwrap();
@@ -196,6 +212,7 @@ mod tests {
 
     #[test]
     fn deref_gives_field_access() {
+        let _guard = env_lock().lock().unwrap();
         clean();
         let cfg = Config::<TestCfg>::from_env().unwrap();
         // Access via Deref.
@@ -204,6 +221,7 @@ mod tests {
 
     #[test]
     fn into_inner_consumes() {
+        let _guard = env_lock().lock().unwrap();
         clean();
         let cfg = Config::<TestCfg>::from_env().unwrap();
         let inner = cfg.into_inner();
@@ -212,6 +230,7 @@ mod tests {
 
     #[test]
     fn prefix_strips_prefix_from_var_names() {
+        let _guard = env_lock().lock().unwrap();
         std::env::remove_var("MYAPP_NEUTRON_TEST_KEY");
         std::env::set_var("MYAPP_NEUTRON_TEST_KEY", "prefixed");
         let cfg = Config::<TestCfg>::from_env_prefixed("MYAPP").unwrap();
@@ -221,10 +240,13 @@ mod tests {
 
     #[test]
     fn missing_required_field_is_error() {
+        let _guard = env_lock().lock().unwrap();
         clean();
         // `database_url: String` (no default) is required; absence is an error.
         #[derive(Deserialize)]
-        struct Required { neutron_required_url: String }
+        struct Required {
+            neutron_required_url: String,
+        }
         std::env::remove_var("NEUTRON_REQUIRED_URL");
         let result = Config::<Required>::from_env();
         assert!(result.is_err());

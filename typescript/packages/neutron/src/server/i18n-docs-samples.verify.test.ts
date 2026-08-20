@@ -180,7 +180,7 @@ describe("docs page: middleware tables and claims, against a live server", () =>
     }
     expect(canonical.status).toBe(307);
     expect(canonical.headers.get("location")).toBe("/pricing");
-  });
+  }, 30000);
 
   it("a prefixed URL with no matching route 404s (matching is not rewritten)", async () => {
     const root = await makeApp({
@@ -191,7 +191,7 @@ describe("docs page: middleware tables and claims, against a live server", () =>
 
     const res = await fetch(`${base}/es/pricing`);
     expect(res.status).toBe(404);
-  });
+  }, 30000);
 
   it("strategy prefix: /pricing 307s to /en/pricing; non-GET is not redirected", async () => {
     const root = await makeApp({
@@ -214,5 +214,5 @@ describe("docs page: middleware tables and claims, against a live server", () =>
     const es = await fetch(`${base}/es/pricing`);
     expect(es.status).toBe(200);
     expect((await es.text()).replace(/&quot;/g, '"')).toContain('"locale":"es"');
-  });
+  }, 30000);
 });

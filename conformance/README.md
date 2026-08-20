@@ -22,7 +22,10 @@ The runner exits non-zero if any contract dimension **fails** (skips do not fail
 so it is CI-usable as-is.
 
 Requires Node ≥ 18 (uses built-in `fetch`/`zlib`). Per-SDK toolchains:
-Go (`go`), Rust (`cargo`), Python (`python3` + `starlette pydantic uvicorn`).
+Go (`go`), Rust (`cargo`), Python (`python3` + `starlette pydantic uvicorn`),
+TypeScript (built `@neutron-build/core` — run `pnpm --filter @neutron-build/core
+build` inside `typescript/` first; the SDK auto-skips until then), Elixir
+(`elixir` + `mix`).
 
 ## Structure
 
@@ -32,15 +35,19 @@ conformance/
     run.mjs        # orchestrator: free-port → boot → wait /health → assert → teardown → matrix
     contract.mjs   # language-agnostic assertions (one fn per contract dimension)
     sdks.mjs       # per-SDK boot descriptors (build cmd, start cmd, availability)
+    validate-ir.mjs# re-parses FRAMEWORK_CONTRACT.md, fails if contract-ir.json disagrees
+  contract-ir.json # machine-readable single source for every constant the runner asserts
+  known-skips.json # recorded skips (dimension × SDK) with reason and expiry
   adapters/
     go/conformance-app/      # canonical no-DB Neutron Go app (own go.mod, replace → ../../../../go)
     rust/                    # → rust/crates/neutron/examples/conformance_app.rs (registered example)
     python/conformance_app.py# canonical no-DB Neutron Python app (imports in-repo SDK)
-    typescript/README.md     # document-only: why TS isn't auto-booted + its confirmed drift
+    typescript/              # boots the built SDK headless (conformance_app.mjs + routes/) — see its README.md
+    elixir/conformance_app.exs
 ```
 
 Each conformance app is **database-free** (the `nucleus` health field reports the
-"unconfigured/disconnected/false" state) and wires the same canonical endpoints:
+"unconfigured" state) and wires the same canonical endpoints:
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -55,12 +62,12 @@ Each conformance app is **database-free** (the `nucleus` health field reports th
 | Dimension | Contract § | What is checked |
 |-----------|-----------|-----------------|
 | `health.shape` | §7 | `GET /health` is 200 and body has **exactly** keys `{status, nucleus, version}` |
-| `health.types` | §7 | `status`/`version` are strings; **`nucleus` is a boolean** (`true\|false`) |
+| `health.types` | §7 | `status`/`version` are strings; `nucleus` is one of the tri-state strings `connected\|disconnected\|unconfigured` |
 | `error.rfc7807` | §2 | forced errors carry RFC 7807 fields `type`, `title`, `status`, `detail` |
 | `error.contenttype` | §2/§4 | error responses use `application/problem+json` |
 | `error.codes` | §2 | each standard status maps to the documented `type` suffix + `title` |
 | `validation.format` | §2 | a bad body → 422 with RFC 7807 + `errors[]` of `{field, message[, value]}` |
-| `feature.detection` | §1 | `nucleus` detection state is exposed via `/health` (its only HTTP surface) |
+| `feature.detection` | §1 | the `nucleus` field reports dependency health via `/health` (its only HTTP surface) |
 | `openapi.present` | §4 | `GET /openapi.json` is served and parses as JSON |
 | `openapi.31` | §4 | spec `openapi` field is `3.1.x` |
 | `mw.requestid` | §5 | `x-request-id` response header present (RequestID middleware ran) |
@@ -73,38 +80,43 @@ Feature detection (§1) is a **connection-time SQL probe** (`SELECT VERSION()`),
 an HTTP endpoint; its only HTTP-observable surface is the `nucleus` field of
 `/health`, which the suite asserts. The §3 Nucleus SQL functions require a live
 Nucleus database and so are out of scope for the HTTP runner — the one §3-adjacent
-contract issue (KV comma-split) is documented below as a static finding.
+contract issue (KV comma-split) is documented below (resolved).
 
 ## Current PASS/FAIL matrix
 
-Produced by `node runner/run.mjs` on this machine (Go 1.26, cargo 1.93, Python 3.14,
-Node 26). Deterministic across runs.
+Produced by `node runner/run.mjs` on this machine (go1.26.6, cargo 1.97.0,
+Python 3.14.7, Node 22.23.2, 2026-08-19). Deterministic across runs.
 
 ```
-Dimension            | go      | rust    | python
----------------------------------------------------
-health.shape         | PASS    | PASS    | PASS
-health.types         | PASS    | FAIL    | PASS
-error.rfc7807        | PASS    | PASS    | PASS
-error.contenttype    | PASS    | PASS    | PASS
-error.codes          | PASS    | PASS    | PASS
-validation.format    | PASS    | FAIL    | PASS
-feature.detection    | PASS    | PASS    | PASS
-openapi.present      | PASS    | PASS    | PASS
-openapi.31           | PASS    | PASS    | PASS
-mw.requestid         | PASS    | PASS    | PASS
-mw.cors              | PASS    | PASS    | PASS
-mw.compression       | PASS    | PASS    | PASS
----------------------------------------------------
+Dimension            | go      | rust    | python  | ts      | elixir  
+-----------------------------------------------------------------------
+health.shape         | PASS    | PASS    | PASS    | PASS    | PASS    | 
+health.types         | PASS    | PASS    | PASS    | PASS    | PASS    | 
+error.rfc7807        | PASS    | PASS    | PASS    | PASS    | PASS    | 
+error.contenttype    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+error.codes          | PASS    | PASS    | PASS    | PASS    | PASS    | 
+validation.format    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+feature.detection    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+openapi.present      | PASS    | PASS    | PASS    | PASS    | PASS    | 
+openapi.31           | PASS    | PASS    | PASS    | PASS    | PASS    | 
+mw.requestid         | PASS    | PASS    | PASS    | PASS    | PASS    | 
+mw.cors              | PASS    | PASS    | PASS    | PASS    | PASS    | 
+mw.compression       | PASS    | PASS    | PASS    | PASS    | PASS    | 
+-----------------------------------------------------------------------
+
 [go]     12 pass, 0 fail, 0 skip
-[rust]   10 pass, 2 fail, 0 skip
+[rust]   12 pass, 0 fail, 0 skip
 [python] 12 pass, 0 fail, 0 skip
+[ts]     12 pass, 0 fail, 0 skip
+[elixir] 12 pass, 0 fail, 0 skip
 ```
 
-**SDKs booted in this environment:** Go, Rust, Python (3 of 4).
-**Not booted:** TypeScript — it is a web/SSR framework, not a JSON API server; it
-needs a network `pnpm install` + build and does not expose `/openapi.json` or
-RFC 7807 HTTP errors. See [`adapters/typescript/README.md`](adapters/typescript/README.md).
+**SDKs booted in this environment:** all five. The TypeScript SDK is a web/SSR
+meta-framework, but since S81 it implements the full contract surface — RFC 7807
+errors, typed validation and OpenAPI 3.1 included — and boots headless via
+[`adapters/typescript/`](adapters/typescript/) once the package is built. An SDK
+whose toolchain or build is missing is auto-skipped (reported `UNAVAILABLE`), not
+failed.
 
 ---
 
@@ -113,99 +125,96 @@ RFC 7807 HTTP errors. See [`adapters/typescript/README.md`](adapters/typescript/
 Discovering drift is the point of this suite. Each finding below was either found
 by the runner (the matrix `FAIL`s) or confirmed by code inspection where the
 surface isn't HTTP-reachable. Findings are stated as **confirmed** / **refuted** /
-**partially refuted** against the three drifts the original engine audit flagged,
-plus two new ones the runner surfaced.
+**partially refuted** / **resolved** against the three drifts the original engine
+audit flagged, plus two new ones the runner surfaced. Resolved findings stay
+recorded so the same drift isn't rediscovered.
 
-### 1. `/health` nucleus-field TYPE drift — CONFIRMED (runner FAIL)
+### 1. `/health` nucleus-field TYPE drift — CONFIRMED, then RESOLVED by a contract decision (ea703d97)
 
-The contract §7 specifies `nucleus: true|false` (boolean). Two SDKs emit a **string**
-instead:
+The original audit read §7 as `nucleus: true|false` (boolean) and flagged Rust and
+TS — both emitted strings — as the drift, with Go/Python's boolean held up as
+correct. The resolution went the other way: the string carries a state the boolean
+cannot (`unconfigured` is not an error, `disconnected` is), so commit `ea703d97`
+("feat(contract): /health nucleus is tri-state connectivity across all SDKs",
+2026-06-07) made §7 specify
 
-- **Rust** — `rust/crates/neutron/src/health.rs:96-103` defines
-  `ContractHealthResponse.nucleus: &'static str` and emits `"connected"` /
-  `"disconnected"` / `"unconfigured"`. The crate's own test even asserts the string
-  shape (`health.rs:501` `assert_eq!(parsed["nucleus"], "unconfigured")`).
-- **TypeScript** — `typescript/packages/neutron/src/server/index.ts:351` emits
-  `nucleus: "unconfigured"`.
+    "nucleus": "connected" | "disconnected" | "unconfigured"
 
-Whereas the contract-faithful **boolean** is emitted by:
+with the semantics *health of the nucleus dependency* (feature detection — is the
+DB a Nucleus instance vs plain Postgres — is §1, not `/health`). Go
+(`go/neutron/app.go`) and Python (`python/neutron/app.py`) were migrated from the
+boolean to the tri-state; Rust (`health.rs` `HealthCheck::contract`) and TS
+already conformed; Elixir's boolean was fixed 2026-08-16. The runner asserts the
+tri-state via `contract-ir.json` (`health.nucleusStates`), `validate-ir.mjs` keeps
+the IR pinned to the prose, and all five SDKs pass `health.types` and
+`feature.detection` today. A client reading `/health` can treat `nucleus`
+uniformly across SDKs.
 
-- **Go** — `go/neutron/app.go:194-197` (`resp["nucleus"] = …IsNucleus()` / `false`).
-- **Python** — `python/neutron/app.py:154-156` (`"nucleus": is_nucleus`, a `bool`).
+### 2. Validation-error format drift (Rust) — RESOLVED (f6527299)
 
-This is a genuine cross-SDK divergence: a client reading `/health` cannot treat
-`nucleus` uniformly across SDKs. The runner's `health.types` dimension fails Rust on
-exactly this (TS would fail too if booted). **The original audit's "/health shape
-drift" is CONFIRMED**, and now pinpointed to a `boolean` vs `string` type split.
+Contract §2 validation format requires RFC 7807 with `type/title/status/detail`
+and an `errors[]` array of `{field, message[, value]}`. The Rust SDK's
+`impl IntoResponse for ValidationErrors` used to emit status 422 with
+`content-type: application/json` and body `{ "error": …, "fields": { … } }` —
+none of the RFC 7807 members, and an object where the array belongs.
 
-### 2. Validation-error format drift (Rust) — CONFIRMED (runner FAIL)
+Fixed in commit `f6527299` (P2.1/P2.3): the impl now delegates to
+`AppError::validation_error` (`rust/crates/neutron/src/validate.rs` →
+`rust/crates/neutron/src/error.rs`), which serializes
+`application/problem+json` with the full RFC 7807 shape plus a populated
+`errors[]`. Pinned by the crate's own tests (`error_response_is_problem_json`,
+`invalid_json_returns_422`, `validated_json_rejects_with_422_and_field_errors`)
+and by the runner's `validation.format` dimension, which passes on every SDK.
 
-Contract §2 validation format requires RFC 7807 with `type/title/status/detail` and
-an `errors[]` array of `{field, message, value}`. The Rust SDK's validation response
-does **not** conform:
-
-- `rust/crates/neutron/src/validate.rs:321-342` — `impl IntoResponse for
-  ValidationErrors` emits status 422 but with `content-type: application/json`
-  (not `application/problem+json`) and body
-  `{ "error": "Validation failed", "fields": { … } }` — it has **none** of
-  `type/title/status/detail` and uses a `fields` object instead of an `errors`
-  array.
-
-Go (`go/neutron/error.go:76-80,91-105`) and Python
-(`python/neutron/error.py:39-53,81-86`) both emit the correct RFC 7807 validation
-shape. The runner's `validation.format` dimension fails Rust on exactly this.
-
-### 3. Middleware order "documented but enforced nowhere" — PARTIALLY REFUTED
+### 3. Middleware order "documented but enforced nowhere" — REFUTED as of current code
 
 The original audit said the contract §5 middleware order is documented but enforced
-nowhere. As of current code this is **partially refuted**:
+nowhere. Today every server SDK ships a default stack helper:
 
-- **Enforced via a helper** in **Go** (`go/neutron/middleware.go:50` `DefaultStack`,
-  hard-codes RequestID→Logging→Recovery→CORS→Compression→RateLimit→Auth→Timeout→OTel)
-  and **Python** (`python/neutron/middleware.py:507` `default_stack`, same order).
-- **NOT enforced** in **Rust** or **TypeScript** — neither ships a `default_stack`/
-  `defaultStack`; order is hand-wired in examples with a comment that
-  acknowledges the gap (`rust/crates/neutron/examples/rest_api.rs:223-227`:
-  "P1.4 will replace this hand-wired stack with `default_stack()`"). TS hand-wires
-  CORS-before-Compression inline in `server/index.ts:318-343`.
+- **Go** — `go/neutron/middleware.go` `DefaultStack` (RequestID→Logging→Recovery→
+  CORS→Compression→RateLimit→Auth→Timeout→OTel).
+- **Python** — `python/neutron/middleware.py` `default_stack`, same order.
+- **Rust** — `rust/crates/neutron/src/router.rs` `Router::default_stack`, same
+  order (Auth omitted by design: there is no universal default — add it at the
+  Auth position after calling `default_stack()`). The `rest_api.rs` example still
+  hand-wires its stack and carries a stale "P1.4 will replace this" comment —
+  an adoption gap in the example, not a missing helper.
+- **TypeScript** — wires Hono's built-in request-id/CORS/compression middleware in
+  one place (`server/index.ts`) rather than a named `defaultStack`; the §5
+  observable layers are identical.
 
-So the order is **observable and correct** where the conformance apps are wired
-(all three booted SDKs pass `mw.requestid`/`mw.cors`/`mw.compression`), but it is
-only **structurally enforced** in Go and Python. The runner asserts the observable
-effects, not internal layering — internal enforcement is a code-structure finding.
+The runner asserts the observable effects (request id, CORS, compression), and all
+five booted SDKs pass `mw.requestid`/`mw.cors`/`mw.compression`.
 
-### 4. KV comma-split bug ported across SDKs — CONFIRMED (static)
+### 4. KV comma-split bug ported across SDKs — RESOLVED (JSON-array returns)
 
-Contract §3.1 has several KV functions return **comma-separated** strings
-(`KV_LRANGE`, `KV_SMEMBERS`, `KV_ZRANGE`, `KV_HGETALL`, …). Every SDK's Nucleus
-client parses these with a naive `split(',')`, so any member/value containing a
-literal comma is corrupted (split into multiple elements) on read:
+Contract §3.1 functions that return collections (`KV_LRANGE`, `KV_SMEMBERS`,
+`KV_ZRANGE`, `KV_HGETALL`, …) used to return comma-separated strings, and every
+SDK client parsed them with a naive `split(',')`, corrupting any member or value
+containing a literal comma. The engine now returns JSON arrays and every client
+parses structured JSON instead of splitting: Go
+(`go/nucleus/kv.go`, `json.Unmarshal`), Python (`python/neutron/nucleus/kv.py`,
+`json.loads`), Rust (`rust/crates/neutron-nucleus/src/models/kv.rs`,
+`serde_json::from_str`), TypeScript
+(`typescript/packages/neutron-nucleus/src/kv/index.ts`, `JSON.parse`). Not
+exercised by the HTTP runner (no Nucleus DB in CI); recorded as resolved by
+inspection.
 
-- **Go** — `go/nucleus/kv.go:267,346,400,448,464`
-- **Python** — `python/neutron/nucleus/kv.py:118,157,182,215,226`
-- **Rust** — `rust/crates/neutron-nucleus/src/models/kv.rs:215,299,354,409,429`
-- **TypeScript** — `typescript/packages/neutron-nucleus/src/kv/index.ts:274,314,344,368,375`
-
-The same pattern also appears in the Document clients (comma-separated ID lists)
-and PubSub channel lists. This is a data-fidelity drift identical across all four
-clients — **CONFIRMED**. It is not exercised by the HTTP runner (no Nucleus DB in
-CI); it requires a live Nucleus instance and a member containing `,` to reproduce.
-Fixing it requires a contract-level escaping/encoding decision (e.g. length-prefixed
-or JSON-array returns) applied uniformly across the engine + all clients.
-
-### 5. Config env-var prefix drift (Rust) — minor, observed
+### 5. Config env-var prefix drift (Rust) — RESOLVED
 
 Contract §6 specifies `{PREFIX}_HOST` / `{PREFIX}_PORT`. The Rust `Config::from_env`
-reads **bare** `HOST` / `PORT` (`rust/crates/neutron/src/config.rs:24-28`), with no
-framework prefix, while the contract's intent is a prefixed var. Go's example uses an
-explicit addr. Not asserted by the runner (boot-time only), recorded for completeness.
+used to read bare `HOST` / `PORT`; it now reads `NEUTRON_HOST` / `NEUTRON_PORT`
+(`rust/crates/neutron/src/config.rs`, commit `944b54ac`). The runner pins the
+conformance app's port via `NEUTRON_PORT`.
 
 ---
 
 ## Extending the suite
 
-- **Add a contract dimension:** add a check to `runner/contract.mjs` and its id to
-  the `DIMENSIONS` array (drives matrix column order).
+- **Add a contract dimension:** add the check to `runner/contract.mjs` and the
+  dimension to `contract-ir.json` (which drives the matrix column order) —
+  `runner/validate-ir.mjs` must still pass, so FRAMEWORK_CONTRACT.md and the IR
+  have to agree first.
 - **Add an SDK:** append a descriptor to `runner/sdks.mjs` with `build()`, `cmd()`
   (returns `{command, args}` and reads its port from the `portEnv` var), and
   `available()` (returns `null` if bootable, else a reason string). Add a canonical

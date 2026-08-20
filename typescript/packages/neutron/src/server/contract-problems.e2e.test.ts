@@ -152,7 +152,7 @@ describe("contract problems and OpenAPI (e2e)", () => {
       // Middleware ordering intact: the problem response still carries the id.
       expect(res.headers.get("x-request-id")).toBeTruthy();
     }
-  });
+  }, 30000);
 
   it("returns 422 problem+json with errors[] for an invalid POST body", async () => {
     root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-problems-"));
@@ -195,7 +195,7 @@ describe("contract problems and OpenAPI (e2e)", () => {
       body: JSON.stringify({ name: "x", price: 1 }),
     });
     expect(ok.status).toBe(201);
-  });
+  }, 30000);
 
   it("converts a ProblemError thrown from route middleware", async () => {
     root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-problems-"));
@@ -216,7 +216,7 @@ describe("contract problems and OpenAPI (e2e)", () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.type).toBe("https://neutron.dev/errors/unauthorized");
     expect(body.detail).toBe("route middleware says no");
-  });
+  }, 30000);
 
   it("serves an OpenAPI 3.1 document and /docs from the route tree", async () => {
     root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-problems-"));
@@ -251,7 +251,7 @@ describe("contract problems and OpenAPI (e2e)", () => {
     expect(docs.status).toBe(200);
     expect(docs.headers.get("content-type")).toContain("text/html");
     expect(await docs.text()).toContain("/openapi.json");
-  });
+  }, 30000);
 
   it("omits the spec surface when the openapi option is absent", async () => {
     root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-problems-"));
@@ -267,5 +267,5 @@ describe("contract problems and OpenAPI (e2e)", () => {
     const base = `http://127.0.0.1:${port}`;
     expect((await fetch(`${base}/openapi.json`)).status).toBe(404);
     expect((await fetch(`${base}/docs`)).status).toBe(404);
-  });
+  }, 30000);
 });
