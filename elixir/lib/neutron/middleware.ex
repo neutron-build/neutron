@@ -73,7 +73,19 @@ end
 # Layer 3: Recovery (Exception Handler)
 # =============================================================================
 defmodule Neutron.Middleware.Recovery do
-  @moduledoc "Catches unhandled exceptions and returns RFC 7807 500 responses."
+  @moduledoc """
+  Catches unhandled exceptions and returns RFC 7807 500 responses.
+
+  A linear Plug pipeline cannot rescue downstream exceptions from inside a
+  plug's own `call/2`: a `rescue` there only guards the expressions in its own
+  body, so the previous `conn \n rescue` guarded a bare variable and never
+  caught anything — a raising route crashed the connection process instead of
+  answering 500. The actual catch lives in `Neutron.Middleware.call/2`, which
+  wraps the whole compiled chain (the `super` override documented by
+  `Plug.Builder`) and delegates here on rescue. This plug remains in the chain
+  as layer 3 so the contract's order stays observable; its `call/2` is a
+  pass-through.
+  """
   @behaviour Plug
   require Logger
 
@@ -81,17 +93,22 @@ defmodule Neutron.Middleware.Recovery do
   def init(opts), do: opts
 
   @impl true
-  def call(conn, _opts) do
-    conn
-  rescue
-    exception ->
-      Logger.error("Unhandled exception: #{inspect(exception)}")
-      Logger.error(Exception.format(:error, exception, __STACKTRACE__))
+  def call(conn, _opts), do: conn
 
+  @doc false
+  def handle_exception(conn, exception, stacktrace) do
+    Logger.error("Unhandled exception: #{inspect(exception)}")
+    Logger.error(Exception.format(:error, exception, stacktrace))
+
+    if conn.state == :sent do
+      # The response already went out; there is nothing left to send.
+      conn
+    else
       Neutron.Error.send_error(
         conn,
         Neutron.Error.internal("An unexpected error occurred")
       )
+    end
   end
 end
 
@@ -488,8 +505,10 @@ defmodule Neutron.Middleware do
      which names a module that does not exist and sent at least one reader
      looking for compression that is not here and concluding it was missing.
   6. **RateLimit** — ETS-based sliding window per IP
-  7. **Auth** — JWT verification (optional)
-  8. **Timeout** — Task.async with deadline
+  7. **Auth** — optional bearer JWT (`required: false`, so requests without a
+  token pass through with `current_user` nil; protect routes with
+  `Neutron.Auth.Plug.require_auth/2`)
+  8. **Timeout** — watcher process with a deadline
   9. **OTel** — OpenTelemetry span creation
   10. **Router** — route dispatch
 
@@ -523,6 +542,8 @@ defmodule Neutron.Middleware do
   plug(Plug.Head)
   # Layer 6: Rate Limiting
   plug(Neutron.Middleware.RateLimit)
+  # Layer 7: Auth (optional bearer — pass-through when no token is present)
+  plug(Neutron.Auth.Plug, type: :bearer, required: false)
   # Layer 8: Request Timeout
   plug(Neutron.Middleware.Timeout)
   # Layer 9: OTel tracing
@@ -537,6 +558,19 @@ defmodule Neutron.Middleware do
   # `copy_opts_to_assign` on `use Plug.Builder` above (`builder_opts()` is
   # deprecated); Dispatch reads `:router` out of that assign.
   plug(Neutron.Middleware.Dispatch)
+
+  # Layer 3 (Recovery) actually catches HERE, not inside its own `call/2`.
+  # `Plug.Builder` chains plugs linearly, so a plug can only observe exceptions
+  # raised by its own body — a rescue in `Neutron.Middleware.Recovery.call/2`
+  # never sees downstream failures. The override below is the one wrap point
+  # around the whole compiled chain (`super`), which is where a recovery layer
+  # can meaningfully live. See `Neutron.Middleware.Recovery`'s moduledoc.
+  def call(conn, opts) do
+    super(conn, opts)
+  rescue
+    exception ->
+      Neutron.Middleware.Recovery.handle_exception(conn, exception, __STACKTRACE__)
+  end
 
   @doc false
   def init(opts) do

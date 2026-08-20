@@ -117,6 +117,31 @@ defmodule Neutron.OpenAPITest do
       assert Map.has_key?(get_users["responses"], "500")
     end
 
+    # FRAMEWORK_CONTRACT §4: error responses reference the shared RFC 7807
+    # schema and carry the problem+json content type.
+    test "error responses reference ProblemDetails as application/problem+json" do
+      spec = OpenAPI.generate(TestRouter)
+
+      for status <- ["400", "500"] do
+        response = spec["paths"]["/users"]["get"]["responses"][status]
+
+        assert %{"$ref" => "#/components/schemas/ProblemDetails"} =
+                 response["content"]["application/problem+json"]["schema"]
+
+        refute Map.has_key?(response["content"], "application/json")
+      end
+    end
+
+    test "ProblemDetails schema requires exactly the RFC 7807 required members" do
+      schema = OpenAPI.generate(TestRouter)["components"]["schemas"]["ProblemDetails"]
+
+      assert schema["required"] == ["type", "title", "status", "detail"]
+
+      for member <- ["type", "title", "status", "detail", "instance", "errors"] do
+        assert Map.has_key?(schema["properties"], member)
+      end
+    end
+
     test "handles empty router" do
       spec = OpenAPI.generate(EmptyRouter)
       # Should still have /health

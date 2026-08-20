@@ -44,6 +44,7 @@ defmodule Nucleus.Client do
     @moduledoc "Detected Nucleus capabilities."
     defstruct [
       :version,
+      :nucleus_version,
       is_nucleus: false,
       has_kv: false,
       has_vector: false,
@@ -62,6 +63,7 @@ defmodule Nucleus.Client do
 
     @type t :: %__MODULE__{
             version: String.t() | nil,
+            nucleus_version: String.t() | nil,
             is_nucleus: boolean(),
             has_kv: boolean(),
             has_vector: boolean(),
@@ -194,6 +196,37 @@ defmodule Nucleus.Client do
     end
   end
 
+  @doc """
+  Parses a `SELECT VERSION()` answer into detected features.
+
+  FRAMEWORK_CONTRACT §1: a version string containing "Nucleus" means the peer
+  is a Nucleus instance (every model available) and its version is extracted;
+  anything else is plain PostgreSQL, SQL-only.
+  """
+  @spec parse_version(String.t()) :: Features.t()
+  def parse_version(version) when is_binary(version) do
+    is_nucleus = String.contains?(version, "Nucleus")
+
+    %Features{
+      version: version,
+      is_nucleus: is_nucleus,
+      nucleus_version: if(is_nucleus, do: extract_nucleus_version(version)),
+      has_kv: is_nucleus,
+      has_vector: is_nucleus,
+      has_ts: is_nucleus,
+      has_document: is_nucleus,
+      has_graph: is_nucleus,
+      has_fts: is_nucleus,
+      has_geo: is_nucleus,
+      has_blob: is_nucleus,
+      has_streams: is_nucleus,
+      has_columnar: is_nucleus,
+      has_datalog: is_nucleus,
+      has_cdc: is_nucleus,
+      has_pubsub: is_nucleus
+    }
+  end
+
   # --- GenServer Implementation ---
 
   @impl true
@@ -263,28 +296,17 @@ defmodule Nucleus.Client do
   defp detect_features(conn) do
     case Postgrex.query(conn, "SELECT VERSION()", []) do
       {:ok, %{rows: [[version]]}} ->
-        is_nucleus = String.contains?(version, "Nucleus")
-
-        %Features{
-          version: version,
-          is_nucleus: is_nucleus,
-          has_kv: is_nucleus,
-          has_vector: is_nucleus,
-          has_ts: is_nucleus,
-          has_document: is_nucleus,
-          has_graph: is_nucleus,
-          has_fts: is_nucleus,
-          has_geo: is_nucleus,
-          has_blob: is_nucleus,
-          has_streams: is_nucleus,
-          has_columnar: is_nucleus,
-          has_datalog: is_nucleus,
-          has_cdc: is_nucleus,
-          has_pubsub: is_nucleus
-        }
+        parse_version(version)
 
       {:error, _} ->
         %Features{version: "unknown", is_nucleus: false}
+    end
+  end
+
+  defp extract_nucleus_version(version) do
+    case Regex.run(~r/Nucleus (\d+(?:\.\d+)*)/, version) do
+      [_, extracted] -> extracted
+      nil -> nil
     end
   end
 

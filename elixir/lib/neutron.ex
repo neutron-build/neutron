@@ -61,6 +61,8 @@ defmodule Neutron do
     * `:port` — listen port (default: from config or 4000)
     * `:host` — bind address (default: from config or "0.0.0.0")
     * `:nucleus` — Nucleus client pid or name (optional)
+    * `:shutdown_timeout` — drain timeout for in-flight requests at shutdown,
+      in ms (default: from config or 30 000, per FRAMEWORK_CONTRACT §8)
 
   ## Example
 
@@ -75,9 +77,18 @@ defmodule Neutron do
     port = Keyword.get(opts, :port, config.port)
     host = Keyword.get(opts, :host, config.host)
     router = Keyword.fetch!(opts, :router)
+    shutdown_timeout = Keyword.get(opts, :shutdown_timeout, config.shutdown_timeout)
 
     plug =
       {Neutron.Middleware, router: router, nucleus: Keyword.get(opts, :nucleus)}
+
+    # FRAMEWORK_CONTRACT §8: the drain timeout must reach the HTTP server.
+    # Bandit (via ThousandIsland) stops accepting, then gives in-flight
+    # connections up to `shutdown_timeout` to finish before force-closing.
+    thousand_island_options =
+      opts
+      |> Keyword.get(:thousand_island_options, [])
+      |> Keyword.put(:shutdown_timeout, shutdown_timeout)
 
     %{
       id: __MODULE__,
@@ -88,7 +99,8 @@ defmodule Neutron do
              plug: plug,
              port: port,
              ip: parse_host(host),
-             scheme: :http
+             scheme: :http,
+             thousand_island_options: thousand_island_options
            ]
          ]},
       type: :supervisor
