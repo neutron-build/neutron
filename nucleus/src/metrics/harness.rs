@@ -247,6 +247,10 @@ impl HarnessDb {
         std::fs::create_dir_all(dir).map_err(|e| HarnessError(format!("create {dir:?}: {e}")))?;
         let catalog = Arc::new(Catalog::new());
         let catalog_path = dir.join("catalog.json");
+        // One registry, shared by the executor and (for paged engines) the
+        // storage layer, so a counter incremented in either is visible to the
+        // caller.
+        let metrics = Arc::new(MetricsRegistry::new());
 
         let mut disk: Option<Arc<DiskEngine>> = None;
         let storage: Arc<dyn StorageEngine> = match kind {
@@ -277,7 +281,15 @@ impl HarnessDb {
                 }
                 disk = Some(engine.clone());
                 if kind == EngineKind::BufferedDisk {
-                    Arc::new(BufferedDiskEngine::new(engine))
+                    let buffered = Arc::new(BufferedDiskEngine::new(engine));
+                    // The lock-manager counters (`nucleus_lock_timeouts_total`,
+                    // `nucleus_lock_deadlock_kills_total`) live on the ENGINE
+                    // and are gated on a registry that only `main.rs` attached.
+                    // So every harness and probe ran with them permanently
+                    // zero — including the concurrency probe, which is the one
+                    // place a lock timeout would explain what it measures.
+                    buffered.set_metrics(Arc::clone(&metrics));
+                    buffered as Arc<dyn StorageEngine>
                 } else {
                     engine as Arc<dyn StorageEngine>
                 }
@@ -291,7 +303,7 @@ impl HarnessDb {
                 kind.is_durable().then(|| catalog_path.clone()),
                 Some(dir),
             )
-            .with_metrics(Arc::new(MetricsRegistry::new())),
+            .with_metrics(Arc::clone(&metrics)),
         );
         executor.load_meta().await;
 

@@ -126,6 +126,15 @@ fn new_rt() -> tokio::runtime::Runtime {
 static ENGINE: OnceLock<Option<EngineKind>> = OnceLock::new();
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Lock-manager counters, accumulated across rounds.
+///
+/// Each round builds a fresh database and therefore a fresh registry, so the
+/// per-round values have to be harvested before the round is dropped. They are
+/// the only thing that distinguishes "writers queued through contention" from
+/// "writers hit `lock_timeout` and gave up", and the wall clock cannot.
+static LOCK_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static DEADLOCK_KILLS: AtomicU64 = AtomicU64::new(0);
+
 /// One round's database. Dropping it closes the engine before removing the
 /// directory — a paged engine holds WAL and data-file handles until then.
 struct RoundDb {
@@ -136,6 +145,9 @@ struct RoundDb {
 
 impl Drop for RoundDb {
     fn drop(&mut self) {
+        let m = self.ex.metrics();
+        LOCK_TIMEOUTS.fetch_add(m.lock_timeouts.get(), Ordering::Relaxed);
+        DEADLOCK_KILLS.fetch_add(m.lock_deadlock_kills.get(), Ordering::Relaxed);
         self.db.take();
         if let Some(dir) = &self.dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -843,6 +855,16 @@ fn main_impl() {
 
     println!("\n════ SUMMARY ════");
     println!("rounds                       : {rounds}");
+    // Lock-manager counters, printed because they are the difference between
+    // "writers queued through contention" and "writers hit the 10s
+    // `lock_timeout` and gave up" — and the wall clock alone cannot tell those
+    // apart. They read zero on engines with no `LockManager` (mvcc, memory),
+    // which is correct rather than missing.
+    println!(
+        "lock timeouts / deadlock kills: {} / {}",
+        LOCK_TIMEOUTS.load(Ordering::Relaxed),
+        DEADLOCK_KILLS.load(Ordering::Relaxed)
+    );
     println!("invariant violations         : {}", report.divergences);
     println!(
         "write-conflict trials        : {} (conflicts detected in {}, both-committed in {})",
