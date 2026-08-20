@@ -37,13 +37,13 @@ func (m *mockScanRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (m *mockScanRows) Next() bool                         { return false }
-func (m *mockScanRows) Close()                              { m.closed = true }
-func (m *mockScanRows) Err() error                          { return nil }
-func (m *mockScanRows) CommandTag() pgconn.CommandTag        { return pgconn.CommandTag{} }
-func (m *mockScanRows) RawValues() [][]byte                  { return nil }
-func (m *mockScanRows) Conn() *pgx.Conn                     { return nil }
-func (m *mockScanRows) Values() ([]any, error)              { return nil, nil }
+func (m *mockScanRows) Next() bool                    { return false }
+func (m *mockScanRows) Close()                        { m.closed = true }
+func (m *mockScanRows) Err() error                    { return nil }
+func (m *mockScanRows) CommandTag() pgconn.CommandTag { return pgconn.CommandTag{} }
+func (m *mockScanRows) RawValues() [][]byte           { return nil }
+func (m *mockScanRows) Conn() *pgx.Conn               { return nil }
+func (m *mockScanRows) Values() ([]any, error)        { return nil, nil }
 
 func strPtr(s string) *string { return &s }
 

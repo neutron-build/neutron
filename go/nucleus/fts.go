@@ -26,10 +26,10 @@ type FTSSchema = map[string]any
 type FTSOption func(*ftsOpts)
 
 type ftsOpts struct {
-	fuzzyDist  int
-	limit      int64
-	highlight  []string
-	facets     []string
+	fuzzyDist int
+	limit     int64
+	highlight []string
+	facets    []string
 }
 
 // WithFuzzy enables fuzzy matching with the given edit distance.

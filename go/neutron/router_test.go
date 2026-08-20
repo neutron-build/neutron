@@ -131,8 +131,8 @@ func TestRouterQueryParams(t *testing.T) {
 	r := newRouter()
 
 	type Input struct {
-		Page  int    `query:"page"`
-		Sort  string `query:"sort"`
+		Page int    `query:"page"`
+		Sort string `query:"sort"`
 	}
 	type Resp struct {
 		Page int    `json:"page"`

@@ -20,13 +20,13 @@ func (e *AppError) Error() string {
 
 // ProblemDetail is the RFC 7807 JSON representation.
 type ProblemDetail struct {
-	Type     string             `json:"type"`
-	Title    string             `json:"title"`
-	Status   int                `json:"status"`
-	Detail   string             `json:"detail"`
-	Instance string             `json:"instance,omitempty"`
-	Errors   []ValidationError  `json:"errors,omitempty"`
-	Meta     map[string]any     `json:"extensions,omitempty"`
+	Type     string            `json:"type"`
+	Title    string            `json:"title"`
+	Status   int               `json:"status"`
+	Detail   string            `json:"detail"`
+	Instance string            `json:"instance,omitempty"`
+	Errors   []ValidationError `json:"errors,omitempty"`
+	Meta     map[string]any    `json:"extensions,omitempty"`
 }
 
 // ValidationError represents a single field validation failure.

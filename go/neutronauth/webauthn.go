@@ -54,13 +54,13 @@ type WebAuthnConfig struct {
 
 // RegistrationOptions is sent to the browser to start navigator.credentials.create().
 type RegistrationOptions struct {
-	Challenge        string                   `json:"challenge"`
-	RP               rpEntity                 `json:"rp"`
-	User             userEntity               `json:"user"`
-	PubKeyCredParams []pubKeyCredParam        `json:"pubKeyCredParams"`
-	Timeout          int                      `json:"timeout"`
-	Attestation      string                   `json:"attestation"`
-	AuthenticatorSel authenticatorSelection   `json:"authenticatorSelection"`
+	Challenge        string                 `json:"challenge"`
+	RP               rpEntity               `json:"rp"`
+	User             userEntity             `json:"user"`
+	PubKeyCredParams []pubKeyCredParam      `json:"pubKeyCredParams"`
+	Timeout          int                    `json:"timeout"`
+	Attestation      string                 `json:"attestation"`
+	AuthenticatorSel authenticatorSelection `json:"authenticatorSelection"`
 }
 
 type rpEntity struct {
@@ -103,16 +103,16 @@ type RegistrationResponse struct {
 
 // AuthenticationOptions is sent to the browser to start navigator.credentials.get().
 type AuthenticationOptions struct {
-	Challenge        string               `json:"challenge"`
-	RPID             string               `json:"rpId"`
-	Timeout          int                  `json:"timeout"`
-	UserVerification string               `json:"userVerification"`
+	Challenge        string                `json:"challenge"`
+	RPID             string                `json:"rpId"`
+	Timeout          int                   `json:"timeout"`
+	UserVerification string                `json:"userVerification"`
 	AllowCredentials []allowCredentialDesc `json:"allowCredentials,omitempty"`
 }
 
 type allowCredentialDesc struct {
-	Type string   `json:"type"`
-	ID   string   `json:"id"`
+	Type string `json:"type"`
+	ID   string `json:"id"`
 }
 
 // AuthenticationResponse is the JSON payload the browser sends back after

@@ -18,10 +18,10 @@ func TestSecureHeadersDefaults(t *testing.T) {
 
 	headers := map[string]string{
 		"X-Content-Type-Options":    "nosniff",
-		"X-Frame-Options":          "DENY",
+		"X-Frame-Options":           "DENY",
 		"Strict-Transport-Security": "max-age=63072000; includeSubDomains",
-		"Referrer-Policy":          "strict-origin-when-cross-origin",
-		"X-XSS-Protection":        "0",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+		"X-XSS-Protection":          "0",
 	}
 
 	for key, expected := range headers {
@@ -35,12 +35,12 @@ func TestSecureHeadersDefaults(t *testing.T) {
 func TestSecureHeadersCustomValues(t *testing.T) {
 	mw := SecureHeaders(SecureHeadersOptions{
 		ContentTypeOptions:      "nosniff",
-		FrameOptions:           "SAMEORIGIN",
+		FrameOptions:            "SAMEORIGIN",
 		StrictTransportSecurity: "max-age=31536000",
-		ReferrerPolicy:         "no-referrer",
-		XSSProtection:          "1; mode=block",
-		ContentSecurityPolicy:  "default-src 'self'",
-		PermissionsPolicy:      "camera=(), microphone=()",
+		ReferrerPolicy:          "no-referrer",
+		XSSProtection:           "1; mode=block",
+		ContentSecurityPolicy:   "default-src 'self'",
+		PermissionsPolicy:       "camera=(), microphone=()",
 	})
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -66,7 +66,7 @@ func TestSecureHeadersCustomValues(t *testing.T) {
 
 func TestSecureHeadersDisableWithDash(t *testing.T) {
 	mw := SecureHeaders(SecureHeadersOptions{
-		FrameOptions:           "-", // disable
+		FrameOptions:            "-", // disable
 		StrictTransportSecurity: "-", // disable
 	})
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

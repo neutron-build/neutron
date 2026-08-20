@@ -18,8 +18,8 @@ type DistanceMetric int
 
 const (
 	Cosine     DistanceMetric = iota
-	Euclidean                         // L2
-	DotProduct                        // inner product
+	Euclidean                 // L2
+	DotProduct                // inner product
 )
 
 func (m DistanceMetric) String() string {

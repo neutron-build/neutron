@@ -38,6 +38,24 @@ jobs:
         run: go build ./...
         working-directory: go
 
+      # `gofmt -l` prints filenames and exits 0 either way, so the emptiness
+      # of its output is the assertion. This gate could not exist until
+      # 2026-08-19: 81 files were unformatted purely because they were stored
+      # with CRLF, and the repo-wide renormalisation left 9 genuine ones, now
+      # fixed. Adding the gate in the same breath is the point — otherwise the
+      # drift comes straight back.
+      - name: Format
+        run: |
+          set -euo pipefail
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt would reformat these files:"
+            echo "$out"
+            exit 1
+          fi
+          echo "gofmt: clean"
+        working-directory: go
+
       - name: Vet
         run: go vet ./...
         working-directory: go

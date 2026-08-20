@@ -47,7 +47,7 @@ func TestLRUAccessOrder(t *testing.T) {
 	c := NewLRU(2)
 	c.Set("a", []byte("1"), 0)
 	c.Set("b", []byte("2"), 0)
-	c.Get("a") // access "a" so it's recently used
+	c.Get("a")                 // access "a" so it's recently used
 	c.Set("c", []byte("3"), 0) // should evict "b", not "a"
 
 	if _, ok := c.Get("a"); !ok {
