@@ -1267,18 +1267,41 @@ impl ShardedCollections {
         id_str: &str,
         fields: Vec<(String, String)>,
     ) -> Result<super::streams::StreamId, String> {
+        // Stream entries were never logged at all. `CollectionWal::log_xadd`
+        // and the OP_XADD replay arm both existed, with unit tests — and no
+        // caller anywhere in the crate, so every RESP `XADD` was lost on
+        // restart while every LPUSH beside it survived.
+        //
+        // This one logs AFTER applying, because the id is assigned by the
+        // stream: `XADD key *` does not know what it is logging until the entry
+        // exists. `begin_op` covers that window so a checkpoint cannot snapshot
+        // the applied entry and truncate the log before the record lands.
+        #[cfg(feature = "server")]
+        let _in_flight = self.wal.as_ref().map(|wal| wal.begin_op());
+        #[cfg(feature = "server")]
+        let logged_fields = self.wal.as_ref().map(|_| fields.clone());
+
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let stream = data
             .entry(key.to_string())
             .or_insert_with(|| KvCollection::Stream(Stream::new()));
-        match stream {
+        let applied = match stream {
             KvCollection::Stream(s) => s.xadd(id_str, fields),
             other => Err(format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected stream, got {})",
                 other.type_name()
             )),
+        };
+        drop(data);
+
+        #[cfg(feature = "server")]
+        if let Ok(ref id) = applied
+            && let Some(fields) = logged_fields
+        {
+            let _logged = self.log_write(|wal| wal.log_xadd(key, id, &fields));
         }
+        applied
     }
 
     /// XLEN: get the number of entries in a stream.
@@ -1368,6 +1391,10 @@ impl ShardedCollections {
         key: &str,
         ids: &[super::streams::StreamId],
     ) -> Result<usize, WrongTypeError> {
+        // Logged before applying, like the list/hash/set ops: the ids are the
+        // caller's, so there is nothing to learn from the apply first.
+        #[cfg(feature = "server")]
+        let _in_flight = self.log_write(|wal| wal.log_xdel(key, ids));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {

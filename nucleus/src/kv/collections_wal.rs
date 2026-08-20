@@ -255,6 +255,22 @@ impl CollectionWal {
         ))
     }
 
+    /// Mark an operation in flight before it is logged.
+    ///
+    /// The fourteen list/hash/set ops log BEFORE they apply, so `append`'s own
+    /// guard covers their window. Stream ops cannot: `XADD` does not know the
+    /// id it is logging until the entry is in the stream. They therefore take
+    /// this guard first, apply, log, and drop it — so a checkpoint can no more
+    /// run between their apply and their log than between the others' log and
+    /// their apply. Without it, a checkpoint in that window snapshots the
+    /// applied entry, truncates the log, and the append that follows lands in
+    /// the fresh tail: replay then applies the same entry twice.
+    pub fn begin_op(&self) -> InFlight<'_> {
+        let _w = self.writer.lock();
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        InFlight { wal: self }
+    }
+
     /// Append a WAL entry: op(u8) + key_len(u32) + key + data_len(u32) + data.
     fn append(&self, op: u8, key: &str, data: &[u8]) -> io::Result<InFlight<'_>> {
         let mut buf = Vec::new();
