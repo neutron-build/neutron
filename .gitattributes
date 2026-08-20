@@ -1,15 +1,46 @@
-# Elixir sources are checked in with LF endings.
+# Line endings, decided once (H8/S94, 2026-08-19).
 #
-# 27 files under elixir/ were committed with CRLF. Elixir 1.20's formatter
-# tolerates that; the 1.15 the CI gate pins does not, and reported all 26 of
-# them (every one that .formatter.exs globs) as unformatted -- so
-# `mix format --check-formatted` could not pass on CI and did pass locally, on
-# the same bytes.
+# 896 tracked files were committed with CRLF, spread across Go, TypeScript,
+# Python, Zig, Julia, Rust, Quint, the docs and more. Nothing enforced it and
+# nothing depended on it — it was an accident of whichever editor wrote each
+# file first. The cost was real and recurring: `mix format --check-formatted`
+# went red on CI and passed locally on the same bytes; `gofmt -l ./go` printed
+# 79 filenames; `cargo fmt` inside rust/ rewrote 140 files as a side effect of
+# an unrelated change; and every agent or tool that read a file as text and
+# wrote it back turned a four-line edit into a whole-file diff.
 #
-# Scoped deliberately. CRLF is repo-wide -- hundreds of tracked files across Go,
-# TypeScript, Python, Zig, Julia, Quint and the docs -- but no other gate
-# enforces line endings, and `* text=auto` would renormalize the whole tree on
-# everyone's next checkout. Widening this is a separate decision, not a
-# side effect of greening a gate.
-*.ex  text eol=lf
-*.exs text eol=lf
+# The previous version of this file scoped the rule to Elixir alone and said
+# widening it was "a separate decision, not a side effect of greening a gate".
+# This is that decision, taken deliberately and on its own.
+#
+# Everything is normalised to LF in the repository. Git still checks out
+# whatever the platform wants; only the stored bytes are fixed.
+* text=auto eol=lf
+
+# Windows shells need CRLF at runtime, not as an accident.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binaries: never touched, never diffed as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+*.wasm binary
+*.so   binary
+*.dylib binary
+*.dll  binary
+*.a    binary
+*.node binary
+*.iso  binary
+*.bin  binary
