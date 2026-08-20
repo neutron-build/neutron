@@ -626,3 +626,74 @@ fn test_transport_pubsub_gossip_codec() {
         other => panic!("expected PubSubGossip, got {other:?}"),
     }
 }
+
+// ======================================================================
+// Memory accounting (S30-9)
+// ======================================================================
+
+/// The allocator's "kv" ledger has to see collection footprint in BYTES.
+///
+/// It saw ~0 for lists, hashes, sets and sorted sets, and charged a flat 64
+/// bytes for an HLL whose register array is 16 KiB — so the ceiling it enforces
+/// could not see the memory it exists to bound. Measuring KV memory in the
+/// wrong unit is what cost 32 hours of rejected writes once already.
+#[tokio::test]
+async fn test_collection_memory_is_accounted_in_bytes() {
+    let ex = test_executor();
+    let ledger = || {
+        ex.memory_allocator()
+            .lock()
+            .allocation("kv")
+            .map(|a| a.current_bytes)
+            .unwrap_or(0)
+    };
+
+    let before = ledger();
+    let payload = "x".repeat(4096);
+    for i in 0..8 {
+        exec(&ex, &format!("SELECT kv_hset('big', 'f{i}', '{payload}')")).await;
+    }
+    let charged = ledger() - before;
+    // Eight 4 KiB values is 32 KiB of payload. Anything within a small
+    // constant factor is fine; ~0 is the bug.
+    assert!(
+        charged >= 32 * 1024,
+        "8 x 4KiB hash values charged only {charged} bytes"
+    );
+    assert!(
+        charged < 32 * 1024 * 4,
+        "accounting overshot wildly: {charged} bytes for 32KiB of payload"
+    );
+
+    // Deleting the fields gives it back.
+    let peak = ledger();
+    for i in 0..8 {
+        exec(&ex, &format!("SELECT kv_hdel('big', 'f{i}')")).await;
+    }
+    assert!(
+        ledger() < peak / 2,
+        "hdel released nothing: {} vs peak {peak}",
+        ledger()
+    );
+}
+
+/// An HLL key is 2^14 one-byte registers. The site said "fixed 16 bytes".
+#[tokio::test]
+async fn test_hll_is_charged_its_real_register_array() {
+    let ex = test_executor();
+    let ledger = || {
+        ex.memory_allocator()
+            .lock()
+            .allocation("kv")
+            .map(|a| a.current_bytes)
+            .unwrap_or(0)
+    };
+
+    let before = ledger();
+    exec(&ex, "SELECT kv_pfadd('visitors', 'alice')").await;
+    let charged = ledger() - before;
+    assert!(
+        charged >= 16 * 1024,
+        "an HLL key charged {charged} bytes; its register array alone is 16 KiB"
+    );
+}

@@ -186,6 +186,53 @@ pub enum KvCollection {
     Geo(GeoSet),
 }
 
+impl KvCollection {
+    /// Approximate heap footprint in **bytes**.
+    ///
+    /// Bytes, not entries, and not a flat per-key constant. The SQL path used
+    /// to charge a flat 64 bytes for an HLL whose register array is 16 KiB, and
+    /// nothing at all for lists, hashes, sets and sorted sets — so the memory
+    /// ceiling the allocator enforces could not see the collections at all.
+    /// Counting the wrong unit here is the shape of the KV memory incident that
+    /// cost 32 hours of rejected writes.
+    pub fn approx_heap_size(&self) -> usize {
+        const ENTRY_OVERHEAD: usize = 48;
+        match self {
+            KvCollection::List(list) => list.iter().fold(0usize, |acc, v| {
+                acc.saturating_add(v.approx_heap_size() + 8)
+            }),
+            KvCollection::Hash(map) => map.iter().fold(0usize, |acc, (f, v)| {
+                acc.saturating_add(f.len() + v.approx_heap_size() + ENTRY_OVERHEAD)
+            }),
+            KvCollection::Set(set) => set.iter().fold(0usize, |acc, m| {
+                acc.saturating_add(m.len() + ENTRY_OVERHEAD)
+            }),
+            KvCollection::SortedSet(z) => z.approx_heap_size(),
+            // The whole point of the finding: precision 14 means 2^14 one-byte
+            // registers, so 16 KiB per key, not the 16 bytes the comment claimed.
+            KvCollection::HyperLogLog(hll) => hll.registers().len(),
+            KvCollection::Stream(stream) => {
+                let entries = stream.xrange("-", "+", None);
+                let body = entries.iter().fold(0usize, |acc, e| {
+                    let fields = e.fields.iter().fold(0usize, |a, (f, v)| {
+                        a.saturating_add(f.len() + v.len() + ENTRY_OVERHEAD)
+                    });
+                    acc.saturating_add(fields + 16 + ENTRY_OVERHEAD)
+                });
+                let groups = stream.groups().values().fold(0usize, |acc, g| {
+                    acc.saturating_add(
+                        g.name.len() + g.pel.len() * (16 + ENTRY_OVERHEAD) + ENTRY_OVERHEAD,
+                    )
+                });
+                body.saturating_add(groups)
+            }
+            KvCollection::Geo(geo) => geo.members().iter().fold(0usize, |acc, (m, _)| {
+                acc.saturating_add(m.len() + 16 + ENTRY_OVERHEAD)
+            }),
+        }
+    }
+}
+
 /// Error returned when a key exists but holds the wrong collection type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrongTypeError {
@@ -1199,6 +1246,29 @@ impl ShardedCollections {
             }
         }
         result
+    }
+
+    /// Total approximate heap footprint of every collection, in bytes.
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for shard in &self.shards {
+            let data = shard.data.read();
+            for (key, coll) in data.iter() {
+                total = total
+                    .saturating_add(key.len())
+                    .saturating_add(coll.approx_heap_size());
+            }
+        }
+        total
+    }
+
+    /// Approximate heap footprint of one key, or 0 if it holds no collection.
+    pub fn key_memory_bytes(&self, key: &str) -> usize {
+        let shard = self.shard(key);
+        let data = shard.data.read();
+        data.get(key)
+            .map(|c| key.len() + c.approx_heap_size())
+            .unwrap_or(0)
     }
 
     /// Clear all collections across all shards. Used by WAL snapshot replay.

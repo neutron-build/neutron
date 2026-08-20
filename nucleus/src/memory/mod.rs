@@ -165,6 +165,16 @@ impl MemoryAllocator {
         }
     }
 
+    /// Record memory that is already in use, whether or not it fits.
+    ///
+    /// `request` refuses past the ceiling, which is right for a decision made
+    /// *before* allocating. Reconciling a ledger after the fact is a different
+    /// question: the bytes exist either way, and a ledger that declines to
+    /// count them is the under-reporting the ceiling was built to prevent.
+    pub fn account_used(&mut self, subsystem: &str, bytes: usize) {
+        self.grant(subsystem, bytes);
+    }
+
     fn grant(&mut self, subsystem: &str, bytes: usize) {
         let alloc = self
             .allocations

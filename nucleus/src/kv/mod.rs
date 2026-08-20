@@ -1484,7 +1484,11 @@ impl KvStore {
                     .saturating_add(KV_ENTRY_OVERHEAD_BYTES);
             }
         }
-        total
+        // Collections live in a separate store and were invisible here, so a
+        // workload of lists, hashes, sets and HLLs reported a memory footprint
+        // of roughly zero to everything that reads this — the eviction trigger
+        // included.
+        total.saturating_add(self.collections.estimated_memory_bytes())
     }
 
     /// Evict non-TTL entries from the hot tier to the cold LsmTree when the hot
@@ -2052,6 +2056,16 @@ impl SortedSet {
                 score: *s,
             })
             .collect()
+    }
+
+    /// Approximate heap footprint: both indexes hold the member string.
+    pub fn approx_heap_size(&self) -> usize {
+        let mut total = 0usize;
+        for member in self.members.keys() {
+            // Once in `members`, once in the `tree` key, plus the score.
+            total = total.saturating_add(member.len() * 2 + 8 + 48);
+        }
+        total
     }
 
     pub fn zcard(&self) -> usize {

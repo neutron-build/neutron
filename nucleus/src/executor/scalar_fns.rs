@@ -49,6 +49,30 @@ impl Executor {
         result
     }
 
+    /// Reconcile the KV ledger with a collection key's real footprint.
+    ///
+    /// Take `before` from `kv_key_bytes` around the mutation and pass it here.
+    /// The old sites charged fixed constants — a flat 64 bytes for an HLL whose
+    /// register array is 16 KiB, and nothing at all for lists, hashes, sets and
+    /// sorted sets — so the ceiling the allocator enforces could not see the
+    /// collections it was meant to bound.
+    #[cfg(feature = "server")]
+    fn kv_reconcile(&self, key: &str, before: usize) {
+        let after = self.kv_store.collections().key_memory_bytes(key);
+        let mut alloc = self.memory_allocator.lock();
+        if after > before {
+            alloc.account_used("kv", after - before);
+        } else {
+            alloc.release("kv", before - after);
+        }
+    }
+
+    /// A collection key's current footprint in bytes.
+    #[cfg(feature = "server")]
+    fn kv_key_bytes(&self, key: &str) -> usize {
+        self.kv_store.collections().key_memory_bytes(key)
+    }
+
     /// Drain the write-failure flag from both KV logs.
     #[cfg(feature = "server")]
     fn kv_write_failed(&self) -> bool {
@@ -3235,10 +3259,15 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let val = args[1].clone();
-                match self.kv_store.lpush(&key, val) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.lpush(&key, val) {
                     Ok(len) => Ok(Value::Int64(len as i64)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_RPUSH" => {
                 // kv_rpush(key, value) → list length after push
@@ -3248,10 +3277,15 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let val = args[1].clone();
-                match self.kv_store.rpush(&key, val) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.rpush(&key, val) {
                     Ok(len) => Ok(Value::Int64(len as i64)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_LPOP" => {
                 // kv_lpop(key) → popped value or NULL
@@ -3260,11 +3294,16 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.kv_store.lpop(&key) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.lpop(&key) {
                     Ok(Some(v)) => Ok(v),
                     Ok(None) => Ok(Value::Null),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_RPOP" => {
                 // kv_rpop(key) → popped value or NULL
@@ -3273,11 +3312,16 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.kv_store.rpop(&key) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.rpop(&key) {
                     Ok(Some(v)) => Ok(v),
                     Ok(None) => Ok(Value::Null),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_LRANGE" => {
                 // kv_lrange(key, start, stop) → comma-separated values
@@ -3366,10 +3410,15 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let val = args[2].clone();
-                match self.kv_store.hset(&key, &field, val) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.hset(&key, &field, val) {
                     Ok(is_new) => Ok(Value::Bool(is_new)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_HGET" => {
                 // kv_hget(key, field) → value or NULL
@@ -3399,10 +3448,15 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.kv_store.hdel(&key, &field) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.hdel(&key, &field) {
                     Ok(deleted) => Ok(Value::Bool(deleted)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_HGETALL" => {
                 // kv_hgetall(key) → comma-separated "field=value" pairs
@@ -3469,10 +3523,15 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.kv_store.sadd(&key, &member) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.sadd(&key, &member) {
                     Ok(is_new) => Ok(Value::Bool(is_new)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_SREM" => {
                 // kv_srem(key, member) → boolean
@@ -3485,10 +3544,15 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.kv_store.srem(&key, &member) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.srem(&key, &member) {
                     Ok(removed) => Ok(Value::Bool(removed)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_KEYS" => {
                 // kv_keys(pattern) → JSON array of non-expired keys matching a
@@ -3574,10 +3638,15 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.kv_store.col_zadd(&key, &member, score) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.col_zadd(&key, &member, score) {
                     Ok(is_new) => Ok(Value::Bool(is_new)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_ZREM" => {
                 // kv_zrem(key, member) → boolean
@@ -3590,10 +3659,15 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                match self.kv_store.col_zrem(&key, &member) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.col_zrem(&key, &member) {
                     Ok(removed) => Ok(Value::Bool(removed)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_ZRANGE" => {
                 // kv_zrange(key, start, stop) → comma-separated "member:score" pairs
@@ -3705,16 +3779,30 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                // HLL is fixed 16 bytes per key; account for key creation overhead
-                if !self.memory_allocator.lock().request("kv", 64) {
+                // Precision 14 → 2^14 one-byte registers, so a new HLL key is
+                // 16 KiB. The comment here said "fixed 16 bytes per key" and
+                // the request was 64 — wrong by 1024x and 256x respectively.
+                // The pre-flight reserves the real cost of creating one; the
+                // reconcile below settles the ledger against the actual key.
+                const HLL_REGISTERS_BYTES: usize = 1 << 14;
+                if !self
+                    .memory_allocator
+                    .lock()
+                    .request("kv", HLL_REGISTERS_BYTES)
+                {
                     return Err(ExecError::Unsupported(
                         "KV_PFADD: memory budget exceeded".into(),
                     ));
                 }
-                match self.kv_store.col_pfadd(&key, &element) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&key);
+                let outcome = match self.kv_store.col_pfadd(&key, &element) {
                     Ok(changed) => Ok(Value::Bool(changed)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&key, before_bytes);
+                outcome
             }
             "KV_PFCOUNT" => {
                 // kv_pfcount(key) → integer estimate
@@ -3750,15 +3838,21 @@ impl Executor {
                     })
                     .collect();
                 let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
-                if !self.memory_allocator.lock().request("kv", 64) {
+                // A merge can create the destination: same 16 KiB, not 64 bytes.
+                if !self.memory_allocator.lock().request("kv", 1 << 14) {
                     return Err(ExecError::Unsupported(
                         "KV_PFMERGE: memory budget exceeded".into(),
                     ));
                 }
-                match self.kv_store.col_pfmerge(&dest, &source_refs) {
+                #[cfg(feature = "server")]
+                let before_bytes = self.kv_key_bytes(&dest);
+                let outcome = match self.kv_store.col_pfmerge(&dest, &source_refs) {
                     Ok(()) => Ok(Value::Bool(true)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
-                }
+                };
+                #[cfg(feature = "server")]
+                self.kv_reconcile(&dest, before_bytes);
+                outcome
             }
 
             // ================================================================
