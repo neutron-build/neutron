@@ -67,6 +67,12 @@ cd python/benchmarks
 .venv-bench/bin/python measure_noise.py --repeats 6   # noise floor + gate check
 ```
 
+If `typescript/benchmarks/node_modules` is absent (it is a borrowed install,
+not a dependency of this suite), point `AUTOCANNON_MODULE` at any autocannon
+8.x — e.g. `npm install autocannon@8.0.0` in a scratch dir and export
+`AUTOCANNON_MODULE=<dir>/node_modules/autocannon`. The recorded provenance
+follows the override, so the artifact still names the client it used.
+
 Tunables (local defaults, NOT the TS CI profile): `PYBENCH_CONNECTIONS`
 (100), `PYBENCH_DURATION` (5), `PYBENCH_WARMUP` (2), `PYBENCH_RUNS` (3),
 `PYBENCH_FRAMEWORKS`, `PYBENCH_SCENARIOS`, `PYBENCH_PORT`.
@@ -87,6 +93,35 @@ thresholds follow the same derivation as
 `typescript/benchmarks/scripts/measure-gate-noise.mjs`; if the floor is too
 wide for a gate at the current profile, that is the finding — say so, don't
 tune the number.
+
+**The floor was measured (2026-08-19, Apple M4 / 10 cores / macOS): no gate
+is possible on this harness on this machine class, so none is wired.**
+Three runs, all 6 repeats of the full matrix:
+
+- Quietest attainable window (background load still swung the 1-min loadavg
+  from 7 to 35 during the run; a dev laptop is never idle while in use):
+  worst single-repeat rps drop on neutron rows **95.4%**, six cells above
+  79%.
+- Contaminated window (a concurrent 4-core `rustc` build; loadavg 8 → 98):
+  worst drop **100%** — one neutron/compute repeat measured 0 rps with zero
+  errors, a green run indistinguishable from a dead framework.
+- The interrupted 2026-08-18 run (4 repeats, "idle-ish"): worst drop
+  **76.8%**.
+
+A 10x regression is a 90% rps drop — at or below the green-run floor, so a
+threshold high enough to never fire on a green run can never fire on a real
+regression either. A paired within-repeat ratio (neutron/starlette, which
+load bursts should cancel if anything could) deviates up to 257% from its
+own median, so ratio gates are out too. The suggested-threshold column that
+`measure_noise.py` prints is a derivation, not a recommendation: when it
+says 135%, the answer is "no gate", not "gate at 135%".
+
+No competitive figures are publishable from this machine either: framework
+medians differ by less than ~26% on every scenario while single cells swing
+1.6x–36x across green repeats of the same framework. Revisit only on a
+machine whose background load is controlled (dedicated runner; the noise
+artifacts now record the per-repeat loadavg precisely so contamination is
+visible in the artifact, not inferred afterwards).
 
 ## Known caveats
 

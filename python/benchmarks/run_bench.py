@@ -342,9 +342,14 @@ def provenance() -> dict:
     node_ver = subprocess.run(
         ["node", "--version"], capture_output=True, text=True
     ).stdout.strip()
-    autocannon_pkg = (
-        REPO_ROOT / "typescript/benchmarks/node_modules/autocannon/package.json"
+    # Same precedence as client.mjs: an AUTOCANNON_MODULE override changes what
+    # actually drives the load, so it must also change what provenance records —
+    # otherwise the artifact claims an unknown client for a known install.
+    autocannon_dir = Path(
+        os.environ.get("AUTOCANNON_MODULE")
+        or REPO_ROOT / "typescript/benchmarks/node_modules/autocannon"
     )
+    autocannon_pkg = autocannon_dir / "package.json"
     autocannon_ver = "?"
     if autocannon_pkg.exists():
         autocannon_ver = json.loads(autocannon_pkg.read_text())["version"]

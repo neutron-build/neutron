@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import sys
 from datetime import datetime, timezone
@@ -48,8 +49,17 @@ def main() -> int:
     )
 
     all_rows: list[dict] = []
+    repeat_loads: list[dict] = []
     for i in range(args.repeats):
-        print(f"\n=== repeat {i + 1}/{args.repeats} ===", flush=True)
+        # A noise run is only meaningful if the machine stayed comparably
+        # loaded throughout; 2026-08-19's first full run was contaminated by
+        # a concurrent 4-core rustc build and showed 100% phantom "drops".
+        # Recording load per repeat makes that taint visible in the artifact
+        # instead of discoverable only by correlating with ps afterwards.
+        load1 = os.getloadavg()[0] if hasattr(os, "getloadavg") else None
+        repeat_loads.append({"repeat": i, "load1": round(load1, 2) if load1 else None})
+        suffix = f" (load1={load1:.1f})" if load1 else ""
+        print(f"\n=== repeat {i + 1}/{args.repeats}{suffix} ===", flush=True)
         rows = run_bench.run_matrix(
             runs=1,
             warmup_sec=run_bench.CONFIG["warmupSec"],
@@ -145,6 +155,7 @@ def main() -> int:
     doc = {
         "provenance": prov,
         "repeats": args.repeats,
+        "loadAvgPerRepeat": repeat_loads,
         "gateFrameworks": GATE_FRAMEWORKS,
         "worst": {
             "rpsDropPct": round(worst_drop, 1),
