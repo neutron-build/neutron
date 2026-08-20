@@ -298,7 +298,48 @@ impl RespHandler {
     }
 
     /// Process a single command and return the RESP2-encoded response bytes.
+    ///
+    /// The response is not handed back until whatever it wrote is fsynced.
+    /// Nothing in this module used to do that: `force_specialty_durability`
+    /// drains the KV and collections logs at the SQL commit boundary, and only
+    /// the SQL path called it, so a RESP-acked write survived `kill -9` on
+    /// kernel buffers and not a power cut. The documented
+    /// write-then-`kill -9`-then-restart evidence cannot catch that class,
+    /// which is why it looked covered.
     pub fn handle_command(&mut self, args: Vec<Vec<u8>>) -> Vec<u8> {
+        let response = self.handle_command_inner(args);
+        self.sync_acked_writes();
+        response
+    }
+
+    /// fsync anything this connection just wrote, before its acknowledgement
+    /// goes out.
+    ///
+    /// Checks `is_dirty` first, so a read-only command pays one atomic load
+    /// rather than a syscall, and group commit (`WalSync`) amortises the fsync
+    /// across concurrent connections exactly as it does for SQL clients.
+    fn sync_acked_writes(&self) {
+        if let Some(wal) = self.kv.wal()
+            && wal.is_dirty()
+            && let Err(e) = wal.group_sync()
+        {
+            tracing::error!(
+                target: "nucleus::resp",
+                "KV WAL fsync failed before acknowledging a write: {e}"
+            );
+        }
+        if let Some(wal) = self.kv.collections_wal()
+            && wal.is_dirty()
+            && let Err(e) = wal.group_sync()
+        {
+            tracing::error!(
+                target: "nucleus::resp",
+                "collections WAL fsync failed before acknowledging a write: {e}"
+            );
+        }
+    }
+
+    fn handle_command_inner(&mut self, args: Vec<Vec<u8>>) -> Vec<u8> {
         if args.is_empty() {
             return encoder::encode_error("ERR empty command");
         }
