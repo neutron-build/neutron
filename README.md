@@ -26,9 +26,9 @@ Full guide: **[neutron.build/docs](https://neutron.build/docs)**.
 
 ## Why Neutron
 
-- **8 languages, one contract.** TypeScript, Rust, Go, Python, Elixir, Zig, Julia, and Mojo. Every SDK implements the same [framework contract](./FRAMEWORK_CONTRACT.md) — RFC 7807 errors, a standard middleware order, `GET /health`, graceful shutdown — so behavior is identical while the code stays idiomatic in each language.
-- **14 data models, one database.** Nucleus stands in for Postgres + Redis + a vector store + a search index + a graph DB: SQL, KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub — all over the Postgres wire protocol, so any Postgres client connects. 310,261 lines of Rust, 4,783 declared tests, MVCC + WAL crash recovery.
-- **Fast.** The TypeScript framework averages ~18,500 req/s across 8 scenarios — roughly 2.7x Next.js and 1.7x Astro on the same hardware. These are representative numbers; run the reproducible harness in [`typescript/benchmarks/`](./typescript/benchmarks) on your own machine.
+- **8 languages, one contract.** TypeScript, Rust, Go, Python, Elixir, Zig, Julia, and Mojo. The six web-framework SDKs (TypeScript, Rust, Go, Python, Elixir, Zig) implement the same [framework contract](./FRAMEWORK_CONTRACT.md) — RFC 7807 errors, a standard middleware order, `GET /health`, graceful shutdown — while the code stays idiomatic in each language. A language-agnostic conformance matrix in [`conformance/`](./conformance) verifies this live: Go and Python currently pass 12/12 dimensions, Rust 10/12. Julia (scientific computing) and Mojo (ML) are client libraries, not web SDKs.
+- **14 data models, one database.** Nucleus stands in for Postgres + Redis + a vector store + a search index + a graph DB: SQL, KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub — all over the Postgres wire protocol, so any Postgres client connects. 310,360 lines of Rust, 4,785 declared tests, MVCC + WAL crash recovery.
+- **Fast.** On the TypeScript benchmark harness in [`typescript/benchmarks/`](./typescript/benchmarks), Neutron beat Next.js on all 8 scenarios in every recorded run (2026-02 to 2026-08) and Astro on 6–8 of 8 depending on the run. Absolute throughput varies several-fold across machines — recorded 8-scenario averages span ~3.3k–28.6k req/s — so run the harness on your own hardware before quoting a number.
 - **Agent-native.** Ships [`llms.txt`](./llms.txt) + [`llms-full.txt`](https://neutron.build/llms-full.txt), a first-party MCP server (`neutron mcp` — 17 Nucleus tools plus `search_docs`/`get_doc`), and an `AGENTS.md` in every scaffolded app — so AI coding agents can build with Neutron from day one.
 
 ## What's inside
@@ -37,7 +37,7 @@ Full guide: **[neutron.build/docs](https://neutron.build/docs)**.
 | Directory | Language | Description |
 |-----------|----------|-------------|
 | [`typescript/`](./typescript) | TypeScript | UI framework — SSR, file-based routing, Preact, islands, signals |
-| [`rust/`](./rust) | Rust | Web framework — Hyper, trie routing, HTTP/1–3, 19 composable crates |
+| [`rust/`](./rust) | Rust | Web framework — Hyper, trie routing, HTTP/1–2 (+HTTP/3 behind the `http3` feature), 19 composable crates |
 | [`go/`](./go) | Go | Backend framework — generics, OpenAPI 3.1, OAuth2, WebAuthn, jobs |
 | [`python/`](./python) | Python | AI app framework — Starlette + Pydantic, RAG, MCP integration |
 | [`elixir/`](./elixir) | Elixir | OTP fault-tolerant backend — Plug + Bandit, channels, presence |
@@ -51,15 +51,15 @@ Full guide: **[neutron.build/docs](https://neutron.build/docs)**.
 ### Clients & libraries
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| [`zig/`](./zig) | Zig | Systems/embedded Nucleus client — comptime SQL validation, zero-alloc |
+| [`zig/`](./zig) | Zig | Systems/embedded Nucleus client — comptime-typed queries, fixed-capacity connection pool |
 | [`julia/`](./julia) | Julia | Scientific-computing client — DataFrames, DiffEq, Flux, CUDA, Makie bridges |
-| [`mojo/`](./mojo) | Mojo | ML library — tensors, quantization, inference (preview, awaiting Mojo 1.0) |
+| [`mojo/`](./mojo) | Mojo | ML library — tensors, quantization, inference (preview; built on Mojo 1.0) |
 
 ### Platforms & tooling
 | Directory | Language | Description |
 |-----------|----------|-------------|
 | [`native/`](./native) | TypeScript | Mobile — Preact components rendering to native iOS/Android views |
-| [`desktop/`](./desktop) | Rust + TS | Desktop apps — Tauri 2.0 + Preact, ~10MB bundles, Nucleus embedded |
+| [`desktop/`](./desktop) | Rust + TS | Desktop apps — Tauri 2.0 + Preact, 12 plugin crates, Nucleus embedded mode (bundle-size targets, not yet measured) |
 | [`cli/`](./cli) | Go | Universal CLI — `neutron new/dev/build/studio`, plus `neutron mcp` |
 
 ### Verification

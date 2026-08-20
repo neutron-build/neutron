@@ -2318,6 +2318,73 @@ mod tests {
         assert_eq!(decode_bulk(&resp), Some("v_conflict".to_string()));
     }
 
+    /// WATCH must observe writes to every type this port implements, not just
+    /// strings. Each of these interleaved writes used to leave `key_version`
+    /// untouched, so EXEC committed over the other client's write — the exact
+    /// lost update WATCH exists to prevent.
+    #[test]
+    fn test_watch_aborts_on_collection_write() {
+        for (setup, conflict) in [
+            (vec!["RPUSH", "ck", "a"], vec!["RPUSH", "ck", "b"]),
+            (vec!["HSET", "ck", "f", "a"], vec!["HSET", "ck", "f", "b"]),
+            (vec!["SADD", "ck", "a"], vec!["SADD", "ck", "b"]),
+            (vec!["ZADD", "ck", "1", "a"], vec!["ZADD", "ck", "2", "b"]),
+            (vec!["PFADD", "ck", "a"], vec!["PFADD", "ck", "b"]),
+        ] {
+            let mut h = new_handler();
+            h.handle_command(args(&setup));
+
+            let resp = h.handle_command(args(&["WATCH", "ck"]));
+            assert_eq!(decode_simple(&resp), "OK");
+
+            // Another client mutates the watched key.
+            h.handle_command(args(&conflict));
+
+            h.handle_command(args(&["MULTI"]));
+            h.handle_command(args(&["SET", "other", "v"]));
+            let resp = h.handle_command(args(&["EXEC"]));
+            let s = String::from_utf8_lossy(&resp);
+            assert!(
+                s.starts_with("$-1\r\n"),
+                "{:?} did not abort the transaction; EXEC returned: {s}",
+                conflict[0]
+            );
+        }
+    }
+
+    /// FLUSHDB's entire contract is that the keyspace is empty afterwards.
+    /// It used to clear the string shards only, so every collection type
+    /// survived it.
+    #[test]
+    fn test_flushdb_removes_every_type() {
+        let mut h = new_handler();
+        h.handle_command(args(&["SET", "s", "v"]));
+        h.handle_command(args(&["RPUSH", "l", "v"]));
+        h.handle_command(args(&["HSET", "hh", "f", "v"]));
+        h.handle_command(args(&["SADD", "st", "m"]));
+        h.handle_command(args(&["ZADD", "z", "1", "m"]));
+        h.handle_command(args(&["PFADD", "p", "m"]));
+        h.handle_command(args(&["XADD", "x", "*", "f", "v"]));
+
+        let resp = h.handle_command(args(&["FLUSHDB"]));
+        assert_eq!(decode_simple(&resp), "OK");
+
+        for (cmd, empty) in [
+            (vec!["LLEN", "l"], ":0\r\n"),
+            (vec!["HLEN", "hh"], ":0\r\n"),
+            (vec!["SCARD", "st"], ":0\r\n"),
+            (vec!["ZCARD", "z"], ":0\r\n"),
+            (vec!["PFCOUNT", "p"], ":0\r\n"),
+            (vec!["XLEN", "x"], ":0\r\n"),
+        ] {
+            let resp = h.handle_command(args(&cmd));
+            let s = String::from_utf8_lossy(&resp);
+            assert_eq!(s, empty, "{} survived FLUSHDB", cmd[0]);
+        }
+        let resp = h.handle_command(args(&["GET", "s"]));
+        assert_eq!(decode_bulk(&resp), None);
+    }
+
     #[test]
     fn test_unwatch() {
         let mut h = new_handler();

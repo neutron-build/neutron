@@ -291,7 +291,10 @@ impl KvStore {
         self.version()
     }
 
-    /// Bump the global version counter. Called on every write operation.
+    /// Bump the global version counter. **Every** mutator must call this —
+    /// strings and collections alike. WATCH is built on it, so a mutator that
+    /// skips it makes EXEC miss a concurrent write and commit the lost update
+    /// WATCH exists to prevent.
     fn bump_version(&self) {
         self.global_version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -587,7 +590,12 @@ impl KvStore {
         count
     }
 
-    /// FLUSHDB — remove all keys from both hot and cold tiers.
+    /// FLUSHDB — remove all keys of every type, from both hot and cold tiers.
+    ///
+    /// "Every type" is the whole contract of this command, so it must reach the
+    /// collections store too: lists, hashes, sets, sorted sets, HLLs, streams
+    /// and geosets all live there, not in the string shards. Clearing only the
+    /// strings left `RPUSH k v; FLUSHDB; LRANGE k 0 -1` returning `v`.
     pub fn flushdb(&self) {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
@@ -605,6 +613,13 @@ impl KvStore {
             let config = crate::storage::lsm::LsmConfig::default();
             *cold.lock() = crate::storage::lsm::LsmTree::new(config);
         }
+        // Collections: clear memory first, then snapshot the (now empty) state
+        // so replay cannot resurrect what FLUSHDB just removed.
+        self.collections.clear_all();
+        if let Err(e) = self.collections.checkpoint() {
+            eprintln!("KV collections WAL: failed to checkpoint on flushdb: {e}");
+        }
+        self.bump_version();
     }
 
     /// Active TTL sweep: only process keys whose expiry time has passed.
@@ -1067,18 +1082,22 @@ impl KvStore {
     // --- Lists ---
 
     pub fn lpush(&self, key: &str, value: Value) -> Result<usize, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "list")?;
         self.collections.lpush(key, value)
     }
     pub fn rpush(&self, key: &str, value: Value) -> Result<usize, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "list")?;
         self.collections.rpush(key, value)
     }
     pub fn lpop(&self, key: &str) -> Result<Option<Value>, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "list")?;
         self.collections.lpop(key)
     }
     pub fn rpop(&self, key: &str) -> Result<Option<Value>, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "list")?;
         self.collections.rpop(key)
     }
@@ -1112,6 +1131,7 @@ impl KvStore {
         field: &str,
         value: Value,
     ) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "hash")?;
         self.collections.hset(key, field, value)
     }
@@ -1124,6 +1144,7 @@ impl KvStore {
         self.collections.hget(key, field)
     }
     pub fn hdel(&self, key: &str, field: &str) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "hash")?;
         self.collections.hdel(key, field)
     }
@@ -1151,10 +1172,12 @@ impl KvStore {
     // --- Sets ---
 
     pub fn sadd(&self, key: &str, member: &str) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "set")?;
         self.collections.sadd(key, member)
     }
     pub fn srem(&self, key: &str, member: &str) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "set")?;
         self.collections.srem(key, member)
     }
@@ -1188,10 +1211,12 @@ impl KvStore {
         member: &str,
         score: f64,
     ) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "zset")?;
         self.collections.zadd(key, member, score)
     }
     pub fn col_zrem(&self, key: &str, member: &str) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "zset")?;
         self.collections.zrem(key, member)
     }
@@ -1236,6 +1261,7 @@ impl KvStore {
         member: &str,
         increment: f64,
     ) -> Result<f64, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "zset")?;
         self.collections.zincrby(key, member, increment)
     }
@@ -1256,6 +1282,7 @@ impl KvStore {
     // --- HyperLogLog ---
 
     pub fn col_pfadd(&self, key: &str, element: &str) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(key, "hyperloglog")?;
         self.collections.pfadd(key, element)
     }
@@ -1268,6 +1295,7 @@ impl KvStore {
         dest_key: &str,
         source_keys: &[&str],
     ) -> Result<(), collections::WrongTypeError> {
+        self.bump_version();
         self.check_string_conflict(dest_key, "hyperloglog")?;
         self.collections.pfmerge(dest_key, source_keys)
     }
@@ -1331,6 +1359,7 @@ impl KvStore {
         self.collections.xtrim_maxlen(key, maxlen)
     }
     pub fn xgroup_create(&self, key: &str, group_name: &str, start_id: &str) -> Result<(), String> {
+        self.bump_version();
         self.collections.xgroup_create(key, group_name, start_id)
     }
     pub fn xgroup_destroy(
@@ -1338,6 +1367,7 @@ impl KvStore {
         key: &str,
         group_name: &str,
     ) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
         self.collections.xgroup_destroy(key, group_name)
     }
     pub fn xreadgroup(
@@ -1348,6 +1378,7 @@ impl KvStore {
         pending_id: &str,
         count: Option<usize>,
     ) -> Result<Vec<streams::StreamEntry>, String> {
+        self.bump_version();
         self.collections
             .xreadgroup(key, group_name, consumer_name, pending_id, count)
     }
@@ -1357,6 +1388,7 @@ impl KvStore {
         group_name: &str,
         ids: &[streams::StreamId],
     ) -> Result<usize, String> {
+        self.bump_version();
         self.collections.xack(key, group_name, ids)
     }
 

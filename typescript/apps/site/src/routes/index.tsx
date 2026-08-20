@@ -104,7 +104,7 @@ export default function HomePage() {
                 data-animate
                 style="--animate-delay: 0.3s"
               >
-                <span class="stats__number">4,783</span>
+                <span class="stats__number">4,785</span>
                 <span class="stats__label">Declared tests</span>
               </div>
             </div>
@@ -227,7 +227,7 @@ export default function HomePage() {
                     </span>
                   </div>
                   <p class="products__desc">
-                    High-performance backend. Trie router, middleware, JWT, WebSocket, SSE. 1,210 tests across 19 crates. Also powers Desktop via Tauri.
+                    High-performance backend. Trie router, middleware, JWT, WebSocket, SSE. 1,233 tests across 19 crates. Also powers Desktop via Tauri.
                   </p>
                   <span class="products__link">Learn more &rarr;</span>
                 </div>
@@ -247,7 +247,7 @@ export default function HomePage() {
                   </div>
                   <p class="products__desc">
                     ML tensor library. SIMD kernels, 8 quant formats,
-                    inference pipeline, training stack. Awaiting Mojo 1.0.
+                    inference pipeline, training stack. Preview, on Mojo 1.0.
                   </p>
                   <span class="products__link">Get started &rarr;</span>
                 </div>
@@ -329,8 +329,8 @@ export default function HomePage() {
                     </span>
                   </div>
                   <p class="products__desc">
-                    Systems and embedded framework. Zero-alloc hot path,
-                    comptime validation, 40+ target architectures.
+                    Systems and embedded framework. Fixed-buffer APIs,
+                    comptime typing, layer-wise build.
                   </p>
                   <span class="products__link">Learn more &rarr;</span>
                 </div>
