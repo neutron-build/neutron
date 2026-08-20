@@ -215,6 +215,24 @@ async fn an_rls_denial_reaches_an_extended_protocol_client() {
             || message.to_lowercase().contains("unavailable"),
         "the denial reached the client without its reason: {message}"
     );
+    // Schema-qualified: `pg_catalog.kv_get(...)` must be denied too. A
+    // dispatch reported this as a live bypass; the strip that makes the guard
+    // see the canonical name was moved BEFORE the policy decision when the same
+    // hole was found in 2026-07, and this is the pin that it stayed fixed.
+    let err = c
+        .query("SELECT pg_catalog.kv_get($1)", &[&"k"])
+        .await
+        .expect_err("a schema-qualified specialty call must be denied under RLS too");
+    let message = err
+        .as_db_error()
+        .map(|e| e.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(
+        message.to_lowercase().contains("row-level security")
+            || message.to_lowercase().contains("unavailable"),
+        "`pg_catalog.` qualification bypassed the specialty guard: {message}"
+    );
+
     c.simple_query("RESET ROLE").await.expect("reset role");
 
     // And one that applies to everyone: a specialty call inside an explicit
