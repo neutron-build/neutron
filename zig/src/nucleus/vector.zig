@@ -11,12 +11,22 @@ pub const VectorModel = struct {
 
     // ── SQL generators ───────────────────────────────────────────
 
+    // The table these statements address has the schema every SDK's
+    // create-collection uses — id TEXT, embedding VECTOR, metadata JSONB —
+    // including this SDK's own documentation. The previous generators could
+    // never execute: insertSql wrote to a `vector` column no such table has,
+    // and searchSql called VECTOR_DISTANCE with the TABLE NAME as its first
+    // argument and no FROM clause, so it queried nothing.
+
+    /// SELECT id, metadata, VECTOR_DISTANCE(embedding, VECTOR('q'), metric)
+    /// AS distance FROM collection ORDER BY distance LIMIT k — the shape the
+    /// engine answers; matches the Go SDK's Search.
     pub fn searchSql(collection: []const u8, query_vec: []const u8, k: u32, metric: []const u8, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "SELECT VECTOR_DISTANCE('{s}', VECTOR('{s}'), {d}, '{s}')", .{ collection, query_vec, k, metric }) catch return error.BufferTooShort;
+        return std.fmt.bufPrint(buf, "SELECT id, metadata, VECTOR_DISTANCE(embedding, VECTOR('{s}'), '{s}') AS distance FROM {s} ORDER BY distance LIMIT {d}", .{ query_vec, metric, collection, k }) catch return error.BufferTooShort;
     }
 
     pub fn insertSql(collection: []const u8, id: []const u8, vector_data: []const u8, metadata: []const u8, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "INSERT INTO {s} (id, vector, metadata) VALUES ('{s}', VECTOR('{s}'), '{s}')", .{ collection, id, vector_data, metadata }) catch return error.BufferTooShort;
+        return std.fmt.bufPrint(buf, "INSERT INTO {s} (id, embedding, metadata) VALUES ('{s}', VECTOR('{s}'), '{s}')", .{ collection, id, vector_data, metadata }) catch return error.BufferTooShort;
     }
 
     pub fn deleteSql(collection: []const u8, id: []const u8, buf: []u8) ![]const u8 {
@@ -41,6 +51,11 @@ pub const VectorModel = struct {
 
     // ── Execution methods ────────────────────────────────────────
 
+    /// Nearest-neighbour search. Returns the id of the single nearest match
+    /// as text — the client's QueryResult keeps only the first column of a
+    /// row, so a k>1 result set cannot cross this API; callers that need
+    /// every hit run searchSql through NucleusClient.query and read
+    /// row_count rows of ids.
     pub fn search(self: VectorModel, collection: []const u8, query_vec: []const u8, k: u32, metric: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try searchSql(collection, query_vec, k, metric, &buf);
@@ -89,13 +104,13 @@ pub const VectorModel = struct {
 test "VECTOR search sql" {
     var buf: [512]u8 = undefined;
     const sql = try VectorModel.searchSql("embeddings", "[0.1,0.2,0.3]", 10, "cosine", &buf);
-    try std.testing.expectEqualStrings("SELECT VECTOR_DISTANCE('embeddings', VECTOR('[0.1,0.2,0.3]'), 10, 'cosine')", sql);
+    try std.testing.expectEqualStrings("SELECT id, metadata, VECTOR_DISTANCE(embedding, VECTOR('[0.1,0.2,0.3]'), 'cosine') AS distance FROM embeddings ORDER BY distance LIMIT 10", sql);
 }
 
 test "VECTOR insert sql" {
     var buf: [512]u8 = undefined;
     const sql = try VectorModel.insertSql("embeddings", "doc-1", "[0.5,0.6]", "{\"source\":\"test\"}", &buf);
-    try std.testing.expectEqualStrings("INSERT INTO embeddings (id, vector, metadata) VALUES ('doc-1', VECTOR('[0.5,0.6]'), '{\"source\":\"test\"}')", sql);
+    try std.testing.expectEqualStrings("INSERT INTO embeddings (id, embedding, metadata) VALUES ('doc-1', VECTOR('[0.5,0.6]'), '{\"source\":\"test\"}')", sql);
 }
 
 test "VECTOR_DIMS sql" {

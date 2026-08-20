@@ -42,6 +42,46 @@ the Zig client (no predicate argument — see the comment in `main.zig`;
 cross-SDK drift on scoped clears will surface in the matrix); `cdc.cdcRead`
 takes only the offset (no limit — same drift-matrix story).
 
+## 2026-08-19: first live run, and what it took to go 42/42
+
+The executor was ported to *compile*, and it had never exchanged a byte with
+the engine. The first live matrix run failed 19 cases; the worklist below is
+what was actually wrong, in causal order. Everything was measured against the
+engine (psql) before being changed — the engine was never at fault.
+
+1. **PgClient.execute() desynced the connection** (SDK, layer2). It read ONE
+   TCP segment and returned without waiting for ReadyForQuery, so whenever
+   the response was split the next query() on that pooled connection decoded
+   the stale tail as its own answer — returning the health check's `1` or
+   nothing. A probe (execute("SELECT 1") + query(...) ×200) reproduced it
+   110/200 times. Fixed: drain to ReadyForQuery, and keep messages that
+   straddle read boundaries instead of overwriting them.
+2. **NucleusClient.execute() returned a dangling slice** (SDK). PgClient.query
+   returns its QueryResult by value, so scalar() pointed into a dead frame;
+   ids held across steps turned to garbage. Fixed: results and command tags
+   are duped into the client's allocator.
+3. **Four engine-surface mistakes in the SDK** (all measured): KV_SET with
+   ttl 0 expires the key immediately, so no-TTL sets must use the two-arg
+   form; graph node/edge ids are integers (GRAPH_ADD_EDGE rejects strings);
+   CDC_READ requires (after, limit); DATALOG_CLEAR/IMPORT_GRAPH require the
+   predicate. The old `datalog.clear()` was NOT global — the engine rejects
+   the zero-argument call, so the "cross-SDK drift" note above was wrong.
+4. **Vector SQL generators could never execute** (SDK): INSERT wrote a
+   `vector` column no schema has (every SDK uses `embedding`), and search
+   called VECTOR_DISTANCE with the table name and no FROM clause.
+5. **Missing runtime surface** (SDK): document countIn/pathIn wrappers and
+   the filter-based find/findOne/updateWhere/deleteWhere (DOC_QUERY answers
+   ids, not docs — those ops are compositions, as in every other SDK);
+   TS_RANGE and a windowed aggregate.
+
+Executor-side: mappings for the ops above, spec args actually passed through
+(streams bounds/counts, graph direction), raw-text binding so ids round-trip
+as what the engine said, per-run fixture nonces ("unique across runs" — a
+case-index-only seed made run two collide with run one's tables), KV
+t/f→bool and ZRANGE/HGETALL pair decoding, and vector count/search via the
+public SQL builders (this client's QueryResult keeps only each row's first
+column, so a k-match search is honestly a list of matched ids).
+
 ## Running
 
 ```sh

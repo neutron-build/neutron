@@ -10,9 +10,11 @@ pub const CdcModel = struct {
 
     // ── SQL generators ───────────────────────────────────────────
 
-    /// SELECT CDC_READ(offset)
-    pub fn readSql(offset: i64, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "SELECT CDC_READ({d})", .{offset}) catch return error.BufferTooShort;
+    /// SELECT CDC_READ(offset, limit). Both arguments are required — the
+    /// engine answers one-arg CDC_READ(0) with "CDC_READ requires
+    /// (after_sequence, limit)" (measured live; the Go SDK binds both).
+    pub fn readSql(offset: i64, limit: i64, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "SELECT CDC_READ({d}, {d})", .{ offset, limit }) catch return error.BufferTooShort;
     }
 
     /// SELECT CDC_COUNT()
@@ -27,9 +29,9 @@ pub const CdcModel = struct {
 
     // ── Execution methods ────────────────────────────────────────
 
-    pub fn cdcRead(self: CdcModel, offset: i64) !?[]const u8 {
+    pub fn cdcRead(self: CdcModel, offset: i64, limit: i64) !?[]const u8 {
         var buf: [256]u8 = undefined;
-        const sql = try readSql(offset, &buf);
+        const sql = try readSql(offset, limit, &buf);
         return try self.client.executeModel(sql);
     }
 
@@ -50,8 +52,8 @@ pub const CdcModel = struct {
 
 test "CDC_READ sql" {
     var buf: [256]u8 = undefined;
-    const sql = try CdcModel.readSql(42, &buf);
-    try std.testing.expectEqualStrings("SELECT CDC_READ(42)", sql);
+    const sql = try CdcModel.readSql(42, 10, &buf);
+    try std.testing.expectEqualStrings("SELECT CDC_READ(42, 10)", sql);
 }
 
 test "CDC_COUNT sql" {

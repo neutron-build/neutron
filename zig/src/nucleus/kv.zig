@@ -20,8 +20,14 @@ pub const KVModel = struct {
         return std.fmt.bufPrint(buf, "SELECT KV_GET('{s}')", .{key}) catch return error.BufferTooShort;
     }
 
+    /// SELECT KV_SET('key', 'value') — no expiry. TTL 0 is NOT "no TTL": the
+    /// engine expires the key immediately (KV_SET('k','v',0) then KV_GET →
+    /// NULL, KV_TTL → -2, measured live). The no-TTL form is the two-argument
+    /// one, which is what the Go SDK binds for a plain Set.
     pub fn setSql(key: []const u8, value: []const u8, ttl_seconds: i64, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "SELECT KV_SET('{s}', '{s}', {d})", .{ key, value, ttl_seconds }) catch return error.BufferTooShort;
+        if (ttl_seconds > 0)
+            return std.fmt.bufPrint(buf, "SELECT KV_SET('{s}', '{s}', {d})", .{ key, value, ttl_seconds }) catch return error.BufferTooShort;
+        return std.fmt.bufPrint(buf, "SELECT KV_SET('{s}', '{s}')", .{ key, value }) catch return error.BufferTooShort;
     }
 
     pub fn setnxSql(key: []const u8, value: []const u8, buf: []u8) ![]const u8 {
@@ -381,6 +387,12 @@ test "KV_SET sql with ttl" {
     var buf: [256]u8 = undefined;
     const sql = try KVModel.setSql("session:abc", "token123", 3600, &buf);
     try std.testing.expectEqualStrings("SELECT KV_SET('session:abc', 'token123', 3600)", sql);
+}
+
+test "KV_SET sql without ttl is the two-argument form" {
+    var buf: [256]u8 = undefined;
+    const sql = try KVModel.setSql("plain", "v", 0, &buf);
+    try std.testing.expectEqualStrings("SELECT KV_SET('plain', 'v')", sql);
 }
 
 test "KV_DEL sql" {

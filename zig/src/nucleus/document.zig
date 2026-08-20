@@ -190,6 +190,116 @@ pub const DocumentModel = struct {
         const sql = try countSql(&buf);
         return try self.client.executeModel(sql);
     }
+
+    // ── Filter-based operations ──────────────────────────────────
+    //
+    // DOC_QUERY answers with a comma-separated list of matching ids — not
+    // documents — so filter-based find/update/delete are client-side
+    // compositions over DOC_QUERY + DOC_GET/DOC_UPDATE/DOC_DELETE, exactly as
+    // the Go SDK composes them. These are the only methods in this file that
+    // allocate: assembling a JSON array of results has no zero-allocation
+    // form. The returned strings are owned by the client's allocator.
+
+    /// Count documents in one collection. The countInSql builder existed
+    /// without a runtime wrapper, which made collection-scoped counts
+    /// unreachable — callers got DOC_COUNT() (every collection) instead.
+    pub fn countIn(self: DocumentModel, collection: []const u8) !?[]const u8 {
+        var buf: [256]u8 = undefined;
+        const sql = try countInSql(collection, &buf);
+        return try self.client.executeModel(sql);
+    }
+
+    /// Extract a nested value from a document in one collection. The
+    /// pathInSql builder existed without a runtime wrapper; path() addresses
+    /// the default collection and read the wrong documents.
+    pub fn pathIn(self: DocumentModel, collection: []const u8, id: u64, keys: []const []const u8) !?[]const u8 {
+        var buf: [1024]u8 = undefined;
+        const sql = try pathInSql(collection, id, keys, &buf);
+        return try self.client.executeModel(sql);
+    }
+
+    const IdIter = struct {
+        rest: []const u8,
+
+        fn next(self: *IdIter) ?u64 {
+            while (self.rest.len > 0) {
+                const end = std.mem.indexOfScalar(u8, self.rest, ',') orelse self.rest.len;
+                const part = std.mem.trim(u8, self.rest[0..end], " \t\r\n");
+                self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else self.rest[0..0];
+                if (part.len == 0) continue;
+                if (std.fmt.parseInt(u64, part, 10)) |id| return id else |_| continue;
+            }
+            return null;
+        }
+    };
+
+    /// All documents in one collection matching a JSON filter, as a JSON
+    /// array. An empty match is "[]", not null.
+    pub fn find(self: DocumentModel, collection: []const u8, filter_json: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(self.client.allocator, "[");
+        var it = try self.idIter(collection, filter_json);
+        var first = true;
+        while (it.next()) |id| {
+            const doc = try self.getIn(collection, id) orelse continue;
+            if (!first) try out.append(self.client.allocator, ',');
+            first = false;
+            try out.appendSlice(self.client.allocator, doc);
+        }
+        try out.appendSlice(self.client.allocator, "]");
+        return out.items;
+    }
+
+    /// The first document matching a JSON filter, or null.
+    pub fn findOne(self: DocumentModel, collection: []const u8, filter_json: []const u8) !?[]const u8 {
+        var it = try self.idIter(collection, filter_json);
+        while (it.next()) |id| {
+            if (try self.getIn(collection, id)) |doc| return doc;
+        }
+        return null;
+    }
+
+    /// Apply a patch object to every document matching a JSON filter and
+    /// return how many were written. Mirrors the Go SDK: fetch each doc,
+    /// overwrite the patch's top-level keys, DOC_UPDATE it back.
+    pub fn updateWhere(self: DocumentModel, collection: []const u8, filter_json: []const u8, patch_json: []const u8) !u64 {
+        const alloc = self.client.allocator;
+        var patch = try std.json.parseFromSlice(std.json.Value, alloc, patch_json, .{});
+        defer patch.deinit();
+        if (patch.value != .object) return error.InvalidJson;
+
+        var written: u64 = 0;
+        var it = try self.idIter(collection, filter_json);
+        while (it.next()) |id| {
+            const raw = (try self.getIn(collection, id)) orelse continue;
+            var doc = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+            defer doc.deinit();
+            if (doc.value != .object) continue;
+            var pit = patch.value.object.iterator();
+            while (pit.next()) |e| try doc.value.object.put(e.key_ptr.*, e.value_ptr.*);
+            const merged = try std.json.Stringify.valueAlloc(alloc, doc.value, .{});
+            const answer = (try self.updateIn(collection, id, merged)) orelse continue;
+            if (answer.len > 0 and answer[0] == 't') written += 1;
+        }
+        return written;
+    }
+
+    /// Delete every document matching a JSON filter and return how many
+    /// were removed.
+    pub fn deleteWhere(self: DocumentModel, collection: []const u8, filter_json: []const u8) !u64 {
+        var removed: u64 = 0;
+        var it = try self.idIter(collection, filter_json);
+        while (it.next()) |id| {
+            const answer = (try self.deleteIn(collection, id)) orelse continue;
+            if (answer.len > 0 and answer[0] == 't') removed += 1;
+        }
+        return removed;
+    }
+
+    fn idIter(self: DocumentModel, collection: []const u8, filter_json: []const u8) !IdIter {
+        const ids = (try self.docQueryIn(collection, filter_json)) orelse "";
+        return .{ .rest = ids };
+    }
 };
 
 // ── Tests ─────────────────────────────────────────────────────

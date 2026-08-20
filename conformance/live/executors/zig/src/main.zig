@@ -131,7 +131,13 @@ fn resultToJson(alloc: std.mem.Allocator, r: Result) !std.json.Value {
         .text => |s| blk: {
             // Numbers and booleans arrive as text over this client; decode them
             // so `equals: 1` compares against 1 rather than "1". A value that
-            // is not JSON stays a string, which is the common case.
+            // is not JSON stays a string, which is the common case. The bare
+            // "t"/"f" pair is PostgreSQL's text spelling of a boolean — this
+            // client carries no result type OIDs, so the spelling itself is
+            // the only thing that distinguishes a bool from a one-char string,
+            // and every KV/GRAPH/BLOB predicate answer uses it.
+            if (std.mem.eql(u8, s, "t")) break :blk std.json.Value{ .bool = true };
+            if (std.mem.eql(u8, s, "f")) break :blk std.json.Value{ .bool = false };
             const trimmed = std.mem.trim(u8, s, " \t\r\n");
             if (trimmed.len == 0) break :blk std.json.Value{ .string = s };
             const parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch
@@ -405,12 +411,24 @@ fn call(
     if (eq(u8, op, "kv.hdel")) return opt(try kv.hdel(try argStr(args, 0), try argStr(args, 1)));
     if (eq(u8, op, "kv.hexists")) return opt(try kv.hexists(try argStr(args, 0), try argStr(args, 1)));
     if (eq(u8, op, "kv.hlen")) return opt(try kv.hlen(try argStr(args, 0)));
-    if (eq(u8, op, "kv.hgetall")) return opt(try kv.hgetall(try argStr(args, 0)));
+    // KV_HGETALL answers with [field, value] PAIRS; the spec's key
+    // expectation needs the map shape every other SDK's HGetall returns, so
+    // the pairs are folded here — the SDK's contract is raw engine text.
+    if (eq(u8, op, "kv.hgetall")) {
+        const got = try kv.hgetall(try argStr(args, 0)) orelse return .none;
+        return .{ .parsed = try pairsToObject(alloc, got) };
+    }
     if (eq(u8, op, "kv.sadd")) return opt(try kv.sadd(try argStr(args, 0), try argStr(args, 1)));
     if (eq(u8, op, "kv.srem")) return opt(try kv.srem(try argStr(args, 0), try argStr(args, 1)));
     if (eq(u8, op, "kv.smembers")) return opt(try kv.smembers(try argStr(args, 0)));
     if (eq(u8, op, "kv.zadd")) return opt(try kv.zadd(try argStr(args, 0), try argFloat(args, 1), try argStr(args, 2)));
-    if (eq(u8, op, "kv.zrange")) return opt(try kv.zrange(try argStr(args, 0), try argInt(args, 1), try argInt(args, 2)));
+    // KV_ZRANGE answers with [member, score] PAIRS; the spec's members-only
+    // expectation (index 0 = "a:b") needs the member projection the Go SDK
+    // applies in its own decode layer.
+    if (eq(u8, op, "kv.zrange")) {
+        const got = try kv.zrange(try argStr(args, 0), try argInt(args, 1), try argInt(args, 2)) orelse return .none;
+        return .{ .parsed = try pairsToMembers(alloc, got) };
+    }
 
     // ── document ──
     var doc = client.document();
@@ -421,18 +439,26 @@ fn call(
     if (eq(u8, op, "document.getIn"))
         return opt(try doc.getIn(try argStr(args, 0), @intCast(try argInt(args, 1))));
     if (eq(u8, op, "document.countIn"))
-        return opt(try doc.count());
+        return opt(try doc.countIn(try argStr(args, 0)));
     if (eq(u8, op, "document.find"))
-        return opt(try doc.docQueryIn(try argStr(args, 0), try argJson(alloc, args, 1)));
+        return .{ .text = try doc.find(try argStr(args, 0), try argJson(alloc, args, 1)) };
+    if (eq(u8, op, "document.findOne"))
+        return opt(try doc.findOne(try argStr(args, 0), try argJson(alloc, args, 1)));
+    if (eq(u8, op, "document.update"))
+        return .{ .parsed = .{ .integer = @intCast(try doc.updateWhere(try argStr(args, 0), try argJson(alloc, args, 1), try argJson(alloc, args, 2))) } };
+    if (eq(u8, op, "document.delete"))
+        return .{ .parsed = .{ .integer = @intCast(try doc.deleteWhere(try argStr(args, 0), try argJson(alloc, args, 1))) } };
     if (eq(u8, op, "document.getPathIn")) {
         var keys = try std.ArrayList([]const u8).initCapacity(alloc, args.len - 2);
         for (args[2..]) |k| keys.appendAssumeCapacity(k.string);
-        return opt(try doc.path(@intCast(try argInt(args, 1)), keys.items));
+        return opt(try doc.pathIn(try argStr(args, 0), @intCast(try argInt(args, 1)), keys.items));
     }
 
     // ── vector ──
     var vec = client.vector();
     if (eq(u8, op, "vector.createCollection")) {
+        // The schema every SDK's create uses — the vector model's own INSERT
+        // addresses the embedding column.
         var buf: [512]u8 = undefined;
         const sql = try std.fmt.bufPrint(&buf, "CREATE TABLE {s} (id TEXT PRIMARY KEY, embedding VECTOR({d}), metadata JSONB)", .{ try argStr(args, 0), try argInt(args, 1) });
         _ = try client.exec(sql);
@@ -440,8 +466,32 @@ fn call(
     }
     if (eq(u8, op, "vector.insert"))
         return .{ .text = try vec.insert(try argStr(args, 0), try argStr(args, 1), try argVector(alloc, args, 2), "{}") };
-    if (eq(u8, op, "vector.search"))
-        return opt(try vec.search(try argStr(args, 0), try argVector(alloc, args, 1), @intCast(try argInt(args, 2)), "cosine"));
+    if (eq(u8, op, "vector.count")) {
+        // The vector model has no count (neither does Go's); the Go executor
+        // runs the same plain SELECT COUNT(*) through its SQL model.
+        var buf: [512]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&buf, "SELECT COUNT(*) FROM {s}", .{try argStr(args, 0)});
+        return opt(try client.execute(sql));
+    }
+    if (eq(u8, op, "vector.search")) {
+        // searchSql + query rather than the model's search(): this client's
+        // QueryResult keeps only the first column per row, so the honest
+        // projection of a k-match result is the list of matched ids.
+        var buf: [1024]u8 = undefined;
+        const sql = try neutron.nucleus_vector.VectorModel.searchSql(try argStr(args, 0), try argVector(alloc, args, 1), @intCast(try argInt(args, 2)), "cosine", &buf);
+        const rows = try client.query(sql);
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(alloc, "[");
+        var i: usize = 0;
+        while (i < rows.row_count) : (i += 1) {
+            if (i > 0) try out.append(alloc, ',');
+            if (rows.rows[i].value()) |v| {
+                try out.print(alloc, "\"{s}\"", .{v});
+            } else try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, "]");
+        return .{ .text = out.items };
+    }
 
     // ── timeseries ──
     var ts = client.timeseries();
@@ -459,6 +509,10 @@ fn call(
     }
     if (eq(u8, op, "timeseries.count")) return opt(try ts.count(try argStr(args, 0)));
     if (eq(u8, op, "timeseries.last")) return opt(try ts.last(try argStr(args, 0)));
+    if (eq(u8, op, "timeseries.query"))
+        return opt(try ts.range(try argStr(args, 0), TS_BASE_MS + try argInt(args, 1), TS_BASE_MS + try argInt(args, 2)));
+    if (eq(u8, op, "timeseries.aggregate"))
+        return opt(try ts.aggregate(try argStr(args, 0), TS_BASE_MS + try argInt(args, 1), TS_BASE_MS + try argInt(args, 2), try argInt(args, 3)));
 
     // ── fts ──
     var fts = client.fts();
@@ -480,14 +534,16 @@ fn call(
         return opt(try fts.search(try argStr(args, 1), @intCast(try argInt(args, 2))));
 
     // ── graph ──
+    // Node and edge ids are integers at the engine; the spec binds whatever
+    // addNode answered (raw text), and argInt parses it back.
     var graph = client.graph();
     if (eq(u8, op, "graph.addNode"))
         return opt(try graph.addNode(args[0].array.items[0].string, try argJson(alloc, args, 1)));
     if (eq(u8, op, "graph.addEdge"))
-        return opt(try graph.addEdge(try argStr(args, 1), try argStr(args, 2), try argStr(args, 0), "{}"));
-    if (eq(u8, op, "graph.deleteNode")) return opt(try graph.deleteNode(try argStr(args, 0)));
-    if (eq(u8, op, "graph.neighbors")) return opt(try graph.neighbors(try argStr(args, 0), "both"));
-    if (eq(u8, op, "graph.shortestPath")) return opt(try graph.shortestPath(try argStr(args, 0), try argStr(args, 1)));
+        return opt(try graph.addEdge(try argInt(args, 1), try argInt(args, 2), try argStr(args, 0), "{}"));
+    if (eq(u8, op, "graph.deleteNode")) return opt(try graph.deleteNode(try argInt(args, 0)));
+    if (eq(u8, op, "graph.neighbors")) return opt(try graph.neighbors(try argInt(args, 0), try argStr(args, 1)));
+    if (eq(u8, op, "graph.shortestPath")) return opt(try graph.shortestPath(try argInt(args, 0), try argInt(args, 1)));
     if (eq(u8, op, "graph.nodeCount")) return opt(try graph.nodeCount());
     if (eq(u8, op, "graph.edgeCount")) return opt(try graph.edgeCount());
 
@@ -500,13 +556,13 @@ fn call(
     }
     if (eq(u8, op, "streams.xlen")) return opt(try streams.xlen(try argStr(args, 0)));
     if (eq(u8, op, "streams.xrange"))
-        return opt(try streams.xrange(try argStr(args, 0), 0, std.math.maxInt(i64), 100));
+        return opt(try streams.xrange(try argStr(args, 0), try argInt(args, 1), try argInt(args, 2), @intCast(try argInt(args, 3))));
     if (eq(u8, op, "streams.xread"))
-        return opt(try streams.xread(try argStr(args, 0), 0, 100));
+        return opt(try streams.xread(try argStr(args, 0), try argInt(args, 1), @intCast(try argInt(args, 2))));
     if (eq(u8, op, "streams.xgroupCreate"))
-        return opt(try streams.xgroupCreate(try argStr(args, 0), try argStr(args, 1), 0));
+        return opt(try streams.xgroupCreate(try argStr(args, 0), try argStr(args, 1), try argInt(args, 2)));
     if (eq(u8, op, "streams.xreadgroup"))
-        return opt(try streams.xreadgroup(try argStr(args, 0), try argStr(args, 1), try argStr(args, 2), 100));
+        return opt(try streams.xreadgroup(try argStr(args, 0), try argStr(args, 1), try argStr(args, 2), @intCast(try argInt(args, 3))));
     if (eq(u8, op, "streams.xack")) {
         // The client takes the id as (ms, seq); the spec passes "<ms>-<seq>".
         const id = try argStr(args, 2);
@@ -523,28 +579,11 @@ fn call(
     var dl = client.datalog();
     if (eq(u8, op, "datalog.assertFact")) return opt(try dl.assertFact(try argStr(args, 0)));
     if (eq(u8, op, "datalog.query")) return opt(try dl.datalogQuery(try argStr(args, 0)));
-    if (eq(u8, op, "datalog.clear")) {
-        // The Zig client's clear() is global — it takes no predicate. The
-        // spec's predicate argument is consumed but unused; if the engine
-        // scopes clear per-predicate, this executor will disagree with the
-        // other SDKs and the drift matrix will say so.
-        _ = try argStr(args, 0);
-        return opt(try dl.clear());
-    }
+    if (eq(u8, op, "datalog.clear")) return opt(try dl.clear(try argStr(args, 0)));
 
     // ── cdc ──
     var cdc = client.cdc();
-    if (eq(u8, op, "cdc.read")) {
-        // The Zig client takes only the offset — no limit. The spec's limit
-        // argument is consumed but unused; drift against other SDKs will
-        // surface if the engine respects the limit.
-        const after = try argInt(args, 0);
-        if (args.len > 1) {
-            const lim = try argInt(args, 1);
-            if (lim <= 0) return failWith("cdc.read limit must be positive", .{});
-        }
-        return opt(try cdc.cdcRead(after));
-    }
+    if (eq(u8, op, "cdc.read")) return opt(try cdc.cdcRead(try argInt(args, 0), try argInt(args, 1)));
     if (eq(u8, op, "cdc.count")) return opt(try cdc.count());
 
     // ── blob ──
@@ -577,6 +616,40 @@ fn call(
 fn scopedKey(alloc: std.mem.Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
     if (bucket.len == 0) return key;
     return std.fmt.allocPrint(alloc, "{s}/{s}", .{ bucket, key });
+}
+
+/// [[k, v], ...] → {k: v, ...}. KV hash answers cross the wire as pairs; the
+/// spec's `key` expectation needs the map shape other SDKs decode to.
+fn pairsToObject(alloc: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .{ .object = std.json.ObjectMap.init(alloc) };
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch
+        return failWith("KV_HGETALL did not answer JSON pairs: {s}", .{raw});
+    if (parsed.value != .array) return failWith("KV_HGETALL did not answer a pairs array: {s}", .{raw});
+    var out = std.json.ObjectMap.init(alloc);
+    for (parsed.value.array.items) |pair| {
+        if (pair != .array or pair.array.items.len < 2 or pair.array.items[0] != .string)
+            return failWith("KV_HGETALL pair is not [field, value]: {s}", .{raw});
+        try out.put(pair.array.items[0].string, pair.array.items[1]);
+    }
+    return .{ .object = out };
+}
+
+/// [[member, score], ...] → [member, ...], as Redis ZRANGE without
+/// WITHSCORES and as the Go SDK's ZRange decodes.
+fn pairsToMembers(alloc: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .{ .array = .{ .items = &.{}, .capacity = 0, .allocator = alloc } };
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch
+        return failWith("KV_ZRANGE did not answer JSON pairs: {s}", .{raw});
+    if (parsed.value != .array) return failWith("KV_ZRANGE did not answer a pairs array: {s}", .{raw});
+    var out = try std.ArrayList(std.json.Value).initCapacity(alloc, parsed.value.array.items.len);
+    for (parsed.value.array.items) |pair| {
+        if (pair != .array or pair.array.items.len < 1)
+            return failWith("KV_ZRANGE pair is not [member, score]: {s}", .{raw});
+        out.appendAssumeCapacity(pair.array.items[0]);
+    }
+    return .{ .array = .{ .items = out.items, .capacity = out.capacity, .allocator = alloc } };
 }
 
 fn b64ToHex(alloc: std.mem.Allocator, b64: []const u8) ![]const u8 {
@@ -677,6 +750,7 @@ pub fn main() !void {
         );
         std.process.exit(1);
     }
+    run_nonce = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
 
     const spec_path = "../../spec.json";
     const spec_bytes = std.fs.cwd().readFileAlloc(alloc, spec_path, 8 << 20) catch |e| {
@@ -773,13 +847,19 @@ pub fn main() !void {
     if (failures > 0) std.process.exit(1);
 }
 
+/// Mixed into every fixture name once per run, so "@table" in this run is a
+/// different table from "@table" in the last run — the spec's "unique across
+/// runs" convention. A case-index-only seed made the second run of the suite
+/// collide with the first (CREATE TABLE ... already exists).
+var run_nonce: u64 = 0;
+
 fn runCase(
     alloc: std.mem.Allocator,
     client: *NucleusClient,
     case: std.json.Value,
     seed: u64,
 ) !void {
-    var fx = Fixtures.init(alloc, 0x9E3779B97F4A7C15 *% (seed +% 1));
+    var fx = Fixtures.init(alloc, 0x9E3779B97F4A7C15 *% (run_nonce ^ (seed +% 1)));
     var bound = std.StringHashMap(std.json.Value).init(alloc);
 
     for (case.object.get("steps").?.array.items, 0..) |step, si| {
@@ -801,7 +881,17 @@ fn runCase(
         };
 
         if (step.object.get("bind")) |b| {
-            try bound.put(b.string, try resultToJson(alloc, result));
+            // Bind what the engine SAID, not what it JSON-parses into: an id
+            // answered as "5" stays "5" so a later argInt/argStr both work,
+            // and a "<ms>-<seq>" id stays the string it is. Bound values are
+            // only ever consumed as arguments, never re-checked, so no
+            // expectation loses anything by this.
+            const bound_value: std.json.Value = switch (result) {
+                .none => .null,
+                .text => |s| .{ .string = s },
+                .parsed => |v| v,
+            };
+            try bound.put(b.string, bound_value);
         }
         if (step.object.get("expect")) |ex| {
             check(alloc, result, ex.object) catch |e| {

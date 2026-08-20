@@ -266,6 +266,13 @@ pub const NucleusClient = struct {
     }
 
     /// Execute a SQL query and return the raw result text (first column, first row).
+    ///
+    /// The string is a copy owned by the client's allocator. It cannot be a
+    /// slice into the query result: PgClient.query returns its QueryResult by
+    /// value, so a slice into it dangles the moment this frame returns —
+    /// callers holding the "same" string across later calls read reclaimed
+    /// stack (measured: ids and list elements turning to garbage a few calls
+    /// later).
     pub fn execute(self: *NucleusClient, sql_str: []const u8) !?[]const u8 {
         if (!self.connected) return error.NotConnected;
         const conn = try self.acquireHealthy();
@@ -275,7 +282,8 @@ pub const NucleusClient = struct {
             self.captureErrorCode(conn);
             return err;
         };
-        return result.scalar();
+        const text = result.scalar() orelse return null;
+        return try self.allocator.dupe(u8, text);
     }
 
     /// Execute a SQL query and return the full QueryResult.
@@ -291,15 +299,20 @@ pub const NucleusClient = struct {
     }
 
     /// Execute a statement (INSERT/UPDATE/DELETE) and return the command tag.
+    ///
+    /// The tag is a copy owned by the client's allocator — the raw tag is a
+    /// slice into the connection's receive buffer, which the next query on
+    /// that pooled connection overwrites.
     pub fn exec(self: *NucleusClient, sql_str: []const u8) ![]const u8 {
         if (!self.connected) return error.NotConnected;
         const conn = try self.acquireHealthy();
         defer self.pool.release(conn);
 
-        return conn.execute(sql_str) catch |err| {
+        const tag = conn.execute(sql_str) catch |err| {
             self.captureErrorCode(conn);
             return err;
         };
+        return try self.allocator.dupe(u8, tag);
     }
 
     /// Copy the connection's SQLSTATE up to the client before the connection

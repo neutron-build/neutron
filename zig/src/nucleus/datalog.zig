@@ -31,14 +31,18 @@ pub const DatalogModel = struct {
         return std.fmt.bufPrint(buf, "SELECT DATALOG_QUERY('{s}')", .{query_str}) catch return error.BufferTooShort;
     }
 
-    /// SELECT DATALOG_CLEAR()
-    pub fn clearSql(buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "SELECT DATALOG_CLEAR()", .{}) catch return error.BufferTooShort;
+    /// SELECT DATALOG_CLEAR('predicate'). The argument is required — the
+    /// engine answers DATALOG_CLEAR() with "DATALOG_CLEAR requires 1
+    /// argument(s), got 0" (measured live; the Go SDK binds the predicate).
+    pub fn clearSql(predicate: []const u8, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "SELECT DATALOG_CLEAR('{s}')", .{predicate}) catch return error.BufferTooShort;
     }
 
-    /// SELECT DATALOG_IMPORT_GRAPH()
-    pub fn importGraphSql(buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "SELECT DATALOG_IMPORT_GRAPH()", .{}) catch return error.BufferTooShort;
+    /// SELECT DATALOG_IMPORT_GRAPH('predicate') — same arity, verified the
+    /// same way: DATALOG_IMPORT_GRAPH() is rejected with "requires 1
+    /// argument(s)".
+    pub fn importGraphSql(predicate: []const u8, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "SELECT DATALOG_IMPORT_GRAPH('{s}')", .{predicate}) catch return error.BufferTooShort;
     }
 
     // ── Execution methods ────────────────────────────────────────
@@ -67,15 +71,15 @@ pub const DatalogModel = struct {
         return try self.client.executeModel(sql);
     }
 
-    pub fn clear(self: DatalogModel) !?[]const u8 {
+    pub fn clear(self: DatalogModel, predicate: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
-        const sql = try clearSql(&buf);
+        const sql = try clearSql(predicate, &buf);
         return try self.client.executeModel(sql);
     }
 
-    pub fn importGraph(self: DatalogModel) !?[]const u8 {
+    pub fn importGraph(self: DatalogModel, predicate: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
-        const sql = try importGraphSql(&buf);
+        const sql = try importGraphSql(predicate, &buf);
         return try self.client.executeModel(sql);
     }
 };
@@ -108,12 +112,12 @@ test "DATALOG_QUERY sql" {
 
 test "DATALOG_CLEAR sql" {
     var buf: [256]u8 = undefined;
-    const sql = try DatalogModel.clearSql(&buf);
-    try std.testing.expectEqualStrings("SELECT DATALOG_CLEAR()", sql);
+    const sql = try DatalogModel.clearSql("parent", &buf);
+    try std.testing.expectEqualStrings("SELECT DATALOG_CLEAR('parent')", sql);
 }
 
 test "DATALOG_IMPORT_GRAPH sql" {
     var buf: [256]u8 = undefined;
-    const sql = try DatalogModel.importGraphSql(&buf);
-    try std.testing.expectEqualStrings("SELECT DATALOG_IMPORT_GRAPH()", sql);
+    const sql = try DatalogModel.importGraphSql("parent", &buf);
+    try std.testing.expectEqualStrings("SELECT DATALOG_IMPORT_GRAPH('parent')", sql);
 }

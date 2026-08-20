@@ -227,51 +227,86 @@ pub const PgClient = struct {
     }
 
     /// Execute a simple query. Returns the command tag string.
+    ///
+    /// Reads until ReadyForQuery. A single read() here used to leave the
+    /// response tail (CommandComplete/ReadyForQuery) unread in the socket
+    /// whenever the server split it across TCP segments, and the next query
+    /// on the connection then decoded those stale bytes as its own response —
+    /// returning the previous statement's DataRow or nothing. Reproduced
+    /// against a live Nucleus: execute("SELECT 1") + query(...) desynced on
+    /// 110 of 200 iterations.
     pub fn execute(self: *PgClient, sql: []const u8) ![]const u8 {
         const msg_len = codec.encodeQuery(self.send_buf, sql) catch return Error.BufferTooShort;
         try self.stream.writeAll(self.send_buf[0..msg_len]);
 
-        // Read response
-        const n = try self.stream.read(self.recv_buf);
-        if (n == 0) return Error.ConnectionFailed;
-
-        var pos: usize = 0;
         var command_tag: []const u8 = "";
+        var buffered: usize = 0;
 
-        while (pos < n) {
-            const result = codec.decode(self.recv_buf[pos..n]) catch break;
-            pos += result.consumed;
+        while (true) {
+            const n = try self.stream.read(self.recv_buf[buffered..]);
+            if (n == 0) return Error.ConnectionFailed;
+            buffered += n;
 
-            switch (result.msg) {
-                .command_complete => |tag| command_tag = tag,
-                .ready_for_query => |status| {
-                    self.transaction_status = status;
-                    return command_tag;
-                },
-                .error_response => |err| {
-                    return self.recordErrorResponse(err);
-                },
-                else => {},
+            var pos: usize = 0;
+            while (pos < buffered) {
+                const result = codec.decode(self.recv_buf[pos..buffered]) catch |e| switch (e) {
+                    // A message straddles the end of what has been read so
+                    // far: stop decoding, keep the tail, read more.
+                    error.BufferTooShort => break,
+                    else => return Error.InvalidResponse,
+                };
+                pos += result.consumed;
+
+                switch (result.msg) {
+                    .command_complete => |tag| command_tag = tag,
+                    .ready_for_query => |status| {
+                        self.transaction_status = status;
+                        return command_tag;
+                    },
+                    .error_response => |err| {
+                        return self.recordErrorResponse(err);
+                    },
+                    else => {},
+                }
             }
+
+            const rest_len = buffered - pos;
+            if (pos > 0) {
+                std.mem.copyForwards(u8, self.recv_buf[0..rest_len], self.recv_buf[pos..buffered]);
+                buffered = rest_len;
+            }
+            // The buffer is full and still does not hold a complete message:
+            // no further read can ever complete it.
+            if (buffered == self.recv_buf.len) return Error.ValueTooLarge;
         }
-        return command_tag;
     }
 
     /// Execute a simple query and collect DataRow results.
     /// Returns a QueryResult containing rows and column metadata.
+    ///
+    /// Messages that straddle a read boundary are preserved: the undecoded
+    /// tail is moved to the front of recv_buf and the next read appends after
+    /// it. Restarting the decode at offset 0 of a refilled buffer (the old
+    /// behaviour) overwrote the partial message and parsed garbage — the
+    /// truncated-hex blob results in the live suite came from exactly this.
     pub fn query(self: *PgClient, sql: []const u8) !QueryResult {
         const msg_len = codec.encodeQuery(self.send_buf, sql) catch return Error.BufferTooShort;
         try self.stream.writeAll(self.send_buf[0..msg_len]);
 
         var result = QueryResult{};
+        var buffered: usize = 0;
 
         while (true) {
-            const n = try self.stream.read(self.recv_buf);
+            const n = try self.stream.read(self.recv_buf[buffered..]);
             if (n == 0) return Error.ConnectionFailed;
+            buffered += n;
 
             var pos: usize = 0;
-            while (pos < n) {
-                const decoded = codec.decode(self.recv_buf[pos..n]) catch break;
+            while (pos < buffered) {
+                const decoded = codec.decode(self.recv_buf[pos..buffered]) catch |e| switch (e) {
+                    error.BufferTooShort => break,
+                    else => return Error.InvalidResponse,
+                };
                 pos += decoded.consumed;
 
                 switch (decoded.msg) {
@@ -310,6 +345,13 @@ pub const PgClient = struct {
                     else => {},
                 }
             }
+
+            const rest_len = buffered - pos;
+            if (pos > 0) {
+                std.mem.copyForwards(u8, self.recv_buf[0..rest_len], self.recv_buf[pos..buffered]);
+                buffered = rest_len;
+            }
+            if (buffered == self.recv_buf.len) return Error.ValueTooLarge;
         }
     }
 
