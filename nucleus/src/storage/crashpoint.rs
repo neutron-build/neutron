@@ -133,6 +133,12 @@ pub const ALL_IO_POINTS: &[&str] = &[
     // survive a restart.
     "datalog.wal_append",
     "vector.wal_append",
+    // The KV string log and the KV collections log. Same class as the two
+    // above, reached from RESP rather than SQL: a failed append was logged and
+    // the command answered `+OK` anyway, so the client counted a write that
+    // the log had refused. Failing these must change the reply.
+    "kv.wal_append",
+    "collections.wal_append",
 ];
 
 fn io_armed() -> Option<&'static str> {

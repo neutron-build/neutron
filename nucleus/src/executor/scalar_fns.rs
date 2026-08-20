@@ -21,7 +21,51 @@ use std::collections::{HashMap, HashSet};
 
 impl Executor {
     /// Evaluate a scalar (non-aggregate) function call.
+    /// Evaluate a scalar function, then refuse to report success for a KV write
+    /// whose log would not take it.
+    ///
+    /// The KV mutators log an append failure and apply the change anyway. That
+    /// keeps the live view usable, and it makes the statement's success a lie:
+    /// durable mode promised the write would survive a restart. Both logs carry
+    /// an edge-triggered failure flag for exactly this — drained here, per
+    /// call, so the error lands on the statement that caused it rather than on
+    /// whatever ran next. Same discipline as the Datalog and vector WAL appends
+    /// (NU-013, NU-048): a failed append fails the statement.
     pub(super) fn eval_scalar_fn(
+        &self,
+        fname: &str,
+        func: &ast::Function,
+        row: &Row,
+        col_meta: &[ColMeta],
+    ) -> Result<Value, ExecError> {
+        let result = self.eval_scalar_fn_inner(fname, func, row, col_meta);
+        #[cfg(feature = "server")]
+        if touches_kv_logs(fname) && self.kv_write_failed() {
+            return Err(ExecError::Runtime(format!(
+                "{fname}: WAL write failed; the value is in memory only and \
+                 will not survive a restart"
+            )));
+        }
+        result
+    }
+
+    /// Drain the write-failure flag from both KV logs.
+    #[cfg(feature = "server")]
+    fn kv_write_failed(&self) -> bool {
+        let strings = self
+            .kv_store
+            .wal()
+            .map(|w| w.take_write_error())
+            .unwrap_or(false);
+        let collections = self
+            .kv_store
+            .collections_wal()
+            .map(|w| w.take_write_error())
+            .unwrap_or(false);
+        strings || collections
+    }
+
+    fn eval_scalar_fn_inner(
         &self,
         fname: &str,
         func: &ast::Function,
@@ -6380,6 +6424,17 @@ fn stream_entries_to_json(entries: &[&crate::pubsub::StreamEntry]) -> String {
 /// refused while degraded yet unknown to Describe. `mutating_registries_agree`
 /// derives both directions from this list, so the next mutator added in one
 /// place fails a test instead of shipping. (NU-216)
+/// Whether a call can append to the KV string log or the KV collections log.
+///
+/// Derived from `SIDE_EFFECTING_FN_NAMES` rather than hand-listed: a KV or
+/// stream mutator added there is covered here the moment it lands, which is the
+/// property a hand-maintained second list never has.
+#[cfg(feature = "server")]
+pub(crate) fn touches_kv_logs(fname: &str) -> bool {
+    (fname.starts_with("KV_") || fname.starts_with("STREAM_"))
+        && SIDE_EFFECTING_FN_NAMES.contains(&fname)
+}
+
 #[cfg(feature = "server")]
 pub(crate) const SIDE_EFFECTING_FN_NAMES: &[&str] = &[
     "BLOB_DELETE",

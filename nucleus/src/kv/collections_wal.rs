@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -195,6 +195,20 @@ pub struct CollectionWal {
     /// process that had not applied it yet. `checkpoint` now waits for this to
     /// reach zero while holding the writer lock, which no new append can pass.
     in_flight: AtomicU64,
+    /// A write to this log failed since the last time anyone asked.
+    ///
+    /// Every mutator logs its error and applies the change anyway, which is a
+    /// defensible choice for a live view and an indefensible one for the reply:
+    /// the client was told the write was durable when the log never took it.
+    /// The RESP layer drains this flag after each command and turns the
+    /// acknowledgement into a `-MISCONF` error, so the failure reaches whoever
+    /// is relying on it instead of only the log file.
+    write_error: AtomicBool,
+    /// Test-only: fail the next append, to exercise the path above without a
+    /// full disk. The env-var fault point `collections.wal_append` covers the
+    /// same path out-of-process for the probes.
+    #[cfg(test)]
+    fail_next_append: AtomicBool,
 }
 
 /// Outstanding-append guard: alive from the moment a record reaches the log
@@ -250,6 +264,9 @@ impl CollectionWal {
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
                 in_flight: AtomicU64::new(0),
+                write_error: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_append: AtomicBool::new(false),
             },
             collections,
         ))
@@ -271,8 +288,36 @@ impl CollectionWal {
         InFlight { wal: self }
     }
 
+    /// Record that a write to this log failed. Drained by `take_write_error`.
+    fn note_write_error(&self) {
+        self.write_error.store(true, Ordering::Release);
+    }
+
+    /// Take the write-failure flag, clearing it.
+    ///
+    /// Edge-triggered on purpose: the caller that drains it is the one that
+    /// must report the failure, and the next command starts clean.
+    pub fn take_write_error(&self) -> bool {
+        self.write_error.swap(false, Ordering::AcqRel)
+    }
+
+    /// Test-only: arm a one-shot append failure.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&self) {
+        self.fail_next_append.store(true, Ordering::Release);
+    }
+
     /// Append a WAL entry: op(u8) + key_len(u32) + key + data_len(u32) + data.
     fn append(&self, op: u8, key: &str, data: &[u8]) -> io::Result<InFlight<'_>> {
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, Ordering::AcqRel) {
+            self.note_write_error();
+            return Err(io::Error::other("injected collections WAL append failure"));
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("collections.wal_append") {
+            self.note_write_error();
+            return Err(e);
+        }
         let mut buf = Vec::new();
         buf.push(op);
         write_string(key, &mut buf);
@@ -289,6 +334,7 @@ impl CollectionWal {
         let write = w.write_all(&buf).and_then(|()| w.flush());
         if let Err(e) = write {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.note_write_error();
             return Err(e);
         }
         self.syncer.on_append();
@@ -308,7 +354,11 @@ impl CollectionWal {
     /// Group-commit sync: durable coverage of every append made before this
     /// call; concurrent committers share fsyncs.
     pub fn group_sync(&self) -> io::Result<()> {
-        self.syncer.group_sync(|| self.sync_covering())
+        let r = self.syncer.group_sync(|| self.sync_covering());
+        if r.is_err() {
+            self.note_write_error();
+        }
+        r
     }
 
     /// Whether appends exist that no completed fsync covers yet.

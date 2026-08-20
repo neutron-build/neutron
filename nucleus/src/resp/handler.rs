@@ -309,7 +309,34 @@ impl RespHandler {
     pub fn handle_command(&mut self, args: Vec<Vec<u8>>) -> Vec<u8> {
         let response = self.handle_command_inner(args);
         self.sync_acked_writes();
+        if self.take_write_failure() {
+            // The mutation is already in memory — the store deliberately keeps
+            // serving the live view — but the log refused it, so this reply
+            // cannot be the `+OK` the command would otherwise get. Redis uses
+            // MISCONF for exactly this: the server is up, the write is not
+            // durable, and the client is the only one who can decide what that
+            // means for it.
+            return encoder::encode_error(
+                "MISCONF Write to the WAL failed; this write is in memory only \
+                 and will not survive a restart",
+            );
+        }
         response
+    }
+
+    /// Drain the write-failure flag from both durable logs.
+    ///
+    /// Both are drained, not short-circuited: a command can dirty either log,
+    /// and leaving one set would misattribute the failure to whatever command
+    /// came next.
+    fn take_write_failure(&self) -> bool {
+        let kv = self.kv.wal().map(|w| w.take_write_error()).unwrap_or(false);
+        let collections = self
+            .kv
+            .collections_wal()
+            .map(|w| w.take_write_error())
+            .unwrap_or(false);
+        kv || collections
     }
 
     /// fsync anything this connection just wrote, before its acknowledgement
@@ -2383,6 +2410,48 @@ mod tests {
         }
         let resp = h.handle_command(args(&["GET", "s"]));
         assert_eq!(decode_bulk(&resp), None);
+    }
+
+    /// A write the log refused must not be acknowledged as one that succeeded.
+    /// Every mutator logs the IO error and applies the change anyway — good for
+    /// the live view, a lie in the reply — so the reply is what has to change.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_failed_wal_append_is_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(KvStore::open(dir.path()).unwrap());
+        let pubsub = Arc::new(PubSubRegistry::new());
+        let mut h = RespHandler::new(kv.clone(), None, pubsub);
+
+        // Baseline: a healthy write is acknowledged.
+        let resp = h.handle_command(args(&["SET", "k", "v"]));
+        assert_eq!(decode_simple(&resp), "OK");
+
+        // String log refuses the next record.
+        kv.wal().unwrap().fail_next_append();
+        let resp = h.handle_command(args(&["SET", "k2", "v2"]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("-MISCONF"),
+            "a refused append was acknowledged: {s}"
+        );
+
+        // Edge-triggered: the failure belongs to the command that caused it.
+        let resp = h.handle_command(args(&["SET", "k3", "v3"]));
+        assert_eq!(decode_simple(&resp), "OK");
+
+        // Collections log, same contract.
+        kv.collections_wal().unwrap().fail_next_append();
+        let resp = h.handle_command(args(&["RPUSH", "l", "a"]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("-MISCONF"),
+            "a refused collections append was acknowledged: {s}"
+        );
+
+        // Control: reads never touch either log, so they can never be blamed.
+        let resp = h.handle_command(args(&["GET", "k"]));
+        assert_eq!(decode_bulk(&resp), Some("v".to_string()));
     }
 
     #[test]

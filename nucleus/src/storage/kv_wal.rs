@@ -20,6 +20,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use parking_lot::Mutex;
 
 use crate::storage::wal_util::WalSync;
@@ -76,6 +78,18 @@ pub struct KvWal {
     writer: Mutex<BufWriter<File>>,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: WalSync,
+    /// A write to this log failed since the last time anyone asked.
+    ///
+    /// Every caller in `kv/mod.rs` logs the error and applies the change
+    /// anyway. That keeps the live view usable and makes the reply a lie: the
+    /// client was told the write was durable when the log never took it. The
+    /// RESP layer drains this after each command and answers `-MISCONF`
+    /// instead of `+OK`.
+    write_error: AtomicBool,
+    /// Test-only: fail the next record, to exercise that path without a full
+    /// disk. `kv.wal_append` covers the same path out-of-process.
+    #[cfg(test)]
+    fail_next_append: AtomicBool,
 }
 
 impl KvWal {
@@ -102,20 +116,58 @@ impl KvWal {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: WalSync::new(),
+                write_error: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_append: AtomicBool::new(false),
             },
             state,
         ))
+    }
+
+    /// Record that a write to this log failed. Drained by `take_write_error`.
+    fn note_write_error(&self) {
+        self.write_error.store(true, Ordering::Release);
+    }
+
+    /// Take the write-failure flag, clearing it. Edge-triggered: the caller
+    /// that drains it is the one that must report the failure.
+    pub fn take_write_error(&self) -> bool {
+        self.write_error.swap(false, Ordering::AcqRel)
+    }
+
+    /// Test-only: arm a one-shot append failure.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&self) {
+        self.fail_next_append.store(true, Ordering::Release);
+    }
+
+    /// Write one already-encoded record. The single place an append can fail,
+    /// so the single place that has to remember it did.
+    fn write_record(&self, buf: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, Ordering::AcqRel) {
+            self.note_write_error();
+            return Err(io::Error::other("injected KV WAL append failure"));
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("kv.wal_append") {
+            self.note_write_error();
+            return Err(e);
+        }
+        let mut w = self.writer.lock();
+        let write = w.write_all(buf).and_then(|()| w.flush());
+        if let Err(e) = write {
+            self.note_write_error();
+            return Err(e);
+        }
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a SET operation (key + value, no TTL change).
     pub fn log_set(&self, key: &str, val: &Value) -> io::Result<()> {
         let mut buf = Vec::new();
         encode_set(&mut buf, key, val);
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.write_record(&buf)
     }
 
     /// Log a SET that also decides the key's expiry, as ONE record.
@@ -131,11 +183,7 @@ impl KvWal {
     ) -> io::Result<()> {
         let mut buf = Vec::new();
         encode_set_with_expiry(&mut buf, key, val, expires_ms);
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.write_record(&buf)
     }
 
     /// Log a DEL operation.
@@ -146,11 +194,7 @@ impl KvWal {
         buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
         buf.extend_from_slice(kb);
 
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.write_record(&buf)
     }
 
     /// Log an EXPIRE operation (absolute TTL in milliseconds since epoch).
@@ -162,11 +206,7 @@ impl KvWal {
         buf.extend_from_slice(kb);
         buf.extend_from_slice(&ttl_ms.to_le_bytes());
 
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.write_record(&buf)
     }
 
     /// Log multiple operations in a single `write_all` + `flush` call.
@@ -209,11 +249,7 @@ impl KvWal {
                 }
             }
         }
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.write_record(&buf)
     }
 
     /// Flush + `fsync` the log, capturing (under the writer lock) the highest
@@ -241,7 +277,11 @@ impl KvWal {
     /// Group-commit sync: returns only once a completed fsync covers every append
     /// made before this call. Concurrent committers share fsyncs.
     pub fn group_sync(&self) -> io::Result<()> {
-        self.syncer.group_sync(|| self.sync_covering())
+        let r = self.syncer.group_sync(|| self.sync_covering());
+        if r.is_err() {
+            self.note_write_error();
+        }
+        r
     }
 
     /// Whether appends exist that no completed fsync covers yet.

@@ -26,8 +26,12 @@ DECLARED_TESTS=$((UNIT_DECLARED + INTEGRATION_DECLARED))
 UNIT_IGNORED=$(count_matching_lines "$SRC" '^[[:space:]]*#\[ignore([^]]*)?\]')
 INTEGRATION_IGNORED=$(count_matching_lines "$TEST_DIR" '^[[:space:]]*#\[ignore([^]]*)?\]')
 IGNORED_TESTS=$((UNIT_IGNORED + INTEGRATION_IGNORED))
+# `child` is a category, not an escape hatch: an I/O-fault test has to arm the
+# fault in a fresh process (the armed point is read once into a OnceLock), so
+# the child body is a #[ignore]d test the parent runs by name. It does execute
+# — every run — which is the property this check exists to protect.
 STRESS_IGNORED=$(find "$TEST_DIR" -type f -name '*.rs' -exec grep -Ehi \
-    '^[[:space:]]*#\[ignore([^]]*)?(stress|scale|large|concurrent|crash|overflow|expression)' {} + \
+    '^[[:space:]]*#\[ignore([^]]*)?(stress|scale|large|concurrent|crash|overflow|expression|child)' {} + \
     2>/dev/null | wc -l | tr -d ' ')
 UNCLASSIFIED_INTEGRATION_IGNORES=$((INTEGRATION_IGNORED - STRESS_IGNORED))
 WAL_FILES=$(find "$SRC" -type f -name '*wal*.rs' | wc -l | tr -d ' ')
