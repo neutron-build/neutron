@@ -28,6 +28,18 @@ use super::streams::{Stream, StreamId};
 
 // ─── Operation tags ──────────────────────────────────────────────────────────
 
+/// Marks a log whose records each carry a CRC32C trailer.
+///
+/// Logs written before this had no checksum anywhere, so a corrupted length
+/// field mid-file was indistinguishable from a torn tail: replay stopped, threw
+/// the remainder away and returned `Ok`, and the database came back as a prefix
+/// of itself with nothing looking wrong. The main WAL has had per-record
+/// CRC32C since the beginning (`storage/wal.rs`); this store never got one.
+///
+/// A file that does not start with this magic is a v1 log and replays without
+/// checksums, so an existing database still opens.
+const WAL_MAGIC_V2: &[u8; 8] = b"NCOLWAL2";
+
 const OP_LPUSH: u8 = 1;
 const OP_RPUSH: u8 = 2;
 const OP_LPOP: u8 = 3;
@@ -207,6 +219,11 @@ const COLL_STREAM_V2: u8 = 8;
 /// Append-only WAL for KV collections.
 pub struct CollectionWal {
     path: PathBuf,
+    /// Whether this log's records carry a CRC32C trailer (see `WAL_MAGIC_V2`).
+    ///
+    /// Atomic because a checkpoint rewrites the file and upgrades a v1 log in
+    /// place, while other threads are appending to it.
+    checksummed: AtomicBool,
     writer: Mutex<BufWriter<File>>,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: crate::storage::wal_util::WalSync,
@@ -282,10 +299,22 @@ impl CollectionWal {
         } else {
             ShardedCollections::new()
         };
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // A brand-new log starts with the v2 magic. An existing one keeps
+        // whatever format it already has: upgrading in place would mean
+        // rewriting the file, and a checkpoint does that anyway.
+        let checksummed = if existing_len == 0 {
+            file.write_all(WAL_MAGIC_V2)?;
+            file.flush()?;
+            true
+        } else {
+            starts_with_magic(&std::fs::read(&path)?)
+        };
         Ok((
             Self {
                 path,
+                checksummed: AtomicBool::new(checksummed),
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
                 in_flight: AtomicU64::new(0),
@@ -332,7 +361,8 @@ impl CollectionWal {
         self.fail_next_append.store(true, Ordering::Release);
     }
 
-    /// Append a WAL entry: op(u8) + key_len(u32) + key + data_len(u32) + data.
+    /// Append a WAL entry: op(u8) + key_len(u32) + key + data_len(u32) + data,
+    /// followed on a v2 log by a CRC32C(u32) over all of it.
     fn append(&self, op: u8, key: &str, data: &[u8]) -> io::Result<InFlight<'_>> {
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
@@ -348,6 +378,10 @@ impl CollectionWal {
         write_string(key, &mut buf);
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(data);
+        if self.checksummed.load(Ordering::Acquire) {
+            let crc = crc32c::crc32c(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+        }
 
         // The lock comes FIRST and the count is taken under it. Counting
         // before the lock deadlocks: a writer blocked on the lock would already
@@ -628,11 +662,18 @@ impl CollectionWal {
         let snapshot_data = serialize_snapshot(collections);
 
         // Serialize the complete new log body (SNAPSHOT tag + empty key + snapshot).
+        // A checkpoint rewrites the whole file, so it is also where a v1 log
+        // becomes a v2 one: the magic goes in unconditionally and the record
+        // gets its checksum.
         let mut contents: Vec<u8> = Vec::new();
+        contents.extend_from_slice(WAL_MAGIC_V2);
+        let record_start = contents.len();
         contents.push(OP_SNAPSHOT);
         write_string_to_writer("", &mut contents)?;
         contents.extend_from_slice(&(snapshot_data.len() as u32).to_le_bytes());
         contents.extend_from_slice(&snapshot_data);
+        let crc = crc32c::crc32c(&contents[record_start..]);
+        contents.extend_from_slice(&crc.to_le_bytes());
 
         // Replace atomically — temp file + fsync + rename — so a crash
         // mid-checkpoint leaves the old log or the new snapshot, never an empty
@@ -640,6 +681,7 @@ impl CollectionWal {
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
         *w = BufWriter::new(file);
+        self.checksummed.store(true, Ordering::Release);
         // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
         let mark = self.syncer.on_append();
         self.syncer.mark_synced(mark);
@@ -895,10 +937,19 @@ struct ReplayOutcome {
     corruption: Option<String>,
 }
 
+/// Whether a log body opens with the v2 magic.
+fn starts_with_magic(data: &[u8]) -> bool {
+    data.len() >= WAL_MAGIC_V2.len() && &data[..WAL_MAGIC_V2.len()] == WAL_MAGIC_V2
+}
+
 fn replay(data: &[u8]) -> ReplayOutcome {
     let collections = ShardedCollections::new();
     let mut corruption: Option<String> = None;
     let mut pos = 0usize;
+    let checksummed = starts_with_magic(data);
+    if checksummed {
+        pos = WAL_MAGIC_V2.len();
+    }
 
     while pos < data.len() {
         // Where this record begins, so a corruption report can name the offset
@@ -907,11 +958,21 @@ fn replay(data: &[u8]) -> ReplayOutcome {
         let Some(&op) = data.get(pos) else { break };
         pos += 1;
 
-        // Read key (all entries have a key, even SNAPSHOT which uses empty key)
-        let Some(key) = read_string(data, &mut pos) else {
+        // Frame the record from its LENGTHS ONLY, without interpreting a byte
+        // of it. The checksum has to be verified before anything is decoded:
+        // a corrupted byte inside a key used to fail UTF-8 decoding first, and
+        // that path exits as a torn tail — so the one thing that could tell
+        // corruption from truncation was never reached.
+        let Some(key_len) = read_u32(data, &mut pos) else {
             break;
         };
-        // Read data payload
+        let key_len = key_len as usize;
+        if pos + key_len > data.len() {
+            break;
+        }
+        let key_bytes = &data[pos..pos + key_len];
+        pos += key_len;
+
         let Some(data_len) = read_u32(data, &mut pos) else {
             break;
         };
@@ -922,21 +983,64 @@ fn replay(data: &[u8]) -> ReplayOutcome {
         let payload = &data[pos..pos + data_len];
         pos += data_len;
 
-        match op {
-            OP_LPUSH => {
-                let mut dpos = 0;
-                if let Some(val) = decode_value(payload, &mut dpos)
-                    && let Err(e) = collections.lpush(&key, val)
-                {
-                    tracing::warn!("KV WAL replay lpush({key}) failed: {e}");
-                }
+        if checksummed {
+            // A record whose trailer is missing is torn — the last append
+            // caught by a crash, which is normal. A record whose trailer is
+            // present and wrong is corruption: the bytes are not what was
+            // written, and continuing would replay a lie.
+            let Some(stored) = read_u32(data, &mut pos) else {
+                break;
+            };
+            let computed = crc32c::crc32c(&data[rec_start..pos - 4]);
+            if stored != computed {
+                corruption = Some(format!(
+                    "record at offset {rec_start} (op {op}) failed its checksum: \
+                     stored {stored:#010x}, computed {computed:#010x}"
+                ));
+                break;
             }
-            OP_RPUSH => {
+        }
+
+        let key = match std::str::from_utf8(key_bytes) {
+            Ok(k) => k.to_string(),
+            Err(e) => {
+                if checksummed {
+                    // The CRC just said these are the bytes that were written,
+                    // so a key that is not UTF-8 is a format fault, not media
+                    // rot — and either way it is not a torn tail.
+                    corruption = Some(format!(
+                        "record at offset {rec_start} (op {op}) has a non-UTF-8 key: {e}"
+                    ));
+                }
+                break;
+            }
+        };
+
+        match op {
+            OP_LPUSH | OP_RPUSH => {
+                // A payload that will not decode is corruption, not a record to
+                // skip: on a checksummed log the CRC has already said these are
+                // the bytes that were written, so the failure is in the format,
+                // not the media. These two arms did not even warn.
                 let mut dpos = 0;
-                if let Some(val) = decode_value(payload, &mut dpos)
-                    && let Err(e) = collections.rpush(&key, val)
-                {
-                    tracing::warn!("KV WAL replay rpush({key}) failed: {e}");
+                match decode_value(payload, &mut dpos) {
+                    Some(val) => {
+                        let applied = if op == OP_LPUSH {
+                            collections.lpush(&key, val)
+                        } else {
+                            collections.rpush(&key, val)
+                        };
+                        if let Err(e) = applied {
+                            tracing::warn!("KV WAL replay push({key}) failed: {e}");
+                        }
+                    }
+                    None => {
+                        corruption = Some(format!(
+                            "record at offset {rec_start} (op {op}, key {key}) has an \
+                             undecodable value payload"
+                        ));
+                        break;
+                    }
                 }
             }
             OP_LPOP => {
@@ -1240,8 +1344,17 @@ mod tests {
         // empty key(0) + payload_len(4).
         let path = dir.path().join("collections.wal");
         let mut bytes = std::fs::read(&path).unwrap();
-        let payload_start = 1 + 4 + 4;
+        let rec = WAL_MAGIC_V2.len();
+        let payload_start = rec + 1 + 4 + 4;
         bytes[payload_start..payload_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Recompute the CRC of THIS record — the snapshot is not the last one
+        // in the file, there is an append after it. This test is about a record
+        // that is intact on the media and still does not deserialize, which is
+        // a different failure from bit-rot and gets its own diagnosis.
+        let data_len = u32::from_le_bytes(bytes[rec + 5..rec + 9].try_into().unwrap()) as usize;
+        let rec_end = rec + 9 + data_len;
+        let crc = crc32c::crc32c(&bytes[rec..rec_end]);
+        bytes[rec_end..rec_end + 4].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
 
         let err = match CollectionWal::open(dir.path()) {
@@ -1294,7 +1407,15 @@ mod tests {
 
         let path = dir.path().join("collections.wal");
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[0] = 250; // not a defined opcode
+        // The opcode is the first byte AFTER the format magic. The CRC is
+        // recomputed so this exercises the unknown-opcode arm and not the
+        // checksum arm — the two failures are different diagnoses and each
+        // needs its own test.
+        let rec = WAL_MAGIC_V2.len();
+        bytes[rec] = 250; // not a defined opcode
+        let end = bytes.len() - 4;
+        let crc = crc32c::crc32c(&bytes[rec..end]);
+        bytes[end..].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
 
         let err = match CollectionWal::open(dir.path()) {
@@ -2127,6 +2248,104 @@ mod tests {
         let items = colls2.lrange("list", 0, -1).unwrap();
         assert_eq!(items, vec![Value::Text("hello".into())]);
         assert!(colls2.sismember("set", "member").unwrap());
+    }
+
+    /// Corruption in the MIDDLE of the log must be an error, not a silent
+    /// truncation.
+    ///
+    /// Without a checksum there was no way to tell a bad length field from a
+    /// torn tail: replay stopped, discarded everything after it, and returned
+    /// `Ok`. The database came back as a prefix of itself and nothing looked
+    /// wrong — the same shape the snapshot arm was fixed for.
+    #[test]
+    fn mid_file_corruption_is_an_error_not_a_short_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
+        for k in ["alpha", "beta", "gamma"] {
+            colls.lpush(k, Value::Text("v".into())).unwrap();
+            drop(wal.log_lpush(k, &Value::Text("v".into())).unwrap());
+        }
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        let path = dir.path().join("collections.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Flip a byte inside the FIRST record's key, leaving every length
+        // field intact — so the framing still walks and the tail is reachable.
+        let victim = WAL_MAGIC_V2.len() + 6;
+        bytes[victim] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match CollectionWal::open(dir.path()) {
+            Ok(_) => panic!("a corrupted record in the middle of the log opened cleanly"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("checksum"),
+            "the error should name the checksum, got: {err}"
+        );
+    }
+
+    /// A torn tail stays non-fatal WITH checksums on: the last append can
+    /// always be half-written, and its trailer is simply not there.
+    #[test]
+    fn a_torn_checksum_trailer_is_still_just_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
+        colls.lpush("alpha", Value::Text("v".into())).unwrap();
+        drop(wal.log_lpush("alpha", &Value::Text("v".into())).unwrap());
+        colls.lpush("beta", Value::Text("v".into())).unwrap();
+        drop(wal.log_lpush("beta", &Value::Text("v".into())).unwrap());
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        let path = dir.path().join("collections.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 2); // half a CRC trailer
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (_w, recovered) = CollectionWal::open(dir.path())
+            .expect("a half-written trailer is crash recovery, not corruption");
+        assert_eq!(recovered.llen("alpha").unwrap(), 1);
+        assert_eq!(
+            recovered.llen("beta").unwrap(),
+            0,
+            "the torn record applied"
+        );
+    }
+
+    /// A log written before checksums existed still opens.
+    #[test]
+    fn a_v1_log_without_the_magic_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collections.wal");
+        // Hand-build a v1 record: op + key + payload, no magic, no trailer.
+        let mut bytes = Vec::new();
+        let mut payload = Vec::new();
+        encode_value(&Value::Text("v".into()), &mut payload);
+        bytes.push(OP_LPUSH);
+        write_string("alpha", &mut bytes);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (wal, recovered) =
+            CollectionWal::open(dir.path()).expect("a pre-checksum log must still open");
+        assert_eq!(recovered.llen("alpha").unwrap(), 1);
+        assert!(
+            !wal.checksummed.load(Ordering::Acquire),
+            "an existing v1 log keeps its format until a checkpoint rewrites it"
+        );
+
+        // A checkpoint rewrites the file, and that is where the upgrade happens.
+        wal.checkpoint(&recovered).unwrap();
+        assert!(wal.checksummed.load(Ordering::Acquire));
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            starts_with_magic(&after),
+            "checkpoint did not write the magic"
+        );
     }
 
     /// A log written before groups were checkpointed must still decode.
