@@ -305,6 +305,43 @@ impl Stream {
     // ---- Consumer Groups ----
 
     /// Create a consumer group. `start_id` is "0" for beginning, "$" for latest.
+    /// Every consumer group, for checkpointing.
+    pub fn groups(&self) -> &HashMap<String, ConsumerGroup> {
+        &self.groups
+    }
+
+    /// Reapply a delivery the log recorded: advance `last_delivered_id` past
+    /// the ids handed out and put them back in the consumer's pending list.
+    ///
+    /// Replay cannot re-run `xreadgroup` — `>` selects whatever is new, which
+    /// after a restart is a different set — so the log carries the outcome and
+    /// this reproduces it.
+    pub fn replay_delivery(&mut self, group_name: &str, consumer: &str, ids: &[StreamId]) {
+        let Some(group) = self.groups.get_mut(group_name) else {
+            return;
+        };
+        for id in ids {
+            group.pel.insert(*id, consumer.to_string());
+            group
+                .consumers
+                .entry(consumer.to_string())
+                .or_default()
+                .insert(*id);
+            if *id > group.last_delivered_id {
+                group.last_delivered_id = *id;
+            }
+        }
+    }
+
+    /// Reinstate a consumer group verbatim, from a checkpoint or a WAL replay.
+    ///
+    /// Distinct from `xgroup_create`, which starts a group empty: this restores
+    /// `last_delivered_id` and the pending list, the state a client has no way
+    /// to rebuild after a restart.
+    pub fn restore_group(&mut self, group: ConsumerGroup) {
+        self.groups.insert(group.name.clone(), group);
+    }
+
     pub fn xgroup_create(&mut self, group_name: &str, start_id: &str) -> Result<(), String> {
         if self.groups.contains_key(group_name) {
             return Err("BUSYGROUP Consumer Group name already exists".to_string());

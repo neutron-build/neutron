@@ -43,7 +43,13 @@ const OP_PFADD: u8 = 40;
 const OP_PFMERGE: u8 = 41;
 const OP_XADD: u8 = 45;
 const OP_XDEL: u8 = 46;
+const OP_XTRIM: u8 = 47;
+const OP_XGROUP_CREATE: u8 = 48;
+const OP_XGROUP_DESTROY: u8 = 49;
 const OP_DEL: u8 = 50;
+const OP_XACK: u8 = 51;
+const OP_XREADGROUP: u8 = 52;
+const OP_GEOADD: u8 = 53;
 const OP_SNAPSHOT: u8 = 60;
 
 // ─── Value encoding (same scheme as kv_wal) ─────────────────────────────────
@@ -144,6 +150,18 @@ fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
     read_u64(data, pos).map(|v| v as i64)
 }
 
+/// A length-prefixed run of stream ids, as every group op writes them.
+fn read_stream_ids(data: &[u8], pos: &mut usize) -> Option<Vec<StreamId>> {
+    let n = read_u32(data, pos)? as usize;
+    let mut ids = Vec::with_capacity(n.min(MAX_PREALLOC));
+    for _ in 0..n {
+        let ms = read_u64(data, pos)?;
+        let seq = read_u64(data, pos)?;
+        ids.push(StreamId::new(ms, seq));
+    }
+    Some(ids)
+}
+
 fn read_f64(data: &[u8], pos: &mut usize) -> Option<f64> {
     read_u64(data, pos).map(f64::from_bits)
 }
@@ -176,6 +194,13 @@ const COLL_ZSET: u8 = 4;
 const COLL_HLL: u8 = 5;
 const COLL_STREAM: u8 = 6;
 const COLL_GEO: u8 = 7;
+/// A stream snapshot that also carries its consumer groups.
+///
+/// `COLL_STREAM` wrote entries and nothing else, so every checkpoint dropped
+/// the groups, their `last_delivered_id` and their pending lists — the one
+/// piece of stream state a client cannot reconstruct. Old logs still decode
+/// through `COLL_STREAM`; nothing writes that tag any more.
+const COLL_STREAM_V2: u8 = 8;
 
 // ─── CollectionWal ──────────────────────────────────────────────────────────
 
@@ -480,6 +505,78 @@ impl CollectionWal {
         self.append(OP_XADD, key, &data)
     }
 
+    pub fn log_xtrim(&self, key: &str, maxlen: usize) -> io::Result<InFlight<'_>> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(maxlen as u64).to_le_bytes());
+        self.append(OP_XTRIM, key, &data)
+    }
+
+    pub fn log_xgroup_create(
+        &self,
+        key: &str,
+        group: &str,
+        start_id: &str,
+    ) -> io::Result<InFlight<'_>> {
+        let mut data = Vec::new();
+        write_string(group, &mut data);
+        write_string(start_id, &mut data);
+        self.append(OP_XGROUP_CREATE, key, &data)
+    }
+
+    pub fn log_xgroup_destroy(&self, key: &str, group: &str) -> io::Result<InFlight<'_>> {
+        let mut data = Vec::new();
+        write_string(group, &mut data);
+        self.append(OP_XGROUP_DESTROY, key, &data)
+    }
+
+    pub fn log_xack(&self, key: &str, group: &str, ids: &[StreamId]) -> io::Result<InFlight<'_>> {
+        let mut data = Vec::new();
+        write_string(group, &mut data);
+        data.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            data.extend_from_slice(&id.ms.to_le_bytes());
+            data.extend_from_slice(&id.seq.to_le_bytes());
+        }
+        self.append(OP_XACK, key, &data)
+    }
+
+    /// A delivery moved `last_delivered_id` and added to the pending list.
+    ///
+    /// Logged after the fact, from the ids the group actually handed out: a
+    /// delivery is not a request the replay can repeat, it is a decision the
+    /// replay has to reproduce exactly.
+    pub fn log_xreadgroup(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        ids: &[StreamId],
+    ) -> io::Result<InFlight<'_>> {
+        let mut data = Vec::new();
+        write_string(group, &mut data);
+        write_string(consumer, &mut data);
+        data.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            data.extend_from_slice(&id.ms.to_le_bytes());
+            data.extend_from_slice(&id.seq.to_le_bytes());
+        }
+        self.append(OP_XREADGROUP, key, &data)
+    }
+
+    pub fn log_geoadd(
+        &self,
+        key: &str,
+        lon: f64,
+        lat: f64,
+        member: &str,
+    ) -> io::Result<InFlight<'_>> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&lon.to_le_bytes());
+        data.extend_from_slice(&lat.to_le_bytes());
+        write_string(member, &mut data);
+        self.append(OP_GEOADD, key, &data)
+    }
+
     pub fn log_xdel(&self, key: &str, ids: &[StreamId]) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         data.extend_from_slice(&(ids.len() as u32).to_le_bytes());
@@ -608,7 +705,7 @@ fn serialize_snapshot(collections: &ShardedCollections) -> Vec<u8> {
                 buf.extend_from_slice(regs);
             }
             KvCollection::Stream(stream) => {
-                buf.push(COLL_STREAM);
+                buf.push(COLL_STREAM_V2);
                 let entries = stream.xrange("-", "+", None);
                 buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
                 for entry in &entries {
@@ -620,6 +717,19 @@ fn serialize_snapshot(collections: &ShardedCollections) -> Vec<u8> {
                     for (field, value) in &entry.fields {
                         write_string(field, &mut buf);
                         write_string(value, &mut buf);
+                    }
+                }
+                let groups = stream.groups();
+                buf.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+                for group in groups.values() {
+                    write_string(&group.name, &mut buf);
+                    buf.extend_from_slice(&group.last_delivered_id.ms.to_le_bytes());
+                    buf.extend_from_slice(&group.last_delivered_id.seq.to_le_bytes());
+                    buf.extend_from_slice(&(group.pel.len() as u32).to_le_bytes());
+                    for (id, consumer) in &group.pel {
+                        buf.extend_from_slice(&id.ms.to_le_bytes());
+                        buf.extend_from_slice(&id.seq.to_le_bytes());
+                        write_string(consumer, &mut buf);
                     }
                 }
             }
@@ -697,7 +807,7 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
                 hll.set_registers(regs);
                 KvCollection::HyperLogLog(hll)
             }
-            COLL_STREAM => {
+            COLL_STREAM | COLL_STREAM_V2 => {
                 let n_entries = read_u32(data, pos)? as usize;
                 let mut stream = Stream::new();
                 for _ in 0..n_entries {
@@ -713,6 +823,31 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
                     let id_str = format!("{ms}-{seq}");
                     if let Err(e) = stream.xadd(&id_str, fields) {
                         tracing::warn!("WAL stream snapshot entry {id_str} failed: {e}");
+                    }
+                }
+                // Groups only exist in V2. A COLL_STREAM record is an older
+                // log, and stops here — reading further would consume the next
+                // collection's tag as a group count.
+                if type_tag == COLL_STREAM_V2 {
+                    let n_groups = read_u32(data, pos)? as usize;
+                    for _ in 0..n_groups {
+                        let name = read_string(data, pos)?;
+                        let ms = read_u64(data, pos)?;
+                        let seq = read_u64(data, pos)?;
+                        let mut group = super::streams::ConsumerGroup::new(
+                            name.clone(),
+                            StreamId::new(ms, seq),
+                        );
+                        let n_pel = read_u32(data, pos)? as usize;
+                        for _ in 0..n_pel {
+                            let pms = read_u64(data, pos)?;
+                            let pseq = read_u64(data, pos)?;
+                            let consumer = read_string(data, pos)?;
+                            let id = StreamId::new(pms, pseq);
+                            group.pel.insert(id, consumer.clone());
+                            group.consumers.entry(consumer).or_default().insert(id);
+                        }
+                        stream.restore_group(group);
                     }
                 }
                 KvCollection::Stream(stream)
@@ -938,6 +1073,62 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                     if let Err(e) = collections.xdel(&key, &ids) {
                         tracing::warn!("KV WAL replay xdel({key}) failed: {e}");
                     }
+                }
+            }
+            OP_XTRIM => {
+                let mut dpos = 0;
+                if let Some(maxlen) = read_u64(payload, &mut dpos)
+                    && let Err(e) = collections.xtrim_maxlen(&key, maxlen as usize)
+                {
+                    tracing::warn!("KV WAL replay xtrim({key}) failed: {e}");
+                }
+            }
+            OP_XGROUP_CREATE => {
+                let mut dpos = 0;
+                if let (Some(group), Some(start_id)) = (
+                    read_string(payload, &mut dpos),
+                    read_string(payload, &mut dpos),
+                ) && let Err(e) = collections.xgroup_create(&key, &group, &start_id)
+                {
+                    tracing::warn!("KV WAL replay xgroup_create({key}) failed: {e}");
+                }
+            }
+            OP_XGROUP_DESTROY => {
+                let mut dpos = 0;
+                if let Some(group) = read_string(payload, &mut dpos)
+                    && let Err(e) = collections.xgroup_destroy(&key, &group)
+                {
+                    tracing::warn!("KV WAL replay xgroup_destroy({key}) failed: {e}");
+                }
+            }
+            OP_XACK => {
+                let mut dpos = 0;
+                if let Some(group) = read_string(payload, &mut dpos)
+                    && let Some(ids) = read_stream_ids(payload, &mut dpos)
+                    && let Err(e) = collections.xack(&key, &group, &ids)
+                {
+                    tracing::warn!("KV WAL replay xack({key}) failed: {e}");
+                }
+            }
+            OP_XREADGROUP => {
+                let mut dpos = 0;
+                if let (Some(group), Some(consumer)) = (
+                    read_string(payload, &mut dpos),
+                    read_string(payload, &mut dpos),
+                ) && let Some(ids) = read_stream_ids(payload, &mut dpos)
+                {
+                    collections.replay_delivery(&key, &group, &consumer, &ids);
+                }
+            }
+            OP_GEOADD => {
+                let mut dpos = 0;
+                if let (Some(lon), Some(lat), Some(member)) = (
+                    read_f64(payload, &mut dpos),
+                    read_f64(payload, &mut dpos),
+                    read_string(payload, &mut dpos),
+                ) && let Err(e) = collections.geoadd(&key, lon, lat, &member)
+                {
+                    tracing::warn!("KV WAL replay geoadd({key}) failed: {e}");
                 }
             }
             OP_DEL => {
@@ -1936,6 +2127,45 @@ mod tests {
         let items = colls2.lrange("list", 0, -1).unwrap();
         assert_eq!(items, vec![Value::Text("hello".into())]);
         assert!(colls2.sismember("set", "member").unwrap());
+    }
+
+    /// A log written before groups were checkpointed must still decode.
+    ///
+    /// `COLL_STREAM` records have no group count after the entries, so a reader
+    /// that always looked for one would consume the next collection's type tag
+    /// as a length and desync the whole snapshot.
+    #[test]
+    fn old_stream_snapshots_without_groups_still_decode() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes()); // two collections
+        // 1: an old-format stream with one entry and no group section
+        write_string("s", &mut buf);
+        buf.push(COLL_STREAM);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        write_string("f", &mut buf);
+        write_string("v", &mut buf);
+        // 2: whatever follows must still be found — this is what desync breaks
+        write_string("after", &mut buf);
+        buf.push(COLL_SET);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        write_string("member", &mut buf);
+
+        let mut pos = 0;
+        let items = deserialize_snapshot(&buf, &mut pos).expect("old snapshot failed to decode");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, "s");
+        match &items[0].1 {
+            KvCollection::Stream(stream) => {
+                assert_eq!(stream.xlen(), 1);
+                assert!(stream.groups().is_empty());
+            }
+            other => panic!("expected a stream, got {other:?}"),
+        }
+        assert_eq!(items[1].0, "after");
+        assert!(matches!(items[1].1, KvCollection::Set(_)));
     }
 
     #[test]

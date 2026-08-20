@@ -1408,7 +1408,12 @@ impl ShardedCollections {
     }
 
     /// XTRIM MAXLEN: trim stream to at most maxlen entries.
+    ///
+    /// Logged: without a record, replay reinstates every XADD the trim removed,
+    /// so trimmed entries came back on restart.
     pub fn xtrim_maxlen(&self, key: &str, maxlen: usize) -> Result<usize, WrongTypeError> {
+        #[cfg(feature = "server")]
+        let _in_flight = self.log_write(|wal| wal.log_xtrim(key, maxlen));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -1423,6 +1428,8 @@ impl ShardedCollections {
 
     /// XGROUP CREATE: create a consumer group.
     pub fn xgroup_create(&self, key: &str, group_name: &str, start_id: &str) -> Result<(), String> {
+        #[cfg(feature = "server")]
+        let _in_flight = self.log_write(|wal| wal.log_xgroup_create(key, group_name, start_id));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let stream = data
@@ -1439,6 +1446,8 @@ impl ShardedCollections {
 
     /// XGROUP DESTROY: destroy a consumer group.
     pub fn xgroup_destroy(&self, key: &str, group_name: &str) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
+        let _in_flight = self.log_write(|wal| wal.log_xgroup_destroy(key, group_name));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -1460,9 +1469,17 @@ impl ShardedCollections {
         pending_id: &str,
         count: Option<usize>,
     ) -> Result<Vec<super::streams::StreamEntry>, String> {
+        // Logged after the fact, like XADD: a delivery is a decision, not a
+        // repeatable request. `>` means "whatever is new", which replays to a
+        // different set of entries, so the ids the group actually handed out
+        // are what goes in the log. `begin_op` holds the checkpoint off until
+        // the record lands.
+        #[cfg(feature = "server")]
+        let _in_flight = self.wal.as_ref().map(|wal| wal.begin_op());
+
         let shard = self.shard(key);
         let mut data = shard.data.write();
-        match data.get_mut(key) {
+        let applied = match data.get_mut(key) {
             Some(KvCollection::Stream(s)) => {
                 s.xreadgroup(group_name, consumer_name, pending_id, count)
             }
@@ -1471,6 +1488,33 @@ impl ShardedCollections {
                 other.type_name()
             )),
             None => Err("ERR no such key".to_string()),
+        };
+        drop(data);
+
+        #[cfg(feature = "server")]
+        if let Ok(ref entries) = applied
+            && !entries.is_empty()
+        {
+            let ids: Vec<super::streams::StreamId> = entries.iter().map(|e| e.id).collect();
+            let _logged =
+                self.log_write(|wal| wal.log_xreadgroup(key, group_name, consumer_name, &ids));
+        }
+        applied
+    }
+
+    /// Reapply a logged delivery: move `last_delivered_id` and refill the
+    /// pending list, without re-running the selection the log already decided.
+    pub fn replay_delivery(
+        &self,
+        key: &str,
+        group_name: &str,
+        consumer: &str,
+        ids: &[super::streams::StreamId],
+    ) {
+        let shard = self.shard(key);
+        let mut data = shard.data.write();
+        if let Some(KvCollection::Stream(s)) = data.get_mut(key) {
+            s.replay_delivery(group_name, consumer, ids);
         }
     }
 
@@ -1481,6 +1525,8 @@ impl ShardedCollections {
         group_name: &str,
         ids: &[super::streams::StreamId],
     ) -> Result<usize, String> {
+        #[cfg(feature = "server")]
+        let _in_flight = self.log_write(|wal| wal.log_xack(key, group_name, ids));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -1506,6 +1552,8 @@ impl ShardedCollections {
         lat: f64,
         member: &str,
     ) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
+        let _in_flight = self.log_write(|wal| wal.log_geoadd(key, lon, lat, member));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
