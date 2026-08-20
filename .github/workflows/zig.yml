@@ -21,8 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # v2, not v1: v1 resolves versions through the NIGHTLY builds index, so
+      # it 404'd on 0.15.2 from every mirror and from ziglang.org itself, even
+      # though 0.15.2 is a tagged release listed in download/index.json. The
+      # version pin and the action bump have to land together.
       - name: Install Zig ${{ matrix.zig-version }}
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ matrix.zig-version }}
 
@@ -49,8 +53,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # v2: v1 resolves a version through the NIGHTLY builds index, so it
+      # 404'd on 0.15.2 from every mirror and from ziglang.org itself even
+      # though 0.15.2 is a tagged release. The pin change and the action bump
+      # have to land together.
       - name: Install Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: "0.15.2"
 

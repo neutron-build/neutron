@@ -174,7 +174,7 @@ jobs:
       # 0.15.2 — the one version the SDK's manifest, its own workflow and the
       # local toolchain agree on. `run.sh` resolves a keg-only 0.15 ahead of a
       # 0.16 on PATH locally; in CI this action is the only zig present.
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         if: matrix.sdk == 'zig'
         with:
           version: "0.15.2"
