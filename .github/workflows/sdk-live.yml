@@ -81,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk: [python, go, typescript, elixir, rust, julia, zig]
+        sdk: [python, go, typescript, elixir, rust, julia]
         # elixir joined 2026-08-15, once it could connect at all. Its executor
         # existed since S17 and reported 42/42 failing, because Postgrex's type
         # bootstrap died on `ARRAY (SELECT ...)`; with that fixed it runs
@@ -101,11 +101,19 @@ jobs:
         # defect), execute! raised on any DDL or transaction control, and
         # zrange re-joined member:score.
         #
-        # zig joined 2026-08-19. Its executor was blocked on the 0.14-vs-0.16
-        # toolchain wall; that ended when the SDK pinned 0.15.2 everywhere, and
-        # the executor was ported off the defunct 0.16-proposal APIs and
-        # registered in the runner. It has never been scored against a live
-        # engine — this job is the first run that can. An
+        # zig was added on 2026-08-19 and taken back out the same day. The
+        # toolchain wall that blocked it is gone (0.15.2 pinned everywhere, the
+        # executor ported off the defunct 0.16-proposal APIs and registered),
+        # and the first live run is what that bought: the executor BOOTS and
+        # then fails 19 of 42 cases, because it was ported to compile rather
+        # than to answer correctly. queryScalar returns null or an integer where
+        # a string is expected, timeseries/vector/blob mappings are missing
+        # entirely, streams.xack takes the wrong argument type. Those are
+        # executor defects, not SDK defects, and none of them is hidden by this
+        # line: the drift job below prints `absent` for zig and says what that
+        # means. It goes back in the matrix when it passes locally against a
+        # live engine — a red lane nobody can fix today teaches people to
+        # ignore the lane. An
         # SDK absent from this list is UNPROVEN, and the drift job below says so
         # out loud rather than counting it as agreement.
     steps:
