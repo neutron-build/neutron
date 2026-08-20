@@ -261,6 +261,15 @@ jobs:
       # the note said to.
       - uses: dtolnay/rust-toolchain@stable
 
+      # This job runs EVERY executor itself, so it needs every toolchain — a
+      # missing one shows up as "<sdk> executor did not produce a report" and an
+      # `absent` column, which the diff correctly refuses to count as agreement.
+      # Zig's was left out when zig joined the matrix, and that is exactly how
+      # it presented.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.2"
+
       - uses: julia-actions/setup-julia@v2
         with:
           version: "1.11"
