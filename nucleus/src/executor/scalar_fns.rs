@@ -5875,6 +5875,22 @@ impl Executor {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
+                // Nothing enforces this. No background task, no statement and
+                // no code path deletes a row on the strength of a registered
+                // policy — `RETENTION_CHECK` reports what WOULD expire and is
+                // the only other reader of this engine. Saying so out loud is
+                // the same decision taken for triggers on 2026-08-19: keep
+                // accepting (rejecting breaks any script already calling it),
+                // warn at registration, and document it. Implementing the
+                // sweep is the real fix and is a product decision about
+                // deleting data, filed as `OPEN_WORK.md` §0f.
+                tracing::warn!(
+                    target: "nucleus::compliance",
+                    "RETENTION_SET registered a {days}-day policy on '{table_name}' \
+                     ({ts_col}), but retention is ADVISORY in this build: nothing \
+                     deletes expired rows. Use RETENTION_CHECK to see what would \
+                     expire, and delete it yourself."
+                );
                 self.retention_engine
                     .write()
                     .register(crate::compliance::RetentionPolicy {

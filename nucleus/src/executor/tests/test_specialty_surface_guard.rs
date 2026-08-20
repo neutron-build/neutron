@@ -355,3 +355,57 @@ async fn an_unrevertable_mutation_is_refused_inside_a_transaction() {
         "the enlisted control write should have been reverted"
     );
 }
+
+/// Retention is ADVISORY, and this pins that it stays honest about it.
+///
+/// `RETENTION_SET` returns 'OK' and registers a policy that **nothing
+/// enforces**: no background task, no statement and no code path deletes a row
+/// on the strength of it, and `RETENTION_CHECK` — which reports what WOULD
+/// expire — is the only other reader of the engine. An operator who sets a
+/// retention policy for a compliance requirement gets an acknowledgement and no
+/// deletion, indefinitely.
+///
+/// The decision (2026-08-19, `OPEN_WORK.md` §0f) is the one taken for triggers:
+/// keep accepting, warn at registration, document it. Implementing the sweep is
+/// a product decision about deleting data.
+///
+/// This test exists so that if someone implements enforcement, it fails and
+/// they update the story deliberately.
+#[tokio::test]
+async fn retention_is_advisory_and_deletes_nothing() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE r (id INT PRIMARY KEY, created_at BIGINT)",
+    )
+    .await;
+    // Rows far older than the policy about to be registered.
+    exec(&ex, "INSERT INTO r VALUES (1, 0), (2, 1)").await;
+
+    let res = exec(&ex, "SELECT RETENTION_SET('r', 1, 'created_at')").await;
+    assert_eq!(
+        scalar(&res[0]),
+        &Value::Text("OK".into()),
+        "the return value is part of the surface; changing it is a decision"
+    );
+
+    // What it reports it WOULD do.
+    let check = exec(&ex, "SELECT RETENTION_CHECK()").await;
+    let reported = match scalar(&check[0]) {
+        Value::Text(t) => t.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        reported.contains("\"table\":\"r\""),
+        "RETENTION_CHECK should name the table it would expire rows from: {reported}"
+    );
+
+    // What it actually does: nothing.
+    let count = exec(&ex, "SELECT COUNT(*) FROM r").await;
+    assert_eq!(
+        scalar(&count[0]),
+        &Value::Int64(2),
+        "rows were deleted — retention is no longer advisory, so update \
+         OPEN_WORK §0f, MODEL_SEMANTICS and this test deliberately"
+    );
+}

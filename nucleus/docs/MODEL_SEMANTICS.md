@@ -70,6 +70,16 @@ they do not roll back in PostgreSQL either, and `SERIAL` depends on that.
 dispatcher's own source, so a new mutating function must be enlisted, refused,
 or declared non-transactional — it cannot quietly join the silent-loss set.
 
+**Retention is advisory.** `RETENTION_SET(table, days, ts_column)` returns `OK`
+and registers a policy that **nothing enforces** — no background task and no
+statement deletes a row because of it, and `RETENTION_CHECK`, which reports what
+*would* expire, is the only other reader. It warns at registration and is
+documented here rather than being rejected, because rejecting breaks any script
+already calling it; implementing the sweep is a product decision about deleting
+data (`OPEN_WORK.md` §0f). Pinned by
+`test_specialty_surface_guard::retention_is_advisory_and_deletes_nothing`, which
+fails if enforcement ever lands so the claim is updated with it.
+
 ### The facts that matter most
 
 1. **Nothing outside the relational model is crash-atomic with the SQL
