@@ -3,6 +3,7 @@ import { useEffect } from 'preact/hooks'
 import { activeConnection, schema, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
+import { friendlyError } from '../../lib/rls'
 import type { QueryResult } from '../../lib/types'
 import s from './DatalogModule.module.css'
 
@@ -104,7 +105,7 @@ export function DatalogModule() {
       for (const q of parsed.queries) {
         const r = await api.query(`SELECT DATALOG_QUERY(${sqlStr(q)})`, conn.id)
         if (r.error) {
-          result.value = r
+          result.value = { ...r, error: friendlyError(r.error) }
           return
         }
         const cell = r.rows.length > 0 ? r.rows[0][0] : null
@@ -114,7 +115,7 @@ export function DatalogModule() {
       res.duration = Math.round(performance.now() - started)
       result.value = res
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', friendlyError(err instanceof Error ? err.message : String(err)))
     } finally {
       running.value = false
     }

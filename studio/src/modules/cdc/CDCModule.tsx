@@ -3,6 +3,8 @@ import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import type { QueryResult } from '../../lib/types'
 import s from './CDCModule.module.css'
 
@@ -59,6 +61,7 @@ export function CDCModule() {
   const result = useSignal<QueryResult | null>(null)
   const loading = useSignal(false)
   const refreshInterval = useSignal<RefreshInterval>('off')
+  const rlsDenied = useSignal<string | null>(null)
   const gridRef = useRef<HTMLDivElement>(null)
 
   const conn = activeConnection.value!
@@ -81,7 +84,14 @@ export function CDCModule() {
     loading.value = true
     try {
       const countR = await api.query(`SELECT CDC_COUNT()`, conn.id)
-      const count = !countR.error && countR.rows.length > 0 ? Number(countR.rows[0][0]) : 0
+      if (countR.error) {
+        if (isRlsDenied(countR.error)) {
+          rlsDenied.value = countR.error
+          return
+        }
+        throw new Error(countR.error)
+      }
+      const count = countR.rows.length > 0 ? Number(countR.rows[0][0]) : 0
       totalCount.value = count
 
       const r = await api.query(buildCdcQuery(count, limit.value, filterTable.value), conn.id)
@@ -119,6 +129,7 @@ export function CDCModule() {
 
   return (
     <div class={s.layout}>
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
       <div class={s.header}>
         <span class={s.title}>Change Data Capture</span>
         {totalCount.value != null && (

@@ -6,6 +6,14 @@
   border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
 .channelName { font-family: var(--font-mono); font-size: var(--text-sm); font-weight: 600; color: var(--text-primary); flex: 1; }
+.channelInput {
+  font-family: var(--font-mono); font-size: var(--text-sm); font-weight: 600;
+  color: var(--text-primary); flex: 1;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 3px 8px;
+  outline: none;
+}
+.channelInput:focus { border-color: var(--border-focus); }
 .subCount { font-size: var(--text-xs); color: var(--text-tertiary); }
 .msgBadge {
   font-size: 10px; font-weight: 700;

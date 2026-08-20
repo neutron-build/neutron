@@ -10,6 +10,11 @@ interface Section {
   kind: TabKind
   items: { name: string; sub?: string }[]
   nucleusOnly: boolean
+  // Entry shown when the engine has no enumeration surface for the model
+  // (vector, timeseries, geo, streams, columnar, datalog never list; the
+  // others list nothing while empty or when RLS seals the store). The
+  // browser itself is still usable — the object name is supplied inside it.
+  fallback: string
 }
 
 export function SchemaTree() {
@@ -31,98 +36,21 @@ export function SchemaTree() {
       kind: 'sql-browser',
       items: sc.sql.map(t => ({ name: t.name, sub: t.schema !== 'public' ? t.schema : undefined })),
       nucleusOnly: false,
+      fallback: '',
     },
-    {
-      model: 'kv',
-      label: 'Key-Value',
-      kind: 'kv',
-      items: sc.kv.map(k => ({ name: k.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'vector',
-      label: 'Vector',
-      kind: 'vector',
-      items: sc.vector.map(v => ({ name: v.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'timeseries',
-      label: 'TimeSeries',
-      kind: 'timeseries',
-      items: sc.timeseries.map(t => ({ name: t.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'document',
-      label: 'Document',
-      kind: 'document',
-      items: sc.document.map(d => ({ name: d.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'graph',
-      label: 'Graph',
-      kind: 'graph',
-      items: sc.graph.map(g => ({ name: g.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'fts',
-      label: 'Full-Text',
-      kind: 'fts',
-      items: sc.fts.map(f => ({ name: f.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'geo',
-      label: 'Geo',
-      kind: 'geo',
-      items: sc.geo.map(g => ({ name: g.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'blob',
-      label: 'Blob',
-      kind: 'blob',
-      items: sc.blob.map(b => ({ name: b.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'pubsub',
-      label: 'PubSub',
-      kind: 'pubsub',
-      items: sc.pubsub.map(p => ({ name: p.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'streams',
-      label: 'Streams',
-      kind: 'streams',
-      items: sc.streams.map(st => ({ name: st.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'columnar',
-      label: 'Columnar',
-      kind: 'columnar',
-      items: sc.columnar.map(c => ({ name: c.name })),
-      nucleusOnly: true,
-    },
-    {
-      model: 'datalog',
-      label: 'Datalog',
-      kind: 'datalog',
-      items: sc.datalog ? [{ name: 'datalog' }] : [],
-      nucleusOnly: true,
-    },
-    {
-      model: 'cdc',
-      label: 'CDC',
-      kind: 'cdc',
-      items: sc.cdc ? [{ name: 'changes' }] : [],
-      nucleusOnly: true,
-    },
+    { model: 'kv', label: 'Key-Value', kind: 'kv', items: sc.kv.map(k => ({ name: k.name })), nucleusOnly: true, fallback: 'keyspace' },
+    { model: 'vector', label: 'Vector', kind: 'vector', items: sc.vector.map(v => ({ name: v.name })), nucleusOnly: true, fallback: 'search' },
+    { model: 'timeseries', label: 'TimeSeries', kind: 'timeseries', items: sc.timeseries.map(t => ({ name: t.name })), nucleusOnly: true, fallback: 'series' },
+    { model: 'document', label: 'Document', kind: 'document', items: sc.document.map(d => ({ name: d.name })), nucleusOnly: true, fallback: 'documents' },
+    { model: 'graph', label: 'Graph', kind: 'graph', items: sc.graph.map(g => ({ name: g.name })), nucleusOnly: true, fallback: 'graph' },
+    { model: 'fts', label: 'Full-Text', kind: 'fts', items: sc.fts.map(f => ({ name: f.name })), nucleusOnly: true, fallback: 'index' },
+    { model: 'geo', label: 'Geo', kind: 'geo', items: sc.geo.map(g => ({ name: g.name })), nucleusOnly: true, fallback: 'calculator' },
+    { model: 'blob', label: 'Blob', kind: 'blob', items: sc.blob.map(b => ({ name: b.name })), nucleusOnly: true, fallback: 'blobs' },
+    { model: 'pubsub', label: 'PubSub', kind: 'pubsub', items: sc.pubsub.map(p => ({ name: p.name })), nucleusOnly: true, fallback: 'channel' },
+    { model: 'streams', label: 'Streams', kind: 'streams', items: sc.streams.map(st => ({ name: st.name })), nucleusOnly: true, fallback: 'stream' },
+    { model: 'columnar', label: 'Columnar', kind: 'columnar', items: sc.columnar.map(c => ({ name: c.name })), nucleusOnly: true, fallback: 'table' },
+    { model: 'datalog', label: 'Datalog', kind: 'datalog', items: sc.datalog ? [{ name: 'datalog' }] : [], nucleusOnly: true, fallback: 'datalog' },
+    { model: 'cdc', label: 'CDC', kind: 'cdc', items: sc.cdc ? [{ name: 'changes' }] : [], nucleusOnly: true, fallback: 'changes' },
   ]
 
   const visible = sections.filter(sec =>
@@ -151,7 +79,14 @@ export function SchemaTree() {
 function TreeSection({ section }: { section: Section }) {
   const open = useSignal(section.model === 'sql')
 
-  if (section.items.length === 0 && section.nucleusOnly) return null
+  // Every Nucleus model keeps its browser reachable: when there is nothing to
+  // enumerate (no listing surface, an empty store, or RLS sealing the counts)
+  // the fallback entry opens the browser directly.
+  const items = section.items.length > 0
+    ? section.items
+    : section.nucleusOnly && section.fallback
+      ? [{ name: section.fallback }]
+      : []
 
   return (
     <div class={s.section}>
@@ -165,13 +100,13 @@ function TreeSection({ section }: { section: Section }) {
         <span class={s.count}>{section.items.length}</span>
       </button>
 
-      {open.value && section.items.length === 0 && (
+      {open.value && section.items.length === 0 && !section.nucleusOnly && (
         <div class={s.empty}>
           <span class={s.emptyText}>No {section.label.toLowerCase()} objects</span>
         </div>
       )}
 
-      {open.value && section.items.map(item => (
+      {open.value && items.map(item => (
         <button
           key={item.name}
           class={s.item}

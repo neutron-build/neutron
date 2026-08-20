@@ -1,14 +1,16 @@
 import { describe, it, expect } from 'vitest'
 
-// Tests for ColumnarModule real Nucleus SQL. Columnar operates on NAMED user
-// tables (regular tables), so row data comes from a plain scan while the
-// aggregates and inserts are UPPERCASE SCALAR functions.
+// Tests for ColumnarModule real Nucleus SQL. The COLUMNAR_* store is a named
+// keyspace inside the columnar store — NOT a SQL relation, so `SELECT * FROM
+// t` does not address it (SQL tables created WITH (engine='columnar') are
+// browsed in the SQL section). Aggregates and inserts are UPPERCASE SCALAR
+// functions.
 
 const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
 
 const QUICK_QUERIES = [
   (t: string) => `SELECT COLUMNAR_COUNT(${sqlStr(t)})`,
-  (t: string) => `SELECT * FROM ${t} LIMIT 100`,
+  (t: string) => `SELECT COLUMNAR_SUM(${sqlStr(t)}, 'column')`,
 ]
 
 type Agg = 'SUM' | 'AVG' | 'MIN' | 'MAX'
@@ -38,8 +40,8 @@ describe('ColumnarModule — QUICK_QUERIES', () => {
     expect(QUICK_QUERIES[0]('analytics')).toBe("SELECT COLUMNAR_COUNT('analytics')")
   })
 
-  it('should generate a plain-table SCAN query (columnar tables are regular tables)', () => {
-    expect(QUICK_QUERIES[1]('sales')).toBe('SELECT * FROM sales LIMIT 100')
+  it('should generate a COLUMNAR_SUM template query (the store is not a SQL relation)', () => {
+    expect(QUICK_QUERIES[1]('sales')).toBe("SELECT COLUMNAR_SUM('sales', 'column')")
   })
 })
 

@@ -3,6 +3,8 @@ import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import s from './PubSubModule.module.css'
 
 // Nucleus pub/sub over SQL is publish-only: PUBSUB_PUBLISH(channel, message)
@@ -27,31 +29,46 @@ export function parseChannels(cell: unknown): string[] {
 }
 
 export function PubSubModule({ name }: PubSubModuleProps) {
+  // Channels exist only while a subscriber holds them open, so the tab label
+  // is only the starting channel to publish to.
+  const channelName = useSignal(name)
   const messages = useSignal<PubSubMessage[]>([])
   const payload = useSignal('')
   const publishing = useSignal(false)
   const subscriberCount = useSignal<number | null>(null)
   const channels = useSignal<string[]>([])
   const pinToBottom = useSignal(true)
+  const rlsDenied = useSignal<string | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
   const conn = activeConnection.value!
 
   async function refreshInfo() {
+    const channel = channelName.value.trim()
     try {
-      const subRes = await api.query(
-        `SELECT PUBSUB_SUBSCRIBERS('${name.replace(/'/g, "''")}')`,
-        conn.id
-      )
-      if (!subRes.error && subRes.rows.length > 0) subscriberCount.value = Number(subRes.rows[0][0])
+      if (channel) {
+        const subRes = await api.query(
+          `SELECT PUBSUB_SUBSCRIBERS('${channel.replace(/'/g, "''")}')`,
+          conn.id
+        )
+        if (subRes.error) {
+          if (isRlsDenied(subRes.error)) rlsDenied.value = subRes.error
+        } else if (subRes.rows.length > 0) {
+          subscriberCount.value = Number(subRes.rows[0][0])
+        }
+      }
       const chanRes = await api.query(`SELECT PUBSUB_CHANNELS()`, conn.id)
-      if (!chanRes.error && chanRes.rows.length > 0) channels.value = parseChannels(chanRes.rows[0][0])
+      if (chanRes.error) {
+        if (isRlsDenied(chanRes.error)) rlsDenied.value = chanRes.error
+        return
+      }
+      if (chanRes.rows.length > 0) channels.value = parseChannels(chanRes.rows[0][0])
     } catch { /* non-critical */ }
   }
 
   useEffect(() => {
     refreshInfo()
-  }, [name])
+  }, [])
 
   // Auto-scroll when pinned and new messages arrive
   useEffect(() => {
@@ -61,12 +78,14 @@ export function PubSubModule({ name }: PubSubModuleProps) {
   }, [messages.value.length, pinToBottom.value])
 
   async function publish() {
+    const channel = channelName.value.trim()
     const msg = payload.value.trim()
+    if (!channel) return
     if (!msg) return
     publishing.value = true
     try {
       const r = await api.query(
-        `SELECT PUBSUB_PUBLISH('${name.replace(/'/g, "''")}', '${msg.replace(/'/g, "''")}')`,
+        `SELECT PUBSUB_PUBLISH('${channel.replace(/'/g, "''")}', '${msg.replace(/'/g, "''")}')`,
         conn.id
       )
       if (r.error) throw new Error(r.error)
@@ -77,7 +96,7 @@ export function PubSubModule({ name }: PubSubModuleProps) {
         { id: crypto.randomUUID(), payload: msg, receivedAt: new Date().toISOString() },
       ]
       payload.value = ''
-      toast('success', `Published to ${name} (${reached} subscriber${reached !== 1 ? 's' : ''})`)
+      toast('success', `Published to ${channel} (${reached} subscriber${reached !== 1 ? 's' : ''})`)
       refreshInfo()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -103,17 +122,25 @@ export function PubSubModule({ name }: PubSubModuleProps) {
       payload: m.payload,
       receivedAt: m.receivedAt,
     }))
-    exportCSV(data, `pubsub-${name}.csv`)
+    exportCSV(data, `pubsub-${channelName.value || 'channel'}.csv`)
   }
 
   function handleExportJSON() {
-    exportJSON(messages.value, `pubsub-${name}.json`)
+    exportJSON(messages.value, `pubsub-${channelName.value || 'channel'}.json`)
   }
 
   return (
     <div class={s.layout}>
       <div class={s.header}>
-        <span class={s.channelName}>{name}</span>
+        <input
+          class={s.channelInput}
+          value={channelName.value}
+          placeholder="channel name"
+          title="Channel to publish to"
+          onInput={e => { channelName.value = (e.target as HTMLInputElement).value }}
+          onKeyDown={e => { if (e.key === 'Enter') refreshInfo() }}
+          onBlur={refreshInfo}
+        />
         {subscriberCount.value != null && (
           <span class={s.subCount}>{subscriberCount.value} subscriber{subscriberCount.value !== 1 ? 's' : ''}</span>
         )}
@@ -121,6 +148,8 @@ export function PubSubModule({ name }: PubSubModuleProps) {
           <span class={s.msgBadge}>{messages.value.length}</span>
         )}
       </div>
+
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
 
       {/* Toolbar: refresh, pin, export, clear */}
       <div class={s.toolbar}>

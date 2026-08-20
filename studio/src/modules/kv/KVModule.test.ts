@@ -106,6 +106,27 @@ describe('KVModule — query building', () => {
     expect(query).toBe("SELECT KV_GET('mykey'), KV_GET('key''q')")
   })
 
+  it('should fetch value and remaining TTL per key in one select', () => {
+    // KV_TTL(key) → remaining seconds; -1 = no TTL, -2 = missing
+    const keys = ['a', 'b']
+    const cols = keys.flatMap(k => [`KV_GET(${sqlStr(k)})`, `KV_TTL(${sqlStr(k)})`]).join(', ')
+    const query = `SELECT ${cols}`
+    expect(query).toBe("SELECT KV_GET('a'), KV_TTL('a'), KV_GET('b'), KV_TTL('b')")
+  })
+
+  it('should map engine TTL sentinels to null (no expiry / missing)', () => {
+    function ttlFromEngine(v: unknown): number | null {
+      if (v == null || v === '') return null
+      const n = Number(v)
+      return Number.isFinite(n) && n >= 0 ? n : null
+    }
+    expect(ttlFromEngine(3563)).toBe(3563)
+    expect(ttlFromEngine(0)).toBe(0)
+    expect(ttlFromEngine(-1)).toBe(null) // no TTL
+    expect(ttlFromEngine(-2)).toBe(null) // missing key
+    expect(ttlFromEngine(null)).toBe(null)
+  })
+
   it('should build KV_SET query without TTL', () => {
     const key = 'mykey'
     const value = 'myvalue'

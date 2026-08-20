@@ -3,6 +3,8 @@ import { useEffect } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
+import { isRlsDenied, friendlyError } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import s from './FTSModule.module.css'
 
 // Nucleus FTS is a single GLOBAL index — there is no index-name argument and
@@ -25,6 +27,7 @@ export function FTSModule({ name }: FTSModuleProps) {
   const fuzzy = useSignal(false)
   const maxDistance = useSignal(2)
   const limit = useSignal(25)
+  const rlsDenied = useSignal<string | null>(null)
 
   const conn = activeConnection.value!
 
@@ -32,7 +35,11 @@ export function FTSModule({ name }: FTSModuleProps) {
     async function loadCount() {
       try {
         const r = await api.query(`SELECT FTS_DOC_COUNT()`, conn.id)
-        if (!r.error && r.rows.length > 0) totalDocs.value = Number(r.rows[0][0])
+        if (r.error) {
+          if (isRlsDenied(r.error)) rlsDenied.value = r.error
+          return
+        }
+        if (r.rows.length > 0) totalDocs.value = Number(r.rows[0][0])
       } catch { /* non-critical */ }
     }
     loadCount()
@@ -53,7 +60,7 @@ export function FTSModule({ name }: FTSModuleProps) {
       const cell = r.rows.length > 0 ? r.rows[0][0] : null
       hits.value = parseHits(cell)
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', friendlyError(err instanceof Error ? err.message : String(err)))
     } finally {
       running.value = false
     }
@@ -65,6 +72,7 @@ export function FTSModule({ name }: FTSModuleProps) {
 
   return (
     <div class={s.layout}>
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
       <div class={s.header}>
         <span class={s.indexName}>{name}</span>
         {totalDocs.value != null && (

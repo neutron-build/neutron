@@ -3,6 +3,8 @@ import { useEffect, useMemo } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
+import { isRlsDenied, friendlyError } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import type { QueryResult } from '../../lib/types'
 import s from './GraphModule.module.css'
 
@@ -221,6 +223,7 @@ export function GraphModule({ name }: GraphModuleProps) {
   const statsResult = useSignal<{ nodes: number; edges: number } | null>(null)
   const viewMode = useSignal<ViewMode>('table')
   const hoveredNode = useSignal<string | null>(null)
+  const rlsDenied = useSignal<string | null>(null)
 
   const conn = activeConnection.value!
 
@@ -232,7 +235,11 @@ export function GraphModule({ name }: GraphModuleProps) {
           `SELECT GRAPH_NODE_COUNT(), GRAPH_EDGE_COUNT()`,
           conn.id
         )
-        if (!r.error && r.rows.length > 0) {
+        if (r.error) {
+          if (isRlsDenied(r.error)) rlsDenied.value = r.error
+          return
+        }
+        if (r.rows.length > 0) {
           statsResult.value = { nodes: Number(r.rows[0][0]), edges: Number(r.rows[0][1]) }
         }
       } catch { /* non-critical */ }
@@ -261,7 +268,7 @@ export function GraphModule({ name }: GraphModuleProps) {
         duration: r.duration,
       }
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      toast('error', friendlyError(err instanceof Error ? err.message : String(err)))
     } finally {
       running.value = false
     }
@@ -292,6 +299,7 @@ export function GraphModule({ name }: GraphModuleProps) {
 
   return (
     <div class={s.layout}>
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
       <div class={s.header}>
         <span class={s.graphName}>{name}</span>
         {statsResult.value && (

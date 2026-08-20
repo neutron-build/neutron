@@ -1,0 +1,29 @@
+.layout {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  margin: 12px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+}
+
+.title {
+  font-weight: 600;
+  font-size: var(--text-md);
+  color: var(--text-primary);
+}
+
+.body {
+  font-size: var(--text-base);
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.detail {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}

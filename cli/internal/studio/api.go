@@ -294,6 +294,21 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		data = append(data, vals)
 	}
+	// pgx surfaces execution errors (division by zero, RLS denials, missing
+	// relations…) at the end of iteration, not from Query itself. Without
+	// this check every failing statement reported "0 rows, success" and the
+	// frontend could never show why.
+	if err := rows.Err(); err != nil {
+		log.Printf("studio: query error: %v", err)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"columns":  cols,
+			"rows":     [][]any{},
+			"rowCount": 0,
+			"duration": time.Since(start).Milliseconds(),
+			"error":    sanitizeError(err),
+		})
+		return
+	}
 	if data == nil {
 		data = [][]any{}
 	}
@@ -426,6 +441,18 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		data = append(data, vals)
+	}
+	// Same as handleQuery: execution errors surface after iteration.
+	if err := rows.Err(); err != nil {
+		log.Printf("studio: table query error: %v", err)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"columns":  cols,
+			"rows":     [][]any{},
+			"rowCount": 0,
+			"duration": time.Since(start).Milliseconds(),
+			"error":    sanitizeError(err),
+		})
+		return
 	}
 	if data == nil {
 		data = [][]any{}

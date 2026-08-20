@@ -3,6 +3,8 @@ import { useEffect, useRef, useCallback } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import s from './KVModule.module.css'
 
 interface KVEntry {
@@ -13,6 +15,13 @@ interface KVEntry {
 
 interface KVModuleProps {
   name: string
+}
+
+// KV_TTL returns remaining seconds, or -1 (no TTL) / -2 (missing key).
+export function ttlFromEngine(v: unknown): number | null {
+  if (v == null || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) && n >= 0 ? n : null
 }
 
 export function KVModule({ name }: KVModuleProps) {
@@ -39,6 +48,9 @@ export function KVModule({ name }: KVModuleProps) {
   // New key inline form
   const showNewKeyForm = useSignal(false)
 
+  // RLS seals the specialty stores for non-superuser sessions
+  const rlsDenied = useSignal<string | null>(null)
+
   const conn = activeConnection.value!
 
   async function load() {
@@ -58,19 +70,21 @@ export function KVModule({ name }: KVModuleProps) {
         entries.value = []
         return
       }
-      // Fetch each key's value with KV_GET in a single multi-column select.
-      const cols = keys.map(k => `KV_GET(${sqlStr(k)})`).join(', ')
+      // Fetch each key's value and remaining TTL in a single multi-column
+      // select: KV_GET(k), KV_TTL(k) pairs.
+      const cols = keys.flatMap(k => [`KV_GET(${sqlStr(k)})`, `KV_TTL(${sqlStr(k)})`]).join(', ')
       const valRes = await api.query(`SELECT ${cols}`, conn.id)
       if (valRes.error) throw new Error(valRes.error)
       const valRow = (valRes.rows[0] ?? []) as unknown[]
-      // The engine exposes no remaining-TTL read, so ttl is always null here.
       entries.value = keys.map((k, i) => ({
         key: k,
-        value: valRow[i] != null ? String(valRow[i]) : '',
-        ttl: null,
+        value: valRow[i * 2] != null ? String(valRow[i * 2]) : '',
+        ttl: ttlFromEngine(valRow[i * 2 + 1]),
       }))
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      const msg = err instanceof Error ? err.message : String(err)
+      rlsDenied.value = isRlsDenied(msg) ? msg : null
+      toast('error', msg)
     } finally {
       loading.value = false
     }
@@ -231,6 +245,8 @@ export function KVModule({ name }: KVModuleProps) {
             title="New Key"
           >+</button>
         </div>
+
+        {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
 
         {/* New Key inline form */}
         {showNewKeyForm.value && (

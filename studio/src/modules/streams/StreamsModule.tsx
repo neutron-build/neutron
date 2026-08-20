@@ -3,6 +3,8 @@ import { useEffect } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import type { QueryResult } from '../../lib/types'
 import s from './StreamsModule.module.css'
 
@@ -45,11 +47,15 @@ const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
 const MAX_MS = 9999999999999
 
 export function StreamsModule({ name }: StreamsModuleProps) {
+  // Stream names are user-supplied (the engine has no stream listing), so the
+  // tab label is only the starting value.
+  const streamName = useSignal(name)
   const streamLen = useSignal<number | null>(null)
   const entriesResult = useSignal<QueryResult | null>(null)
   const loadingEntries = useSignal(false)
   const fromMs = useSignal(0)
   const entryLimit = useSignal(100)
+  const rlsDenied = useSignal<string | null>(null)
 
   // Append (STREAM_XADD)
   const addField = useSignal('')
@@ -75,23 +81,37 @@ export function StreamsModule({ name }: StreamsModuleProps) {
   useEffect(() => {
     loadMeta()
     loadEntries()
-  }, [name])
+  }, [])
+
+  function reload() {
+    loadMeta()
+    loadEntries()
+  }
 
   async function loadMeta() {
+    const stream = streamName.value.trim()
+    if (!stream) return
     try {
-      const lenR = await api.query(`SELECT STREAM_XLEN(${sqlStr(name)})`, conn.id)
-      if (!lenR.error && lenR.rows.length > 0) streamLen.value = Number(lenR.rows[0][0])
+      const lenR = await api.query(`SELECT STREAM_XLEN(${sqlStr(stream)})`, conn.id)
+      if (lenR.error) {
+        if (isRlsDenied(lenR.error)) rlsDenied.value = lenR.error
+        return
+      }
+      if (lenR.rows.length > 0) streamLen.value = Number(lenR.rows[0][0])
     } catch { /* non-critical */ }
   }
 
   async function loadEntries() {
+    const stream = streamName.value.trim()
+    if (!stream) return
     loadingEntries.value = true
     try {
       const r = await api.query(
-        `SELECT STREAM_XRANGE(${sqlStr(name)}, ${fromMs.value}, ${MAX_MS}, ${entryLimit.value})`,
+        `SELECT STREAM_XRANGE(${sqlStr(stream)}, ${fromMs.value}, ${MAX_MS}, ${entryLimit.value})`,
         conn.id
       )
       if (r.error) {
+        if (isRlsDenied(r.error)) rlsDenied.value = r.error
         entriesResult.value = r
       } else {
         const cell = r.rows.length > 0 ? r.rows[0][0] : null
@@ -105,6 +125,11 @@ export function StreamsModule({ name }: StreamsModuleProps) {
   }
 
   async function appendEntry() {
+    const stream = streamName.value.trim()
+    if (!stream) {
+      toast('error', 'Stream name is required')
+      return
+    }
     const field = addField.value.trim()
     if (!field) {
       toast('error', 'Field name is required')
@@ -113,10 +138,10 @@ export function StreamsModule({ name }: StreamsModuleProps) {
     appending.value = true
     try {
       await api.query(
-        `SELECT STREAM_XADD(${sqlStr(name)}, ${sqlStr(field)}, ${sqlStr(addValue.value)})`,
+        `SELECT STREAM_XADD(${sqlStr(stream)}, ${sqlStr(field)}, ${sqlStr(addValue.value)})`,
         conn.id
       )
-      toast('success', `Appended to ${name}`)
+      toast('success', `Appended to ${stream}`)
       addField.value = ''
       addValue.value = ''
       await loadMeta()
@@ -129,7 +154,12 @@ export function StreamsModule({ name }: StreamsModuleProps) {
   }
 
   async function createConsumerGroup() {
+    const stream = streamName.value.trim()
     const groupName = newGroupName.value.trim()
+    if (!stream) {
+      toast('error', 'Stream name is required')
+      return
+    }
     if (!groupName) {
       toast('error', 'Group name is required')
       return
@@ -137,7 +167,7 @@ export function StreamsModule({ name }: StreamsModuleProps) {
     creatingGroup.value = true
     try {
       await api.query(
-        `SELECT STREAM_XGROUP_CREATE(${sqlStr(name)}, ${sqlStr(groupName)}, ${newGroupStartMs.value})`,
+        `SELECT STREAM_XGROUP_CREATE(${sqlStr(stream)}, ${sqlStr(groupName)}, ${newGroupStartMs.value})`,
         conn.id
       )
       toast('success', `Consumer group "${groupName}" created`)
@@ -152,8 +182,13 @@ export function StreamsModule({ name }: StreamsModuleProps) {
   }
 
   async function readGroup() {
+    const stream = streamName.value.trim()
     const group = consumeGroup.value.trim()
     const consumer = consumeConsumer.value.trim()
+    if (!stream) {
+      toast('error', 'Stream name is required')
+      return
+    }
     if (!group || !consumer) {
       toast('error', 'Group and consumer are required')
       return
@@ -161,7 +196,7 @@ export function StreamsModule({ name }: StreamsModuleProps) {
     reading.value = true
     try {
       const r = await api.query(
-        `SELECT STREAM_XREADGROUP(${sqlStr(name)}, ${sqlStr(group)}, ${sqlStr(consumer)}, ${consumeCount.value})`,
+        `SELECT STREAM_XREADGROUP(${sqlStr(stream)}, ${sqlStr(group)}, ${sqlStr(consumer)}, ${consumeCount.value})`,
         conn.id
       )
       if (r.error) {
@@ -185,7 +220,7 @@ export function StreamsModule({ name }: StreamsModuleProps) {
     const [idMs, idSeq] = entryId.split('-')
     try {
       await api.query(
-        `SELECT STREAM_XACK(${sqlStr(name)}, ${sqlStr(group)}, ${Number(idMs)}, ${Number(idSeq)})`,
+        `SELECT STREAM_XACK(${sqlStr(streamName.value.trim())}, ${sqlStr(group)}, ${Number(idMs)}, ${Number(idSeq)})`,
         conn.id
       )
       toast('success', `ACK ${entryId}`)
@@ -198,11 +233,22 @@ export function StreamsModule({ name }: StreamsModuleProps) {
   return (
     <div class={s.layout}>
       <div class={s.header}>
-        <span class={s.streamName}>{name}</span>
+        <input
+          class={s.rangeInput}
+          style={{ width: 180 }}
+          value={streamName.value}
+          placeholder="stream name"
+          title="Stream name (user-supplied — the engine has no stream listing)"
+          onInput={e => { streamName.value = (e.target as HTMLInputElement).value }}
+          onKeyDown={e => { if (e.key === 'Enter') reload() }}
+          onBlur={reload}
+        />
         {streamLen.value != null && (
           <span class={s.pill}>{streamLen.value.toLocaleString()} entries</span>
         )}
       </div>
+
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
 
       {/* Append entry (STREAM_XADD) */}
       <div class={s.rangeBar}>

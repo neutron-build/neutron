@@ -3,6 +3,8 @@ import { useEffect, useRef, useCallback } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import s from './DocModule.module.css'
 
 interface DocEntry {
@@ -168,6 +170,9 @@ export function DocModule({ name }: DocModuleProps) {
   // Track raw editor dirty state
   const rawOriginal = useSignal('')
 
+  // RLS seals the specialty stores for non-superuser sessions
+  const rlsDenied = useSignal<string | null>(null)
+
   const conn = activeConnection.value!
 
   async function load() {
@@ -199,7 +204,9 @@ export function DocModule({ name }: DocModuleProps) {
         data: row[i] != null ? (typeof row[i] === 'string' ? JSON.parse(row[i] as string) : row[i]) : null,
       }))
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      const msg = err instanceof Error ? err.message : String(err)
+      rlsDenied.value = isRlsDenied(msg) ? msg : null
+      toast('error', msg)
     } finally {
       loading.value = false
     }
@@ -343,6 +350,7 @@ export function DocModule({ name }: DocModuleProps) {
     <div class={s.layout}>
       {/* Left: doc list */}
       <div class={s.listPanel}>
+        {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
         <div class={s.listHeader}>
           <span class={s.listTitle}>{name}</span>
           <span class={s.docCount}>{total.value} docs</span>

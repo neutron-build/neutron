@@ -3,6 +3,8 @@ import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import type { QueryResult } from '../../lib/types'
 import s from './TSModule.module.css'
 
@@ -177,10 +179,14 @@ const MAX_BUCKETS = 500
 
 export function TSModule({ name }: TSModuleProps) {
   const now = Date.now()
+  // Series names are user-supplied (the engine has no series listing), so the
+  // tab label is only the starting value.
+  const seriesName = useSignal(name)
   // Range is expressed as epoch-milliseconds (numeric), matching the engine.
   const startMs = useSignal(String(now - 60 * 60_000))
   const endMs = useSignal(String(now))
-  // Only avg and count have engine primitives (TS_RANGE_AVG / TS_RANGE_COUNT).
+  // The chart aggregates per bucket with TS_RANGE_AVG / TS_RANGE_COUNT; raw
+  // points are available separately via TS_RANGE(series, start, end).
   const aggFn = useSignal<'avg' | 'count'>('avg')
   const bucketMs = useSignal(60 * 60_000)
   const result = useSignal<QueryResult | null>(null)
@@ -189,30 +195,42 @@ export function TSModule({ name }: TSModuleProps) {
   const bucketLabels = useSignal<string[]>([])
   const stats = useSignal<{ count: number; last: number | null } | null>(null)
   const viewMode = useSignal<ViewMode>('chart')
+  const rlsDenied = useSignal<string | null>(null)
 
   const conn = activeConnection.value!
 
-  // Load quick stats on mount: total point count and the last value.
-  useEffect(() => {
-    async function loadStats() {
-      try {
-        const r = await api.query(
-          `SELECT TS_COUNT(${sqlStr(name)}), TS_LAST(${sqlStr(name)})`,
-          conn.id
-        )
-        if (!r.error && r.rows.length > 0) {
-          const [count, last] = r.rows[0] as unknown[]
-          stats.value = {
-            count: Number(count),
-            last: last != null ? Number(last) : null,
-          }
+  // Load quick stats: total point count and the last value for this series.
+  function loadStats() {
+    const series = seriesName.value.trim()
+    if (!series) return
+    api.query(
+      `SELECT TS_COUNT(${sqlStr(series)}), TS_LAST(${sqlStr(series)})`,
+      conn.id
+    ).then(r => {
+      if (r.error) {
+        if (isRlsDenied(r.error)) rlsDenied.value = r.error
+        return
+      }
+      if (r.rows.length > 0) {
+        const [count, last] = r.rows[0] as unknown[]
+        stats.value = {
+          count: Number(count),
+          last: last != null ? Number(last) : null,
         }
-      } catch { /* non-critical */ }
-    }
+      }
+    }).catch(() => { /* non-critical */ })
+  }
+
+  useEffect(() => {
     loadStats()
-  }, [name])
+  }, [])
 
   async function runQuery() {
+    const series = seriesName.value.trim()
+    if (!series) {
+      toast('error', 'Set a series name')
+      return
+    }
     const start = Number(startMs.value)
     const end = Number(endMs.value)
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
@@ -231,14 +249,14 @@ export function TSModule({ name }: TSModuleProps) {
     sparkValues.value = []
     bucketLabels.value = []
     try {
-      // The engine has no raw-point fetch and no server-side bucketing over a
-      // series, so we build each bucket window client-side and aggregate it
-      // with the real range function, batched into one multi-column select.
+      // No server-side bucketing over a series, so each bucket window is
+      // built client-side and aggregated with the real range function,
+      // batched into one multi-column select.
       const fn = aggFn.value === 'count' ? 'TS_RANGE_COUNT' : 'TS_RANGE_AVG'
       const windows: number[] = []
       for (let b = start; b < end; b += size) windows.push(b)
       const cols = windows
-        .map(b => `${fn}(${sqlStr(name)}, ${b}, ${Math.min(b + size, end)})`)
+        .map(b => `${fn}(${sqlStr(series)}, ${b}, ${Math.min(b + size, end)})`)
         .join(', ')
       const r = await api.query(`SELECT ${cols}`, conn.id)
       if (r.error) throw new Error(r.error)
@@ -269,7 +287,16 @@ export function TSModule({ name }: TSModuleProps) {
   return (
     <div class={s.layout}>
       <div class={s.header}>
-        <span class={s.metricName}>{name}</span>
+        <input
+          class={s.fieldInput}
+          style={{ width: 160 }}
+          value={seriesName.value}
+          placeholder="series name"
+          title="Series name (user-supplied — the engine has no series listing)"
+          onInput={e => { seriesName.value = (e.target as HTMLInputElement).value }}
+          onKeyDown={e => { if (e.key === 'Enter') loadStats() }}
+          onBlur={loadStats}
+        />
         {stats.value && (
           <div class={s.statPills}>
             <span class={s.statPill}>{stats.value.count.toLocaleString()} pts</span>
@@ -279,6 +306,8 @@ export function TSModule({ name }: TSModuleProps) {
           </div>
         )}
       </div>
+
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
 
       <div class={s.queryPanel}>
         <div class={s.queryRow}>

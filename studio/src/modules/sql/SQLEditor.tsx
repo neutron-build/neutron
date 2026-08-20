@@ -3,6 +3,7 @@ import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
+import { friendlyError } from '../../lib/rls'
 import type { QueryResult, QueryHistoryEntry, SavedQuery } from '../../lib/types'
 import s from './SQLEditor.module.css'
 
@@ -156,7 +157,7 @@ export function SQLEditor({ tabId }: SQLEditorProps) {
     const start = Date.now()
     try {
       const res = await api.query(sqlText, conn.id)
-      result.value = res
+      result.value = res.error ? { ...res, error: friendlyError(res.error) } : res
       // Push to history
       pushHistory(conn.id, {
         sql: sqlText.trim(),

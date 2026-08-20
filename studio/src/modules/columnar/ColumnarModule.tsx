@@ -3,6 +3,8 @@ import { useEffect } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import type { QueryResult } from '../../lib/types'
 import s from './ColumnarModule.module.css'
 
@@ -12,10 +14,13 @@ interface ColumnarModuleProps {
 
 const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
 
-// Columnar tables ARE named user tables, so row data comes from a plain scan.
+// The COLUMNAR_* store is addressed by table name, not browsed as a SQL
+// relation — `SELECT * FROM t` only works for a real SQL table (e.g. one
+// created WITH (engine='columnar'), which the SQL section lists). Quick
+// queries therefore use the store's aggregate surface.
 export const QUICK_QUERIES = [
   (t: string) => `SELECT COLUMNAR_COUNT(${sqlStr(t)})`,
-  (t: string) => `SELECT * FROM ${t} LIMIT 100`,
+  (t: string) => `SELECT COLUMNAR_SUM(${sqlStr(t)}, 'column')`,
 ]
 
 type Agg = 'SUM' | 'AVG' | 'MIN' | 'MAX'
@@ -43,10 +48,14 @@ export function buildInsertSql(table: string, pairsInput: string): string {
 }
 
 export function ColumnarModule({ name }: ColumnarModuleProps) {
+  // Columnar store table names are user-supplied (the store has no listing
+  // surface), so the tab label is only the starting value.
+  const tableName = useSignal(name)
   const rowCount = useSignal<number | null>(null)
-  const query = useSignal(`SELECT * FROM ${name} LIMIT 100`)
+  const query = useSignal(name ? `SELECT COLUMNAR_COUNT(${sqlStr(name)})` : '')
   const result = useSignal<QueryResult | null>(null)
   const running = useSignal(false)
+  const rlsDenied = useSignal<string | null>(null)
 
   // Aggregate helper
   const aggCol = useSignal('')
@@ -59,13 +68,18 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
 
   useEffect(() => {
     loadMeta()
-  }, [name])
+  }, [])
 
-  async function loadMeta() {
-    try {
-      const r = await api.query(`SELECT COLUMNAR_COUNT(${sqlStr(name)})`, conn.id)
-      if (!r.error && r.rows.length > 0) rowCount.value = Number(r.rows[0][0])
-    } catch { /* non-critical */ }
+  function loadMeta() {
+    const table = tableName.value.trim()
+    if (!table) return
+    api.query(`SELECT COLUMNAR_COUNT(${sqlStr(table)})`, conn.id).then(r => {
+      if (r.error) {
+        if (isRlsDenied(r.error)) rlsDenied.value = r.error
+        return
+      }
+      if (r.rows.length > 0) rowCount.value = Number(r.rows[0][0])
+    }).catch(() => { /* non-critical */ })
   }
 
   async function runQuery() {
@@ -81,18 +95,32 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
     }
   }
 
+  function currentTable(): string {
+    return tableName.value.trim()
+  }
+
   function runAggregate(agg: Agg) {
+    const table = currentTable()
     const col = aggCol.value.trim()
+    if (!table) {
+      toast('error', 'Table name is required')
+      return
+    }
     if (!col) {
       toast('error', 'Column name is required')
       return
     }
-    query.value = aggregateSql(name, agg, col)
+    query.value = aggregateSql(table, agg, col)
     runQuery()
   }
 
   async function insertRow() {
-    const sql = buildInsertSql(name, insertPairs.value)
+    const table = currentTable()
+    if (!table) {
+      toast('error', 'Table name is required')
+      return
+    }
+    const sql = buildInsertSql(table, insertPairs.value)
     if (!sql.includes(',')) {
       toast('error', 'Enter at least one col=val pair')
       return
@@ -100,7 +128,7 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
     inserting.value = true
     try {
       await api.query(sql, conn.id)
-      toast('success', `Inserted into ${name}`)
+      toast('success', `Inserted into ${table}`)
       insertPairs.value = ''
       await loadMeta()
     } catch (err: unknown) {
@@ -113,11 +141,22 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
   return (
     <div class={s.layout}>
       <div class={s.header}>
-        <span class={s.tableName}>{name}</span>
+        <input
+          class={s.queryInput}
+          style={{ height: 'auto', width: 180 }}
+          value={tableName.value}
+          placeholder="table name"
+          title="Columnar store table (user-supplied — the store has no listing surface)"
+          onInput={e => { tableName.value = (e.target as HTMLInputElement).value }}
+          onKeyDown={e => { if (e.key === 'Enter') loadMeta() }}
+          onBlur={loadMeta}
+        />
         {rowCount.value != null && (
           <span class={s.pill}>{rowCount.value.toLocaleString()} rows</span>
         )}
       </div>
+
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
 
       {/* Aggregates (COLUMNAR_SUM/AVG/MIN/MAX) */}
       <div class={s.statsPanel}>
@@ -161,8 +200,8 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
         <div class={s.queryRow}>
           <div class={s.quickBtns}>
             {QUICK_QUERIES.map((fn, i) => (
-              <button key={i} class={s.quickBtn} onClick={() => { query.value = fn(name) }}>
-                {i === 0 ? 'COUNT' : 'SCAN 100'}
+              <button key={i} class={s.quickBtn} onClick={() => { query.value = fn(currentTable()) }}>
+                {i === 0 ? 'COUNT' : 'SUM'}
               </button>
             ))}
           </div>

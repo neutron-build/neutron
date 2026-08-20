@@ -3,6 +3,8 @@ import { useEffect, useRef, useCallback } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
+import { isRlsDenied } from '../../lib/rls'
+import { RlsNotice } from '../../components/RlsNotice'
 import s from './BlobModule.module.css'
 
 // Nucleus has one GLOBAL blob store keyed by string — there is no store name
@@ -43,6 +45,9 @@ export function BlobModule({ name }: BlobModuleProps) {
   // Download state
   const downloadingId = useSignal<string | null>(null)
 
+  // RLS seals the specialty stores for non-superuser sessions
+  const rlsDenied = useSignal<string | null>(null)
+
   const conn = activeConnection.value!
 
   // Fetch all keys, then metadata for the visible page.
@@ -59,7 +64,9 @@ export function BlobModule({ name }: BlobModuleProps) {
       if (page.value > maxPage) page.value = maxPage
       await loadPage()
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      const msg = err instanceof Error ? err.message : String(err)
+      rlsDenied.value = isRlsDenied(msg) ? msg : null
+      toast('error', msg)
     } finally {
       loading.value = false
     }
@@ -238,6 +245,7 @@ export function BlobModule({ name }: BlobModuleProps) {
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
+      {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
       {/* Hidden file input */}
       <input
         ref={fileInputRef}
