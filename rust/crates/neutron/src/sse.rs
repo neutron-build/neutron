@@ -354,9 +354,8 @@ mod tests {
     #[tokio::test]
     async fn sse_with_id_and_retry() {
         let client = TestClient::new(Router::new().get("/events", || async {
-            let stream = tokio_stream::iter(vec![
-                SseEvent::new().data("hello").id("1").retry(5000),
-            ]);
+            let stream =
+                tokio_stream::iter(vec![SseEvent::new().data("hello").id("1").retry(5000)]);
             Sse::new(stream)
         }));
 
@@ -372,15 +371,13 @@ mod tests {
     async fn sse_compression_skipped() {
         use crate::compress::Compress;
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/events", || async {
-                    let stream =
-                        tokio_stream::iter(vec![SseEvent::new().data("a]".repeat(1000))]);
-                    Sse::new(stream)
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Compress::new()).get(
+            "/events",
+            || async {
+                let stream = tokio_stream::iter(vec![SseEvent::new().data("a]".repeat(1000))]);
+                Sse::new(stream)
+            },
+        ));
 
         let resp = client
             .get("/events")

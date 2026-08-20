@@ -28,16 +28,22 @@ impl PkceChallenge {
     pub fn new() -> Self {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
-        let verifier  = URL_SAFE_NO_PAD.encode(bytes);
+        let verifier = URL_SAFE_NO_PAD.encode(bytes);
         let challenge = Self::derive_challenge(&verifier);
-        Self { verifier, challenge }
+        Self {
+            verifier,
+            challenge,
+        }
     }
 
     /// Derive a challenge from an existing verifier string.
     pub fn from_verifier(verifier: impl Into<String>) -> Self {
-        let verifier  = verifier.into();
+        let verifier = verifier.into();
         let challenge = Self::derive_challenge(&verifier);
-        Self { verifier, challenge }
+        Self {
+            verifier,
+            challenge,
+        }
     }
 
     fn derive_challenge(verifier: &str) -> String {
@@ -66,7 +72,10 @@ mod tests {
         // 32 bytes → 43 base64url chars (no padding)
         assert_eq!(pkce.verifier.len(), 43);
         // Only base64url characters
-        assert!(pkce.verifier.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+        assert!(pkce
+            .verifier
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -82,7 +91,10 @@ mod tests {
         // verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         // challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         let pkce = PkceChallenge::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
-        assert_eq!(pkce.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            pkce.challenge,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 
     #[test]
@@ -96,7 +108,7 @@ mod tests {
     #[test]
     fn from_verifier_round_trips() {
         let original = PkceChallenge::new();
-        let derived  = PkceChallenge::from_verifier(&original.verifier);
+        let derived = PkceChallenge::from_verifier(&original.verifier);
         assert_eq!(derived.challenge, original.challenge);
     }
 }

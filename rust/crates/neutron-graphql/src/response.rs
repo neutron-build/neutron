@@ -12,7 +12,10 @@ pub struct GraphQlError {
 
 impl GraphQlError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), path: None }
+        Self {
+            message: message.into(),
+            path: None,
+        }
     }
 
     pub fn with_path(mut self, path: Vec<serde_json::Value>) -> Self {
@@ -27,19 +30,25 @@ impl GraphQlError {
 /// If only errors are present, `data` is omitted. If only data, `errors` is omitted.
 #[derive(Debug, Clone)]
 pub struct GraphQlResponse {
-    pub data:   Option<serde_json::Value>,
+    pub data: Option<serde_json::Value>,
     pub errors: Vec<GraphQlError>,
 }
 
 impl GraphQlResponse {
     /// Successful response with data.
     pub fn ok(data: serde_json::Value) -> Self {
-        Self { data: Some(data), errors: Vec::new() }
+        Self {
+            data: Some(data),
+            errors: Vec::new(),
+        }
     }
 
     /// Error response (single error, no data).
     pub fn error(message: impl Into<String>) -> Self {
-        Self { data: None, errors: vec![GraphQlError::new(message)] }
+        Self {
+            data: None,
+            errors: vec![GraphQlError::new(message)],
+        }
     }
 
     /// Multiple errors, no data.
@@ -49,7 +58,10 @@ impl GraphQlResponse {
 
     /// Partial response — data plus errors (common with field-level errors).
     pub fn partial(data: serde_json::Value, errors: Vec<GraphQlError>) -> Self {
-        Self { data: Some(data), errors }
+        Self {
+            data: Some(data),
+            errors,
+        }
     }
 }
 
@@ -96,7 +108,10 @@ mod tests {
     async fn ok_response_has_data_field() {
         let resp = GraphQlResponse::ok(serde_json::json!({"name": "Alice"})).into_response();
         assert_eq!(resp.status(), http::StatusCode::OK);
-        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
 
         let body = body_str(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();

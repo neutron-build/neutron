@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::queue::JobQueue;
-use crate::store::{JobStore, StoredJob, StoreError, now_ms};
+use crate::store::{now_ms, JobStore, StoreError, StoredJob};
 
 // ---------------------------------------------------------------------------
 // PersistentJobQueue
@@ -56,7 +56,7 @@ impl PersistentJobQueue {
 
     /// Like [`new`], but with a custom stale-job timeout in seconds.
     pub async fn with_stale_timeout(
-        store:      Arc<dyn JobStore>,
+        store: Arc<dyn JobStore>,
         stale_secs: u64,
     ) -> Result<Self, StoreError> {
         let inner = Arc::new(JobQueue::new());
@@ -92,40 +92,43 @@ impl PersistentJobQueue {
     pub async fn enqueue(
         &self,
         job_type: impl Into<String>,
-        payload:  Vec<u8>,
+        payload: Vec<u8>,
     ) -> Result<u64, StoreError> {
-        self.enqueue_job(StoredJob::new(job_type, "default", payload, 3)).await
+        self.enqueue_job(StoredJob::new(job_type, "default", payload, 3))
+            .await
     }
 
     /// Persist and enqueue a job with a specific max-attempts limit.
     pub async fn enqueue_with_retries(
         &self,
-        job_type:     impl Into<String>,
-        payload:      Vec<u8>,
+        job_type: impl Into<String>,
+        payload: Vec<u8>,
         max_attempts: u32,
     ) -> Result<u64, StoreError> {
-        self.enqueue_job(StoredJob::new(job_type, "default", payload, max_attempts)).await
+        self.enqueue_job(StoredJob::new(job_type, "default", payload, max_attempts))
+            .await
     }
 
     /// Persist and enqueue a job on a named queue.
     pub async fn enqueue_on(
         &self,
         job_type: impl Into<String>,
-        queue:    impl Into<String>,
-        payload:  Vec<u8>,
+        queue: impl Into<String>,
+        payload: Vec<u8>,
     ) -> Result<u64, StoreError> {
-        self.enqueue_job(StoredJob::new(job_type, queue, payload, 3)).await
+        self.enqueue_job(StoredJob::new(job_type, queue, payload, 3))
+            .await
     }
 
     /// Persist and schedule a delayed job.
     pub async fn enqueue_delayed(
         &self,
         job_type: impl Into<String>,
-        payload:  Vec<u8>,
-        delay:    Duration,
+        payload: Vec<u8>,
+        delay: Duration,
     ) -> Result<u64, StoreError> {
-        let job = StoredJob::new(job_type, "default", payload, 3)
-            .with_delay_ms(delay.as_millis() as u64);
+        let job =
+            StoredJob::new(job_type, "default", payload, 3).with_delay_ms(delay.as_millis() as u64);
         self.enqueue_job(job).await
     }
 
@@ -158,15 +161,15 @@ impl JobQueue {
 
         // Convert run_at_ms (epoch ms) to an Instant for the heap.
         let delay_ms = job.run_at_ms.saturating_sub(now_ms());
-        let run_at   = Instant::now() + Duration::from_millis(delay_ms);
+        let run_at = Instant::now() + Duration::from_millis(delay_ms);
         let enqueued_at = UNIX_EPOCH + Duration::from_millis(job.enqueued_at_ms);
 
         self.push_raw(crate::queue::QueuedJob {
-            id:           job.id,
-            job_type:     job.job_type,
-            payload:      job.payload,
-            queue:        job.queue,
-            attempt:      job.attempt,
+            id: job.id,
+            job_type: job.job_type,
+            payload: job.payload,
+            queue: job.queue,
+            attempt: job.attempt,
             max_attempts: job.max_attempts,
             run_at,
             enqueued_at,
@@ -186,15 +189,15 @@ mod tests {
     #[tokio::test]
     async fn enqueue_returns_id() {
         let store = Arc::new(MemoryJobStore::new());
-        let pq    = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
-        let id    = pq.enqueue("email", b"data".to_vec()).await.unwrap();
+        let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
+        let id = pq.enqueue("email", b"data".to_vec()).await.unwrap();
         assert!(id > 0);
     }
 
     #[tokio::test]
     async fn enqueue_adds_to_memory_queue() {
         let store = Arc::new(MemoryJobStore::new());
-        let pq    = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
+        let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
         pq.enqueue("email", vec![]).await.unwrap();
         assert_eq!(pq.queue().len(), 1);
     }
@@ -202,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_persists_to_store() {
         let store = Arc::new(MemoryJobStore::new());
-        let pq    = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
+        let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
         pq.enqueue("email", b"body".to_vec()).await.unwrap();
 
         // The store should have 1 running job (claimed by enqueue internally)
@@ -218,8 +221,10 @@ mod tests {
     #[tokio::test]
     async fn enqueue_delayed_not_in_memory_queue_yet() {
         let store = Arc::new(MemoryJobStore::new());
-        let pq    = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
-        pq.enqueue_delayed("email", vec![], Duration::from_secs(60)).await.unwrap();
+        let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
+        pq.enqueue_delayed("email", vec![], Duration::from_secs(60))
+            .await
+            .unwrap();
         // Should NOT be in memory queue (not due yet)
         assert_eq!(pq.queue().len(), 0);
     }
@@ -227,8 +232,10 @@ mod tests {
     #[tokio::test]
     async fn enqueue_with_retries() {
         let store = Arc::new(MemoryJobStore::new());
-        let pq    = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
-        pq.enqueue_with_retries("critical", b"data".to_vec(), 10).await.unwrap();
+        let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
+        pq.enqueue_with_retries("critical", b"data".to_vec(), 10)
+            .await
+            .unwrap();
         let job = pq.queue().try_dequeue().unwrap();
         assert_eq!(job.max_attempts, 10);
     }

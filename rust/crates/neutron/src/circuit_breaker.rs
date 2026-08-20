@@ -356,20 +356,16 @@ mod tests {
 
         let handle = cb.handle();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(cb)
-                .get("/", move || {
-                    let should_fail = fail_clone.clone();
-                    async move {
-                        if should_fail.load(Ordering::SeqCst) {
-                            (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
-                        } else {
-                            "ok".into_response()
-                        }
-                    }
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(cb).get("/", move || {
+            let should_fail = fail_clone.clone();
+            async move {
+                if should_fail.load(Ordering::SeqCst) {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
+                } else {
+                    "ok".into_response()
+                }
+            }
+        }));
 
         (client, fail, handle)
     }
@@ -507,20 +503,16 @@ mod tests {
         let fail = Arc::new(AtomicBool::new(true));
         let fail_clone = fail.clone();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(cb)
-                .get("/", move || {
-                    let f = fail_clone.clone();
-                    async move {
-                        if f.load(Ordering::SeqCst) {
-                            (StatusCode::INTERNAL_SERVER_ERROR, "err").into_response()
-                        } else {
-                            "ok".into_response()
-                        }
-                    }
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(cb).get("/", move || {
+            let f = fail_clone.clone();
+            async move {
+                if f.load(Ordering::SeqCst) {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "err").into_response()
+                } else {
+                    "ok".into_response()
+                }
+            }
+        }));
 
         // Trigger open
         client.get("/").send().await;
@@ -549,13 +541,9 @@ mod tests {
 
         let handle = cb.handle();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(cb)
-                .get("/", || async {
-                    (StatusCode::BAD_REQUEST, "bad").into_response()
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(cb).get("/", || async {
+            (StatusCode::BAD_REQUEST, "bad").into_response()
+        }));
 
         for _ in 0..5 {
             client.get("/").send().await;

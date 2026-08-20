@@ -160,8 +160,9 @@ impl std::error::Error for MultipartError {}
 impl IntoResponse for MultipartError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
-            multer::Error::FieldSizeExceeded { .. }
-            | multer::Error::StreamSizeExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. } => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
             _ => StatusCode::BAD_REQUEST,
         };
         (status, self.to_string()).into_response()
@@ -206,15 +207,16 @@ mod tests {
 
     #[tokio::test]
     async fn parse_text_field() {
-        let client = TestClient::new(
-            Router::new().post("/upload", |mut form: Multipart| async move {
+        let client = TestClient::new(Router::new().post(
+            "/upload",
+            |mut form: Multipart| async move {
                 let field = form.next_field().await.unwrap().unwrap();
                 assert_eq!(field.name(), Some("greeting"));
                 assert!(field.file_name().is_none());
                 let text = field.text().await.unwrap();
                 text
-            }),
-        );
+            },
+        ));
 
         let boundary = "----TestBoundary";
         let body = build_multipart_body(boundary, &[("greeting", None, b"hello world")]);
@@ -235,15 +237,16 @@ mod tests {
 
     #[tokio::test]
     async fn parse_file_upload() {
-        let client = TestClient::new(
-            Router::new().post("/upload", |mut form: Multipart| async move {
+        let client = TestClient::new(Router::new().post(
+            "/upload",
+            |mut form: Multipart| async move {
                 let field = form.next_field().await.unwrap().unwrap();
                 assert_eq!(field.name(), Some("document"));
                 assert_eq!(field.file_name(), Some("test.txt"));
                 let data = field.bytes().await.unwrap();
                 format!("{}:{}", data.len(), String::from_utf8_lossy(&data))
-            }),
-        );
+            },
+        ));
 
         let boundary = "----FileBoundary";
         let body = build_multipart_body(
@@ -267,8 +270,9 @@ mod tests {
 
     #[tokio::test]
     async fn parse_multiple_fields() {
-        let client = TestClient::new(
-            Router::new().post("/upload", |mut form: Multipart| async move {
+        let client = TestClient::new(Router::new().post(
+            "/upload",
+            |mut form: Multipart| async move {
                 let mut names = Vec::new();
                 while let Some(field) = form.next_field().await.unwrap() {
                     let name = field.name().unwrap_or("?").to_string();
@@ -277,8 +281,8 @@ mod tests {
                     names.push(format!("{name}:{is_file}:{}", data.len()));
                 }
                 names.join(",")
-            }),
-        );
+            },
+        ));
 
         let boundary = "----MultiBoundary";
         let body = build_multipart_body(
@@ -301,20 +305,18 @@ mod tests {
             .await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.text().await,
-            "name:false:5,avatar:true:4,bio:false:6"
-        );
+        assert_eq!(resp.text().await, "name:false:5,avatar:true:4,bio:false:6");
     }
 
     #[tokio::test]
     async fn rejects_missing_boundary() {
-        let client = TestClient::new(
-            Router::new().post("/upload", |mut form: Multipart| async move {
+        let client = TestClient::new(Router::new().post(
+            "/upload",
+            |mut form: Multipart| async move {
                 let _ = form.next_field().await;
                 "ok"
-            }),
-        );
+            },
+        ));
 
         let resp = client
             .post("/upload")
@@ -328,12 +330,13 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_non_multipart_content_type() {
-        let client = TestClient::new(
-            Router::new().post("/upload", |mut form: Multipart| async move {
+        let client = TestClient::new(Router::new().post(
+            "/upload",
+            |mut form: Multipart| async move {
                 let _ = form.next_field().await;
                 "ok"
-            }),
-        );
+            },
+        ));
 
         let resp = client
             .post("/upload")
@@ -347,8 +350,9 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_by_chunk_reading() {
-        let client = TestClient::new(
-            Router::new().post("/upload", |mut form: Multipart| async move {
+        let client = TestClient::new(Router::new().post(
+            "/upload",
+            |mut form: Multipart| async move {
                 let mut field = form.next_field().await.unwrap().unwrap();
                 let mut chunks = 0;
                 let mut total = 0;
@@ -357,8 +361,8 @@ mod tests {
                     total += chunk.len();
                 }
                 format!("{chunks} chunks, {total} bytes")
-            }),
-        );
+            },
+        ));
 
         let boundary = "----ChunkBoundary";
         let data = vec![0u8; 1024];

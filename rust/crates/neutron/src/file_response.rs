@@ -126,11 +126,7 @@ impl NamedFile {
         }
 
         // --- Range → 206 / 416 --------------------------------------------------
-        if let Some(range_val) = req
-            .headers()
-            .get("range")
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(range_val) = req.headers().get("range").and_then(|v| v.to_str().ok()) {
             return self.range_response(range_val);
         }
 
@@ -184,8 +180,7 @@ impl NamedFile {
         match parse_range(range_header, file_size) {
             Some((start, end)) => {
                 let content_length = end - start + 1;
-                let content_range =
-                    format!("bytes {start}-{end}/{file_size}");
+                let content_range = format!("bytes {start}-{end}/{file_size}");
                 let path = self.path.clone();
 
                 let stream = file_byte_stream(path, start, content_length);
@@ -248,11 +243,7 @@ fn file_byte_stream(
 
         if offset > 0 {
             use tokio::io::AsyncSeekExt;
-            if file
-                .seek(std::io::SeekFrom::Start(offset))
-                .await
-                .is_err()
-            {
+            if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
                 return;
             }
         }
@@ -394,8 +385,7 @@ fn format_last_modified(secs: u64) -> String {
     // Convert days since epoch to year/month/day using a civil calendar algorithm.
     let (year, month, day) = civil_from_days(days_since_epoch as i64);
     let month_names = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
-        "Nov", "Dec",
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
 
     format!(
@@ -433,11 +423,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// Detect content type from file extension.
 fn content_type_for_path(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-    {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
         // Text
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -505,16 +491,18 @@ mod tests {
 
     /// Collect a response body into bytes.
     async fn body_bytes(resp: Response) -> Vec<u8> {
-        resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
     }
 
     /// Create a temp file with the given extension and content.
     fn temp_file_with_ext(ext: &str, content: &[u8]) -> NamedTempFile {
         let suffix = format!(".{ext}");
-        let mut f = tempfile::Builder::new()
-            .suffix(&suffix)
-            .tempfile()
-            .unwrap();
+        let mut f = tempfile::Builder::new().suffix(&suffix).tempfile().unwrap();
         f.write_all(content).unwrap();
         f.flush().unwrap();
         f
@@ -544,10 +532,7 @@ mod tests {
             "application/json; charset=utf-8"
         );
         assert_eq!(content_type_for_path(Path::new("photo.png")), "image/png");
-        assert_eq!(
-            content_type_for_path(Path::new("photo.jpg")),
-            "image/jpeg"
-        );
+        assert_eq!(content_type_for_path(Path::new("photo.jpg")), "image/jpeg");
         assert_eq!(content_type_for_path(Path::new("anim.gif")), "image/gif");
         assert_eq!(
             content_type_for_path(Path::new("icon.svg")),
@@ -617,10 +602,7 @@ mod tests {
                 .unwrap(),
             content.len().to_string()
         );
-        assert_eq!(
-            resp.headers().get("accept-ranges").unwrap(),
-            "bytes"
-        );
+        assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
         assert!(resp.headers().get("etag").is_some());
         assert!(resp.headers().get("last-modified").is_some());
 

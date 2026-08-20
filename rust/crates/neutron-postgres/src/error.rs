@@ -22,12 +22,12 @@ pub enum PgError {
 impl fmt::Display for PgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect(e)                 => write!(f, "Postgres connect: {e}"),
-            Self::Query(e)                   => write!(f, "Postgres query: {e}"),
-            Self::PoolExhausted              => write!(f, "Postgres pool exhausted"),
+            Self::Connect(e) => write!(f, "Postgres connect: {e}"),
+            Self::Query(e) => write!(f, "Postgres query: {e}"),
+            Self::PoolExhausted => write!(f, "Postgres pool exhausted"),
             Self::Migration { step, source } => write!(f, "Migration '{step}' failed: {source}"),
-            Self::Io(e)                      => write!(f, "Postgres I/O: {e}"),
-            Self::InvalidConfig(msg)         => write!(f, "Postgres config: {msg}"),
+            Self::Io(e) => write!(f, "Postgres I/O: {e}"),
+            Self::InvalidConfig(msg) => write!(f, "Postgres config: {msg}"),
         }
     }
 }
@@ -35,12 +35,12 @@ impl fmt::Display for PgError {
 impl std::error::Error for PgError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Connect(e)               => Some(e),
-            Self::Query(e)                 => Some(e),
+            Self::Connect(e) => Some(e),
+            Self::Query(e) => Some(e),
             Self::Migration { source, .. } => Some(source.as_ref()),
-            Self::Io(e)                    => Some(e),
-            Self::PoolExhausted            => None,
-            Self::InvalidConfig(_)         => None,
+            Self::Io(e) => Some(e),
+            Self::PoolExhausted => None,
+            Self::InvalidConfig(_) => None,
         }
     }
 }
@@ -69,7 +69,7 @@ mod tests {
     fn display_migration() {
         let inner = PgError::PoolExhausted;
         let e = PgError::Migration {
-            step:   "001_init.sql".to_string(),
+            step: "001_init.sql".to_string(),
             source: Box::new(inner),
         };
         assert!(e.to_string().contains("001_init.sql"));

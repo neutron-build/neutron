@@ -1,14 +1,12 @@
 use crate::error::OtelError;
 
 /// Transport protocol for OTLP export.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum OtlpProtocol {
     /// HTTP/JSON — POST to `{endpoint}/v1/traces`.
     #[default]
     HttpJson,
 }
-
 
 /// Configuration for the OTLP exporter.
 #[derive(Debug, Clone)]
@@ -28,10 +26,10 @@ pub struct OtelConfig {
 impl Default for OtelConfig {
     fn default() -> Self {
         OtelConfig {
-            endpoint:           "http://localhost:4318".to_string(),
-            service_name:       "neutron".to_string(),
-            protocol:           OtlpProtocol::HttpJson,
-            batch_size:         512,
+            endpoint: "http://localhost:4318".to_string(),
+            service_name: "neutron".to_string(),
+            protocol: OtlpProtocol::HttpJson,
+            batch_size: 512,
             export_interval_ms: 5_000,
         }
     }
@@ -70,7 +68,9 @@ impl OtelConfig {
             return Err(OtelError::Config("endpoint must not be empty".to_string()));
         }
         if self.service_name.is_empty() {
-            return Err(OtelError::Config("service_name must not be empty".to_string()));
+            return Err(OtelError::Config(
+                "service_name must not be empty".to_string(),
+            ));
         }
         if self.batch_size == 0 {
             return Err(OtelError::Config("batch_size must be > 0".to_string()));

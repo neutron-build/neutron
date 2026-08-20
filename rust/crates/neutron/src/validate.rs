@@ -211,13 +211,7 @@ impl ValidationErrors {
     }
 
     /// Require a numeric value in `[min, max]` (inclusive).
-    pub fn range<T: PartialOrd + fmt::Display>(
-        &mut self,
-        field: &str,
-        value: T,
-        min: T,
-        max: T,
-    ) {
+    pub fn range<T: PartialOrd + fmt::Display>(&mut self, field: &str, value: T, min: T, max: T) {
         if value < min || value > max {
             self.add(
                 field,
@@ -257,12 +251,7 @@ impl ValidationErrors {
     }
 
     /// Require value to be one of the allowed values.
-    pub fn one_of<T: PartialEq + fmt::Display>(
-        &mut self,
-        field: &str,
-        value: &T,
-        allowed: &[T],
-    ) {
+    pub fn one_of<T: PartialEq + fmt::Display>(&mut self, field: &str, value: &T, allowed: &[T]) {
         if !allowed.iter().any(|a| a == value) {
             let list: Vec<_> = allowed.iter().map(|v| v.to_string()).collect();
             self.add(
@@ -326,9 +315,8 @@ impl IntoResponse for ValidationErrors {
             .fields
             .into_iter()
             .flat_map(|(field, errs)| {
-                errs.into_iter().map(move |e| {
-                    crate::error::ValidationFieldError::new(field.clone(), e.message)
-                })
+                errs.into_iter()
+                    .map(move |e| crate::error::ValidationFieldError::new(field.clone(), e.message))
             })
             .collect();
 
@@ -567,10 +555,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["status"], 422);
         let errors = parsed["errors"].as_array().expect("errors array");
-        let fields: std::collections::HashSet<&str> = errors
-            .iter()
-            .filter_map(|e| e["field"].as_str())
-            .collect();
+        let fields: std::collections::HashSet<&str> =
+            errors.iter().filter_map(|e| e["field"].as_str()).collect();
         assert!(fields.contains("name"));
         assert!(fields.contains("email"));
         assert!(fields.contains("age"));
@@ -591,10 +577,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         // Only email should fail.
         let errors = parsed["errors"].as_array().expect("errors array");
-        let fields: std::collections::HashSet<&str> = errors
-            .iter()
-            .filter_map(|e| e["field"].as_str())
-            .collect();
+        let fields: std::collections::HashSet<&str> =
+            errors.iter().filter_map(|e| e["field"].as_str()).collect();
         assert!(fields.contains("email"));
         assert!(!fields.contains("name"));
         assert!(!fields.contains("age"));
@@ -634,10 +618,8 @@ mod tests {
         let body = resp.text().await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         let errors = parsed["errors"].as_array().expect("errors array");
-        let fields: std::collections::HashSet<&str> = errors
-            .iter()
-            .filter_map(|e| e["field"].as_str())
-            .collect();
+        let fields: std::collections::HashSet<&str> =
+            errors.iter().filter_map(|e| e["field"].as_str()).collect();
         assert!(fields.contains("q"));
         assert!(fields.contains("page"));
     }
@@ -953,11 +935,21 @@ mod tests {
     #[test]
     fn matches_validator() {
         let mut e = ValidationErrors::new();
-        e.matches("slug", "hello world", |s| !s.contains(' '), "slug must not contain spaces");
+        e.matches(
+            "slug",
+            "hello world",
+            |s| !s.contains(' '),
+            "slug must not contain spaces",
+        );
         assert!(!e.is_empty());
 
         let mut e = ValidationErrors::new();
-        e.matches("slug", "hello-world", |s| !s.contains(' '), "slug must not contain spaces");
+        e.matches(
+            "slug",
+            "hello-world",
+            |s| !s.contains(' '),
+            "slug must not contain spaces",
+        );
         assert!(e.is_empty());
     }
 

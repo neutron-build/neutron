@@ -66,11 +66,11 @@ impl Http2Config {
     /// with larger windows than hyper's defaults for better throughput.
     pub fn new() -> Self {
         Self {
-            initial_stream_window_size: 2 * 1024 * 1024,       // 2 MB
-            initial_connection_window_size: 4 * 1024 * 1024,    // 4 MB
+            initial_stream_window_size: 2 * 1024 * 1024,     // 2 MB
+            initial_connection_window_size: 4 * 1024 * 1024, // 4 MB
             max_concurrent_streams: 200,
-            max_frame_size: 16 * 1024,                          // 16 KB
-            max_header_list_size: 16 * 1024,                    // 16 KB
+            max_frame_size: 16 * 1024,       // 16 KB
+            max_header_list_size: 16 * 1024, // 16 KB
             enable_connect_protocol: true,
             keep_alive_interval: Some(Duration::from_secs(20)),
             keep_alive_timeout: Duration::from_secs(10),
@@ -222,7 +222,10 @@ mod tests {
     fn default_is_same_as_new() {
         let new = Http2Config::new();
         let default = Http2Config::default();
-        assert_eq!(new.initial_stream_window_size, default.initial_stream_window_size);
+        assert_eq!(
+            new.initial_stream_window_size,
+            default.initial_stream_window_size
+        );
         assert_eq!(new.max_concurrent_streams, default.max_concurrent_streams);
     }
 }

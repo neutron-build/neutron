@@ -86,15 +86,16 @@ fn bench_pipeline_json(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_pipeline_path_param(c: &mut Criterion) {
-    let client = TestClient::new(
-        Router::new().get("/users/:id", |Path(id): Path<u64>| async move {
+    let client = TestClient::new(Router::new().get(
+        "/users/:id",
+        |Path(id): Path<u64>| async move {
             Json(User {
                 id,
                 name: "Alice".into(),
                 email: "alice@example.com".into(),
             })
-        }),
-    );
+        },
+    ));
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -254,9 +255,7 @@ fn bench_into_response(c: &mut Criterion) {
     });
 
     group.bench_function("Json(small)", |b| {
-        b.iter(|| {
-            black_box(Json(serde_json::json!({"id": 42, "name": "Alice"})).into_response())
-        })
+        b.iter(|| black_box(Json(serde_json::json!({"id": 42, "name": "Alice"})).into_response()))
     });
 
     group.bench_function("Json(medium)", |b| {
@@ -385,9 +384,10 @@ fn bench_extractors(c: &mut Criterion) {
     let mut group = c.benchmark_group("extractors");
 
     // Path<u64>
-    let client_path = TestClient::new(
-        Router::new().get("/items/:id", |Path(id): Path<u64>| async move { id.to_string() }),
-    );
+    let client_path = TestClient::new(Router::new().get(
+        "/items/:id",
+        |Path(id): Path<u64>| async move { id.to_string() },
+    ));
     group.bench_function("Path<u64>", |b| {
         b.iter(|| {
             rt.block_on(async {
@@ -397,9 +397,8 @@ fn bench_extractors(c: &mut Criterion) {
     });
 
     // Query<T>
-    let client_query = TestClient::new(
-        Router::new().get("/items", |Query(_p): Query<ListParams>| async { "ok" }),
-    );
+    let client_query =
+        TestClient::new(Router::new().get("/items", |Query(_p): Query<ListParams>| async { "ok" }));
     group.bench_function("Query<ListParams>", |b| {
         b.iter(|| {
             rt.block_on(async {
@@ -409,9 +408,8 @@ fn bench_extractors(c: &mut Criterion) {
     });
 
     // Json<T> body
-    let client_json = TestClient::new(
-        Router::new().post("/users", |Json(_u): Json<User>| async { "ok" }),
-    );
+    let client_json =
+        TestClient::new(Router::new().post("/users", |Json(_u): Json<User>| async { "ok" }));
     group.bench_function("Json<User> body", |b| {
         b.iter(|| {
             rt.block_on(async {
@@ -431,9 +429,7 @@ fn bench_extractors(c: &mut Criterion) {
     });
 
     // HeaderMap
-    let client_headers = TestClient::new(
-        Router::new().get("/", |_h: HeaderMap| async { "ok" }),
-    );
+    let client_headers = TestClient::new(Router::new().get("/", |_h: HeaderMap| async { "ok" }));
     group.bench_function("HeaderMap", |b| {
         b.iter(|| {
             rt.block_on(async {
@@ -461,9 +457,8 @@ fn bench_extractors(c: &mut Criterion) {
         serde_json::to_vec(&small_user).unwrap().len() < 1024,
         "small_json_extract fixture must be < 1KB"
     );
-    let client_small = TestClient::new(
-        Router::new().post("/u", |Json(_u): Json<User>| async { "ok" }),
-    );
+    let client_small =
+        TestClient::new(Router::new().post("/u", |Json(_u): Json<User>| async { "ok" }));
     group.bench_function("small_json_extract (<1KB, streaming)", |b| {
         b.iter(|| {
             rt.block_on(async {
@@ -488,7 +483,11 @@ criterion_group!(
     bench_pipeline_query,
 );
 
-criterion_group!(middleware, bench_middleware_overhead, bench_real_middleware_chain);
+criterion_group!(
+    middleware,
+    bench_middleware_overhead,
+    bench_real_middleware_chain
+);
 
 criterion_group!(responses, bench_into_response);
 
@@ -498,4 +497,11 @@ criterion_group!(scale, bench_router_scale);
 
 criterion_group!(extractors, bench_extractors);
 
-criterion_main!(pipeline, middleware, responses, negotiation, scale, extractors);
+criterion_main!(
+    pipeline,
+    middleware,
+    responses,
+    negotiation,
+    scale,
+    extractors
+);

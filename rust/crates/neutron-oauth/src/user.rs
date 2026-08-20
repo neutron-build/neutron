@@ -18,45 +18,49 @@ use crate::token::TokenResponse;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthUser {
     /// Provider-assigned user ID (as a string for cross-provider compatibility).
-    pub id:         String,
+    pub id: String,
     /// Primary email address, if available.
-    pub email:      Option<String>,
+    pub email: Option<String>,
     /// Display name or username.
-    pub name:       Option<String>,
+    pub name: Option<String>,
     /// URL of the user's avatar image.
     pub avatar_url: Option<String>,
     /// Raw JSON from the userinfo endpoint (all provider-specific fields).
-    pub raw:        Value,
+    pub raw: Value,
 }
 
 impl OAuthUser {
     /// Extract an `OAuthUser` from raw JSON (provider-agnostic field mapping).
     pub fn from_json(raw: Value) -> Option<Self> {
         // Try common field names across providers
-        let id = raw.get("id")
-            .or_else(|| raw.get("sub"))
-            .map(|v| match v {
-                Value::Number(n) => n.to_string(),
-                Value::String(s) => s.clone(),
-                other            => other.to_string(),
-            })?;
+        let id = raw.get("id").or_else(|| raw.get("sub")).map(|v| match v {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })?;
 
-        let email = raw.get("email")
+        let email = raw.get("email").and_then(Value::as_str).map(str::to_string);
+
+        let name = raw
+            .get("name")
+            .or_else(|| raw.get("login")) // GitHub
+            .or_else(|| raw.get("username")) // Discord
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        let name = raw.get("name")
-            .or_else(|| raw.get("login"))        // GitHub
-            .or_else(|| raw.get("username"))     // Discord
+        let avatar_url = raw
+            .get("avatar_url") // GitHub / Discord
+            .or_else(|| raw.get("picture")) // Google OIDC
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        let avatar_url = raw.get("avatar_url")   // GitHub / Discord
-            .or_else(|| raw.get("picture"))      // Google OIDC
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
-        Some(Self { id, email, name, avatar_url, raw })
+        Some(Self {
+            id,
+            email,
+            name,
+            avatar_url,
+            raw,
+        })
     }
 }
 
@@ -82,11 +86,11 @@ pub async fn fetch_userinfo(
     } else {
         // No userinfo endpoint — return a minimal user from the token alone
         Ok(OAuthUser {
-            id:         tokens.access_token.chars().take(16).collect(),
-            email:      None,
-            name:       None,
+            id: tokens.access_token.chars().take(16).collect(),
+            email: None,
+            name: None,
             avatar_url: None,
-            raw:        Value::Null,
+            raw: Value::Null,
         })
     }
 }
@@ -125,7 +129,10 @@ mod tests {
         });
         let user = OAuthUser::from_json(raw).unwrap();
         assert_eq!(user.id, "107978799123456789");
-        assert_eq!(user.avatar_url.as_deref(), Some("https://lh3.googleusercontent.com/photo.jpg"));
+        assert_eq!(
+            user.avatar_url.as_deref(),
+            Some("https://lh3.googleusercontent.com/photo.jpg")
+        );
     }
 
     #[test]

@@ -65,7 +65,9 @@ pub struct Http3Config {
 
 impl Default for Http3Config {
     fn default() -> Self {
-        Self { max_body_size: 2 * 1024 * 1024 }
+        Self {
+            max_body_size: 2 * 1024 * 1024,
+        }
     }
 }
 
@@ -80,21 +82,22 @@ impl Default for Http3Config {
 ///
 /// TLS 1.3 with ALPN `"h3"` is configured automatically from `tls_config`.
 pub async fn serve_h3(
-    addr:       SocketAddr,
-    dispatch:   DispatchChain,
-    state_map:  Arc<StateMap>,
+    addr: SocketAddr,
+    dispatch: DispatchChain,
+    state_map: Arc<StateMap>,
     tls_config: TlsConfig,
-    config:     Http3Config,
+    config: Http3Config,
 ) -> Result<(), std::io::Error> {
     // Clone the rustls ServerConfig and replace ALPN protocols with "h3".
     let mut rustls_cfg = (*tls_config.server_config).clone();
     rustls_cfg.alpn_protocols = vec![b"h3".to_vec()];
 
-    let quic_tls: quinn::crypto::rustls::QuicServerConfig = rustls_cfg
-        .try_into()
-        .map_err(|e: quinn::crypto::rustls::NoInitialCipherSuite| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-        })?;
+    let quic_tls: quinn::crypto::rustls::QuicServerConfig =
+        rustls_cfg
+            .try_into()
+            .map_err(|e: quinn::crypto::rustls::NoInitialCipherSuite| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            })?;
 
     let quic_server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
     let endpoint = quinn::Endpoint::server(quic_server_config, addr)?;
@@ -102,9 +105,9 @@ pub async fn serve_h3(
     tracing::info!("HTTP/3 (QUIC) listening on {addr}");
 
     while let Some(incoming) = endpoint.accept().await {
-        let dispatch   = Arc::clone(&dispatch);
-        let state_map  = Arc::clone(&state_map);
-        let cfg        = config.clone();
+        let dispatch = Arc::clone(&dispatch);
+        let state_map = Arc::clone(&state_map);
+        let cfg = config.clone();
         tokio::spawn(handle_connection(incoming, dispatch, state_map, cfg));
     }
 
@@ -116,10 +119,10 @@ pub async fn serve_h3(
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(
-    incoming:  quinn::Incoming,
-    dispatch:  DispatchChain,
+    incoming: quinn::Incoming,
+    dispatch: DispatchChain,
     state_map: Arc<StateMap>,
-    config:    Http3Config,
+    config: Http3Config,
 ) {
     let conn = match incoming.await {
         Ok(c) => c,
@@ -133,21 +136,21 @@ async fn handle_connection(
     tracing::debug!(%remote, "HTTP/3 connection established");
 
     let h3_conn = h3_quinn::Connection::new(conn);
-    let mut h3: h3::server::Connection<_, Bytes> =
-        match h3::server::builder().build(h3_conn).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(%remote, "HTTP/3 handshake failed: {e}");
-                return;
-            }
-        };
+    let mut h3: h3::server::Connection<_, Bytes> = match h3::server::builder().build(h3_conn).await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(%remote, "HTTP/3 handshake failed: {e}");
+            return;
+        }
+    };
 
     loop {
         match h3.accept().await {
             Ok(Some(resolver)) => {
-                let dispatch   = Arc::clone(&dispatch);
-                let state_map  = Arc::clone(&state_map);
-                let cfg        = config.clone();
+                let dispatch = Arc::clone(&dispatch);
+                let state_map = Arc::clone(&state_map);
+                let cfg = config.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
@@ -159,8 +162,8 @@ async fn handle_connection(
                     }
                 });
             }
-            Ok(None) => break,   // Connection closed cleanly.
-            Err(e)   => {
+            Ok(None) => break, // Connection closed cleanly.
+            Err(e) => {
                 tracing::debug!(%remote, "HTTP/3 stream accept error: {e}");
                 break;
             }
@@ -173,12 +176,12 @@ async fn handle_connection(
 // ---------------------------------------------------------------------------
 
 async fn handle_request(
-    req:       http::Request<()>,
+    req: http::Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    dispatch:  DispatchChain,
+    dispatch: DispatchChain,
     state_map: Arc<StateMap>,
-    config:    Http3Config,
-    remote:    SocketAddr,
+    config: Http3Config,
+    remote: SocketAddr,
 ) {
     // Collect the request body from the QUIC stream.
     let mut body_bytes: Vec<u8> = Vec::new();
@@ -187,7 +190,7 @@ async fn handle_request(
             Ok(Some(mut data)) => {
                 while data.has_remaining() {
                     let chunk = data.chunk().to_vec();
-                    let len   = chunk.len();
+                    let len = chunk.len();
                     body_bytes.extend_from_slice(&chunk);
                     data.advance(len);
 
@@ -198,8 +201,8 @@ async fn handle_request(
                     }
                 }
             }
-            Ok(None) => break,  // End of body.
-            Err(e)   => {
+            Ok(None) => break, // End of body.
+            Err(e) => {
                 tracing::debug!(%remote, "HTTP/3 recv_data error: {e}");
                 return;
             }
@@ -254,8 +257,8 @@ async fn handle_request(
 }
 
 async fn send_error(
-    stream:  &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    status:  StatusCode,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
 ) -> Result<(), h3::error::StreamError> {
     let resp = http::Response::builder()
         .status(status)
@@ -285,7 +288,9 @@ mod tests {
 
     #[test]
     fn http3_config_clone() {
-        let cfg  = Http3Config { max_body_size: 1024 };
+        let cfg = Http3Config {
+            max_body_size: 1024,
+        };
         let cfg2 = cfg.clone();
         assert_eq!(cfg.max_body_size, cfg2.max_body_size);
     }

@@ -520,14 +520,13 @@ mod tests {
         let ps = PubSub::new();
         let mut rx = ps.subscribe::<String>("events");
 
-        let client = TestClient::new(
-            Router::new()
-                .state(ps.clone())
-                .post("/emit", |State(ps): State<PubSub>| async move {
-                    ps.publish("events", &"happened".to_string());
-                    "emitted"
-                }),
-        );
+        let client = TestClient::new(Router::new().state(ps.clone()).post(
+            "/emit",
+            |State(ps): State<PubSub>| async move {
+                ps.publish("events", &"happened".to_string());
+                "emitted"
+            },
+        ));
 
         let resp = client.post("/emit").send().await;
         assert_eq!(resp.status(), StatusCode::OK);

@@ -35,7 +35,7 @@ use crate::pool::PgPool;
 /// Each migration runs in its own transaction — a failure rolls back that
 /// step and returns an error, leaving previously applied migrations intact.
 pub async fn migrate(pool: &PgPool, dir: impl AsRef<Path>) -> Result<(), PgError> {
-    let conn   = pool.get().await?;
+    let conn = pool.get().await?;
     let client = conn.client();
 
     // Ensure the migrations tracking table exists.
@@ -79,7 +79,10 @@ pub async fn migrate(pool: &PgPool, dir: impl AsRef<Path>) -> Result<(), PgError
                 .execute("INSERT INTO __pg_migrations (name) VALUES ($1)", &[&name])
                 .await
                 .map_err(PgError::Query)?;
-            client.execute("COMMIT", &[]).await.map_err(PgError::Query)?;
+            client
+                .execute("COMMIT", &[])
+                .await
+                .map_err(PgError::Query)?;
             Ok::<_, PgError>(())
         }
         .await;
@@ -87,7 +90,7 @@ pub async fn migrate(pool: &PgPool, dir: impl AsRef<Path>) -> Result<(), PgError
         if let Err(e) = result {
             let _ = client.execute("ROLLBACK", &[]).await;
             return Err(PgError::Migration {
-                step:   name,
+                step: name,
                 source: Box::new(e),
             });
         }
@@ -103,7 +106,7 @@ fn read_sql_files(dir: &Path) -> Result<Vec<(String, String)>, PgError> {
 
     for entry in entries {
         let entry = entry.map_err(PgError::Io)?;
-        let path  = entry.path();
+        let path = entry.path();
 
         if path.extension().and_then(|e| e.to_str()) != Some("sql") {
             continue;
@@ -175,7 +178,17 @@ mod tests {
         TempDir { path }
     }
 
-    struct TempDir { path: std::path::PathBuf }
-    impl TempDir { fn path(&self) -> &Path { &self.path } }
-    impl Drop for TempDir { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); } }
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }

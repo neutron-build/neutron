@@ -11,10 +11,7 @@ pub struct StripeConfig {
 
 impl StripeConfig {
     /// Create a config from a webhook secret and API key.
-    pub fn new(
-        webhook_secret: impl Into<String>,
-        secret_key: impl Into<String>,
-    ) -> Self {
+    pub fn new(webhook_secret: impl Into<String>, secret_key: impl Into<String>) -> Self {
         StripeConfig {
             webhook_secret: webhook_secret.into(),
             secret_key: secret_key.into(),
@@ -41,8 +38,7 @@ mod tests {
 
     #[test]
     fn custom_api_base() {
-        let c = StripeConfig::new("whsec_abc", "sk_test_xyz")
-            .api_base("http://localhost:12111");
+        let c = StripeConfig::new("whsec_abc", "sk_test_xyz").api_base("http://localhost:12111");
         assert_eq!(c.api_base, "http://localhost:12111");
     }
 

@@ -45,49 +45,60 @@ impl FromRequestParts for Db {
 
 impl Db {
     /// Execute a statement, returning the number of rows affected.
-    pub async fn execute(
-        &self,
-        sql:    &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<u64, PgError> {
+    pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PgError> {
         let conn = self.pool.get().await?;
-        conn.client().execute(sql, params).await.map_err(PgError::Query)
+        conn.client()
+            .execute(sql, params)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Execute a query and return all matching rows.
     pub async fn query(
         &self,
-        sql:    &str,
+        sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>, PgError> {
         let conn = self.pool.get().await?;
-        conn.client().query(sql, params).await.map_err(PgError::Query)
+        conn.client()
+            .query(sql, params)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Execute a query expecting exactly one row.
     pub async fn query_one(
         &self,
-        sql:    &str,
+        sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Row, PgError> {
         let conn = self.pool.get().await?;
-        conn.client().query_one(sql, params).await.map_err(PgError::Query)
+        conn.client()
+            .query_one(sql, params)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Execute a query expecting zero or one rows.
     pub async fn query_opt(
         &self,
-        sql:    &str,
+        sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<Row>, PgError> {
         let conn = self.pool.get().await?;
-        conn.client().query_opt(sql, params).await.map_err(PgError::Query)
+        conn.client()
+            .query_opt(sql, params)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Execute multiple semicolon-separated statements (e.g. DDL scripts).
     pub async fn batch_execute(&self, sql: &str) -> Result<(), PgError> {
         let conn = self.pool.get().await?;
-        conn.client().batch_execute(sql).await.map_err(PgError::Query)
+        conn.client()
+            .batch_execute(sql)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Begin a transaction.  The connection is held for the lifetime of the
@@ -118,30 +129,38 @@ pub struct PgTransaction {
 
 impl PgTransaction {
     /// Execute a statement inside the transaction.
-    pub async fn execute(
-        &self,
-        sql:    &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<u64, PgError> {
-        self.conn.client().execute(sql, params).await.map_err(PgError::Query)
+    pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PgError> {
+        self.conn
+            .client()
+            .execute(sql, params)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Query inside the transaction.
     pub async fn query(
         &self,
-        sql:    &str,
+        sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>, PgError> {
-        self.conn.client().query(sql, params).await.map_err(PgError::Query)
+        self.conn
+            .client()
+            .query(sql, params)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Query a single row inside the transaction.
     pub async fn query_one(
         &self,
-        sql:    &str,
+        sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Row, PgError> {
-        self.conn.client().query_one(sql, params).await.map_err(PgError::Query)
+        self.conn
+            .client()
+            .query_one(sql, params)
+            .await
+            .map_err(PgError::Query)
     }
 
     /// Commit the transaction and return the connection to the pool.
@@ -194,9 +213,9 @@ mod tests {
     async fn db_requires_pool_in_state() {
         // Verify that FromRequestParts returns an error response when the pool
         // is absent — we can test this without a real DB connection.
-        use neutron::handler::Request as NeutronRequest;
-        use http::Method;
         use bytes::Bytes;
+        use http::Method;
+        use neutron::handler::Request as NeutronRequest;
 
         let req = NeutronRequest::new(
             Method::GET,
@@ -209,16 +228,13 @@ mod tests {
         // unwrap_err() requires Debug on Ok variant; match instead
         match result {
             Err(resp) => assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR),
-            Ok(_)     => panic!("expected Err"),
+            Ok(_) => panic!("expected Err"),
         }
     }
 
     #[test]
     fn pg_config_fields() {
-        let cfg = PgConfig::new()
-            .host("pg.local")
-            .dbname("app")
-            .user("svc");
+        let cfg = PgConfig::new().host("pg.local").dbname("app").user("svc");
         assert_eq!(cfg.host, "pg.local");
         assert_eq!(cfg.dbname, "app");
         assert_eq!(cfg.user, "svc");

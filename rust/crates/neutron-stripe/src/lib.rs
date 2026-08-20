@@ -37,7 +37,7 @@ pub use webhook::verify_webhook_signature;
 
 pub mod prelude {
     pub use crate::{
-        CreatePaymentIntent, StripeClient, StripeConfig, StripeError, StripeEvent,
-        StripeEventType, verify_webhook_signature,
+        verify_webhook_signature, CreatePaymentIntent, StripeClient, StripeConfig, StripeError,
+        StripeEvent, StripeEventType,
     };
 }

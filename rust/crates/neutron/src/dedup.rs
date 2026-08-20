@@ -81,10 +81,7 @@ impl Deduplicate {
     /// Set a custom cache key function.
     ///
     /// Default key: `"METHOD:path?query"`.
-    pub fn key_fn(
-        mut self,
-        f: impl Fn(&Request) -> String + Send + Sync + 'static,
-    ) -> Self {
+    pub fn key_fn(mut self, f: impl Fn(&Request) -> String + Send + Sync + 'static) -> Self {
         self.key_fn = Some(Arc::new(f));
         self
     }
@@ -97,10 +94,7 @@ impl Default for Deduplicate {
 }
 
 fn is_safe_method(method: &Method) -> bool {
-    matches!(
-        *method,
-        Method::GET | Method::HEAD | Method::OPTIONS
-    )
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
 fn default_key(req: &Request) -> String {
@@ -155,10 +149,8 @@ impl MiddlewareTrait for Deduplicate {
                             let borrow = rx.borrow();
                             match borrow.as_ref() {
                                 Some(shared) => reconstruct_response(shared),
-                                None => {
-                                    (StatusCode::INTERNAL_SERVER_ERROR, "dedup: no result")
-                                        .into_response()
-                                }
+                                None => (StatusCode::INTERNAL_SERVER_ERROR, "dedup: no result")
+                                    .into_response(),
                             }
                         }
                         Err(_) => {
@@ -224,18 +216,17 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Deduplicate::new())
-                .get("/slow", move || {
-                    let c = count_clone.clone();
-                    async move {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        "result"
-                    }
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Deduplicate::new()).get(
+            "/slow",
+            move || {
+                let c = count_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    "result"
+                }
+            },
+        ));
 
         // Fire two requests concurrently — they should share one handler call
         let (r1, r2) = tokio::join!(client.get("/slow").send(), client.get("/slow").send(),);
@@ -250,17 +241,16 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Deduplicate::new())
-                .get("/fast", move || {
-                    let c = count_clone.clone();
-                    async move {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        "result"
-                    }
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Deduplicate::new()).get(
+            "/fast",
+            move || {
+                let c = count_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    "result"
+                }
+            },
+        ));
 
         // Sequential requests — each gets its own handler call
         client.get("/fast").send().await;
@@ -274,23 +264,19 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Deduplicate::new())
-                .post("/write", move || {
-                    let c = count_clone.clone();
-                    async move {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        "written"
-                    }
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Deduplicate::new()).post(
+            "/write",
+            move || {
+                let c = count_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    "written"
+                }
+            },
+        ));
 
-        let (r1, r2) = tokio::join!(
-            client.post("/write").send(),
-            client.post("/write").send(),
-        );
+        let (r1, r2) = tokio::join!(client.post("/write").send(), client.post("/write").send(),);
 
         // POST is not safe — both should execute
         assert_eq!(count.load(Ordering::SeqCst), 2);
@@ -337,10 +323,7 @@ mod tests {
                 }),
         );
 
-        let (r1, r2) = tokio::join!(
-            client.get("/created").send(),
-            client.get("/created").send(),
-        );
+        let (r1, r2) = tokio::join!(client.get("/created").send(), client.get("/created").send(),);
 
         // Both should see the same status
         // (One is the leader, one is the waiter — but both should see the response)
@@ -350,15 +333,14 @@ mod tests {
 
     #[tokio::test]
     async fn response_headers_preserved() {
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Deduplicate::new())
-                .get("/headers", || async {
-                    let mut headers = http::HeaderMap::new();
-                    headers.insert("x-custom", "hello".parse().unwrap());
-                    (headers, "body").into_response()
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Deduplicate::new()).get(
+            "/headers",
+            || async {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-custom", "hello".parse().unwrap());
+                (headers, "body").into_response()
+            },
+        ));
 
         let resp = client.get("/headers").send().await;
         assert_eq!(resp.header("x-custom").unwrap(), "hello");

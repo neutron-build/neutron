@@ -18,7 +18,7 @@
 use neutron::health::HealthCheck;
 use neutron::openapi::{ApiRoute, OpenApi, Schema};
 use neutron::prelude::*;
-use neutron::validate::{Validate, ValidationErrors, Validated};
+use neutron::validate::{Validate, Validated, ValidationErrors};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Clone)]
@@ -58,21 +58,21 @@ async fn list_items() -> Json<Vec<Item>> {
 async fn create_item(Validated(Json(input)): Validated<Json<NewItem>>) -> (StatusCode, Json<Item>) {
     (
         StatusCode::CREATED,
-        Json(Item { id: 1, name: input.name, price: input.price }),
+        Json(Item {
+            id: 1,
+            name: input.name,
+            price: input.price,
+        }),
     )
 }
 
 fn api_spec() -> OpenApi {
     OpenApi::new("Neutron Conformance API", "9.9.9")
-        .route(
-            ApiRoute::get("/api/items")
-                .summary("List items")
-                .response(
-                    200,
-                    "application/json",
-                    Schema::array(Schema::ref_to("#/components/schemas/Item")),
-                ),
-        )
+        .route(ApiRoute::get("/api/items").summary("List items").response(
+            200,
+            "application/json",
+            Schema::array(Schema::ref_to("#/components/schemas/Item")),
+        ))
         .schema(
             "Item",
             Schema::object()
@@ -93,20 +93,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .middleware(RequestId::new())
         .middleware(Logger::new())
         .middleware(Compress::new())
-        .middleware(Cors::new().allow_any_origin().allow_any_method().allow_any_header())
+        .middleware(
+            Cors::new()
+                .allow_any_origin()
+                .allow_any_method()
+                .allow_any_header(),
+        )
         // Contract /health shape {status, nucleus, version}. No DB probe → unconfigured.
         .get("/health", health.contract(None, "9.9.9"))
         .get("/openapi.json", spec.json_handler())
         .get("/api/items", list_items)
         .post("/api/items", create_item)
-        .get("/errors/bad-request", || async { AppError::bad_request("forced bad request") })
-        .get("/errors/unauthorized", || async { AppError::unauthorized("forced unauthorized") })
-        .get("/errors/forbidden", || async { AppError::forbidden("forced forbidden") })
-        .get("/errors/not-found", || async { AppError::not_found("forced not found") })
-        .get("/errors/conflict", || async { AppError::conflict("forced conflict") })
-        .get("/errors/rate-limited", || async { AppError::rate_limited("forced rate limited") })
-        .get("/errors/internal", || async { AppError::internal("forced internal error") });
+        .get("/errors/bad-request", || async {
+            AppError::bad_request("forced bad request")
+        })
+        .get("/errors/unauthorized", || async {
+            AppError::unauthorized("forced unauthorized")
+        })
+        .get("/errors/forbidden", || async {
+            AppError::forbidden("forced forbidden")
+        })
+        .get("/errors/not-found", || async {
+            AppError::not_found("forced not found")
+        })
+        .get("/errors/conflict", || async {
+            AppError::conflict("forced conflict")
+        })
+        .get("/errors/rate-limited", || async {
+            AppError::rate_limited("forced rate limited")
+        })
+        .get("/errors/internal", || async {
+            AppError::internal("forced internal error")
+        });
 
     let config = Config::from_env();
-    Neutron::new().router(router).listen(config.socket_addr()).await
+    Neutron::new()
+        .router(router)
+        .listen(config.socket_addr())
+        .await
 }

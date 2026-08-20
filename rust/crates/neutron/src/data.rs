@@ -345,15 +345,9 @@ mod tests {
             Ok(format!("value-{key}"))
         }
 
-        async fn load_batch(
-            &self,
-            keys: &[u64],
-        ) -> Result<HashMap<u64, String>, String> {
+        async fn load_batch(&self, keys: &[u64]) -> Result<HashMap<u64, String>, String> {
             self.batch_count.fetch_add(1, Ordering::SeqCst);
-            Ok(keys
-                .iter()
-                .map(|k| (*k, format!("value-{k}")))
-                .collect())
+            Ok(keys.iter().map(|k| (*k, format!("value-{k}"))).collect())
         }
     }
 
@@ -499,7 +493,8 @@ mod tests {
 
     #[tokio::test]
     async fn join_all_empty() {
-        let results: Vec<i32> = join_all(std::iter::empty::<Pin<Box<dyn Future<Output = i32> + Send>>>()).await;
+        let results: Vec<i32> =
+            join_all(std::iter::empty::<Pin<Box<dyn Future<Output = i32> + Send>>>()).await;
         assert!(results.is_empty());
     }
 
@@ -545,8 +540,10 @@ mod tests {
 
     #[tokio::test]
     async fn try_join_all_empty() {
-        let results: Result<Vec<i32>, String> =
-            try_join_all(std::iter::empty::<Pin<Box<dyn Future<Output = Result<i32, String>> + Send>>>()).await;
+        let results: Result<Vec<i32>, String> = try_join_all(std::iter::empty::<
+            Pin<Box<dyn Future<Output = Result<i32, String>> + Send>>,
+        >())
+        .await;
         assert_eq!(results.unwrap(), Vec::<i32>::new());
     }
 }

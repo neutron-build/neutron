@@ -4,9 +4,9 @@
 use serde_json;
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::models::is_valid_identifier;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Handle for columnar analytics operations.
 pub struct ColumnarModel {

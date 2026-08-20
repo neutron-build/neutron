@@ -173,8 +173,10 @@ impl WebSocketUpgrade {
             match self.on_upgrade.await {
                 Ok(upgraded) => {
                     let io = TokioIo::new(upgraded);
-                    let ws =
-                        fastwebsockets::WebSocket::after_handshake(io, fastwebsockets::Role::Server);
+                    let ws = fastwebsockets::WebSocket::after_handshake(
+                        io,
+                        fastwebsockets::Role::Server,
+                    );
                     let ws = fastwebsockets::FragmentCollector::new(ws);
                     let socket = WebSocket { inner: ws };
                     callback(socket).await;
@@ -209,8 +211,7 @@ impl WebSocketUpgrade {
                 for &supported_proto in supported {
                     for requested_proto in requested_str.split(',').map(str::trim) {
                         if requested_proto.eq_ignore_ascii_case(supported_proto) {
-                            self.protocols =
-                                Some(HeaderValue::from_str(supported_proto).unwrap());
+                            self.protocols = Some(HeaderValue::from_str(supported_proto).unwrap());
                             return self;
                         }
                     }
@@ -240,9 +241,11 @@ impl FromRequestParts for WebSocketUpgrade {
             .split(',')
             .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
         {
-            return Err(
-                (StatusCode::BAD_REQUEST, "Missing Connection: upgrade header").into_response(),
-            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Missing Connection: upgrade header",
+            )
+                .into_response());
         }
 
         // Upgrade: websocket
@@ -266,9 +269,7 @@ impl FromRequestParts for WebSocketUpgrade {
             .unwrap_or("");
 
         if version != "13" {
-            return Err(
-                (StatusCode::BAD_REQUEST, "Unsupported WebSocket version").into_response(),
-            );
+            return Err((StatusCode::BAD_REQUEST, "Unsupported WebSocket version").into_response());
         }
 
         // Sec-WebSocket-Key
@@ -319,22 +320,16 @@ impl WebSocket {
     pub async fn recv(&mut self) -> Option<Message> {
         match self.inner.read_frame().await {
             Ok(frame) => match frame.opcode {
-                fastwebsockets::OpCode::Text => {
-                    String::from_utf8(frame.payload.to_vec())
-                        .ok()
-                        .map(Message::Text)
-                }
-                fastwebsockets::OpCode::Binary => {
-                    Some(Message::Binary(frame.payload.to_vec()))
-                }
+                fastwebsockets::OpCode::Text => String::from_utf8(frame.payload.to_vec())
+                    .ok()
+                    .map(Message::Text),
+                fastwebsockets::OpCode::Binary => Some(Message::Binary(frame.payload.to_vec())),
                 fastwebsockets::OpCode::Ping => Some(Message::Ping(frame.payload.to_vec())),
                 fastwebsockets::OpCode::Pong => Some(Message::Pong(frame.payload.to_vec())),
                 fastwebsockets::OpCode::Close => {
                     let close = if frame.payload.len() >= 2 {
-                        let code =
-                            u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
-                        let reason =
-                            String::from_utf8_lossy(&frame.payload[2..]).into_owned();
+                        let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                        let reason = String::from_utf8_lossy(&frame.payload[2..]).into_owned();
                         Some(CloseFrame { code, reason })
                     } else {
                         None

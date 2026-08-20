@@ -80,7 +80,9 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn tc() -> TieredCache { TieredCache::l1_only(64) }
+    fn tc() -> TieredCache {
+        TieredCache::l1_only(64)
+    }
 
     #[test]
     fn get_returns_none_on_empty_cache() {
@@ -139,7 +141,7 @@ mod tests {
         let c = tc();
         c.set("session:abc", b"1".to_vec(), 60);
         c.set("session:xyz", b"2".to_vec(), 60);
-        c.set("user:1",      b"3".to_vec(), 60);
+        c.set("user:1", b"3".to_vec(), 60);
         c.invalidate_prefix("session:");
         assert!(c.get("session:abc").is_none());
         assert!(c.get("session:xyz").is_none());

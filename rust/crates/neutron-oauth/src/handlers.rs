@@ -51,21 +51,17 @@ use crate::user::{fetch_userinfo, OAuthUser};
 /// 3. Redirects the browser to the provider's authorization URL.
 pub fn oauth_redirect_handler(
     config: OAuthConfig,
-) -> impl Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
-       + Clone
-       + Send
-       + Sync
-       + 'static
+) -> impl Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
 {
     let config = Arc::new(config);
     move |_req: Request| {
         let config = Arc::clone(&config);
         Box::pin(async move {
-            let pkce  = PkceChallenge::new();
+            let pkce = PkceChallenge::new();
             let state = generate_state();
 
             let cookie_val = encode_state_cookie(&state, &pkce.verifier, &config.secret);
-            let auth_url   = config.authorization_url(&state, &pkce.challenge);
+            let auth_url = config.authorization_url(&state, &pkce.challenge);
 
             let cookie_hdr = SetCookie::new(OAUTH_STATE_COOKIE, cookie_val)
                 .path("/")
@@ -78,7 +74,7 @@ pub fn oauth_redirect_handler(
             // Redirect to provider
             http::Response::builder()
                 .status(StatusCode::FOUND)
-                .header("location",   &auth_url)
+                .header("location", &auth_url)
                 .header("set-cookie", cookie_hdr)
                 .body(neutron::handler::Body::empty())
                 .unwrap()
@@ -98,27 +94,23 @@ pub fn oauth_redirect_handler(
 ///
 /// On failure, a `400 Bad Request` response is returned.
 pub fn oauth_callback_handler<F, Fut>(
-    config:     OAuthConfig,
+    config: OAuthConfig,
     on_success: F,
-) -> impl Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
-       + Clone
-       + Send
-       + Sync
-       + 'static
+) -> impl Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
 where
-    F:   Fn(OAuthUser, Request) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Response>     + Send + 'static,
+    F: Fn(OAuthUser, Request) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
 {
-    let config     = Arc::new(config);
+    let config = Arc::new(config);
     let on_success = Arc::new(on_success);
 
     move |req: Request| {
-        let config     = Arc::clone(&config);
+        let config = Arc::clone(&config);
         let on_success = Arc::clone(&on_success);
         Box::pin(async move {
             match handle_callback(req, config, on_success).await {
-                Ok(resp)  => resp,
-                Err(e)    => {
+                Ok(resp) => resp,
+                Err(e) => {
                     tracing::warn!("OAuth callback error: {e}");
                     (StatusCode::BAD_REQUEST, e.to_string()).into_response()
                 }
@@ -128,34 +120,33 @@ where
 }
 
 async fn handle_callback<F, Fut>(
-    req:        Request,
-    config:     Arc<OAuthConfig>,
+    req: Request,
+    config: Arc<OAuthConfig>,
     on_success: Arc<F>,
 ) -> Result<Response, OAuthError>
 where
-    F:   Fn(OAuthUser, Request) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Response>     + Send + 'static,
+    F: Fn(OAuthUser, Request) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
 {
     // 1. Extract `code` and `state` from the query string.
     let query = req.uri().query().unwrap_or("");
     let params = parse_query(query);
 
-    let code  = params.get("code")
-        .ok_or(OAuthError::MissingCode)?;
-    let state = params.get("state")
-        .ok_or(OAuthError::InvalidState)?;
+    let code = params.get("code").ok_or(OAuthError::MissingCode)?;
+    let state = params.get("state").ok_or(OAuthError::InvalidState)?;
 
     // 2. Read and verify the signed state cookie.
-    let cookie_header = req.headers()
+    let cookie_header = req
+        .headers()
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let cookie_val = find_cookie(cookie_header, OAUTH_STATE_COOKIE)
-        .ok_or(OAuthError::InvalidState)?;
+    let cookie_val =
+        find_cookie(cookie_header, OAUTH_STATE_COOKIE).ok_or(OAuthError::InvalidState)?;
 
-    let (stored_state, verifier) = decode_state_cookie(&cookie_val, &config.secret)
-        .ok_or(OAuthError::CsrfViolation)?;
+    let (stored_state, verifier) =
+        decode_state_cookie(&cookie_val, &config.secret).ok_or(OAuthError::CsrfViolation)?;
 
     // 3. Verify the anti-CSRF state matches.
     if !constant_time_eq(state.as_bytes(), stored_state.as_bytes()) {
@@ -189,12 +180,15 @@ where
 // ---------------------------------------------------------------------------
 
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
-    query.split('&')
+    query
+        .split('&')
         .filter(|s| !s.is_empty())
         .filter_map(|kv| {
             let mut it = kv.splitn(2, '=');
             let k = it.next()?.to_string();
-            if k.is_empty() { return None; }
+            if k.is_empty() {
+                return None;
+            }
             let v = it.next().unwrap_or("").to_string();
             Some((k, v))
         })
@@ -214,8 +208,13 @@ fn find_cookie(header: &str, name: &str) -> Option<String> {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +241,10 @@ mod tests {
     #[test]
     fn find_cookie_found() {
         let header = "session=abc; __oauth_state=myval; other=x";
-        assert_eq!(find_cookie(header, "__oauth_state"), Some("myval".to_string()));
+        assert_eq!(
+            find_cookie(header, "__oauth_state"),
+            Some("myval".to_string())
+        );
     }
 
     #[test]

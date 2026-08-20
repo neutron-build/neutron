@@ -6,7 +6,11 @@ use std::time::{Duration, SystemTime};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "neutron-rs", about = "Neutron Rust framework CLI. The global 'neutron' command is the universal CLI.", version)]
+#[command(
+    name = "neutron-rs",
+    about = "Neutron Rust framework CLI. The global 'neutron' command is the universal CLI.",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -44,11 +48,11 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Dev { port }          => cmd_dev(port),
+        Commands::Dev { port } => cmd_dev(port),
         Commands::New { name, template } => cmd_new(&name, &template),
-        Commands::Build { args }        => cmd_build(args),
-        Commands::Check                 => cmd_check(),
-        Commands::Routes                => cmd_routes(),
+        Commands::Build { args } => cmd_build(args),
+        Commands::Check => cmd_check(),
+        Commands::Routes => cmd_routes(),
     }
 }
 
@@ -97,10 +101,10 @@ fn cmd_new(name: &str, template: &str) {
     });
 
     let extra_deps = match tpl {
-        "grpc"    => "neutron-grpc = { path = \"../neutron/crates/neutron-grpc\" }\n",
+        "grpc" => "neutron-grpc = { path = \"../neutron/crates/neutron-grpc\" }\n",
         "graphql" => "neutron-graphql = { path = \"../neutron/crates/neutron-graphql\" }\n",
-        "jobs"    => "neutron-jobs = { path = \"../neutron/crates/neutron-jobs\" }\n",
-        "full"    => concat!(
+        "jobs" => "neutron-jobs = { path = \"../neutron/crates/neutron-jobs\" }\n",
+        "full" => concat!(
             "neutron-grpc     = { path = \"../neutron/crates/neutron-grpc\" }\n",
             "neutron-graphql  = { path = \"../neutron/crates/neutron-graphql\" }\n",
             "neutron-jobs     = { path = \"../neutron/crates/neutron-jobs\" }\n",
@@ -128,19 +132,19 @@ fn cmd_new(name: &str, template: &str) {
     };
 
     let routes_file = match tpl {
-        "grpc"    => ("src/services/mod.rs", TEMPLATE_GRPC_SERVICE),
-        "graphql" => ("src/routes/mod.rs",   TEMPLATE_GRAPHQL_ROUTES),
-        "jobs"    => ("src/routes/mod.rs",   TEMPLATE_JOBS_ROUTES),
-        _         => ("src/routes/mod.rs",   TEMPLATE_API_ROUTES),
+        "grpc" => ("src/services/mod.rs", TEMPLATE_GRPC_SERVICE),
+        "graphql" => ("src/routes/mod.rs", TEMPLATE_GRAPHQL_ROUTES),
+        "jobs" => ("src/routes/mod.rs", TEMPLATE_JOBS_ROUTES),
+        _ => ("src/routes/mod.rs", TEMPLATE_API_ROUTES),
     };
 
     let gitignore = "/target\n";
 
     let files: &[(&str, &str)] = &[
-        ("Cargo.toml",      &cargo_toml),
-        ("src/main.rs",     &main_rs),
-        (routes_file.0,     routes_file.1),
-        (".gitignore",       gitignore),
+        ("Cargo.toml", &cargo_toml),
+        ("src/main.rs", &main_rs),
+        (routes_file.0, routes_file.1),
+        (".gitignore", gitignore),
     ];
 
     for (path, content) in files {
@@ -367,7 +371,11 @@ fn cmd_build(extra_args: Vec<String>) {
     // Report binary size.
     if let Ok(meta) = std::fs::metadata(binary_path()) {
         let bytes = meta.len();
-        println!("\nBinary size: {} ({:.1} MB)", bytes, bytes as f64 / 1_048_576.0);
+        println!(
+            "\nBinary size: {} ({:.1} MB)",
+            bytes,
+            bytes as f64 / 1_048_576.0
+        );
         println!("Location:    {}", binary_path().display());
     }
 }
@@ -382,7 +390,11 @@ fn binary_path() -> std::path::PathBuf {
         .unwrap_or("app")
         .to_string();
 
-    let exe = if cfg!(windows) { format!("{name}.exe") } else { name };
+    let exe = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name
+    };
     std::path::Path::new("target/release").join(exe)
 }
 
@@ -429,7 +441,7 @@ fn cmd_routes() {
     }
 
     let methods = ["get", "post", "put", "patch", "delete", "head", "options"];
-    let files   = collect_mtimes("src");
+    let files = collect_mtimes("src");
 
     let mut routes: Vec<(String, String, String)> = Vec::new(); // (method, path, file)
 
@@ -437,7 +449,9 @@ fn cmd_routes() {
         if !file_path.ends_with(".rs") {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(file_path) else { continue };
+        let Ok(src) = std::fs::read_to_string(file_path) else {
+            continue;
+        };
         for line in src.lines() {
             let trimmed = line.trim();
             for method in methods {
@@ -463,8 +477,18 @@ fn cmd_routes() {
 
     routes.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
-    let method_w = routes.iter().map(|(m, _, _)| m.len()).max().unwrap_or(6).max(6);
-    let path_w   = routes.iter().map(|(_, p, _)| p.len()).max().unwrap_or(4).max(4);
+    let method_w = routes
+        .iter()
+        .map(|(m, _, _)| m.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let path_w = routes
+        .iter()
+        .map(|(_, p, _)| p.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
 
     println!("\n{:<method_w$}  {:<path_w$}  FILE", "METHOD", "PATH");
     println!("{}", "-".repeat(method_w + path_w + 20));
@@ -687,12 +711,7 @@ mod tests {
 
     #[test]
     fn parse_build_with_extra_args() {
-        let cli = Cli::parse_from([
-            "neutron-rs",
-            "build",
-            "--features",
-            "jemalloc",
-        ]);
+        let cli = Cli::parse_from(["neutron-rs", "build", "--features", "jemalloc"]);
         match cli.command {
             Commands::Build { args } => {
                 assert_eq!(args, vec!["--features", "jemalloc"]);
@@ -948,9 +967,9 @@ let router = Router::new()
     #[test]
     fn grpc_template_adds_grpc_dep() {
         let extra_deps = match "grpc" {
-            "grpc"    => "neutron-grpc = { path = \"../neutron/crates/neutron-grpc\" }\n",
+            "grpc" => "neutron-grpc = { path = \"../neutron/crates/neutron-grpc\" }\n",
             "graphql" => "neutron-graphql = { path = \"../neutron/crates/neutron-graphql\" }\n",
-            "jobs"    => "neutron-jobs = { path = \"../neutron/crates/neutron-jobs\" }\n",
+            "jobs" => "neutron-jobs = { path = \"../neutron/crates/neutron-jobs\" }\n",
             _ => "",
         };
         assert!(extra_deps.contains("neutron-grpc"));
@@ -959,9 +978,9 @@ let router = Router::new()
     #[test]
     fn api_template_adds_no_extra_deps() {
         let extra_deps = match "api" {
-            "grpc"    => "neutron-grpc",
+            "grpc" => "neutron-grpc",
             "graphql" => "neutron-graphql",
-            "jobs"    => "neutron-jobs",
+            "jobs" => "neutron-jobs",
             _ => "",
         };
         assert!(extra_deps.is_empty());

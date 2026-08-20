@@ -1,8 +1,8 @@
 //! PubSub model — PUBSUB_PUBLISH, PUBSUB_CHANNELS, PUBSUB_SUBSCRIBERS.
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Handle for PubSub operations.
 pub struct PubSubModel {

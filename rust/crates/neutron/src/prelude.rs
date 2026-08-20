@@ -4,7 +4,9 @@
 pub use crate::app::Neutron;
 pub use crate::config::Config;
 pub use crate::error::{AppError, ValidationFieldError};
-pub use crate::handler::{AnyState, Body, IntoResponse, Redirect, Request, Response, StateMap, StateMapBuilder};
+pub use crate::handler::{
+    AnyState, Body, IntoResponse, Redirect, Request, Response, StateMap, StateMapBuilder,
+};
 pub use crate::http2::Http2Config;
 pub use crate::middleware::Next;
 pub use crate::router::{MethodRouter, Router};
@@ -154,7 +156,9 @@ pub use crate::compress::Compress;
 // WebSocket
 // ---------------------------------------------------------------------------
 #[cfg(feature = "ws")]
-pub use crate::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, WsError, WsSender, WsReceiver};
+pub use crate::ws::{
+    CloseFrame, Message, WebSocket, WebSocketUpgrade, WsError, WsReceiver, WsSender,
+};
 
 // ---------------------------------------------------------------------------
 // Multipart

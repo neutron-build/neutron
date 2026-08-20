@@ -15,8 +15,8 @@
 use serde_json;
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Handle for document store operations.
 pub struct DocumentModel {
@@ -372,5 +372,4 @@ impl DocumentModel {
         }
         Ok(out)
     }
-
 }

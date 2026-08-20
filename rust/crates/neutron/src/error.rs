@@ -136,12 +136,22 @@ impl AppError {
 
     /// 400 Bad Request
     pub fn bad_request(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "bad-request", "Bad Request", detail)
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "bad-request",
+            "Bad Request",
+            detail,
+        )
     }
 
     /// 401 Unauthorized
     pub fn unauthorized(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "Unauthorized", detail)
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Unauthorized",
+            detail,
+        )
     }
 
     /// 403 Forbidden
@@ -191,10 +201,7 @@ impl AppError {
     }
 
     /// 422 Validation Failed — with field-level errors.
-    pub fn validation_error(
-        detail: impl Into<String>,
-        errors: Vec<ValidationFieldError>,
-    ) -> Self {
+    pub fn validation_error(detail: impl Into<String>, errors: Vec<ValidationFieldError>) -> Self {
         Self::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation",
@@ -384,8 +391,7 @@ mod tests {
 
     #[test]
     fn with_instance() {
-        let err = AppError::not_found("User 42 does not exist")
-            .with_instance("/api/users/42");
+        let err = AppError::not_found("User 42 does not exist").with_instance("/api/users/42");
         assert_eq!(err.instance.as_deref(), Some("/api/users/42"));
     }
 
@@ -412,9 +418,6 @@ mod tests {
     #[test]
     fn code_without_url_prefix() {
         let err = AppError::new(StatusCode::BAD_REQUEST, "custom-error", "Custom", "detail");
-        assert_eq!(
-            err.error_type,
-            "https://neutron.dev/errors/custom-error"
-        );
+        assert_eq!(err.error_type, "https://neutron.dev/errors/custom-error");
     }
 }

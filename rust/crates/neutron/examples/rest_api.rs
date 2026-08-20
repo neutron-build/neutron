@@ -12,10 +12,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use neutron::prelude::*;
 use neutron::extract::Extension;
 use neutron::jwt::{Claims, JwtAuth, JwtConfig};
 use neutron::openapi::{ApiRoute, OpenApi, Parameter, Schema};
+use neutron::prelude::*;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -50,8 +50,16 @@ impl Store {
     fn new() -> Self {
         Self {
             items: Mutex::new(vec![
-                Item { id: 1, name: "Widget".into(), price: 9.99 },
-                Item { id: 2, name: "Gadget".into(), price: 24.50 },
+                Item {
+                    id: 1,
+                    name: "Widget".into(),
+                    price: 9.99,
+                },
+                Item {
+                    id: 2,
+                    name: "Gadget".into(),
+                    price: 24.50,
+                },
             ]),
             next_id: Mutex::new(3),
         }
@@ -63,8 +71,7 @@ impl Store {
 // ---------------------------------------------------------------------------
 
 fn jwt_config() -> JwtConfig {
-    JwtConfig::new(b"super-secret-key-change-me")
-        .issuer("neutron-example")
+    JwtConfig::new(b"super-secret-key-change-me").issuer("neutron-example")
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +132,11 @@ async fn create_item(
     if input.name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(Item { id: 0, name: "validation error: name required".into(), price: 0.0 }),
+            Json(Item {
+                id: 0,
+                name: "validation error: name required".into(),
+                price: 0.0,
+            }),
         );
     }
 
@@ -159,21 +170,37 @@ fn api_spec() -> OpenApi {
             ApiRoute::post("/auth/login")
                 .summary("Get a JWT token")
                 .tag("auth")
-                .response(200, "application/json", Schema::object().property("token", Schema::string()).build()),
+                .response(
+                    200,
+                    "application/json",
+                    Schema::object().property("token", Schema::string()).build(),
+                ),
         )
         .route(
             ApiRoute::get("/api/items")
                 .summary("List all items")
                 .tag("items")
-                .response(200, "application/json", Schema::array(Schema::ref_to("#/components/schemas/Item"))),
+                .response(
+                    200,
+                    "application/json",
+                    Schema::array(Schema::ref_to("#/components/schemas/Item")),
+                ),
         )
         .route(
             ApiRoute::get("/api/items/{id}")
                 .summary("Get item by ID")
                 .tag("items")
                 .param(Parameter::path("id", Schema::integer()).description("Item ID"))
-                .response(200, "application/json", Schema::ref_to("#/components/schemas/Item"))
-                .response(404, "application/json", Schema::object().property("error", Schema::string()).build()),
+                .response(
+                    200,
+                    "application/json",
+                    Schema::ref_to("#/components/schemas/Item"),
+                )
+                .response(
+                    404,
+                    "application/json",
+                    Schema::object().property("error", Schema::string()).build(),
+                ),
         )
         .route(
             ApiRoute::post("/api/items")
@@ -186,7 +213,11 @@ fn api_spec() -> OpenApi {
                         .property("price", Schema::number())
                         .build(),
                 )
-                .response(201, "application/json", Schema::ref_to("#/components/schemas/Item")),
+                .response(
+                    201,
+                    "application/json",
+                    Schema::ref_to("#/components/schemas/Item"),
+                ),
         )
         .schema(
             "Item",
@@ -204,9 +235,7 @@ fn api_spec() -> OpenApi {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let store = Arc::new(Store::new());
     let spec = api_spec();
@@ -227,13 +256,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // enforces this order so it can't be miswired.)
         .middleware(RequestId::new())
         .middleware(Logger)
-        .middleware(Cors::new().allow_any_origin().allow_any_method().allow_any_header())
+        .middleware(
+            Cors::new()
+                .allow_any_origin()
+                .allow_any_method()
+                .allow_any_header(),
+        )
         .post("/auth/login", login)
         .nest("/api", api)
-        .get("/health", || async { Json(serde_json::json!({ "status": "ok" })) })
+        .get("/health", || async {
+            Json(serde_json::json!({ "status": "ok" }))
+        })
         .get("/docs", spec.json_handler())
         .fallback(|| async {
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" })))
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
         });
 
     let addr = "0.0.0.0:3000".parse()?;

@@ -18,14 +18,14 @@ use crate::error::SmtpError;
 /// ```
 #[derive(Debug, Default)]
 pub struct Email {
-    pub(crate) from:       Option<String>,
-    pub(crate) reply_to:   Option<String>,
-    pub(crate) to:         Vec<String>,
-    pub(crate) cc:         Vec<String>,
-    pub(crate) bcc:        Vec<String>,
-    pub(crate) subject:    Option<String>,
-    pub(crate) text:       Option<String>,
-    pub(crate) html:       Option<String>,
+    pub(crate) from: Option<String>,
+    pub(crate) reply_to: Option<String>,
+    pub(crate) to: Vec<String>,
+    pub(crate) cc: Vec<String>,
+    pub(crate) bcc: Vec<String>,
+    pub(crate) subject: Option<String>,
+    pub(crate) text: Option<String>,
+    pub(crate) html: Option<String>,
     pub(crate) attachments: Vec<EmailAttachment>,
 }
 
@@ -33,9 +33,9 @@ pub struct Email {
 #[derive(Debug)]
 pub struct EmailAttachment {
     /// File name shown to the recipient.
-    pub filename:     String,
+    pub filename: String,
     /// Raw bytes of the attachment.
-    pub data:         Vec<u8>,
+    pub data: Vec<u8>,
     /// MIME content type, e.g. `"application/pdf"`.
     pub content_type: String,
 }
@@ -102,7 +102,7 @@ impl Email {
         content_type: impl Into<String>,
     ) -> Self {
         self.attachments.push(EmailAttachment {
-            filename:     filename.into(),
+            filename: filename.into(),
             data,
             content_type: content_type.into(),
         });
@@ -117,14 +117,18 @@ impl Email {
     ///
     /// `fallback_from` is used when `Email::from()` was not called.
     pub(crate) fn into_message(self, fallback_from: Option<&str>) -> Result<Message, SmtpError> {
-        let from_str = self.from.as_deref()
-            .or(fallback_from)
-            .ok_or_else(|| SmtpError::Config("no From address — set Email::from() or SmtpConfig::default_from()".into()))?;
+        let from_str = self.from.as_deref().or(fallback_from).ok_or_else(|| {
+            SmtpError::Config(
+                "no From address — set Email::from() or SmtpConfig::default_from()".into(),
+            )
+        })?;
 
         let from: Mailbox = from_str.parse().map_err(SmtpError::from)?;
 
         if self.to.is_empty() {
-            return Err(SmtpError::Build("at least one To address is required".into()));
+            return Err(SmtpError::Build(
+                "at least one To address is required".into(),
+            ));
         }
 
         let mut builder = Message::builder().from(from);
@@ -156,15 +160,12 @@ impl Email {
             builder.multipart(build_body(self.text.as_deref(), self.html.as_deref())?)?
         } else {
             // multipart/mixed: body part + attachments
-            let mut mixed = MultiPart::mixed().multipart(
-                build_body(self.text.as_deref(), self.html.as_deref())?
-            );
+            let mut mixed = MultiPart::mixed()
+                .multipart(build_body(self.text.as_deref(), self.html.as_deref())?);
 
             for att in self.attachments {
-                let ct: ContentType = att.content_type.parse()
-                    .unwrap_or(ContentType::TEXT_PLAIN);
-                let part = Attachment::new(att.filename)
-                    .body(att.data, ct);
+                let ct: ContentType = att.content_type.parse().unwrap_or(ContentType::TEXT_PLAIN);
+                let part = Attachment::new(att.filename).body(att.data, ct);
                 mixed = mixed.singlepart(part);
             }
 
@@ -178,33 +179,27 @@ impl Email {
 /// Build a `multipart/alternative` or a simple text/html part.
 fn build_body(text: Option<&str>, html: Option<&str>) -> Result<MultiPart, SmtpError> {
     match (text, html) {
-        (Some(t), Some(h)) => {
-            Ok(MultiPart::alternative()
-                .singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_PLAIN)
-                        .body(t.to_string()),
-                )
-                .singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_HTML)
-                        .body(h.to_string()),
-                ))
-        }
-        (Some(t), None) => {
-            Ok(MultiPart::alternative().singlepart(
+        (Some(t), Some(h)) => Ok(MultiPart::alternative()
+            .singlepart(
                 SinglePart::builder()
                     .header(ContentType::TEXT_PLAIN)
                     .body(t.to_string()),
-            ))
-        }
-        (None, Some(h)) => {
-            Ok(MultiPart::alternative().singlepart(
+            )
+            .singlepart(
                 SinglePart::builder()
                     .header(ContentType::TEXT_HTML)
                     .body(h.to_string()),
-            ))
-        }
+            )),
+        (Some(t), None) => Ok(MultiPart::alternative().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .body(t.to_string()),
+        )),
+        (None, Some(h)) => Ok(MultiPart::alternative().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_HTML)
+                .body(h.to_string()),
+        )),
         (None, None) => {
             // Empty body — send a blank plain-text message
             Ok(MultiPart::alternative().singlepart(
@@ -303,10 +298,11 @@ mod tests {
 
     #[test]
     fn email_attachment_fields() {
-        let e = Email::new()
-            .from("a@b.com")
-            .to("r@b.com")
-            .attach("data.csv", vec![1, 2, 3], "text/csv");
+        let e = Email::new().from("a@b.com").to("r@b.com").attach(
+            "data.csv",
+            vec![1, 2, 3],
+            "text/csv",
+        );
         assert_eq!(e.attachments.len(), 1);
         assert_eq!(e.attachments[0].filename, "data.csv");
         assert_eq!(e.attachments[0].content_type, "text/csv");

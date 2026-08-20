@@ -127,8 +127,7 @@ impl Helmet {
         if seconds == 0 {
             self.strict_transport_security = None;
         } else {
-            self.strict_transport_security =
-                Some(format!("max-age={seconds}; includeSubDomains"));
+            self.strict_transport_security = Some(format!("max-age={seconds}; includeSubDomains"));
         }
         self
     }
@@ -220,9 +219,7 @@ impl Default for Helmet {
             x_content_type_options: Some("nosniff".to_string()),
             x_frame_options: Some("DENY".to_string()),
             x_xss_protection: Some("0".to_string()),
-            strict_transport_security: Some(
-                "max-age=15552000; includeSubDomains".to_string(),
-            ),
+            strict_transport_security: Some("max-age=15552000; includeSubDomains".to_string()),
             content_security_policy: None,
             referrer_policy: Some("no-referrer".to_string()),
             permissions_policy: None,
@@ -243,10 +240,7 @@ impl MiddlewareTrait for Helmet {
             ("x-content-type-options", &self.x_content_type_options),
             ("x-frame-options", &self.x_frame_options),
             ("x-xss-protection", &self.x_xss_protection),
-            (
-                "strict-transport-security",
-                &self.strict_transport_security,
-            ),
+            ("strict-transport-security", &self.strict_transport_security),
             ("content-security-policy", &self.content_security_policy),
             ("referrer-policy", &self.referrer_policy),
             ("permissions-policy", &self.permissions_policy),
@@ -276,8 +270,7 @@ impl MiddlewareTrait for Helmet {
         Box::pin(async move {
             let mut resp = next.run(req).await;
             for (name, value) in headers {
-                resp.headers_mut()
-                    .insert(name, value.parse().unwrap());
+                resp.headers_mut().insert(name, value.parse().unwrap());
             }
             resp
         })
@@ -421,9 +414,7 @@ mod tests {
     async fn custom_referrer_policy() {
         let client = TestClient::new(
             Router::new()
-                .middleware(
-                    Helmet::new().referrer_policy("strict-origin-when-cross-origin"),
-                )
+                .middleware(Helmet::new().referrer_policy("strict-origin-when-cross-origin"))
                 .get("/", || async { "ok" }),
         );
 

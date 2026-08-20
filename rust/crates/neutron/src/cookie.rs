@@ -312,7 +312,10 @@ impl Key {
         let mut encryption = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut signing);
         rand::thread_rng().fill_bytes(&mut encryption);
-        Self { signing, encryption }
+        Self {
+            signing,
+            encryption,
+        }
     }
 
     /// Create a key from raw bytes (must be at least 64 bytes).
@@ -332,7 +335,10 @@ impl Key {
         let mut encryption = [0u8; 32];
         signing.copy_from_slice(&bytes[..32]);
         encryption.copy_from_slice(&bytes[32..64]);
-        Self { signing, encryption }
+        Self {
+            signing,
+            encryption,
+        }
     }
 
     /// Sign a cookie value with HMAC-SHA256.
@@ -673,11 +679,7 @@ mod tests {
             }))
         }));
 
-        let resp = client
-            .get("/")
-            .header("cookie", "token=xyz")
-            .send()
-            .await;
+        let resp = client.get("/").header("cookie", "token=xyz").send().await;
 
         let body: serde_json::Value = resp.json().await;
         assert_eq!(body["has_token"], true);
@@ -736,9 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_site_none_requires_secure() {
-        let cookie = SetCookie::new("x", "1")
-            .same_site(SameSite::None)
-            .secure();
+        let cookie = SetCookie::new("x", "1").same_site(SameSite::None).secure();
         let val = cookie.to_header_value();
         assert!(val.contains("SameSite=None"));
         assert!(val.contains("Secure"));
@@ -1021,11 +1021,9 @@ mod tests {
 
     #[tokio::test]
     async fn signed_jar_without_key_returns_500() {
-        let client = TestClient::new(
-            Router::new().get("/", |jar: SignedCookieJar| async move {
-                jar.get("x").unwrap_or("none").to_string()
-            }),
-        );
+        let client = TestClient::new(Router::new().get("/", |jar: SignedCookieJar| async move {
+            jar.get("x").unwrap_or("none").to_string()
+        }));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1053,11 +1051,7 @@ mod tests {
         let set_cookie = resp.header("set-cookie").unwrap().to_string();
 
         // Extract the cookie value from Set-Cookie header
-        let cookie_val = set_cookie
-            .split(';')
-            .next()
-            .unwrap()
-            .trim();
+        let cookie_val = set_cookie.split(';').next().unwrap().trim();
 
         // Read it back
         let resp = client
@@ -1142,11 +1136,9 @@ mod tests {
 
     #[tokio::test]
     async fn private_jar_without_key_returns_500() {
-        let client = TestClient::new(
-            Router::new().get("/", |jar: PrivateCookieJar| async move {
-                jar.get("x").unwrap_or("none").to_string()
-            }),
-        );
+        let client = TestClient::new(Router::new().get("/", |jar: PrivateCookieJar| async move {
+            jar.get("x").unwrap_or("none").to_string()
+        }));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1192,19 +1184,15 @@ mod tests {
         let signed_value = key.sign("signed-data");
         let encrypted_value = key.encrypt("encrypted", "encrypted-data");
 
-        let client = TestClient::new(
-            Router::new()
-                .state(key)
-                .get(
-                    "/",
-                    |signed: SignedCookieJar, private: PrivateCookieJar| async move {
-                        Json(serde_json::json!({
-                            "signed": signed.get("signed"),
-                            "encrypted": private.get("encrypted"),
-                        }))
-                    },
-                ),
-        );
+        let client = TestClient::new(Router::new().state(key).get(
+            "/",
+            |signed: SignedCookieJar, private: PrivateCookieJar| async move {
+                Json(serde_json::json!({
+                    "signed": signed.get("signed"),
+                    "encrypted": private.get("encrypted"),
+                }))
+            },
+        ));
 
         let resp = client
             .get("/")

@@ -2,8 +2,8 @@
 
 use std::future::Future;
 
-use neutron_grpc::{GrpcRequest, GrpcResponse, GrpcRouter};
 use neutron::handler::Handler;
+use neutron_grpc::{GrpcRequest, GrpcResponse, GrpcRouter};
 
 use crate::codec::RpcMessage;
 use crate::error::RpcError;
@@ -43,7 +43,7 @@ use crate::error::RpcError;
 pub struct RpcServer {
     /// Service package + name, e.g. `"helloworld.Greeter"`.
     service: String,
-    router:  GrpcRouter,
+    router: GrpcRouter,
 }
 
 impl RpcServer {
@@ -52,7 +52,10 @@ impl RpcServer {
     /// `service` is the dotted package + service name used to form the route
     /// path: `/{service}/{Method}`.
     pub fn new(service: impl Into<String>) -> Self {
-        Self { service: service.into(), router: GrpcRouter::new() }
+        Self {
+            service: service.into(),
+            router: GrpcRouter::new(),
+        }
     }
 
     /// Register a typed RPC method.
@@ -62,23 +65,26 @@ impl RpcServer {
     /// (blanket-implemented for all serde types via JSON).
     pub fn method<Req, Resp, F, Fut>(self, name: &str, handler: F) -> Self
     where
-        Req:  RpcMessage,
+        Req: RpcMessage,
         Resp: RpcMessage,
-        F:    Fn(Req) -> Fut + Send + Sync + Clone + 'static,
-        Fut:  Future<Output = Result<Resp, RpcError>> + Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = Result<Resp, RpcError>> + Send + 'static,
     {
-        let path    = format!("/{}/{}", self.service, name);
+        let path = format!("/{}/{}", self.service, name);
         let handler = wrap_handler(handler);
 
         Self {
             service: self.service,
-            router:  self.router.method(&path, handler),
+            router: self.router.method(&path, handler),
         }
     }
 
     /// Register shared state accessible via `State<T>` in RPC handlers.
     pub fn state<T: Send + Sync + 'static>(self, value: T) -> Self {
-        Self { service: self.service, router: self.router.state(value) }
+        Self {
+            service: self.service,
+            router: self.router.state(value),
+        }
     }
 
     /// Consume the builder and produce a [`GrpcRouter`].
@@ -91,21 +97,19 @@ impl RpcServer {
 // Internal: lift typed (Req -> Resp) handler into a GrpcRequest handler
 // ---------------------------------------------------------------------------
 
-fn wrap_handler<Req, Resp, F, Fut>(
-    handler: F,
-) -> impl Handler<(GrpcRequest,)> + Clone + 'static
+fn wrap_handler<Req, Resp, F, Fut>(handler: F) -> impl Handler<(GrpcRequest,)> + Clone + 'static
 where
-    Req:  RpcMessage,
+    Req: RpcMessage,
     Resp: RpcMessage,
-    F:    Fn(Req) -> Fut + Send + Sync + Clone + 'static,
-    Fut:  Future<Output = Result<Resp, RpcError>> + Send + 'static,
+    F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<Resp, RpcError>> + Send + 'static,
 {
     move |GrpcRequest(bytes): GrpcRequest| {
         let handler = handler.clone();
         async move {
             // 1. Decode request.
             let req = match Req::decode(&bytes) {
-                Ok(r)  => r,
+                Ok(r) => r,
                 Err(e) => {
                     return GrpcResponse::error(
                         neutron_grpc::GrpcStatus::InvalidArgument,
@@ -119,7 +123,7 @@ where
                 Ok(resp) => {
                     // 3. Encode response.
                     match resp.encode() {
-                        Ok(bytes)  => GrpcResponse::ok(bytes),
+                        Ok(bytes) => GrpcResponse::ok(bytes),
                         Err(e) => GrpcResponse::error(
                             neutron_grpc::GrpcStatus::Internal,
                             format!("encode error: {}", e.0),
@@ -142,12 +146,18 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, Debug)]
-    struct Req  { name: String }
+    struct Req {
+        name: String,
+    }
     #[derive(Serialize, Deserialize, Debug)]
-    struct Resp { greeting: String }
+    struct Resp {
+        greeting: String,
+    }
 
     async fn greet(req: Req) -> Result<Resp, RpcError> {
-        Ok(Resp { greeting: format!("Hello, {}!", req.name) })
+        Ok(Resp {
+            greeting: format!("Hello, {}!", req.name),
+        })
     }
 
     async fn always_fails(_req: Req) -> Result<Resp, RpcError> {
@@ -170,21 +180,27 @@ mod tests {
     }
 
     fn ok_or_panic<T>(r: Result<T, neutron::handler::Response>, msg: &str) -> T {
-        match r { Ok(v) => v, Err(resp) => panic!("{msg}: HTTP {}", resp.status()) }
+        match r {
+            Ok(v) => v,
+            Err(resp) => panic!("{msg}: HTTP {}", resp.status()),
+        }
     }
 
     #[tokio::test]
     async fn wrapped_handler_ok_path() {
-        use neutron_grpc::body::frame_message;
-        use neutron::handler::{IntoResponse, Request};
-        use neutron::extract::FromRequest;
-        use http::{HeaderMap, Method};
         use bytes::Bytes;
+        use http::{HeaderMap, Method};
         use http_body_util::BodyExt;
+        use neutron::extract::FromRequest;
+        use neutron::handler::{IntoResponse, Request};
+        use neutron_grpc::body::frame_message;
 
         // Build a synthetic gRPC HTTP request.
-        let req_body = serde_json::to_vec(&Req { name: "world".to_string() }).unwrap();
-        let framed   = frame_message(Bytes::from(req_body));
+        let req_body = serde_json::to_vec(&Req {
+            name: "world".to_string(),
+        })
+        .unwrap();
+        let framed = frame_message(Bytes::from(req_body));
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/grpc".parse().unwrap());
         let mut http_req = Request::new(Method::POST, "/".parse().unwrap(), headers, framed);
@@ -193,42 +209,45 @@ mod tests {
         let GrpcRequest(bytes) =
             ok_or_panic(GrpcRequest::from_request(&mut http_req).await, "extract");
 
-        let req: Req  = Req::decode(&bytes).unwrap();
+        let req: Req = Req::decode(&bytes).unwrap();
         let resp: Resp = greet(req).await.unwrap();
-        let encoded    = resp.encode().unwrap();
-        let grpc_resp  = GrpcResponse::ok(encoded);
+        let encoded = resp.encode().unwrap();
+        let grpc_resp = GrpcResponse::ok(encoded);
 
         // Verify the response has grpc-status: 0 trailer.
         let http_resp = grpc_resp.into_response();
         let collected = http_resp.into_body().collect().await.unwrap();
-        let trailers  = collected.trailers().cloned().unwrap_or_default();
+        let trailers = collected.trailers().cloned().unwrap_or_default();
         assert_eq!(trailers.get("grpc-status").unwrap(), "0");
     }
 
     #[tokio::test]
     async fn wrapped_handler_error_path() {
-        use neutron_grpc::body::frame_message;
-        use neutron::handler::{IntoResponse, Request};
-        use neutron::extract::FromRequest;
-        use http::{HeaderMap, Method};
         use bytes::Bytes;
+        use http::{HeaderMap, Method};
         use http_body_util::BodyExt;
+        use neutron::extract::FromRequest;
+        use neutron::handler::{IntoResponse, Request};
+        use neutron_grpc::body::frame_message;
 
-        let req_body = serde_json::to_vec(&Req { name: "nobody".to_string() }).unwrap();
-        let framed   = frame_message(Bytes::from(req_body));
+        let req_body = serde_json::to_vec(&Req {
+            name: "nobody".to_string(),
+        })
+        .unwrap();
+        let framed = frame_message(Bytes::from(req_body));
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/grpc".parse().unwrap());
         let mut http_req = Request::new(Method::POST, "/".parse().unwrap(), headers, framed);
 
         let GrpcRequest(bytes) =
             ok_or_panic(GrpcRequest::from_request(&mut http_req).await, "extract");
-        let req: Req    = Req::decode(&bytes).unwrap();
-        let rpc_err     = always_fails(req).await.unwrap_err();
-        let grpc_resp   = GrpcResponse::error(rpc_err.status, rpc_err.message);
+        let req: Req = Req::decode(&bytes).unwrap();
+        let rpc_err = always_fails(req).await.unwrap_err();
+        let grpc_resp = GrpcResponse::error(rpc_err.status, rpc_err.message);
 
         let http_resp = grpc_resp.into_response();
         let collected = http_resp.into_body().collect().await.unwrap();
-        let trailers  = collected.trailers().cloned().unwrap_or_default();
+        let trailers = collected.trailers().cloned().unwrap_or_default();
         assert_eq!(trailers.get("grpc-status").unwrap(), "5"); // NotFound
     }
 }

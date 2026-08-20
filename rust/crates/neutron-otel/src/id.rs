@@ -3,18 +3,36 @@ use rand::random;
 /// Generate a random 128-bit trace ID.
 pub fn random_trace_id() -> [u8; 16] {
     [
-        random::<u8>(), random::<u8>(), random::<u8>(), random::<u8>(),
-        random::<u8>(), random::<u8>(), random::<u8>(), random::<u8>(),
-        random::<u8>(), random::<u8>(), random::<u8>(), random::<u8>(),
-        random::<u8>(), random::<u8>(), random::<u8>(), random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
     ]
 }
 
 /// Generate a random 64-bit span ID.
 pub fn random_span_id() -> [u8; 8] {
     [
-        random::<u8>(), random::<u8>(), random::<u8>(), random::<u8>(),
-        random::<u8>(), random::<u8>(), random::<u8>(), random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
+        random::<u8>(),
     ]
 }
 

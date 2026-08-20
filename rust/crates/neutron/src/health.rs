@@ -153,11 +153,8 @@ impl HealthCheck {
     /// Does not run custom checks.
     pub fn liveness(
         &self,
-    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>>
-           + Clone
-           + Send
-           + Sync
-           + 'static {
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
+    {
         || {
             Box::pin(async {
                 let body = serde_json::to_vec(&HealthResponse {
@@ -180,11 +177,8 @@ impl HealthCheck {
     /// Runs all registered checks. Returns 200 if all pass, 503 if any fail.
     pub fn readiness(
         &self,
-    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>>
-           + Clone
-           + Send
-           + Sync
-           + 'static {
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
+    {
         let checks: Vec<(String, CheckFn)> = self
             .checks
             .iter()
@@ -201,8 +195,7 @@ impl HealthCheck {
 
                 for (name, check_fn) in &checks {
                     let start = Instant::now();
-                    let result =
-                        tokio::time::timeout(timeout, check_fn()).await;
+                    let result = tokio::time::timeout(timeout, check_fn()).await;
                     let duration_ms = start.elapsed().as_millis() as u64;
 
                     match result {
@@ -338,9 +331,7 @@ mod tests {
     #[tokio::test]
     async fn liveness_returns_200() {
         let health = HealthCheck::new();
-        let client = TestClient::new(
-            Router::new().get("/healthz", health.liveness()),
-        );
+        let client = TestClient::new(Router::new().get("/healthz", health.liveness()));
 
         let resp = client.get("/healthz").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -353,13 +344,9 @@ mod tests {
 
     #[tokio::test]
     async fn liveness_always_200_regardless_of_checks() {
-        let health = HealthCheck::new().check("failing", || async {
-            Err("down".to_string())
-        });
+        let health = HealthCheck::new().check("failing", || async { Err("down".to_string()) });
 
-        let client = TestClient::new(
-            Router::new().get("/healthz", health.liveness()),
-        );
+        let client = TestClient::new(Router::new().get("/healthz", health.liveness()));
 
         // Liveness doesn't run checks — always 200
         let resp = client.get("/healthz").send().await;
@@ -372,9 +359,7 @@ mod tests {
             .check("db", || async { Ok(()) })
             .check("cache", || async { Ok(()) });
 
-        let client = TestClient::new(
-            Router::new().get("/readyz", health.readiness()),
-        );
+        let client = TestClient::new(Router::new().get("/readyz", health.readiness()));
 
         let resp = client.get("/readyz").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -390,13 +375,9 @@ mod tests {
     async fn readiness_one_fails_returns_503() {
         let health = HealthCheck::new()
             .check("db", || async { Ok(()) })
-            .check("cache", || async {
-                Err("connection refused".to_string())
-            });
+            .check("cache", || async { Err("connection refused".to_string()) });
 
-        let client = TestClient::new(
-            Router::new().get("/readyz", health.readiness()),
-        );
+        let client = TestClient::new(Router::new().get("/readyz", health.readiness()));
 
         let resp = client.get("/readyz").send().await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -412,9 +393,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_no_checks_returns_200() {
         let health = HealthCheck::new();
-        let client = TestClient::new(
-            Router::new().get("/readyz", health.readiness()),
-        );
+        let client = TestClient::new(Router::new().get("/readyz", health.readiness()));
 
         let resp = client.get("/readyz").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -431,9 +410,7 @@ mod tests {
             Ok(())
         });
 
-        let client = TestClient::new(
-            Router::new().get("/readyz", health.readiness()),
-        );
+        let client = TestClient::new(Router::new().get("/readyz", health.readiness()));
 
         let resp = client.get("/readyz").send().await;
         let body = resp.text().await;
@@ -445,16 +422,15 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_check_timeout() {
-        let health = HealthCheck::new()
-            .timeout(Duration::from_millis(50))
-            .check("stuck", || async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                Ok(())
-            });
+        let health =
+            HealthCheck::new()
+                .timeout(Duration::from_millis(50))
+                .check("stuck", || async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(())
+                });
 
-        let client = TestClient::new(
-            Router::new().get("/readyz", health.readiness()),
-        );
+        let client = TestClient::new(Router::new().get("/readyz", health.readiness()));
 
         let resp = client.get("/readyz").send().await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -467,8 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn both_endpoints_on_same_router() {
-        let health = HealthCheck::new()
-            .check("db", || async { Ok(()) });
+        let health = HealthCheck::new().check("db", || async { Ok(()) });
 
         let client = TestClient::new(
             Router::new()
@@ -487,8 +462,7 @@ mod tests {
     #[tokio::test]
     async fn health_contract_shape() {
         let health = HealthCheck::new();
-        let client =
-            TestClient::new(Router::new().get("/health", health.contract(None, "9.9.9")));
+        let client = TestClient::new(Router::new().get("/health", health.contract(None, "9.9.9")));
 
         let resp = client.get("/health").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -496,7 +470,11 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&resp.text().await).unwrap();
         let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.len(), 3, "contract /health must have exactly 3 keys, got {obj:?}");
+        assert_eq!(
+            obj.len(),
+            3,
+            "contract /health must have exactly 3 keys, got {obj:?}"
+        );
         assert_eq!(parsed["status"], "ok");
         assert_eq!(parsed["nucleus"], "unconfigured");
         assert_eq!(parsed["version"], "9.9.9");
@@ -506,9 +484,8 @@ mod tests {
     async fn health_connected_when_probe_passes() {
         let probe: CheckFn = Arc::new(|| Box::pin(async { Ok(()) }));
         let health = HealthCheck::new();
-        let client = TestClient::new(
-            Router::new().get("/health", health.contract(Some(probe), "9.9.9")),
-        );
+        let client =
+            TestClient::new(Router::new().get("/health", health.contract(Some(probe), "9.9.9")));
 
         let resp = client.get("/health").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -522,9 +499,8 @@ mod tests {
         let probe: CheckFn =
             Arc::new(|| Box::pin(async { Err::<(), String>("connection refused".into()) }));
         let health = HealthCheck::new();
-        let client = TestClient::new(
-            Router::new().get("/health", health.contract(Some(probe), "9.9.9")),
-        );
+        let client =
+            TestClient::new(Router::new().get("/health", health.contract(Some(probe), "9.9.9")));
 
         let resp = client.get("/health").send().await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);

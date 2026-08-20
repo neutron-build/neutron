@@ -48,7 +48,12 @@ const DURATION_BUCKETS: &[f64] = &[
 
 /// Default response size histogram buckets (in bytes).
 const SIZE_BUCKETS: &[f64] = &[
-    100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0,
+    100.0,
+    1_000.0,
+    10_000.0,
+    100_000.0,
+    1_000_000.0,
+    10_000_000.0,
 ];
 
 // ---------------------------------------------------------------------------
@@ -201,9 +206,7 @@ impl MetricsStore {
         }
 
         // http_requests_in_flight
-        out.push_str(
-            "# HELP http_requests_in_flight Current number of in-flight HTTP requests.\n",
-        );
+        out.push_str("# HELP http_requests_in_flight Current number of in-flight HTTP requests.\n");
         out.push_str("# TYPE http_requests_in_flight gauge\n");
         out.push_str(&format!(
             "http_requests_in_flight {}\n",
@@ -211,9 +214,7 @@ impl MetricsStore {
         ));
 
         // http_request_duration_seconds
-        out.push_str(
-            "# HELP http_request_duration_seconds HTTP request duration in seconds.\n",
-        );
+        out.push_str("# HELP http_request_duration_seconds HTTP request duration in seconds.\n");
         out.push_str("# TYPE http_request_duration_seconds histogram\n");
         {
             let histograms = self.duration_histograms.lock().unwrap();
@@ -309,7 +310,10 @@ impl Metrics {
     /// Get a handler function that serves the `/metrics` endpoint.
     ///
     /// Returns metrics in Prometheus text exposition format.
-    pub fn handler(&self) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static {
+    pub fn handler(
+        &self,
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
+    {
         let store = Arc::clone(&self.store);
         move || {
             let store = Arc::clone(&store);
@@ -317,10 +321,7 @@ impl Metrics {
                 let body = store.render();
                 http::Response::builder()
                     .status(StatusCode::OK)
-                    .header(
-                        "content-type",
-                        "text/plain; version=0.0.4; charset=utf-8",
-                    )
+                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
                     .body(Body::full(body))
                     .unwrap()
             })
@@ -410,9 +411,7 @@ mod tests {
         client.get("/").send().await;
 
         let output = metrics.render();
-        assert!(output.contains(
-            r#"http_requests_total{method="GET",path="/",status="200"} 3"#
-        ));
+        assert!(output.contains(r#"http_requests_total{method="GET",path="/",status="200"} 3"#));
     }
 
     #[tokio::test]
@@ -423,12 +422,12 @@ mod tests {
         client.post("/api/data").send().await;
 
         let output = metrics.render();
-        assert!(output.contains(
-            r#"http_requests_total{method="GET",path="/api/data",status="200"}"#
-        ));
-        assert!(output.contains(
-            r#"http_requests_total{method="POST",path="/api/data",status="201"}"#
-        ));
+        assert!(
+            output.contains(r#"http_requests_total{method="GET",path="/api/data",status="200"}"#)
+        );
+        assert!(
+            output.contains(r#"http_requests_total{method="POST",path="/api/data",status="201"}"#)
+        );
     }
 
     #[tokio::test]

@@ -47,6 +47,23 @@ jobs:
       - name: Build size
         run: sh nucleus/scripts/report-build-size.sh --report-only
 
+  # rustfmt could not be gated before 2026-08-19: `cargo fmt --check` reported
+  # 991 diffs, almost all of them from files stored with CRLF, and running the
+  # formatter produced a 140-file diff that had to be discarded by hand every
+  # time an unrelated change touched this tree. With line endings normalised
+  # repo-wide the formatter's output is stable, so it is formatted once and
+  # gated here — a formatter without a gate drifts straight back.
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+        working-directory: rust
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

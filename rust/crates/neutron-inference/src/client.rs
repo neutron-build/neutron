@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 use http::{Method, Request as HyperRequest};
 use http_body_util::{BodyExt, Full};
-use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
+use hyper_util::client::legacy::{connect::HttpConnector, Client as HyperClient};
 use hyper_util::rt::TokioExecutor;
 use tokio_stream::StreamExt;
 
@@ -22,9 +22,9 @@ use crate::response::{InferenceChunk, InferenceResponse};
 #[derive(Debug, Clone)]
 pub struct InferenceClientConfig {
     /// Base URL of the inference server (e.g. `http://127.0.0.1:8080`).
-    pub base_url:    String,
+    pub base_url: String,
     /// Path for non-streaming requests (default: `/inference`).
-    pub infer_path:  String,
+    pub infer_path: String,
     /// Path for streaming requests (default: `/inference/stream`).
     pub stream_path: String,
 }
@@ -32,8 +32,8 @@ pub struct InferenceClientConfig {
 impl Default for InferenceClientConfig {
     fn default() -> Self {
         Self {
-            base_url:    "http://127.0.0.1:8080".to_string(),
-            infer_path:  "/inference".to_string(),
+            base_url: "http://127.0.0.1:8080".to_string(),
+            infer_path: "/inference".to_string(),
             stream_path: "/inference/stream".to_string(),
         }
     }
@@ -67,7 +67,7 @@ impl Default for InferenceClientConfig {
 #[derive(Clone)]
 pub struct InferenceClient {
     config: InferenceClientConfig,
-    http:   HyperClient<HttpConnector, Full<Bytes>>,
+    http: HyperClient<HttpConnector, Full<Bytes>>,
 }
 
 impl InferenceClient {
@@ -78,11 +78,8 @@ impl InferenceClient {
     }
 
     /// Send a non-streaming inference request and collect the full response.
-    pub async fn complete(
-        &self,
-        req: InferenceRequest,
-    ) -> Result<InferenceResponse, InferError> {
-        let url  = format!("{}{}", self.config.base_url, self.config.infer_path);
+    pub async fn complete(&self, req: InferenceRequest) -> Result<InferenceResponse, InferError> {
+        let url = format!("{}{}", self.config.base_url, self.config.infer_path);
         let body = serde_json::to_vec(&req).map_err(InferError::Json)?;
 
         let http_req = HyperRequest::builder()
@@ -99,7 +96,7 @@ impl InferenceClient {
             .map_err(|e| InferError::Http(e.to_string()))?;
 
         let status = resp.status();
-        let bytes  = resp
+        let bytes = resp
             .into_body()
             .collect()
             .await
@@ -123,10 +120,13 @@ impl InferenceClient {
         &self,
         req: InferenceRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<InferenceChunk, InferError>> + Send>> {
-        let req  = InferenceRequest { stream: true, ..req };
-        let url  = format!("{}{}", self.config.base_url, self.config.stream_path);
+        let req = InferenceRequest {
+            stream: true,
+            ..req
+        };
+        let url = format!("{}{}", self.config.base_url, self.config.stream_path);
         let body = match serde_json::to_vec(&req) {
-            Ok(b)  => b,
+            Ok(b) => b,
             Err(e) => {
                 return Box::pin(futures_util::stream::once(async move {
                     Err(InferError::Json(e))
@@ -140,7 +140,7 @@ impl InferenceClient {
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(body)))
         {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 return Box::pin(futures_util::stream::once(async move {
                     Err(InferError::Http(e.to_string()))
@@ -151,7 +151,7 @@ impl InferenceClient {
         let result = self.http.request(http_req).await;
 
         let resp = match result {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 return Box::pin(futures_util::stream::once(async move {
                     Err(InferError::Http(e.to_string()))
@@ -161,7 +161,10 @@ impl InferenceClient {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let bytes = resp.into_body().collect().await
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
             let msg = String::from_utf8_lossy(&bytes).into_owned();
@@ -273,13 +276,9 @@ mod tests {
             "data: {\"delta\":\" world\",\"done\":true,\"finish_reason\":\"stop\"}\n\n",
         );
 
-        let byte_stream = stream::once(async {
-            Ok::<_, InferError>(Bytes::from(frames))
-        });
+        let byte_stream = stream::once(async { Ok::<_, InferError>(Bytes::from(frames)) });
 
-        let chunks: Vec<_> = parse_sse_stream(byte_stream)
-            .collect::<Vec<_>>()
-            .await;
+        let chunks: Vec<_> = parse_sse_stream(byte_stream).collect::<Vec<_>>().await;
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].as_ref().unwrap().delta, "Hello");
@@ -291,9 +290,7 @@ mod tests {
         use futures_util::stream;
 
         let frames = "data: [DONE]\n\n";
-        let byte_stream = stream::once(async {
-            Ok::<_, InferError>(Bytes::from(frames))
-        });
+        let byte_stream = stream::once(async { Ok::<_, InferError>(Bytes::from(frames)) });
         let chunks: Vec<_> = parse_sse_stream(byte_stream).collect::<Vec<_>>().await;
         assert!(chunks.is_empty());
     }

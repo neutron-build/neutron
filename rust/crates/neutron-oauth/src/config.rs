@@ -13,36 +13,33 @@
 /// ```
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
-    pub client_id:     String,
+    pub client_id: String,
     pub client_secret: String,
     /// Provider's authorization endpoint (browser redirect target).
-    pub auth_url:      String,
+    pub auth_url: String,
     /// Provider's token endpoint (server-to-server code exchange).
-    pub token_url:     String,
+    pub token_url: String,
     /// Provider's userinfo endpoint (optional; some providers embed claims in the ID token).
-    pub userinfo_url:  Option<String>,
+    pub userinfo_url: Option<String>,
     /// The registered redirect URI that the provider will call back on.
-    pub redirect_uri:  String,
+    pub redirect_uri: String,
     /// Scopes to request (e.g. `["openid", "profile", "email"]`).
-    pub scopes:        Vec<String>,
+    pub scopes: Vec<String>,
     /// Secret used to HMAC-sign the state cookie (at least 32 bytes recommended).
     pub(crate) secret: Vec<u8>,
 }
 
 impl OAuthConfig {
-    pub fn new(
-        auth_url:  impl Into<String>,
-        token_url: impl Into<String>,
-    ) -> Self {
+    pub fn new(auth_url: impl Into<String>, token_url: impl Into<String>) -> Self {
         Self {
-            client_id:    String::new(),
+            client_id: String::new(),
             client_secret: String::new(),
-            auth_url:     auth_url.into(),
-            token_url:    token_url.into(),
+            auth_url: auth_url.into(),
+            token_url: token_url.into(),
             userinfo_url: None,
             redirect_uri: String::new(),
-            scopes:       Vec::new(),
-            secret:       Vec::new(),
+            scopes: Vec::new(),
+            secret: Vec::new(),
         }
     }
 
@@ -83,17 +80,13 @@ impl OAuthConfig {
     }
 
     /// Build the authorization URL to redirect the browser to.
-    pub(crate) fn authorization_url(
-        &self,
-        state:     &str,
-        challenge: &str,
-    ) -> String {
+    pub(crate) fn authorization_url(&self, state: &str, challenge: &str) -> String {
         let scopes = self.scopes.join(" ");
-        let scope_enc  = url_encode(&scopes);
-        let redir_enc  = url_encode(&self.redirect_uri);
-        let state_enc  = url_encode(state);
-        let chall_enc  = url_encode(challenge);
-        let cid_enc    = url_encode(&self.client_id);
+        let scope_enc = url_encode(&scopes);
+        let redir_enc = url_encode(&self.redirect_uri);
+        let state_enc = url_encode(state);
+        let chall_enc = url_encode(challenge);
+        let cid_enc = url_encode(&self.client_id);
 
         format!(
             "{}?response_type=code\
@@ -161,8 +154,9 @@ pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -215,10 +209,13 @@ mod tests {
 
     #[test]
     fn authorization_url_contains_all_params() {
-        let cfg = OAuthConfig::new("https://auth.example.com/oauth", "https://token.example.com")
-            .client_id("cid")
-            .redirect_uri("https://app.example.com/cb")
-            .scope("openid");
+        let cfg = OAuthConfig::new(
+            "https://auth.example.com/oauth",
+            "https://token.example.com",
+        )
+        .client_id("cid")
+        .redirect_uri("https://app.example.com/cb")
+        .scope("openid");
 
         let url = cfg.authorization_url("mystate", "mychallenge");
         assert!(url.contains("response_type=code"));

@@ -13,10 +13,10 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 #[cfg(feature = "openapi")]
 use std::collections::HashSet;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -219,12 +219,12 @@ fn wrap_handler_with_chain(
 #[cfg(feature = "openapi")]
 fn method_kind_to_str(kind: MethodKind) -> &'static str {
     match kind {
-        MethodKind::Get     => "get",
-        MethodKind::Post    => "post",
-        MethodKind::Put     => "put",
-        MethodKind::Delete  => "delete",
-        MethodKind::Patch   => "patch",
-        MethodKind::Head    => "head",
+        MethodKind::Get => "get",
+        MethodKind::Post => "post",
+        MethodKind::Put => "put",
+        MethodKind::Delete => "delete",
+        MethodKind::Patch => "patch",
+        MethodKind::Head => "head",
         MethodKind::Options => "options",
     }
 }
@@ -408,7 +408,11 @@ impl<S> Router<S> {
         self.pending
             .entry(matchit_path)
             .or_default()
-            .push(PendingRoute { method, handler: boxed, from_nest: false });
+            .push(PendingRoute {
+                method,
+                handler: boxed,
+                from_nest: false,
+            });
         #[cfg(feature = "openapi")]
         self.registered_routes
             .push((method_kind_to_str(method).to_string(), path.to_string()));
@@ -491,7 +495,11 @@ impl<S> Router<S> {
                 self.pending
                     .entry(matchit_path.clone())
                     .or_default()
-                    .push(PendingRoute { method: kind, handler: forwarding, from_nest: true });
+                    .push(PendingRoute {
+                        method: kind,
+                        handler: forwarding,
+                        from_nest: true,
+                    });
                 #[cfg(feature = "openapi")]
                 self.registered_routes
                     .push((method_kind_to_str(kind).to_string(), path.to_string()));
@@ -542,7 +550,11 @@ impl<S> Router<S> {
             self.pending
                 .entry(matchit_path.clone())
                 .or_default()
-                .push(PendingRoute { method: kind, handler, from_nest: false });
+                .push(PendingRoute {
+                    method: kind,
+                    handler,
+                    from_nest: false,
+                });
             #[cfg(feature = "openapi")]
             self.registered_routes
                 .push((method_kind_to_str(kind).to_string(), path.to_string()));
@@ -576,12 +588,17 @@ impl<S> Router<S> {
     fn route_all_boxed(mut self, path: &str, boxed: Arc<BoxedHandler>) -> Self {
         let matchit_path = to_matchit_path(path);
         for kind in MethodKind::ALL {
-            let forwarding: BoxedHandler =
-                Box::new(ForwardingHandler { inner: Arc::clone(&boxed) });
+            let forwarding: BoxedHandler = Box::new(ForwardingHandler {
+                inner: Arc::clone(&boxed),
+            });
             self.pending
                 .entry(matchit_path.clone())
                 .or_default()
-                .push(PendingRoute { method: kind, handler: forwarding, from_nest: true });
+                .push(PendingRoute {
+                    method: kind,
+                    handler: forwarding,
+                    from_nest: true,
+                });
             #[cfg(feature = "openapi")]
             self.registered_routes
                 .push((method_kind_to_str(kind).to_string(), path.to_string()));
@@ -675,7 +692,8 @@ impl<S> Router<S> {
 
         // 2. Logging.
         #[cfg(feature = "logging")]
-        self.middlewares.push(Arc::new(crate::logger::Logger::new()));
+        self.middlewares
+            .push(Arc::new(crate::logger::Logger::new()));
 
         // 3. Recovery — catch panics and convert to a 500 problem+json.
         #[cfg(feature = "catch-panic")]
@@ -776,13 +794,14 @@ impl<S> Router<S> {
     /// ```
     pub fn openapi(&self, title: &str, version: &str) -> crate::openapi::OpenApi {
         let mut all_registered: Vec<(String, String)> = Vec::new();
-        let mut all_docs: Vec<crate::openapi::ApiRoute>  = Vec::new();
+        let mut all_docs: Vec<crate::openapi::ApiRoute> = Vec::new();
         self.collect_openapi_routes("", &mut all_registered, &mut all_docs);
 
         let mut spec = crate::openapi::OpenApi::new(title, version);
 
         // Build a lookup of explicitly documented (method, path) pairs.
-        let documented: HashSet<(String, String)> = all_docs.iter()
+        let documented: HashSet<(String, String)> = all_docs
+            .iter()
             .map(|r| (r.method().to_string(), r.path().to_string()))
             .collect();
 
@@ -893,7 +912,11 @@ impl<S> Router<S> {
             let sub_pending = std::mem::take(&mut sub.pending);
             for (path, routes) in sub_pending {
                 let full_path = if path == "/" {
-                    if prefix_str.is_empty() { "/".to_string() } else { prefix_str.to_string() }
+                    if prefix_str.is_empty() {
+                        "/".to_string()
+                    } else {
+                        prefix_str.to_string()
+                    }
                 } else {
                     format!("{prefix_str}{path}")
                 };
@@ -1059,7 +1082,9 @@ pub struct MethodRouter {
 impl MethodRouter {
     /// Create an empty `MethodRouter`. Prefer the [`get`]/[`post`]/… free fns.
     pub fn new() -> Self {
-        Self { handlers: Vec::new() }
+        Self {
+            handlers: Vec::new(),
+        }
     }
 
     fn with<H, T>(mut self, method: MethodKind, handler: H) -> Self
@@ -1264,10 +1289,12 @@ where
             }
             let http_req = match builder.body(Body::full(body)) {
                 Ok(r) => r,
-                Err(_) => return crate::error::AppError::internal(
-                    "Failed to reconstruct request for nested service.",
-                )
-                .into_response(),
+                Err(_) => {
+                    return crate::error::AppError::internal(
+                        "Failed to reconstruct request for nested service.",
+                    )
+                    .into_response()
+                }
             };
             // poll_ready then call; Error is Infallible so unwrap is total.
             std::future::poll_fn(|cx| service.poll_ready(cx))
@@ -1345,16 +1372,9 @@ impl tower_service::Service<http::Request<Body>> for RouterService {
             // P1.2: pass the body through as a lazy stream. The response `Body`'s
             // error type is `Infallible`, so the boxed `ReqBody` error is the
             // never type (the map closure is never invoked).
-            let boxed: ReqBody = Box::pin(
-                body.map_err(|e: std::convert::Infallible| match e {}),
-            );
-            let neutron_req = Request::with_streaming_state(
-                parts.method,
-                parts.uri,
-                parts.headers,
-                boxed,
-                state,
-            );
+            let boxed: ReqBody = Box::pin(body.map_err(|e: std::convert::Infallible| match e {}));
+            let neutron_req =
+                Request::with_streaming_state(parts.method, parts.uri, parts.headers, boxed, state);
             Ok(dispatch(neutron_req).await)
         })
     }
@@ -1476,11 +1496,26 @@ mod tests {
                 .patch("/res", || async { "PATCH" }),
         );
 
-        assert_eq!(body_of(r.resolve(&Method::GET, "/res").unwrap().handler).await, "GET");
-        assert_eq!(body_of(r.resolve(&Method::POST, "/res").unwrap().handler).await, "POST");
-        assert_eq!(body_of(r.resolve(&Method::PUT, "/res").unwrap().handler).await, "PUT");
-        assert_eq!(body_of(r.resolve(&Method::DELETE, "/res").unwrap().handler).await, "DELETE");
-        assert_eq!(body_of(r.resolve(&Method::PATCH, "/res").unwrap().handler).await, "PATCH");
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/res").unwrap().handler).await,
+            "GET"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::POST, "/res").unwrap().handler).await,
+            "POST"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::PUT, "/res").unwrap().handler).await,
+            "PUT"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::DELETE, "/res").unwrap().handler).await,
+            "DELETE"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::PATCH, "/res").unwrap().handler).await,
+            "PATCH"
+        );
     }
 
     #[test]
@@ -1586,7 +1621,12 @@ mod tests {
 
         let resp = svc.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
-        let allow = resp.headers().get(http::header::ALLOW).unwrap().to_str().unwrap();
+        let allow = resp
+            .headers()
+            .get(http::header::ALLOW)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(allow.contains("GET"), "Allow header was {allow:?}");
     }
 
@@ -1636,7 +1676,9 @@ mod tests {
         let inner = Router::<()>::new()
             .post("/echo", |body: String| async move { body })
             .into_service();
-        let app = Router::<()>::new().nest_service("/svc", inner).into_service();
+        let app = Router::<()>::new()
+            .nest_service("/svc", inner)
+            .into_service();
 
         let req = http::Request::builder()
             .method(Method::POST)
@@ -1694,7 +1736,10 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(allow.contains("GET") && allow.contains("POST"), "Allow: {allow}");
+        assert!(
+            allow.contains("GET") && allow.contains("POST"),
+            "Allow: {allow}"
+        );
     }
 
     // P1.4: default_stack installs the contract middleware and dispatch works.
@@ -1787,7 +1832,9 @@ mod tests {
     async fn not_found_is_problem_json() {
         use tower::ServiceExt;
 
-        let svc = Router::<()>::new().get("/x", || async { "x" }).into_service();
+        let svc = Router::<()>::new()
+            .get("/x", || async { "x" })
+            .into_service();
         let req = http::Request::builder()
             .method(Method::GET)
             .uri("/nope")
@@ -1810,7 +1857,9 @@ mod tests {
     async fn method_not_allowed_is_problem_json_with_allow() {
         use tower::ServiceExt;
 
-        let svc = Router::<()>::new().get("/x", || async { "x" }).into_service();
+        let svc = Router::<()>::new()
+            .get("/x", || async { "x" })
+            .into_service();
         let req = http::Request::builder()
             .method(Method::DELETE)
             .uri("/x")
@@ -1846,7 +1895,10 @@ mod tests {
             .get("/", || async { "ok" })
             .into_service();
 
-        let req = http::Request::builder().uri("/").body(Body::empty()).unwrap();
+        let req = http::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
         let resp = svc.oneshot(req).await.unwrap();
         assert_eq!(resp.headers().get("x-mw").unwrap(), "1");
     }
@@ -1857,7 +1909,9 @@ mod tests {
     async fn router_service_composes_with_tower_layer() {
         use tower::{ServiceBuilder, ServiceExt};
 
-        let router = Router::<()>::new().get("/", || async { "ok" }).into_service();
+        let router = Router::<()>::new()
+            .get("/", || async { "ok" })
+            .into_service();
         let svc = ServiceBuilder::new()
             .map_response(|mut resp: Response| {
                 resp.headers_mut()
@@ -1866,7 +1920,10 @@ mod tests {
             })
             .service(router);
 
-        let req = http::Request::builder().uri("/").body(Body::empty()).unwrap();
+        let req = http::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
         let resp = svc.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::OK);
         assert_eq!(resp.headers().get("x-wrapped").unwrap(), "1");
@@ -1912,7 +1969,8 @@ mod tests {
 
     #[test]
     fn param_preserves_names() {
-        let r = build(Router::<()>::new().get("/teams/:team_id/members/:member_id", || async { "m" }));
+        let r =
+            build(Router::<()>::new().get("/teams/:team_id/members/:member_id", || async { "m" }));
         let m = r.resolve(&Method::GET, "/teams/alpha/members/42").unwrap();
         assert_eq!(m.params[0], ("team_id".into(), "alpha".into()));
         assert_eq!(m.params[1], ("member_id".into(), "42".into()));
@@ -1998,8 +2056,14 @@ mod tests {
                 .get("/x/:id", || async { "PARAM" }),
         );
 
-        assert_eq!(body_of(r.resolve(&Method::GET, "/x/known").unwrap().handler).await, "STATIC");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/x/other").unwrap().handler).await, "PARAM");
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/x/known").unwrap().handler).await,
+            "STATIC"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/x/other").unwrap().handler).await,
+            "PARAM"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2113,7 +2177,13 @@ mod tests {
                 .get("/e", || async { "e" }),
         );
 
-        for (path, expected) in [("/a","a"),("/b","b"),("/c","c"),("/d","d"),("/e","e")] {
+        for (path, expected) in [
+            ("/a", "a"),
+            ("/b", "b"),
+            ("/c", "c"),
+            ("/d", "d"),
+            ("/e", "e"),
+        ] {
             let m = r.resolve(&Method::GET, path).unwrap();
             assert_eq!(body_of(m.handler).await, expected, "mismatch for {path}");
         }
@@ -2128,9 +2198,18 @@ mod tests {
                 .get("/api/health", || async { "health" }),
         );
 
-        assert_eq!(body_of(r.resolve(&Method::GET, "/api/users").unwrap().handler).await, "users");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/api/posts").unwrap().handler).await, "posts");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/api/health").unwrap().handler).await, "health");
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/api/users").unwrap().handler).await,
+            "users"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/api/posts").unwrap().handler).await,
+            "posts"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/api/health").unwrap().handler).await,
+            "health"
+        );
     }
 
     #[test]
@@ -2207,9 +2286,7 @@ mod tests {
     #[test]
     fn multiple_state_types() {
         let r = Router::<()>::new()
-            .state(TestConfig {
-                name: "app".into(),
-            })
+            .state(TestConfig { name: "app".into() })
             .state(42u64);
 
         assert!(r.state_map.contains_key(&TypeId::of::<TestConfig>()));
@@ -2288,7 +2365,8 @@ mod tests {
         use http::StatusCode;
 
         // No state registered — extraction should fail with 500.
-        let r = build(Router::<()>::new().get("/", |State(_c): State<TestConfig>| async { "nope" }));
+        let r =
+            build(Router::<()>::new().get("/", |State(_c): State<TestConfig>| async { "nope" }));
 
         let m = r.resolve(&Method::GET, "/").unwrap();
         let req = test_req(); // no state injected
@@ -2345,9 +2423,18 @@ mod tests {
                 .nest("/api", api),
         );
 
-        assert_eq!(body_of(r.resolve(&Method::GET, "/").unwrap().handler).await, "root");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/api/users").unwrap().handler).await, "list_users");
-        assert_eq!(body_of(r.resolve(&Method::POST, "/api/users").unwrap().handler).await, "create_user");
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/").unwrap().handler).await,
+            "root"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/api/users").unwrap().handler).await,
+            "list_users"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::POST, "/api/users").unwrap().handler).await,
+            "create_user"
+        );
     }
 
     #[tokio::test]
@@ -2486,10 +2573,22 @@ mod tests {
                 .nest("/posts", posts),
         );
 
-        assert_eq!(body_of(r.resolve(&Method::GET, "/users").unwrap().handler).await, "list_users");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/users/5").unwrap().handler).await, "get_user");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/posts").unwrap().handler).await, "list_posts");
-        assert_eq!(body_of(r.resolve(&Method::POST, "/posts").unwrap().handler).await, "create_post");
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/users").unwrap().handler).await,
+            "list_users"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/users/5").unwrap().handler).await,
+            "get_user"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/posts").unwrap().handler).await,
+            "list_posts"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::POST, "/posts").unwrap().handler).await,
+            "create_post"
+        );
     }
 
     #[tokio::test]
@@ -2503,9 +2602,18 @@ mod tests {
                 .nest("/api", sub),
         );
 
-        assert_eq!(body_of(r.resolve(&Method::GET, "/").unwrap().handler).await, "root");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/health").unwrap().handler).await, "ok");
-        assert_eq!(body_of(r.resolve(&Method::GET, "/api/items").unwrap().handler).await, "items");
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/").unwrap().handler).await,
+            "root"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/health").unwrap().handler).await,
+            "ok"
+        );
+        assert_eq!(
+            body_of(r.resolve(&Method::GET, "/api/items").unwrap().handler).await,
+            "items"
+        );
     }
 
     #[test]

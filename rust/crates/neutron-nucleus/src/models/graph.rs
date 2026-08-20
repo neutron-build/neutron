@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Edge traversal direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

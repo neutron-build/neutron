@@ -48,8 +48,8 @@ impl SpanData {
     /// OpenTelemetry proto3 JSON mapping.
     pub fn to_otlp_json(&self) -> Value {
         let status_obj = match &self.status {
-            SpanStatus::Unset      => json!({ "code": 0 }),
-            SpanStatus::Ok         => json!({ "code": 1 }),
+            SpanStatus::Unset => json!({ "code": 0 }),
+            SpanStatus::Ok => json!({ "code": 1 }),
             SpanStatus::Error(msg) => json!({ "code": 2, "message": msg }),
         };
 
@@ -59,9 +59,9 @@ impl SpanData {
             .map(|(key, val)| {
                 let v = match val {
                     AttributeValue::String(s) => json!({ "stringValue": s }),
-                    AttributeValue::Int(i)    => json!({ "intValue": i.to_string() }),
-                    AttributeValue::Float(f)  => json!({ "doubleValue": f }),
-                    AttributeValue::Bool(b)   => json!({ "boolValue": b }),
+                    AttributeValue::Int(i) => json!({ "intValue": i.to_string() }),
+                    AttributeValue::Float(f) => json!({ "doubleValue": f }),
+                    AttributeValue::Bool(b) => json!({ "boolValue": b }),
                 };
                 json!({ "key": key, "value": v })
             })
@@ -106,7 +106,10 @@ mod tests {
     #[test]
     fn otlp_json_trace_id() {
         let json = make_span().to_otlp_json();
-        assert_eq!(json["traceId"].as_str().unwrap(), "01010101010101010101010101010101");
+        assert_eq!(
+            json["traceId"].as_str().unwrap(),
+            "01010101010101010101010101010101"
+        );
     }
 
     #[test]
@@ -162,7 +165,10 @@ mod tests {
     #[test]
     fn otlp_json_string_attribute() {
         let mut span = make_span();
-        span.attributes.push(("http.method".to_string(), AttributeValue::String("GET".to_string())));
+        span.attributes.push((
+            "http.method".to_string(),
+            AttributeValue::String("GET".to_string()),
+        ));
         let json = span.to_otlp_json();
         assert_eq!(json["attributes"][0]["key"], "http.method");
         assert_eq!(json["attributes"][0]["value"]["stringValue"], "GET");
@@ -171,7 +177,8 @@ mod tests {
     #[test]
     fn otlp_json_int_attribute() {
         let mut span = make_span();
-        span.attributes.push(("status_code".to_string(), AttributeValue::Int(200)));
+        span.attributes
+            .push(("status_code".to_string(), AttributeValue::Int(200)));
         let json = span.to_otlp_json();
         assert_eq!(json["attributes"][0]["value"]["intValue"], "200");
     }
@@ -179,16 +186,20 @@ mod tests {
     #[test]
     fn otlp_json_float_attribute() {
         let mut span = make_span();
-        span.attributes.push(("lat".to_string(), AttributeValue::Float(3.14)));
+        span.attributes
+            .push(("lat".to_string(), AttributeValue::Float(3.14)));
         let json = span.to_otlp_json();
-        let v = json["attributes"][0]["value"]["doubleValue"].as_f64().unwrap();
+        let v = json["attributes"][0]["value"]["doubleValue"]
+            .as_f64()
+            .unwrap();
         assert!((v - 3.14).abs() < 1e-9);
     }
 
     #[test]
     fn otlp_json_bool_attribute() {
         let mut span = make_span();
-        span.attributes.push(("error".to_string(), AttributeValue::Bool(true)));
+        span.attributes
+            .push(("error".to_string(), AttributeValue::Bool(true)));
         let json = span.to_otlp_json();
         assert_eq!(json["attributes"][0]["value"]["boolValue"], true);
     }
@@ -196,8 +207,10 @@ mod tests {
     #[test]
     fn otlp_json_multiple_attributes() {
         let mut span = make_span();
-        span.attributes.push(("a".to_string(), AttributeValue::String("x".to_string())));
-        span.attributes.push(("b".to_string(), AttributeValue::Int(42)));
+        span.attributes
+            .push(("a".to_string(), AttributeValue::String("x".to_string())));
+        span.attributes
+            .push(("b".to_string(), AttributeValue::Int(42)));
         let json = span.to_otlp_json();
         assert_eq!(json["attributes"].as_array().unwrap().len(), 2);
     }
@@ -214,7 +227,10 @@ mod tests {
     fn span_status_equality() {
         assert_eq!(SpanStatus::Unset, SpanStatus::Unset);
         assert_eq!(SpanStatus::Ok, SpanStatus::Ok);
-        assert_eq!(SpanStatus::Error("e".to_string()), SpanStatus::Error("e".to_string()));
+        assert_eq!(
+            SpanStatus::Error("e".to_string()),
+            SpanStatus::Error("e".to_string())
+        );
         assert_ne!(SpanStatus::Ok, SpanStatus::Unset);
     }
 

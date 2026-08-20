@@ -112,11 +112,11 @@ impl KeyExtractor {
 /// `{prefix}:{client_key}`.
 #[derive(Clone)]
 pub struct RedisRateLimitLayer {
-    pool:      RedisPool,
-    limit:     u32,
-    window:    Duration,
-    key_ext:   KeyExtractor,
-    prefix:    String,
+    pool: RedisPool,
+    limit: u32,
+    window: Duration,
+    key_ext: KeyExtractor,
+    prefix: String,
     script_sha: Arc<std::sync::OnceLock<String>>,
 }
 
@@ -161,11 +161,11 @@ impl RedisRateLimitLayer {
 
     /// Check rate limit.  Returns `(allowed, remaining)`.
     async fn check(
-        pool:       &RedisPool,
+        pool: &RedisPool,
         script_sha: &Arc<std::sync::OnceLock<String>>,
         bucket_key: &str,
-        limit:      u32,
-        window_ms:  u64,
+        limit: u32,
+        window_ms: u64,
     ) -> (bool, i64) {
         let mut conn = pool.conn();
 
@@ -212,17 +212,13 @@ impl RedisRateLimitLayer {
 }
 
 impl MiddlewareTrait for RedisRateLimitLayer {
-    fn call(
-        &self,
-        req: Request,
-        next: Next,
-    ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-        let pool       = self.pool.clone();
-        let limit      = self.limit;
-        let window_ms  = self.window.as_millis() as u64;
+    fn call(&self, req: Request, next: Next) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+        let pool = self.pool.clone();
+        let limit = self.limit;
+        let window_ms = self.window.as_millis() as u64;
         let client_key = self.key_ext.extract(&req);
         let bucket_key = format!("{}:{}", self.prefix, client_key);
-        let sha        = Arc::clone(&self.script_sha);
+        let sha = Arc::clone(&self.script_sha);
 
         Box::pin(async move {
             let (allowed, remaining) =
@@ -237,7 +233,7 @@ impl MiddlewareTrait for RedisRateLimitLayer {
                 return http::Response::builder()
                     .status(StatusCode::TOO_MANY_REQUESTS)
                     .header("content-type", "application/json")
-                    .header("x-ratelimit-limit",     limit.to_string())
+                    .header("x-ratelimit-limit", limit.to_string())
                     .header("x-ratelimit-remaining", "0")
                     .body(Body::full(body))
                     .unwrap();
@@ -247,10 +243,7 @@ impl MiddlewareTrait for RedisRateLimitLayer {
 
             if remaining >= 0 {
                 let headers = resp.headers_mut();
-                headers.insert(
-                    "x-ratelimit-limit",
-                    limit.to_string().parse().unwrap(),
-                );
+                headers.insert("x-ratelimit-limit", limit.to_string().parse().unwrap());
                 headers.insert(
                     "x-ratelimit-remaining",
                     remaining.to_string().parse().unwrap(),
@@ -284,7 +277,7 @@ mod tests {
 
     #[test]
     fn layer_builder_api() {
-        let rt   = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let pool = rt.block_on(RedisPool::new("redis://127.0.0.1/0"));
 
         if let Ok(pool) = pool {

@@ -61,12 +61,11 @@ pub enum CronError {
 impl std::fmt::Display for CronError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CronError::WrongFieldCount(n) =>
-                write!(f, "cron: expected 5 fields, got {n}"),
-            CronError::InvalidToken(t) =>
-                write!(f, "cron: invalid token '{t}'"),
-            CronError::OutOfRange { field, value } =>
-                write!(f, "cron: {field} value {value} out of range"),
+            CronError::WrongFieldCount(n) => write!(f, "cron: expected 5 fields, got {n}"),
+            CronError::InvalidToken(t) => write!(f, "cron: invalid token '{t}'"),
+            CronError::OutOfRange { field, value } => {
+                write!(f, "cron: {field} value {value} out of range")
+            }
         }
     }
 }
@@ -93,24 +92,52 @@ fn parse_field(s: &str, name: &'static str, min: u8, max: u8) -> Result<CronFiel
 
     for token in s.split(',') {
         if token == "*" {
-            for i in min..=max { bits[i as usize] = true; }
+            for i in min..=max {
+                bits[i as usize] = true;
+            }
         } else if let Some(step_str) = token.strip_prefix("*/") {
-            let step: u8 = step_str.parse()
+            let step: u8 = step_str
+                .parse()
                 .map_err(|_| CronError::InvalidToken(token.to_string()))?;
-            if step == 0 { return Err(CronError::InvalidToken(token.to_string())); }
+            if step == 0 {
+                return Err(CronError::InvalidToken(token.to_string()));
+            }
             let mut i = min;
-            while i <= max { bits[i as usize] = true; i = i.saturating_add(step); }
+            while i <= max {
+                bits[i as usize] = true;
+                i = i.saturating_add(step);
+            }
         } else if let Some((a, b)) = token.split_once('-') {
-            let a: u8 = a.parse().map_err(|_| CronError::InvalidToken(token.to_string()))?;
-            let b: u8 = b.parse().map_err(|_| CronError::InvalidToken(token.to_string()))?;
-            if a > max { return Err(CronError::OutOfRange { field: name, value: a }); }
-            if b > max { return Err(CronError::OutOfRange { field: name, value: b }); }
-            for i in a..=b { bits[i as usize] = true; }
+            let a: u8 = a
+                .parse()
+                .map_err(|_| CronError::InvalidToken(token.to_string()))?;
+            let b: u8 = b
+                .parse()
+                .map_err(|_| CronError::InvalidToken(token.to_string()))?;
+            if a > max {
+                return Err(CronError::OutOfRange {
+                    field: name,
+                    value: a,
+                });
+            }
+            if b > max {
+                return Err(CronError::OutOfRange {
+                    field: name,
+                    value: b,
+                });
+            }
+            for i in a..=b {
+                bits[i as usize] = true;
+            }
         } else {
-            let v: u8 = token.parse()
+            let v: u8 = token
+                .parse()
                 .map_err(|_| CronError::InvalidToken(token.to_string()))?;
             if v < min || v > max {
-                return Err(CronError::OutOfRange { field: name, value: v });
+                return Err(CronError::OutOfRange {
+                    field: name,
+                    value: v,
+                });
             }
             bits[v as usize] = true;
         }
@@ -126,11 +153,11 @@ fn parse_field(s: &str, name: &'static str, min: u8, max: u8) -> Result<CronFiel
 /// A parsed cron schedule.
 #[derive(Debug, Clone)]
 pub struct CronSchedule {
-    minutes:  CronField,   // 0–59
-    hours:    CronField,   // 0–23
-    doms:     CronField,   // 1–31
-    months:   CronField,   // 1–12
-    weekdays: CronField,   // 0–6 (0 = Sunday)
+    minutes: CronField,  // 0–59
+    hours: CronField,    // 0–23
+    doms: CronField,     // 1–31
+    months: CronField,   // 1–12
+    weekdays: CronField, // 0–6 (0 = Sunday)
 }
 
 impl CronSchedule {
@@ -141,20 +168,20 @@ impl CronSchedule {
             return Err(CronError::WrongFieldCount(fields.len()));
         }
         Ok(Self {
-            minutes:  parse_field(fields[0], "minute",       0, 59)?,
-            hours:    parse_field(fields[1], "hour",         0, 23)?,
-            doms:     parse_field(fields[2], "day-of-month", 1, 31)?,
-            months:   parse_field(fields[3], "month",        1, 12)?,
-            weekdays: parse_field(fields[4], "day-of-week",  0,  6)?,
+            minutes: parse_field(fields[0], "minute", 0, 59)?,
+            hours: parse_field(fields[1], "hour", 0, 23)?,
+            doms: parse_field(fields[2], "day-of-month", 1, 31)?,
+            months: parse_field(fields[3], "month", 1, 12)?,
+            weekdays: parse_field(fields[4], "day-of-week", 0, 6)?,
         })
     }
 
     /// Return `true` if this schedule fires at the given Unix timestamp
     /// (truncated to whole minutes — seconds are ignored).
     pub fn matches_epoch(&self, secs: u64) -> bool {
-        let min  = ((secs / 60)   % 60) as u8;
+        let min = ((secs / 60) % 60) as u8;
         let hour = ((secs / 3600) % 24) as u8;
-        let days =   secs / 86400;
+        let days = secs / 86400;
 
         let (year, month, dom) = days_to_ymd(days);
         let weekday = ((days + 4) % 7) as u8; // Jan 1 1970 was Thursday (4)
@@ -170,19 +197,39 @@ impl CronSchedule {
 
 /// Convert days-since-epoch to (year, 1-based month, 1-based day).
 fn days_to_ymd(mut d: u64) -> (u32, u8, u8) {
-    let n400 = d / 146097; d %= 146097;
-    let n100 = (d / 36524).min(3); d -= n100 * 36524;
-    let n4   = d / 1461;   d %= 1461;
-    let n1   = (d / 365).min(3); d -= n1 * 365;
+    let n400 = d / 146097;
+    d %= 146097;
+    let n100 = (d / 36524).min(3);
+    d -= n100 * 36524;
+    let n4 = d / 1461;
+    d %= 1461;
+    let n1 = (d / 365).min(3);
+    d -= n1 * 365;
 
     let year = (n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970) as u32;
     let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let dim: [u8; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let dim: [u8; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
 
     let mut month = 0u8;
-    let mut day   = d as u8 + 1;
+    let mut day = d as u8 + 1;
     for (i, &m) in dim.iter().enumerate() {
-        if day <= m { month = i as u8 + 1; break; }
+        if day <= m {
+            month = i as u8 + 1;
+            break;
+        }
         day -= m;
     }
     (year, month, day)
@@ -196,7 +243,7 @@ fn days_to_ymd(mut d: u64) -> (u32, u8, u8) {
 pub struct CronJob {
     pub schedule: CronSchedule,
     pub job_type: String,
-    pub payload:  Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 /// Runs recurring jobs on cron schedules.
@@ -208,7 +255,9 @@ pub struct CronScheduler {
 }
 
 impl Default for CronScheduler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CronScheduler {
@@ -223,12 +272,16 @@ impl CronScheduler {
     /// passed to the handler via [`JobContext::payload`].
     pub fn add(
         mut self,
-        expr:     &str,
+        expr: &str,
         job_type: impl Into<String>,
-        payload:  Vec<u8>,
+        payload: Vec<u8>,
     ) -> Result<Self, CronError> {
         let schedule = CronSchedule::parse(expr)?;
-        self.jobs.push(CronJob { schedule, job_type: job_type.into(), payload });
+        self.jobs.push(CronJob {
+            schedule,
+            job_type: job_type.into(),
+            payload,
+        });
         Ok(self)
     }
 
@@ -281,7 +334,9 @@ mod tests {
     // 2024-01-15 00:00:00 UTC = 1705276800
     const MON_0000: u64 = 1705276800;
 
-    fn parse(expr: &str) -> CronSchedule { CronSchedule::parse(expr).unwrap() }
+    fn parse(expr: &str) -> CronSchedule {
+        CronSchedule::parse(expr).unwrap()
+    }
 
     #[test]
     fn every_minute() {
@@ -310,7 +365,7 @@ mod tests {
     fn range_weekdays_mon_fri() {
         let s = parse("0 8 * * 1-5");
         assert!(s.matches_epoch(1705276800 + 8 * 3600)); // Monday 08:00
-        assert!(!s.matches_epoch(SUN_2330));              // Sunday
+        assert!(!s.matches_epoch(SUN_2330)); // Sunday
     }
 
     #[test]
@@ -323,16 +378,16 @@ mod tests {
     #[test]
     fn list_syntax() {
         let s = parse("0 8,12,18 * * *");
-        assert!(s.matches_epoch(1705276800 + 8 * 3600));   // 08:00
-        assert!(s.matches_epoch(1705276800 + 12 * 3600));  // 12:00
-        assert!(s.matches_epoch(1705276800 + 18 * 3600));  // 18:00
-        assert!(!s.matches_epoch(1705276800 + 9 * 3600));  // 09:00 — no
+        assert!(s.matches_epoch(1705276800 + 8 * 3600)); // 08:00
+        assert!(s.matches_epoch(1705276800 + 12 * 3600)); // 12:00
+        assert!(s.matches_epoch(1705276800 + 18 * 3600)); // 18:00
+        assert!(!s.matches_epoch(1705276800 + 9 * 3600)); // 09:00 — no
     }
 
     #[test]
     fn day_of_month() {
         let s = parse("0 0 15 * *");
-        assert!(s.matches_epoch(MON_0000));   // Jan 15 00:00
+        assert!(s.matches_epoch(MON_0000)); // Jan 15 00:00
         assert!(!s.matches_epoch(MON_0000 + 86400)); // Jan 16
     }
 
@@ -383,8 +438,10 @@ mod tests {
     #[test]
     fn scheduler_add_valid() {
         let s = CronScheduler::new()
-            .add("* * * * *", "ping", b"{}".to_vec()).unwrap()
-            .add("0 8 * * 1-5", "report", b"{}".to_vec()).unwrap();
+            .add("* * * * *", "ping", b"{}".to_vec())
+            .unwrap()
+            .add("0 8 * * 1-5", "report", b"{}".to_vec())
+            .unwrap();
         assert_eq!(s.jobs.len(), 2);
     }
 

@@ -26,7 +26,7 @@ type ChunkStream = Pin<Box<dyn Stream<Item = Result<InferenceChunk, InferError>>
 
 struct SseBody {
     inner: ChunkStream,
-    done:  bool,
+    done: bool,
 }
 
 impl SseBody {
@@ -37,7 +37,7 @@ impl SseBody {
 }
 
 impl HttpBody for SseBody {
-    type Data  = Bytes;
+    type Data = Bytes;
     type Error = Infallible;
 
     fn poll_frame(
@@ -53,7 +53,9 @@ impl HttpBody for SseBody {
             Poll::Ready(None) => {
                 self.done = true;
                 // Send SSE stream terminator.
-                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"data: [DONE]\n\n")))))
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(
+                    b"data: [DONE]\n\n",
+                )))))
             }
             Poll::Ready(Some(Ok(chunk))) => {
                 if chunk.done {
@@ -70,8 +72,12 @@ impl HttpBody for SseBody {
         }
     }
 
-    fn is_end_stream(&self) -> bool { self.done }
-    fn size_hint(&self)   -> SizeHint { SizeHint::default() }
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +113,10 @@ impl IntoResponse for InferStream {
             .header("content-type", "text/event-stream")
             .header("cache-control", "no-cache")
             .header("x-accel-buffering", "no") // disable nginx buffering
-            .body(Body::stream(SseBody { inner: self.0, done: false }))
+            .body(Body::stream(SseBody {
+                inner: self.0,
+                done: false,
+            }))
             .unwrap()
     }
 }
@@ -133,7 +142,10 @@ mod tests {
         let s = InferStream::new(stream::iter(chunks));
         let resp = s.into_response();
 
-        assert_eq!(resp.headers().get("content-type").unwrap(), "text/event-stream");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = std::str::from_utf8(&body).unwrap();
@@ -149,7 +161,13 @@ mod tests {
         let chunks: Vec<Result<InferenceChunk, InferError>> =
             vec![Err(InferError::Protocol("bad frame".to_string()))];
         let s = InferStream::new(stream::iter(chunks));
-        let body = s.into_response().into_body().collect().await.unwrap().to_bytes();
+        let body = s
+            .into_response()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("event: error"));
     }

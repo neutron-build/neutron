@@ -47,10 +47,7 @@ impl Config {
 
     /// Parse the host and port into a `SocketAddr`.
     pub fn socket_addr(&self) -> SocketAddr {
-        let ip: IpAddr = self
-            .host
-            .parse()
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let ip: IpAddr = self.host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         SocketAddr::from((ip, self.port))
     }
 }

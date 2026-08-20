@@ -18,12 +18,13 @@ pub enum StripeError {
 impl fmt::Display for StripeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StripeError::InvalidSignature(m)     => write!(f, "stripe: invalid signature: {m}"),
-            StripeError::ParseError(m)           => write!(f, "stripe: parse error: {m}"),
-            StripeError::ApiError(m)             => write!(f, "stripe: API error: {m}"),
-            StripeError::StripeApiError { status, message } =>
-                write!(f, "stripe: {status} {message}"),
-            StripeError::Config(m)               => write!(f, "stripe: config error: {m}"),
+            StripeError::InvalidSignature(m) => write!(f, "stripe: invalid signature: {m}"),
+            StripeError::ParseError(m) => write!(f, "stripe: parse error: {m}"),
+            StripeError::ApiError(m) => write!(f, "stripe: API error: {m}"),
+            StripeError::StripeApiError { status, message } => {
+                write!(f, "stripe: {status} {message}")
+            }
+            StripeError::Config(m) => write!(f, "stripe: config error: {m}"),
         }
     }
 }
@@ -42,7 +43,10 @@ mod tests {
 
     #[test]
     fn display_api_error() {
-        let e = StripeError::StripeApiError { status: 402, message: "card_declined".to_string() };
+        let e = StripeError::StripeApiError {
+            status: 402,
+            message: "card_declined".to_string(),
+        };
         assert!(e.to_string().contains("402"));
         assert!(e.to_string().contains("card_declined"));
     }

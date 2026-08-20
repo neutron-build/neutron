@@ -94,14 +94,13 @@ mod tests {
 
     #[tokio::test]
     async fn slow_handler_times_out() {
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Timeout::from_millis(50))
-                .get("/slow", || async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    "done"
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Timeout::from_millis(50)).get(
+            "/slow",
+            || async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                "done"
+            },
+        ));
 
         let resp = client.get("/slow").send().await;
         assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
@@ -109,14 +108,13 @@ mod tests {
 
     #[tokio::test]
     async fn handler_just_under_timeout_passes() {
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Timeout::from_millis(200))
-                .get("/", || async {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    "fast enough"
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Timeout::from_millis(200)).get(
+            "/",
+            || async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                "fast enough"
+            },
+        ));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -125,15 +123,14 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_preserves_response_headers() {
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Timeout::from_secs(5))
-                .get("/", || async {
-                    let mut headers = http::HeaderMap::new();
-                    headers.insert("x-custom", "value".parse().unwrap());
-                    (headers, "ok")
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Timeout::from_secs(5)).get(
+            "/",
+            || async {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-custom", "value".parse().unwrap());
+                (headers, "ok")
+            },
+        ));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -142,14 +139,13 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_response_body() {
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Timeout::from_millis(10))
-                .get("/", || async {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    "never"
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Timeout::from_millis(10)).get(
+            "/",
+            || async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "never"
+            },
+        ));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);

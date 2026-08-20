@@ -140,7 +140,10 @@ impl AcceptHeader {
                 let mut quality: u16 = 1000; // default q=1.0
                 for param in parts {
                     let param = param.trim();
-                    if let Some(q_str) = param.strip_prefix("q=").or_else(|| param.strip_prefix("Q=")) {
+                    if let Some(q_str) = param
+                        .strip_prefix("q=")
+                        .or_else(|| param.strip_prefix("Q="))
+                    {
                         let q_str = q_str.trim();
                         if let Ok(q) = q_str.parse::<f64>() {
                             // Clamp to [0, 1] and convert to integer representation
@@ -305,12 +308,7 @@ mod tests {
     fn request_with_accept(accept: &str) -> Request {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::ACCEPT, accept.parse().unwrap());
-        Request::new(
-            Method::GET,
-            Uri::from_static("/"),
-            headers,
-            Bytes::new(),
-        )
+        Request::new(Method::GET, Uri::from_static("/"), headers, Bytes::new())
     }
 
     /// Helper to build a Request with no Accept header.
@@ -402,7 +400,10 @@ mod tests {
     async fn missing_accept_defaults_to_wildcard() {
         let mut req = request_without_accept();
         let negotiate_result = Negotiate::from_request(&mut req).await;
-        assert!(negotiate_result.is_ok(), "should succeed when Accept is missing");
+        assert!(
+            negotiate_result.is_ok(),
+            "should succeed when Accept is missing"
+        );
         // The first default offered type should be chosen (application/json)
         let Negotiate(ct) = negotiate_result.unwrap_or_else(|_| panic!("expected Ok"));
         assert_eq!(ct, ContentType::Json);

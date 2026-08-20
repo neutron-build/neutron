@@ -218,9 +218,7 @@ impl Cors {
                     Some(HeaderValue::from_static("*"))
                 }
             }
-            AllowOrigin::List(set) => request_origin
-                .filter(|o| set.contains(*o))
-                .cloned(),
+            AllowOrigin::List(set) => request_origin.filter(|o| set.contains(*o)).cloned(),
         }
     }
 
@@ -396,7 +394,10 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_any_origin() {
-        let cors = Cors::new().allow_any_origin().allow_any_method().allow_any_header();
+        let cors = Cors::new()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header();
         let req = make_request(
             Method::OPTIONS,
             &[
@@ -460,7 +461,10 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_max_age() {
-        let cors = Cors::new().allow_any_origin().allow_any_method().max_age(3600);
+        let cors = Cors::new()
+            .allow_any_origin()
+            .allow_any_method()
+            .max_age(3600);
 
         let req = make_request(
             Method::OPTIONS,
@@ -479,14 +483,20 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_allow_headers_echoed() {
-        let cors = Cors::new().allow_any_origin().allow_any_method().allow_any_header();
+        let cors = Cors::new()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header();
 
         let req = make_request(
             Method::OPTIONS,
             &[
                 ("origin", "http://example.com"),
                 ("access-control-request-method", "POST"),
-                ("access-control-request-headers", "content-type, authorization"),
+                (
+                    "access-control-request-headers",
+                    "content-type, authorization",
+                ),
             ],
         );
 
@@ -509,7 +519,10 @@ mod tests {
             &[
                 ("origin", "http://example.com"),
                 ("access-control-request-method", "POST"),
-                ("access-control-request-headers", "content-type, authorization"),
+                (
+                    "access-control-request-headers",
+                    "content-type, authorization",
+                ),
             ],
         );
 
@@ -634,7 +647,10 @@ mod tests {
         let resp = cors.call(req, make_next()).await;
 
         let vary = resp.headers().get("vary").unwrap().to_str().unwrap();
-        assert!(vary.contains("origin"), "Vary must include origin with credentials");
+        assert!(
+            vary.contains("origin"),
+            "Vary must include origin with credentials"
+        );
     }
 
     // -----------------------------------------------------------------------

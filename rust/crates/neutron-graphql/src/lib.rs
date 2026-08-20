@@ -37,8 +37,7 @@ pub use subscription::{graphql_subscription_handler, SubscriptionSchema};
 
 pub mod prelude {
     pub use crate::{
-        graphql_handler, graphql_subscription_handler,
-        ExecutableSchema, GraphQlError, GraphQlRequest, GraphQlResponse,
-        SubscriptionSchema,
+        graphql_handler, graphql_subscription_handler, ExecutableSchema, GraphQlError,
+        GraphQlRequest, GraphQlResponse, SubscriptionSchema,
     };
 }

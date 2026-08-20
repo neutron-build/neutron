@@ -47,7 +47,7 @@ pub fn unframe_message(data: &[u8]) -> Option<(&[u8], bool)> {
 /// This is the mechanism gRPC uses over HTTP/2 to deliver `grpc-status` and
 /// `grpc-message` trailers after the response body.
 pub struct GrpcBodyStream {
-    data:     Option<Bytes>,
+    data: Option<Bytes>,
     trailers: Option<HeaderMap>,
 }
 
@@ -57,27 +57,38 @@ impl GrpcBodyStream {
         let mut trailers = HeaderMap::new();
         trailers.insert("grpc-status", "0".parse().unwrap());
         Self {
-            data: if framed_message.is_empty() { None } else { Some(framed_message) },
+            data: if framed_message.is_empty() {
+                None
+            } else {
+                Some(framed_message)
+            },
             trailers: Some(trailers),
         }
     }
 
     /// Body with only trailers (no data frame) — used for gRPC errors.
     pub fn error(trailers: HeaderMap) -> Self {
-        Self { data: None, trailers: Some(trailers) }
+        Self {
+            data: None,
+            trailers: Some(trailers),
+        }
     }
 
     /// Body with a framed message and a custom trailer set.
     pub fn with_trailers(framed_message: Bytes, trailers: HeaderMap) -> Self {
         Self {
-            data: if framed_message.is_empty() { None } else { Some(framed_message) },
+            data: if framed_message.is_empty() {
+                None
+            } else {
+                Some(framed_message)
+            },
             trailers: Some(trailers),
         }
     }
 }
 
 impl HttpBody for GrpcBodyStream {
-    type Data  = Bytes;
+    type Data = Bytes;
     type Error = Infallible;
 
     fn poll_frame(
@@ -179,7 +190,10 @@ mod tests {
 
     #[test]
     fn is_end_stream_when_empty() {
-        let body = GrpcBodyStream { data: None, trailers: None };
+        let body = GrpcBodyStream {
+            data: None,
+            trailers: None,
+        };
         assert!(body.is_end_stream());
     }
 }

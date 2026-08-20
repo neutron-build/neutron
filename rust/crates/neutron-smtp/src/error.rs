@@ -18,10 +18,10 @@ pub enum SmtpError {
 impl fmt::Display for SmtpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SmtpError::Build(s)     => write!(f, "email build error: {s}"),
+            SmtpError::Build(s) => write!(f, "email build error: {s}"),
             SmtpError::Transport(s) => write!(f, "SMTP transport error: {s}"),
-            SmtpError::Address(s)   => write!(f, "invalid email address: {s}"),
-            SmtpError::Config(s)    => write!(f, "SMTP config error: {s}"),
+            SmtpError::Address(s) => write!(f, "invalid email address: {s}"),
+            SmtpError::Config(s) => write!(f, "SMTP config error: {s}"),
         }
     }
 }

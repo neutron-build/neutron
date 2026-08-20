@@ -343,19 +343,33 @@ impl ApiRoute {
         }
     }
 
-    pub fn get(path: &str) -> Self { Self::new("get", path) }
-    pub fn post(path: &str) -> Self { Self::new("post", path) }
-    pub fn put(path: &str) -> Self { Self::new("put", path) }
-    pub fn delete(path: &str) -> Self { Self::new("delete", path) }
-    pub fn patch(path: &str) -> Self { Self::new("patch", path) }
+    pub fn get(path: &str) -> Self {
+        Self::new("get", path)
+    }
+    pub fn post(path: &str) -> Self {
+        Self::new("post", path)
+    }
+    pub fn put(path: &str) -> Self {
+        Self::new("put", path)
+    }
+    pub fn delete(path: &str) -> Self {
+        Self::new("delete", path)
+    }
+    pub fn patch(path: &str) -> Self {
+        Self::new("patch", path)
+    }
 
     // -- Internal helpers used by Router::openapi() -------------------------
 
     /// Return the HTTP method (lowercase).
-    pub(crate) fn method(&self) -> &str { &self.method }
+    pub(crate) fn method(&self) -> &str {
+        &self.method
+    }
 
     /// Return the path.
-    pub(crate) fn path(&self) -> &str { &self.path }
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
 
     /// Create a minimal stub ApiRoute for any HTTP method string (lowercase).
     pub(crate) fn for_method(method: &str, path: &str) -> Self {
@@ -445,9 +459,11 @@ impl ApiRoute {
         }
 
         if !self.parameters.is_empty() {
-            op["parameters"] = json!(
-                self.parameters.iter().map(|p| p.to_value()).collect::<Vec<_>>()
-            );
+            op["parameters"] = json!(self
+                .parameters
+                .iter()
+                .map(|p| p.to_value())
+                .collect::<Vec<_>>());
         }
 
         if let Some((ref ct, ref schema)) = self.request_body {
@@ -620,11 +636,8 @@ impl OpenApi {
     /// Get a handler that serves the OpenAPI JSON spec.
     pub fn json_handler(
         &self,
-    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>>
-           + Clone
-           + Send
-           + Sync
-           + 'static {
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
+    {
         let json = Arc::new(self.to_json_string());
         move || {
             let json = Arc::clone(&json);
@@ -641,11 +654,10 @@ impl OpenApi {
     /// Get a handler that serves the Swagger UI HTML page.
     ///
     /// The UI loads the spec from `spec_url` (default: `"/openapi.json"`).
-    pub fn swagger_ui(&self) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>>
-           + Clone
-           + Send
-           + Sync
-           + 'static {
+    pub fn swagger_ui(
+        &self,
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
+    {
         self.swagger_ui_at("/openapi.json")
     }
 
@@ -670,7 +682,9 @@ impl OpenApi {
 
         // ---- Interfaces for components/schemas -----------------------------
         if !self.schemas.is_empty() {
-            out.push_str("// ── Schemas ──────────────────────────────────────────────────────\n\n");
+            out.push_str(
+                "// ── Schemas ──────────────────────────────────────────────────────\n\n",
+            );
             // Sort for deterministic output
             let mut schema_names: Vec<&String> = self.schemas.keys().collect();
             schema_names.sort();
@@ -695,11 +709,8 @@ impl OpenApi {
     pub fn swagger_ui_at(
         &self,
         spec_url: &str,
-    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>>
-           + Clone
-           + Send
-           + Sync
-           + 'static {
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
+    {
         let html = Arc::new(swagger_html(spec_url));
         move || {
             let html = Arc::clone(&html);
@@ -722,14 +733,18 @@ impl OpenApi {
 fn schema_to_ts_type(schema: &Value) -> String {
     if let Some(ref_path) = schema.get("$ref").and_then(|v| v.as_str()) {
         // "#/components/schemas/Foo" → "Foo"
-        return ref_path.split('/').next_back().unwrap_or("unknown").to_string();
+        return ref_path
+            .split('/')
+            .next_back()
+            .unwrap_or("unknown")
+            .to_string();
     }
     let ty = schema.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match ty {
-        "string"  => "string".to_string(),
+        "string" => "string".to_string(),
         "integer" | "number" => "number".to_string(),
         "boolean" => "boolean".to_string(),
-        "array"   => {
+        "array" => {
             let item_type = schema
                 .get("items")
                 .map(schema_to_ts_type)
@@ -747,7 +762,11 @@ fn schema_to_ts_type(schema: &Value) -> String {
                 let fields: Vec<String> = props
                     .iter()
                     .map(|(k, v)| {
-                        let opt = if required.contains(&k.as_str()) { "" } else { "?" };
+                        let opt = if required.contains(&k.as_str()) {
+                            ""
+                        } else {
+                            "?"
+                        };
                         format!("  {k}{opt}: {}", schema_to_ts_type(v))
                     })
                     .collect();
@@ -783,7 +802,11 @@ fn schema_to_ts_interface(name: &str, schema: &Value) -> String {
             keys.sort();
             for key in keys {
                 let v = &props[key];
-                let opt = if required.contains(&key.as_str()) { "" } else { "?" };
+                let opt = if required.contains(&key.as_str()) {
+                    ""
+                } else {
+                    "?"
+                };
                 out.push_str(&format!("  {key}{opt}: {};\n", schema_to_ts_type(v)));
             }
         }
@@ -798,13 +821,17 @@ fn schema_to_ts_interface(name: &str, schema: &Value) -> String {
 /// Convert a neutron-style path `/users/:id/posts` to a TypeScript template literal
 /// `\`${BASE_URL}/users/${id}/posts\``.
 fn path_to_ts_template(path: &str) -> String {
-    let converted = path.split('/').map(|segment| {
-        if let Some(name) = segment.strip_prefix(':') {
-            format!("${{{name}}}")
-        } else {
-            segment.to_string()
-        }
-    }).collect::<Vec<_>>().join("/");
+    let converted = path
+        .split('/')
+        .map(|segment| {
+            if let Some(name) = segment.strip_prefix(':') {
+                format!("${{{name}}}")
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
     format!("`${{BASE_URL}}{converted}`")
 }
 
@@ -813,7 +840,9 @@ fn path_to_ts_template(path: &str) -> String {
 fn route_to_function_name(method: &str, path: &str) -> String {
     let mut parts = vec![method.to_lowercase()];
     for segment in path.split('/') {
-        if segment.is_empty() { continue; }
+        if segment.is_empty() {
+            continue;
+        }
         if let Some(name) = segment.strip_prefix(':') {
             parts.push(format!("By{}", capitalise(name)));
         } else {
@@ -833,17 +862,27 @@ fn capitalise(s: &str) -> String {
 
 /// Generate a TypeScript `async function` for a single API route.
 fn route_to_ts_function(route: &ApiRoute) -> String {
-    let fn_name = route.operation_id.clone()
+    let fn_name = route
+        .operation_id
+        .clone()
         .unwrap_or_else(|| route_to_function_name(&route.method, &route.path));
 
     // Collect path and query parameters
-    let path_params: Vec<&Parameter> = route.parameters.iter()
-        .filter(|p| p.location == "path").collect();
-    let query_params: Vec<&Parameter> = route.parameters.iter()
-        .filter(|p| p.location == "query").collect();
+    let path_params: Vec<&Parameter> = route
+        .parameters
+        .iter()
+        .filter(|p| p.location == "path")
+        .collect();
+    let query_params: Vec<&Parameter> = route
+        .parameters
+        .iter()
+        .filter(|p| p.location == "query")
+        .collect();
 
     // Return type — use first 2xx response schema if available
-    let return_type = route.responses.iter()
+    let return_type = route
+        .responses
+        .iter()
         .find(|(status, _, _, _)| *status >= 200 && *status < 300)
         .and_then(|(_, _, _, schema)| schema.as_ref())
         .map(|s| schema_to_ts_type(&s.0))
@@ -856,10 +895,13 @@ fn route_to_ts_function(route: &ApiRoute) -> String {
         params.push(format!("{}: {}", p.name, ts_type));
     }
     if !query_params.is_empty() {
-        let fields: Vec<String> = query_params.iter().map(|p| {
-            let opt = if p.required { "" } else { "?" };
-            format!("{}{}?: {}", p.name, opt, schema_to_ts_type(&p.schema.0))
-        }).collect();
+        let fields: Vec<String> = query_params
+            .iter()
+            .map(|p| {
+                let opt = if p.required { "" } else { "?" };
+                format!("{}{}?: {}", p.name, opt, schema_to_ts_type(&p.schema.0))
+            })
+            .collect();
         params.push(format!("query?: {{ {} }}", fields.join(", ")));
     }
     if let Some((_ct, schema)) = &route.request_body {
@@ -1036,10 +1078,7 @@ mod tests {
                 ApiRoute::post("/users")
                     .summary("Create user")
                     .tag("users")
-                    .body(
-                        "application/json",
-                        Schema::ref_to("CreateUser"),
-                    )
+                    .body("application/json", Schema::ref_to("CreateUser"))
                     .response(201, "application/json", Schema::ref_to("User")),
             )
             .route(
@@ -1147,10 +1186,7 @@ mod tests {
     #[test]
     fn deprecated_flag() {
         let spec = sample_spec().to_json();
-        assert_eq!(
-            spec["paths"]["/users/:id"]["delete"]["deprecated"],
-            true
-        );
+        assert_eq!(spec["paths"]["/users/:id"]["delete"]["deprecated"], true);
     }
 
     #[test]
@@ -1207,9 +1243,7 @@ mod tests {
     #[tokio::test]
     async fn json_endpoint_returns_spec() {
         let spec = sample_spec();
-        let client = TestClient::new(
-            Router::<()>::new().get("/openapi.json", spec.json_handler()),
-        );
+        let client = TestClient::new(Router::<()>::new().get("/openapi.json", spec.json_handler()));
 
         let resp = client.get("/openapi.json").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1223,16 +1257,11 @@ mod tests {
     #[tokio::test]
     async fn swagger_ui_returns_html() {
         let spec = sample_spec();
-        let client = TestClient::new(
-            Router::<()>::new().get("/docs", spec.swagger_ui()),
-        );
+        let client = TestClient::new(Router::<()>::new().get("/docs", spec.swagger_ui()));
 
         let resp = client.get("/docs").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp
-            .header("content-type")
-            .unwrap()
-            .contains("text/html"));
+        assert!(resp.header("content-type").unwrap().contains("text/html"));
 
         let body = resp.text().await;
         assert!(body.contains("swagger-ui"));
@@ -1242,9 +1271,8 @@ mod tests {
     #[tokio::test]
     async fn swagger_ui_custom_url() {
         let spec = sample_spec();
-        let client = TestClient::new(
-            Router::<()>::new().get("/docs", spec.swagger_ui_at("/api/spec.json")),
-        );
+        let client =
+            TestClient::new(Router::<()>::new().get("/docs", spec.swagger_ui_at("/api/spec.json")));
 
         let resp = client.get("/docs").send().await;
         let body = resp.text().await;
@@ -1295,15 +1323,19 @@ mod tests {
                 ApiRoute::get("/users")
                     .summary("List all users")
                     .tag("users")
-                    .response(200, "application/json", Schema::array(Schema::ref_to("User"))),
+                    .response(
+                        200,
+                        "application/json",
+                        Schema::array(Schema::ref_to("User")),
+                    ),
             )
             .openapi("Rich API", "1.0.0")
             .to_json();
 
         assert_eq!(spec["paths"]["/users"]["get"]["summary"], "List all users");
         assert_eq!(spec["paths"]["/users"]["get"]["tags"][0], "users");
-        let schema_ref = &spec["paths"]["/users"]["get"]["responses"]["200"]
-            ["content"]["application/json"]["schema"]["items"]["$ref"];
+        let schema_ref = &spec["paths"]["/users"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["items"]["$ref"];
         assert!(schema_ref.as_str().unwrap().contains("User"));
     }
 
@@ -1314,8 +1346,8 @@ mod tests {
         let spec = Router::<()>::new()
             .get("/users", || async { "ok" })
             .doc(ApiRoute::get("/users").summary("Documented"))
-            .post("/users", || async { "ok" })     // no doc → auto-stub
-            .get("/health", || async { "ok" })     // no doc → auto-stub
+            .post("/users", || async { "ok" }) // no doc → auto-stub
+            .get("/health", || async { "ok" }) // no doc → auto-stub
             .openapi("Mixed API", "1.0.0")
             .to_json();
 
@@ -1352,7 +1384,11 @@ mod tests {
         use crate::router::Router;
 
         let spec = Router::<()>::new()
-            .on("/resource", &[http::Method::GET, http::Method::HEAD], || async { "ok" })
+            .on(
+                "/resource",
+                &[http::Method::GET, http::Method::HEAD],
+                || async { "ok" },
+            )
             .openapi("On API", "1.0.0")
             .to_json();
 
@@ -1386,15 +1422,14 @@ mod tests {
 
     #[test]
     fn ts_codegen_contains_interface_for_schema() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .schema(
-                "User",
-                Schema::object()
-                    .property("id", Schema::integer())
-                    .property("name", Schema::string())
-                    .required(&["id", "name"])
-                    .build(),
-            );
+        let spec = OpenApi::new("API", "1.0.0").schema(
+            "User",
+            Schema::object()
+                .property("id", Schema::integer())
+                .property("name", Schema::string())
+                .required(&["id", "name"])
+                .build(),
+        );
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("export interface User"));
         assert!(ts.contains("id: number"));
@@ -1403,15 +1438,14 @@ mod tests {
 
     #[test]
     fn ts_codegen_optional_field_uses_question_mark() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .schema(
-                "Item",
-                Schema::object()
-                    .property("id", Schema::integer())
-                    .property("note", Schema::string()) // not in required → optional
-                    .required(&["id"])
-                    .build(),
-            );
+        let spec = OpenApi::new("API", "1.0.0").schema(
+            "Item",
+            Schema::object()
+                .property("id", Schema::integer())
+                .property("note", Schema::string()) // not in required → optional
+                .required(&["id"])
+                .build(),
+        );
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("note?: string"));
         // id is required — no question mark
@@ -1421,9 +1455,13 @@ mod tests {
 
     #[test]
     fn ts_codegen_generates_get_function() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .route(ApiRoute::get("/users").summary("List users")
-                .response(200, "application/json", Schema::array(Schema::ref_to("User"))));
+        let spec = OpenApi::new("API", "1.0.0").route(
+            ApiRoute::get("/users").summary("List users").response(
+                200,
+                "application/json",
+                Schema::array(Schema::ref_to("User")),
+            ),
+        );
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("export async function getUsers("));
         assert!(ts.contains("Promise<User[]>"));
@@ -1432,12 +1470,11 @@ mod tests {
 
     #[test]
     fn ts_codegen_path_param_in_function_signature() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .route(
-                ApiRoute::get("/users/:id")
-                    .param(Parameter::path("id", Schema::integer()))
-                    .response(200, "application/json", Schema::ref_to("User")),
-            );
+        let spec = OpenApi::new("API", "1.0.0").route(
+            ApiRoute::get("/users/:id")
+                .param(Parameter::path("id", Schema::integer()))
+                .response(200, "application/json", Schema::ref_to("User")),
+        );
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("getUsersById(id: number"));
         // Path template should use the param
@@ -1446,12 +1483,11 @@ mod tests {
 
     #[test]
     fn ts_codegen_post_with_body() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .route(
-                ApiRoute::post("/users")
-                    .body("application/json", Schema::ref_to("CreateUser"))
-                    .response(201, "application/json", Schema::ref_to("User")),
-            );
+        let spec = OpenApi::new("API", "1.0.0").route(
+            ApiRoute::post("/users")
+                .body("application/json", Schema::ref_to("CreateUser"))
+                .response(201, "application/json", Schema::ref_to("User")),
+        );
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("method: \"POST\""));
         assert!(ts.contains("JSON.stringify(body)"));
@@ -1460,13 +1496,16 @@ mod tests {
 
     #[test]
     fn ts_codegen_query_params_in_signature() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .route(
-                ApiRoute::get("/users")
-                    .param(Parameter::query("page", Schema::integer()))
-                    .param(Parameter::query("limit", Schema::integer()))
-                    .response(200, "application/json", Schema::array(Schema::ref_to("User"))),
-            );
+        let spec = OpenApi::new("API", "1.0.0").route(
+            ApiRoute::get("/users")
+                .param(Parameter::query("page", Schema::integer()))
+                .param(Parameter::query("limit", Schema::integer()))
+                .response(
+                    200,
+                    "application/json",
+                    Schema::array(Schema::ref_to("User")),
+                ),
+        );
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("query?:"));
         assert!(ts.contains("page?"));
@@ -1475,20 +1514,21 @@ mod tests {
 
     #[test]
     fn ts_codegen_operation_id_overrides_name() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .route(
-                ApiRoute::get("/users")
-                    .operation_id("listUsers")
-                    .response(200, "application/json", Schema::array(Schema::ref_to("User"))),
-            );
+        let spec = OpenApi::new("API", "1.0.0").route(
+            ApiRoute::get("/users").operation_id("listUsers").response(
+                200,
+                "application/json",
+                Schema::array(Schema::ref_to("User")),
+            ),
+        );
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("export async function listUsers("));
     }
 
     #[test]
     fn ts_codegen_jsdoc_summary() {
-        let spec = OpenApi::new("API", "1.0.0")
-            .route(ApiRoute::get("/ping").summary("Health check"));
+        let spec =
+            OpenApi::new("API", "1.0.0").route(ApiRoute::get("/ping").summary("Health check"));
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("/** Health check */"));
     }
@@ -1496,8 +1536,7 @@ mod tests {
     #[test]
     fn ts_codegen_void_return_no_json_parse() {
         let spec = OpenApi::new("API", "1.0.0")
-            .route(ApiRoute::delete("/users/:id")
-                .param(Parameter::path("id", Schema::integer())));
+            .route(ApiRoute::delete("/users/:id").param(Parameter::path("id", Schema::integer())));
         let ts = spec.generate_typescript("https://api.example.com");
         assert!(ts.contains("Promise<void>"));
         assert!(!ts.contains("res.json()"));
@@ -1541,7 +1580,10 @@ mod tests {
 
     #[test]
     fn ts_function_name_nested() {
-        assert_eq!(route_to_function_name("delete", "/users/:id/posts/:postId"), "deleteUsersByIdPostsByPostId");
+        assert_eq!(
+            route_to_function_name("delete", "/users/:id/posts/:postId"),
+            "deleteUsersByIdPostsByPostId"
+        );
     }
 
     #[test]

@@ -52,7 +52,9 @@ pub struct Proto<T>(pub T);
 
 impl<T> Proto<T> {
     /// Consume the wrapper and return the inner value.
-    pub fn into_inner(self) -> T { self.0 }
+    pub fn into_inner(self) -> T {
+        self.0
+    }
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Proto<T> {
@@ -100,8 +102,8 @@ mod tests {
     #[test]
     fn proto_encode_decode_roundtrip() {
         let original = Proto(Point { x: 10, y: 20 });
-        let encoded  = original.encode().unwrap();
-        let decoded  = Proto::<Point>::decode(&encoded).unwrap();
+        let encoded = original.encode().unwrap();
+        let decoded = Proto::<Point>::decode(&encoded).unwrap();
         assert_eq!(decoded.0, original.0);
     }
 
@@ -117,7 +119,7 @@ mod tests {
     #[test]
     fn empty_message_roundtrip() {
         let original = Proto(Point { x: 0, y: 0 });
-        let encoded  = original.encode().unwrap();
+        let encoded = original.encode().unwrap();
         // An all-zero protobuf message encodes to empty bytes.
         assert!(encoded.is_empty());
         let decoded = Proto::<Point>::decode(&encoded).unwrap();

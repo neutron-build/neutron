@@ -42,9 +42,9 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 use serde::de::DeserializeOwned;
 
 use crate::error::AppError;
-use crate::handler::{IntoResponse, Request, Response};
 #[cfg(feature = "json")]
 use crate::handler::Json;
+use crate::handler::{IntoResponse, Request, Response};
 
 /// Build an extractor rejection as RFC 7807 `application/problem+json` (P1.5a).
 /// Every extractor failure renders identically — the framework honors its own
@@ -228,16 +228,13 @@ pub struct State<T>(pub T);
 
 impl<T: Clone + Send + Sync + 'static> FromRequestParts for State<T> {
     async fn from_parts(req: &Request) -> Result<Self, Response> {
-        req.get_state::<T>()
-            .cloned()
-            .map(State)
-            .ok_or_else(|| {
-                tracing::error!(
-                    "State<{}> not found — did you call Router::state()?",
-                    std::any::type_name::<T>()
-                );
-                reject(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-            })
+        req.get_state::<T>().cloned().map(State).ok_or_else(|| {
+            tracing::error!(
+                "State<{}> not found — did you call Router::state()?",
+                std::any::type_name::<T>()
+            );
+            reject(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        })
     }
 }
 
@@ -278,11 +275,12 @@ pub struct ConnectInfo(pub SocketAddr);
 
 impl FromRequestParts for ConnectInfo {
     async fn from_parts(req: &Request) -> Result<Self, Response> {
-        req.remote_addr()
-            .map(ConnectInfo)
-            .ok_or_else(|| {
-                reject(StatusCode::INTERNAL_SERVER_ERROR, "Remote address not available")
-            })
+        req.remote_addr().map(ConnectInfo).ok_or_else(|| {
+            reject(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Remote address not available",
+            )
+        })
     }
 }
 
@@ -516,24 +514,19 @@ pub struct TypedHeader<T: TypedHeaderValue>(pub T);
 
 impl<T: TypedHeaderValue + 'static> FromRequestParts for TypedHeader<T> {
     async fn from_parts(req: &Request) -> Result<Self, Response> {
-        let value = req
-            .headers()
-            .get(T::HEADER_NAME)
-            .ok_or_else(|| {
-                reject(
-                    StatusCode::BAD_REQUEST,
-                    format!("Missing required header: {}", T::HEADER_NAME),
-                )
-            })?;
+        let value = req.headers().get(T::HEADER_NAME).ok_or_else(|| {
+            reject(
+                StatusCode::BAD_REQUEST,
+                format!("Missing required header: {}", T::HEADER_NAME),
+            )
+        })?;
 
-        T::decode(value)
-            .map(TypedHeader)
-            .map_err(|msg| {
-                reject(
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid header {}: {}", T::HEADER_NAME, msg),
-                )
-            })
+        T::decode(value).map(TypedHeader).map_err(|msg| {
+            reject(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid header {}: {}", T::HEADER_NAME, msg),
+            )
+        })
     }
 }
 
@@ -641,9 +634,7 @@ impl TypedHeaderValue for BearerToken {
 
         s.strip_prefix("Bearer ")
             .map(|token| BearerToken(token.to_owned()))
-            .ok_or_else(|| {
-                "Authorization header does not start with \"Bearer \"".to_string()
-            })
+            .ok_or_else(|| "Authorization header does not start with \"Bearer \"".to_string())
     }
 }
 
@@ -671,7 +662,11 @@ mod tests {
             Bytes::from("streamed-body"),
         );
         let BodyStream(body) = ok_or_panic(BodyStream::from_request(&mut req).await);
-        let collected = body.collect().await.unwrap_or_else(|_| panic!("stream errored")).to_bytes();
+        let collected = body
+            .collect()
+            .await
+            .unwrap_or_else(|_| panic!("stream errored"))
+            .to_bytes();
         assert_eq!(collected, Bytes::from("streamed-body"));
     }
 
@@ -687,7 +682,11 @@ mod tests {
         );
         let _ = req.take_body();
         let BodyStream(body) = ok_or_panic(BodyStream::from_request(&mut req).await);
-        let collected = body.collect().await.unwrap_or_else(|_| panic!("stream errored")).to_bytes();
+        let collected = body
+            .collect()
+            .await
+            .unwrap_or_else(|_| panic!("stream errored"))
+            .to_bytes();
         assert!(collected.is_empty());
     }
 
@@ -724,7 +723,13 @@ mod tests {
             Bytes::from(r#"{"name":"Alice","age":30}"#),
         );
         let Json(u) = ok_or_panic(Json::<User>::from_request(&mut req).await);
-        assert_eq!(u, User { name: "Alice".into(), age: 30 });
+        assert_eq!(
+            u,
+            User {
+                name: "Alice".into(),
+                age: 30
+            }
+        );
     }
 
     // Proves every extractor future is `Send` (required to box into the handler's
@@ -733,7 +738,12 @@ mod tests {
     #[test]
     fn extractor_futures_are_send() {
         fn assert_send<F: Send>(_: F) {}
-        let req = Request::new(Method::GET, "/".parse().unwrap(), HeaderMap::new(), Bytes::new());
+        let req = Request::new(
+            Method::GET,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        );
         assert_send(async move {
             let mut r = req;
             let _ = String::from_request(&mut r).await;
@@ -828,10 +838,7 @@ mod tests {
 
     #[test]
     fn path_param_2_tuple_typed() {
-        let params = vec![
-            ("org".into(), "neutron".into()),
-            ("id".into(), "42".into()),
-        ];
+        let params = vec![("org".into(), "neutron".into()), ("id".into(), "42".into())];
         let result = <(String, u64)>::from_params(&params);
         let (name, id) = result.unwrap();
         assert_eq!(name, "neutron");
@@ -860,10 +867,7 @@ mod tests {
 
     #[test]
     fn path_param_3_tuple_too_few() {
-        let params = vec![
-            ("a".into(), "1".into()),
-            ("b".into(), "2".into()),
-        ];
+        let params = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
         let result = <(u32, u32, u32)>::from_params(&params);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expected 3"));
@@ -983,7 +987,9 @@ mod tests {
             name: String,
         }
 
-        let cfg = AppConfig { name: "test".into() };
+        let cfg = AppConfig {
+            name: "test".into(),
+        };
         let state = StateMapBuilder::new().insert(cfg.clone()).build();
 
         let mut req = get_request("/test");
@@ -1030,12 +1036,7 @@ mod tests {
     async fn headermap_extractor() {
         let mut headers = HeaderMap::new();
         headers.insert("x-custom", HeaderValue::from_static("hello"));
-        let req = Request::new(
-            Method::GET,
-            "/test".parse().unwrap(),
-            headers,
-            Bytes::new(),
-        );
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
         let extracted = ok_or_panic(HeaderMap::from_parts(&req).await);
         assert_eq!(extracted.get("x-custom").unwrap(), "hello");
     }
@@ -1141,7 +1142,13 @@ mod tests {
 
         let mut req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
         let Json(user) = ok_or_panic(Json::<User>::from_request(&mut req).await);
-        assert_eq!(user, User { name: "Alice".into(), age: 30 });
+        assert_eq!(
+            user,
+            User {
+                name: "Alice".into(),
+                age: 30
+            }
+        );
     }
 
     #[cfg(feature = "json")]
@@ -1230,7 +1237,12 @@ mod tests {
         }
 
         let body = Bytes::from(r#"{"name":"Alice"}"#);
-        let mut req = Request::new(Method::POST, "/test".parse().unwrap(), HeaderMap::new(), body);
+        let mut req = Request::new(
+            Method::POST,
+            "/test".parse().unwrap(),
+            HeaderMap::new(),
+            body,
+        );
         let err = err_or_panic(Json::<User>::from_request(&mut req).await);
         assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
@@ -1257,7 +1269,13 @@ mod tests {
 
         let mut req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
         let Form(login) = ok_or_panic(Form::<Login>::from_request(&mut req).await);
-        assert_eq!(login, Login { username: "alice".into(), password: "secret".into() });
+        assert_eq!(
+            login,
+            Login {
+                username: "alice".into(),
+                password: "secret".into()
+            }
+        );
     }
 
     #[cfg(feature = "form")]
@@ -1419,10 +1437,7 @@ mod tests {
     #[tokio::test]
     async fn bearer_token_wrong_scheme_returns_400() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_static("Basic abc123"),
-        );
+        headers.insert("authorization", HeaderValue::from_static("Basic abc123"));
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
         let err = err_or_panic(TypedHeader::<BearerToken>::from_parts(&req).await);
@@ -1451,4 +1466,3 @@ mod tests {
         assert_eq!(method, Method::DELETE);
     }
 }
-

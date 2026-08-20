@@ -30,15 +30,15 @@ pub enum OAuthError {
 impl fmt::Display for OAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadUrl(u)        => write!(f, "OAuth bad URL: {u}"),
-            Self::Connect(e)       => write!(f, "OAuth connect: {e}"),
-            Self::Http(e)          => write!(f, "OAuth HTTP: {e}"),
+            Self::BadUrl(u) => write!(f, "OAuth bad URL: {u}"),
+            Self::Connect(e) => write!(f, "OAuth connect: {e}"),
+            Self::Http(e) => write!(f, "OAuth HTTP: {e}"),
             Self::TokenExchange(e) => write!(f, "OAuth token exchange: {e}"),
             Self::RefreshRejected(e) => write!(f, "OAuth refresh rejected (re-auth required): {e}"),
-            Self::InvalidState     => write!(f, "OAuth invalid state parameter"),
-            Self::MissingCode      => write!(f, "OAuth missing 'code' parameter"),
-            Self::UserInfo(e)      => write!(f, "OAuth userinfo: {e}"),
-            Self::CsrfViolation    => write!(f, "OAuth CSRF violation — state mismatch"),
+            Self::InvalidState => write!(f, "OAuth invalid state parameter"),
+            Self::MissingCode => write!(f, "OAuth missing 'code' parameter"),
+            Self::UserInfo(e) => write!(f, "OAuth userinfo: {e}"),
+            Self::CsrfViolation => write!(f, "OAuth CSRF violation — state mismatch"),
         }
     }
 }
@@ -58,8 +58,12 @@ mod tests {
         assert!(OAuthError::BadUrl("x".into()).to_string().contains('x'));
         assert!(OAuthError::Connect("c".into()).to_string().contains('c'));
         assert!(OAuthError::Http("h".into()).to_string().contains('h'));
-        assert!(OAuthError::TokenExchange("t".into()).to_string().contains('t'));
-        assert!(OAuthError::RefreshRejected("r".into()).to_string().contains('r'));
+        assert!(OAuthError::TokenExchange("t".into())
+            .to_string()
+            .contains('t'));
+        assert!(OAuthError::RefreshRejected("r".into())
+            .to_string()
+            .contains('r'));
         assert!(OAuthError::InvalidState.to_string().contains("invalid"));
         assert!(OAuthError::MissingCode.to_string().contains("missing"));
         assert!(OAuthError::UserInfo("u".into()).to_string().contains('u'));

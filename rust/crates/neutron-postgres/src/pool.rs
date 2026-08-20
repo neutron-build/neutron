@@ -34,10 +34,10 @@ pub struct PgConfig {
     /// When set, takes precedence over the individual fields.
     url: Option<String>,
 
-    pub host:     String,
-    pub port:     u16,
-    pub dbname:   String,
-    pub user:     String,
+    pub host: String,
+    pub port: u16,
+    pub dbname: String,
+    pub user: String,
     pub password: String,
     /// Maximum concurrent connections (default: 16).
     pub max_size: usize,
@@ -46,11 +46,11 @@ pub struct PgConfig {
 impl Default for PgConfig {
     fn default() -> Self {
         Self {
-            url:      None,
-            host:     "127.0.0.1".to_string(),
-            port:     5432,
-            dbname:   "postgres".to_string(),
-            user:     "postgres".to_string(),
+            url: None,
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
             password: String::new(),
             max_size: 16,
         }
@@ -67,7 +67,10 @@ impl PgConfig {
     ///
     /// The URL is stored verbatim and used as-is when connecting.
     pub fn from_url(url: impl Into<String>) -> Self {
-        Self { url: Some(url.into()), ..Default::default() }
+        Self {
+            url: Some(url.into()),
+            ..Default::default()
+        }
     }
 
     pub fn host(mut self, h: impl Into<String>) -> Self {
@@ -117,9 +120,9 @@ impl PgConfig {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct PoolInner {
-    pub(crate) config:    PgConfig,
+    pub(crate) config: PgConfig,
     pub(crate) semaphore: Arc<Semaphore>,
-    pub(crate) idle:      Mutex<VecDeque<Client>>,
+    pub(crate) idle: Mutex<VecDeque<Client>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +154,7 @@ impl PgPool {
         let sem = Arc::new(Semaphore::new(config.max_size));
         Self(Arc::new(PoolInner {
             semaphore: sem,
-            idle:      Mutex::new(VecDeque::new()),
+            idle: Mutex::new(VecDeque::new()),
             config,
         }))
     }
@@ -173,7 +176,11 @@ impl PgPool {
             _ => self.new_client().await?,
         };
 
-        Ok(PooledConn { client: Some(client), pool: Arc::clone(&self.0), permit: Some(permit) })
+        Ok(PooledConn {
+            client: Some(client),
+            pool: Arc::clone(&self.0),
+            permit: Some(permit),
+        })
     }
 
     async fn new_client(&self) -> Result<Client, PgError> {
@@ -202,8 +209,8 @@ impl PgPool {
 /// Automatically returned to the pool (and semaphore slot released) on drop.
 pub struct PooledConn {
     pub(crate) client: Option<Client>,
-    pool:              Arc<PoolInner>,
-    permit:            Option<OwnedSemaphorePermit>,
+    pool: Arc<PoolInner>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PooledConn {
@@ -259,7 +266,7 @@ mod tests {
 
     #[test]
     fn pool_is_clone() {
-        let pool  = PgPool::new(PgConfig::new());
+        let pool = PgPool::new(PgConfig::new());
         let _copy = pool.clone(); // must compile
     }
 

@@ -17,8 +17,8 @@
 use std::path::Path;
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Apply all pending migrations from `dir` to the pool.
 ///

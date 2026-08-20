@@ -2,8 +2,8 @@
 //! DATALOG_QUERY, DATALOG_CLEAR, DATALOG_IMPORT_GRAPH.
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Handle for Datalog reasoning operations.
 pub struct DatalogModel {

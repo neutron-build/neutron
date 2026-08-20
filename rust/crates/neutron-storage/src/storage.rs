@@ -17,24 +17,24 @@ use crate::sign::{
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
     /// Object key (path within the bucket).
-    pub key:           String,
+    pub key: String,
     /// Size in bytes.
-    pub size:          u64,
+    pub size: u64,
     /// RFC-2822 / ISO-8601 last-modified string from the provider.
     pub last_modified: String,
     /// ETag (usually MD5 hex or multipart hash), stripped of surrounding quotes.
-    pub etag:          Option<String>,
+    pub etag: Option<String>,
 }
 
 /// Metadata returned by `head()`.
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     /// Size in bytes (`Content-Length` header).
-    pub size:          u64,
+    pub size: u64,
     /// MIME type (`Content-Type` header).
-    pub content_type:  Option<String>,
+    pub content_type: Option<String>,
     /// ETag header value.
-    pub etag:          Option<String>,
+    pub etag: Option<String>,
     /// Last-Modified header value.
     pub last_modified: Option<String>,
 }
@@ -81,32 +81,32 @@ impl StorageClient {
 
     async fn signed_request(
         &self,
-        method:       &str,
-        key:          &str,
-        query:        &str,
+        method: &str,
+        key: &str,
+        query: &str,
         extra_headers: &[(&str, &str)],
-        body:         Vec<u8>,
+        body: Vec<u8>,
     ) -> Result<(u16, Vec<u8>), StorageError> {
         let (host, region) = self.0.host_and_region();
         let (datetime, date) = utc_now();
         let payload_hash = sha256_hex(&body);
 
-        let raw_path     = self.bucket_key_path(key);
+        let raw_path = self.bucket_key_path(key);
         // Double-encode the path segments (S3 expects key segments to be uri-encoded)
         let encoded_path = encode_path(&raw_path);
 
         let auth = authorization_header(&AuthParams {
             method,
-            host:          &host,
-            path:          &encoded_path,
+            host: &host,
+            path: &encoded_path,
             query,
             extra_headers,
-            payload_hash:  &payload_hash,
-            datetime:      &datetime,
-            date:          &date,
-            region:        &region,
-            access_key:    &self.0.access_key,
-            secret_key:    &self.0.secret_key,
+            payload_hash: &payload_hash,
+            datetime: &datetime,
+            date: &date,
+            region: &region,
+            access_key: &self.0.access_key,
+            secret_key: &self.0.secret_key,
         });
 
         let path_and_query = if query.is_empty() {
@@ -116,22 +116,28 @@ impl StorageClient {
         };
 
         let mut headers: Vec<(&str, String)> = vec![
-            ("authorization",       auth),
-            ("x-amz-date",          datetime),
+            ("authorization", auth),
+            ("x-amz-date", datetime),
             ("x-amz-content-sha256", payload_hash),
         ];
         for (k, v) in extra_headers {
             headers.push((k, v.to_string()));
         }
-        let header_refs: Vec<(&str, &str)> = headers.iter()
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
             .map(|(k, v): &(&str, String)| (*k, v.as_str()))
             .collect();
 
         https_request(
-            method, &host, self.0.port(),
-            &path_and_query, &header_refs, body,
+            method,
+            &host,
+            self.0.port(),
+            &path_and_query,
+            &header_refs,
+            body,
             !self.0.use_http,
-        ).await
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -143,14 +149,14 @@ impl StorageClient {
     /// Returns the ETag of the uploaded object.
     pub async fn put(
         &self,
-        key:          &str,
-        data:         Vec<u8>,
+        key: &str,
+        data: Vec<u8>,
         content_type: &str,
     ) -> Result<String, StorageError> {
         let ct_header = [("content-type", content_type)];
-        let (status, body) = self.signed_request(
-            "PUT", key, "", &ct_header, data,
-        ).await?;
+        let (status, body) = self
+            .signed_request("PUT", key, "", &ct_header, data)
+            .await?;
 
         if !(200..300).contains(&status) {
             return Err(StorageError::Status {
@@ -167,9 +173,7 @@ impl StorageClient {
 
     /// Download the object at `key`.
     pub async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        let (status, body) = self.signed_request(
-            "GET", key, "", &[], vec![],
-        ).await?;
+        let (status, body) = self.signed_request("GET", key, "", &[], vec![]).await?;
 
         if !(200..300).contains(&status) {
             return Err(StorageError::Status {
@@ -186,9 +190,7 @@ impl StorageClient {
 
     /// Delete the object at `key`.
     pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let (status, body) = self.signed_request(
-            "DELETE", key, "", &[], vec![],
-        ).await?;
+        let (status, body) = self.signed_request("DELETE", key, "", &[], vec![]).await?;
 
         // S3 DELETE returns 204 No Content on success
         if status != 204 && !(200..300).contains(&status) {
@@ -213,21 +215,21 @@ impl StorageClient {
         // HEAD uses empty body
         let payload_hash = sha256_hex(b"");
 
-        let raw_path     = self.bucket_key_path(key);
+        let raw_path = self.bucket_key_path(key);
         let encoded_path = encode_path(&raw_path);
 
         let auth = authorization_header(&AuthParams {
-            method:        "HEAD",
-            host:          &host,
-            path:          &encoded_path,
-            query:         "",
+            method: "HEAD",
+            host: &host,
+            path: &encoded_path,
+            query: "",
             extra_headers: &[],
-            payload_hash:  &payload_hash,
-            datetime:      &datetime,
-            date:          &date,
-            region:        &region,
-            access_key:    &self.0.access_key,
-            secret_key:    &self.0.secret_key,
+            payload_hash: &payload_hash,
+            datetime: &datetime,
+            date: &date,
+            region: &region,
+            access_key: &self.0.access_key,
+            secret_key: &self.0.secret_key,
         });
 
         // We need the response headers from HEAD.  Because our internal client
@@ -243,18 +245,26 @@ impl StorageClient {
         //
         // For a production client, you would plumb response headers through.
 
-        let headers = [("authorization",        auth),
-            ("x-amz-date",           datetime),
-            ("x-amz-content-sha256", payload_hash)];
-        let header_refs: Vec<(&str, &str)> = headers.iter()
+        let headers = [
+            ("authorization", auth),
+            ("x-amz-date", datetime),
+            ("x-amz-content-sha256", payload_hash),
+        ];
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
             .map(|(k, v): &(&str, String)| (*k, v.as_str()))
             .collect();
 
         let (status, _body) = crate::client::https_request(
-            "HEAD", &host, self.0.port(),
-            &encoded_path, &header_refs, vec![],
+            "HEAD",
+            &host,
+            self.0.port(),
+            &encoded_path,
+            &header_refs,
+            vec![],
             !self.0.use_http,
-        ).await?;
+        )
+        .await?;
 
         if status == 404 {
             return Err(StorageError::Status {
@@ -272,9 +282,9 @@ impl StorageClient {
         // With only status available (no header map from our client), we
         // return a stub meta.  A full impl would plumb headers through.
         Ok(ObjectMeta {
-            size:          0,
-            content_type:  None,
-            etag:          None,
+            size: 0,
+            content_type: None,
+            etag: None,
             last_modified: None,
         })
     }
@@ -292,38 +302,46 @@ impl StorageClient {
         let payload_hash = sha256_hex(b"");
 
         // The list request targets the bucket root with a query string.
-        let bucket_path    = format!("/{}", self.0.bucket);
+        let bucket_path = format!("/{}", self.0.bucket);
         let encoded_prefix = uri_encode(prefix, true);
         let query = format!("list-type=2&prefix={encoded_prefix}");
 
         let auth = authorization_header(&AuthParams {
-            method:        "GET",
-            host:          &host,
-            path:          &bucket_path,
-            query:         &query,
+            method: "GET",
+            host: &host,
+            path: &bucket_path,
+            query: &query,
             extra_headers: &[],
-            payload_hash:  &payload_hash,
-            datetime:      &datetime,
-            date:          &date,
-            region:        &region,
-            access_key:    &self.0.access_key,
-            secret_key:    &self.0.secret_key,
+            payload_hash: &payload_hash,
+            datetime: &datetime,
+            date: &date,
+            region: &region,
+            access_key: &self.0.access_key,
+            secret_key: &self.0.secret_key,
         });
 
         let path_and_query = format!("{bucket_path}?{query}");
 
-        let headers = [("authorization",        auth),
-            ("x-amz-date",           datetime),
-            ("x-amz-content-sha256", payload_hash)];
-        let header_refs: Vec<(&str, &str)> = headers.iter()
+        let headers = [
+            ("authorization", auth),
+            ("x-amz-date", datetime),
+            ("x-amz-content-sha256", payload_hash),
+        ];
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
             .map(|(k, v): &(&str, String)| (*k, v.as_str()))
             .collect();
 
         let (status, body) = crate::client::https_request(
-            "GET", &host, self.0.port(),
-            &path_and_query, &header_refs, vec![],
+            "GET",
+            &host,
+            self.0.port(),
+            &path_and_query,
+            &header_refs,
+            vec![],
             !self.0.use_http,
-        ).await?;
+        )
+        .await?;
 
         if !(200..300).contains(&status) {
             return Err(StorageError::Status {
@@ -409,28 +427,32 @@ fn encode_path(path: &str) -> String {
 fn parse_list_xml(xml: &str) -> Result<Vec<ObjectInfo>, StorageError> {
     let mut objects = Vec::new();
     for block in xml.split("<Contents>").skip(1) {
-        let end   = block.find("</Contents>").unwrap_or(block.len());
+        let end = block.find("</Contents>").unwrap_or(block.len());
         let inner = &block[..end];
 
-        let key           = xml_tag(inner, "Key").unwrap_or_default();
-        let size: u64     = xml_tag(inner, "Size")
+        let key = xml_tag(inner, "Key").unwrap_or_default();
+        let size: u64 = xml_tag(inner, "Size")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let last_modified = xml_tag(inner, "LastModified").unwrap_or_default();
-        let etag          = xml_tag(inner, "ETag")
-            .map(|s| s.trim_matches('"').to_string());
+        let etag = xml_tag(inner, "ETag").map(|s| s.trim_matches('"').to_string());
 
-        objects.push(ObjectInfo { key, size, last_modified, etag });
+        objects.push(ObjectInfo {
+            key,
+            size,
+            last_modified,
+            etag,
+        });
     }
     Ok(objects)
 }
 
 /// Extract the text content of the first occurrence of `<tag>...</tag>`.
 fn xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open  = format!("<{tag}>");
+    let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
-    let end   = xml[start..].find(&close)?;
+    let end = xml[start..].find(&close)?;
     Some(xml[start..start + end].to_string())
 }
 
@@ -461,7 +483,10 @@ mod tests {
     #[test]
     fn bucket_key_path() {
         let c = StorageClient::new(cfg());
-        assert_eq!(c.bucket_key_path("folder/file.txt"), "/my-bucket/folder/file.txt");
+        assert_eq!(
+            c.bucket_key_path("folder/file.txt"),
+            "/my-bucket/folder/file.txt"
+        );
     }
 
     #[test]
@@ -484,9 +509,7 @@ mod tests {
 
     #[test]
     fn presign_r2() {
-        let c = StorageClient::new(
-            StorageConfig::r2("account123", "assets").credentials("K", "S")
-        );
+        let c = StorageClient::new(StorageConfig::r2("account123", "assets").credentials("K", "S"));
         let url = c.presign_get("img.png", 86400);
         assert!(url.starts_with("https://account123.r2.cloudflarestorage.com/"));
     }
@@ -522,9 +545,9 @@ mod tests {
 </ListBucketResult>"#;
         let result = parse_list_xml(xml).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].key,  "folder/a.txt");
+        assert_eq!(result[0].key, "folder/a.txt");
         assert_eq!(result[0].size, 100);
-        assert_eq!(result[1].key,  "folder/b.txt");
+        assert_eq!(result[1].key, "folder/b.txt");
         assert_eq!(result[1].size, 200);
     }
 

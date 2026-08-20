@@ -17,10 +17,10 @@ pub enum InferError {
 impl fmt::Display for InferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Http(e)          => write!(f, "Inference HTTP error: {e}"),
-            Self::Status(s, body)  => write!(f, "Inference server returned {s}: {body}"),
-            Self::Json(e)          => write!(f, "Inference JSON parse error: {e}"),
-            Self::Protocol(msg)    => write!(f, "Inference protocol error: {msg}"),
+            Self::Http(e) => write!(f, "Inference HTTP error: {e}"),
+            Self::Status(s, body) => write!(f, "Inference server returned {s}: {body}"),
+            Self::Json(e) => write!(f, "Inference JSON parse error: {e}"),
+            Self::Protocol(msg) => write!(f, "Inference protocol error: {msg}"),
         }
     }
 }
@@ -28,5 +28,7 @@ impl fmt::Display for InferError {
 impl std::error::Error for InferError {}
 
 impl From<serde_json::Error> for InferError {
-    fn from(e: serde_json::Error) -> Self { Self::Json(e) }
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json(e)
+    }
 }

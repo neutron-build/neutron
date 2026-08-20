@@ -36,8 +36,7 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
 {
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| CodecError(format!("JSON decode: {e}")))
+        serde_json::from_slice(bytes).map_err(|e| CodecError(format!("JSON decode: {e}")))
     }
 
     fn encode(&self) -> Result<Bytes, CodecError> {
@@ -57,13 +56,17 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
-    struct Greeting { name: String }
+    struct Greeting {
+        name: String,
+    }
 
     #[test]
     fn json_encode_decode_roundtrip() {
-        let g = Greeting { name: "world".to_string() };
+        let g = Greeting {
+            name: "world".to_string(),
+        };
         let encoded = g.encode().unwrap();
-        let decoded  = Greeting::decode(&encoded).unwrap();
+        let decoded = Greeting::decode(&encoded).unwrap();
         assert_eq!(decoded, g);
     }
 

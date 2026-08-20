@@ -13,11 +13,11 @@ use crate::error::WebAuthnError;
 /// Options sent to the browser to initiate a registration.
 #[derive(Debug, Clone, Serialize)]
 pub struct RegistrationOptions {
-    pub rp_id:      String,
-    pub rp_name:    String,
-    pub user_id:    String,
-    pub username:   String,
-    pub challenge:  String, // base64url
+    pub rp_id: String,
+    pub rp_name: String,
+    pub user_id: String,
+    pub username: String,
+    pub challenge: String, // base64url
     pub timeout_ms: u64,
 }
 
@@ -51,14 +51,17 @@ pub fn begin_registration(
     let user_id = user_id.into();
 
     let options = RegistrationOptions {
-        rp_id:      config.rp_id.clone(),
-        rp_name:    config.rp_name.clone(),
-        user_id:    user_id.clone(),
-        username:   username.into(),
-        challenge:  challenge_b64,
+        rp_id: config.rp_id.clone(),
+        rp_name: config.rp_name.clone(),
+        user_id: user_id.clone(),
+        username: username.into(),
+        challenge: challenge_b64,
         timeout_ms: 60_000,
     };
-    let state = RegistrationChallenge { challenge_bytes, user_id };
+    let state = RegistrationChallenge {
+        challenge_bytes,
+        user_id,
+    };
     (options, state)
 }
 
@@ -123,7 +126,8 @@ pub fn finish_registration(
     }
 
     // 8. Parse sign count (bytes 33–36, big-endian u32)
-    let sign_count = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+    let sign_count =
+        u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
 
     // 9. Extract COSE public key from attested credential data (byte 55 onwards, simplified)
     let cose_key_bytes = extract_cose_key(&auth_data)?;
@@ -165,9 +169,13 @@ fn random_bytes(n: usize) -> Vec<u8> {
 fn parse_attestation_object(data: &[u8]) -> Result<(Vec<u8>, String), WebAuthnError> {
     // Simple CBOR map decoder: find "authData" and "fmt" keys
     let mut pos = 0usize;
-    let b = *data.get(pos).ok_or_else(|| WebAuthnError::Cbor("empty".into()))?;
+    let b = *data
+        .get(pos)
+        .ok_or_else(|| WebAuthnError::Cbor("empty".into()))?;
     if b >> 5 != 5 {
-        return Err(WebAuthnError::Cbor("attestation object must be a CBOR map".into()));
+        return Err(WebAuthnError::Cbor(
+            "attestation object must be a CBOR map".into(),
+        ));
     }
     let map_len = (b & 0x1f) as usize;
     pos += 1;
@@ -179,9 +187,15 @@ fn parse_attestation_object(data: &[u8]) -> Result<(Vec<u8>, String), WebAuthnEr
         // Read key (text string)
         let key = read_cbor_text(data, &mut pos)?;
         match key.as_str() {
-            "authData" => { auth_data = Some(read_cbor_bytes(data, &mut pos)?); }
-            "fmt"      => { fmt = read_cbor_text(data, &mut pos)?; }
-            _          => { skip_cbor_value(data, &mut pos)?; }
+            "authData" => {
+                auth_data = Some(read_cbor_bytes(data, &mut pos)?);
+            }
+            "fmt" => {
+                fmt = read_cbor_text(data, &mut pos)?;
+            }
+            _ => {
+                skip_cbor_value(data, &mut pos)?;
+            }
         }
     }
 
@@ -193,21 +207,30 @@ fn parse_attestation_object(data: &[u8]) -> Result<(Vec<u8>, String), WebAuthnEr
 /// authData layout: rpIdHash(32) | flags(1) | signCount(4) | aaguid(16) | credIdLen(2) | credId(n) | coseKey(...)
 fn extract_cose_key(auth_data: &[u8]) -> Result<Vec<u8>, WebAuthnError> {
     if auth_data.len() < 55 {
-        return Err(WebAuthnError::Cbor("authData too short for attested credential data".into()));
+        return Err(WebAuthnError::Cbor(
+            "authData too short for attested credential data".into(),
+        ));
     }
     // 32 (rp hash) + 1 (flags) + 4 (sign count) + 16 (aaguid) = 53
     let cred_id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
     let cose_start = 55 + cred_id_len;
     if cose_start > auth_data.len() {
-        return Err(WebAuthnError::Cbor("authData too short for COSE key".into()));
+        return Err(WebAuthnError::Cbor(
+            "authData too short for COSE key".into(),
+        ));
     }
     Ok(auth_data[cose_start..].to_vec())
 }
 
 fn read_cbor_text(data: &[u8], pos: &mut usize) -> Result<String, WebAuthnError> {
-    let b = *data.get(*pos).ok_or_else(|| WebAuthnError::Cbor("truncated".into()))?;
+    let b = *data
+        .get(*pos)
+        .ok_or_else(|| WebAuthnError::Cbor("truncated".into()))?;
     if b >> 5 != 3 {
-        return Err(WebAuthnError::Cbor(format!("expected text, got major {}", b >> 5)));
+        return Err(WebAuthnError::Cbor(format!(
+            "expected text, got major {}",
+            b >> 5
+        )));
     }
     let len = (b & 0x1f) as usize;
     *pos += 1;
@@ -222,19 +245,30 @@ fn read_cbor_text(data: &[u8], pos: &mut usize) -> Result<String, WebAuthnError>
 }
 
 fn read_cbor_bytes(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, WebAuthnError> {
-    let b = *data.get(*pos).ok_or_else(|| WebAuthnError::Cbor("truncated".into()))?;
+    let b = *data
+        .get(*pos)
+        .ok_or_else(|| WebAuthnError::Cbor("truncated".into()))?;
     if b >> 5 != 2 {
-        return Err(WebAuthnError::Cbor(format!("expected bytes, got major {}", b >> 5)));
+        return Err(WebAuthnError::Cbor(format!(
+            "expected bytes, got major {}",
+            b >> 5
+        )));
     }
     *pos += 1;
     // Handle 1-byte length prefix (0x58 = major 2, additional 24 = 1-byte length follows)
     let len = if (b & 0x1f) == 24 {
-        let l = *data.get(*pos).ok_or_else(|| WebAuthnError::Cbor("truncated".into()))? as usize;
+        let l = *data
+            .get(*pos)
+            .ok_or_else(|| WebAuthnError::Cbor("truncated".into()))? as usize;
         *pos += 1;
         l
     } else if (b & 0x1f) == 25 {
-        let hi = *data.get(*pos).ok_or_else(|| WebAuthnError::Cbor("truncated".into()))? as usize;
-        let lo = *data.get(*pos + 1).ok_or_else(|| WebAuthnError::Cbor("truncated".into()))? as usize;
+        let hi = *data
+            .get(*pos)
+            .ok_or_else(|| WebAuthnError::Cbor("truncated".into()))? as usize;
+        let lo = *data
+            .get(*pos + 1)
+            .ok_or_else(|| WebAuthnError::Cbor("truncated".into()))? as usize;
         *pos += 2;
         (hi << 8) | lo
     } else {
@@ -249,15 +283,23 @@ fn read_cbor_bytes(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, WebAuthnErro
 }
 
 fn skip_cbor_value(data: &[u8], pos: &mut usize) -> Result<(), WebAuthnError> {
-    let b = *data.get(*pos).ok_or_else(|| WebAuthnError::Cbor("truncated".into()))?;
+    let b = *data
+        .get(*pos)
+        .ok_or_else(|| WebAuthnError::Cbor("truncated".into()))?;
     let major = b >> 5;
     match major {
-        0 | 1 => { *pos += 1; } // simple small int
+        0 | 1 => {
+            *pos += 1;
+        } // simple small int
         2 | 3 => {
             let len = (b & 0x1f) as usize;
             *pos += 1 + len;
         }
-        _ => return Err(WebAuthnError::Cbor(format!("skip: unsupported major {major}"))),
+        _ => {
+            return Err(WebAuthnError::Cbor(format!(
+                "skip: unsupported major {major}"
+            )))
+        }
     }
     Ok(())
 }
@@ -275,8 +317,8 @@ mod tests {
 
     #[test]
     fn begin_registration_options_fields() {
-        let config = WebAuthnConfig::new("example.com", "https://example.com")
-            .rp_name("Example Corp");
+        let config =
+            WebAuthnConfig::new("example.com", "https://example.com").rp_name("Example Corp");
         let (opts, _) = begin_registration(&config, "u1", "alice");
         assert_eq!(opts.rp_id, "example.com");
         assert_eq!(opts.rp_name, "Example Corp");

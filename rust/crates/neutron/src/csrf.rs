@@ -62,15 +62,13 @@ pub struct CsrfToken(pub String);
 
 impl FromRequest for CsrfToken {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
-        req.get_extension::<CsrfToken>()
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "CsrfLayer middleware not configured",
-                )
-                    .into_response()
-            })
+        req.get_extension::<CsrfToken>().cloned().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CsrfLayer middleware not configured",
+            )
+                .into_response()
+        })
     }
 }
 
@@ -217,7 +215,11 @@ impl MiddlewareTrait for CsrfLayer {
             if !is_safe_method(req.method()) {
                 // The form-field fallback needs the body; buffer it (keeping it
                 // available to downstream extractors) before reading.
-                if req.buffer_body(crate::app::DEFAULT_MAX_BODY_SIZE).await.is_err() {
+                if req
+                    .buffer_body(crate::app::DEFAULT_MAX_BODY_SIZE)
+                    .await
+                    .is_err()
+                {
                     return http::Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header("content-type", "text/plain; charset=utf-8")
@@ -263,10 +265,8 @@ impl MiddlewareTrait for CsrfLayer {
             if secure {
                 cookie_parts.push("Secure".to_string());
             }
-            resp.headers_mut().append(
-                "set-cookie",
-                cookie_parts.join("; ").parse().unwrap(),
-            );
+            resp.headers_mut()
+                .append("set-cookie", cookie_parts.join("; ").parse().unwrap());
 
             resp
         })
@@ -467,9 +467,8 @@ mod tests {
 
     #[tokio::test]
     async fn without_middleware_returns_500() {
-        let client = TestClient::new(
-            Router::new().get("/", |token: CsrfToken| async move { token.0 }),
-        );
+        let client =
+            TestClient::new(Router::new().get("/", |token: CsrfToken| async move { token.0 }));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);

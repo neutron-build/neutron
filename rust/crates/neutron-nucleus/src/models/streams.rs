@@ -6,8 +6,8 @@ use serde_json;
 use std::collections::HashMap;
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// A single entry in a stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]

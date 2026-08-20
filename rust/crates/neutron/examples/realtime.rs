@@ -77,16 +77,16 @@ async fn handle_ws(mut socket: WebSocket) {
 
     // Send a welcome message
     let _ = socket
-        .send(Message::text("Welcome to the Neutron WebSocket echo server!"))
+        .send(Message::text(
+            "Welcome to the Neutron WebSocket echo server!",
+        ))
         .await;
 
     while let Some(msg) = socket.recv().await {
         match msg {
             Message::Text(text) => {
                 tracing::info!(msg = %text, "WS received");
-                let _ = socket
-                    .send(Message::text(format!("Echo: {text}")))
-                    .await;
+                let _ = socket.send(Message::text(format!("Echo: {text}"))).await;
             }
             Message::Binary(data) => {
                 let _ = socket.send(Message::binary(data)).await;
@@ -109,9 +109,7 @@ async fn handle_ws(mut socket: WebSocket) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let pubsub = PubSub::new();
 
@@ -122,11 +120,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .state(pubsub)
         .middleware(Logger)
         .middleware(RequestId::new())
-        .middleware(Cors::new().allow_any_origin().allow_any_method().allow_any_header())
+        .middleware(
+            Cors::new()
+                .allow_any_origin()
+                .allow_any_method()
+                .allow_any_header(),
+        )
         .get("/events", sse_events)
         .post("/broadcast", broadcast)
         .get("/ws", ws_handler)
-        .get("/health", || async { Json(serde_json::json!({ "status": "ok" })) })
+        .get("/health", || async {
+            Json(serde_json::json!({ "status": "ok" }))
+        })
         .get("/", || async {
             (
                 StatusCode::OK,

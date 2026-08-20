@@ -84,15 +84,17 @@ impl OtlpExporter {
             }]
         });
 
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| OtelError::Export(e.to_string()))?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| OtelError::Export(e.to_string()))?;
 
         let traces_url = self.config.traces_url();
         let url: hyper::Uri = traces_url
             .parse()
             .map_err(|e: hyper::http::uri::InvalidUri| OtelError::Config(e.to_string()))?;
 
-        let host = url.host().ok_or_else(|| OtelError::Config("missing host".into()))?.to_string();
+        let host = url
+            .host()
+            .ok_or_else(|| OtelError::Config("missing host".into()))?
+            .to_string();
         let port = url.port_u16().unwrap_or(80);
 
         let stream = TcpStream::connect(format!("{host}:{port}"))
@@ -100,9 +102,12 @@ impl OtlpExporter {
             .map_err(|e| OtelError::Connect(e.to_string()))?;
         let io = TokioIo::new(stream);
 
-        let (mut sender, conn) = http1::handshake::<_, Full<Bytes>>(io).await
+        let (mut sender, conn) = http1::handshake::<_, Full<Bytes>>(io)
+            .await
             .map_err(|e| OtelError::Export(e.to_string()))?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
         let req = Request::builder()
             .method("POST")
@@ -112,7 +117,9 @@ impl OtlpExporter {
             .body(Full::<Bytes>::from(body_bytes))
             .map_err(|e| OtelError::Export(e.to_string()))?;
 
-        let resp = sender.send_request(req).await
+        let resp = sender
+            .send_request(req)
+            .await
             .map_err(|e| OtelError::Export(e.to_string()))?;
 
         if !resp.status().is_success() {
@@ -140,7 +147,10 @@ mod tests {
             start_ns: 1_000_000,
             end_ns: 2_000_000,
             status: SpanStatus::Ok,
-            attributes: vec![("svc".to_string(), AttributeValue::String("test".to_string()))],
+            attributes: vec![(
+                "svc".to_string(),
+                AttributeValue::String("test".to_string()),
+            )],
         }
     }
 

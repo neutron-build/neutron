@@ -169,8 +169,7 @@ impl JwtConfig {
         let header = r#"{"alg":"HS256","typ":"JWT"}"#;
         let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
 
-        let payload_json =
-            serde_json::to_vec(claims).map_err(|_| JwtError::InvalidToken)?;
+        let payload_json = serde_json::to_vec(claims).map_err(|_| JwtError::InvalidToken)?;
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
 
         let signing_input = format!("{header_b64}.{payload_b64}");
@@ -562,13 +561,12 @@ mod tests {
         let claims = make_claims("alice");
         let token = config.encode(&claims).unwrap();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(JwtAuth::new(config))
-                .get("/", |Extension(claims): Extension<Claims>| async move {
-                    format!("Hello, {}", claims.sub.unwrap_or_default())
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(JwtAuth::new(config)).get(
+            "/",
+            |Extension(claims): Extension<Claims>| async move {
+                format!("Hello, {}", claims.sub.unwrap_or_default())
+            },
+        ));
 
         let resp = client
             .get("/")
@@ -683,7 +681,10 @@ mod tests {
     #[test]
     fn token_with_three_parts_required() {
         let config = test_config();
-        assert_eq!(config.decode("only.two").unwrap_err(), JwtError::InvalidToken);
+        assert_eq!(
+            config.decode("only.two").unwrap_err(),
+            JwtError::InvalidToken
+        );
         assert_eq!(config.decode("one").unwrap_err(), JwtError::InvalidToken);
         assert_eq!(config.decode("").unwrap_err(), JwtError::InvalidToken);
     }
@@ -696,9 +697,8 @@ mod tests {
 
         // Tamper with the payload (middle part)
         let parts: Vec<&str> = token.split('.').collect();
-        let tampered_payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&serde_json::json!({"sub": "admin"})).unwrap(),
-        );
+        let tampered_payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&serde_json::json!({"sub": "admin"})).unwrap());
         let tampered_token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
 
         assert_eq!(

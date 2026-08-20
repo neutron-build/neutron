@@ -3,7 +3,7 @@
 use serde::Deserialize;
 
 use crate::client::https_post;
-use crate::config::{OAuthConfig, url_encode};
+use crate::config::{url_encode, OAuthConfig};
 use crate::error::OAuthError;
 
 // ---------------------------------------------------------------------------
@@ -13,13 +13,13 @@ use crate::error::OAuthError;
 /// The response from the provider's token endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenResponse {
-    pub access_token:  String,
-    pub token_type:    String,
-    pub expires_in:    Option<u64>,
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: Option<u64>,
     pub refresh_token: Option<String>,
     /// OIDC ID token (JWT).
-    pub id_token:      Option<String>,
-    pub scope:         Option<String>,
+    pub id_token: Option<String>,
+    pub scope: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -31,8 +31,8 @@ pub struct TokenResponse {
 /// Sends a POST to `config.token_url` with the code, redirect URI, PKCE
 /// verifier, and client credentials.
 pub async fn exchange_code(
-    config:        &OAuthConfig,
-    code:          &str,
+    config: &OAuthConfig,
+    code: &str,
     code_verifier: &str,
 ) -> Result<TokenResponse, OAuthError> {
     let body = format!(
@@ -63,7 +63,7 @@ pub async fn exchange_code(
 /// which callers should treat as "this account must re-authenticate" rather
 /// than as a transient failure worth retrying.
 pub async fn refresh_access_token(
-    config:  &OAuthConfig,
+    config: &OAuthConfig,
     refresh: &str,
 ) -> Result<TokenResponse, OAuthError> {
     let body = format!(
@@ -113,7 +113,8 @@ fn parse_oauth_error(resp_text: &str) -> Option<OAuthError> {
         let v: serde_json::Value = serde_json::from_str(resp_text).ok()?;
         v.get("error")?.as_str()?.to_string()
     } else {
-        resp_text.split('&')
+        resp_text
+            .split('&')
             .filter_map(|kv| kv.split_once('='))
             .find(|(k, _)| *k == "error")
             .map(|(_, v)| percent_decode(v))?
@@ -121,23 +122,24 @@ fn parse_oauth_error(resp_text: &str) -> Option<OAuthError> {
 
     Some(match code.as_str() {
         "invalid_grant" => OAuthError::RefreshRejected(resp_text.to_string()),
-        _               => OAuthError::TokenExchange(format!("{code}: {resp_text}")),
+        _ => OAuthError::TokenExchange(format!("{code}: {resp_text}")),
     })
 }
 
 /// Parse an `application/x-www-form-urlencoded` token response (GitHub style).
 fn parse_form_response(body: &str) -> Result<TokenResponse, OAuthError> {
-    let pairs: Vec<(&str, &str)> = body.split('&')
+    let pairs: Vec<(&str, &str)> = body
+        .split('&')
         .filter_map(|kv| {
             let (k, v) = kv.split_once('=')?;
-            
-            
+
             Some((k, v))
         })
         .collect();
 
     let get = |key: &str| -> Option<String> {
-        pairs.iter()
+        pairs
+            .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| percent_decode(v))
     };
@@ -147,11 +149,11 @@ fn parse_form_response(body: &str) -> Result<TokenResponse, OAuthError> {
 
     Ok(TokenResponse {
         access_token,
-        token_type:    get("token_type").unwrap_or_else(|| "bearer".into()),
-        expires_in:    get("expires_in").and_then(|v| v.parse().ok()),
+        token_type: get("token_type").unwrap_or_else(|| "bearer".into()),
+        expires_in: get("expires_in").and_then(|v| v.parse().ok()),
         refresh_token: get("refresh_token"),
-        id_token:      get("id_token"),
-        scope:         get("scope"),
+        id_token: get("id_token"),
+        scope: get("scope"),
     })
 }
 
@@ -177,7 +179,7 @@ fn hex_val(b: u8) -> u8 {
         b'0'..=b'9' => b - b'0',
         b'a'..=b'f' => b - b'a' + 10,
         b'A'..=b'F' => b - b'A' + 10,
-        _           => 0,
+        _ => 0,
     }
 }
 
@@ -233,7 +235,8 @@ mod tests {
 
     #[test]
     fn invalid_grant_reports_refresh_rejected() {
-        let body = r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+        let body =
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
         match parse_token_response(body) {
             Err(OAuthError::RefreshRejected(msg)) => assert!(msg.contains("revoked")),
             other => panic!("expected RefreshRejected, got {other:?}"),

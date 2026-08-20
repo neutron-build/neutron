@@ -27,9 +27,9 @@ use bytes::BufMut;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::Full;
-use smallvec::SmallVec;
 #[cfg(feature = "json")]
 use serde::Serialize;
+use smallvec::SmallVec;
 
 use crate::error::AppError;
 use crate::extract::FromRequest;
@@ -142,9 +142,8 @@ pub type Response = http::Response<Body>;
 /// can fail mid-stream (connection reset during upload), so it carries a real
 /// boxed error. Kept separate from `Body` to preserve the response-body
 /// `Infallible` invariant relied on by `IntoResponse`.
-pub type ReqBody = Pin<
-    Box<dyn HttpBody<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>> + Send>,
->;
+pub type ReqBody =
+    Pin<Box<dyn HttpBody<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>> + Send>>;
 
 /// Collect a streaming request body with a hard byte ceiling enforced
 /// **during** streaming — the limit is checked per-frame as bytes arrive, so a
@@ -221,7 +220,8 @@ impl StateMapBuilder {
 
     /// Insert a value of type `T` into the state map.
     pub fn insert<T: Send + Sync + 'static>(mut self, value: T) -> Self {
-        self.0.insert(TypeId::of::<T>(), Arc::new(value) as Arc<dyn AnyState>);
+        self.0
+            .insert(TypeId::of::<T>(), Arc::new(value) as Arc<dyn AnyState>);
         self
     }
 
@@ -761,7 +761,12 @@ mod tests {
     use http_body_util::BodyExt;
 
     async fn body_bytes(resp: Response) -> Vec<u8> {
-        resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
     }
 
     #[tokio::test]
@@ -797,17 +802,33 @@ mod tests {
         let resp = (
             StatusCode::CREATED,
             [
-                (http::header::LOCATION, http::HeaderValue::from_static("/items/1")),
-                (http::header::SET_COOKIE, http::HeaderValue::from_static("a=1")),
-                (http::header::SET_COOKIE, http::HeaderValue::from_static("b=2")),
+                (
+                    http::header::LOCATION,
+                    http::HeaderValue::from_static("/items/1"),
+                ),
+                (
+                    http::header::SET_COOKIE,
+                    http::HeaderValue::from_static("a=1"),
+                ),
+                (
+                    http::header::SET_COOKIE,
+                    http::HeaderValue::from_static("b=2"),
+                ),
             ],
             "made",
         )
             .into_response();
 
         assert_eq!(resp.status(), StatusCode::CREATED);
-        assert_eq!(resp.headers().get(http::header::LOCATION).unwrap(), "/items/1");
-        let cookies = resp.headers().get_all(http::header::SET_COOKIE).iter().count();
+        assert_eq!(
+            resp.headers().get(http::header::LOCATION).unwrap(),
+            "/items/1"
+        );
+        let cookies = resp
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .count();
         assert_eq!(cookies, 2, "both Set-Cookie values should be appended");
         assert_eq!(body_bytes(resp).await, b"made");
     }
@@ -887,8 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn result_err_into_response() {
-        let resp: Result<&str, (StatusCode, &str)> =
-            Err((StatusCode::BAD_REQUEST, "bad request"));
+        let resp: Result<&str, (StatusCode, &str)> = Err((StatusCode::BAD_REQUEST, "bad request"));
         let resp = resp.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_bytes(resp).await, b"bad request");
@@ -901,10 +921,7 @@ mod tests {
         struct Msg {
             msg: String,
         }
-        let resp = Json(Msg {
-            msg: "hi".into(),
-        })
-        .into_response();
+        let resp = Json(Msg { msg: "hi".into() }).into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get("content-type").unwrap(),

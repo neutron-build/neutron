@@ -15,23 +15,31 @@ use tokio::sync::Notify;
 /// A pending job waiting to be processed by a `JobWorker`.
 #[derive(Debug)]
 pub struct QueuedJob {
-    pub id:           u64,
-    pub job_type:     String,
-    pub payload:      Vec<u8>,
-    pub queue:        String,
-    pub attempt:      u32,
+    pub id: u64,
+    pub job_type: String,
+    pub payload: Vec<u8>,
+    pub queue: String,
+    pub attempt: u32,
     pub max_attempts: u32,
-    pub run_at:       Instant,
-    pub enqueued_at:  SystemTime,
+    pub run_at: Instant,
+    pub enqueued_at: SystemTime,
 }
 
 // Wrap for min-heap by run_at (BinaryHeap is max-heap by default).
 struct MinByRunAt(QueuedJob);
 
-impl PartialEq  for MinByRunAt { fn eq(&self, other: &Self) -> bool { self.0.run_at == other.0.run_at } }
-impl Eq         for MinByRunAt {}
-impl PartialOrd for MinByRunAt { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-impl Ord        for MinByRunAt {
+impl PartialEq for MinByRunAt {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.run_at == other.0.run_at
+    }
+}
+impl Eq for MinByRunAt {}
+impl PartialOrd for MinByRunAt {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MinByRunAt {
     fn cmp(&self, other: &Self) -> Ordering {
         other.0.run_at.cmp(&self.0.run_at) // reversed for min-heap
     }
@@ -46,16 +54,16 @@ impl Ord        for MinByRunAt {
 /// Backed by a `Mutex<BinaryHeap>` for storage and a `tokio::sync::Notify`
 /// to wake workers when new jobs arrive.
 pub struct JobQueue {
-    heap:    Mutex<BinaryHeap<MinByRunAt>>,
-    notify:  Notify,
+    heap: Mutex<BinaryHeap<MinByRunAt>>,
+    notify: Notify,
     next_id: AtomicU64,
 }
 
 impl JobQueue {
     pub fn new() -> Self {
         Self {
-            heap:    Mutex::new(BinaryHeap::new()),
-            notify:  Notify::new(),
+            heap: Mutex::new(BinaryHeap::new()),
+            notify: Notify::new(),
             next_id: AtomicU64::new(1),
         }
     }
@@ -95,13 +103,13 @@ impl JobQueue {
         let id = self.next_id.fetch_add(1, AtomicOrdering::Relaxed);
         let job = QueuedJob {
             id,
-            job_type:     job_type.into(),
+            job_type: job_type.into(),
             payload,
-            queue:        "default".to_string(),
-            attempt:      1,
+            queue: "default".to_string(),
+            attempt: 1,
             max_attempts,
             run_at,
-            enqueued_at:  SystemTime::now(),
+            enqueued_at: SystemTime::now(),
         };
         self.heap.lock().unwrap().push(MinByRunAt(job));
         self.notify.notify_one();
@@ -118,7 +126,7 @@ impl JobQueue {
     /// Re-enqueue a failed job for retry after a delay.
     pub(crate) fn reenqueue(&self, mut job: QueuedJob, delay: Duration) {
         job.attempt += 1;
-        job.run_at   = Instant::now() + delay;
+        job.run_at = Instant::now() + delay;
         self.heap.lock().unwrap().push(MinByRunAt(job));
         self.notify.notify_one();
     }

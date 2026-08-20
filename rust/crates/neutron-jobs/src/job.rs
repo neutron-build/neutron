@@ -30,11 +30,9 @@ pub struct Job<T>(pub T);
 impl<T: DeserializeOwned + Send + 'static> FromRequest for Job<T> {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
         let body = req.collect_body(2 * 1024 * 1024).await?;
-        serde_json::from_slice(&body)
-            .map(Job)
-            .map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Invalid job payload: {e}")).into_response()
-            })
+        serde_json::from_slice(&body).map(Job).map_err(|e| {
+            (StatusCode::BAD_REQUEST, format!("Invalid job payload: {e}")).into_response()
+        })
     }
 }
 
@@ -53,25 +51,23 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Job<T> {
 /// ```
 #[derive(Debug, Clone)]
 pub struct JobContext {
-    pub job_id:       String,
-    pub job_type:     String,
-    pub attempt:      u32,
+    pub job_id: String,
+    pub job_type: String,
+    pub attempt: u32,
     pub max_attempts: u32,
     pub scheduled_at: SystemTime,
-    pub queue:        String,
+    pub queue: String,
 }
 
 impl FromRequestParts for JobContext {
     async fn from_parts(req: &Request) -> Result<Self, Response> {
-        req.get_extension::<JobContext>()
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "JobContext not set — was this handler called outside a JobWorker?",
-                )
-                    .into_response()
-            })
+        req.get_extension::<JobContext>().cloned().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "JobContext not set — was this handler called outside a JobWorker?",
+            )
+                .into_response()
+        })
     }
 }
 
@@ -87,7 +83,7 @@ pub enum JobResult {
     Ok,
     /// Retry this job after `delay`. The worker will re-enqueue it.
     Retry {
-        delay:  Duration,
+        delay: Duration,
         reason: Option<String>,
     },
     /// Permanent failure — do not retry.
@@ -96,15 +92,23 @@ pub enum JobResult {
 
 impl JobResult {
     pub fn retry_after(delay: Duration) -> Self {
-        Self::Retry { delay, reason: None }
+        Self::Retry {
+            delay,
+            reason: None,
+        }
     }
 
     pub fn retry_with_reason(delay: Duration, reason: impl Into<String>) -> Self {
-        Self::Retry { delay, reason: Some(reason.into()) }
+        Self::Retry {
+            delay,
+            reason: Some(reason.into()),
+        }
     }
 
     pub fn dead(reason: impl Into<String>) -> Self {
-        Self::Dead { reason: reason.into() }
+        Self::Dead {
+            reason: reason.into(),
+        }
     }
 }
 
@@ -196,14 +200,15 @@ mod tests {
 
     #[tokio::test]
     async fn job_result_retry_with_reason() {
-        let resp = JobResult::retry_with_reason(
-            Duration::from_millis(500),
-            "downstream unavailable",
-        )
-        .into_response();
+        let resp =
+            JobResult::retry_with_reason(Duration::from_millis(500), "downstream unavailable")
+                .into_response();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(resp.headers().get("x-retry-after-ms").unwrap(), "500");
-        assert_eq!(resp.headers().get("x-retry-reason").unwrap(), "downstream unavailable");
+        assert_eq!(
+            resp.headers().get("x-retry-reason").unwrap(),
+            "downstream unavailable"
+        );
     }
 
     #[tokio::test]
@@ -240,7 +245,7 @@ mod tests {
     // Helper: unwrap Result<T, Response> without requiring Response: Debug
     fn ok_or_panic<T>(r: Result<T, Response>, msg: &str) -> T {
         match r {
-            Ok(v)    => v,
+            Ok(v) => v,
             Err(resp) => panic!("{msg}: HTTP {}", resp.status()),
         }
     }
@@ -250,15 +255,30 @@ mod tests {
     #[tokio::test]
     async fn job_extractor_deserializes_json_body() {
         #[derive(serde::Deserialize, Debug, PartialEq)]
-        struct Payload { id: u64, name: String }
+        struct Payload {
+            id: u64,
+            name: String,
+        }
 
         let body = serde_json::to_vec(&serde_json::json!({"id": 1, "name": "alice"})).unwrap();
         let mut req = Request::new(
-            Method::POST, "/".parse().unwrap(), HeaderMap::new(), Bytes::from(body),
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from(body),
         );
 
-        let Job(p) = ok_or_panic(Job::<Payload>::from_request(&mut req).await, "Job extractor failed");
-        assert_eq!(p, Payload { id: 1, name: "alice".to_string() });
+        let Job(p) = ok_or_panic(
+            Job::<Payload>::from_request(&mut req).await,
+            "Job extractor failed",
+        );
+        assert_eq!(
+            p,
+            Payload {
+                id: 1,
+                name: "alice".to_string()
+            }
+        );
     }
 
     #[tokio::test]
@@ -269,7 +289,9 @@ mod tests {
             HeaderMap::new(),
             Bytes::from_static(b"not json"),
         );
-        assert!(Job::<serde_json::Value>::from_request(&mut req).await.is_err());
+        assert!(Job::<serde_json::Value>::from_request(&mut req)
+            .await
+            .is_err());
     }
 
     // -- JobContext extractor ----------------------------------------------
@@ -277,20 +299,26 @@ mod tests {
     #[tokio::test]
     async fn job_context_extracted_from_extension() {
         let ctx = JobContext {
-            job_id:       "abc-123".to_string(),
-            job_type:     "email".to_string(),
-            attempt:      2,
+            job_id: "abc-123".to_string(),
+            job_type: "email".to_string(),
+            attempt: 2,
             max_attempts: 5,
             scheduled_at: SystemTime::now(),
-            queue:        "default".to_string(),
+            queue: "default".to_string(),
         };
 
         let mut req = Request::new(
-            Method::POST, "/".parse().unwrap(), HeaderMap::new(), Bytes::new(),
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
         );
         req.set_extension(ctx.clone());
 
-        let extracted = ok_or_panic(JobContext::from_parts(&req).await, "JobContext extraction failed");
+        let extracted = ok_or_panic(
+            JobContext::from_parts(&req).await,
+            "JobContext extraction failed",
+        );
         assert_eq!(extracted.job_id, "abc-123");
         assert_eq!(extracted.attempt, 2);
     }
@@ -298,7 +326,10 @@ mod tests {
     #[tokio::test]
     async fn job_context_fails_without_extension() {
         let req = Request::new(
-            Method::POST, "/".parse().unwrap(), HeaderMap::new(), Bytes::new(),
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
         );
         assert!(JobContext::from_parts(&req).await.is_err());
     }

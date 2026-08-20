@@ -54,10 +54,10 @@ impl FromRequest for GrpcRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::body::frame_message;
-    use neutron::handler::Request;
+    use bytes::Bytes;
     use http::{HeaderMap, Method};
+    use neutron::handler::Request;
 
     fn grpc_request(payload: &[u8]) -> Request {
         let framed = frame_message(Bytes::copy_from_slice(payload));
@@ -68,7 +68,10 @@ mod tests {
     }
 
     fn ok_or_panic<T>(r: Result<T, Response>, msg: &str) -> T {
-        match r { Ok(v) => v, Err(resp) => panic!("{msg}: HTTP {}", resp.status()) }
+        match r {
+            Ok(v) => v,
+            Err(resp) => panic!("{msg}: HTTP {}", resp.status()),
+        }
     }
 
     #[tokio::test]
@@ -93,8 +96,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/grpc".parse().unwrap());
         // Only 3 bytes — too short for the 5-byte header
-        let mut req =
-            Request::new(Method::POST, "/".parse().unwrap(), headers, Bytes::from_static(b"ab"));
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            headers,
+            Bytes::from_static(b"ab"),
+        );
         let result = GrpcRequest::from_request(&mut req).await;
         assert!(result.is_err());
     }
@@ -102,8 +109,10 @@ mod tests {
     #[tokio::test]
     async fn extracts_empty_payload() {
         let mut req = grpc_request(b"");
-        let GrpcRequest(payload) =
-            ok_or_panic(GrpcRequest::from_request(&mut req).await, "empty extract failed");
+        let GrpcRequest(payload) = ok_or_panic(
+            GrpcRequest::from_request(&mut req).await,
+            "empty extract failed",
+        );
         assert!(payload.is_empty());
     }
 }

@@ -38,5 +38,5 @@ pub use config::{OAuthConfig, OAuthProvider};
 pub use error::OAuthError;
 pub use handlers::{oauth_callback_handler, oauth_redirect_handler};
 pub use pkce::PkceChallenge;
-pub use token::{TokenResponse, exchange_code, refresh_access_token};
+pub use token::{exchange_code, refresh_access_token, TokenResponse};
 pub use user::OAuthUser;

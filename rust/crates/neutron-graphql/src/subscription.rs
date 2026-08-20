@@ -85,8 +85,8 @@ pub trait SubscriptionSchema: Send + Sync + 'static {
 struct ClientMessage {
     #[serde(rename = "type")]
     msg_type: String,
-    id:       Option<String>,
-    payload:  Option<Value>,
+    id: Option<String>,
+    payload: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -94,16 +94,16 @@ struct ServerMessage<'a> {
     #[serde(rename = "type")]
     msg_type: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    id:       Option<&'a str>,
+    id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    payload:  Option<Value>,
+    payload: Option<Value>,
 }
 
 fn make_ack() -> String {
     serde_json::to_string(&ServerMessage {
         msg_type: "connection_ack",
-        id:       None,
-        payload:  None,
+        id: None,
+        payload: None,
     })
     .unwrap()
 }
@@ -111,8 +111,8 @@ fn make_ack() -> String {
 fn make_next(id: &str, payload: Value) -> String {
     serde_json::to_string(&ServerMessage {
         msg_type: "next",
-        id:       Some(id),
-        payload:  Some(payload),
+        id: Some(id),
+        payload: Some(payload),
     })
     .unwrap()
 }
@@ -120,8 +120,8 @@ fn make_next(id: &str, payload: Value) -> String {
 fn make_complete(id: &str) -> String {
     serde_json::to_string(&ServerMessage {
         msg_type: "complete",
-        id:       Some(id),
-        payload:  None,
+        id: Some(id),
+        payload: None,
     })
     .unwrap()
 }
@@ -129,8 +129,8 @@ fn make_complete(id: &str) -> String {
 fn make_error(id: &str, message: &str) -> String {
     serde_json::to_string(&ServerMessage {
         msg_type: "error",
-        id:       Some(id),
-        payload:  Some(serde_json::json!([{"message": message}])),
+        id: Some(id),
+        payload: Some(serde_json::json!([{"message": message}])),
     })
     .unwrap()
 }
@@ -150,11 +150,7 @@ fn make_error(id: &str, message: &str) -> String {
 /// ```
 pub fn graphql_subscription_handler<S>(
     schema: Arc<S>,
-) -> impl Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
-       + Clone
-       + Send
-       + Sync
-       + 'static
+) -> impl Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Clone + Send + Sync + 'static
 where
     S: SubscriptionSchema,
 {
@@ -164,7 +160,7 @@ where
             let mut req = req;
             // Extract the WebSocket upgrade from the request.
             let ws = match WebSocketUpgrade::from_request(&mut req).await {
-                Ok(ws)   => ws,
+                Ok(ws) => ws,
                 Err(err) => return err,
             };
 
@@ -188,13 +184,13 @@ async fn run_graphql_ws<S: SubscriptionSchema>(mut socket: WebSocket, schema: Ar
     loop {
         let msg = match socket.recv().await {
             Some(m) => m,
-            None    => break, // Connection closed.
+            None => break, // Connection closed.
         };
 
         let text = match msg {
-            Message::Text(t)  => t,
+            Message::Text(t) => t,
             Message::Close(_) => break,
-            Message::Ping(d)  => {
+            Message::Ping(d) => {
                 let _ = socket.send(Message::Pong(d)).await;
                 continue;
             }
@@ -202,7 +198,7 @@ async fn run_graphql_ws<S: SubscriptionSchema>(mut socket: WebSocket, schema: Ar
         };
 
         let client_msg: ClientMessage = match serde_json::from_str(&text) {
-            Ok(m)  => m,
+            Ok(m) => m,
             Err(_) => break, // Malformed message — close.
         };
 
@@ -219,18 +215,20 @@ async fn run_graphql_ws<S: SubscriptionSchema>(mut socket: WebSocket, schema: Ar
             "subscribe" if init_done => {
                 let id = match client_msg.id {
                     Some(id) => id,
-                    None     => continue,
+                    None => continue,
                 };
                 let payload = match client_msg.payload {
                     Some(p) => p,
-                    None    => {
-                        let _ = socket.send(Message::Text(make_error(&id, "missing payload"))).await;
+                    None => {
+                        let _ = socket
+                            .send(Message::Text(make_error(&id, "missing payload")))
+                            .await;
                         continue;
                     }
                 };
 
                 let gql_req = match parse_subscribe_payload(payload) {
-                    Ok(r)  => r,
+                    Ok(r) => r,
                     Err(e) => {
                         let _ = socket.send(Message::Text(make_error(&id, &e))).await;
                         continue;
@@ -252,7 +250,11 @@ async fn run_graphql_ws<S: SubscriptionSchema>(mut socket: WebSocket, schema: Ar
                         );
                     }
                     let payload = Value::Object(map);
-                    if socket.send(Message::Text(make_next(&id, payload))).await.is_err() {
+                    if socket
+                        .send(Message::Text(make_next(&id, payload)))
+                        .await
+                        .is_err()
+                    {
                         return; // Connection dropped mid-stream.
                     }
                 }
@@ -295,7 +297,11 @@ fn parse_subscribe_payload(payload: Value) -> Result<GraphQlRequest, String> {
         .and_then(Value::as_object)
         .map(|m| Value::Object(m.clone()));
 
-    Ok(GraphQlRequest { query, variables, operation_name })
+    Ok(GraphQlRequest {
+        query,
+        variables,
+        operation_name,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -317,16 +323,16 @@ mod tests {
     fn next_message_contains_payload() {
         let payload = serde_json::json!({"data": {"count": 1}});
         let msg: Value = serde_json::from_str(&make_next("sub-1", payload)).unwrap();
-        assert_eq!(msg["type"],                         "next");
-        assert_eq!(msg["id"],                           "sub-1");
-        assert_eq!(msg["payload"]["data"]["count"],     1);
+        assert_eq!(msg["type"], "next");
+        assert_eq!(msg["id"], "sub-1");
+        assert_eq!(msg["payload"]["data"]["count"], 1);
     }
 
     #[test]
     fn complete_message_no_payload() {
         let msg: Value = serde_json::from_str(&make_complete("sub-1")).unwrap();
         assert_eq!(msg["type"], "complete");
-        assert_eq!(msg["id"],   "sub-1");
+        assert_eq!(msg["id"], "sub-1");
         assert!(msg.get("payload").map(|v| v.is_null()).unwrap_or(true));
     }
 
@@ -345,8 +351,8 @@ mod tests {
             "variables":     { "n": 5 }
         });
         let req = parse_subscribe_payload(payload).unwrap();
-        assert_eq!(req.query,                          "subscription { count }");
-        assert_eq!(req.operation_name.as_deref(),      Some("CountSub"));
+        assert_eq!(req.query, "subscription { count }");
+        assert_eq!(req.operation_name.as_deref(), Some("CountSub"));
         assert_eq!(req.variables.as_ref().unwrap()["n"], 5);
     }
 

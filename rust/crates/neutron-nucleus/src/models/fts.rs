@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// A single full-text search result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,9 +101,8 @@ impl FtsModel {
             validate_identifier(ident)?;
         }
         let conn = self.pool.get().await?;
-        let sql = format!(
-            "CREATE INDEX IF NOT EXISTS {index_name} ON {table} USING FTS ({column})"
-        );
+        let sql =
+            format!("CREATE INDEX IF NOT EXISTS {index_name} ON {table} USING FTS ({column})");
         conn.client()
             .execute(&sql, &[])
             .await

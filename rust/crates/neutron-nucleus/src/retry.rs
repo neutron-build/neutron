@@ -209,8 +209,7 @@ mod tests {
         // The distinction that matters: retrying 55P03 spins against a lock
         // that is not moving, so it must never be folded into 40001.
         assert_ne!(
-            SQLSTATE_LOCK_NOT_AVAILABLE,
-            SQLSTATE_SERIALIZATION_FAILURE,
+            SQLSTATE_LOCK_NOT_AVAILABLE, SQLSTATE_SERIALIZATION_FAILURE,
             "lock timeout and serialization failure are different outcomes"
         );
     }
@@ -226,7 +225,10 @@ mod tests {
     fn jitter_stays_within_the_delay() {
         let d = Duration::from_millis(50);
         for attempt in 1..64 {
-            assert!(jittered(d, attempt) <= d, "jitter must not exceed the delay");
+            assert!(
+                jittered(d, attempt) <= d,
+                "jitter must not exceed the delay"
+            );
         }
     }
 

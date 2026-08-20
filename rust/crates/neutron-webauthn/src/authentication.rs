@@ -1,10 +1,10 @@
 //! WebAuthn authentication ceremony.
 
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use p256::EncodedPoint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-use p256::EncodedPoint;
 
 use crate::cbor::parse_cose_key;
 use crate::config::WebAuthnConfig;
@@ -15,9 +15,9 @@ use crate::registration::{b64url_decode, b64url_encode};
 /// Options sent to the browser to initiate an authentication assertion.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthenticationOptions {
-    pub rp_id:         String,
-    pub challenge:     String, // base64url
-    pub timeout_ms:    u64,
+    pub rp_id: String,
+    pub challenge: String, // base64url
+    pub timeout_ms: u64,
     pub credential_id: String, // base64url hint to the browser
 }
 
@@ -120,7 +120,8 @@ pub fn finish_authentication(
     }
 
     // 8. Extract sign count
-    let sign_count = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+    let sign_count =
+        u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
 
     // 9. Verify signature
     //    verificationData = authData || SHA-256(clientDataJSON)
@@ -156,15 +157,15 @@ fn verify_es256_signature(
     uncompressed[0] = 0x04;
     uncompressed[1..33].copy_from_slice(&cose_key.x);
     uncompressed[33..].copy_from_slice(&cose_key.y);
-    let point = EncodedPoint::from_bytes(uncompressed)
-        .map_err(|_| WebAuthnError::InvalidSignature)?;
-    let verifying_key = VerifyingKey::from_encoded_point(&point)
-        .map_err(|_| WebAuthnError::InvalidSignature)?;
+    let point =
+        EncodedPoint::from_bytes(uncompressed).map_err(|_| WebAuthnError::InvalidSignature)?;
+    let verifying_key =
+        VerifyingKey::from_encoded_point(&point).map_err(|_| WebAuthnError::InvalidSignature)?;
 
-    let signature = Signature::from_der(sig_der)
-        .map_err(|_| WebAuthnError::InvalidSignature)?;
+    let signature = Signature::from_der(sig_der).map_err(|_| WebAuthnError::InvalidSignature)?;
 
-    verifying_key.verify(data, &signature)
+    verifying_key
+        .verify(data, &signature)
         .map_err(|_| WebAuthnError::InvalidSignature)
 }
 
@@ -302,7 +303,9 @@ mod tests {
 
     #[test]
     fn finish_registration_challenge_mismatch_fails() {
-        use crate::registration::{finish_registration, RegistrationChallenge, RegistrationResponse};
+        use crate::registration::{
+            finish_registration, RegistrationChallenge, RegistrationResponse,
+        };
         let config = WebAuthnConfig::new("example.com", "https://example.com");
 
         let challenge = RegistrationChallenge {
@@ -329,7 +332,7 @@ mod tests {
 
     #[test]
     fn p256_signature_verification_with_generated_key() {
-        use p256::ecdsa::{SigningKey, signature::Signer};
+        use p256::ecdsa::{signature::Signer, SigningKey};
         use rand::rngs::OsRng;
 
         let signing_key = SigningKey::random(&mut OsRng);
@@ -341,11 +344,20 @@ mod tests {
         // Build COSE key bytes matching the cbor::build_cose_key format
         let mut cose_bytes = vec![];
         cose_bytes.push(0xa5); // map(5)
-        cose_bytes.push(0x01); cose_bytes.push(0x02); // 1:2
-        cose_bytes.push(0x03); cose_bytes.push(0x26); // 3:-7
-        cose_bytes.push(0x20); cose_bytes.push(0x01); // -1:1
-        cose_bytes.push(0x21); cose_bytes.push(0x58); cose_bytes.push(32); cose_bytes.extend_from_slice(&x); // -2: x
-        cose_bytes.push(0x22); cose_bytes.push(0x58); cose_bytes.push(32); cose_bytes.extend_from_slice(&y); // -3: y
+        cose_bytes.push(0x01);
+        cose_bytes.push(0x02); // 1:2
+        cose_bytes.push(0x03);
+        cose_bytes.push(0x26); // 3:-7
+        cose_bytes.push(0x20);
+        cose_bytes.push(0x01); // -1:1
+        cose_bytes.push(0x21);
+        cose_bytes.push(0x58);
+        cose_bytes.push(32);
+        cose_bytes.extend_from_slice(&x); // -2: x
+        cose_bytes.push(0x22);
+        cose_bytes.push(0x58);
+        cose_bytes.push(32);
+        cose_bytes.extend_from_slice(&y); // -3: y
 
         let data = b"test signing data";
         let sig: p256::ecdsa::Signature = signing_key.sign(data);
@@ -356,7 +368,7 @@ mod tests {
 
     #[test]
     fn p256_wrong_signature_fails() {
-        use p256::ecdsa::{SigningKey, signature::Signer};
+        use p256::ecdsa::{signature::Signer, SigningKey};
         use rand::rngs::OsRng;
 
         let signing_key = SigningKey::random(&mut OsRng);
@@ -367,11 +379,20 @@ mod tests {
 
         let mut cose_bytes = vec![];
         cose_bytes.push(0xa5);
-        cose_bytes.push(0x01); cose_bytes.push(0x02);
-        cose_bytes.push(0x03); cose_bytes.push(0x26);
-        cose_bytes.push(0x20); cose_bytes.push(0x01);
-        cose_bytes.push(0x21); cose_bytes.push(0x58); cose_bytes.push(32); cose_bytes.extend_from_slice(&x);
-        cose_bytes.push(0x22); cose_bytes.push(0x58); cose_bytes.push(32); cose_bytes.extend_from_slice(&y);
+        cose_bytes.push(0x01);
+        cose_bytes.push(0x02);
+        cose_bytes.push(0x03);
+        cose_bytes.push(0x26);
+        cose_bytes.push(0x20);
+        cose_bytes.push(0x01);
+        cose_bytes.push(0x21);
+        cose_bytes.push(0x58);
+        cose_bytes.push(32);
+        cose_bytes.extend_from_slice(&x);
+        cose_bytes.push(0x22);
+        cose_bytes.push(0x58);
+        cose_bytes.push(32);
+        cose_bytes.extend_from_slice(&y);
 
         let data = b"real data";
         let sig: p256::ecdsa::Signature = signing_key.sign(data);

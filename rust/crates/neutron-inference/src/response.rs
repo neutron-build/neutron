@@ -45,11 +45,19 @@ pub struct InferenceChunk {
 
 impl InferenceChunk {
     pub fn data(delta: impl Into<String>) -> Self {
-        Self { delta: delta.into(), done: false, finish_reason: None }
+        Self {
+            delta: delta.into(),
+            done: false,
+            finish_reason: None,
+        }
     }
 
     pub fn final_chunk(delta: impl Into<String>, reason: FinishReason) -> Self {
-        Self { delta: delta.into(), done: true, finish_reason: Some(reason) }
+        Self {
+            delta: delta.into(),
+            done: true,
+            finish_reason: Some(reason),
+        }
     }
 }
 
@@ -75,11 +83,11 @@ mod tests {
     #[test]
     fn response_json_roundtrip() {
         let r = InferenceResponse {
-            text:             "test".to_string(),
+            text: "test".to_string(),
             tokens_generated: 10,
-            prompt_tokens:    5,
-            finish_reason:    FinishReason::Length,
-            latency_ms:       42,
+            prompt_tokens: 5,
+            finish_reason: FinishReason::Length,
+            latency_ms: 42,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: InferenceResponse = serde_json::from_str(&json).unwrap();

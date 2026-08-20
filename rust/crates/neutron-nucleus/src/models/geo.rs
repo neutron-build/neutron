@@ -2,8 +2,8 @@
 //! GEO_AREA, ST_MAKEPOINT, ST_X, ST_Y.
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// A geographic coordinate.
 #[derive(Debug, Clone, Copy)]

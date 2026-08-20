@@ -2,8 +2,8 @@
 //! TS_RANGE_AVG, TS_RETENTION, TIME_BUCKET.
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Handle for time-series operations.
 pub struct TimeSeriesModel {
@@ -64,7 +64,10 @@ impl TimeSeriesModel {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
-            .query_one("SELECT TS_RANGE($1, $2, $3)", &[&series, &start_ms, &end_ms])
+            .query_one(
+                "SELECT TS_RANGE($1, $2, $3)",
+                &[&series, &start_ms, &end_ms],
+            )
             .await
             .map_err(NucleusError::Query)?;
         let raw = row.get_ck::<String>(0)?;

@@ -11,14 +11,14 @@ use std::{
 
 #[derive(Clone)]
 struct Entry {
-    value:      Vec<u8>,
+    value: Vec<u8>,
     expires_at: Instant,
 }
 
 /// Cheap-to-clone, thread-safe in-process TTL cache.
 #[derive(Clone)]
 pub struct L1Cache {
-    inner:        Arc<Mutex<HashMap<String, Entry>>>,
+    inner: Arc<Mutex<HashMap<String, Entry>>>,
     max_capacity: usize,
 }
 
@@ -33,7 +33,11 @@ impl L1Cache {
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let map = self.inner.lock().unwrap();
         map.get(key).and_then(|e| {
-            if Instant::now() < e.expires_at { Some(e.value.clone()) } else { None }
+            if Instant::now() < e.expires_at {
+                Some(e.value.clone())
+            } else {
+                None
+            }
         })
     }
 
@@ -67,7 +71,9 @@ impl L1Cache {
     }
 
     pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
-        self.inner.lock().unwrap()
+        self.inner
+            .lock()
+            .unwrap()
             .keys()
             .filter(|k| k.starts_with(prefix))
             .cloned()
@@ -76,14 +82,16 @@ impl L1Cache {
 
     fn evict_one(&self, map: &mut HashMap<String, Entry>) {
         let now = Instant::now();
-        if let Some(expired_key) = map.iter()
+        if let Some(expired_key) = map
+            .iter()
             .find(|(_, e)| e.expires_at <= now)
             .map(|(k, _)| k.clone())
         {
             map.remove(&expired_key);
             return;
         }
-        if let Some(oldest_key) = map.iter()
+        if let Some(oldest_key) = map
+            .iter()
             .min_by_key(|(_, e)| e.expires_at)
             .map(|(k, _)| k.clone())
         {
@@ -97,7 +105,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn cache(cap: usize) -> L1Cache { L1Cache::new(cap) }
+    fn cache(cap: usize) -> L1Cache {
+        L1Cache::new(cap)
+    }
 
     #[test]
     fn get_on_empty_cache_returns_none() {

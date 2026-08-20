@@ -41,7 +41,7 @@ type SmtpTransport = AsyncSmtpTransport<Tokio1Executor>;
 pub struct Mailer(Arc<MailerInner>);
 
 struct MailerInner {
-    transport:    SmtpTransport,
+    transport: SmtpTransport,
     default_from: Option<String>,
 }
 
@@ -75,19 +75,14 @@ impl Mailer {
 fn build_transport(cfg: &SmtpConfig) -> Result<SmtpTransport, SmtpError> {
     let builder = match cfg.tls {
         TlsMode::None => {
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host)
-                .port(cfg.port)
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host).port(cfg.port)
         }
-        TlsMode::StartTls => {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)
-                .map_err(SmtpError::from)?
-                .port(cfg.port)
-        }
-        TlsMode::Tls => {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)
-                .map_err(SmtpError::from)?
-                .port(cfg.port)
-        }
+        TlsMode::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)
+            .map_err(SmtpError::from)?
+            .port(cfg.port),
+        TlsMode::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)
+            .map_err(SmtpError::from)?
+            .port(cfg.port),
     };
 
     let builder = if let (Some(u), Some(p)) = (&cfg.username, &cfg.password) {

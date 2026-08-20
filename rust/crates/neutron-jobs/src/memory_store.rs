@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::store::{BoxFuture, JobStore, StoredJob, StoreError, now_ms};
+use crate::store::{now_ms, BoxFuture, JobStore, StoreError, StoredJob};
 
 // ---------------------------------------------------------------------------
 // Internal record (tracks status)
@@ -21,7 +21,7 @@ enum JobStatus {
 
 #[derive(Debug, Clone)]
 struct Record {
-    job:    StoredJob,
+    job: StoredJob,
     status: JobStatus,
 }
 
@@ -66,7 +66,10 @@ impl JobStore for MemoryJobStore {
         Box::pin(async move {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             job.id = id;
-            let record = Record { job, status: JobStatus::Pending };
+            let record = Record {
+                job,
+                status: JobStatus::Pending,
+            };
             self.records.lock().unwrap().insert(id, record);
             Ok(id)
         })
@@ -104,39 +107,8 @@ impl JobStore for MemoryJobStore {
         Box::pin(async move {
             let mut records = self.records.lock().unwrap();
             match records.get_mut(&id) {
-                Some(r) => { r.status = JobStatus::Completed; Ok(()) }
-                None    => Err(StoreError::NotFound(id)),
-            }
-        })
-    }
-
-    fn mark_failed<'a>(
-        &'a self,
-        id:     u64,
-        _reason: &'a str,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            let mut records = self.records.lock().unwrap();
-            match records.get_mut(&id) {
-                Some(r) => { r.status = JobStatus::Failed; Ok(()) }
-                None    => Err(StoreError::NotFound(id)),
-            }
-        })
-    }
-
-    fn schedule_retry(
-        &self,
-        id:        u64,
-        attempt:   u32,
-        run_at_ms: u64,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
-        Box::pin(async move {
-            let mut records = self.records.lock().unwrap();
-            match records.get_mut(&id) {
                 Some(r) => {
-                    r.job.attempt   = attempt;
-                    r.job.run_at_ms = run_at_ms;
-                    r.status        = JobStatus::Pending;
+                    r.status = JobStatus::Completed;
                     Ok(())
                 }
                 None => Err(StoreError::NotFound(id)),
@@ -144,10 +116,44 @@ impl JobStore for MemoryJobStore {
         })
     }
 
-    fn recover_stale(
+    fn mark_failed<'a>(
+        &'a self,
+        id: u64,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let mut records = self.records.lock().unwrap();
+            match records.get_mut(&id) {
+                Some(r) => {
+                    r.status = JobStatus::Failed;
+                    Ok(())
+                }
+                None => Err(StoreError::NotFound(id)),
+            }
+        })
+    }
+
+    fn schedule_retry(
         &self,
-        stale_secs: u64,
-    ) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
+        id: u64,
+        attempt: u32,
+        run_at_ms: u64,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async move {
+            let mut records = self.records.lock().unwrap();
+            match records.get_mut(&id) {
+                Some(r) => {
+                    r.job.attempt = attempt;
+                    r.job.run_at_ms = run_at_ms;
+                    r.status = JobStatus::Pending;
+                    Ok(())
+                }
+                None => Err(StoreError::NotFound(id)),
+            }
+        })
+    }
+
+    fn recover_stale(&self, stale_secs: u64) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
         Box::pin(async move {
             let threshold = now_ms().saturating_sub(stale_secs * 1_000);
             let mut records = self.records.lock().unwrap();
@@ -157,7 +163,7 @@ impl JobStore for MemoryJobStore {
                 if let JobStatus::Running { started_at_ms } = record.status {
                     if started_at_ms < threshold {
                         record.job.attempt += 1;
-                        record.status       = JobStatus::Pending;
+                        record.status = JobStatus::Pending;
                         recovered.push(record.job.clone());
                     }
                 }
@@ -211,7 +217,7 @@ mod tests {
         let s = MemoryJobStore::new();
         s.push(make_job("default")).await.unwrap();
 
-        let first  = s.claim_due("default", 10).await.unwrap();
+        let first = s.claim_due("default", 10).await.unwrap();
         let second = s.claim_due("default", 10).await.unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 0);
@@ -264,7 +270,10 @@ mod tests {
     #[tokio::test]
     async fn mark_completed_not_found() {
         let s = MemoryJobStore::new();
-        assert!(matches!(s.mark_completed(999).await, Err(StoreError::NotFound(999))));
+        assert!(matches!(
+            s.mark_completed(999).await,
+            Err(StoreError::NotFound(999))
+        ));
     }
 
     #[tokio::test]
@@ -304,7 +313,9 @@ mod tests {
         {
             let mut records = s.records.lock().unwrap();
             if let Some(r) = records.get_mut(&id) {
-                r.status = JobStatus::Running { started_at_ms: 1_000 }; // epoch + 1s
+                r.status = JobStatus::Running {
+                    started_at_ms: 1_000,
+                }; // epoch + 1s
             }
         }
 

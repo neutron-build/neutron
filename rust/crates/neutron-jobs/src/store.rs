@@ -43,14 +43,14 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone)]
 pub struct StoredJob {
     /// Store-assigned ID (0 before first `push`).
-    pub id:           u64,
-    pub job_type:     String,
-    pub queue:        String,
-    pub payload:      Vec<u8>,
-    pub attempt:      u32,
+    pub id: u64,
+    pub job_type: String,
+    pub queue: String,
+    pub payload: Vec<u8>,
+    pub attempt: u32,
     pub max_attempts: u32,
     /// Earliest time to run — milliseconds since UNIX epoch.
-    pub run_at_ms:    u64,
+    pub run_at_ms: u64,
     /// Time the job was first enqueued — milliseconds since UNIX epoch.
     pub enqueued_at_ms: u64,
 }
@@ -59,19 +59,19 @@ impl StoredJob {
     /// Construct a new `StoredJob` with `run_at_ms = enqueued_at_ms = now`.
     pub fn new(
         job_type: impl Into<String>,
-        queue:    impl Into<String>,
-        payload:  Vec<u8>,
+        queue: impl Into<String>,
+        payload: Vec<u8>,
         max_attempts: u32,
     ) -> Self {
         let now = now_ms();
         Self {
-            id:             0,
-            job_type:       job_type.into(),
-            queue:          queue.into(),
+            id: 0,
+            job_type: job_type.into(),
+            queue: queue.into(),
             payload,
-            attempt:        1,
+            attempt: 1,
             max_attempts,
-            run_at_ms:      now,
+            run_at_ms: now,
             enqueued_at_ms: now,
         }
     }
@@ -105,7 +105,7 @@ pub enum StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Backend(e)  => write!(f, "job store error: {e}"),
+            Self::Backend(e) => write!(f, "job store error: {e}"),
             Self::NotFound(id) => write!(f, "job {id} not found in store"),
         }
     }
@@ -149,17 +149,14 @@ pub trait JobStore: Send + Sync + 'static {
     fn mark_completed(&self, id: u64) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Mark a job as permanently failed with an error reason.
-    fn mark_failed<'a>(
-        &'a self,
-        id:     u64,
-        reason: &'a str,
-    ) -> BoxFuture<'a, Result<(), StoreError>>;
+    fn mark_failed<'a>(&'a self, id: u64, reason: &'a str)
+        -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Reschedule a job for retry at `run_at_ms` (ms since epoch).
     fn schedule_retry(
         &self,
-        id:        u64,
-        attempt:   u32,
+        id: u64,
+        attempt: u32,
         run_at_ms: u64,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
@@ -167,10 +164,7 @@ pub trait JobStore: Send + Sync + 'static {
     /// and reset them to `pending` with `attempt += 1`.
     ///
     /// Used on startup to recover from crashes where jobs were mid-flight.
-    fn recover_stale(
-        &self,
-        stale_secs: u64,
-    ) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>>;
+    fn recover_stale(&self, stale_secs: u64) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +189,7 @@ mod tests {
     #[test]
     fn stored_job_with_delay() {
         let before = now_ms();
-        let j = StoredJob::new("email", "default", vec![], 3)
-            .with_delay_ms(60_000);
+        let j = StoredJob::new("email", "default", vec![], 3).with_delay_ms(60_000);
         assert!(j.run_at_ms >= before + 60_000);
     }
 

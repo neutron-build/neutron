@@ -46,12 +46,12 @@ pub mod redis_store;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 
+pub use cron::{CronError, CronSchedule, CronScheduler};
 pub use job::{Job, JobContext, JobResult};
 pub use memory_store::MemoryJobStore;
 pub use persistent_queue::PersistentJobQueue;
 pub use queue::JobQueue;
-pub use store::{JobStore, StoredJob, StoreError};
-pub use cron::{CronError, CronSchedule, CronScheduler};
+pub use store::{JobStore, StoreError, StoredJob};
 pub use worker::JobWorker;
 
 #[cfg(feature = "redis")]
@@ -62,7 +62,7 @@ pub use postgres_store::PostgresJobStore;
 
 pub mod prelude {
     pub use crate::{
-        Job, JobContext, JobQueue, JobResult, JobStore, JobWorker,
-        MemoryJobStore, PersistentJobQueue, StoredJob, StoreError,
+        Job, JobContext, JobQueue, JobResult, JobStore, JobWorker, MemoryJobStore,
+        PersistentJobQueue, StoreError, StoredJob,
     };
 }

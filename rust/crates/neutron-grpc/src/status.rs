@@ -9,23 +9,23 @@ use crate::body::GrpcBodyStream;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum GrpcStatus {
-    Ok                 = 0,
-    Cancelled          = 1,
-    Unknown            = 2,
-    InvalidArgument    = 3,
-    DeadlineExceeded   = 4,
-    NotFound           = 5,
-    AlreadyExists      = 6,
-    PermissionDenied   = 7,
-    ResourceExhausted  = 8,
+    Ok = 0,
+    Cancelled = 1,
+    Unknown = 2,
+    InvalidArgument = 3,
+    DeadlineExceeded = 4,
+    NotFound = 5,
+    AlreadyExists = 6,
+    PermissionDenied = 7,
+    ResourceExhausted = 8,
     FailedPrecondition = 9,
-    Aborted            = 10,
-    OutOfRange         = 11,
-    Unimplemented      = 12,
-    Internal           = 13,
-    Unavailable        = 14,
-    DataLoss           = 15,
-    Unauthenticated    = 16,
+    Aborted = 10,
+    OutOfRange = 11,
+    Unimplemented = 12,
+    Internal = 13,
+    Unavailable = 14,
+    DataLoss = 15,
+    Unauthenticated = 16,
 }
 
 impl GrpcStatus {
@@ -68,7 +68,10 @@ pub struct GrpcError {
 
 impl GrpcError {
     pub fn new(status: GrpcStatus, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self {
+            status,
+            message: message.into(),
+        }
     }
 
     pub fn not_found(msg: impl Into<String>) -> Self {
@@ -104,7 +107,13 @@ impl IntoResponse for GrpcError {
 
 impl std::fmt::Display for GrpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "gRPC {} ({}): {}", self.status, self.status.as_u32(), self.message)
+        write!(
+            f,
+            "gRPC {} ({}): {}",
+            self.status,
+            self.status.as_u32(),
+            self.message
+        )
     }
 }
 

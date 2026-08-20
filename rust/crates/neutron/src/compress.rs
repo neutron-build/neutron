@@ -297,14 +297,11 @@ mod tests {
     async fn gzip_compresses_large_text() {
         let body = large_body();
         let expected_len = body.len();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
         let resp = client
             .get("/")
@@ -327,20 +324,13 @@ mod tests {
     async fn brotli_compresses_large_text() {
         let body = large_body();
         let expected_len = body.len();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
-        let resp = client
-            .get("/")
-            .header("accept-encoding", "br")
-            .send()
-            .await;
+        let resp = client.get("/").header("accept-encoding", "br").send().await;
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.header("content-encoding").unwrap(), "br");
@@ -352,14 +342,11 @@ mod tests {
     #[tokio::test]
     async fn brotli_preferred_over_gzip() {
         let body = large_body();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
         let resp = client
             .get("/")
@@ -373,14 +360,11 @@ mod tests {
     #[tokio::test]
     async fn brotli_preferred_regardless_of_order() {
         let body = large_body();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
         let resp = client
             .get("/")
@@ -413,14 +397,11 @@ mod tests {
     #[tokio::test]
     async fn skips_when_no_accept_encoding() {
         let body = large_body();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
         let resp = client.get("/").send().await;
 
@@ -431,14 +412,11 @@ mod tests {
     #[tokio::test]
     async fn skips_unsupported_encoding() {
         let body = large_body();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
         let resp = client
             .get("/")
@@ -452,17 +430,15 @@ mod tests {
     #[tokio::test]
     async fn skips_precompressed_content_type() {
         let body = large_body();
-        let client = TestClient::new(Router::new().middleware(Compress::new()).get(
-            "/",
-            move || {
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
                 let b = body.clone();
                 async move {
                     let mut headers = http::HeaderMap::new();
                     headers.insert("content-type", "image/png".parse().unwrap());
                     (headers, b)
                 }
-            },
-        ));
+            }));
 
         let resp = client
             .get("/")
@@ -476,17 +452,15 @@ mod tests {
     #[tokio::test]
     async fn skips_already_encoded() {
         let body = large_body();
-        let client = TestClient::new(Router::new().middleware(Compress::new()).get(
-            "/",
-            move || {
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
                 let b = body.clone();
                 async move {
                     let mut headers = http::HeaderMap::new();
                     headers.insert("content-encoding", "br".parse().unwrap());
                     (headers, b)
                 }
-            },
-        ));
+            }));
 
         let resp = client
             .get("/")
@@ -501,14 +475,11 @@ mod tests {
     #[tokio::test]
     async fn respects_q_zero_exclusion() {
         let body = large_body();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
         // Client supports gzip but explicitly disables brotli.
         let resp = client
@@ -523,14 +494,11 @@ mod tests {
     #[tokio::test]
     async fn json_response_compressed() {
         let val = large_json();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let v = val.clone();
-                    async move { Json(v) }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let v = val.clone();
+                async move { Json(v) }
+            }));
 
         let resp = client
             .get("/")
@@ -553,14 +521,11 @@ mod tests {
     async fn compressed_body_decompresses_correctly_gzip() {
         let body = large_body();
         let original = body.clone();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
         let resp = client
             .get("/")
@@ -582,20 +547,13 @@ mod tests {
     async fn compressed_body_decompresses_correctly_brotli() {
         let body = large_body();
         let original = body.clone();
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::new())
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client =
+            TestClient::new(Router::new().middleware(Compress::new()).get("/", move || {
+                let b = body.clone();
+                async move { b }
+            }));
 
-        let resp = client
-            .get("/")
-            .header("accept-encoding", "br")
-            .send()
-            .await;
+        let resp = client.get("/").header("accept-encoding", "br").send().await;
 
         assert_eq!(resp.header("content-encoding").unwrap(), "br");
 
@@ -611,14 +569,13 @@ mod tests {
         // Body is 200 bytes — below default 860 threshold but above custom 100.
         // Must be large enough for gzip to actually shrink (repeated text compresses well).
         let body = "abcdefghij".repeat(20);
-        let client = TestClient::new(
-            Router::new()
-                .middleware(Compress::min_size(100))
-                .get("/", move || {
-                    let b = body.clone();
-                    async move { b }
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(Compress::min_size(100)).get(
+            "/",
+            move || {
+                let b = body.clone();
+                async move { b }
+            },
+        ));
 
         let resp = client
             .get("/")

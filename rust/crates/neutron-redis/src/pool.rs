@@ -42,7 +42,7 @@ pub struct RedisPool {
 impl RedisPool {
     /// Connect to Redis at `url` (e.g. `"redis://127.0.0.1/"`) and return a pool.
     pub async fn new(url: &str) -> Result<Self, RedisError> {
-        let client  = redis::Client::open(url).map_err(RedisError::Redis)?;
+        let client = redis::Client::open(url).map_err(RedisError::Redis)?;
         let manager = ConnectionManager::new(client)
             .await
             .map_err(RedisError::Redis)?;

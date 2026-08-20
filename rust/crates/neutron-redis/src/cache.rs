@@ -40,9 +40,9 @@ use neutron::middleware::{MiddlewareTrait, Next};
 
 #[derive(Serialize, Deserialize)]
 struct CachedResponse {
-    status:  u16,
+    status: u16,
     headers: Vec<(String, Vec<u8>)>,
-    body:    Vec<u8>,
+    body: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,8 +55,8 @@ struct CachedResponse {
 /// provided via [`key_fn`](RedisCacheLayer::key_fn).
 #[derive(Clone)]
 pub struct RedisCacheLayer {
-    pool:   RedisPool,
-    ttl:    Duration,
+    pool: RedisPool,
+    ttl: Duration,
     prefix: String,
     #[allow(clippy::type_complexity)]
     key_fn: Option<std::sync::Arc<dyn Fn(&Request) -> Option<String> + Send + Sync>>,
@@ -124,19 +124,15 @@ impl RedisCacheLayer {
 }
 
 impl MiddlewareTrait for RedisCacheLayer {
-    fn call(
-        &self,
-        req: Request,
-        next: Next,
-    ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-        let pool   = self.pool.clone();
-        let ttl    = self.ttl;
-        let key    = self.cache_key(&req);
+    fn call(&self, req: Request, next: Next) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+        let pool = self.pool.clone();
+        let ttl = self.ttl;
+        let key = self.cache_key(&req);
 
         Box::pin(async move {
             let cache_key = match key {
                 Some(k) => k,
-                None    => return next.run(req).await,
+                None => return next.run(req).await,
             };
 
             // Try cache hit.
@@ -174,7 +170,7 @@ impl MiddlewareTrait for RedisCacheLayer {
                 .unwrap_or_default();
 
             let entry = CachedResponse {
-                status:  parts.status.as_u16(),
+                status: parts.status.as_u16(),
                 headers: parts
                     .headers
                     .iter()
@@ -185,7 +181,9 @@ impl MiddlewareTrait for RedisCacheLayer {
 
             if let Ok(serialised) = serde_json::to_vec(&entry) {
                 let ttl_secs = ttl.as_secs().max(1);
-                let _ = conn.set_ex::<_, _, ()>(&cache_key, serialised, ttl_secs).await;
+                let _ = conn
+                    .set_ex::<_, _, ()>(&cache_key, serialised, ttl_secs)
+                    .await;
             }
 
             // Reassemble response from parts.
@@ -245,14 +243,12 @@ mod tests {
 
     #[test]
     fn builder_api_compiles() {
-        let rt   = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let pool = rt.block_on(RedisPool::new("redis://127.0.0.1/0"));
         if let Ok(pool) = pool {
             let _layer = RedisCacheLayer::new(pool, Duration::from_secs(60))
                 .prefix("test")
-                .key_fn(|req: &Request| {
-                    Some(req.uri().path().to_string())
-                });
+                .key_fn(|req: &Request| Some(req.uri().path().to_string()));
         }
     }
 }

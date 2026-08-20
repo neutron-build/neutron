@@ -13,12 +13,12 @@ use crate::span::{AttributeValue, SpanData, SpanStatus};
 
 /// Per-span data stored in the tracing registry while a span is open.
 struct SpanStorage {
-    trace_id:      [u8; 16],
-    span_id:       [u8; 8],
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
     parent_span_id: Option<[u8; 8]>,
-    name:          String,
-    start_ns:      u64,
-    attributes:    Vec<(String, AttributeValue)>,
+    name: String,
+    start_ns: u64,
+    attributes: Vec<(String, AttributeValue)>,
 }
 
 fn unix_nanos() -> u64 {
@@ -36,7 +36,9 @@ pub struct OtelLayer {
 
 impl OtelLayer {
     pub fn new(exporter: OtlpExporter) -> Self {
-        OtelLayer { exporter: Arc::new(exporter) }
+        OtelLayer {
+            exporter: Arc::new(exporter),
+        }
     }
 }
 
@@ -74,22 +76,36 @@ where
                 struct Visitor<'a>(&'a mut Vec<(String, AttributeValue)>);
                 impl tracing::field::Visit for Visitor<'_> {
                     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                        self.0.push((field.name().to_string(), AttributeValue::String(value.to_string())));
+                        self.0.push((
+                            field.name().to_string(),
+                            AttributeValue::String(value.to_string()),
+                        ));
                     }
                     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-                        self.0.push((field.name().to_string(), AttributeValue::Int(value)));
+                        self.0
+                            .push((field.name().to_string(), AttributeValue::Int(value)));
                     }
                     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-                        self.0.push((field.name().to_string(), AttributeValue::Int(value as i64)));
+                        self.0
+                            .push((field.name().to_string(), AttributeValue::Int(value as i64)));
                     }
                     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-                        self.0.push((field.name().to_string(), AttributeValue::Bool(value)));
+                        self.0
+                            .push((field.name().to_string(), AttributeValue::Bool(value)));
                     }
                     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-                        self.0.push((field.name().to_string(), AttributeValue::Float(value)));
+                        self.0
+                            .push((field.name().to_string(), AttributeValue::Float(value)));
                     }
-                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                        self.0.push((field.name().to_string(), AttributeValue::String(format!("{value:?}"))));
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push((
+                            field.name().to_string(),
+                            AttributeValue::String(format!("{value:?}")),
+                        ));
                     }
                 }
                 values.record(&mut Visitor(&mut storage.attributes));

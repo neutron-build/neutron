@@ -26,30 +26,28 @@
 //! finish_authentication(&config, &challenge, &assertion, &stored_public_key_cbor)?;
 //! ```
 
+pub mod authentication;
 pub mod cbor;
 pub mod config;
 pub mod credential;
 pub mod error;
 pub mod registration;
-pub mod authentication;
 
+pub use authentication::{
+    begin_authentication, finish_authentication, AuthenticationChallenge, AuthenticationOptions,
+    AuthenticationResponse,
+};
 pub use config::WebAuthnConfig;
 pub use credential::{PublicKeyCredential, StoredCredential};
 pub use error::WebAuthnError;
 pub use registration::{
-    begin_registration, finish_registration,
-    RegistrationChallenge, RegistrationOptions, RegistrationResponse,
-};
-pub use authentication::{
-    begin_authentication, finish_authentication,
-    AuthenticationChallenge, AuthenticationOptions, AuthenticationResponse,
+    begin_registration, finish_registration, RegistrationChallenge, RegistrationOptions,
+    RegistrationResponse,
 };
 
 pub mod prelude {
     pub use crate::{
-        WebAuthnConfig, WebAuthnError,
-        begin_registration, finish_registration,
-        begin_authentication, finish_authentication,
-        StoredCredential,
+        begin_authentication, begin_registration, finish_authentication, finish_registration,
+        StoredCredential, WebAuthnConfig, WebAuthnError,
     };
 }

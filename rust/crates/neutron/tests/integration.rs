@@ -106,11 +106,7 @@ async fn http_get(addr: SocketAddr, path: &str) -> hyper::Response<Incoming> {
 }
 
 /// Make a POST request with a JSON body.
-async fn http_post_json(
-    addr: SocketAddr,
-    path: &str,
-    body: &str,
-) -> hyper::Response<Incoming> {
+async fn http_post_json(addr: SocketAddr, path: &str, body: &str) -> hyper::Response<Incoming> {
     let stream = TcpStream::connect(addr).await.unwrap();
     let io = TokioIo::new(stream);
 
@@ -254,7 +250,12 @@ async fn method_not_allowed() {
 async fn custom_fallback() {
     let router = Router::new()
         .get("/", || async { "home" })
-        .fallback(|| async { (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "custom 404" }))) });
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "custom 404" })),
+            )
+        });
 
     let (addr, shutdown) = start_server(router).await;
 
@@ -286,7 +287,12 @@ async fn middleware_adds_headers() {
 #[tokio::test]
 async fn cors_preflight() {
     let router = Router::new()
-        .middleware(Cors::new().allow_any_origin().allow_any_method().allow_any_header())
+        .middleware(
+            Cors::new()
+                .allow_any_origin()
+                .allow_any_method()
+                .allow_any_header(),
+        )
         .get("/api", || async { "data" });
 
     let (addr, shutdown) = start_server(router).await;
@@ -376,12 +382,13 @@ async fn state_sharing() {
 
     let counter = Arc::new(AtomicU64::new(0));
 
-    let router = Router::new()
-        .state(counter)
-        .get("/count", |State(c): State<Arc<AtomicU64>>| async move {
-            let n = c.fetch_add(1, Ordering::Relaxed);
-            Json(serde_json::json!({ "count": n }))
-        });
+    let router =
+        Router::new()
+            .state(counter)
+            .get("/count", |State(c): State<Arc<AtomicU64>>| async move {
+                let n = c.fetch_add(1, Ordering::Relaxed);
+                Json(serde_json::json!({ "count": n }))
+            });
 
     let (addr, shutdown) = start_server(router).await;
 
@@ -416,7 +423,10 @@ async fn graceful_shutdown() {
 
     // Server should no longer accept connections
     let result = TcpStream::connect(addr).await;
-    assert!(result.is_err(), "Server should have stopped accepting connections");
+    assert!(
+        result.is_err(),
+        "Server should have stopped accepting connections"
+    );
 }
 
 #[tokio::test]

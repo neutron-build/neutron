@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -12,17 +12,14 @@ use neutron::handler::{Handler, Request, Response, StateMap, StateMapBuilder};
 
 use crate::job::{parse_response, JobContext, JobOutcome};
 use crate::queue::{JobQueue, QueuedJob};
-use crate::store::{JobStore, now_ms};
+use crate::store::{now_ms, JobStore};
 
 // ---------------------------------------------------------------------------
 // Type alias for type-erased job handler functions
 // ---------------------------------------------------------------------------
 
-type BoxedJobFn = Arc<
-    dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
-        + Send
-        + Sync,
->;
+type BoxedJobFn =
+    Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // JobWorker
@@ -45,23 +42,23 @@ type BoxedJobFn = Arc<
 /// tokio::spawn(worker.run());
 /// ```
 pub struct JobWorker {
-    queue:       Arc<JobQueue>,
-    handlers:    HashMap<String, BoxedJobFn>,
-    state:       StateMapBuilder,
+    queue: Arc<JobQueue>,
+    handlers: HashMap<String, BoxedJobFn>,
+    state: StateMapBuilder,
     concurrency: usize,
-    active:      Arc<AtomicUsize>,
-    store:       Option<Arc<dyn JobStore>>,
+    active: Arc<AtomicUsize>,
+    store: Option<Arc<dyn JobStore>>,
 }
 
 impl JobWorker {
     pub fn new(queue: Arc<JobQueue>) -> Self {
         Self {
             queue,
-            handlers:    HashMap::new(),
-            state:       StateMapBuilder::new(),
+            handlers: HashMap::new(),
+            state: StateMapBuilder::new(),
             concurrency: 8,
-            active:      Arc::new(AtomicUsize::new(0)),
-            store:       None,
+            active: Arc::new(AtomicUsize::new(0)),
+            store: None,
         }
     }
 
@@ -121,11 +118,11 @@ impl JobWorker {
     ///
     /// Typically wrapped in `tokio::spawn(worker.run())`.
     pub async fn run(self) {
-        let state     = self.state.build();
-        let handlers  = Arc::new(self.handlers);
-        let queue     = self.queue;
+        let state = self.state.build();
+        let handlers = Arc::new(self.handlers);
+        let queue = self.queue;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
-        let active    = self.active;
+        let active = self.active;
         let store: Option<Arc<dyn JobStore>> = self.store;
 
         loop {
@@ -138,16 +135,24 @@ impl JobWorker {
                     continue;
                 };
 
-                let state_clone  = Arc::clone(&state);
-                let queue_clone  = Arc::clone(&queue);
+                let state_clone = Arc::clone(&state);
+                let queue_clone = Arc::clone(&queue);
                 let active_clone = Arc::clone(&active);
-                let store_clone  = store.clone();
-                let permit       = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                let store_clone = store.clone();
+                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
 
                 active.fetch_add(1, Ordering::Release);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    execute_job(job, handler, state_clone, queue_clone, store_clone, active_clone).await;
+                    execute_job(
+                        job,
+                        handler,
+                        state_clone,
+                        queue_clone,
+                        store_clone,
+                        active_clone,
+                    )
+                    .await;
                 });
             } else {
                 // No ready job — wait for a new one or poll again shortly
@@ -165,20 +170,20 @@ impl JobWorker {
 // ---------------------------------------------------------------------------
 
 async fn execute_job(
-    job:     QueuedJob,
+    job: QueuedJob,
     handler: BoxedJobFn,
-    state:   Arc<StateMap>,
-    queue:   Arc<JobQueue>,
-    store:   Option<Arc<dyn JobStore>>,
-    active:  Arc<AtomicUsize>,
+    state: Arc<StateMap>,
+    queue: Arc<JobQueue>,
+    store: Option<Arc<dyn JobStore>>,
+    active: Arc<AtomicUsize>,
 ) {
     let ctx = JobContext {
-        job_id:       job.id.to_string(),
-        job_type:     job.job_type.clone(),
-        attempt:      job.attempt,
+        job_id: job.id.to_string(),
+        job_type: job.job_type.clone(),
+        attempt: job.attempt,
         max_attempts: job.max_attempts,
         scheduled_at: job.enqueued_at,
-        queue:        job.queue.clone(),
+        queue: job.queue.clone(),
     };
 
     // Build a synthetic request: body = job payload, extensions = ctx, state = shared state
@@ -191,7 +196,7 @@ async fn execute_job(
     req.set_state(state);
     req.set_extension(ctx);
 
-    let resp    = handler(req).await;
+    let resp = handler(req).await;
     let outcome = parse_response(&resp);
 
     match outcome {
@@ -206,7 +211,7 @@ async fn execute_job(
         JobOutcome::Retry(delay) => {
             if job.attempt < job.max_attempts {
                 let next_attempt = job.attempt + 1;
-                let run_at_ms    = now_ms() + delay.as_millis() as u64;
+                let run_at_ms = now_ms() + delay.as_millis() as u64;
                 tracing::debug!(
                     job_id = %job.id,
                     attempt = job.attempt,
@@ -248,21 +253,25 @@ async fn execute_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::JobResult;
+    use neutron::extract::State;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
-    use neutron::extract::State;
-    use crate::job::JobResult;
 
     // Helper: run worker until queue is empty AND all in-flight jobs have finished.
     async fn run_until_empty(worker: JobWorker, queue: Arc<JobQueue>, timeout_ms: u64) {
-        let active   = worker.active();
-        let handle   = tokio::spawn(worker.run());
+        let active = worker.active();
+        let handle = tokio::spawn(worker.run());
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            let is_idle = queue.is_empty()
-                && active.load(std::sync::atomic::Ordering::Acquire) == 0;
-            if is_idle { break; }
-            if std::time::Instant::now() > deadline { panic!("timed out waiting for queue to drain"); }
+            let is_idle =
+                queue.is_empty() && active.load(std::sync::atomic::Ordering::Acquire) == 0;
+            if is_idle {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for queue to drain");
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         handle.abort();
@@ -275,12 +284,13 @@ mod tests {
 
         let queue = Arc::new(JobQueue::new());
 
-        let worker = JobWorker::new(Arc::clone(&queue))
-            .state(counter2)
-            .job("noop", |State(c): neutron::extract::State<Arc<AtomicU32>>| async move {
+        let worker = JobWorker::new(Arc::clone(&queue)).state(counter2).job(
+            "noop",
+            |State(c): neutron::extract::State<Arc<AtomicU32>>| async move {
                 c.fetch_add(1, Ordering::Relaxed);
                 JobResult::Ok
-            });
+            },
+        );
 
         queue.enqueue("noop", serde_json::to_vec(&serde_json::json!({})).unwrap());
         run_until_empty(worker, Arc::clone(&queue), 500).await;
@@ -292,7 +302,9 @@ mod tests {
     async fn worker_drops_unknown_job_type() {
         let queue = Arc::new(JobQueue::new());
         // Register only "known", enqueue "unknown"
-        async fn handler() -> JobResult { JobResult::Ok }
+        async fn handler() -> JobResult {
+            JobResult::Ok
+        }
         let worker = JobWorker::new(Arc::clone(&queue)).job("known", handler);
 
         queue.enqueue("unknown", vec![]);
@@ -310,18 +322,23 @@ mod tests {
 
         let queue = Arc::new(JobQueue::new());
 
-        let worker = JobWorker::new(Arc::clone(&queue))
-            .state(attempts2)
-            .job("flaky", |State(a): neutron::extract::State<Arc<AtomicU32>>| async move {
+        let worker = JobWorker::new(Arc::clone(&queue)).state(attempts2).job(
+            "flaky",
+            |State(a): neutron::extract::State<Arc<AtomicU32>>| async move {
                 let n = a.fetch_add(1, Ordering::Relaxed);
                 if n < 2 {
                     JobResult::retry_after(Duration::from_millis(1))
                 } else {
                     JobResult::Ok
                 }
-            });
+            },
+        );
 
-        queue.enqueue_with_retries("flaky", serde_json::to_vec(&serde_json::json!({})).unwrap(), 5);
+        queue.enqueue_with_retries(
+            "flaky",
+            serde_json::to_vec(&serde_json::json!({})).unwrap(),
+            5,
+        );
         run_until_empty(worker, Arc::clone(&queue), 1000).await;
 
         // Handler should have been called 3 times (fail, fail, succeed)
@@ -335,14 +352,19 @@ mod tests {
 
         let queue = Arc::new(JobQueue::new());
 
-        let worker = JobWorker::new(Arc::clone(&queue))
-            .state(attempts2)
-            .job("always_fails", |State(a): neutron::extract::State<Arc<AtomicU32>>| async move {
+        let worker = JobWorker::new(Arc::clone(&queue)).state(attempts2).job(
+            "always_fails",
+            |State(a): neutron::extract::State<Arc<AtomicU32>>| async move {
                 a.fetch_add(1, Ordering::Relaxed);
                 JobResult::retry_after(Duration::from_millis(1))
-            });
+            },
+        );
 
-        queue.enqueue_with_retries("always_fails", serde_json::to_vec(&serde_json::json!({})).unwrap(), 3);
+        queue.enqueue_with_retries(
+            "always_fails",
+            serde_json::to_vec(&serde_json::json!({})).unwrap(),
+            3,
+        );
         run_until_empty(worker, Arc::clone(&queue), 1000).await;
 
         // Should stop after max_attempts (3) even though it always retries
@@ -353,7 +375,9 @@ mod tests {
     fn worker_is_send() {
         fn assert_send<T: Send>(_: T) {}
         let q = Arc::new(JobQueue::new());
-        async fn noop() -> JobResult { JobResult::Ok }
+        async fn noop() -> JobResult {
+            JobResult::Ok
+        }
         assert_send(JobWorker::new(q).job("x", noop).run());
     }
 }

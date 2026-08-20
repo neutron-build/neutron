@@ -43,14 +43,17 @@ use neutron::session::SessionStore;
 /// default.
 #[derive(Clone)]
 pub struct RedisSessionStore {
-    pool:   RedisPool,
+    pool: RedisPool,
     prefix: String,
 }
 
 impl RedisSessionStore {
     /// Create a new store backed by `pool`.
     pub fn new(pool: RedisPool) -> Self {
-        Self { pool, prefix: "neutron:session".into() }
+        Self {
+            pool,
+            prefix: "neutron:session".into(),
+        }
     }
 
     /// Set a key prefix (default: `"neutron:session"`).
@@ -72,48 +75,37 @@ impl RedisSessionStore {
     where
         F: std::future::Future<Output = Result<T, RedisError>>,
     {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(f)
-        })
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
     }
 }
 
 impl SessionStore for RedisSessionStore {
     fn load(&self, id: &str) -> Option<HashMap<String, serde_json::Value>> {
-        let key  = self.redis_key(id);
+        let key = self.redis_key(id);
         let mut conn = self.pool.conn();
 
         let result = self.block(async move {
-            let raw: Option<String> = conn
-                .get(&key)
-                .await
-                .map_err(RedisError::Redis)?;
+            let raw: Option<String> = conn.get(&key).await.map_err(RedisError::Redis)?;
             Ok::<_, RedisError>(raw)
         });
 
         match result {
             Ok(Some(json)) => serde_json::from_str(&json).ok(),
-            Ok(None)       => None,
-            Err(e)         => {
+            Ok(None) => None,
+            Err(e) => {
                 tracing::warn!(error = %e, "redis session load failed");
                 None
             }
         }
     }
 
-    fn save(
-        &self,
-        id: &str,
-        data: HashMap<String, serde_json::Value>,
-        ttl: Duration,
-    ) {
-        let key          = self.redis_key(id);
-        let mut conn     = self.pool.conn();
-        let ttl_secs     = ttl.as_secs().max(1);
+    fn save(&self, id: &str, data: HashMap<String, serde_json::Value>, ttl: Duration) {
+        let key = self.redis_key(id);
+        let mut conn = self.pool.conn();
+        let ttl_secs = ttl.as_secs().max(1);
 
         let serialised = match serde_json::to_string(&data) {
-            Ok(s)  => s,
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "redis session serialisation failed");
                 return;
@@ -132,12 +124,11 @@ impl SessionStore for RedisSessionStore {
     }
 
     fn destroy(&self, id: &str) {
-        let key      = self.redis_key(id);
+        let key = self.redis_key(id);
         let mut conn = self.pool.conn();
 
-        let result = self.block(async move {
-            conn.del::<_, ()>(&key).await.map_err(RedisError::Redis)
-        });
+        let result =
+            self.block(async move { conn.del::<_, ()>(&key).await.map_err(RedisError::Redis) });
 
         if let Err(e) = result {
             tracing::warn!(error = %e, "redis session destroy failed");
@@ -159,8 +150,8 @@ mod tests {
         struct FakePool;
         // We just test the key generation logic inline.
         let prefix = "myapp:session";
-        let id     = "abc123";
-        let key    = format!("{prefix}:{id}");
+        let id = "abc123";
+        let key = format!("{prefix}:{id}");
         assert_eq!(key, "myapp:session:abc123");
     }
 

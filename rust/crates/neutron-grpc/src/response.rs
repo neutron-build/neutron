@@ -22,8 +22,8 @@ use crate::status::GrpcStatus;
 ///
 /// For fallible handlers, call `.unwrap_or_else(|e| e.into_response())` to convert.
 pub struct GrpcResponse {
-    pub status:         GrpcStatus,
-    pub message:        Option<Bytes>,
+    pub status: GrpcStatus,
+    pub message: Option<Bytes>,
     pub status_message: Option<String>,
 }
 
@@ -39,7 +39,11 @@ impl GrpcResponse {
 
     /// Error response with no data frame.
     pub fn error(status: GrpcStatus, text: impl Into<String>) -> Self {
-        Self { status, message: None, status_message: Some(text.into()) }
+        Self {
+            status,
+            message: None,
+            status_message: Some(text.into()),
+        }
     }
 
     /// Add a human-readable status message to any response.
@@ -71,7 +75,9 @@ impl IntoResponse for GrpcResponse {
             .status(http::StatusCode::OK)
             .header("content-type", "application/grpc")
             .header("te", "trailers")
-            .body(Body::stream(GrpcBodyStream::with_trailers(framed, trailers)))
+            .body(Body::stream(GrpcBodyStream::with_trailers(
+                framed, trailers,
+            )))
             .unwrap()
     }
 }
@@ -83,14 +89,17 @@ impl IntoResponse for GrpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt;
     use crate::body::unframe_message;
+    use http_body_util::BodyExt;
 
     #[tokio::test]
     async fn ok_response_is_http_200_grpc() {
         let resp = GrpcResponse::ok(b"payload".as_slice()).into_response();
         assert_eq!(resp.status(), http::StatusCode::OK);
-        assert_eq!(resp.headers().get("content-type").unwrap(), "application/grpc");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/grpc"
+        );
     }
 
     #[tokio::test]
@@ -125,5 +134,4 @@ mod tests {
         assert_eq!(trailers.get("grpc-status").unwrap(), "5"); // NotFound
         assert_eq!(trailers.get("grpc-message").unwrap(), "not here");
     }
-
 }

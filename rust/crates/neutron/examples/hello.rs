@@ -191,5 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config = Config::from_env();
 
-    Neutron::new().router(router).listen(config.socket_addr()).await
+    Neutron::new()
+        .router(router)
+        .listen(config.socket_addr())
+        .await
 }

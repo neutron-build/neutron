@@ -29,8 +29,7 @@ pub fn graphql_handler<S: ExecutableSchema>(
 ) -> impl Fn(GraphQlRequest) -> Pin<Box<dyn Future<Output = GraphQlResponse> + Send + 'static>>
        + Send
        + Sync
-       + 'static
-{
+       + 'static {
     let schema = Arc::new(schema);
     move |req: GraphQlRequest| {
         let schema = Arc::clone(&schema);
@@ -47,9 +46,9 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::{HeaderMap, Method};
+    use http_body_util::BodyExt;
     use neutron::extract::FromRequest;
     use neutron::handler::{IntoResponse, Request};
-    use http_body_util::BodyExt;
 
     struct EchoSchema;
 
@@ -58,9 +57,7 @@ mod tests {
             self: Arc<Self>,
             req: GraphQlRequest,
         ) -> Pin<Box<dyn Future<Output = GraphQlResponse> + Send + 'static>> {
-            Box::pin(async move {
-                GraphQlResponse::ok(serde_json::json!({ "query": req.query }))
-            })
+            Box::pin(async move { GraphQlResponse::ok(serde_json::json!({ "query": req.query })) })
         }
     }
 
@@ -76,7 +73,10 @@ mod tests {
     }
 
     fn ok_or_panic<T>(r: Result<T, neutron::handler::Response>, msg: &str) -> T {
-        match r { Ok(v) => v, Err(resp) => panic!("{msg}: HTTP {}", resp.status()) }
+        match r {
+            Ok(v) => v,
+            Err(resp) => panic!("{msg}: HTTP {}", resp.status()),
+        }
     }
 
     #[tokio::test]

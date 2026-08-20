@@ -24,11 +24,11 @@ pub enum TlsMode {
 /// ```
 #[derive(Debug, Clone)]
 pub struct SmtpConfig {
-    pub(crate) host:         String,
-    pub(crate) port:         u16,
-    pub(crate) tls:          TlsMode,
-    pub(crate) username:     Option<String>,
-    pub(crate) password:     Option<String>,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) tls: TlsMode,
+    pub(crate) username: Option<String>,
+    pub(crate) password: Option<String>,
     pub(crate) default_from: Option<String>,
 }
 
@@ -36,11 +36,11 @@ impl SmtpConfig {
     /// Create a new config targeting `host`.  Defaults to port 587 and STARTTLS.
     pub fn new(host: impl Into<String>) -> Self {
         SmtpConfig {
-            host:         host.into(),
-            port:         587,
-            tls:          TlsMode::StartTls,
-            username:     None,
-            password:     None,
+            host: host.into(),
+            port: 587,
+            tls: TlsMode::StartTls,
+            username: None,
+            password: None,
             default_from: None,
         }
     }

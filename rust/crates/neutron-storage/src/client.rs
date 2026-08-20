@@ -10,8 +10,8 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
+use rustls::ClientConfig;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -38,12 +38,12 @@ fn tls_connector() -> Result<TlsConnector, StorageError> {
 
 /// Execute an HTTPS request and return `(status_code, response_body_bytes)`.
 pub async fn https_request(
-    method:  &str,
-    host:    &str,
-    port:    u16,
-    path:    &str,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
     headers: &[(&str, &str)],
-    body:    Vec<u8>,
+    body: Vec<u8>,
     use_tls: bool,
 ) -> Result<(u16, Vec<u8>), StorageError> {
     if use_tls {
@@ -54,53 +54,61 @@ pub async fn https_request(
 }
 
 async fn https_inner(
-    method:  &str,
-    host:    &str,
-    port:    u16,
-    path:    &str,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
     headers: &[(&str, &str)],
-    body:    Vec<u8>,
+    body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), StorageError> {
     let connector = tls_connector()?;
-    let addr      = format!("{host}:{port}");
+    let addr = format!("{host}:{port}");
 
-    let tcp  = TcpStream::connect(&addr).await
+    let tcp = TcpStream::connect(&addr)
+        .await
         .map_err(|e| StorageError::Connect(e.to_string()))?;
     let host_only = host.split(':').next().unwrap_or(host);
     let server_name: ServerName<'static> = ServerName::try_from(host_only.to_string())
         .map_err(|e| StorageError::Connect(e.to_string()))?;
-    let tls = connector.connect(server_name, tcp).await
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
         .map_err(|e| StorageError::Connect(e.to_string()))?;
 
-    let io  = TokioIo::new(tls);
+    let io = TokioIo::new(tls);
     let (mut sender, conn) = http1::Builder::new()
         .handshake::<_, Full<Bytes>>(io)
         .await
         .map_err(|e| StorageError::Connect(e.to_string()))?;
 
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     send_request(&mut sender, method, host, path, headers, body).await
 }
 
 async fn http_inner(
-    method:  &str,
-    host:    &str,
-    port:    u16,
-    path:    &str,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
     headers: &[(&str, &str)],
-    body:    Vec<u8>,
+    body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), StorageError> {
     let addr = format!("{host}:{port}");
-    let tcp  = TcpStream::connect(&addr).await
+    let tcp = TcpStream::connect(&addr)
+        .await
         .map_err(|e| StorageError::Connect(e.to_string()))?;
-    let io   = TokioIo::new(tcp);
+    let io = TokioIo::new(tcp);
     let (mut sender, conn) = http1::Builder::new()
         .handshake::<_, Full<Bytes>>(io)
         .await
         .map_err(|e| StorageError::Connect(e.to_string()))?;
 
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     send_request(&mut sender, method, host, path, headers, body).await
 }
@@ -108,15 +116,15 @@ async fn http_inner(
 type H1Sender = http1::SendRequest<Full<Bytes>>;
 
 async fn send_request(
-    sender:  &mut H1Sender,
-    method:  &str,
-    host:    &str,
-    path:    &str,
+    sender: &mut H1Sender,
+    method: &str,
+    host: &str,
+    path: &str,
     headers: &[(&str, &str)],
-    body:    Vec<u8>,
+    body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), StorageError> {
     let body_len = body.len();
-    let mut req  = Request::builder()
+    let mut req = Request::builder()
         .method(method)
         .uri(path)
         .header("host", host)
@@ -130,11 +138,14 @@ async fn send_request(
         .body(Full::new(Bytes::from(body)))
         .map_err(|e| StorageError::Sign(e.to_string()))?;
 
-    let resp: hyper::Response<Incoming> = sender.send_request(request).await
+    let resp: hyper::Response<Incoming> = sender
+        .send_request(request)
+        .await
         .map_err(|e| StorageError::Io(e.to_string()))?;
 
     let status = resp.status().as_u16();
-    let bytes  = resp.into_body()
+    let bytes = resp
+        .into_body()
         .collect()
         .await
         .map_err(|e| StorageError::Io(e.to_string()))?

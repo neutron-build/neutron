@@ -59,8 +59,7 @@ impl Next {
     #[cfg(feature = "tower-compat")]
     pub(crate) fn into_inner(
         self,
-    ) -> Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>
-    {
+    ) -> Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync> {
         self.inner
     }
 }

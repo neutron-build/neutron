@@ -36,11 +36,12 @@ fn build_router() -> Router {
         .get("/api/v1/posts/:id/comments", || async { "comments" })
         .post("/api/v1/posts/:id/comments", || async { "new_comment" })
         .get("/api/v1/orgs/:org/repos/:repo", || async { "repo" })
-        .get("/api/v1/orgs/:org/repos/:repo/issues", || async { "issues" })
-        .get(
-            "/api/v1/orgs/:org/repos/:repo/issues/:id",
-            || async { "issue" },
-        )
+        .get("/api/v1/orgs/:org/repos/:repo/issues", || async {
+            "issues"
+        })
+        .get("/api/v1/orgs/:org/repos/:repo/issues/:id", || async {
+            "issue"
+        })
         .get("/api/v2/graphql", || async { "graphql" })
         .get("/static/*", || async { "static" })
         .get("/docs/*", || async { "docs" });
@@ -90,13 +91,16 @@ fn bench_param_multi(c: &mut Criterion) {
 
 fn bench_param_deep(c: &mut Criterion) {
     let router = build_router();
-    c.bench_function("resolve: deep param GET /orgs/:o/repos/:r/issues/:id", |b| {
-        b.iter(|| {
-            let _ = black_box(
-                router.resolve(&Method::GET, "/api/v1/orgs/rust-lang/repos/rust/issues/123"),
-            );
-        })
-    });
+    c.bench_function(
+        "resolve: deep param GET /orgs/:o/repos/:r/issues/:id",
+        |b| {
+            b.iter(|| {
+                let _ = black_box(
+                    router.resolve(&Method::GET, "/api/v1/orgs/rust-lang/repos/rust/issues/123"),
+                );
+            })
+        },
+    );
 }
 
 fn bench_wildcard(c: &mut Criterion) {

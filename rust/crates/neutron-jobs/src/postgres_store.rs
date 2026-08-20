@@ -21,33 +21,35 @@
 //! `claim_due` uses `FOR UPDATE SKIP LOCKED` so multiple worker processes can
 //! safely pull from the same queue without double-processing.
 
-use std::sync::Arc;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::{Client, NoTls, Row};
 
-use crate::store::{BoxFuture, JobStore, StoredJob, StoreError, now_ms};
+use crate::store::{now_ms, BoxFuture, JobStore, StoreError, StoredJob};
 
 // ---------------------------------------------------------------------------
 // Tiny connection pool (same pattern as neutron-postgres)
 // ---------------------------------------------------------------------------
 
 struct PoolInner {
-    url:      String,
-    sem:      Arc<Semaphore>,
-    idle:     Mutex<VecDeque<Client>>,
+    url: String,
+    sem: Arc<Semaphore>,
+    idle: Mutex<VecDeque<Client>>,
 }
 
 struct PooledConn {
     client: Option<Client>,
-    pool:   Arc<PoolInner>,
-    _perm:  OwnedSemaphorePermit,
+    pool: Arc<PoolInner>,
+    _perm: OwnedSemaphorePermit,
 }
 
 impl PooledConn {
-    fn client(&self) -> &Client { self.client.as_ref().unwrap() }
+    fn client(&self) -> &Client {
+        self.client.as_ref().unwrap()
+    }
 }
 
 impl Drop for PooledConn {
@@ -82,7 +84,11 @@ async fn pool_get(pool: &Arc<PoolInner>) -> Result<PooledConn, StoreError> {
         }
     };
 
-    Ok(PooledConn { client: Some(client), pool: Arc::clone(pool), _perm: perm })
+    Ok(PooledConn {
+        client: Some(client),
+        pool: Arc::clone(pool),
+        _perm: perm,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -109,8 +115,8 @@ impl PostgresJobStore {
     /// - `max_conns` — pool size
     pub async fn new(url: &str, max_conns: usize) -> Result<Self, StoreError> {
         let pool = Arc::new(PoolInner {
-            url:  url.to_string(),
-            sem:  Arc::new(Semaphore::new(max_conns)),
+            url: url.to_string(),
+            sem: Arc::new(Semaphore::new(max_conns)),
             idle: Mutex::new(VecDeque::new()),
         });
 
@@ -143,13 +149,13 @@ impl PostgresJobStore {
 
 fn row_to_job(row: &Row) -> StoredJob {
     StoredJob {
-        id:             row.get::<_, i64>("id") as u64,
-        job_type:       row.get("job_type"),
-        queue:          row.get("queue"),
-        payload:        row.get("payload"),
-        attempt:        row.get::<_, i32>("attempt") as u32,
-        max_attempts:   row.get::<_, i32>("max_attempts") as u32,
-        run_at_ms:      row.get::<_, i64>("run_at_ms") as u64,
+        id: row.get::<_, i64>("id") as u64,
+        job_type: row.get("job_type"),
+        queue: row.get("queue"),
+        payload: row.get("payload"),
+        attempt: row.get::<_, i32>("attempt") as u32,
+        max_attempts: row.get::<_, i32>("max_attempts") as u32,
+        run_at_ms: row.get::<_, i64>("run_at_ms") as u64,
         enqueued_at_ms: row.get::<_, i64>("enqueued_at_ms") as u64,
     }
 }
@@ -158,7 +164,8 @@ impl JobStore for PostgresJobStore {
     fn push(&self, job: StoredJob) -> BoxFuture<'_, Result<u64, StoreError>> {
         Box::pin(async move {
             let conn = pool_get(&self.pool).await?;
-            let row  = conn.client()
+            let row = conn
+                .client()
                 .query_one(
                     "INSERT INTO __neutron_jobs
                          (job_type, queue, payload, attempt, max_attempts,
@@ -190,10 +197,11 @@ impl JobStore for PostgresJobStore {
         let queue = queue.to_string();
         Box::pin(async move {
             let conn = pool_get(&self.pool).await?;
-            let now  = now_ms() as i64;
-            let lim  = limit as i64;
+            let now = now_ms() as i64;
+            let lim = limit as i64;
 
-            let rows = conn.client()
+            let rows = conn
+                .client()
                 .query(
                     "UPDATE __neutron_jobs
                      SET status = 'running', started_at_ms = $1
@@ -232,7 +240,7 @@ impl JobStore for PostgresJobStore {
 
     fn mark_failed<'a>(
         &'a self,
-        id:     u64,
+        id: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let reason = reason.to_string();
@@ -251,8 +259,8 @@ impl JobStore for PostgresJobStore {
 
     fn schedule_retry(
         &self,
-        id:        u64,
-        attempt:   u32,
+        id: u64,
+        attempt: u32,
         run_at_ms: u64,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
@@ -271,16 +279,14 @@ impl JobStore for PostgresJobStore {
         })
     }
 
-    fn recover_stale(
-        &self,
-        stale_secs: u64,
-    ) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
+    fn recover_stale(&self, stale_secs: u64) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
         Box::pin(async move {
-            let conn      = pool_get(&self.pool).await?;
+            let conn = pool_get(&self.pool).await?;
             let threshold = now_ms().saturating_sub(stale_secs * 1_000) as i64;
-            let now_ms_i  = now_ms() as i64;
+            let now_ms_i = now_ms() as i64;
 
-            let rows = conn.client()
+            let rows = conn
+                .client()
                 .query(
                     "UPDATE __neutron_jobs
                      SET status = 'pending',

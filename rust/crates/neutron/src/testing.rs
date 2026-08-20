@@ -148,10 +148,8 @@ impl<'a> TestRequest<'a> {
     /// Set a JSON body (also sets `Content-Type: application/json`).
     pub fn json<T: Serialize>(mut self, body: &T) -> Self {
         self.body = Bytes::from(serde_json::to_vec(body).expect("JSON serialization failed"));
-        self.headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/json"),
-        );
+        self.headers
+            .insert("content-type", HeaderValue::from_static("application/json"));
         self
     }
 
@@ -195,10 +193,7 @@ impl TestResponse {
 
     /// Get a specific header value.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.inner
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
+        self.inner.headers().get(name).and_then(|v| v.to_str().ok())
     }
 
     /// Consume the response and return the body as a UTF-8 string.
@@ -300,7 +295,7 @@ impl TestResponse {
 /// assert_eq!(resp.text().await, "pong");
 /// ```
 pub struct TestServer {
-    addr:     SocketAddr,
+    addr: SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -320,7 +315,10 @@ impl TestServer {
 
         tokio::spawn(test_server_accept_loop(listener, chain, state_map, rx));
 
-        Self { addr, shutdown: Some(tx) }
+        Self {
+            addr,
+            shutdown: Some(tx),
+        }
     }
 
     /// The address the server is listening on.
@@ -349,9 +347,9 @@ impl Drop for TestServer {
 
 // Accept loop for the test server.
 async fn test_server_accept_loop(
-    listener:   tokio::net::TcpListener,
-    chain:      DispatchChain,
-    state_map:  Arc<StateMap>,
+    listener: tokio::net::TcpListener,
+    chain: DispatchChain,
+    state_map: Arc<StateMap>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     loop {
@@ -372,21 +370,20 @@ async fn test_server_accept_loop(
 
 // Serve a single hyper connection for the test server.
 async fn serve_test_conn(
-    stream:      tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    chain:       DispatchChain,
-    state_map:   Arc<StateMap>,
+    chain: DispatchChain,
+    state_map: Arc<StateMap>,
 ) {
     let service = service_fn(move |mut req: http::Request<Incoming>| {
         let chain = Arc::clone(&chain);
         let state = Arc::clone(&state_map);
         async move {
-            let on_upgrade  = hyper::upgrade::on(&mut req);
+            let on_upgrade = hyper::upgrade::on(&mut req);
             let (parts, body) = req.into_parts();
             // P1.2: pass the hyper body through as a lazy stream (real HTTP/1+2 path).
-            let boxed: crate::handler::ReqBody = Box::pin(
-                body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-            );
+            let boxed: crate::handler::ReqBody =
+                Box::pin(body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
 
             let mut neutron_req = NeutronRequest::with_streaming_state(
                 parts.method,
@@ -404,7 +401,7 @@ async fn serve_test_conn(
     });
 
     let builder = AutoBuilder::new(TokioExecutor::new());
-    let conn    = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+    let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
     let _ = conn.await;
 }
 
@@ -456,11 +453,11 @@ impl TestServerClient {
 
 /// A request being built for [`TestServerClient`].
 pub struct TestServerRequest<'a> {
-    client:  &'a TestServerClient,
-    method:  Method,
-    path:    String,
+    client: &'a TestServerClient,
+    method: Method,
+    path: String,
     headers: HeaderMap,
-    body:    Bytes,
+    body: Bytes,
 }
 
 impl<'a> TestServerRequest<'a> {
@@ -486,10 +483,8 @@ impl<'a> TestServerRequest<'a> {
     /// Set a JSON body (also sets `Content-Type: application/json`).
     pub fn json<T: Serialize>(mut self, body: &T) -> Self {
         self.body = Bytes::from(serde_json::to_vec(body).expect("JSON serialization failed"));
-        self.headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/json"),
-        );
+        self.headers
+            .insert("content-type", HeaderValue::from_static("application/json"));
         self
     }
 
@@ -527,11 +522,10 @@ impl<'a> TestServerRequest<'a> {
             .expect("TestServerClient: failed to connect");
 
         let io = TokioIo::new(stream);
-        let (mut sender, conn) =
-            hyper::client::conn::http1::Builder::new()
-                .handshake(io)
-                .await
-                .expect("TestServerClient: HTTP/1 handshake failed");
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(io)
+            .await
+            .expect("TestServerClient: HTTP/1 handshake failed");
 
         // Drive the connection in the background.
         tokio::spawn(conn);
@@ -669,13 +663,14 @@ mod tests {
             greeting: String,
         }
 
-        let client = TestClient::new(
-            Router::new().post("/greet", |Json(input): Json<Input>| async move {
+        let client = TestClient::new(Router::new().post(
+            "/greet",
+            |Json(input): Json<Input>| async move {
                 Json(Output {
                     greeting: format!("Hello, {}!", input.name),
                 })
-            }),
-        );
+            },
+        ));
 
         let resp = client
             .post("/greet")
@@ -696,17 +691,12 @@ mod tests {
 
     #[tokio::test]
     async fn custom_request_headers() {
-        let client = TestClient::new(
-            Router::new().get(
-                "/echo",
-                |headers: HeaderMap| async move {
-                    headers
-                        .get("x-custom")
-                        .map(|v| v.to_str().unwrap().to_string())
-                        .unwrap_or_default()
-                },
-            ),
-        );
+        let client = TestClient::new(Router::new().get("/echo", |headers: HeaderMap| async move {
+            headers
+                .get("x-custom")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        }));
 
         let resp = client
             .get("/echo")
@@ -761,9 +751,7 @@ mod tests {
         let client = TestClient::new(
             Router::new()
                 .state(AppName("Neutron".into()))
-                .get("/name", |State(name): State<AppName>| async move {
-                    name.0
-                }),
+                .get("/name", |State(name): State<AppName>| async move { name.0 }),
         );
 
         let resp = client.get("/name").send().await;
@@ -804,16 +792,14 @@ mod tests {
     async fn fallback_handler() {
         use crate::handler::Json;
 
-        let client = TestClient::new(
-            Router::new()
-                .get("/", || async { "root" })
-                .fallback(|| async {
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "error": "not found" })),
-                    )
-                }),
-        );
+        let client = TestClient::new(Router::new().get("/", || async { "root" }).fallback(
+            || async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "not found" })),
+                )
+            },
+        ));
 
         let resp = client.get("/missing").send().await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -853,7 +839,12 @@ mod tests {
 
         let client = TestClient::new(
             Router::new()
-                .middleware(Cors::new().allow_any_origin().allow_any_method().max_age(600))
+                .middleware(
+                    Cors::new()
+                        .allow_any_origin()
+                        .allow_any_method()
+                        .max_age(600),
+                )
                 .get("/data", || async { "data" }),
         );
 
@@ -887,15 +878,10 @@ mod tests {
 
     #[tokio::test]
     async fn raw_body_request() {
-        let client = TestClient::new(
-            Router::new().post("/echo", |body: String| async move { body }),
-        );
+        let client =
+            TestClient::new(Router::new().post("/echo", |body: String| async move { body }));
 
-        let resp = client
-            .post("/echo")
-            .body("raw content")
-            .send()
-            .await;
+        let resp = client.post("/echo").body("raw content").send().await;
 
         assert_eq!(resp.text().await, "raw content");
     }
@@ -926,9 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn bytes_response() {
-        let client = TestClient::new(
-            Router::new().get("/bin", || async { vec![0u8, 1, 2, 3] }),
-        );
+        let client = TestClient::new(Router::new().get("/bin", || async { vec![0u8, 1, 2, 3] }));
 
         let resp = client.get("/bin").send().await;
         assert_eq!(resp.bytes().await.as_ref(), &[0, 1, 2, 3]);
@@ -964,9 +948,7 @@ mod tests {
     async fn redirect_response() {
         use crate::handler::Redirect;
 
-        let client = TestClient::new(
-            Router::new().get("/old", || async { Redirect::to("/new") }),
-        );
+        let client = TestClient::new(Router::new().get("/old", || async { Redirect::to("/new") }));
 
         let resp = client.get("/old").send().await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -979,10 +961,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_simple_get() {
-        let server = TestServer::start(
-            Router::new().get("/ping", || async { "pong" }),
-        )
-        .await;
+        let server = TestServer::start(Router::new().get("/ping", || async { "pong" })).await;
 
         let resp = server.client().get("/ping").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -995,15 +974,14 @@ mod tests {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
-        struct Input { value: u32 }
+        struct Input {
+            value: u32,
+        }
 
         let server = TestServer::start(
-            Router::new().post(
-                "/double",
-                |Json(i): Json<Input>| async move {
-                    Json(serde_json::json!({ "result": i.value * 2 }))
-                },
-            ),
+            Router::new().post("/double", |Json(i): Json<Input>| async move {
+                Json(serde_json::json!({ "result": i.value * 2 }))
+            }),
         )
         .await;
 
@@ -1025,12 +1003,9 @@ mod tests {
         use crate::handler::Json;
 
         let server = TestServer::start(
-            Router::new().get(
-                "/users/:id",
-                |Path(id): Path<u64>| async move {
-                    Json(serde_json::json!({ "id": id }))
-                },
-            ),
+            Router::new().get("/users/:id", |Path(id): Path<u64>| async move {
+                Json(serde_json::json!({ "id": id }))
+            }),
         )
         .await;
 
@@ -1069,12 +1044,8 @@ mod tests {
             resp
         }
 
-        let server = TestServer::start(
-            Router::new()
-                .middleware(stamp)
-                .get("/", || async { "ok" }),
-        )
-        .await;
+        let server =
+            TestServer::start(Router::new().middleware(stamp).get("/", || async { "ok" })).await;
 
         let resp = server.client().get("/").send().await;
         assert_eq!(resp.header("x-via").unwrap(), "tcp-test");
@@ -1106,18 +1077,14 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_custom_request_header() {
-        let server = TestServer::start(
-            Router::new().get(
-                "/echo",
-                |headers: HeaderMap| async move {
-                    headers
-                        .get("x-token")
-                        .map(|v| v.to_str().unwrap().to_string())
-                        .unwrap_or_default()
-                },
-            ),
-        )
-        .await;
+        let server =
+            TestServer::start(Router::new().get("/echo", |headers: HeaderMap| async move {
+                headers
+                    .get("x-token")
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            }))
+            .await;
 
         let resp = server
             .client()
@@ -1140,8 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_status_codes() {
         let server = TestServer::start(
-            Router::new()
-                .post("/created", || async { (StatusCode::CREATED, "done") }),
+            Router::new().post("/created", || async { (StatusCode::CREATED, "done") }),
         )
         .await;
 

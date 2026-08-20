@@ -31,7 +31,7 @@ pub fn generate_state() -> String {
 /// Format: `{state}|{verifier}|{base64url(hmac)}`
 pub fn encode_state_cookie(state: &str, verifier: &str, secret: &[u8]) -> String {
     let payload = format!("{state}|{verifier}");
-    let sig     = hmac_sign(&payload, secret);
+    let sig = hmac_sign(&payload, secret);
     format!("{payload}|{sig}")
 }
 
@@ -59,8 +59,7 @@ pub fn decode_state_cookie(cookie: &str, secret: &[u8]) -> Option<(String, Strin
 }
 
 fn hmac_sign(payload: &str, secret: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret)
-        .expect("HMAC accepts any key size");
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key size");
     mac.update(payload.as_bytes());
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
@@ -69,7 +68,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -97,17 +99,17 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip() {
-        let state    = "my-state-value";
+        let state = "my-state-value";
         let verifier = "my-code-verifier";
-        let cookie   = encode_state_cookie(state, verifier, SECRET);
-        let result   = decode_state_cookie(&cookie, SECRET).unwrap();
+        let cookie = encode_state_cookie(state, verifier, SECRET);
+        let result = decode_state_cookie(&cookie, SECRET).unwrap();
         assert_eq!(result.0, state);
         assert_eq!(result.1, verifier);
     }
 
     #[test]
     fn tampered_state_fails_decode() {
-        let cookie  = encode_state_cookie("state", "verifier", SECRET);
+        let cookie = encode_state_cookie("state", "verifier", SECRET);
         let tampered = cookie.replace("state", "evil");
         assert!(decode_state_cookie(&tampered, SECRET).is_none());
     }

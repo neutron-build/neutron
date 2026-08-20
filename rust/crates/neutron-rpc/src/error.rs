@@ -9,31 +9,52 @@ use neutron_grpc::GrpcStatus;
 /// Mapped to the appropriate `grpc-status` trailer automatically.
 #[derive(Debug)]
 pub struct RpcError {
-    pub status:  GrpcStatus,
+    pub status: GrpcStatus,
     pub message: String,
 }
 
 impl RpcError {
     pub fn invalid_argument(msg: impl Into<String>) -> Self {
-        Self { status: GrpcStatus::InvalidArgument, message: msg.into() }
+        Self {
+            status: GrpcStatus::InvalidArgument,
+            message: msg.into(),
+        }
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
-        Self { status: GrpcStatus::NotFound, message: msg.into() }
+        Self {
+            status: GrpcStatus::NotFound,
+            message: msg.into(),
+        }
     }
     pub fn already_exists(msg: impl Into<String>) -> Self {
-        Self { status: GrpcStatus::AlreadyExists, message: msg.into() }
+        Self {
+            status: GrpcStatus::AlreadyExists,
+            message: msg.into(),
+        }
     }
     pub fn permission_denied(msg: impl Into<String>) -> Self {
-        Self { status: GrpcStatus::PermissionDenied, message: msg.into() }
+        Self {
+            status: GrpcStatus::PermissionDenied,
+            message: msg.into(),
+        }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self { status: GrpcStatus::Internal, message: msg.into() }
+        Self {
+            status: GrpcStatus::Internal,
+            message: msg.into(),
+        }
     }
     pub fn unimplemented(msg: impl Into<String>) -> Self {
-        Self { status: GrpcStatus::Unimplemented, message: msg.into() }
+        Self {
+            status: GrpcStatus::Unimplemented,
+            message: msg.into(),
+        }
     }
     pub fn unavailable(msg: impl Into<String>) -> Self {
-        Self { status: GrpcStatus::Unavailable, message: msg.into() }
+        Self {
+            status: GrpcStatus::Unavailable,
+            message: msg.into(),
+        }
     }
 }
 

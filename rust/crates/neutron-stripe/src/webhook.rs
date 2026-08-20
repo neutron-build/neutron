@@ -44,8 +44,12 @@ pub fn verify_webhook_signature(
     }
 
     // Compute expected HMAC: HMAC-SHA256(secret, "<timestamp>.<payload>")
-    let signed_payload = format!("{}.{}", timestamp, std::str::from_utf8(payload)
-        .map_err(|_| StripeError::InvalidSignature("payload is not valid UTF-8".to_string()))?);
+    let signed_payload = format!(
+        "{}.{}",
+        timestamp,
+        std::str::from_utf8(payload)
+            .map_err(|_| StripeError::InvalidSignature("payload is not valid UTF-8".to_string()))?
+    );
 
     let raw_secret = decode_webhook_secret(&config.webhook_secret)?;
     let mut mac = HmacSha256::new_from_slice(&raw_secret)
@@ -55,13 +59,14 @@ pub fn verify_webhook_signature(
     let expected_hex = hex_encode(&expected);
 
     // Constant-time comparison against all v1 signatures in the header
-    let matched = v1_sigs.iter().any(|sig| constant_time_eq(sig, &expected_hex));
+    let matched = v1_sigs
+        .iter()
+        .any(|sig| constant_time_eq(sig, &expected_hex));
     if !matched {
         return Err(StripeError::InvalidSignature("HMAC mismatch".to_string()));
     }
 
-    serde_json::from_slice(payload)
-        .map_err(|e| StripeError::ParseError(e.to_string()))
+    serde_json::from_slice(payload).map_err(|e| StripeError::ParseError(e.to_string()))
 }
 
 /// Parse the Stripe-Signature header into `(timestamp, vec_of_v1_signatures)`.
@@ -71,9 +76,10 @@ fn parse_sig_header(header: &str) -> Result<(u64, Vec<String>), StripeError> {
 
     for part in header.split(',') {
         if let Some(ts) = part.strip_prefix("t=") {
-            timestamp = Some(ts.parse().map_err(|_| {
-                StripeError::InvalidSignature(format!("invalid timestamp: {ts}"))
-            })?);
+            timestamp =
+                Some(ts.parse().map_err(|_| {
+                    StripeError::InvalidSignature(format!("invalid timestamp: {ts}"))
+                })?);
         } else if let Some(sig) = part.strip_prefix("v1=") {
             v1_sigs.push(sig.to_string());
         }
@@ -109,8 +115,13 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    if a.len() != b.len() { return false; }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]
@@ -138,12 +149,9 @@ mod tests {
         let payload = valid_payload();
         let ts = 1700000000u64;
         let header = build_sig_header(SECRET, payload, ts);
-        let event = verify_webhook_signature(
-            &StripeConfig::new(SECRET, "sk_test"),
-            payload,
-            &header,
-            ts,
-        ).unwrap();
+        let event =
+            verify_webhook_signature(&StripeConfig::new(SECRET, "sk_test"), payload, &header, ts)
+                .unwrap();
         assert_eq!(event.id, "evt_1");
     }
 
@@ -151,13 +159,11 @@ mod tests {
     fn wrong_signature_fails() {
         let payload = valid_payload();
         let ts = 1700000000u64;
-        let header = format!("t={ts},v1=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-        let err = verify_webhook_signature(
-            &StripeConfig::new(SECRET, "sk_test"),
-            payload,
-            &header,
-            ts,
-        ).unwrap_err();
+        let header =
+            format!("t={ts},v1=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        let err =
+            verify_webhook_signature(&StripeConfig::new(SECRET, "sk_test"), payload, &header, ts)
+                .unwrap_err();
         assert!(matches!(err, StripeError::InvalidSignature(_)));
     }
 
@@ -167,12 +173,9 @@ mod tests {
         let ts = 1700000000u64;
         let header = build_sig_header(SECRET, payload, ts);
         let now = ts + WEBHOOK_TOLERANCE_SECS + 1;
-        let err = verify_webhook_signature(
-            &StripeConfig::new(SECRET, "sk_test"),
-            payload,
-            &header,
-            now,
-        ).unwrap_err();
+        let err =
+            verify_webhook_signature(&StripeConfig::new(SECRET, "sk_test"), payload, &header, now)
+                .unwrap_err();
         assert!(matches!(err, StripeError::InvalidSignature(_)));
     }
 
@@ -187,7 +190,8 @@ mod tests {
             payload,
             &header,
             0,
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]
@@ -209,13 +213,16 @@ mod tests {
         let real_header = build_sig_header(SECRET, payload, ts);
         // Extract the real v1 sig and prepend a fake one
         let real_v1 = real_header.split(',').nth(1).unwrap();
-        let header = format!("t={ts},v1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,{real_v1}");
+        let header = format!(
+            "t={ts},v1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,{real_v1}"
+        );
         assert!(verify_webhook_signature(
             &StripeConfig::new(SECRET, "sk_test"),
             payload,
             &header,
             ts,
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]

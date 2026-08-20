@@ -22,16 +22,22 @@ pub struct SamplingParams {
     pub repetition_penalty: f32,
 }
 
-fn default_temperature() -> f32 { 0.7 }
-fn default_top_p()       -> f32 { 0.9 }
-fn default_rep_penalty() -> f32 { 1.0 }
+fn default_temperature() -> f32 {
+    0.7
+}
+fn default_top_p() -> f32 {
+    0.9
+}
+fn default_rep_penalty() -> f32 {
+    1.0
+}
 
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
-            temperature:       default_temperature(),
-            top_p:             default_top_p(),
-            top_k:             0,
+            temperature: default_temperature(),
+            top_p: default_top_p(),
+            top_k: 0,
             repetition_penalty: default_rep_penalty(),
         }
     }
@@ -60,23 +66,37 @@ pub struct InferenceRequest {
     pub stop: Vec<String>,
 }
 
-fn default_max_tokens() -> u32 { 256 }
+fn default_max_tokens() -> u32 {
+    256
+}
 
 impl InferenceRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
-            prompt:     prompt.into(),
+            prompt: prompt.into(),
             max_tokens: default_max_tokens(),
-            sampling:   SamplingParams::default(),
-            stream:     false,
-            stop:       Vec::new(),
+            sampling: SamplingParams::default(),
+            stream: false,
+            stop: Vec::new(),
         }
     }
 
-    pub fn max_tokens(mut self, n: u32) -> Self { self.max_tokens = n; self }
-    pub fn temperature(mut self, t: f32) -> Self { self.sampling.temperature = t; self }
-    pub fn stream(mut self) -> Self { self.stream = true; self }
-    pub fn stop(mut self, seq: impl Into<String>) -> Self { self.stop.push(seq.into()); self }
+    pub fn max_tokens(mut self, n: u32) -> Self {
+        self.max_tokens = n;
+        self
+    }
+    pub fn temperature(mut self, t: f32) -> Self {
+        self.sampling.temperature = t;
+        self
+    }
+    pub fn stream(mut self) -> Self {
+        self.stream = true;
+        self
+    }
+    pub fn stop(mut self, seq: impl Into<String>) -> Self {
+        self.stop.push(seq.into());
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------

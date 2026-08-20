@@ -224,11 +224,7 @@ fn generate_etag(metadata: &std::fs::Metadata) -> String {
 
 /// Detect content type from file extension.
 fn content_type_for_path(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-    {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
         // Text
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -329,17 +325,15 @@ mod tests {
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp
-            .header("content-type")
-            .unwrap()
-            .contains("text/html"));
+        assert!(resp.header("content-type").unwrap().contains("text/html"));
         assert_eq!(resp.text().await, "<h1>Home</h1>");
     }
 
     #[tokio::test]
     async fn serves_css_file() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/style.css").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -350,20 +344,19 @@ mod tests {
     #[tokio::test]
     async fn serves_js_file() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/app.js").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp
-            .header("content-type")
-            .unwrap()
-            .contains("javascript"));
+        assert!(resp.header("content-type").unwrap().contains("javascript"));
     }
 
     #[tokio::test]
     async fn serves_json_file() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/static", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/static", dir.path().to_path_buf()));
 
         let resp = client.get("/static/data.json").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -376,7 +369,8 @@ mod tests {
     #[tokio::test]
     async fn serves_nested_file() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/sub/page.html").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -386,7 +380,8 @@ mod tests {
     #[tokio::test]
     async fn serves_subdirectory_index() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/sub").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -396,7 +391,8 @@ mod tests {
     #[tokio::test]
     async fn returns_404_for_missing_file() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/nonexistent.txt").send().await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -405,7 +401,8 @@ mod tests {
     #[tokio::test]
     async fn prevents_directory_traversal() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/../../../etc/passwd").send().await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -414,7 +411,8 @@ mod tests {
     #[tokio::test]
     async fn has_etag_header() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/style.css").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -428,7 +426,8 @@ mod tests {
     #[tokio::test]
     async fn conditional_request_304() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         // First request to get the ETag
         let resp1 = client.get("/assets/style.css").send().await;
@@ -448,7 +447,8 @@ mod tests {
     #[tokio::test]
     async fn conditional_request_mismatched_etag() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client
             .get("/assets/style.css")
@@ -463,7 +463,8 @@ mod tests {
     #[tokio::test]
     async fn has_cache_control_header() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/style.css").send().await;
         assert!(resp
@@ -475,7 +476,8 @@ mod tests {
     #[tokio::test]
     async fn binary_file_content_type() {
         let dir = setup_static_dir();
-        let client = TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
+        let client =
+            TestClient::new(Router::new().static_files("/assets", dir.path().to_path_buf()));
 
         let resp = client.get("/assets/image.png").send().await;
         assert_eq!(resp.status(), StatusCode::OK);

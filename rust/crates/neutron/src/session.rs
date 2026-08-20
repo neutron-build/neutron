@@ -267,15 +267,13 @@ impl Session {
 
 impl FromRequest for Session {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
-        req.get_extension::<Session>()
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "SessionLayer middleware not configured",
-                )
-                    .into_response()
-            })
+        req.get_extension::<Session>().cloned().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SessionLayer middleware not configured",
+            )
+                .into_response()
+        })
     }
 }
 
@@ -410,14 +408,14 @@ impl MiddlewareTrait for SessionLayer {
                 if let Some(cookie_value) = parse_session_cookie(req.headers(), &cookie_name) {
                     if let Some(session_id) = key.verify(&cookie_value) {
                         if let Some(data) = store.load(&session_id) {
-                            (Session::new(session_id.clone(), data, false), Some(session_id))
+                            (
+                                Session::new(session_id.clone(), data, false),
+                                Some(session_id),
+                            )
                         } else {
                             // Session expired or not found — create new
                             let id = generate_session_id();
-                            (
-                                Session::new(id, HashMap::new(), true),
-                                None,
-                            )
+                            (Session::new(id, HashMap::new(), true), None)
                         }
                     } else {
                         // Invalid signature — create new session
@@ -460,10 +458,8 @@ impl MiddlewareTrait for SessionLayer {
                 if cookie_secure {
                     cookie_parts.push("Secure".to_string());
                 }
-                resp.headers_mut().append(
-                    "set-cookie",
-                    cookie_parts.join("; ").parse().unwrap(),
-                );
+                resp.headers_mut()
+                    .append("set-cookie", cookie_parts.join("; ").parse().unwrap());
             } else if inner.modified || inner.is_new {
                 // Save session data
                 store.save(&inner.id, inner.data.clone(), max_age);
@@ -484,10 +480,8 @@ impl MiddlewareTrait for SessionLayer {
                 if let Some(same_site) = cookie_same_site {
                     cookie_parts.push(format!("SameSite={same_site}"));
                 }
-                resp.headers_mut().append(
-                    "set-cookie",
-                    cookie_parts.join("; ").parse().unwrap(),
-                );
+                resp.headers_mut()
+                    .append("set-cookie", cookie_parts.join("; ").parse().unwrap());
             }
 
             resp
@@ -517,14 +511,13 @@ mod tests {
     async fn new_session_gets_cookie() {
         let (layer, _key) = test_layer();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(layer)
-                .get("/", |session: Session| async move {
-                    session.insert("hello", "world");
-                    "ok"
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(layer).get(
+            "/",
+            |session: Session| async move {
+                session.insert("hello", "world");
+                "ok"
+            },
+        ));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -576,31 +569,30 @@ mod tests {
     async fn session_get_set_remove() {
         let (layer, _key) = test_layer();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(layer)
-                .get("/", |session: Session| async move {
-                    // Set values
-                    session.insert("name", "Alice");
-                    session.insert("age", 30u32);
+        let client = TestClient::new(Router::new().middleware(layer).get(
+            "/",
+            |session: Session| async move {
+                // Set values
+                session.insert("name", "Alice");
+                session.insert("age", 30u32);
 
-                    // Get values
-                    let name: String = session.get("name").unwrap();
-                    let age: u32 = session.get("age").unwrap();
-                    let missing: Option<String> = session.get("missing");
+                // Get values
+                let name: String = session.get("name").unwrap();
+                let age: u32 = session.get("age").unwrap();
+                let missing: Option<String> = session.get("missing");
 
-                    // Remove
-                    session.remove("age");
-                    let age_after: Option<u32> = session.get("age");
+                // Remove
+                session.remove("age");
+                let age_after: Option<u32> = session.get("age");
 
-                    Json(serde_json::json!({
-                        "name": name,
-                        "age": age,
-                        "missing": missing,
-                        "age_after": age_after,
-                    }))
-                }),
-        );
+                Json(serde_json::json!({
+                    "name": name,
+                    "age": age,
+                    "missing": missing,
+                    "age_after": age_after,
+                }))
+            },
+        ));
 
         let resp = client.get("/").send().await;
         let body: serde_json::Value = resp.json().await;
@@ -656,11 +648,7 @@ mod tests {
             .await;
 
         // Values should be gone
-        let resp = client
-            .get("/get")
-            .header("cookie", cookie_val)
-            .send()
-            .await;
+        let resp = client.get("/get").header("cookie", cookie_val).send().await;
         let body: serde_json::Value = resp.json().await;
         assert!(body["a"].is_null());
         assert!(body["b"].is_null());
@@ -712,11 +700,7 @@ mod tests {
         assert!(destroy_cookie.contains("Max-Age=0"));
 
         // Old cookie no longer works
-        let resp = client
-            .get("/get")
-            .header("cookie", cookie_val)
-            .send()
-            .await;
+        let resp = client.get("/get").header("cookie", cookie_val).send().await;
         assert_eq!(resp.text().await, "none");
     }
 
@@ -740,14 +724,13 @@ mod tests {
     async fn session_id_is_unique() {
         let (layer, _key) = test_layer();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(layer)
-                .get("/", |session: Session| async move {
-                    session.insert("x", 1);
-                    session.id()
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(layer).get(
+            "/",
+            |session: Session| async move {
+                session.insert("x", 1);
+                session.id()
+            },
+        ));
 
         let resp1 = client.get("/").send().await;
         let id1 = resp1.text().await;
@@ -788,14 +771,13 @@ mod tests {
         let key = Key::generate();
         let layer = SessionLayer::new(MemoryStore::new(), key).cookie_name("my.session");
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(layer)
-                .get("/", |session: Session| async move {
-                    session.insert("x", 1);
-                    "ok"
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(layer).get(
+            "/",
+            |session: Session| async move {
+                session.insert("x", 1);
+                "ok"
+            },
+        ));
 
         let resp = client.get("/").send().await;
         let set_cookie = resp.header("set-cookie").unwrap();
@@ -807,14 +789,13 @@ mod tests {
         let key = Key::generate();
         let layer = SessionLayer::new(MemoryStore::new(), key).secure(true);
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(layer)
-                .get("/", |session: Session| async move {
-                    session.insert("x", 1);
-                    "ok"
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(layer).get(
+            "/",
+            |session: Session| async move {
+                session.insert("x", 1);
+                "ok"
+            },
+        ));
 
         let resp = client.get("/").send().await;
         let set_cookie = resp.header("set-cookie").unwrap();
@@ -823,9 +804,8 @@ mod tests {
 
     #[tokio::test]
     async fn without_session_middleware_returns_500() {
-        let client = TestClient::new(
-            Router::new().get("/", |session: Session| async move { session.id() }),
-        );
+        let client =
+            TestClient::new(Router::new().get("/", |session: Session| async move { session.id() }));
 
         let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -835,14 +815,13 @@ mod tests {
     async fn invalid_session_cookie_creates_new_session() {
         let (layer, _key) = test_layer();
 
-        let client = TestClient::new(
-            Router::new()
-                .middleware(layer)
-                .get("/", |session: Session| async move {
-                    session.insert("x", 1);
-                    format!("new={}", session.is_new())
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(layer).get(
+            "/",
+            |session: Session| async move {
+                session.insert("x", 1);
+                format!("new={}", session.is_new())
+            },
+        ));
 
         let resp = client
             .get("/")
@@ -889,11 +868,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Session should be gone (expired)
-        let resp = client
-            .get("/get")
-            .header("cookie", cookie_val)
-            .send()
-            .await;
+        let resp = client.get("/get").header("cookie", cookie_val).send().await;
         assert_eq!(resp.text().await, "none");
     }
 

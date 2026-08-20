@@ -28,10 +28,10 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 
 /// Derive the SigV4 signing key.
 pub fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_secret  = format!("AWS4{secret}");
-    let k_date    = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
-    let k_region  = hmac_sha256(&k_date,    region.as_bytes());
-    let k_service = hmac_sha256(&k_region,  service.as_bytes());
+    let k_secret = format!("AWS4{secret}");
+    let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
     hmac_sha256(&k_service, b"aws4_request")
 }
 
@@ -41,8 +41,9 @@ pub fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
-            b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b'/' if !encode_slash => out.push('/'),
             other => {
                 out.push('%');
@@ -68,12 +69,12 @@ pub fn utc_now() -> (String, String) {
 
 /// Convert a Unix timestamp (seconds) to `(datetime, date)`.
 pub fn epoch_to_datetime(secs: u64) -> (String, String) {
-    let sec  = (secs % 60) as u8;
-    let min  = ((secs / 60) % 60) as u8;
+    let sec = (secs % 60) as u8;
+    let min = ((secs / 60) % 60) as u8;
     let hour = ((secs / 3600) % 24) as u8;
     let days = secs / 86400;
     let (year, month, day) = days_to_ymd(days);
-    let dt   = format!("{year:04}{month:02}{day:02}T{hour:02}{min:02}{sec:02}Z");
+    let dt = format!("{year:04}{month:02}{day:02}T{hour:02}{min:02}{sec:02}Z");
     let date = dt[..8].to_string();
     (dt, date)
 }
@@ -85,17 +86,30 @@ fn days_to_ymd(mut d: u64) -> (u32, u8, u8) {
     d %= 146097;
     let n100 = (d / 36524).min(3);
     d -= n100 * 36524;
-    let n4   = d / 1461;
+    let n4 = d / 1461;
     d %= 1461;
-    let n1   = (d / 365).min(3);
+    let n1 = (d / 365).min(3);
     d -= n1 * 365;
 
     let year = (n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970) as u32;
     let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let days_in_month: [u8; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let days_in_month: [u8; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
 
     let mut month = 0u8;
-    let mut day   = d as u8 + 1;
+    let mut day = d as u8 + 1;
     for (i, &dim) in days_in_month.iter().enumerate() {
         if day <= dim {
             month = i as u8 + 1;
@@ -112,21 +126,21 @@ fn days_to_ymd(mut d: u64) -> (u32, u8, u8) {
 
 /// Parameters for signing a request via the Authorization header.
 pub struct AuthParams<'a> {
-    pub method:       &'a str,
-    pub host:         &'a str,
+    pub method: &'a str,
+    pub host: &'a str,
     /// URL-encoded path (e.g. `/bucket/path/to/key`).
-    pub path:         &'a str,
+    pub path: &'a str,
     /// Pre-sorted, already-encoded canonical query string (empty if none).
-    pub query:        &'a str,
+    pub query: &'a str,
     /// Additional headers to sign, sorted by name (lowercase).
     /// `host`, `x-amz-content-sha256`, and `x-amz-date` are always added.
     pub extra_headers: &'a [(&'a str, &'a str)],
     pub payload_hash: &'a str,
-    pub datetime:     &'a str,
-    pub date:         &'a str,
-    pub region:       &'a str,
-    pub access_key:   &'a str,
-    pub secret_key:   &'a str,
+    pub datetime: &'a str,
+    pub date: &'a str,
+    pub region: &'a str,
+    pub access_key: &'a str,
+    pub secret_key: &'a str,
 }
 
 /// Returns the `Authorization` header value and the sorted signed-header list
@@ -134,20 +148,22 @@ pub struct AuthParams<'a> {
 pub fn authorization_header(p: &AuthParams<'_>) -> String {
     // Fixed headers that are always signed
     let mut headers: Vec<(&str, String)> = vec![
-        ("host",                 p.host.to_string()),
+        ("host", p.host.to_string()),
         ("x-amz-content-sha256", p.payload_hash.to_string()),
-        ("x-amz-date",           p.datetime.to_string()),
+        ("x-amz-date", p.datetime.to_string()),
     ];
     for (k, v) in p.extra_headers {
         headers.push((k, v.to_string()));
     }
     headers.sort_by_key(|(k, _)| *k);
 
-    let canonical_headers: String = headers.iter()
+    let canonical_headers: String = headers
+        .iter()
         .map(|(k, v)| format!("{}:{}\n", k, v.trim()))
         .collect();
 
-    let signed_headers: String = headers.iter()
+    let signed_headers: String = headers
+        .iter()
         .map(|(k, _)| *k)
         .collect::<Vec<_>>()
         .join(";");
@@ -158,13 +174,15 @@ pub fn authorization_header(p: &AuthParams<'_>) -> String {
     );
 
     let credential_scope = format!("{}/{}/s3/aws4_request", p.date, p.region);
-    let string_to_sign   = format!(
+    let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        p.datetime, credential_scope, sha256_hex(canonical_request.as_bytes())
+        p.datetime,
+        credential_scope,
+        sha256_hex(canonical_request.as_bytes())
     );
 
     let signing_key = derive_signing_key(p.secret_key, p.date, p.region, "s3");
-    let signature   = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
 
     format!(
         "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
@@ -179,27 +197,33 @@ pub fn authorization_header(p: &AuthParams<'_>) -> String {
 /// Build a presigned URL (signature in query parameters, no Authorization header).
 #[allow(clippy::too_many_arguments)]
 pub fn presigned_url(
-    method:     &str,
-    scheme:     &str,
-    host:       &str,
-    path:       &str,
+    method: &str,
+    scheme: &str,
+    host: &str,
+    path: &str,
     access_key: &str,
     secret_key: &str,
-    region:     &str,
-    datetime:   &str,
-    date:       &str,
-    expires:    u64,
-    extra_query: &str,  // additional query params already canonical-encoded, or ""
+    region: &str,
+    datetime: &str,
+    date: &str,
+    expires: u64,
+    extra_query: &str, // additional query params already canonical-encoded, or ""
 ) -> String {
     let credential_scope = format!("{date}/{region}/s3/aws4_request");
     let credential = format!("{access_key}/{credential_scope}");
 
     // Build canonical query string (must be sorted)
     let mut qparams: Vec<(String, String)> = vec![
-        ("X-Amz-Algorithm".to_string(),  "AWS4-HMAC-SHA256".to_string()),
-        ("X-Amz-Credential".to_string(), uri_encode(&credential, true)),
-        ("X-Amz-Date".to_string(),       datetime.to_string()),
-        ("X-Amz-Expires".to_string(),    expires.to_string()),
+        (
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
+        (
+            "X-Amz-Credential".to_string(),
+            uri_encode(&credential, true),
+        ),
+        ("X-Amz-Date".to_string(), datetime.to_string()),
+        ("X-Amz-Expires".to_string(), expires.to_string()),
         ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
     ];
     if !extra_query.is_empty() {
@@ -211,14 +235,15 @@ pub fn presigned_url(
     }
     qparams.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let canonical_query: String = qparams.iter()
+    let canonical_query: String = qparams
+        .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
 
     let canonical_headers = format!("host:{host}\n");
-    let signed_headers    = "host";
-    let payload_hash      = "UNSIGNED-PAYLOAD";
+    let signed_headers = "host";
+    let payload_hash = "UNSIGNED-PAYLOAD";
 
     let canonical_request = format!(
         "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
@@ -230,11 +255,9 @@ pub fn presigned_url(
     );
 
     let signing_key = derive_signing_key(secret_key, date, region, "s3");
-    let signature   = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
 
-    format!(
-        "{scheme}://{host}{path}?{canonical_query}&X-Amz-Signature={signature}"
-    )
+    format!("{scheme}://{host}{path}?{canonical_query}&X-Amz-Signature={signature}")
 }
 
 // ---------------------------------------------------------------------------
@@ -259,13 +282,16 @@ mod tests {
         // RFC 2202 test vector: HMAC-SHA256("key", "The quick brown fox jumps over the lazy dog")
         let result = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog");
         let hex = hex_encode(&result);
-        assert_eq!(hex, "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
+        assert_eq!(
+            hex,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
     }
 
     #[test]
     fn epoch_to_datetime_epoch() {
         let (dt, date) = epoch_to_datetime(0);
-        assert_eq!(dt,   "19700101T000000Z");
+        assert_eq!(dt, "19700101T000000Z");
         assert_eq!(date, "19700101");
     }
 
@@ -273,7 +299,7 @@ mod tests {
     fn epoch_to_datetime_known() {
         // 2024-01-15 12:30:45 UTC = 1705321845
         let (dt, date) = epoch_to_datetime(1705321845);
-        assert_eq!(dt,   "20240115T123045Z");
+        assert_eq!(dt, "20240115T123045Z");
         assert_eq!(date, "20240115");
     }
 
@@ -281,19 +307,22 @@ mod tests {
     fn epoch_to_datetime_leap_year() {
         // 2024-02-29 00:00:00 UTC = 1709164800
         let (dt, date) = epoch_to_datetime(1709164800);
-        assert_eq!(dt,   "20240229T000000Z");
+        assert_eq!(dt, "20240229T000000Z");
         assert_eq!(date, "20240229");
     }
 
     #[test]
     fn uri_encode_unreserved() {
-        assert_eq!(uri_encode("hello-world_test.~ok", true), "hello-world_test.~ok");
+        assert_eq!(
+            uri_encode("hello-world_test.~ok", true),
+            "hello-world_test.~ok"
+        );
     }
 
     #[test]
     fn uri_encode_special() {
         assert_eq!(uri_encode("hello world", true), "hello%20world");
-        assert_eq!(uri_encode("a/b/c", true),  "a%2Fb%2Fc");
+        assert_eq!(uri_encode("a/b/c", true), "a%2Fb%2Fc");
         assert_eq!(uri_encode("a/b/c", false), "a/b/c");
     }
 
@@ -307,17 +336,17 @@ mod tests {
     fn authorization_header_produces_aws4_prefix() {
         let (datetime, date) = epoch_to_datetime(1705320645);
         let auth = authorization_header(&AuthParams {
-            method:        "PUT",
-            host:          "s3.us-east-1.amazonaws.com",
-            path:          "/my-bucket/test.txt",
-            query:         "",
+            method: "PUT",
+            host: "s3.us-east-1.amazonaws.com",
+            path: "/my-bucket/test.txt",
+            query: "",
             extra_headers: &[],
-            payload_hash:  &sha256_hex(b"hello"),
-            datetime:      &datetime,
-            date:          &date,
-            region:        "us-east-1",
-            access_key:    "AKID",
-            secret_key:    "SECRET",
+            payload_hash: &sha256_hex(b"hello"),
+            datetime: &datetime,
+            date: &date,
+            region: "us-east-1",
+            access_key: "AKID",
+            secret_key: "SECRET",
         });
         assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKID/"));
         assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
@@ -328,12 +357,17 @@ mod tests {
     fn presigned_url_contains_required_params() {
         let (datetime, date) = epoch_to_datetime(1705320645);
         let url = presigned_url(
-            "GET", "https",
+            "GET",
+            "https",
             "s3.us-east-1.amazonaws.com",
             "/my-bucket/photo.jpg",
-            "AKID", "SECRET", "us-east-1",
-            &datetime, &date,
-            3600, "",
+            "AKID",
+            "SECRET",
+            "us-east-1",
+            &datetime,
+            &date,
+            3600,
+            "",
         );
         assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
         assert!(url.contains("X-Amz-Expires=3600"));
@@ -351,6 +385,9 @@ mod tests {
 
     #[test]
     fn hex_encode_correct() {
-        assert_eq!(hex_encode(&[0x00, 0xde, 0xad, 0xbe, 0xef, 0xff]), "00deadbeefff");
+        assert_eq!(
+            hex_encode(&[0x00, 0xde, 0xad, 0xbe, 0xef, 0xff]),
+            "00deadbeefff"
+        );
     }
 }

@@ -38,60 +38,67 @@ pub enum Provider {
 /// ```
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
-    pub(crate) provider:   Provider,
-    pub(crate) bucket:     String,
+    pub(crate) provider: Provider,
+    pub(crate) bucket: String,
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
     /// Use plain HTTP instead of HTTPS (for local dev/MinIO).
-    pub(crate) use_http:   bool,
+    pub(crate) use_http: bool,
 }
 
 impl StorageConfig {
     /// AWS S3 in `region`, storing objects in `bucket`.
     pub fn s3(region: impl Into<String>, bucket: impl Into<String>) -> Self {
         StorageConfig {
-            provider:   Provider::S3 { region: region.into() },
-            bucket:     bucket.into(),
+            provider: Provider::S3 {
+                region: region.into(),
+            },
+            bucket: bucket.into(),
             access_key: String::new(),
             secret_key: String::new(),
-            use_http:   false,
+            use_http: false,
         }
     }
 
     /// Cloudflare R2 under `account_id`, storing objects in `bucket`.
     pub fn r2(account_id: impl Into<String>, bucket: impl Into<String>) -> Self {
         StorageConfig {
-            provider:   Provider::R2 { account_id: account_id.into() },
-            bucket:     bucket.into(),
+            provider: Provider::R2 {
+                account_id: account_id.into(),
+            },
+            bucket: bucket.into(),
             access_key: String::new(),
             secret_key: String::new(),
-            use_http:   false,
+            use_http: false,
         }
     }
 
     /// Google Cloud Storage (S3-compatible XML API, HMAC credentials).
     pub fn gcs(bucket: impl Into<String>) -> Self {
         StorageConfig {
-            provider:   Provider::Gcs,
-            bucket:     bucket.into(),
+            provider: Provider::Gcs,
+            bucket: bucket.into(),
             access_key: String::new(),
             secret_key: String::new(),
-            use_http:   false,
+            use_http: false,
         }
     }
 
     /// Custom S3-compatible endpoint (MinIO, Ceph, etc.).
     pub fn custom(
-        host:   impl Into<String>,
+        host: impl Into<String>,
         region: impl Into<String>,
         bucket: impl Into<String>,
     ) -> Self {
         StorageConfig {
-            provider:   Provider::Custom { host: host.into(), region: region.into() },
-            bucket:     bucket.into(),
+            provider: Provider::Custom {
+                host: host.into(),
+                region: region.into(),
+            },
+            bucket: bucket.into(),
             access_key: String::new(),
             secret_key: String::new(),
-            use_http:   false,
+            use_http: false,
         }
     }
 
@@ -119,30 +126,32 @@ impl StorageConfig {
     /// Returns `(host, region)` for signing/connecting.
     pub(crate) fn host_and_region(&self) -> (String, String) {
         match &self.provider {
-            Provider::S3 { region } => (
-                format!("s3.{region}.amazonaws.com"),
-                region.clone(),
-            ),
+            Provider::S3 { region } => (format!("s3.{region}.amazonaws.com"), region.clone()),
             Provider::R2 { account_id } => (
                 format!("{account_id}.r2.cloudflarestorage.com"),
                 "auto".to_string(),
             ),
-            Provider::Gcs => (
-                "storage.googleapis.com".to_string(),
-                "auto".to_string(),
-            ),
+            Provider::Gcs => ("storage.googleapis.com".to_string(), "auto".to_string()),
             Provider::Custom { host, region } => (host.clone(), region.clone()),
         }
     }
 
     /// Returns the scheme prefix for URLs.
     pub(crate) fn scheme(&self) -> &'static str {
-        if self.use_http { "http" } else { "https" }
+        if self.use_http {
+            "http"
+        } else {
+            "https"
+        }
     }
 
     /// Returns the port to connect to (443 or 80).
     pub(crate) fn port(&self) -> u16 {
-        if self.use_http { 80 } else { 443 }
+        if self.use_http {
+            80
+        } else {
+            443
+        }
     }
 }
 
@@ -180,7 +189,8 @@ mod tests {
 
     #[test]
     fn custom_host() {
-        let cfg = StorageConfig::custom("minio.local:9000", "us-east-1", "dev").credentials("a", "b");
+        let cfg =
+            StorageConfig::custom("minio.local:9000", "us-east-1", "dev").credentials("a", "b");
         let (host, region) = cfg.host_and_region();
         assert_eq!(host, "minio.local:9000");
         assert_eq!(region, "us-east-1");

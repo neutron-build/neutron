@@ -90,8 +90,7 @@ impl MiddlewareTrait for RequestId {
 
         Box::pin(async move {
             let mut resp = next.run(req).await;
-            resp.headers_mut()
-                .insert(header_name, id.parse().unwrap());
+            resp.headers_mut().insert(header_name, id.parse().unwrap());
             resp
         })
     }
@@ -137,7 +136,10 @@ mod tests {
             .send()
             .await;
 
-        assert_eq!(resp.header("x-request-id").unwrap(), "from-loadbalancer-123");
+        assert_eq!(
+            resp.header("x-request-id").unwrap(),
+            "from-loadbalancer-123"
+        );
     }
 
     #[tokio::test]

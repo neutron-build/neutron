@@ -229,7 +229,10 @@ mod tests {
 
         let resp = client.get("/").send().await;
         let traceparent = resp.header("traceparent");
-        assert!(traceparent.is_some(), "response should have traceparent header");
+        assert!(
+            traceparent.is_some(),
+            "response should have traceparent header"
+        );
 
         // Validate the format
         let value = traceparent.unwrap();
@@ -258,7 +261,9 @@ mod tests {
             .send()
             .await;
 
-        let traceparent = resp.header("traceparent").expect("missing traceparent header");
+        let traceparent = resp
+            .header("traceparent")
+            .expect("missing traceparent header");
         let parts: Vec<&str> = traceparent.split('-').collect();
 
         // The trace ID should be preserved from the incoming header
@@ -288,6 +293,9 @@ mod tests {
         let parts2: Vec<&str> = tp2.split('-').collect();
         assert_eq!(parts1.len(), 4);
         assert_eq!(parts2.len(), 4);
-        assert_ne!(parts1[1], parts2[1], "different requests should get different trace IDs");
+        assert_ne!(
+            parts1[1], parts2[1],
+            "different requests should get different trace IDs"
+        );
     }
 }

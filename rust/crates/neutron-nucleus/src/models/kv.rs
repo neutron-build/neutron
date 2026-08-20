@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::NucleusError;
-use crate::row_ext::RowExt;
 use crate::pool::NucleusPool;
+use crate::row_ext::RowExt;
 
 /// Handle for key-value operations.
 pub struct KvModel {

@@ -19,30 +19,29 @@ impl std::str::FromStr for StripeEventType {
     type Err = std::convert::Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
-            "payment_intent.succeeded"       => StripeEventType::PaymentIntentSucceeded,
-            "payment_intent.payment_failed"  => StripeEventType::PaymentIntentPaymentFailed,
-            "payment_intent.created"         => StripeEventType::PaymentIntentCreated,
-            "payment_intent.canceled"        => StripeEventType::PaymentIntentCanceled,
-            "customer.created"               => StripeEventType::CustomerCreated,
-            "customer.deleted"               => StripeEventType::CustomerDeleted,
-            "checkout.session.completed"     => StripeEventType::CheckoutSessionCompleted,
-            other                            => StripeEventType::Other(other.to_string()),
+            "payment_intent.succeeded" => StripeEventType::PaymentIntentSucceeded,
+            "payment_intent.payment_failed" => StripeEventType::PaymentIntentPaymentFailed,
+            "payment_intent.created" => StripeEventType::PaymentIntentCreated,
+            "payment_intent.canceled" => StripeEventType::PaymentIntentCanceled,
+            "customer.created" => StripeEventType::CustomerCreated,
+            "customer.deleted" => StripeEventType::CustomerDeleted,
+            "checkout.session.completed" => StripeEventType::CheckoutSessionCompleted,
+            other => StripeEventType::Other(other.to_string()),
         })
     }
 }
 
 impl StripeEventType {
-
     pub fn as_str(&self) -> &str {
         match self {
-            StripeEventType::PaymentIntentSucceeded    => "payment_intent.succeeded",
+            StripeEventType::PaymentIntentSucceeded => "payment_intent.succeeded",
             StripeEventType::PaymentIntentPaymentFailed => "payment_intent.payment_failed",
-            StripeEventType::PaymentIntentCreated      => "payment_intent.created",
-            StripeEventType::PaymentIntentCanceled     => "payment_intent.canceled",
-            StripeEventType::CustomerCreated           => "customer.created",
-            StripeEventType::CustomerDeleted           => "customer.deleted",
-            StripeEventType::CheckoutSessionCompleted  => "checkout.session.completed",
-            StripeEventType::Other(s)                  => s.as_str(),
+            StripeEventType::PaymentIntentCreated => "payment_intent.created",
+            StripeEventType::PaymentIntentCanceled => "payment_intent.canceled",
+            StripeEventType::CustomerCreated => "customer.created",
+            StripeEventType::CustomerDeleted => "customer.deleted",
+            StripeEventType::CheckoutSessionCompleted => "checkout.session.completed",
+            StripeEventType::Other(s) => s.as_str(),
         }
     }
 }
@@ -50,12 +49,12 @@ impl StripeEventType {
 /// A Stripe webhook event envelope.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StripeEvent {
-    pub id:         String,
+    pub id: String,
     #[serde(rename = "type")]
     pub event_type: String,
-    pub livemode:   bool,
-    pub created:    u64,
-    pub data:       StripeEventData,
+    pub livemode: bool,
+    pub created: u64,
+    pub data: StripeEventData,
 }
 
 impl StripeEvent {
@@ -74,16 +73,16 @@ pub struct StripeEventData {
 /// A Stripe PaymentIntent object.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PaymentIntent {
-    pub id:            String,
-    pub object:        String,
+    pub id: String,
+    pub object: String,
     /// Amount in smallest currency unit (e.g. cents).
-    pub amount:        i64,
-    pub currency:      String,
-    pub status:        String,
+    pub amount: i64,
+    pub currency: String,
+    pub status: String,
     pub client_secret: Option<String>,
-    pub customer:      Option<String>,
-    pub description:   Option<String>,
-    pub metadata:      Option<Value>,
+    pub customer: Option<String>,
+    pub description: Option<String>,
+    pub metadata: Option<Value>,
 }
 
 #[cfg(test)]
@@ -117,7 +116,10 @@ mod tests {
     #[test]
     fn parse_unknown_event() {
         let ev = make_event("invoice.paid");
-        assert_eq!(ev.kind(), StripeEventType::Other("invoice.paid".to_string()));
+        assert_eq!(
+            ev.kind(),
+            StripeEventType::Other("invoice.paid".to_string())
+        );
     }
 
     #[test]

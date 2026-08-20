@@ -54,9 +54,10 @@ fn resp_not_found(path: &str) -> Response {
 
 #[inline]
 fn resp_method_not_allowed(allow: &[http::Method], path: &str) -> Response {
-    let mut resp = AppError::method_not_allowed("The request method is not supported for this resource.")
-        .with_instance(path)
-        .into_response();
+    let mut resp =
+        AppError::method_not_allowed("The request method is not supported for this resource.")
+            .with_instance(path)
+            .into_response();
     // RFC 7231 §6.5.5: a 405 response MUST carry an `Allow` header.
     let allow_value = allow
         .iter()
@@ -143,8 +144,7 @@ pub(crate) fn build_dispatch(router: Arc<Router>) -> DispatchChain {
 }
 
 /// Type alias for shutdown hook functions.
-type ShutdownHook =
-    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+type ShutdownHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 /// TCP-level configuration for the server socket.
 #[derive(Clone, Debug)]
@@ -186,7 +186,11 @@ fn create_worker_listeners(
 ) -> Result<Vec<std::net::TcpListener>, Box<dyn std::error::Error + Send + Sync>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
 
     #[cfg(not(target_os = "windows"))]
     {
@@ -293,9 +297,9 @@ async fn worker_accept_loop(
                     // P1.2: pass the body through as a lazy stream — no pre-collect.
                     // The Content-Length early-413 above is kept; the per-frame
                     // ceiling in collect_body enforces the limit for chunked bodies.
-                    let boxed: crate::handler::ReqBody = Box::pin(body.map_err(|e| {
-                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                    }));
+                    let boxed: crate::handler::ReqBody = Box::pin(
+                        body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                    );
 
                     let mut neutron_req = crate::handler::Request::with_streaming_state(
                         parts.method,
@@ -410,8 +414,7 @@ impl Neutron {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.shutdown_hooks
-            .push(Box::new(move || Box::pin(hook())));
+        self.shutdown_hooks.push(Box::new(move || Box::pin(hook())));
         self
     }
 
@@ -1055,10 +1058,10 @@ impl Neutron {
     #[cfg(feature = "http3")]
     pub async fn listen_h3(
         self,
-        addr:       SocketAddr,
+        addr: SocketAddr,
         tls_config: TlsConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use crate::http3_server::{Http3Config, serve_h3};
+        use crate::http3_server::{serve_h3, Http3Config};
 
         // P1.3: single dispatch path shared with the `tower::Service` impl.
         let service = self.router.into_service();

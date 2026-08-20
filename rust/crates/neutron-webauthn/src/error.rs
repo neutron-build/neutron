@@ -28,16 +28,20 @@ pub enum WebAuthnError {
 impl fmt::Display for WebAuthnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WebAuthnError::Base64(m)          => write!(f, "webauthn: base64 error: {m}"),
-            WebAuthnError::Cbor(m)            => write!(f, "webauthn: cbor error: {m}"),
-            WebAuthnError::Json(m)            => write!(f, "webauthn: json error: {m}"),
-            WebAuthnError::ChallengeMismatch  => write!(f, "webauthn: challenge mismatch"),
-            WebAuthnError::OriginMismatch     => write!(f, "webauthn: origin mismatch"),
-            WebAuthnError::UserNotVerified    => write!(f, "webauthn: user not verified (UV flag not set)"),
-            WebAuthnError::InvalidSignature   => write!(f, "webauthn: invalid signature"),
-            WebAuthnError::MissingField(m)    => write!(f, "webauthn: missing field: {m}"),
-            WebAuthnError::UnsupportedCredentialType => write!(f, "webauthn: credential type must be public-key"),
-            WebAuthnError::UnsupportedAlgorithm      => write!(f, "webauthn: algorithm must be ES256"),
+            WebAuthnError::Base64(m) => write!(f, "webauthn: base64 error: {m}"),
+            WebAuthnError::Cbor(m) => write!(f, "webauthn: cbor error: {m}"),
+            WebAuthnError::Json(m) => write!(f, "webauthn: json error: {m}"),
+            WebAuthnError::ChallengeMismatch => write!(f, "webauthn: challenge mismatch"),
+            WebAuthnError::OriginMismatch => write!(f, "webauthn: origin mismatch"),
+            WebAuthnError::UserNotVerified => {
+                write!(f, "webauthn: user not verified (UV flag not set)")
+            }
+            WebAuthnError::InvalidSignature => write!(f, "webauthn: invalid signature"),
+            WebAuthnError::MissingField(m) => write!(f, "webauthn: missing field: {m}"),
+            WebAuthnError::UnsupportedCredentialType => {
+                write!(f, "webauthn: credential type must be public-key")
+            }
+            WebAuthnError::UnsupportedAlgorithm => write!(f, "webauthn: algorithm must be ES256"),
         }
     }
 }
@@ -50,12 +54,16 @@ mod tests {
 
     #[test]
     fn display_challenge_mismatch() {
-        assert!(WebAuthnError::ChallengeMismatch.to_string().contains("challenge mismatch"));
+        assert!(WebAuthnError::ChallengeMismatch
+            .to_string()
+            .contains("challenge mismatch"));
     }
 
     #[test]
     fn display_origin_mismatch() {
-        assert!(WebAuthnError::OriginMismatch.to_string().contains("origin mismatch"));
+        assert!(WebAuthnError::OriginMismatch
+            .to_string()
+            .contains("origin mismatch"));
     }
 
     #[test]

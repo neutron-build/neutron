@@ -53,8 +53,7 @@ mod tests {
 
     #[test]
     fn custom_rp_name() {
-        let c = WebAuthnConfig::new("example.com", "https://example.com")
-            .rp_name("Example Corp");
+        let c = WebAuthnConfig::new("example.com", "https://example.com").rp_name("Example Corp");
         assert_eq!(c.rp_name, "Example Corp");
     }
 

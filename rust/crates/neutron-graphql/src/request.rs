@@ -11,15 +11,15 @@ use neutron::handler::{IntoResponse, Request, Response};
 /// - **POST `application/graphql`** — treats the entire body as the query string.
 #[derive(Debug, Clone)]
 pub struct GraphQlRequest {
-    pub query:          String,
-    pub variables:      Option<serde_json::Value>,
+    pub query: String,
+    pub variables: Option<serde_json::Value>,
     pub operation_name: Option<String>,
 }
 
 impl FromRequest for GraphQlRequest {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
         match *req.method() {
-            Method::GET  => parse_from_query(req),
+            Method::GET => parse_from_query(req),
             Method::POST => {
                 // Copy the content-type out before the &mut collect borrow.
                 let ct = req
@@ -48,10 +48,16 @@ fn parse_from_query(req: &Request) -> Result<GraphQlRequest, Response> {
         .cloned()
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'query' parameter").into_response())?;
 
-    let variables      = params.get("variables").and_then(|v| serde_json::from_str(v).ok());
+    let variables = params
+        .get("variables")
+        .and_then(|v| serde_json::from_str(v).ok());
     let operation_name = params.get("operationName").cloned();
 
-    Ok(GraphQlRequest { query, variables, operation_name })
+    Ok(GraphQlRequest {
+        query,
+        variables,
+        operation_name,
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -65,14 +71,22 @@ fn parse_from_body(ct: &str, body: &[u8]) -> Result<GraphQlRequest, Response> {
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'query' field").into_response())?
             .to_string();
 
-        let variables      = v.get("variables").filter(|v| !v.is_null()).cloned();
+        let variables = v.get("variables").filter(|v| !v.is_null()).cloned();
         let operation_name = v["operationName"].as_str().map(str::to_string);
 
-        Ok(GraphQlRequest { query, variables, operation_name })
+        Ok(GraphQlRequest {
+            query,
+            variables,
+            operation_name,
+        })
     } else if ct.starts_with("application/graphql") {
         let query = String::from_utf8(body.to_vec())
             .map_err(|_| (StatusCode::BAD_REQUEST, "Body must be UTF-8").into_response())?;
-        Ok(GraphQlRequest { query, variables: None, operation_name: None })
+        Ok(GraphQlRequest {
+            query,
+            variables: None,
+            operation_name: None,
+        })
     } else {
         Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -110,7 +124,10 @@ mod tests {
     }
 
     fn ok_or_panic<T>(r: Result<T, Response>, msg: &str) -> T {
-        match r { Ok(v) => v, Err(resp) => panic!("{msg}: HTTP {}", resp.status()) }
+        match r {
+            Ok(v) => v,
+            Err(resp) => panic!("{msg}: HTTP {}", resp.status()),
+        }
     }
 
     #[tokio::test]
@@ -124,14 +141,16 @@ mod tests {
 
     #[tokio::test]
     async fn post_json_with_variables() {
-        let mut req = post_json(r#"{"query":"query($id:ID!){user(id:$id){name}}","variables":{"id":"42"}}"#);
+        let mut req =
+            post_json(r#"{"query":"query($id:ID!){user(id:$id){name}}","variables":{"id":"42"}}"#);
         let gql = ok_or_panic(GraphQlRequest::from_request(&mut req).await, "parse failed");
         assert_eq!(gql.variables.unwrap()["id"], "42");
     }
 
     #[tokio::test]
     async fn post_json_with_operation_name() {
-        let mut req = post_json(r#"{"query":"query GetUser { user { name } }","operationName":"GetUser"}"#);
+        let mut req =
+            post_json(r#"{"query":"query GetUser { user { name } }","operationName":"GetUser"}"#);
         let gql = ok_or_panic(GraphQlRequest::from_request(&mut req).await, "parse failed");
         assert_eq!(gql.operation_name.unwrap(), "GetUser");
     }
@@ -157,11 +176,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
         let mut req = Request::new(
-            Method::POST, "/graphql".parse().unwrap(), headers, Bytes::from_static(b"{}"),
+            Method::POST,
+            "/graphql".parse().unwrap(),
+            headers,
+            Bytes::from_static(b"{}"),
         );
         let result = GraphQlRequest::from_request(&mut req).await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            result.unwrap_err().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 
     #[tokio::test]
@@ -181,7 +206,10 @@ mod tests {
     #[tokio::test]
     async fn wrong_http_method() {
         let mut req = Request::new(
-            Method::DELETE, "/graphql".parse().unwrap(), HeaderMap::new(), Bytes::new(),
+            Method::DELETE,
+            "/graphql".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
         );
         let result = GraphQlRequest::from_request(&mut req).await;
         assert!(result.is_err());

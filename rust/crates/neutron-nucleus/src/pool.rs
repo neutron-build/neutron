@@ -322,7 +322,8 @@ impl NucleusPool {
         #[cfg(not(feature = "tls"))]
         if matches!(sslmode, SslMode::Require | SslMode::VerifyFull) {
             return Err(NucleusError::Tls(
-                "sslmode=require/verify-full requested but the `tls` feature is disabled".to_string(),
+                "sslmode=require/verify-full requested but the `tls` feature is disabled"
+                    .to_string(),
             ));
         }
 
@@ -400,7 +401,9 @@ mod tests {
     #[test]
     fn sslmode_defaults_to_prefer() {
         assert_eq!(NucleusConfig::default().sslmode, SslMode::Prefer);
-        assert!(NucleusConfig::default().connect_string().contains("sslmode=prefer"));
+        assert!(NucleusConfig::default()
+            .connect_string()
+            .contains("sslmode=prefer"));
     }
 
     #[test]

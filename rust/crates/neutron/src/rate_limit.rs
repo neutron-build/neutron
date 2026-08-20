@@ -195,8 +195,7 @@ impl RateLimiter {
         };
         let pct = pct.clamp(0.0, 1.0);
 
-        let estimated =
-            entry.previous_count as f64 * (1.0 - pct) + entry.current_count as f64;
+        let estimated = entry.previous_count as f64 * (1.0 - pct) + entry.current_count as f64;
 
         let remaining_window = self.window.saturating_sub(elapsed_in_window);
         let reset_secs = remaining_window.as_secs().max(1);
@@ -208,8 +207,7 @@ impl RateLimiter {
             }
         } else {
             entry.current_count += 1;
-            let remaining =
-                (self.max_requests as f64 - estimated - 1.0).max(0.0) as u64;
+            let remaining = (self.max_requests as f64 - estimated - 1.0).max(0.0) as u64;
 
             CheckResult::Allowed {
                 limit: self.max_requests,
@@ -257,17 +255,15 @@ impl MiddlewareTrait for RateLimiter {
                         .insert("x-ratelimit-reset", header_val(reset_secs));
                     resp
                 }
-                CheckResult::Limited { limit, reset_secs } => {
-                    http::Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
-                        .header("content-type", "text/plain; charset=utf-8")
-                        .header("retry-after", header_val(reset_secs))
-                        .header("x-ratelimit-limit", header_val(limit))
-                        .header("x-ratelimit-remaining", header_val(0))
-                        .header("x-ratelimit-reset", header_val(reset_secs))
-                        .body(Body::full("Too Many Requests"))
-                        .unwrap()
-                }
+                CheckResult::Limited { limit, reset_secs } => http::Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("retry-after", header_val(reset_secs))
+                    .header("x-ratelimit-limit", header_val(limit))
+                    .header("x-ratelimit-remaining", header_val(0))
+                    .header("x-ratelimit-reset", header_val(reset_secs))
+                    .body(Body::full("Too Many Requests"))
+                    .unwrap(),
             }
         })
     }
@@ -350,15 +346,13 @@ mod tests {
     async fn different_keys_tracked_separately() {
         let client = TestClient::new(
             Router::new()
-                .middleware(
-                    RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
-                        req.headers()
-                            .get("x-client-id")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("unknown")
-                            .to_string()
-                    }),
-                )
+                .middleware(RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
+                    req.headers()
+                        .get("x-client-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("unknown")
+                        .to_string()
+                }))
                 .get("/", || async { "ok" }),
         );
 
@@ -393,42 +387,28 @@ mod tests {
     async fn custom_key_function() {
         let client = TestClient::new(
             Router::new()
-                .middleware(
-                    RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
-                        req.headers()
-                            .get("x-api-key")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("no-key")
-                            .to_string()
-                    }),
-                )
+                .middleware(RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
+                    req.headers()
+                        .get("x-api-key")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("no-key")
+                        .to_string()
+                }))
                 .get("/", || async { "ok" }),
         );
 
         // Key "abc" uses up limit
         for _ in 0..2 {
-            let resp = client
-                .get("/")
-                .header("x-api-key", "abc")
-                .send()
-                .await;
+            let resp = client.get("/").header("x-api-key", "abc").send().await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
         // Key "abc" is limited
-        let resp = client
-            .get("/")
-            .header("x-api-key", "abc")
-            .send()
-            .await;
+        let resp = client.get("/").header("x-api-key", "abc").send().await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
         // Key "xyz" is still allowed
-        let resp = client
-            .get("/")
-            .header("x-api-key", "xyz")
-            .send()
-            .await;
+        let resp = client.get("/").header("x-api-key", "xyz").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -516,17 +496,15 @@ mod tests {
         // Demonstrates how to use X-Forwarded-For behind a trusted proxy
         let client = TestClient::new(
             Router::new()
-                .middleware(
-                    RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
-                        req.headers()
-                            .get("x-forwarded-for")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.split(',').next())
-                            .unwrap_or("unknown")
-                            .trim()
-                            .to_string()
-                    }),
-                )
+                .middleware(RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
+                    req.headers()
+                        .get("x-forwarded-for")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.split(',').next())
+                        .unwrap_or("unknown")
+                        .trim()
+                        .to_string()
+                }))
                 .get("/", || async { "ok" }),
         );
 

@@ -50,13 +50,10 @@ impl TlsConfig {
 
     /// Create TLS config from DER-encoded certificate and private key bytes.
     pub fn from_der(cert_der: Vec<Vec<u8>>, key_der: Vec<u8>) -> Result<Self, TlsError> {
-        let certs: Vec<CertificateDer<'static>> = cert_der
-            .into_iter()
-            .map(CertificateDer::from)
-            .collect();
-        let key = PrivateKeyDer::try_from(key_der).map_err(|e| {
-            TlsError::Config(format!("invalid DER private key: {e}"))
-        })?;
+        let certs: Vec<CertificateDer<'static>> =
+            cert_der.into_iter().map(CertificateDer::from).collect();
+        let key = PrivateKeyDer::try_from(key_der)
+            .map_err(|e| TlsError::Config(format!("invalid DER private key: {e}")))?;
         Self::from_parts(certs, key)
     }
 
@@ -142,8 +139,8 @@ fn load_certs_pem(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError>
 fn load_certs_from_reader(
     reader: &mut dyn io::BufRead,
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(reader).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         return Err(TlsError::Config("no certificates found in PEM".to_string()));
     }
@@ -156,9 +153,7 @@ fn load_key_pem(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     load_key_from_reader(&mut reader)
 }
 
-fn load_key_from_reader(
-    reader: &mut dyn io::BufRead,
-) -> Result<PrivateKeyDer<'static>, TlsError> {
+fn load_key_from_reader(reader: &mut dyn io::BufRead) -> Result<PrivateKeyDer<'static>, TlsError> {
     rustls_pemfile::private_key(reader)?
         .ok_or_else(|| TlsError::Config("no private key found in PEM".to_string()))
 }

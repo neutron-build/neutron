@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{HeaderMap, Method, StatusCode, header};
+use http::{header, HeaderMap, Method, StatusCode};
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
 
@@ -197,10 +197,7 @@ impl ResponseCache {
     /// Set a custom cache key function.
     ///
     /// Default key: `"METHOD:path?query"`.
-    pub fn key_fn(
-        mut self,
-        f: impl Fn(&Request) -> String + Send + Sync + 'static,
-    ) -> Self {
+    pub fn key_fn(mut self, f: impl Fn(&Request) -> String + Send + Sync + 'static) -> Self {
         self.key_fn = Some(Arc::new(f));
         self
     }
@@ -225,7 +222,8 @@ fn request_is_cacheable(req: &Request, public_prefixes: &[String]) -> bool {
     if public_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
         return true;
     }
-    !req.headers().contains_key(header::AUTHORIZATION) && !req.headers().contains_key(header::COOKIE)
+    !req.headers().contains_key(header::AUTHORIZATION)
+        && !req.headers().contains_key(header::COOKIE)
 }
 
 /// Whether a response may be stored. An origin that sets a cookie, marks the
@@ -236,7 +234,10 @@ fn response_is_cacheable(headers: &HeaderMap) -> bool {
     if headers.contains_key(header::SET_COOKIE) {
         return false;
     }
-    if let Some(cc) = headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()) {
+    if let Some(cc) = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+    {
         let cc = cc.to_ascii_lowercase();
         if cc.contains("no-store") || cc.contains("private") {
             return false;
@@ -764,23 +765,30 @@ mod tests {
     #[tokio::test]
     async fn cookie_bearing_request_is_not_served_from_the_shared_cache() {
         let cache = ResponseCache::new(Duration::from_secs(60));
-        let client = TestClient::new(
-            Router::new()
-                .middleware(cache)
-                .get("/account", |headers: HeaderMap| async move {
-                    let who = headers
-                        .get(header::COOKIE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("anonymous")
-                        .to_string();
-                    format!("hello {who}")
-                }),
-        );
+        let client = TestClient::new(Router::new().middleware(cache).get(
+            "/account",
+            |headers: HeaderMap| async move {
+                let who = headers
+                    .get(header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("anonymous")
+                    .to_string();
+                format!("hello {who}")
+            },
+        ));
 
-        let first = client.get("/account").header("cookie", "session=alice").send().await;
+        let first = client
+            .get("/account")
+            .header("cookie", "session=alice")
+            .send()
+            .await;
         assert_eq!(first.text().await, "hello session=alice");
 
-        let second = client.get("/account").header("cookie", "session=bob").send().await;
+        let second = client
+            .get("/account")
+            .header("cookie", "session=bob")
+            .send()
+            .await;
         assert_eq!(
             second.text().await,
             "hello session=bob",
@@ -792,11 +800,21 @@ mod tests {
     async fn authorization_bearing_request_is_not_cached() {
         let cache = ResponseCache::new(Duration::from_secs(60));
         let client = TestClient::new(
-            Router::new().middleware(cache).get("/me", || async { "secret" }),
+            Router::new()
+                .middleware(cache)
+                .get("/me", || async { "secret" }),
         );
 
-        client.get("/me").header("authorization", "Bearer a").send().await;
-        let second = client.get("/me").header("authorization", "Bearer b").send().await;
+        client
+            .get("/me")
+            .header("authorization", "Bearer a")
+            .send()
+            .await;
+        let second = client
+            .get("/me")
+            .header("authorization", "Bearer b")
+            .send()
+            .await;
         assert_ne!(second.header("x-cache"), Some("HIT"));
     }
 
@@ -806,11 +824,21 @@ mod tests {
     async fn public_route_is_cached_despite_a_cookie() {
         let cache = ResponseCache::new(Duration::from_secs(60)).public_routes(["/pricing"]);
         let client = TestClient::new(
-            Router::new().middleware(cache).get("/pricing", || async { "same for all" }),
+            Router::new()
+                .middleware(cache)
+                .get("/pricing", || async { "same for all" }),
         );
 
-        client.get("/pricing").header("cookie", "session=alice").send().await;
-        let second = client.get("/pricing").header("cookie", "session=bob").send().await;
+        client
+            .get("/pricing")
+            .header("cookie", "session=alice")
+            .send()
+            .await;
+        let second = client
+            .get("/pricing")
+            .header("cookie", "session=bob")
+            .send()
+            .await;
         assert_eq!(
             second.header("x-cache"),
             Some("HIT"),

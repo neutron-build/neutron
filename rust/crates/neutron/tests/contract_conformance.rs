@@ -27,7 +27,9 @@ fn conformance_app() -> Router {
         .get("/users/:id", |Path(id): Path<u64>| async move {
             Json(serde_json::json!({ "id": id }))
         })
-        .post("/users", |Json(v): Json<serde_json::Value>| async move { Json(v) })
+        .post("/users", |Json(v): Json<serde_json::Value>| async move {
+            Json(v)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,11 @@ async fn health_returns_contract_shape() {
     assert!(obj.contains_key("status"), "missing `status`");
     assert!(obj.contains_key("nucleus"), "missing `nucleus`");
     assert!(obj.contains_key("version"), "missing `version`");
-    assert_eq!(obj.len(), 3, "health body must have exactly 3 keys: {obj:?}");
+    assert_eq!(
+        obj.len(),
+        3,
+        "health body must have exactly 3 keys: {obj:?}"
+    );
 
     assert_eq!(body["status"], "ok");
     assert_eq!(body["nucleus"], "unconfigured");
@@ -79,7 +85,11 @@ async fn not_found_is_problem_json() {
 async fn method_not_allowed_is_problem_json_with_allow() {
     let server = TestServer::start(conformance_app()).await;
     // /users only has POST; a GET there is a 405 (the :id route is a different path).
-    let resp = server.client().request(Method::DELETE, "/users").send().await;
+    let resp = server
+        .client()
+        .request(Method::DELETE, "/users")
+        .send()
+        .await;
 
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(

@@ -10,7 +10,7 @@ impl fmt::Display for CacheError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CacheError::Serialization(s) => write!(f, "cache serialize error: {s}"),
-            CacheError::Backend(s)       => write!(f, "cache backend error: {s}"),
+            CacheError::Backend(s) => write!(f, "cache backend error: {s}"),
         }
     }
 }
@@ -49,8 +49,7 @@ mod tests {
 
     #[test]
     fn is_std_error() {
-        let e: Box<dyn std::error::Error> =
-            Box::new(CacheError::Backend("x".to_string()));
+        let e: Box<dyn std::error::Error> = Box::new(CacheError::Backend("x".to_string()));
         assert!(e.to_string().contains("cache backend error"));
     }
 
