@@ -64,10 +64,8 @@ impl GeoSet {
     /// Add a member with (longitude, latitude). Returns true if the member is
     /// new, false if it was updated.
     pub fn add(&mut self, lon: f64, lat: f64, member: &str) -> bool {
-        let is_new = !self.members.contains_key(member);
-        self.members.insert(member.to_string(), (lon, lat));
-        // For simplicity, always insert into the R-tree (duplicates are fine
-        // for search — we deduplicate on read via the members map).
+        let previous = self.members.insert(member.to_string(), (lon, lat));
+        let is_new = previous.is_none();
         let id = if let Some(&existing_id) = self.member_ids.get(member) {
             existing_id
         } else {
@@ -76,9 +74,30 @@ impl GeoSet {
             self.member_ids.insert(member.to_string(), id);
             id
         };
+        // Take the old point out first. This used to insert unconditionally
+        // and dedupe on read, which kept answers correct while the tree grew by
+        // one entry per UPDATE, forever — memory proportional to a workload
+        // dimension rather than to state, and nothing wrong to observe.
+        if let Some((old_lon, old_lat)) = previous
+            && (old_lon != lon || old_lat != lat)
+        {
+            let old_point = crate::geo::Point::new(old_lon, old_lat);
+            self.tree.remove(&old_point, id);
+        }
         let point = crate::geo::Point::new(lon, lat);
-        self.tree.insert(&point, id);
+        if previous.is_none() || previous != Some((lon, lat)) {
+            self.tree.insert(&point, id);
+        }
         is_new
+    }
+
+    /// Number of entries in the R-tree index.
+    ///
+    /// Exposed so a test can assert the index does not grow with the number of
+    /// updates — the leak here was silent precisely because answers stayed
+    /// right while it happened.
+    pub fn index_len(&self) -> usize {
+        self.tree.len()
     }
 
     /// Get the position of a member. Returns (lon, lat) or None.

@@ -439,6 +439,51 @@ impl RTree {
             .collect()
     }
 
+    /// Remove the entry for `doc_id` at `point`. Returns whether one was found.
+    ///
+    /// The tree had `insert` and no `remove`, so a GeoSet member that moved
+    /// left its old point behind forever: memory grew with the number of
+    /// UPDATES rather than with the amount of state, and answers stayed
+    /// correct the whole time because reads dedupe against the members map.
+    /// That combination — a leak proportional to a workload dimension, with no
+    /// wrong answer to notice — is what survives a test suite and kills a
+    /// long-running host.
+    ///
+    /// Nodes are not condensed on removal: an emptied leaf stays and is refilled
+    /// by later inserts. Node count is bounded by the tree's shape, not by the
+    /// update count, so it is not the leak.
+    pub fn remove(&mut self, point: &Point, doc_id: u64) -> bool {
+        let removed = Self::remove_from(&mut self.root, point, doc_id);
+        if removed {
+            self.count -= 1;
+            self.points.remove(&doc_id);
+        }
+        removed
+    }
+
+    fn remove_from(node: &mut RTreeNode, point: &Point, doc_id: u64) -> bool {
+        match node {
+            RTreeNode::Leaf { entries } => {
+                if let Some(idx) = entries
+                    .iter()
+                    .position(|e| e.doc_id == doc_id && e.bbox.contains_point(point))
+                {
+                    entries.remove(idx);
+                    return true;
+                }
+                false
+            }
+            RTreeNode::Internal { children } => {
+                for (bbox, child) in children.iter_mut() {
+                    if bbox.contains_point(point) && Self::remove_from(child, point, doc_id) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     /// Number of indexed entries.
     pub fn len(&self) -> usize {
         self.count

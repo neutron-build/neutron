@@ -697,3 +697,45 @@ async fn test_hll_is_charged_its_real_register_array() {
         "an HLL key charged {charged} bytes; its register array alone is 16 KiB"
     );
 }
+
+/// A geo member that moves must not leave its old point in the index.
+///
+/// The R-tree had no `remove`, so `add` inserted unconditionally and reads
+/// deduped against the members map. Answers stayed correct while the index grew
+/// by one entry per update — a leak proportional to updates rather than to
+/// state, with nothing wrong to observe.
+#[tokio::test]
+async fn test_geo_updates_do_not_grow_the_index() {
+    use crate::kv::collections::GeoSet;
+
+    let mut geo = GeoSet::new();
+    geo.add(13.361389, 38.115556, "palermo");
+    assert_eq!(geo.index_len(), 1);
+
+    for i in 1..=200 {
+        let drift = f64::from(i) * 0.0001;
+        geo.add(13.361389 + drift, 38.115556 + drift, "palermo");
+    }
+    assert_eq!(
+        geo.index_len(),
+        1,
+        "200 updates to one member left {} index entries",
+        geo.index_len()
+    );
+
+    // And the answers are still right: the member is found at its LAST
+    // position and not at its first.
+    let last = geo.pos("palermo").unwrap();
+    assert!((last.0 - (13.361389 + 0.02)).abs() < 1e-9);
+    let near_last: Vec<String> = geo
+        .radius(last.0, last.1, 100.0, "m")
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    assert_eq!(near_last, vec!["palermo".to_string()]);
+    let near_first = geo.radius(13.361389, 38.115556, 100.0, "m");
+    assert!(
+        near_first.is_empty(),
+        "the member answered from a position it has left: {near_first:?}"
+    );
+}
