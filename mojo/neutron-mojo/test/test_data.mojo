@@ -10,12 +10,12 @@ from neutron_mojo.data import (
 )
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_data_sample() raises:
+def test_data_sample() raises:
     """DataSample stores input_ids and target."""
     var ids = List[Int]()
     ids.append(1)
@@ -28,7 +28,7 @@ fn test_data_sample() raises:
     print("  data_sample: PASS")
 
 
-fn test_data_sample_copy() raises:
+def test_data_sample_copy() raises:
     """DataSample is Copyable."""
     var ids = List[Int]()
     ids.append(10)
@@ -40,7 +40,7 @@ fn test_data_sample_copy() raises:
     print("  data_sample_copy: PASS")
 
 
-fn test_dataset_add_get() raises:
+def test_dataset_add_get() raises:
     """Dataset add and get."""
     var ds = Dataset()
     var ids1 = List[Int]()
@@ -57,7 +57,7 @@ fn test_dataset_add_get() raises:
     print("  dataset_add_get: PASS")
 
 
-fn test_text_dataset() raises:
+def test_text_dataset() raises:
     """Sliding window text dataset."""
     var tokens = List[Int]()
     for i in range(10):
@@ -73,7 +73,7 @@ fn test_text_dataset() raises:
     print("  text_dataset: PASS")
 
 
-fn test_text_dataset_short() raises:
+def test_text_dataset_short() raises:
     """Text dataset with sequence too short."""
     var tokens = List[Int]()
     tokens.append(1)
@@ -83,7 +83,7 @@ fn test_text_dataset_short() raises:
     print("  text_dataset_short: PASS")
 
 
-fn test_dataloader_basic() raises:
+def test_dataloader_basic() raises:
     """DataLoader produces batches."""
     var ds = Dataset()
     for i in range(10):
@@ -101,7 +101,7 @@ fn test_dataloader_basic() raises:
     print("  dataloader_basic: PASS")
 
 
-fn test_dataloader_iteration() raises:
+def test_dataloader_iteration() raises:
     """DataLoader iterates through all data."""
     var ds = Dataset()
     for i in range(7):
@@ -118,7 +118,7 @@ fn test_dataloader_iteration() raises:
     print("  dataloader_iteration: PASS")
 
 
-fn test_dataloader_reset() raises:
+def test_dataloader_reset() raises:
     """DataLoader reset allows re-iteration."""
     var ds = Dataset()
     for i in range(5):
@@ -137,28 +137,28 @@ fn test_dataloader_reset() raises:
     print("  dataloader_reset: PASS")
 
 
-fn test_csv_parse_basic() raises:
+def test_csv_parse_basic() raises:
     """Parse a simple CSV line."""
     var row = parse_csv_line("hello,world,123")
     assert_eq(row.num_fields(), 3)
     print("  csv_parse_basic: PASS")
 
 
-fn test_csv_parse_single() raises:
+def test_csv_parse_single() raises:
     """Parse CSV with single field."""
     var row = parse_csv_line("only_one")
     assert_eq(row.num_fields(), 1)
     print("  csv_parse_single: PASS")
 
 
-fn test_csv_empty_fields() raises:
+def test_csv_empty_fields() raises:
     """CSV with empty fields."""
     var row = parse_csv_line("a,,c")
     assert_eq(row.num_fields(), 3)
     print("  csv_empty_fields: PASS")
 
 
-fn test_dataloader_shuffle() raises:
+def test_dataloader_shuffle() raises:
     """Shuffled DataLoader produces different order on reset."""
     var ds = Dataset()
     for i in range(20):
@@ -185,7 +185,7 @@ fn test_dataloader_shuffle() raises:
     print("  dataloader_shuffle: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_data:")
     test_data_sample()
     test_data_sample_copy()

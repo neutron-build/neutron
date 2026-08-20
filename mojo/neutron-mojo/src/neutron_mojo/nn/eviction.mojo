@@ -30,7 +30,7 @@ from neutron_mojo.nn.kv_cache import MultiLayerKVCache
 # Eviction Policy Configuration
 # ===----------------------------------------------------------------------=== #
 
-struct EvictionPolicy(Copyable, Movable):
+struct EvictionPolicy(Copyable, Movable, ImplicitlyCopyable):
     """Configuration for KV cache eviction.
 
     Modes:
@@ -43,25 +43,25 @@ struct EvictionPolicy(Copyable, Movable):
     var window_size: Int     # Recent tokens to keep (StreamingLLM)
     var budget: Int          # Max positions to retain (H2O)
 
-    fn __init__(out self):
+    def __init__(out self):
         self.mode = 0
         self.sink_tokens = 4
         self.window_size = 64
         self.budget = 128
 
-    fn __copyinit__(out self, existing: Self):
-        self.mode = existing.mode
-        self.sink_tokens = existing.sink_tokens
-        self.window_size = existing.window_size
-        self.budget = existing.budget
+    def __init__(out self, *, copy: Self):
+        self.mode = copy.mode
+        self.sink_tokens = copy.sink_tokens
+        self.window_size = copy.window_size
+        self.budget = copy.budget
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.mode = other.mode
-        self.sink_tokens = other.sink_tokens
-        self.window_size = other.window_size
-        self.budget = other.budget
+    def __init__(out self, *, deinit move: Self):
+        self.mode = move.mode^
+        self.sink_tokens = move.sink_tokens^
+        self.window_size = move.window_size^
+        self.budget = move.budget^
 
-    fn capacity(self) -> Int:
+    def capacity(self) -> Int:
         """Effective capacity after eviction."""
         if self.mode == 1:
             return self.sink_tokens + self.window_size
@@ -70,12 +70,12 @@ struct EvictionPolicy(Copyable, Movable):
         return 0
 
 
-fn no_eviction() -> EvictionPolicy:
+def no_eviction() -> EvictionPolicy:
     """Create a no-eviction policy."""
     return EvictionPolicy()
 
 
-fn streaming_policy(sink_tokens: Int, window_size: Int) -> EvictionPolicy:
+def streaming_policy(sink_tokens: Int, window_size: Int) -> EvictionPolicy:
     """Create a StreamingLLM eviction policy.
 
     Args:
@@ -92,7 +92,7 @@ fn streaming_policy(sink_tokens: Int, window_size: Int) -> EvictionPolicy:
     return p^
 
 
-fn h2o_policy(budget: Int, sink_tokens: Int = 4) -> EvictionPolicy:
+def h2o_policy(budget: Int, sink_tokens: Int = 4) -> EvictionPolicy:
     """Create an H2O (Heavy-Hitter Oracle) eviction policy.
 
     Args:
@@ -124,19 +124,19 @@ struct AttentionScoreTracker(Movable):
     var max_positions: Int
     var active_count: Int               # Number of positions with scores
 
-    fn __init__(out self, max_positions: Int):
+    def __init__(out self, max_positions: Int):
         self.max_positions = max_positions
         self.active_count = 0
         self.scores = Tensor[DType.float32](Shape(max_positions))
         for i in range(max_positions):
             self.scores.set(i, 0.0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.scores = other.scores^
-        self.max_positions = other.max_positions
-        self.active_count = other.active_count
+    def __init__(out self, *, deinit move: Self):
+        self.scores = move.scores^
+        self.max_positions = move.max_positions^
+        self.active_count = move.active_count^
 
-    fn update(mut self, attention_weights: Tensor[DType.float32], seq_len: Int):
+    def update(mut self, attention_weights: Tensor[DType.float32], seq_len: Int):
         """Accumulate attention weights for positions.
 
         Args:
@@ -151,7 +151,7 @@ struct AttentionScoreTracker(Movable):
         if n > self.active_count:
             self.active_count = n
 
-    fn update_multi_head(
+    def update_multi_head(
         mut self,
         attention_weights: Tensor[DType.float32],
         seq_len: Int,
@@ -175,7 +175,7 @@ struct AttentionScoreTracker(Movable):
         if n > self.active_count:
             self.active_count = n
 
-    fn get_eviction_candidates(
+    def get_eviction_candidates(
         self,
         budget: Int,
         sink_tokens: Int,
@@ -245,21 +245,26 @@ struct AttentionScoreTracker(Movable):
 
         return keep^
 
-    fn compact_scores(mut self, keep_indices: List[Int]):
+    def compact_scores(mut self, keep_indices: List[Int]):
         """Reindex scores after eviction.
 
         Args:
             keep_indices: Sorted list of positions that were kept.
         """
-        var new_scores = Tensor[DType.float32](Shape(self.max_positions))
-        for i in range(self.max_positions):
-            new_scores.set(i, 0.0)
+        var vals = List[Float32]()
         for i in range(len(keep_indices)):
-            new_scores.set(i, self.scores.get(keep_indices[i]))
-        self.scores = new_scores^
+            # NOTE: hoist the List index into a local — passing a List-param
+            # subscript directly into the variadic Tensor.get() miscompiles
+            # under -O1+ on Mojo 1.0.0 (osx-arm64).
+            var keep_idx = keep_indices[i]
+            vals.append(self.scores.get(keep_idx))
+        for i in range(self.max_positions):
+            self.scores.set(i, 0.0)
+        for i in range(len(vals)):
+            self.scores.set(i, vals[i])
         self.active_count = len(keep_indices)
 
-    fn reset(mut self):
+    def reset(mut self):
         """Clear all scores."""
         for i in range(self.max_positions):
             self.scores.set(i, 0.0)
@@ -270,7 +275,7 @@ struct AttentionScoreTracker(Movable):
 # StreamingLLM Eviction
 # ===----------------------------------------------------------------------=== #
 
-fn streaming_evict_layer(
+def streaming_evict_layer(
     mut cache: MultiLayerKVCache,
     layer: Int,
     sink_tokens: Int,
@@ -311,7 +316,7 @@ fn streaming_evict_layer(
     cache.lengths[layer] = target
 
 
-fn streaming_evict(
+def streaming_evict(
     mut cache: MultiLayerKVCache,
     sink_tokens: Int,
     window_size: Int,
@@ -331,7 +336,7 @@ fn streaming_evict(
 # H2O Eviction
 # ===----------------------------------------------------------------------=== #
 
-fn h2o_compact_layer(
+def h2o_compact_layer(
     mut cache: MultiLayerKVCache,
     layer: Int,
     keep_indices: List[Int],
@@ -360,7 +365,7 @@ fn h2o_compact_layer(
     cache.lengths[layer] = num_keep
 
 
-fn h2o_evict(
+def h2o_evict(
     mut cache: MultiLayerKVCache,
     mut tracker: AttentionScoreTracker,
     budget: Int,
@@ -390,7 +395,7 @@ fn h2o_evict(
 # Convenience: Check + Evict
 # ===----------------------------------------------------------------------=== #
 
-fn should_evict(cache: MultiLayerKVCache, policy: EvictionPolicy) -> Bool:
+def should_evict(cache: MultiLayerKVCache, policy: EvictionPolicy) -> Bool:
     """Check if eviction should be triggered.
 
     For StreamingLLM: evict when cache exceeds sink + window capacity.
@@ -414,7 +419,7 @@ fn should_evict(cache: MultiLayerKVCache, policy: EvictionPolicy) -> Bool:
     return False
 
 
-fn evict_if_needed(
+def evict_if_needed(
     mut cache: MultiLayerKVCache,
     policy: EvictionPolicy,
     mut tracker: AttentionScoreTracker,

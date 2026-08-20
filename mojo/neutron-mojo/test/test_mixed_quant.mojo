@@ -25,7 +25,7 @@ from neutron_mojo.nn.mixed_quant import (
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny model with non-trivial weights for testing."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -53,7 +53,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _assert(cond: Bool, msg: String) raises:
+def _assert(cond: Bool, msg: String) raises:
     if not cond:
         raise Error(msg)
 
@@ -62,7 +62,7 @@ fn _assert(cond: Bool, msg: String) raises:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_layer_sensitivity_creation() raises:
+def test_layer_sensitivity_creation() raises:
     """Test LayerSensitivity struct construction."""
     var s = LayerSensitivity()
     _assert(s.q8_error == 0.0, "q8_error should default to 0")
@@ -77,7 +77,7 @@ fn test_layer_sensitivity_creation() raises:
     print("PASS: test_layer_sensitivity_creation")
 
 
-fn test_quant_roundtrip_error() raises:
+def test_quant_roundtrip_error() raises:
     """Test _quant_roundtrip_error helper."""
     # Create small weight tensor: 2 rows x 4 cols
     var weights = Tensor[DType.float32](Shape(8))
@@ -103,7 +103,7 @@ fn test_quant_roundtrip_error() raises:
     print("PASS: test_quant_roundtrip_error")
 
 
-fn test_measure_layer_sensitivity() raises:
+def test_measure_layer_sensitivity() raises:
     """Test per-layer sensitivity measurement."""
     var model = _build_tiny_model()
     var sens = measure_layer_sensitivity(model, layer=0)
@@ -115,7 +115,7 @@ fn test_measure_layer_sensitivity() raises:
     print("PASS: test_measure_layer_sensitivity")
 
 
-fn test_q8_error_less_than_q4() raises:
+def test_q8_error_less_than_q4() raises:
     """Verify Q8 always has less error than Q4 for all layers."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -130,7 +130,7 @@ fn test_q8_error_less_than_q4() raises:
     print("PASS: test_q8_error_less_than_q4")
 
 
-fn test_analyze_all_layers() raises:
+def test_analyze_all_layers() raises:
     """Test sensitivity analysis across all layers."""
     var model = _build_tiny_model()
     var results = analyze_sensitivity(model)
@@ -147,7 +147,7 @@ fn test_analyze_all_layers() raises:
     print("PASS: test_analyze_all_layers")
 
 
-fn test_auto_calibrate_all_q4() raises:
+def test_auto_calibrate_all_q4() raises:
     """With very high threshold, all layers should be Q4."""
     var model = _build_tiny_model()
     var sens = analyze_sensitivity(model)
@@ -162,7 +162,7 @@ fn test_auto_calibrate_all_q4() raises:
     print("PASS: test_auto_calibrate_all_q4")
 
 
-fn test_auto_calibrate_all_q8() raises:
+def test_auto_calibrate_all_q8() raises:
     """With very low threshold, all layers should be Q8."""
     var model = _build_tiny_model()
     var sens = analyze_sensitivity(model)
@@ -177,7 +177,7 @@ fn test_auto_calibrate_all_q8() raises:
     print("PASS: test_auto_calibrate_all_q8")
 
 
-fn test_auto_calibrate_mixed() raises:
+def test_auto_calibrate_mixed() raises:
     """Test that calibration can produce mixed modes with right threshold."""
     # Create model with different weight magnitudes per layer
     var p = tiny_test_params()
@@ -231,7 +231,7 @@ fn test_auto_calibrate_mixed() raises:
     print("PASS: test_auto_calibrate_mixed")
 
 
-fn test_mixed_model_creation() raises:
+def test_mixed_model_creation() raises:
     """Test MixedQuantModel construction."""
     var p = tiny_test_params()
     var modes = List[Int]()
@@ -248,7 +248,7 @@ fn test_mixed_model_creation() raises:
     print("PASS: test_mixed_model_creation")
 
 
-fn test_quantize_mixed_fp32() raises:
+def test_quantize_mixed_fp32() raises:
     """Test that FP32-mode layers preserve exact weights."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -270,7 +270,7 @@ fn test_quantize_mixed_fp32() raises:
     print("PASS: test_quantize_mixed_fp32")
 
 
-fn test_quantize_mixed_q8_q4() raises:
+def test_quantize_mixed_q8_q4() raises:
     """Test mixed Q8 + Q4 quantization."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -302,7 +302,7 @@ fn test_quantize_mixed_q8_q4() raises:
     print("PASS: test_quantize_mixed_q8_q4")
 
 
-fn test_mixed_model_forward() raises:
+def test_mixed_model_forward() raises:
     """Test that mixed model forward pass produces valid logits."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -340,7 +340,7 @@ fn test_mixed_model_forward() raises:
     print("PASS: test_mixed_model_forward")
 
 
-fn test_mixed_generate() raises:
+def test_mixed_generate() raises:
     """Test autoregressive generation with mixed model."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -367,7 +367,7 @@ fn test_mixed_generate() raises:
     print("PASS: test_mixed_generate")
 
 
-fn test_mixed_all_q8_matches_quantized() raises:
+def test_mixed_all_q8_matches_quantized() raises:
     """Mixed model with all-Q8 should match QuantizedModel output."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -412,7 +412,7 @@ fn test_mixed_all_q8_matches_quantized() raises:
     print("PASS: test_mixed_all_q8_matches_quantized")
 
 
-fn test_mode_summary() raises:
+def test_mode_summary() raises:
     """Test mode_summary output."""
     var p = tiny_test_params()
     var modes = List[Int]()
@@ -423,12 +423,12 @@ fn test_mode_summary() raises:
     var summary = mm.mode_summary()
 
     # Should contain FP32 and Q8
-    _assert(len(summary) > 0, "Summary should not be empty")
+    _assert(summary.byte_length() > 0, "Summary should not be empty")
 
     print("PASS: test_mode_summary")
 
 
-fn test_fp32_forward_matches_model() raises:
+def test_fp32_forward_matches_model() raises:
     """Mixed model with all FP32 should match original Model output."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -472,7 +472,7 @@ fn test_fp32_forward_matches_model() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     test_layer_sensitivity_creation()
     test_quant_roundtrip_error()
     test_measure_layer_sensitivity()

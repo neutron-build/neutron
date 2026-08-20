@@ -40,11 +40,11 @@ from neutron_mojo.fusion.rules import (
 from neutron_mojo.fusion.rewrite import RewriteEngine
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error("FAIL: " + msg + " expected=" + String(b) + " got=" + String(a))
 
@@ -53,7 +53,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_add_identity_via_engine() raises:
+def test_add_identity_via_engine() raises:
     """Add identity rule fires via engine: (add ?x 0) -> ?x."""
     var eg = EGraph()
 
@@ -78,7 +78,7 @@ fn test_add_identity_via_engine() raises:
     print("  add_identity_via_engine: PASS")
 
 
-fn test_mul_zero_via_engine() raises:
+def test_mul_zero_via_engine() raises:
     """Mul zero rule fires via engine: (mul ?x 0) -> 0 (Const RHS)."""
     var eg = EGraph()
 
@@ -101,7 +101,7 @@ fn test_mul_zero_via_engine() raises:
     print("  mul_zero_via_engine: PASS")
 
 
-fn test_swiglu_fusion_fires() raises:
+def test_swiglu_fusion_fires() raises:
     """SwiGLU fusion: (mul (silu ?gate) ?up) -> (swiglu ?gate ?up)."""
     var eg = EGraph()
 
@@ -144,7 +144,7 @@ fn test_swiglu_fusion_fires() raises:
     print("  swiglu_fusion_fires: PASS")
 
 
-fn test_rmsnorm_matmul_fusion_fires() raises:
+def test_rmsnorm_matmul_fusion_fires() raises:
     """Fusion: (matmul ?w (rmsnorm ?x ?gamma)) -> (fused_rmsnorm_linear ?x ?gamma ?w)."""
     var eg = EGraph()
 
@@ -183,7 +183,7 @@ fn test_rmsnorm_matmul_fusion_fires() raises:
     print("  rmsnorm_matmul_fusion_fires: PASS")
 
 
-fn test_linear_residual_add_fusion_fires() raises:
+def test_linear_residual_add_fusion_fires() raises:
     """Fusion: (add ?res (matmul ?w ?x)) -> (fused_linear_res_add ?res ?w ?x)."""
     var eg = EGraph()
 
@@ -220,7 +220,7 @@ fn test_linear_residual_add_fusion_fires() raises:
     print("  linear_residual_add_fusion_fires: PASS")
 
 
-fn test_add_commutativity_op_rhs() raises:
+def test_add_commutativity_op_rhs() raises:
     """Add commutativity: (add ?x ?y) -> (add ?y ?x) creates reversed node."""
     var eg = EGraph()
 
@@ -250,7 +250,7 @@ fn test_add_commutativity_op_rhs() raises:
     print("  add_commutativity_op_rhs: PASS")
 
 
-fn test_mul_commutativity_op_rhs() raises:
+def test_mul_commutativity_op_rhs() raises:
     """Mul commutativity: (mul ?x ?y) -> (mul ?y ?x)."""
     var eg = EGraph()
 
@@ -277,7 +277,7 @@ fn test_mul_commutativity_op_rhs() raises:
     print("  mul_commutativity_op_rhs: PASS")
 
 
-fn test_hash_consing_buckets() raises:
+def test_hash_consing_buckets() raises:
     """Hash-consing with bucket-based lookup handles many nodes efficiently."""
     var eg = EGraph()
 
@@ -300,7 +300,7 @@ fn test_hash_consing_buckets() raises:
     print("  hash_consing_buckets: PASS")
 
 
-fn test_swiglu_correct_inputs() raises:
+def test_swiglu_correct_inputs() raises:
     """SwiGLU fusion produces node with correct input ordering."""
     var eg = EGraph()
 
@@ -333,7 +333,7 @@ fn test_swiglu_correct_inputs() raises:
     print("  swiglu_correct_inputs: PASS")
 
 
-fn test_multiple_fusions_one_pass() raises:
+def test_multiple_fusions_one_pass() raises:
     """Multiple fusion rules fire in a single engine pass."""
     var eg = EGraph()
 
@@ -386,7 +386,7 @@ fn test_multiple_fusions_one_pass() raises:
     print("  multiple_fusions_one_pass: PASS")
 
 
-fn test_fusion_and_identity_coexist() raises:
+def test_fusion_and_identity_coexist() raises:
     """Fusion rules and identity rules work together in full default ruleset."""
     var eg = EGraph()
 
@@ -430,7 +430,7 @@ fn test_fusion_and_identity_coexist() raises:
     print("  fusion_and_identity_coexist: PASS")
 
 
-fn test_associativity_nested_op() raises:
+def test_associativity_nested_op() raises:
     """Associativity: (add (add ?x ?y) ?z) -> (add ?x (add ?y ?z))."""
     var eg = EGraph()
 
@@ -466,7 +466,7 @@ fn test_associativity_nested_op() raises:
     print("  associativity_nested_op: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_fusion_complete:")
 
     test_add_identity_via_engine()

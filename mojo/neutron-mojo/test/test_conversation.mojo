@@ -19,7 +19,7 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
@@ -28,7 +28,7 @@ fn assert_true(cond: Bool, msg: String) raises:
 # ChatMessage Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_chat_message_creation() raises:
+def test_chat_message_creation() raises:
     """Test ChatMessage creation and role checks."""
     var msg_u = ChatMessage("user", "Hello")
     assert_true(msg_u.is_user(), "Should be user")
@@ -45,7 +45,7 @@ fn test_chat_message_creation() raises:
     print("  chat_message_creation: PASS")
 
 
-fn test_chat_message_copy() raises:
+def test_chat_message_copy() raises:
     """Test ChatMessage copy."""
     var msg = ChatMessage("user", "Test content")
     var msg2 = msg.copy()
@@ -58,7 +58,7 @@ fn test_chat_message_copy() raises:
 # ConversationSession Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_session_creation() raises:
+def test_session_creation() raises:
     """Test ConversationSession initialization."""
     var session = ConversationSession("sess-1", "You are a helper.")
     assert_true(session.session_id == "sess-1", "Session ID should match")
@@ -68,7 +68,7 @@ fn test_session_creation() raises:
     print("  session_creation: PASS")
 
 
-fn test_session_add_messages() raises:
+def test_session_add_messages() raises:
     """Test adding messages to a session."""
     var session = ConversationSession("s1")
     session.add_user_message("What is 2+2?")
@@ -90,7 +90,7 @@ fn test_session_add_messages() raises:
     print("  session_add_messages: PASS")
 
 
-fn test_session_get_last_messages() raises:
+def test_session_get_last_messages() raises:
     """Test retrieving last user/assistant messages."""
     var session = ConversationSession("s2")
     session.add_user_message("First question")
@@ -105,17 +105,17 @@ fn test_session_get_last_messages() raises:
     print("  session_get_last_messages: PASS")
 
 
-fn test_session_get_last_empty() raises:
+def test_session_get_last_empty() raises:
     """Test getting last messages from empty session."""
     var session = ConversationSession("s3")
-    assert_true(len(session.get_last_user_message()) == 0,
+    assert_true(session.get_last_user_message().byte_length() == 0,
                 "Last user message should be empty")
-    assert_true(len(session.get_last_assistant_message()) == 0,
+    assert_true(session.get_last_assistant_message().byte_length() == 0,
                 "Last assistant message should be empty")
     print("  session_get_last_empty: PASS")
 
 
-fn test_session_clear() raises:
+def test_session_clear() raises:
     """Test clearing a session."""
     var session = ConversationSession("s4")
     session.add_user_message("Hello")
@@ -130,7 +130,7 @@ fn test_session_clear() raises:
     print("  session_clear: PASS")
 
 
-fn test_session_max_history() raises:
+def test_session_max_history() raises:
     """Test max_history limit enforcement."""
     var session = ConversationSession("s5", "", 4)
 
@@ -156,7 +156,7 @@ fn test_session_max_history() raises:
 # Template Formatting Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_format_llama_single_turn() raises:
+def test_format_llama_single_turn() raises:
     """Test Llama template with single user message."""
     var session = ConversationSession("t1", "Be helpful.")
     session.add_user_message("Hello")
@@ -171,7 +171,7 @@ fn test_format_llama_single_turn() raises:
     print("  format_llama_single_turn: PASS")
 
 
-fn test_format_llama_multi_turn() raises:
+def test_format_llama_multi_turn() raises:
     """Test Llama template with multi-turn conversation."""
     var session = ConversationSession("t2")
     session.add_user_message("Q1")
@@ -185,7 +185,7 @@ fn test_format_llama_multi_turn() raises:
     print("  format_llama_multi_turn: PASS")
 
 
-fn test_format_chatml_single_turn() raises:
+def test_format_chatml_single_turn() raises:
     """Test ChatML template with single user message."""
     var session = ConversationSession("t3", "System info")
     session.add_user_message("Hi")
@@ -199,7 +199,7 @@ fn test_format_chatml_single_turn() raises:
     print("  format_chatml_single_turn: PASS")
 
 
-fn test_format_chatml_multi_turn() raises:
+def test_format_chatml_multi_turn() raises:
     """Test ChatML template with multi-turn conversation."""
     var session = ConversationSession("t4")
     session.add_user_message("Q1")
@@ -214,7 +214,7 @@ fn test_format_chatml_multi_turn() raises:
     print("  format_chatml_multi_turn: PASS")
 
 
-fn test_format_conversation_none() raises:
+def test_format_conversation_none() raises:
     """Test 'none' template — simple role prefix format."""
     var session = ConversationSession("t5", "Sys prompt")
     session.add_user_message("Hello")
@@ -230,7 +230,7 @@ fn test_format_conversation_none() raises:
     print("  format_conversation_none: PASS")
 
 
-fn test_format_conversation_dispatch() raises:
+def test_format_conversation_dispatch() raises:
     """Test that format_conversation dispatches to correct template."""
     var session = ConversationSession("t6")
     session.add_user_message("Test")
@@ -251,7 +251,7 @@ fn test_format_conversation_dispatch() raises:
 # Conversation Generate Tests
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny model for testing (1 layer, vocab=32, dim=16)."""
     var params = tiny_test_params()
     var model = Model(params)
@@ -273,7 +273,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build tokenizer for tiny model (vocab=32)."""
     var tok = BPETokenizer()
     _ = tok.add_special_token("<bos>", "bos")
@@ -285,7 +285,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
     return tok^
 
 
-fn test_conversation_generate_basic() raises:
+def test_conversation_generate_basic() raises:
     """Test conversation_generate produces output."""
     var model = _build_tiny_model()
     var tokenizer = _build_tiny_tokenizer()
@@ -298,11 +298,11 @@ fn test_conversation_generate_basic() raises:
 
     var output = conversation_generate(model, tokenizer, session, config)
     # Should produce some output (may be garbage from random weights)
-    assert_true(len(output) >= 0, "Should return a string")
+    assert_true(output.byte_length() >= 0, "Should return a string")
     print("  conversation_generate_basic: PASS")
 
 
-fn test_conversation_generate_multi_turn() raises:
+def test_conversation_generate_multi_turn() raises:
     """Test that multi-turn conversation generates without error."""
     var model = _build_tiny_model()
     var tokenizer = _build_tiny_tokenizer()
@@ -316,11 +316,11 @@ fn test_conversation_generate_multi_turn() raises:
     config.chat_template = "none"
 
     var output = conversation_generate(model, tokenizer, session, config)
-    assert_true(len(output) >= 0, "Multi-turn should produce output")
+    assert_true(output.byte_length() >= 0, "Multi-turn should produce output")
     print("  conversation_generate_multi_turn: PASS")
 
 
-fn test_conversation_generate_with_template() raises:
+def test_conversation_generate_with_template() raises:
     """Test generation with chatml template."""
     var model = _build_tiny_model()
     var tokenizer = _build_tiny_tokenizer()
@@ -332,11 +332,11 @@ fn test_conversation_generate_with_template() raises:
     config.chat_template = "chatml"
 
     var output = conversation_generate(model, tokenizer, session, config)
-    assert_true(len(output) >= 0, "ChatML template generate should work")
+    assert_true(output.byte_length() >= 0, "ChatML template generate should work")
     print("  conversation_generate_with_template: PASS")
 
 
-fn test_full_conversation_flow() raises:
+def test_full_conversation_flow() raises:
     """Test complete multi-turn flow: add user msg, generate, add reply, repeat."""
     var model = _build_tiny_model()
     var tokenizer = _build_tiny_tokenizer()
@@ -367,10 +367,10 @@ fn test_full_conversation_flow() raises:
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _contains(haystack: String, needle: String) -> Bool:
+def _contains(haystack: String, needle: String) -> Bool:
     """Check if haystack contains needle."""
-    var h_len = len(haystack)
-    var n_len = len(needle)
+    var h_len = haystack.byte_length()
+    var n_len = needle.byte_length()
     if n_len == 0:
         return True
     if n_len > h_len:
@@ -390,7 +390,7 @@ fn _contains(haystack: String, needle: String) -> Bool:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_conversation:")
 
     # ChatMessage tests

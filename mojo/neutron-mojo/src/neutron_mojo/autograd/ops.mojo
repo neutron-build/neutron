@@ -16,7 +16,7 @@ to avoid the Mojo 0.26.2 aliasing bug where data_ptr() on a mut struct
 field returns a pointer to a temporary copy.
 """
 
-from math import exp, sqrt, tanh, log
+from std.math import exp, sqrt, tanh, log
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
@@ -28,10 +28,10 @@ from .tape import (
 )
 
 # SIMD width for vectorized forward loops
-alias AUTOGRAD_SIMD_WIDTH = 4
+comptime AUTOGRAD_SIMD_WIDTH = 4
 
 
-fn tracked_add(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_add(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     """Tracked elementwise addition: c = a + b. SIMD-accelerated."""
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()
@@ -45,7 +45,7 @@ fn tracked_add(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     var c_off = tape.var_offset(c_idx)
 
     # SIMD bulk (width-4 loads/stores)
-    alias W = AUTOGRAD_SIMD_WIDTH
+    comptime W = AUTOGRAD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var v0 = tape.data_flat.get(a_off + i) + tape.data_flat.get(b_off + i)
@@ -68,7 +68,7 @@ fn tracked_add(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     return c_idx
 
 
-fn tracked_sub(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_sub(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     """Tracked elementwise subtraction: c = a - b."""
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()
@@ -85,7 +85,7 @@ fn tracked_sub(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     return c_idx
 
 
-fn tracked_mul(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_mul(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     """Tracked elementwise multiplication: c = a * b. SIMD-accelerated."""
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()
@@ -99,7 +99,7 @@ fn tracked_mul(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     var c_off = tape.var_offset(c_idx)
 
     # SIMD bulk (width-4 loads/stores)
-    alias W = AUTOGRAD_SIMD_WIDTH
+    comptime W = AUTOGRAD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var v0 = tape.data_flat.get(a_off + i) * tape.data_flat.get(b_off + i)
@@ -122,7 +122,7 @@ fn tracked_mul(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     return c_idx
 
 
-fn tracked_matmul(mut tape: Tape, a_idx: Int, b_idx: Int, M: Int, K: Int, N: Int) -> Int:
+def tracked_matmul(mut tape: Tape, a_idx: Int, b_idx: Int, M: Int, K: Int, N: Int) -> Int:
     """Tracked matrix multiplication: C = A @ B.
 
     A is (M, K), B is (K, N), C is (M, N).
@@ -143,7 +143,7 @@ fn tracked_matmul(mut tape: Tape, a_idx: Int, b_idx: Int, M: Int, K: Int, N: Int
     return c_idx
 
 
-fn tracked_relu(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_relu(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked ReLU: y = max(0, x). SIMD-accelerated with compare+select."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -157,7 +157,7 @@ fn tracked_relu(mut tape: Tape, x_idx: Int) -> Int:
     var zero = Float32(0.0)
 
     # SIMD bulk (width-4 compare+select)
-    alias W = AUTOGRAD_SIMD_WIDTH
+    comptime W = AUTOGRAD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var v0 = tape.data_flat.get(x_off + i)
@@ -180,7 +180,7 @@ fn tracked_relu(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_sigmoid(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_sigmoid(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked sigmoid: y = 1/(1+exp(-x))."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -198,7 +198,7 @@ fn tracked_sigmoid(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_tanh(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_tanh(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked tanh: y = tanh(x)."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -214,7 +214,7 @@ fn tracked_tanh(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_exp(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_exp(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked exp: y = exp(x)."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -230,7 +230,7 @@ fn tracked_exp(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_log(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_log(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked log: y = log(x)."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -246,7 +246,7 @@ fn tracked_log(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_neg(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_neg(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked negation: y = -x."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -262,7 +262,7 @@ fn tracked_neg(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_scalar_mul(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
+def tracked_scalar_mul(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
     """Tracked scalar multiplication: y = x * scalar. SIMD-accelerated."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -276,7 +276,7 @@ fn tracked_scalar_mul(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
     var y_off = tape.var_offset(y_idx)
 
     # SIMD bulk (width-4 broadcast multiply)
-    alias W = AUTOGRAD_SIMD_WIDTH
+    comptime W = AUTOGRAD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         tape.data_flat.set(y_off + i, tape.data_flat.get(x_off + i) * s)
@@ -294,7 +294,7 @@ fn tracked_scalar_mul(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
     return y_idx
 
 
-fn tracked_scalar_add(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
+def tracked_scalar_add(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
     """Tracked scalar addition: y = x + scalar."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -311,7 +311,7 @@ fn tracked_scalar_add(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
     return y_idx
 
 
-fn tracked_softmax(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_softmax(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked softmax (1D)."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -343,7 +343,7 @@ fn tracked_softmax(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_sum(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_sum(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked sum reduction to scalar (stored as 1-element variable)."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -359,7 +359,7 @@ fn tracked_sum(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_mean(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_mean(mut tape: Tape, x_idx: Int) -> Int:
     """Tracked mean reduction to scalar."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -375,7 +375,7 @@ fn tracked_mean(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn tracked_div(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_div(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     """Tracked elementwise division: c = a / b."""
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()

@@ -22,28 +22,28 @@ struct Dim[name: StringLiteral](Writable, Copyable, Movable):
 
     var size: Int
 
-    fn __init__(out self, size: Int):
+    def __init__(out self, size: Int):
         """Create a dimension with a runtime size."""
         self.size = size
 
     @staticmethod
-    fn static_dim[S: Int]() -> Dim[name]:
+    def static_dim[S: Int]() -> Dim[name]:
         """Create a dimension with a compile-time-known size."""
-        constrained[S > 0, "Static dimension size must be positive"]()
+        comptime assert S > 0, "Static dimension size must be positive"
         return Dim[name](S)
 
-    fn __eq__(self, other: Dim[name]) -> Bool:
+    def __eq__(self, other: Dim[name]) -> Bool:
         """Dimensions are equal if their sizes match."""
         return self.size == other.size
 
-    fn __ne__(self, other: Dim[name]) -> Bool:
+    def __ne__(self, other: Dim[name]) -> Bool:
         """Dimensions are not equal if their sizes differ."""
         return self.size != other.size
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write(name, "(", self.size, ")")
 
-    fn __int__(self) -> Int:
+    def __int__(self) -> Int:
         """Convert to Int (returns the size)."""
         return self.size
 

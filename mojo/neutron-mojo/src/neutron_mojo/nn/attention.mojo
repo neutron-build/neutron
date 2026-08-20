@@ -11,7 +11,7 @@ For Llama-3 8B: 32 Q heads, 8 KV heads → group_size = 4.
 Standard MHA: num_q_heads == num_kv_heads (group_size = 1).
 """
 
-from math import sqrt, exp
+from std.math import sqrt, exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.kv_cache import KVCache, MultiLayerKVCache
@@ -22,7 +22,7 @@ from neutron_mojo.nn.paged_kv_cache import PagedKVCache
 # Attention Scores
 # ===----------------------------------------------------------------------=== #
 
-fn dot_product(
+def dot_product(
     a: Tensor[DType.float32],
     b: Tensor[DType.float32],
     size: Int,
@@ -47,7 +47,7 @@ fn dot_product(
     return result
 
 
-fn softmax_inplace(mut scores: Tensor[DType.float32], length: Int) raises:
+def softmax_inplace(mut scores: Tensor[DType.float32], length: Int) raises:
     """Apply softmax to first `length` elements in-place.
 
     Args:
@@ -82,7 +82,7 @@ fn softmax_inplace(mut scores: Tensor[DType.float32], length: Int) raises:
 # Single-Head Attention (building block)
 # ===----------------------------------------------------------------------=== #
 
-fn attention_single_head(
+def attention_single_head(
     q: Tensor[DType.float32],
     cache: KVCache,
     q_head: Int,
@@ -137,7 +137,7 @@ fn attention_single_head(
 # GQA Multi-Head Attention
 # ===----------------------------------------------------------------------=== #
 
-fn gqa_attention(
+def gqa_attention(
     q_all: Tensor[DType.float32],
     cache: KVCache,
     num_q_heads: Int,
@@ -189,7 +189,7 @@ fn gqa_attention(
 # Standard Multi-Head Attention (MHA = GQA with group_size=1)
 # ===----------------------------------------------------------------------=== #
 
-fn mha_attention(
+def mha_attention(
     q_all: Tensor[DType.float32],
     cache: KVCache,
     num_heads: Int,
@@ -213,7 +213,7 @@ fn mha_attention(
 # Direct Multi-Layer KV Cache Attention (zero-copy)
 # ===----------------------------------------------------------------------=== #
 
-fn gqa_attention_direct(
+def gqa_attention_direct(
     q_all: Tensor[DType.float32],
     cache: MultiLayerKVCache,
     layer: Int,
@@ -277,7 +277,7 @@ fn gqa_attention_direct(
 # Paged KV Cache Attention (zero-copy, page-indirect)
 # ===----------------------------------------------------------------------=== #
 
-fn paged_gqa_attention(
+def paged_gqa_attention(
     q_all: Tensor[DType.float32],
     cache: PagedKVCache,
     layer: Int,
@@ -340,7 +340,7 @@ fn paged_gqa_attention(
 # Batched Prefill Attention (Parallel Prefill)
 # ===----------------------------------------------------------------------=== #
 
-fn gqa_attention_prefill(
+def gqa_attention_prefill(
     q_batch: Tensor[DType.float32],
     cache: MultiLayerKVCache,
     layer: Int,
@@ -421,7 +421,7 @@ fn gqa_attention_prefill(
 # Causal Mask Utilities
 # ===----------------------------------------------------------------------=== #
 
-fn apply_causal_mask(
+def apply_causal_mask(
     mut scores: Tensor[DType.float32],
     query_pos: Int,
     seq_len: Int,

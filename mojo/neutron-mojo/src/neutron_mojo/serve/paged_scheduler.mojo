@@ -19,7 +19,7 @@ Usage:
         var finished = sched.step(model, tokenizer, rope)
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams
@@ -48,7 +48,7 @@ from neutron_mojo.serve.scheduler import (
 # PagedBatchEntry — Per-request state with paged KV cache
 # ===----------------------------------------------------------------------=== #
 
-struct PagedBatchEntry(Copyable, Movable):
+struct PagedBatchEntry(Copyable, Movable, ImplicitlyCopyable):
     """State for a single request being processed with paged KV cache.
 
     Uses PagedKVCache instead of MultiLayerKVCache for on-demand page
@@ -68,7 +68,7 @@ struct PagedBatchEntry(Copyable, Movable):
     var enqueue_time_ns: Int
     var start_gen_time_ns: Int
 
-    fn __init__(out self, request_id: String, input_ids: List[Int],
+    def __init__(out self, request_id: String, input_ids: List[Int],
                 var cache: PagedKVCache, config: PipelineConfig,
                 stop_tokens: List[Int], enqueue_time_ns: Int):
         self.request_id = request_id
@@ -88,39 +88,39 @@ struct PagedBatchEntry(Copyable, Movable):
         self.enqueue_time_ns = enqueue_time_ns
         self.start_gen_time_ns = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.request_id = existing.request_id
+    def __init__(out self, *, copy: Self):
+        self.request_id = copy.request_id
         self.input_ids = List[Int]()
-        for i in range(len(existing.input_ids)):
-            self.input_ids.append(existing.input_ids[i])
+        for i in range(len(copy.input_ids)):
+            self.input_ids.append(copy.input_ids[i])
         self.generated = List[Int]()
-        for i in range(len(existing.generated)):
-            self.generated.append(existing.generated[i])
-        self.cache = existing.cache.copy()
-        self.pos = existing.pos
-        self.prefilled = existing.prefilled
-        self.finished = existing.finished
-        self.max_new_tokens = existing.max_new_tokens
+        for i in range(len(copy.generated)):
+            self.generated.append(copy.generated[i])
+        self.cache = copy.cache.copy()
+        self.pos = copy.pos
+        self.prefilled = copy.prefilled
+        self.finished = copy.finished
+        self.max_new_tokens = copy.max_new_tokens
         self.stop_tokens = List[Int]()
-        for i in range(len(existing.stop_tokens)):
-            self.stop_tokens.append(existing.stop_tokens[i])
-        self.config = existing.config.copy()
-        self.enqueue_time_ns = existing.enqueue_time_ns
-        self.start_gen_time_ns = existing.start_gen_time_ns
+        for i in range(len(copy.stop_tokens)):
+            self.stop_tokens.append(copy.stop_tokens[i])
+        self.config = copy.config.copy()
+        self.enqueue_time_ns = copy.enqueue_time_ns
+        self.start_gen_time_ns = copy.start_gen_time_ns
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.request_id = other.request_id^
-        self.input_ids = other.input_ids^
-        self.generated = other.generated^
-        self.cache = other.cache^
-        self.pos = other.pos
-        self.prefilled = other.prefilled
-        self.finished = other.finished
-        self.max_new_tokens = other.max_new_tokens
-        self.stop_tokens = other.stop_tokens^
-        self.config = other.config^
-        self.enqueue_time_ns = other.enqueue_time_ns
-        self.start_gen_time_ns = other.start_gen_time_ns
+    def __init__(out self, *, deinit move: Self):
+        self.request_id = move.request_id^
+        self.input_ids = move.input_ids^
+        self.generated = move.generated^
+        self.cache = move.cache^
+        self.pos = move.pos^
+        self.prefilled = move.prefilled^
+        self.finished = move.finished^
+        self.max_new_tokens = move.max_new_tokens^
+        self.stop_tokens = move.stop_tokens^
+        self.config = move.config^
+        self.enqueue_time_ns = move.enqueue_time_ns^
+        self.start_gen_time_ns = move.start_gen_time_ns^
 
 
 # ===----------------------------------------------------------------------=== #
@@ -147,7 +147,7 @@ struct PagedBatchScheduler(Movable):
     var max_pages_per_request: Int
     var page_size: Int
 
-    fn __init__(out self, params: ModelParams, max_batch_size: Int = 4,
+    def __init__(out self, params: ModelParams, max_batch_size: Int = 4,
                 max_seq_len: Int = 512, max_queue_depth: Int = 64,
                 max_pages_per_request: Int = 64, page_size: Int = 16):
         """Create a paged batch scheduler.
@@ -169,17 +169,17 @@ struct PagedBatchScheduler(Movable):
         self.max_pages_per_request = max_pages_per_request
         self.page_size = page_size
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.active = other.active^
-        self.queue = other.queue^
-        self.stats = other.stats.copy()
-        self.max_batch_size = other.max_batch_size
-        self.max_seq_len = other.max_seq_len
-        self.params = other.params.copy()
-        self.max_pages_per_request = other.max_pages_per_request
-        self.page_size = other.page_size
+    def __init__(out self, *, deinit move: Self):
+        self.active = move.active^
+        self.queue = move.queue^
+        self.stats = move.stats.copy()
+        self.max_batch_size = move.max_batch_size^
+        self.max_seq_len = move.max_seq_len^
+        self.params = move.params.copy()
+        self.max_pages_per_request = move.max_pages_per_request^
+        self.page_size = move.page_size^
 
-    fn enqueue(mut self, request: InferenceRequest) -> Bool:
+    def enqueue(mut self, request: InferenceRequest) -> Bool:
         """Add a request to the pending queue.
 
         Args:
@@ -194,7 +194,7 @@ struct PagedBatchScheduler(Movable):
             self.stats.requests_dropped += 1
         return ok
 
-    fn admit_from_queue(mut self, tokenizer: BPETokenizer) raises:
+    def admit_from_queue(mut self, tokenizer: BPETokenizer) raises:
         """Move requests from queue to active batch if slots available.
 
         Creates a PagedKVCache for each admitted request with on-demand
@@ -235,7 +235,7 @@ struct PagedBatchScheduler(Movable):
             if len(self.active) > self.stats.peak_batch_size:
                 self.stats.peak_batch_size = len(self.active)
 
-    fn step(mut self, model: Model, tokenizer: BPETokenizer,
+    def step(mut self, model: Model, tokenizer: BPETokenizer,
             rope: RoPETable) raises -> List[FinishedRequest]:
         """Run one step for all active requests using paged forward.
 
@@ -353,23 +353,23 @@ struct PagedBatchScheduler(Movable):
         self.active = keep^
         return finished_list^
 
-    fn has_active(self) -> Bool:
+    def has_active(self) -> Bool:
         """Check if there are active or queued requests."""
         return len(self.active) > 0 or not self.queue.is_empty()
 
-    fn has_pending(self) -> Bool:
+    def has_pending(self) -> Bool:
         """Check if there are requests waiting in the queue."""
         return not self.queue.is_empty()
 
-    fn active_count(self) -> Int:
+    def active_count(self) -> Int:
         """Number of currently active (processing) requests."""
         return len(self.active)
 
-    fn queue_depth(self) -> Int:
+    def queue_depth(self) -> Int:
         """Number of requests waiting in the queue."""
         return self.queue.depth()
 
-    fn get_stats(self) -> SchedulerStats:
+    def get_stats(self) -> SchedulerStats:
         """Get a copy of current scheduler statistics."""
         var s = SchedulerStats()
         s.total_requests_processed = self.stats.total_requests_processed
@@ -381,14 +381,14 @@ struct PagedBatchScheduler(Movable):
         s.requests_dropped = self.stats.requests_dropped
         return s^
 
-    fn total_pages_used(self) -> Int:
+    def total_pages_used(self) -> Int:
         """Total pages currently allocated across all active requests."""
         var total = 0
         for i in range(len(self.active)):
             total += self.active[i].cache.total_pages_used()
         return total
 
-    fn total_cache_bytes(self) -> Int:
+    def total_cache_bytes(self) -> Int:
         """Total KV cache memory in use across all active requests."""
         var total = 0
         for i in range(len(self.active)):
@@ -400,7 +400,7 @@ struct PagedBatchScheduler(Movable):
 # Helper: Run paged scheduler to completion
 # ===----------------------------------------------------------------------=== #
 
-fn run_paged_scheduler_to_completion(
+def run_paged_scheduler_to_completion(
     mut scheduler: PagedBatchScheduler,
     model: Model,
     tokenizer: BPETokenizer,

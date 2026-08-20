@@ -8,26 +8,26 @@ NOTE: These tests require libpython to be available at runtime.
 If Python is not configured in the environment, all tests will SKIP gracefully.
 """
 
-from python import Python, PythonObject
+from std.python import Python, PythonObject
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.python.bridge import (
     to_python_list, from_python_list, call_python,
     numpy_available, to_numpy, from_numpy,
 )
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
+def approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
     return abs(a - b) < tol
 
 
-fn python_available() -> Bool:
+def python_available() -> Bool:
     """Check if Python runtime is available."""
     try:
         _ = Python.import_module("builtins")
@@ -36,7 +36,7 @@ fn python_available() -> Bool:
         return False
 
 
-fn test_to_python_list() raises:
+def test_to_python_list() raises:
     """Convert Mojo tensor to Python list."""
     var t = Tensor[DType.float32](Shape(4))
     for i in range(4):
@@ -49,7 +49,7 @@ fn test_to_python_list() raises:
     print("  to_python_list: PASS")
 
 
-fn test_from_python_list() raises:
+def test_from_python_list() raises:
     """Convert Python list to Mojo tensor."""
     var builtins = Python.import_module("builtins")
     var py_list = builtins.list()
@@ -63,7 +63,7 @@ fn test_from_python_list() raises:
     print("  from_python_list: PASS")
 
 
-fn test_roundtrip() raises:
+def test_roundtrip() raises:
     """Round-trip: Mojo -> Python list -> Mojo."""
     var t = Tensor[DType.float32](Shape(5))
     for i in range(5):
@@ -75,21 +75,21 @@ fn test_roundtrip() raises:
     print("  roundtrip: PASS")
 
 
-fn test_call_python() raises:
+def test_call_python() raises:
     """Call a Python function."""
     var result = call_python("math", "sqrt", PythonObject(16.0))
     assert_true(Float64(py=result) == 4.0, "sqrt(16) should be 4.0")
     print("  call_python: PASS")
 
 
-fn test_numpy_available() raises:
+def test_numpy_available() raises:
     """Check numpy availability."""
     var avail = numpy_available()
     # Just check it doesn't crash; result depends on environment
     print("  numpy_available: " + String(avail) + " PASS")
 
 
-fn test_to_numpy() raises:
+def test_to_numpy() raises:
     """Convert to numpy array (if numpy available)."""
     if not numpy_available():
         print("  to_numpy: SKIP (numpy not available)")
@@ -104,7 +104,7 @@ fn test_to_numpy() raises:
     print("  to_numpy: PASS")
 
 
-fn test_from_numpy() raises:
+def test_from_numpy() raises:
     """Convert from numpy array (if numpy available)."""
     if not numpy_available():
         print("  from_numpy: SKIP (numpy not available)")
@@ -123,7 +123,7 @@ fn test_from_numpy() raises:
     print("  from_numpy: PASS")
 
 
-fn test_numpy_roundtrip() raises:
+def test_numpy_roundtrip() raises:
     """Round-trip: Mojo -> numpy -> Mojo."""
     if not numpy_available():
         print("  numpy_roundtrip: SKIP (numpy not available)")
@@ -138,7 +138,7 @@ fn test_numpy_roundtrip() raises:
     print("  numpy_roundtrip: PASS")
 
 
-fn test_large_tensor() raises:
+def test_large_tensor() raises:
     """Large tensor round-trip."""
     var n = 1000
     var t = Tensor[DType.float32](Shape(n))
@@ -152,7 +152,7 @@ fn test_large_tensor() raises:
     print("  large_tensor: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_python_bridge")
     print("  Python runtime tests skipped by default (requires libpython).")
     print("All 9 python bridge tests skipped.")

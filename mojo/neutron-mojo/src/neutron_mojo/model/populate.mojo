@@ -20,7 +20,7 @@ from neutron_mojo.model.architecture import detect_architecture, arch_from_name
 # Config → Model
 # ===----------------------------------------------------------------------=== #
 
-fn model_from_config(config: ModelConfig) -> Model:
+def model_from_config(config: ModelConfig) -> Model:
     """Create a Model with dimensions matching a ModelConfig.
 
     Auto-detects architecture from config.model_type and sets ModelParams.arch
@@ -57,7 +57,7 @@ fn model_from_config(config: ModelConfig) -> Model:
 # GGUF → HuggingFace Name Mapping
 # ===----------------------------------------------------------------------=== #
 
-fn normalize_weight_name(name: String) -> String:
+def normalize_weight_name(name: String) -> String:
     """Map GGUF tensor names to HuggingFace convention.
 
     Handles both global tensors and per-layer blk.N.* tensors.
@@ -78,18 +78,18 @@ fn normalize_weight_name(name: String) -> String:
         return String("lm_head.weight")
 
     # Per-layer: blk.{N}.suffix -> model.layers.{N}.hf_suffix
-    if len(name) > 4 and name[:4] == "blk.":
+    if name.byte_length() > 4 and name[byte=:4] == "blk.":
         # Find the layer number between first and second dot
         var dot2 = -1
-        for i in range(4, len(name)):
+        for i in range(4, name.byte_length()):
             if ord(name[byte=i]) == 46:  # '.'
                 dot2 = i
                 break
         if dot2 < 0:
             return name
 
-        var layer_str = String(name[4:dot2])
-        var suffix = String(name[dot2 + 1:])
+        var layer_str = String(name[byte=4:dot2])
+        var suffix = String(name[byte=dot2 + 1:])
 
         var prefix = "model.layers." + layer_str + "."
 
@@ -120,7 +120,7 @@ fn normalize_weight_name(name: String) -> String:
 # Named Weight Loading
 # ===----------------------------------------------------------------------=== #
 
-fn load_named_weight(
+def load_named_weight(
     mut model: Model,
     name: String,
     data: Tensor[DType.float32],
@@ -157,7 +157,7 @@ fn load_named_weight(
     elif name == "lm_head.weight":
         for i in range(size):
             model.lm_head.set(i, data.get(i))
-    elif len(name) > 13 and name[:13] == "model.layers.":
+    elif name.byte_length() > 13 and name[byte=:13] == "model.layers.":
         # Layer weight — extract layer index and route to projection
         var layer = _extract_layer_idx(name)
         var off = model._layer_offsets(layer)
@@ -170,11 +170,11 @@ fn load_named_weight(
         raise Error("Unknown weight name: " + name)
 
 
-fn _extract_layer_idx(name: String) raises -> Int:
+def _extract_layer_idx(name: String) raises -> Int:
     """Extract layer index from 'model.layers.N.xxx' pattern."""
     var start = 13  # len("model.layers.")
     var end = start
-    while end < len(name):
+    while end < name.byte_length():
         var c = ord(name[byte=end])
         if c < 48 or c > 57:  # '0'=48, '9'=57
             break
@@ -187,7 +187,7 @@ fn _extract_layer_idx(name: String) raises -> Int:
     return result
 
 
-fn _match_layer_suffix(name: String, off: LayerWeightOffsets) -> Int:
+def _match_layer_suffix(name: String, off: LayerWeightOffsets) -> Int:
     """Match the suffix of a layer weight name to its offset. Returns -1 if no match."""
     if name.endswith("input_layernorm.weight"):
         return off.attn_norm
@@ -214,27 +214,27 @@ fn _match_layer_suffix(name: String, off: LayerWeightOffsets) -> Int:
 # Direct Weight Setters
 # ===----------------------------------------------------------------------=== #
 
-fn set_embed(mut model: Model, data: Tensor[DType.float32], size: Int):
+def set_embed(mut model: Model, data: Tensor[DType.float32], size: Int):
     """Copy embedding weights into model (flat copy, handles 2D shape)."""
     var src = data.data_ptr()
     for i in range(size):
         model.embed.set(i, src[i])
 
 
-fn set_lm_head(mut model: Model, data: Tensor[DType.float32], size: Int):
+def set_lm_head(mut model: Model, data: Tensor[DType.float32], size: Int):
     """Copy LM head weights into model (flat copy, handles 2D shape)."""
     var src = data.data_ptr()
     for i in range(size):
         model.lm_head.set(i, src[i])
 
 
-fn set_final_norm(mut model: Model, data: Tensor[DType.float32], size: Int):
+def set_final_norm(mut model: Model, data: Tensor[DType.float32], size: Int):
     """Copy final norm weights into model."""
     for i in range(size):
         model.final_norm.set(i, data.data_ptr()[i])
 
 
-fn set_layer_projection(
+def set_layer_projection(
     mut model: Model,
     layer: Int,
     proj: String,

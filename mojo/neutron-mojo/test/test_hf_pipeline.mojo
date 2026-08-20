@@ -4,8 +4,8 @@
 
 """Tests for DLPack roundtrip, struct tests, and HF pipeline structs."""
 
-from math import abs
-from testing import assert_true
+from std.math import abs
+from std.testing import assert_true
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
@@ -19,7 +19,7 @@ from neutron_mojo.dlpack.exchange import (
 )
 
 
-fn test_dlpack_roundtrip() raises:
+def test_dlpack_roundtrip() raises:
     """DLPack roundtrip: tensor -> DLPack -> tensor preserves data."""
     var t = Tensor[DType.float32](Shape(5))
     t.set(0, 1.5)
@@ -39,7 +39,7 @@ fn test_dlpack_roundtrip() raises:
     print("PASS: test_dlpack_roundtrip")
 
 
-fn test_dlpack_shape_extraction() raises:
+def test_dlpack_shape_extraction() raises:
     """dlpack_shape extracts correct dimensions."""
     var t = Tensor[DType.float32](Shape(10))
     for i in range(10):
@@ -53,7 +53,7 @@ fn test_dlpack_shape_extraction() raises:
     print("PASS: test_dlpack_shape_extraction")
 
 
-fn test_dlpack_numel_fn() raises:
+def test_dlpack_numel_fn() raises:
     """dlpack_numel returns correct element count."""
     var t = Tensor[DType.float32](Shape(7))
     for i in range(7):
@@ -64,7 +64,7 @@ fn test_dlpack_numel_fn() raises:
     print("PASS: test_dlpack_numel_fn")
 
 
-fn test_dlpack_version() raises:
+def test_dlpack_version() raises:
     """DLPack version is 1.0."""
     var managed = DLManagedTensorVersioned()
     assert_true(Int(managed.version.major) == 1, "major == 1")
@@ -72,7 +72,7 @@ fn test_dlpack_version() raises:
     print("PASS: test_dlpack_version")
 
 
-fn test_dlpack_dtype_float32() raises:
+def test_dlpack_dtype_float32() raises:
     """mojo_dtype_to_dl converts float32 correctly."""
     var dl = mojo_dtype_to_dl(DType.float32)
     assert_true(dl.code == kDLFloat, "code == kDLFloat")
@@ -81,7 +81,7 @@ fn test_dlpack_dtype_float32() raises:
     print("PASS: test_dlpack_dtype_float32")
 
 
-fn test_dl_to_mojo_roundtrip() raises:
+def test_dl_to_mojo_roundtrip() raises:
     """DType conversion roundtrip."""
     var dl = mojo_dtype_to_dl(DType.float32)
     var mojo_dt = dl_to_mojo_dtype(dl)
@@ -93,7 +93,7 @@ fn test_dl_to_mojo_roundtrip() raises:
     print("PASS: test_dl_to_mojo_roundtrip")
 
 
-fn test_dlpack_device_cpu() raises:
+def test_dlpack_device_cpu() raises:
     """Default device is CPU."""
     var t = Tensor[DType.float32](Shape(3))
     t.set(0, 1.0)
@@ -106,7 +106,7 @@ fn test_dlpack_device_cpu() raises:
     print("PASS: test_dlpack_device_cpu")
 
 
-fn test_dlpack_is_copied_flag() raises:
+def test_dlpack_is_copied_flag() raises:
     """tensor_to_dlpack sets the IS_COPIED flag."""
     var t = Tensor[DType.float32](Shape(2))
     t.set(0, 1.0)
@@ -118,7 +118,7 @@ fn test_dlpack_is_copied_flag() raises:
     print("PASS: test_dlpack_is_copied_flag")
 
 
-fn test_dlpack_large_tensor() raises:
+def test_dlpack_large_tensor() raises:
     """DLPack roundtrip with larger tensor."""
     var n = 1000
     var t = Tensor[DType.float32](Shape(n))
@@ -137,7 +137,7 @@ fn test_dlpack_large_tensor() raises:
     print("PASS: test_dlpack_large_tensor")
 
 
-fn test_hf_load_result_struct() raises:
+def test_hf_load_result_struct() raises:
     """HFLoadResult struct can be created (mock — no actual HF download)."""
     # Just test the struct exists and is movable
     from neutron_mojo.python.hf_pipeline import HFLoadResult
@@ -146,12 +146,12 @@ fn test_hf_load_result_struct() raises:
     print("PASS: test_hf_load_result_struct")
 
 
-fn test_hf_available_check() raises:
+def test_hf_available_check() raises:
     """Skip by default because Python runtime may ABORT if libpython is missing."""
     print("SKIP: test_hf_available_check (requires Python)")
 
 
-fn test_dlpack_single_element() raises:
+def test_dlpack_single_element() raises:
     """DLPack with single element tensor."""
     var t = Tensor[DType.float32](Shape(1))
     t.set(0, 42.0)
@@ -163,7 +163,7 @@ fn test_dlpack_single_element() raises:
     print("PASS: test_dlpack_single_element")
 
 
-fn main() raises:
+def main() raises:
     print("=== Sprint 65: HF Pipeline + DLPack Exchange Tests ===")
     test_dlpack_roundtrip()
     test_dlpack_shape_extraction()

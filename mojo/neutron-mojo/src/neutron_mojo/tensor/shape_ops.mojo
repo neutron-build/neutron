@@ -8,7 +8,7 @@ Separate from ops.mojo to avoid concurrent edit conflicts.
 All functions follow the same pattern: allocate result, scalar loop, return.
 """
 
-from math import sqrt
+from std.math import sqrt
 
 from .shape import Shape
 from .tensor import Tensor
@@ -19,7 +19,7 @@ from .tensor import Tensor
 # ===----------------------------------------------------------------------=== #
 
 
-fn concat2[dtype: DType](
+def concat2[dtype: DType](
     a: Tensor[dtype], b: Tensor[dtype], dim: Int = 0
 ) raises -> Tensor[dtype]:
     """Concatenate two tensors along a dimension.
@@ -76,7 +76,7 @@ fn concat2[dtype: DType](
         raise Error("concat2: tensors must be same ndim (1D or 2D)")
 
 
-fn concat3[dtype: DType](
+def concat3[dtype: DType](
     a: Tensor[dtype], b: Tensor[dtype], c: Tensor[dtype], dim: Int = 0
 ) raises -> Tensor[dtype]:
     """Concatenate three tensors along a dimension."""
@@ -84,7 +84,7 @@ fn concat3[dtype: DType](
     return concat2(ab, c, dim)
 
 
-fn concat4[dtype: DType](
+def concat4[dtype: DType](
     a: Tensor[dtype], b: Tensor[dtype], c: Tensor[dtype], d: Tensor[dtype], dim: Int = 0
 ) raises -> Tensor[dtype]:
     """Concatenate four tensors along a dimension."""
@@ -103,13 +103,13 @@ struct SplitResult2[dtype: DType](Movable):
     var part0: Tensor[Self.dtype]
     var part1: Tensor[Self.dtype]
 
-    fn __init__(out self, var p0: Tensor[Self.dtype], var p1: Tensor[Self.dtype]):
+    def __init__(out self, var p0: Tensor[Self.dtype], var p1: Tensor[Self.dtype]):
         self.part0 = p0^
         self.part1 = p1^
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.part0 = other.part0^
-        self.part1 = other.part1^
+    def __init__(out self, *, deinit move: Self):
+        self.part0 = move.part0^
+        self.part1 = move.part1^
 
 
 struct SplitResult3[dtype: DType](Movable):
@@ -118,18 +118,18 @@ struct SplitResult3[dtype: DType](Movable):
     var part1: Tensor[Self.dtype]
     var part2: Tensor[Self.dtype]
 
-    fn __init__(out self, var p0: Tensor[Self.dtype], var p1: Tensor[Self.dtype], var p2: Tensor[Self.dtype]):
+    def __init__(out self, var p0: Tensor[Self.dtype], var p1: Tensor[Self.dtype], var p2: Tensor[Self.dtype]):
         self.part0 = p0^
         self.part1 = p1^
         self.part2 = p2^
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.part0 = other.part0^
-        self.part1 = other.part1^
-        self.part2 = other.part2^
+    def __init__(out self, *, deinit move: Self):
+        self.part0 = move.part0^
+        self.part1 = move.part1^
+        self.part2 = move.part2^
 
 
-fn split2[dtype: DType](
+def split2[dtype: DType](
     x: Tensor[dtype], split_at: Int, dim: Int = 0
 ) raises -> SplitResult2[dtype]:
     """Split a tensor into 2 parts at the given index along dim."""
@@ -184,7 +184,7 @@ fn split2[dtype: DType](
         raise Error("split2: only 1D and 2D supported")
 
 
-fn split3[dtype: DType](
+def split3[dtype: DType](
     x: Tensor[dtype], split1: Int, split2_at: Int, dim: Int = 0
 ) raises -> SplitResult3[dtype]:
     """Split a tensor into 3 parts at two split points along dim."""
@@ -198,7 +198,7 @@ fn split3[dtype: DType](
 # ===----------------------------------------------------------------------=== #
 
 
-fn squeeze[dtype: DType](x: Tensor[dtype], dim: Int) raises -> Tensor[dtype]:
+def squeeze[dtype: DType](x: Tensor[dtype], dim: Int) raises -> Tensor[dtype]:
     """Remove a dimension of size 1."""
     var s = x.shape()
     if dim < 0 or dim >= s.ndim():
@@ -221,7 +221,7 @@ fn squeeze[dtype: DType](x: Tensor[dtype], dim: Int) raises -> Tensor[dtype]:
     return result^
 
 
-fn unsqueeze[dtype: DType](x: Tensor[dtype], dim: Int) raises -> Tensor[dtype]:
+def unsqueeze[dtype: DType](x: Tensor[dtype], dim: Int) raises -> Tensor[dtype]:
     """Insert a dimension of size 1 at the given position."""
     var s = x.shape()
     if dim < 0 or dim > s.ndim():
@@ -245,7 +245,7 @@ fn unsqueeze[dtype: DType](x: Tensor[dtype], dim: Int) raises -> Tensor[dtype]:
     return result^
 
 
-fn flatten[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def flatten[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Flatten to 1D."""
     var n = x.numel()
     var result = Tensor[dtype](n)
@@ -256,7 +256,7 @@ fn flatten[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn expand[dtype: DType](x: Tensor[dtype], shape: Shape) raises -> Tensor[dtype]:
+def expand[dtype: DType](x: Tensor[dtype], shape: Shape) raises -> Tensor[dtype]:
     """Expand a tensor to a larger shape by repeating along size-1 dims."""
     if x.ndim() != shape.ndim():
         raise Error("expand: ndim must match")
@@ -289,7 +289,7 @@ fn expand[dtype: DType](x: Tensor[dtype], shape: Shape) raises -> Tensor[dtype]:
 # ===----------------------------------------------------------------------=== #
 
 
-fn arange[dtype: DType](start: Float64, stop: Float64, step: Float64 = 1.0) raises -> Tensor[dtype]:
+def arange[dtype: DType](start: Float64, stop: Float64, step: Float64 = 1.0) raises -> Tensor[dtype]:
     """Create a 1D tensor with evenly spaced values."""
     if step == 0.0:
         raise Error("arange: step must be non-zero")
@@ -308,7 +308,7 @@ fn arange[dtype: DType](start: Float64, stop: Float64, step: Float64 = 1.0) rais
     return result^
 
 
-fn linspace[dtype: DType](start: Float64, stop: Float64, num: Int) raises -> Tensor[dtype]:
+def linspace[dtype: DType](start: Float64, stop: Float64, num: Int) raises -> Tensor[dtype]:
     """Create a 1D tensor with num evenly spaced values from start to stop (inclusive)."""
     if num < 1:
         raise Error("linspace: num must be >= 1")
@@ -323,7 +323,7 @@ fn linspace[dtype: DType](start: Float64, stop: Float64, num: Int) raises -> Ten
     return result^
 
 
-fn eye[dtype: DType](n: Int) -> Tensor[dtype]:
+def eye[dtype: DType](n: Int) -> Tensor[dtype]:
     """Create an n x n identity matrix."""
     var result = Tensor[dtype](n, n)
     var r_ptr = result.data_ptr()
@@ -332,7 +332,7 @@ fn eye[dtype: DType](n: Int) -> Tensor[dtype]:
     return result^
 
 
-fn tril[dtype: DType](x: Tensor[dtype], diagonal: Int = 0) raises -> Tensor[dtype]:
+def tril[dtype: DType](x: Tensor[dtype], diagonal: Int = 0) raises -> Tensor[dtype]:
     """Lower triangular: zero out elements above the k-th diagonal."""
     if x.ndim() != 2:
         raise Error("tril: only 2D tensors supported")
@@ -349,7 +349,7 @@ fn tril[dtype: DType](x: Tensor[dtype], diagonal: Int = 0) raises -> Tensor[dtyp
     return result^
 
 
-fn triu[dtype: DType](x: Tensor[dtype], diagonal: Int = 0) raises -> Tensor[dtype]:
+def triu[dtype: DType](x: Tensor[dtype], diagonal: Int = 0) raises -> Tensor[dtype]:
     """Upper triangular: zero out elements below the k-th diagonal."""
     if x.ndim() != 2:
         raise Error("triu: only 2D tensors supported")
@@ -375,16 +375,16 @@ struct SortResult[dtype: DType](Movable):
     var values: Tensor[Self.dtype]
     var indices: List[Int]
 
-    fn __init__(out self, var values: Tensor[Self.dtype], var indices: List[Int]):
+    def __init__(out self, var values: Tensor[Self.dtype], var indices: List[Int]):
         self.values = values^
         self.indices = indices^
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.values = other.values^
-        self.indices = other.indices^
+    def __init__(out self, *, deinit move: Self):
+        self.values = move.values^
+        self.indices = move.indices^
 
 
-fn sort[dtype: DType](x: Tensor[dtype], descending: Bool = False) raises -> SortResult[dtype]:
+def sort[dtype: DType](x: Tensor[dtype], descending: Bool = False) raises -> SortResult[dtype]:
     """Sort a 1D tensor. Returns sorted values and original indices."""
     if x.ndim() != 1:
         raise Error("sort: only 1D tensors supported")
@@ -421,7 +421,7 @@ fn sort[dtype: DType](x: Tensor[dtype], descending: Bool = False) raises -> Sort
     return SortResult[dtype](result^, indices^)
 
 
-fn argsort[dtype: DType](x: Tensor[dtype], descending: Bool = False) raises -> List[Int]:
+def argsort[dtype: DType](x: Tensor[dtype], descending: Bool = False) raises -> List[Int]:
     """Return indices that would sort a 1D tensor."""
     var sr = sort(x, descending)
     return sr.indices.copy()

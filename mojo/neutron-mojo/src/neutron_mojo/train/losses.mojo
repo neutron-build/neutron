@@ -8,7 +8,7 @@ NOTE: Uses tape.get_data()/set_data() instead of data_ptr() to avoid
 the Mojo 0.26.2 aliasing bug.
 """
 
-from math import exp, log
+from std.math import exp, log
 
 from neutron_mojo.autograd.tape import (
     Tape, TapeEntry, OP_LOG_SOFTMAX, OP_CROSS_ENTROPY, OP_MSE,
@@ -17,7 +17,7 @@ from neutron_mojo.autograd.tape import (
 from neutron_mojo.autograd.ops import tracked_sum, tracked_scalar_mul, tracked_add
 
 
-fn log_softmax(mut tape: Tape, x_idx: Int) -> Int:
+def log_softmax(mut tape: Tape, x_idx: Int) -> Int:
     """Numerically stable log-softmax."""
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
@@ -47,7 +47,7 @@ fn log_softmax(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-fn cross_entropy_loss(mut tape: Tape, logits_idx: Int, target: Int, vocab_size: Int) -> Int:
+def cross_entropy_loss(mut tape: Tape, logits_idx: Int, target: Int, vocab_size: Int) -> Int:
     """Cross-entropy loss: -log(softmax(logits)[target]).
 
     Fused backward: softmax(logits) - one_hot(target).
@@ -76,7 +76,7 @@ fn cross_entropy_loss(mut tape: Tape, logits_idx: Int, target: Int, vocab_size: 
     return loss_idx
 
 
-fn mse_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
+def mse_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     """Mean squared error loss: mean((pred - target)^2)."""
     var n = tape.var_numel(pred_idx)
     var dims = List[Int]()
@@ -94,7 +94,7 @@ fn mse_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     return loss_idx
 
 
-fn l1_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
+def l1_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     """L1 (mean absolute error) loss: mean(|pred - target|)."""
     var n = tape.var_numel(pred_idx)
     var dims = List[Int]()
@@ -112,7 +112,7 @@ fn l1_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     return loss_idx
 
 
-fn binary_cross_entropy(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
+def binary_cross_entropy(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     """Binary cross-entropy: -mean(target*log(pred) + (1-target)*log(1-pred))."""
     var n = tape.var_numel(pred_idx)
     var dims = List[Int]()
@@ -133,7 +133,7 @@ fn binary_cross_entropy(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     return loss_idx
 
 
-fn kl_divergence(mut tape: Tape, p_idx: Int, q_idx: Int) -> Int:
+def kl_divergence(mut tape: Tape, p_idx: Int, q_idx: Int) -> Int:
     """KL divergence: sum(p * log(p/q))."""
     var n = tape.var_numel(p_idx)
     var dims = List[Int]()
@@ -152,7 +152,7 @@ fn kl_divergence(mut tape: Tape, p_idx: Int, q_idx: Int) -> Int:
     return loss_idx
 
 
-fn sequence_cross_entropy_loss(
+def sequence_cross_entropy_loss(
     mut tape: Tape,
     logits_indices: List[Int],
     targets: List[Int],

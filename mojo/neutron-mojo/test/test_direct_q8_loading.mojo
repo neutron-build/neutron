@@ -5,7 +5,7 @@
 """Tests for direct Q8_0 GGUF loading: read_tensor_q8_0_as_quantized,
 load_gguf_quantized_direct_from_buffer, and equivalence vs roundtrip path."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.io.binary_reader import BinaryReader, _fp16_to_fp32
@@ -33,12 +33,12 @@ from neutron_mojo.nn.model import Model, ModelParams, generate
 from neutron_mojo.nn.q_model import QuantizedModel, quantize_from_model, q_generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -46,7 +46,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
         )
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg
@@ -58,7 +58,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Q8_0 Binary Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _write_q8_block(mut buf: List[UInt8], scale_f32: Float32, values: List[Int]):
+def _write_q8_block(mut buf: List[UInt8], scale_f32: Float32, values: List[Int]):
     """Write a Q8_0 block: 2-byte FP16 scale + 32 INT8 values.
 
     Note: For testing we encode the scale approximately as FP16 bits.
@@ -103,7 +103,7 @@ fn _write_q8_block(mut buf: List[UInt8], scale_f32: Float32, values: List[Int]):
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_read_q8_0_as_quantized_basic() raises:
+def test_read_q8_0_as_quantized_basic() raises:
     """Single Q8_0 block -> verify data and scales."""
     var buf = List[UInt8]()
 
@@ -133,7 +133,7 @@ fn test_read_q8_0_as_quantized_basic() raises:
     print("  read_q8_0_as_quantized_basic: PASS")
 
 
-fn test_read_q8_0_as_quantized_multi() raises:
+def test_read_q8_0_as_quantized_multi() raises:
     """Multiple Q8_0 blocks -> verify data + scales for each."""
     var buf = List[UInt8]()
 
@@ -165,7 +165,7 @@ fn test_read_q8_0_as_quantized_multi() raises:
     print("  read_q8_0_as_quantized_multi: PASS")
 
 
-fn test_quantized_tensor_data_struct() raises:
+def test_quantized_tensor_data_struct() raises:
     """QuantizedTensorData struct creation and access."""
     var data = Tensor[DType.float32](Shape(8))
     var scales = Tensor[DType.float32](Shape(2))
@@ -185,7 +185,7 @@ fn test_quantized_tensor_data_struct() raises:
 # Full GGUF Builder with Mixed F32 + Q8 Tensors
 # ===----------------------------------------------------------------------=== #
 
-fn _build_mixed_gguf() raises -> List[UInt8]:
+def _build_mixed_gguf() raises -> List[UInt8]:
     """Build GGUF with F32 embed/norm/lm_head + Q8_0 projection weights.
 
     Model: 1 layer, hidden=4, heads=2, kv_heads=1, head_dim=2, ffn=8, vocab=8
@@ -445,7 +445,7 @@ fn _build_mixed_gguf() raises -> List[UInt8]:
     return buf^
 
 
-fn test_load_direct_q8_embed_f32() raises:
+def test_load_direct_q8_embed_f32() raises:
     """F32 embed loads correctly alongside Q8 projections."""
     var buf = _build_mixed_gguf()
     var buf2 = buf.copy()
@@ -469,7 +469,7 @@ fn test_load_direct_q8_embed_f32() raises:
     print("  load_direct_q8_embed_f32: PASS")
 
 
-fn test_load_direct_q8_from_buffer() raises:
+def test_load_direct_q8_from_buffer() raises:
     """Full GGUF buffer with Q8 projection + F32 embed -> QuantizedModel with correct weights."""
     var buf = _build_mixed_gguf()
     var model = load_gguf_quantized_direct_from_buffer(buf^, block_size=32)
@@ -496,7 +496,7 @@ fn test_load_direct_q8_from_buffer() raises:
     print("  load_direct_q8_from_buffer: PASS")
 
 
-fn test_direct_vs_roundtrip_equivalence() raises:
+def test_direct_vs_roundtrip_equivalence() raises:
     """Compare direct Q8 loading vs load-as-F32 + quantize_from_model.
 
     For the roundtrip path (F32 GGUF), both should produce identical results
@@ -536,7 +536,7 @@ fn test_direct_vs_roundtrip_equivalence() raises:
     print("  direct_vs_roundtrip_equivalence: PASS")
 
 
-fn test_direct_q8_generates() raises:
+def test_direct_q8_generates() raises:
     """Loaded model can run forward pass and produce valid token IDs."""
     var buf = _build_mixed_gguf()
     var model = load_gguf_quantized_direct_from_buffer(buf^, block_size=32)
@@ -559,7 +559,7 @@ fn test_direct_q8_generates() raises:
 # All-F32 GGUF for equivalence testing
 # ===----------------------------------------------------------------------=== #
 
-fn _build_all_f32_gguf() raises -> List[UInt8]:
+def _build_all_f32_gguf() raises -> List[UInt8]:
     """Build all-F32 GGUF for equivalence testing (same architecture as mixed).
 
     Model: 1 layer, hidden=4, heads=2, kv_heads=1, head_dim=2, ffn=8, vocab=8
@@ -779,7 +779,7 @@ fn _build_all_f32_gguf() raises -> List[UInt8]:
     return buf^
 
 
-fn test_all_f32_gguf_basic_load() raises:
+def test_all_f32_gguf_basic_load() raises:
     """Diagnostic: verify the all-F32 GGUF loads correctly."""
     var buf = _build_all_f32_gguf()
     var buf2 = buf.copy()
@@ -813,7 +813,7 @@ fn test_all_f32_gguf_basic_load() raises:
     print("  all_f32_gguf_basic_load: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_direct_q8_loading:")
 
     test_read_q8_0_as_quantized_basic()

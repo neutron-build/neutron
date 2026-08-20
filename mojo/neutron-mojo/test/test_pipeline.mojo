@@ -4,7 +4,7 @@
 
 """Tests for the unified generation pipeline and chat templates."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
@@ -22,12 +22,12 @@ from neutron_mojo.model.config import ModelConfig
 from neutron_mojo.model.populate import model_from_config, load_named_weight
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -35,7 +35,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
         )
 
 
-fn assert_eq_str(a: String, b: String, msg: String) raises:
+def assert_eq_str(a: String, b: String, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -43,7 +43,7 @@ fn assert_eq_str(a: String, b: String, msg: String) raises:
         )
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg
@@ -55,7 +55,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helper: build a tiny model + tokenizer for pipeline testing
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() raises -> Model:
+def _build_tiny_model() raises -> Model:
     """Create a tiny model with populated weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -133,7 +133,7 @@ fn _build_tiny_model() raises -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build a tiny tokenizer whose vocab matches tiny_test_params vocab_size=8."""
     var tok = BPETokenizer()
     _ = tok.add_special_token("<s>", "bos")     # 0
@@ -151,7 +151,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_pipeline_config_defaults() raises:
+def test_pipeline_config_defaults() raises:
     """Test PipelineConfig has correct defaults."""
     var cfg = PipelineConfig()
 
@@ -179,7 +179,7 @@ fn test_pipeline_config_defaults() raises:
     print("  pipeline_config_defaults: PASS")
 
 
-fn test_pipeline_generate_basic() raises:
+def test_pipeline_generate_basic() raises:
     """Test basic pipeline generation with a tiny model."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -190,12 +190,12 @@ fn test_pipeline_generate_basic() raises:
     var result = pipeline_generate(model, tok, "ab", cfg)
 
     # Should produce a non-empty string
-    assert_true(len(result) > 0, "non-empty output")
+    assert_true(result.byte_length() > 0, "non-empty output")
 
     print("  pipeline_generate_basic: PASS")
 
 
-fn test_pipeline_with_eos_stopping() raises:
+def test_pipeline_with_eos_stopping() raises:
     """Test that pipeline stops at EOS token."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -208,12 +208,12 @@ fn test_pipeline_with_eos_stopping() raises:
 
     # Just verify it doesn't crash and returns something
     # (with random-ish weights, we can't predict if EOS will be hit)
-    assert_true(len(result) >= 0, "valid output")
+    assert_true(result.byte_length() >= 0, "valid output")
 
     print("  pipeline_with_eos_stopping: PASS")
 
 
-fn test_pipeline_with_repetition_penalty() raises:
+def test_pipeline_with_repetition_penalty() raises:
     """Test pipeline with repetition penalty enabled."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -224,12 +224,12 @@ fn test_pipeline_with_repetition_penalty() raises:
 
     var result = pipeline_generate(model, tok, "a", cfg)
     # Just verify it runs without error
-    assert_true(len(result) >= 0, "rep penalty output")
+    assert_true(result.byte_length() >= 0, "rep penalty output")
 
     print("  pipeline_with_repetition_penalty: PASS")
 
 
-fn test_pipeline_with_chat_template() raises:
+def test_pipeline_with_chat_template() raises:
     """Test pipeline with llama chat template."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -240,12 +240,12 @@ fn test_pipeline_with_chat_template() raises:
 
     var result = pipeline_generate(model, tok, "ab", cfg)
     # Should produce some output (template adds extra tokens around prompt)
-    assert_true(len(result) >= 0, "chat template output")
+    assert_true(result.byte_length() >= 0, "chat template output")
 
     print("  pipeline_with_chat_template: PASS")
 
 
-fn test_format_llama_basic() raises:
+def test_format_llama_basic() raises:
     """Test Llama template formatting without system prompt."""
     var result = format_llama("Hello", "")
     assert_eq_str(result, "[INST] Hello [/INST]", "llama basic")
@@ -253,12 +253,12 @@ fn test_format_llama_basic() raises:
     print("  format_llama_basic: PASS")
 
 
-fn test_format_llama_with_system() raises:
+def test_format_llama_with_system() raises:
     """Test Llama template formatting with system prompt."""
     var result = format_llama("Hello", "You are helpful.")
     assert_true(
-        len(result) > 0
-        and result[:8] == "<<SYS>>\n",
+        result.byte_length() > 0
+        and result[byte=:8] == "<<SYS>>\n",
         "llama system starts with <<SYS>>",
     )
     assert_true(
@@ -269,11 +269,11 @@ fn test_format_llama_with_system() raises:
     print("  format_llama_with_system: PASS")
 
 
-fn test_format_chatml() raises:
+def test_format_chatml() raises:
     """Test ChatML template formatting."""
     var result = format_chatml("Hello", "")
     assert_true(
-        result[:15] == "<|im_start|>use",
+        result[byte=:15] == "<|im_start|>use",
         "chatml starts with im_start user",
     )
     assert_true(
@@ -284,14 +284,14 @@ fn test_format_chatml() raises:
     # With system prompt
     var result2 = format_chatml("Hello", "You are helpful.")
     assert_true(
-        result2[:15] == "<|im_start|>sys",
+        result2[byte=:15] == "<|im_start|>sys",
         "chatml sys starts with im_start system",
     )
 
     print("  format_chatml: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_pipeline:")
 
     test_pipeline_config_defaults()

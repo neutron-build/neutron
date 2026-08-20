@@ -12,7 +12,7 @@ All small value types use TrivialRegisterPassable for efficient
 pass-by-value semantics matching C ABI expectations.
 """
 
-from memory import UnsafePointer
+from std.memory import Pointer
 
 
 # ===----------------------------------------------------------------------=== #
@@ -64,22 +64,22 @@ struct DLDataType(Writable, TrivialRegisterPassable):
     var bits: UInt8
     var lanes: UInt16
 
-    fn __init__(out self, code: UInt8, bits: UInt8, lanes: UInt16):
+    def __init__(out self, code: UInt8, bits: UInt8, lanes: UInt16):
         self.code = code
         self.bits = bits
         self.lanes = lanes
 
-    fn __eq__(self, other: DLDataType) -> Bool:
+    def __eq__(self, other: DLDataType) -> Bool:
         return (
             self.code == other.code
             and self.bits == other.bits
             and self.lanes == other.lanes
         )
 
-    fn __ne__(self, other: DLDataType) -> Bool:
+    def __ne__(self, other: DLDataType) -> Bool:
         return not (self == other)
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write(
             "DLDataType(code=", self.code,
             ", bits=", self.bits,
@@ -98,20 +98,20 @@ struct DLDevice(Writable, TrivialRegisterPassable):
     var device_type: Int32
     var device_id: Int32
 
-    fn __init__(out self, device_type: Int32, device_id: Int32):
+    def __init__(out self, device_type: Int32, device_id: Int32):
         self.device_type = device_type
         self.device_id = device_id
 
-    fn __eq__(self, other: DLDevice) -> Bool:
+    def __eq__(self, other: DLDevice) -> Bool:
         return (
             self.device_type == other.device_type
             and self.device_id == other.device_id
         )
 
-    fn __ne__(self, other: DLDevice) -> Bool:
+    def __ne__(self, other: DLDevice) -> Bool:
         return not (self == other)
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write(
             "DLDevice(type=", self.device_type,
             ", id=", self.device_id, ")",
@@ -129,17 +129,17 @@ struct DLPackVersion(Writable, TrivialRegisterPassable):
     var major: UInt32
     var minor: UInt32
 
-    fn __init__(out self, major: UInt32, minor: UInt32):
+    def __init__(out self, major: UInt32, minor: UInt32):
         self.major = major
         self.minor = minor
 
-    fn __eq__(self, other: DLPackVersion) -> Bool:
+    def __eq__(self, other: DLPackVersion) -> Bool:
         return self.major == other.major and self.minor == other.minor
 
-    fn __ne__(self, other: DLPackVersion) -> Bool:
+    def __ne__(self, other: DLPackVersion) -> Bool:
         return not (self == other)
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write(self.major, ".", self.minor)
 
 
@@ -159,32 +159,32 @@ struct DLTensor(ImplicitlyCopyable, Copyable, Movable):
     Strides are in elements, not bytes. NULL strides = C-contiguous.
     """
 
-    var data: UnsafePointer[UInt8, MutExternalOrigin]
+    var data: Optional[Pointer[UInt8, MutUntrackedOrigin]]
     var device: DLDevice
     var ndim: Int32
     var dtype: DLDataType
-    var shape: UnsafePointer[Int64, MutExternalOrigin]
-    var strides: UnsafePointer[Int64, MutExternalOrigin]
+    var shape: Optional[Pointer[Int64, MutUntrackedOrigin]]
+    var strides: Optional[Pointer[Int64, MutUntrackedOrigin]]
     var byte_offset: UInt64
 
-    fn __init__(out self):
+    def __init__(out self):
         """Create a zero-initialized DLTensor."""
-        self.data = UnsafePointer[UInt8, MutExternalOrigin]()
+        self.data = None
         self.device = DLDevice(kDLCPU, 0)
         self.ndim = 0
         self.dtype = DLDataType(kDLFloat, 32, 1)
-        self.shape = UnsafePointer[Int64, MutExternalOrigin]()
-        self.strides = UnsafePointer[Int64, MutExternalOrigin]()
+        self.shape = None
+        self.strides = None
         self.byte_offset = 0
 
-    fn __init__(
+    def __init__(
         out self,
-        data: UnsafePointer[UInt8, MutExternalOrigin],
+        data: Optional[Pointer[UInt8, MutUntrackedOrigin]],
         device: DLDevice,
         ndim: Int32,
         dtype: DLDataType,
-        shape: UnsafePointer[Int64, MutExternalOrigin],
-        strides: UnsafePointer[Int64, MutExternalOrigin],
+        shape: Optional[Pointer[Int64, MutUntrackedOrigin]],
+        strides: Optional[Pointer[Int64, MutUntrackedOrigin]],
         byte_offset: UInt64,
     ):
         self.data = data
@@ -195,23 +195,23 @@ struct DLTensor(ImplicitlyCopyable, Copyable, Movable):
         self.strides = strides
         self.byte_offset = byte_offset
 
-    fn __copyinit__(out self, other: Self):
-        self.data = other.data
-        self.device = other.device
-        self.ndim = other.ndim
-        self.dtype = other.dtype
-        self.shape = other.shape
-        self.strides = other.strides
-        self.byte_offset = other.byte_offset
+    def __init__(out self, *, copy: Self):
+        self.data = copy.data
+        self.device = copy.device
+        self.ndim = copy.ndim
+        self.dtype = copy.dtype
+        self.shape = copy.shape
+        self.strides = copy.strides
+        self.byte_offset = copy.byte_offset
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data = other.data
-        self.device = other.device
-        self.ndim = other.ndim
-        self.dtype = other.dtype
-        self.shape = other.shape
-        self.strides = other.strides
-        self.byte_offset = other.byte_offset
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
+        self.device = move.device^
+        self.ndim = move.ndim^
+        self.dtype = move.dtype^
+        self.shape = move.shape^
+        self.strides = move.strides^
+        self.byte_offset = move.byte_offset^
 
 
 # ===----------------------------------------------------------------------=== #
@@ -232,38 +232,38 @@ struct DLManagedTensorVersioned(ImplicitlyCopyable, Copyable, Movable):
     """
 
     var version: DLPackVersion
-    var manager_ctx: UnsafePointer[UInt8, MutExternalOrigin]
-    var deleter_ctx: UnsafePointer[UInt8, MutExternalOrigin]
+    var manager_ctx: Optional[Pointer[UInt8, MutUntrackedOrigin]]
+    var deleter_ctx: Optional[Pointer[UInt8, MutUntrackedOrigin]]
     var flags: UInt64
     var dl_tensor: DLTensor
 
-    fn __init__(out self):
+    def __init__(out self):
         """Create a zero-initialized managed tensor."""
         self.version = DLPACK_VERSION
-        self.manager_ctx = UnsafePointer[UInt8, MutExternalOrigin]()
-        self.deleter_ctx = UnsafePointer[UInt8, MutExternalOrigin]()
+        self.manager_ctx = None
+        self.deleter_ctx = None
         self.flags = 0
         self.dl_tensor = DLTensor()
 
-    fn __copyinit__(out self, other: Self):
-        self.version = other.version
-        self.manager_ctx = other.manager_ctx
-        self.deleter_ctx = other.deleter_ctx
-        self.flags = other.flags
-        self.dl_tensor = other.dl_tensor
+    def __init__(out self, *, copy: Self):
+        self.version = copy.version
+        self.manager_ctx = copy.manager_ctx
+        self.deleter_ctx = copy.deleter_ctx
+        self.flags = copy.flags
+        self.dl_tensor = copy.dl_tensor
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.version = other.version
-        self.manager_ctx = other.manager_ctx
-        self.deleter_ctx = other.deleter_ctx
-        self.flags = other.flags
-        self.dl_tensor = other.dl_tensor
+    def __init__(out self, *, deinit move: Self):
+        self.version = move.version^
+        self.manager_ctx = move.manager_ctx^
+        self.deleter_ctx = move.deleter_ctx^
+        self.flags = move.flags^
+        self.dl_tensor = move.dl_tensor^
 
-    fn is_read_only(self) -> Bool:
+    def is_read_only(self) -> Bool:
         """Check if the read-only flag is set."""
         return (self.flags & DLPACK_FLAG_BITMASK_READ_ONLY) != 0
 
-    fn is_copied(self) -> Bool:
+    def is_copied(self) -> Bool:
         """Check if the is-copied flag is set."""
         return (self.flags & DLPACK_FLAG_BITMASK_IS_COPIED) != 0
 
@@ -273,7 +273,7 @@ struct DLManagedTensorVersioned(ImplicitlyCopyable, Copyable, Movable):
 # ===----------------------------------------------------------------------=== #
 
 
-fn mojo_dtype_to_dl(dtype: DType) -> DLDataType:
+def mojo_dtype_to_dl(dtype: DType) -> DLDataType:
     """Convert a Mojo DType to a DLPack DLDataType."""
     if dtype == DType.bool:
         return DLDataType(kDLBool, 8, 1)
@@ -305,10 +305,10 @@ fn mojo_dtype_to_dl(dtype: DType) -> DLDataType:
     return DLDataType(0, 0, 0)
 
 
-fn dl_to_mojo_dtype(dl: DLDataType) -> DType:
+def dl_to_mojo_dtype(dl: DLDataType) raises -> DType:
     """Convert a DLPack DLDataType back to a Mojo DType.
 
-    Returns DType.invalid for unrecognized combinations.
+    Raises an error for unrecognized combinations.
     """
     var code = dl.code
     var bits = Int(dl.bits)
@@ -342,4 +342,4 @@ fn dl_to_mojo_dtype(dl: DLDataType) -> DType:
             return DType.uint32
         if bits == 64:
             return DType.uint64
-    return DType.invalid
+    raise Error("unsupported DLDataType code / bit-width combination")

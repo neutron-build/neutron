@@ -12,12 +12,12 @@ from neutron_mojo.io.safetensors import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_tensor_info_creation() raises:
+def test_tensor_info_creation() raises:
     """Test TensorInfo struct creation."""
     var info = TensorInfo()
     info.dtype = String("F32")
@@ -33,7 +33,7 @@ fn test_tensor_info_creation() raises:
     print("  tensor_info_creation: PASS")
 
 
-fn test_tensor_info_shape() raises:
+def test_tensor_info_shape() raises:
     """Test TensorInfo shape calculations."""
     var info = TensorInfo()
     info.shape = List[Int]()
@@ -46,7 +46,7 @@ fn test_tensor_info_shape() raises:
     print("  tensor_info_shape: PASS")
 
 
-fn test_safetensors_file_creation() raises:
+def test_safetensors_file_creation() raises:
     """Test SafeTensorsFile struct creation."""
     var st = SafeTensorsFile()
 
@@ -56,7 +56,7 @@ fn test_safetensors_file_creation() raises:
     print("  safetensors_file_creation: PASS")
 
 
-fn test_safetensors_register_tensor() raises:
+def test_safetensors_register_tensor() raises:
     """Test manual tensor registration."""
     var st = SafeTensorsFile()
 
@@ -72,7 +72,7 @@ fn test_safetensors_register_tensor() raises:
     print("  safetensors_register_tensor: PASS")
 
 
-fn test_safetensors_get_tensor_info() raises:
+def test_safetensors_get_tensor_info() raises:
     """Test getting tensor metadata."""
     var st = SafeTensorsFile()
 
@@ -92,7 +92,7 @@ fn test_safetensors_get_tensor_info() raises:
     print("  safetensors_get_tensor_info: PASS")
 
 
-fn test_safetensors_get_tensor_size() raises:
+def test_safetensors_get_tensor_size() raises:
     """Test getting tensor size."""
     var st = SafeTensorsFile()
 
@@ -107,7 +107,7 @@ fn test_safetensors_get_tensor_size() raises:
     print("  safetensors_get_tensor_size: PASS")
 
 
-fn test_safetensors_data_offset() raises:
+def test_safetensors_data_offset() raises:
     """Test calculating absolute data offset."""
     var st = SafeTensorsFile()
     st.data_offset = 1000  # Simulate header + metadata size
@@ -123,7 +123,7 @@ fn test_safetensors_data_offset() raises:
     print("  safetensors_data_offset: PASS")
 
 
-fn test_parse_dtype_string() raises:
+def test_parse_dtype_string() raises:
     """Test parsing dtype strings."""
     var dt_f32 = parse_dtype_string("F32")
     var dt_f16 = parse_dtype_string("F16")
@@ -136,7 +136,7 @@ fn test_parse_dtype_string() raises:
     print("  parse_dtype_string: PASS")
 
 
-fn test_dtype_to_safetensors() raises:
+def test_dtype_to_safetensors() raises:
     """Test converting DType to SafeTensors string."""
     var str_f32 = dtype_to_safetensors(DType.float32)
     var str_f16 = dtype_to_safetensors(DType.float16)
@@ -149,7 +149,7 @@ fn test_dtype_to_safetensors() raises:
     print("  dtype_to_safetensors: PASS")
 
 
-fn test_multiple_tensors() raises:
+def test_multiple_tensors() raises:
     """Test registering multiple tensors."""
     var st = SafeTensorsFile()
 
@@ -178,7 +178,7 @@ fn test_multiple_tensors() raises:
     print("  multiple_tensors: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_safetensors:")
 
     test_tensor_info_creation()

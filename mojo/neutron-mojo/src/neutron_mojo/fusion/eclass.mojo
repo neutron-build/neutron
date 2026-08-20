@@ -8,7 +8,7 @@ Implements path-compressed union-find to efficiently manage equivalence classes
 of graph nodes. This is the core data structure for the e-graph rewrite engine.
 """
 
-from collections import List, Optional
+from std.collections import List, Optional
 
 # ===----------------------------------------------------------------------=== #
 # ClassId — Reference to an equivalence class
@@ -18,19 +18,19 @@ struct ClassId(Writable, TrivialRegisterPassable):
     """Reference to an equivalence class."""
     var _id: Int
 
-    fn __init__(out self, id: Int):
+    def __init__(out self, id: Int):
         self._id = id
 
-    fn __eq__(self, other: ClassId) -> Bool:
+    def __eq__(self, other: ClassId) -> Bool:
         return self._id == other._id
 
-    fn __ne__(self, other: ClassId) -> Bool:
+    def __ne__(self, other: ClassId) -> Bool:
         return self._id != other._id
 
-    fn id(self) -> Int:
+    def id(self) -> Int:
         return self._id
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write("c")
         writer.write(String(self._id))
 
@@ -50,11 +50,11 @@ struct UnionFind:
     var _parent: List[Int]
     var _rank: List[Int]  # For union by rank optimization
 
-    fn __init__(out self):
+    def __init__(out self):
         self._parent = List[Int]()
         self._rank = List[Int]()
 
-    fn make_set(mut self) -> ClassId:
+    def make_set(mut self) -> ClassId:
         """Create a new singleton equivalence class.
 
         Returns the ClassId of the new class.
@@ -64,7 +64,7 @@ struct UnionFind:
         self._rank.append(0)
         return ClassId(id)
 
-    fn find(mut self, id: ClassId) -> ClassId:
+    def find(mut self, id: ClassId) -> ClassId:
         """Find the canonical representative of the equivalence class.
 
         Applies path compression: all nodes on the path to the root are
@@ -82,7 +82,7 @@ struct UnionFind:
             self._parent[idx] = self.find(ClassId(self._parent[idx])).id()
         return ClassId(self._parent[idx])
 
-    fn merge(mut self, id1: ClassId, id2: ClassId) -> ClassId:
+    def merge(mut self, id1: ClassId, id2: ClassId) -> ClassId:
         """Merge two equivalence classes.
 
         Uses union by rank to keep trees balanced. Returns the canonical
@@ -118,7 +118,7 @@ struct UnionFind:
             self._rank[r1] += 1
             return root1
 
-    fn in_same_class(mut self, id1: ClassId, id2: ClassId) -> Bool:
+    def in_same_class(mut self, id1: ClassId, id2: ClassId) -> Bool:
         """Check if two ClassIds are in the same equivalence class.
 
         Args:
@@ -130,7 +130,7 @@ struct UnionFind:
         """
         return self.find(id1) == self.find(id2)
 
-    fn size(self) -> Int:
+    def size(self) -> Int:
         """Return the number of equivalence classes (including merged ones).
 
         Note: This is the total number of make_set calls, not the number of
@@ -143,7 +143,7 @@ struct UnionFind:
 # EClass — Equivalence class of graph nodes
 # ===----------------------------------------------------------------------=== #
 
-struct EClass(Copyable, Movable):
+struct EClass(Copyable, Movable, ImplicitlyCopyable):
     """Equivalence class of graph nodes.
 
     An e-class represents a set of e-nodes that are known to be equivalent
@@ -153,21 +153,21 @@ struct EClass(Copyable, Movable):
     var id: ClassId
     var nodes: List[Int]  # Indices into the global node list
 
-    fn __init__(out self, id: ClassId):
+    def __init__(out self, id: ClassId):
         self.id = id
         self.nodes = List[Int]()
 
-    fn __copyinit__(out self, existing: Self):
-        self.id = existing.id
-        self.nodes = existing.nodes.copy()
+    def __init__(out self, *, copy: Self):
+        self.id = copy.id
+        self.nodes = copy.nodes.copy()
 
-    fn copy(self) -> EClass:
+    def copy(self) -> EClass:
         """Return a deep copy of this e-class."""
         var ec = EClass(self.id)
         ec.nodes = self.nodes.copy()
         return ec^
 
-    fn add_node(mut self, node_idx: Int):
+    def add_node(mut self, node_idx: Int):
         """Add a node to this equivalence class.
 
         Args:
@@ -175,6 +175,6 @@ struct EClass(Copyable, Movable):
         """
         self.nodes.append(node_idx)
 
-    fn size(self) -> Int:
+    def size(self) -> Int:
         """Return the number of nodes in this e-class."""
         return len(self.nodes)

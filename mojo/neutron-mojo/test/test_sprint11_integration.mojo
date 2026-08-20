@@ -5,8 +5,8 @@
 """End-to-end tests: GGUF -> quantize -> q_pipeline_generate -> text.
 Also: benchmark FP32 vs Q8 pipeline tokens/sec."""
 
-from math import abs
-from time import perf_counter_ns
+from std.math import abs
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.io.gguf import (
@@ -36,12 +36,12 @@ from neutron_mojo.nn.pipeline import (
 from neutron_mojo.nn.q_pipeline import q_pipeline_generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -53,7 +53,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # GGUF + Tokenizer Builder
 # ===----------------------------------------------------------------------=== #
 
-fn _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[String]):
+def _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[String]):
     """Write a string array metadata entry."""
     _write_string_gguf(buf, key)
     _write_u32_le(buf, 9)   # GGUF_TYPE_ARRAY
@@ -63,7 +63,7 @@ fn _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[Stri
         _write_string_gguf(buf, values[i])
 
 
-fn _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
+def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     """Build complete GGUF with model tensors + tokenizer data (all F32).
 
     Model: 1 layer, hidden=4, heads=2, kv_heads=1, head_dim=2, ffn=8, vocab=16
@@ -282,7 +282,7 @@ fn _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     return buf^
 
 
-fn _load_tokenizer_from_gguf(mut buf: List[UInt8]) raises -> BPETokenizer:
+def _load_tokenizer_from_gguf(mut buf: List[UInt8]) raises -> BPETokenizer:
     """Load tokenizer from GGUF buffer."""
     var buf_copy = buf.copy()
     var gguf = parse_gguf_from_buffer(buf_copy^)
@@ -301,7 +301,7 @@ fn _load_tokenizer_from_gguf(mut buf: List[UInt8]) raises -> BPETokenizer:
 # Helpers for building models from tiny params
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -323,7 +323,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build a minimal tokenizer for testing (8 tokens, IDs 0-7)."""
     var tok = BPETokenizer()
     _ = tok.add_token("<s>")     # 0
@@ -344,7 +344,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Integration Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_q_pipeline_from_gguf() raises:
+def test_q_pipeline_from_gguf() raises:
     """Load GGUF (F32) -> quantize -> q_pipeline_generate -> non-empty text."""
     var buf = _build_full_gguf_with_tokenizer()
     var buf2 = buf.copy()
@@ -357,12 +357,12 @@ fn test_q_pipeline_from_gguf() raises:
     cfg.max_new_tokens = 5
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "q_pipeline from GGUF produces output")
+    assert_true(result.byte_length() >= 0, "q_pipeline from GGUF produces output")
 
     print("  q_pipeline_from_gguf: PASS")
 
 
-fn test_direct_q8_pipeline() raises:
+def test_direct_q8_pipeline() raises:
     """Direct Q8 GGUF -> q_pipeline_generate -> non-empty text."""
     var buf = _build_full_gguf_with_tokenizer()
     var buf2 = buf.copy()
@@ -375,12 +375,12 @@ fn test_direct_q8_pipeline() raises:
     cfg.max_new_tokens = 5
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "direct Q8 pipeline produces output")
+    assert_true(result.byte_length() >= 0, "direct Q8 pipeline produces output")
 
     print("  direct_q8_pipeline: PASS")
 
 
-fn test_fp32_vs_q8_pipeline_output() raises:
+def test_fp32_vs_q8_pipeline_output() raises:
     """Both pipelines run on same model, both produce valid output."""
     var buf = _build_full_gguf_with_tokenizer()
     var buf2 = buf.copy()
@@ -399,13 +399,13 @@ fn test_fp32_vs_q8_pipeline_output() raises:
     var fp32_result = pipeline_generate(fp32_model2, tok, "ab", cfg)
     var q8_result = q_pipeline_generate(qm, tok, "ab", cfg)
 
-    assert_true(len(fp32_result) >= 0, "fp32 pipeline output valid")
-    assert_true(len(q8_result) >= 0, "q8 pipeline output valid")
+    assert_true(fp32_result.byte_length() >= 0, "fp32 pipeline output valid")
+    assert_true(q8_result.byte_length() >= 0, "q8 pipeline output valid")
 
     print("  fp32_vs_q8_pipeline_output: PASS")
 
 
-fn test_direct_q8_with_chat_template() raises:
+def test_direct_q8_with_chat_template() raises:
     """Direct loaded Q8 model + llama template -> generates text."""
     var buf = _build_full_gguf_with_tokenizer()
     var buf2 = buf.copy()
@@ -418,12 +418,12 @@ fn test_direct_q8_with_chat_template() raises:
     cfg.chat_template = String("llama")
 
     var result = q_pipeline_generate(qm, tok, "hello", cfg)
-    assert_true(len(result) >= 0, "direct Q8 with chat template works")
+    assert_true(result.byte_length() >= 0, "direct Q8 with chat template works")
 
     print("  direct_q8_with_chat_template: PASS")
 
 
-fn test_direct_q8_with_penalties() raises:
+def test_direct_q8_with_penalties() raises:
     """Repetition + frequency penalties work with direct-loaded model."""
     var buf = _build_full_gguf_with_tokenizer()
     var buf2 = buf.copy()
@@ -438,7 +438,7 @@ fn test_direct_q8_with_penalties() raises:
     cfg.presence_penalty = 0.2
 
     var result = q_pipeline_generate(qm, tok, "abc", cfg)
-    assert_true(len(result) >= 0, "penalties work with direct Q8")
+    assert_true(result.byte_length() >= 0, "penalties work with direct Q8")
 
     print("  direct_q8_with_penalties: PASS")
 
@@ -447,7 +447,7 @@ fn test_direct_q8_with_penalties() raises:
 # Benchmarks
 # ===----------------------------------------------------------------------=== #
 
-fn test_benchmark_fp32() raises:
+def test_benchmark_fp32() raises:
     """Time FP32 generation, print tokens/sec."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -465,7 +465,7 @@ fn test_benchmark_fp32() raises:
     print("  benchmark_fp32: " + String(Int(tokens_per_sec)) + " tok/s (" + String(Int(elapsed_ms)) + " ms for 20 tokens): PASS")
 
 
-fn test_benchmark_q8() raises:
+def test_benchmark_q8() raises:
     """Time Q8 generation, print tokens/sec."""
     var model = _build_tiny_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -484,7 +484,7 @@ fn test_benchmark_q8() raises:
     print("  benchmark_q8: " + String(Int(tokens_per_sec)) + " tok/s (" + String(Int(elapsed_ms)) + " ms for 20 tokens): PASS")
 
 
-fn test_benchmark_comparison() raises:
+def test_benchmark_comparison() raises:
     """Run both benchmarks and print speedup ratio."""
     var model = _build_tiny_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -521,7 +521,7 @@ fn test_benchmark_comparison() raises:
     print("    PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sprint11_integration:")
 
     test_q_pipeline_from_gguf()

@@ -13,24 +13,24 @@ from neutron_mojo.python.hf import (
     hf_available, hf_download, hf_list_files, hf_find_gguf,
     hf_find_safetensors, _ends_with, _contains,
 )
+from std.python import Python
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn python_available() -> Bool:
+def python_available() -> Bool:
     """Check if Python runtime is available."""
     try:
-        from python import Python
         _ = Python.import_module("builtins")
         return True
     except:
         return False
 
 
-fn test_ends_with() raises:
+def test_ends_with() raises:
     """String suffix matching."""
     assert_true(_ends_with("model.gguf", ".gguf"), "Should match .gguf suffix")
     assert_true(_ends_with("weights.safetensors", ".safetensors"), "Should match .safetensors")
@@ -41,7 +41,7 @@ fn test_ends_with() raises:
     print("  ends_with: PASS")
 
 
-fn test_contains() raises:
+def test_contains() raises:
     """String contains matching."""
     assert_true(_contains("hello world", "world"), "Should contain 'world'")
     assert_true(_contains("model.gguf", ".gguf"), "Should contain '.gguf'")
@@ -51,7 +51,7 @@ fn test_contains() raises:
     print("  contains: PASS")
 
 
-fn test_hf_available_check() raises:
+def test_hf_available_check() raises:
     """Check hf_available doesn't crash."""
     if not python_available():
         print("  hf_available_check: SKIP (no Python)")
@@ -60,7 +60,7 @@ fn test_hf_available_check() raises:
     print("  hf_available_check: " + String(avail) + " PASS")
 
 
-fn test_hf_download_missing_hub() raises:
+def test_hf_download_missing_hub() raises:
     """Download should raise if huggingface_hub not installed."""
     if not python_available():
         print("  hf_download_missing_hub: SKIP (no Python)")
@@ -77,7 +77,7 @@ fn test_hf_download_missing_hub() raises:
     print("  hf_download_missing_hub: PASS")
 
 
-fn test_hf_list_files_missing_hub() raises:
+def test_hf_list_files_missing_hub() raises:
     """List files should raise if huggingface_hub not installed."""
     if not python_available():
         print("  hf_list_files_missing_hub: SKIP (no Python)")
@@ -94,7 +94,7 @@ fn test_hf_list_files_missing_hub() raises:
     print("  hf_list_files_missing_hub: PASS")
 
 
-fn test_find_gguf_pattern() raises:
+def test_find_gguf_pattern() raises:
     """Find GGUF by extension matching logic."""
     # Test _ends_with which is the core of hf_find_gguf
     assert_true(_ends_with("model-q4_k.gguf", ".gguf"), "Q4_K GGUF")
@@ -104,7 +104,7 @@ fn test_find_gguf_pattern() raises:
     print("  find_gguf_pattern: PASS")
 
 
-fn test_find_safetensors_pattern() raises:
+def test_find_safetensors_pattern() raises:
     """Find SafeTensors by extension matching logic."""
     assert_true(_ends_with("model.safetensors", ".safetensors"), "SafeTensors")
     assert_true(_ends_with("model-00001-of-00003.safetensors", ".safetensors"), "Sharded SafeTensors")
@@ -112,7 +112,7 @@ fn test_find_safetensors_pattern() raises:
     print("  find_safetensors_pattern: PASS")
 
 
-fn test_various_gguf_names() raises:
+def test_various_gguf_names() raises:
     """Various GGUF filename patterns."""
     var names = List[String]()
     names.append("model.gguf")
@@ -125,7 +125,7 @@ fn test_various_gguf_names() raises:
     print("  various_gguf_names: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_hf_loader")
     # Pure logic tests (no Python required)
     test_ends_with()

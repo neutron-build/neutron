@@ -19,7 +19,7 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
@@ -28,7 +28,7 @@ fn assert_true(cond: Bool, msg: String) raises:
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     var params = tiny_test_params()
     var model = Model(params)
     var total = model.layer_weights.numel()
@@ -45,7 +45,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     var tok = BPETokenizer()
     _ = tok.add_special_token("<bos>", "bos")
     _ = tok.add_special_token("<eos>", "eos")
@@ -60,7 +60,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Memory Estimation Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_memory_estimate_creation() raises:
+def test_memory_estimate_creation() raises:
     """Test MemoryEstimate default construction."""
     var est = MemoryEstimate()
     assert_true(est.total_bytes == 0, "Default total should be 0")
@@ -68,7 +68,7 @@ fn test_memory_estimate_creation() raises:
     print("  memory_estimate_creation: PASS")
 
 
-fn test_estimate_memory_tiny() raises:
+def test_estimate_memory_tiny() raises:
     """Test memory estimation for tiny model."""
     var params = tiny_test_params()
     var est = estimate_memory(params)
@@ -89,7 +89,7 @@ fn test_estimate_memory_tiny() raises:
     print("  estimate_memory_tiny: PASS")
 
 
-fn test_estimate_memory_batch() raises:
+def test_estimate_memory_batch() raises:
     """Test that batch size scales KV cache memory."""
     var params = tiny_test_params()
     var est1 = estimate_memory(params, batch_size=1)
@@ -106,7 +106,7 @@ fn test_estimate_memory_batch() raises:
     print("  estimate_memory_batch: PASS")
 
 
-fn test_estimate_memory_seq_len() raises:
+def test_estimate_memory_seq_len() raises:
     """Test that sequence length scales KV cache memory."""
     var params = tiny_test_params()
     var est_256 = estimate_memory(params, seq_len=256)
@@ -118,7 +118,7 @@ fn test_estimate_memory_seq_len() raises:
     print("  estimate_memory_seq_len: PASS")
 
 
-fn test_estimate_memory_q8() raises:
+def test_estimate_memory_q8() raises:
     """Test Q8 (1 byte per param) memory estimation."""
     var params = tiny_test_params()
     var est_fp32 = estimate_memory(params, bytes_per_param=4)
@@ -131,7 +131,7 @@ fn test_estimate_memory_q8() raises:
     print("  estimate_memory_q8: PASS")
 
 
-fn test_estimate_memory_realistic() raises:
+def test_estimate_memory_realistic() raises:
     """Test memory estimation for a realistic-sized model config."""
     var params = ModelParams()  # Default: 32-layer, 4096 hidden
     var est = estimate_memory(params, batch_size=1, seq_len=2048)
@@ -150,7 +150,7 @@ fn test_estimate_memory_realistic() raises:
 # Model Info Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_model_info_tiny() raises:
+def test_model_info_tiny() raises:
     """Test model info for tiny model."""
     var params = tiny_test_params()
     var info = model_info(params)
@@ -168,13 +168,13 @@ fn test_model_info_tiny() raises:
     print("  model_info_tiny: PASS")
 
 
-fn test_model_info_summary() raises:
+def test_model_info_summary() raises:
     """Test model info summary string."""
     var params = tiny_test_params()
     var info = model_info(params)
     var s = info.summary()
 
-    assert_true(len(s) > 50, "Summary should be non-trivial")
+    assert_true(s.byte_length() > 50, "Summary should be non-trivial")
     # Check key content is present
     assert_true(s.find("Layers: 2") >= 0, "Should mention 2 layers")
     assert_true(s.find("GQA") >= 0, "Should mention GQA")
@@ -182,7 +182,7 @@ fn test_model_info_summary() raises:
     print("  model_info_summary: PASS")
 
 
-fn test_model_info_non_gqa() raises:
+def test_model_info_non_gqa() raises:
     """Test model info for non-GQA model (MHA)."""
     var params = ModelParams()
     params.num_q_heads = 8
@@ -199,7 +199,7 @@ fn test_model_info_non_gqa() raises:
 # Benchmark Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_benchmark_result_creation() raises:
+def test_benchmark_result_creation() raises:
     """Test BenchmarkResult default values."""
     var r = BenchmarkResult()
     assert_true(r.prefill_tokens == 0, "Default prefill should be 0")
@@ -208,7 +208,7 @@ fn test_benchmark_result_creation() raises:
     print("  benchmark_result_creation: PASS")
 
 
-fn test_benchmark_inference_batch() raises:
+def test_benchmark_inference_batch() raises:
     """Test benchmark with batch prefill."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -224,7 +224,7 @@ fn test_benchmark_inference_batch() raises:
     print("  benchmark_inference_batch: PASS")
 
 
-fn test_benchmark_inference_sequential() raises:
+def test_benchmark_inference_sequential() raises:
     """Test benchmark with sequential prefill."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -238,7 +238,7 @@ fn test_benchmark_inference_sequential() raises:
     print("  benchmark_inference_sequential: PASS")
 
 
-fn test_benchmark_result_summary() raises:
+def test_benchmark_result_summary() raises:
     """Test benchmark result summary formatting."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -246,7 +246,7 @@ fn test_benchmark_result_summary() raises:
     var result = benchmark_inference(model, tok, "ab", max_tokens=2)
     var s = result.summary()
 
-    assert_true(len(s) > 50, "Summary should be non-trivial")
+    assert_true(s.byte_length() > 50, "Summary should be non-trivial")
     assert_true(s.find("Prefill") >= 0, "Should mention Prefill")
     assert_true(s.find("Decode") >= 0, "Should mention Decode")
     assert_true(s.find("tok/s") >= 0, "Should show tok/s")
@@ -254,14 +254,14 @@ fn test_benchmark_result_summary() raises:
     print("  benchmark_result_summary: PASS")
 
 
-fn test_benchmark_comparison() raises:
+def test_benchmark_comparison() raises:
     """Test prefill comparison utility."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
 
     var s = benchmark_prefill_comparison(model, tok, "ab")
 
-    assert_true(len(s) > 50, "Comparison should be non-trivial")
+    assert_true(s.byte_length() > 50, "Comparison should be non-trivial")
     assert_true(s.find("Sequential") >= 0, "Should mention Sequential")
     assert_true(s.find("Batch") >= 0, "Should mention Batch")
     assert_true(s.find("Speedup") >= 0, "Should mention Speedup")
@@ -269,7 +269,7 @@ fn test_benchmark_comparison() raises:
     print("  benchmark_comparison: PASS")
 
 
-fn test_memory_estimate_copy() raises:
+def test_memory_estimate_copy() raises:
     """Test MemoryEstimate copy semantics."""
     var est1 = estimate_memory(tiny_test_params())
     var est2 = est1.copy()
@@ -284,7 +284,7 @@ fn test_memory_estimate_copy() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_bench:")
 
     # Memory estimation

@@ -14,19 +14,19 @@ from neutron_mojo.train.trainable import (
 from neutron_mojo.train.losses import cross_entropy_loss
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_tracked_div_basic() raises:
+def test_tracked_div_basic() raises:
     """tracked_div computes elementwise a/b."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -51,7 +51,7 @@ fn test_tracked_div_basic() raises:
     print("  tracked_div_basic: PASS")
 
 
-fn test_tracked_div_backward() raises:
+def test_tracked_div_backward() raises:
     """tracked_div backward: da = 1/b, db = -a/b^2."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -73,7 +73,7 @@ fn test_tracked_div_backward() raises:
     print("  tracked_div_backward: PASS")
 
 
-fn test_single_token_forward_unchanged() raises:
+def test_single_token_forward_unchanged() raises:
     """Single-token forward still works identically through forward()."""
     var tape = Tape(65536)
     var block = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
@@ -83,7 +83,7 @@ fn test_single_token_forward_unchanged() raises:
     dims.append(4)
     var x_idx = tape.add_variable(dims^)
     for i in range(4):
-        tape.set_data(x_idx, i, Float32(0.1 * (i + 1)))
+        tape.set_data(x_idx, i, Float32(0.1 * Float64(i + 1)))
 
     var out_idx = block.forward(tape, x_idx)
     assert_eq(tape.var_numel(out_idx), 4)
@@ -97,7 +97,7 @@ fn test_single_token_forward_unchanged() raises:
     print("  single_token_forward_unchanged: PASS")
 
 
-fn test_forward_with_seq_single() raises:
+def test_forward_with_seq_single() raises:
     """forward_with_seq(seq_len=1) matches forward() behavior."""
     var tape = Tape(65536)
     var block = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
@@ -107,14 +107,14 @@ fn test_forward_with_seq_single() raises:
     dims.append(4)
     var x_idx = tape.add_variable(dims^)
     for i in range(4):
-        tape.set_data(x_idx, i, Float32(0.2 * (i + 1)))
+        tape.set_data(x_idx, i, Float32(0.2 * Float64(i + 1)))
 
     var out_idx = block.forward_with_seq(tape, x_idx, 1)
     assert_eq(tape.var_numel(out_idx), 4)
     print("  forward_with_seq_single: PASS")
 
 
-fn test_forward_with_seq_multi() raises:
+def test_forward_with_seq_multi() raises:
     """forward_with_seq processes multiple tokens."""
     var tape = Tape(262144)
     var block = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
@@ -126,7 +126,7 @@ fn test_forward_with_seq_multi() raises:
     dims.append(seq_len * hd)
     var x_idx = tape.add_variable(dims^)
     for i in range(seq_len * hd):
-        tape.set_data(x_idx, i, Float32(0.05 * (i + 1)))
+        tape.set_data(x_idx, i, Float32(0.05 * Float64(i + 1)))
 
     var out_idx = block.forward_with_seq(tape, x_idx, seq_len)
     # Output should have seq_len * hidden_dim elements
@@ -134,7 +134,7 @@ fn test_forward_with_seq_multi() raises:
     print("  forward_with_seq_multi: PASS")
 
 
-fn test_causal_attention_shape() raises:
+def test_causal_attention_shape() raises:
     """Multi-token attention produces correct output shape."""
     var tape = Tape(262144)
     var block = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
@@ -146,14 +146,14 @@ fn test_causal_attention_shape() raises:
     dims.append(seq_len * hd)
     var x_idx = tape.add_variable(dims^)
     for i in range(seq_len * hd):
-        tape.set_data(x_idx, i, Float32(0.1 * (i + 1)))
+        tape.set_data(x_idx, i, Float32(0.1 * Float64(i + 1)))
 
     var out_idx = block.forward_with_seq(tape, x_idx, seq_len)
     assert_eq(tape.var_numel(out_idx), seq_len * hd)
     print("  causal_attention_shape: PASS")
 
 
-fn test_lm_forward_seq_basic() raises:
+def test_lm_forward_seq_basic() raises:
     """TrainableLM.forward_seq processes a sequence and returns logits."""
     var tape = Tape(524288)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, ffn_dim=8)
@@ -172,7 +172,7 @@ fn test_lm_forward_seq_basic() raises:
     print("  lm_forward_seq_basic: PASS")
 
 
-fn test_lm_forward_seq_values() raises:
+def test_lm_forward_seq_values() raises:
     """forward_seq produces finite values."""
     var tape = Tape(524288)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, ffn_dim=8)
@@ -191,7 +191,7 @@ fn test_lm_forward_seq_values() raises:
     print("  lm_forward_seq_values: PASS")
 
 
-fn test_lm_forward_seq_single_matches() raises:
+def test_lm_forward_seq_single_matches() raises:
     """forward_seq with 1 token behaves similarly to forward."""
     var tape1 = Tape(524288)
     var lm1 = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, ffn_dim=8)
@@ -206,7 +206,7 @@ fn test_lm_forward_seq_single_matches() raises:
     print("  lm_forward_seq_single_matches: PASS")
 
 
-fn test_seq_backward() raises:
+def test_seq_backward() raises:
     """Backward through forward_seq produces gradients."""
     var tape = Tape(524288)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, ffn_dim=8)
@@ -237,7 +237,7 @@ fn test_seq_backward() raises:
     print("  seq_backward: PASS")
 
 
-fn test_two_layer_seq() raises:
+def test_two_layer_seq() raises:
     """forward_seq works with 2 layers."""
     var tape = Tape(1048576)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=2, ffn_dim=8)
@@ -255,7 +255,7 @@ fn test_two_layer_seq() raises:
     print("  two_layer_seq: PASS")
 
 
-fn test_causal_masking_effect() raises:
+def test_causal_masking_effect() raises:
     """Position 0 logits should not depend on position 1 input.
 
     Causal masking means token 0 only attends to itself.
@@ -278,7 +278,7 @@ fn test_causal_masking_effect() raises:
     print("  causal_masking_effect: PASS")
 
 
-fn test_seq_loss_decreases() raises:
+def test_seq_loss_decreases() raises:
     """Sequence loss decreases with a training step (smoke test).
 
     Not a proper training loop, just verifies gradient-based update
@@ -315,7 +315,7 @@ fn test_seq_loss_decreases() raises:
     print("  seq_loss_decreases: PASS (loss=" + String(loss1) + ")")
 
 
-fn test_block_ffn_produces_output() raises:
+def test_block_ffn_produces_output() raises:
     """FFN block within forward_with_seq produces non-zero output."""
     var tape = Tape(65536)
     var block = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
@@ -339,7 +339,7 @@ fn test_block_ffn_produces_output() raises:
     print("  block_ffn_produces_output: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_real_attention:")
     test_tracked_div_basic()
     test_tracked_div_backward()

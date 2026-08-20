@@ -22,12 +22,12 @@ from neutron_mojo.nn.tokenizer import BPETokenizer
 from neutron_mojo.nn.pipeline import PipelineConfig, pipeline_generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     var diff = a - b
     if diff < 0:
         diff = -diff
@@ -39,7 +39,7 @@ fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helper builders
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny model for testing (2 layers, vocab=8, dim=4)."""
     var params = tiny_test_params()
     var model = Model(params)
@@ -57,7 +57,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build tokenizer for tiny model (vocab=8)."""
     var tok = BPETokenizer()
     _ = tok.add_special_token("<bos>", "bos")
@@ -73,7 +73,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Batch Kernel Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_batch_matvec_single() raises:
+def test_batch_matvec_single() raises:
     """Batch matvec with batch=1 should match regular matvec."""
     var weight = Tensor[DType.float32](Shape(3 * 4))  # 3x4 matrix
     for i in range(12):
@@ -97,7 +97,7 @@ fn test_batch_matvec_single() raises:
     print("  batch_matvec_single: PASS")
 
 
-fn test_batch_matvec_multi() raises:
+def test_batch_matvec_multi() raises:
     """Batch matvec with batch=3 should produce correct results."""
     var weight = Tensor[DType.float32](Shape(2 * 3))  # 2x3 matrix
     for i in range(6):
@@ -126,7 +126,7 @@ fn test_batch_matvec_multi() raises:
     print("  batch_matvec_multi: PASS")
 
 
-fn test_batch_rmsnorm() raises:
+def test_batch_rmsnorm() raises:
     """Batch RMSNorm should match per-vector RMSNorm."""
     var dim = 4
     var batch = 3
@@ -154,7 +154,7 @@ fn test_batch_rmsnorm() raises:
     print("  batch_rmsnorm: PASS")
 
 
-fn test_batch_swiglu() raises:
+def test_batch_swiglu() raises:
     """Batch SwiGLU should match per-vector SwiGLU."""
     var dim = 4
     var batch = 2
@@ -180,7 +180,7 @@ fn test_batch_swiglu() raises:
     print("  batch_swiglu: PASS")
 
 
-fn test_batch_add() raises:
+def test_batch_add() raises:
     """Batch add should produce correct element-wise sums."""
     var batch = 3
     var dim = 4
@@ -203,7 +203,7 @@ fn test_batch_add() raises:
 # forward_prefill Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_prefill_single_token() raises:
+def test_prefill_single_token() raises:
     """forward_prefill with 1 token should match forward."""
     var model = _build_tiny_model()
     var params = tiny_test_params()
@@ -237,7 +237,7 @@ fn test_prefill_single_token() raises:
     print("  prefill_single_token: PASS")
 
 
-fn test_prefill_multi_token() raises:
+def test_prefill_multi_token() raises:
     """forward_prefill with N tokens should match N sequential forward calls."""
     var model = _build_tiny_model()
     var params = tiny_test_params()
@@ -276,7 +276,7 @@ fn test_prefill_multi_token() raises:
     print("  prefill_multi_token: PASS")
 
 
-fn test_prefill_cache_state() raises:
+def test_prefill_cache_state() raises:
     """Cache should have correct state after batch prefill."""
     var model = _build_tiny_model()
     var params = tiny_test_params()
@@ -305,7 +305,7 @@ fn test_prefill_cache_state() raises:
     print("  prefill_cache_state: PASS")
 
 
-fn test_prefill_then_decode() raises:
+def test_prefill_then_decode() raises:
     """Batch prefill followed by single-token decode should work."""
     var model = _build_tiny_model()
     var params = tiny_test_params()
@@ -337,7 +337,7 @@ fn test_prefill_then_decode() raises:
     print("  prefill_then_decode: PASS")
 
 
-fn test_prefill_vs_sequential_decode() raises:
+def test_prefill_vs_sequential_decode() raises:
     """Full prefill+decode should match sequential prefill+decode."""
     var model = _build_tiny_model()
     var params = tiny_test_params()
@@ -378,7 +378,7 @@ fn test_prefill_vs_sequential_decode() raises:
     print("  prefill_vs_sequential_decode: PASS")
 
 
-fn test_pipeline_with_batch_prefill() raises:
+def test_pipeline_with_batch_prefill() raises:
     """Pipeline generate should work with batch prefill enabled."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -387,12 +387,12 @@ fn test_pipeline_with_batch_prefill() raises:
     config.max_new_tokens = 3
 
     var output = pipeline_generate(model, tok, "ab", config)
-    assert_true(len(output) >= 0, "Pipeline should produce output")
+    assert_true(output.byte_length() >= 0, "Pipeline should produce output")
 
     print("  pipeline_with_batch_prefill: PASS")
 
 
-fn test_prefill_different_prompt_lengths() raises:
+def test_prefill_different_prompt_lengths() raises:
     """Batch prefill should work with various prompt lengths."""
     var model = _build_tiny_model()
     var params = tiny_test_params()
@@ -428,7 +428,7 @@ fn test_prefill_different_prompt_lengths() raises:
     print("  prefill_different_prompt_lengths: PASS")
 
 
-fn test_batch_matvec_with_offset() raises:
+def test_batch_matvec_with_offset() raises:
     """Batch matvec should work with non-zero offsets."""
     var weight = Tensor[DType.float32](Shape(10 + 2 * 3))  # Offset + 2x3
     for i in range(10, 10 + 6):
@@ -456,7 +456,7 @@ fn test_batch_matvec_with_offset() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_batch_prefill:")
 
     # Batch kernel tests

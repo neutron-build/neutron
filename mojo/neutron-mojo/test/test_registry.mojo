@@ -37,12 +37,12 @@ from neutron_mojo.serve.registry import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error("FAIL: " + msg + " expected=" + String(b) + " got=" + String(a))
 
@@ -51,7 +51,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -73,7 +73,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build a minimal tokenizer for testing."""
     var tok = BPETokenizer()
     _ = tok.add_token("<s>")     # 0
@@ -94,18 +94,18 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Registry Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_empty_registry() raises:
+def test_empty_registry() raises:
     """Empty registry has count 0 and no models."""
     var reg = ModelRegistry()
 
     assert_eq(reg.count(), 0, "empty registry count")
     assert_true(not reg.has_model("anything"), "empty has no models")
-    assert_true(len(reg.default_model) == 0, "empty has no default")
+    assert_true(reg.default_model.byte_length() == 0, "empty has no default")
 
     print("  empty_registry: PASS")
 
 
-fn test_register_fp32() raises:
+def test_register_fp32() raises:
     """Register an FP32 model."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -120,7 +120,7 @@ fn test_register_fp32() raises:
     print("  register_fp32: PASS")
 
 
-fn test_register_q8() raises:
+def test_register_q8() raises:
     """Register a Q8 quantized model."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -136,7 +136,7 @@ fn test_register_q8() raises:
     print("  register_q8: PASS")
 
 
-fn test_has_model() raises:
+def test_has_model() raises:
     """has_model returns correct results."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -150,7 +150,7 @@ fn test_has_model() raises:
     print("  has_model: PASS")
 
 
-fn test_count() raises:
+def test_count() raises:
     """count tracks number of registered models."""
     var reg = ModelRegistry()
 
@@ -169,7 +169,7 @@ fn test_count() raises:
     print("  count: PASS")
 
 
-fn test_list_models() raises:
+def test_list_models() raises:
     """list_models returns metadata for all registered models."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -192,7 +192,7 @@ fn test_list_models() raises:
     print("  list_models: PASS")
 
 
-fn test_default_model_first_registered() raises:
+def test_default_model_first_registered() raises:
     """First registered model becomes default."""
     var reg = ModelRegistry()
     var m1 = _build_tiny_model()
@@ -210,7 +210,7 @@ fn test_default_model_first_registered() raises:
     print("  default_model_first_registered: PASS")
 
 
-fn test_set_default() raises:
+def test_set_default() raises:
     """set_default changes the default model."""
     var reg = ModelRegistry()
     var m1 = _build_tiny_model()
@@ -228,7 +228,7 @@ fn test_set_default() raises:
     print("  set_default: PASS")
 
 
-fn test_infer_fp32() raises:
+def test_infer_fp32() raises:
     """Infer routes to FP32 model and returns valid response."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -245,7 +245,7 @@ fn test_infer_fp32() raises:
     print("  infer_fp32: PASS")
 
 
-fn test_infer_q8() raises:
+def test_infer_q8() raises:
     """Infer routes to Q8 model and returns valid response."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -264,7 +264,7 @@ fn test_infer_q8() raises:
     print("  infer_q8: PASS")
 
 
-fn test_infer_default() raises:
+def test_infer_default() raises:
     """Infer with empty model name uses default."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -280,7 +280,7 @@ fn test_infer_default() raises:
     print("  infer_default: PASS")
 
 
-fn test_infer_unknown_model() raises:
+def test_infer_unknown_model() raises:
     """Infer with unknown model name returns error."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -297,7 +297,7 @@ fn test_infer_unknown_model() raises:
     print("  infer_unknown_model: PASS")
 
 
-fn test_get_model_info() raises:
+def test_get_model_info() raises:
     """get_model_info returns correct architecture info."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -317,7 +317,7 @@ fn test_get_model_info() raises:
     print("  get_model_info: PASS")
 
 
-fn test_get_memory_estimate() raises:
+def test_get_memory_estimate() raises:
     """get_memory_estimate returns correct memory breakdown."""
     var reg = ModelRegistry()
     var model = _build_tiny_model()
@@ -335,7 +335,7 @@ fn test_get_memory_estimate() raises:
     print("  get_memory_estimate: PASS")
 
 
-fn test_multiple_models() raises:
+def test_multiple_models() raises:
     """Multiple FP32 and Q8 models coexist and route correctly."""
     var reg = ModelRegistry()
 
@@ -375,7 +375,7 @@ fn test_multiple_models() raises:
     print("  multiple_models: PASS")
 
 
-fn test_registry_entry_info_summary() raises:
+def test_registry_entry_info_summary() raises:
     """RegistryEntryInfo summary formatting works."""
     var info = RegistryEntryInfo("test-model", False, 7.5, 28.6, 42)
     var s = info.summary()
@@ -395,7 +395,7 @@ fn test_registry_entry_info_summary() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_registry:")
 
     test_empty_registry()

@@ -28,16 +28,16 @@ from neutron_mojo.tensor.simd_math import (
     simd_attention_weighted_sum,
     simd_online_softmax_attention,
 )
-from math import abs, sqrt, exp
-from time import perf_counter_ns
+from std.math import abs, sqrt, exp
+from std.time import perf_counter_ns
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn _fill_matrix(mut t: Tensor[DType.float32], rows: Int, cols: Int, offset: Int):
+def _fill_matrix(mut t: Tensor[DType.float32], rows: Int, cols: Int, offset: Int):
     """Fill matrix with deterministic values."""
     for i in range(rows):
         for j in range(cols):
@@ -45,14 +45,14 @@ fn _fill_matrix(mut t: Tensor[DType.float32], rows: Int, cols: Int, offset: Int)
             t.set(offset + i * cols + j, val)
 
 
-fn _fill_vector(mut t: Tensor[DType.float32], n: Int, offset: Int):
+def _fill_vector(mut t: Tensor[DType.float32], n: Int, offset: Int):
     """Fill vector with deterministic values."""
     for i in range(n):
         var val = Float32((i * 5 + 2) % 11) * 0.1 - 0.5
         t.set(offset + i, val)
 
 
-fn _max_diff(
+def _max_diff(
     a: Tensor[DType.float32], a_off: Int,
     b: Tensor[DType.float32], b_off: Int,
     n: Int,
@@ -66,7 +66,7 @@ fn _max_diff(
     return md
 
 
-fn test_tiled_matvec_correctness() raises:
+def test_tiled_matvec_correctness() raises:
     """Tiled matvec should match plain simd_matvec for large matrices."""
     var rows = 128
     var cols = 512
@@ -88,7 +88,7 @@ fn test_tiled_matvec_correctness() raises:
     print("  tiled_matvec_correctness: PASS")
 
 
-fn test_tiled_matvec_small_fallback() raises:
+def test_tiled_matvec_small_fallback() raises:
     """Tiled matvec should work for small matrices (fallback path)."""
     var rows = 4
     var cols = 8
@@ -110,7 +110,7 @@ fn test_tiled_matvec_small_fallback() raises:
     print("  tiled_matvec_small_fallback: PASS")
 
 
-fn test_tiled_matvec_non_aligned() raises:
+def test_tiled_matvec_non_aligned() raises:
     """Tiled matvec with dimensions not aligned to tile sizes."""
     var rows = 37
     var cols = 311  # Not a multiple of 256
@@ -132,7 +132,7 @@ fn test_tiled_matvec_non_aligned() raises:
     print("  tiled_matvec_non_aligned: PASS")
 
 
-fn test_par_tiled_matvec() raises:
+def test_par_tiled_matvec() raises:
     """Parallel tiled matvec should match plain simd_matvec."""
     var rows = 256
     var cols = 512
@@ -154,7 +154,7 @@ fn test_par_tiled_matvec() raises:
     print("  par_tiled_matvec: PASS")
 
 
-fn test_simd_attention_scores() raises:
+def test_simd_attention_scores() raises:
     """SIMD attention scores should match scalar computation."""
     var head_dim = 8
     var seq_len = 4
@@ -185,7 +185,7 @@ fn test_simd_attention_scores() raises:
     print("  simd_attention_scores: PASS")
 
 
-fn test_simd_attention_weighted_sum() raises:
+def test_simd_attention_weighted_sum() raises:
     """SIMD weighted sum should match scalar computation."""
     var head_dim = 8
     var seq_len = 4
@@ -217,7 +217,7 @@ fn test_simd_attention_weighted_sum() raises:
     print("  simd_attention_weighted_sum: PASS")
 
 
-fn test_online_softmax_attention() raises:
+def test_online_softmax_attention() raises:
     """Online softmax attention should produce valid output."""
     var head_dim = 8
     var seq_len = 4
@@ -247,7 +247,7 @@ fn test_online_softmax_attention() raises:
     print("  online_softmax_attention: PASS")
 
 
-fn test_online_vs_twopass_attention() raises:
+def test_online_vs_twopass_attention() raises:
     """Online softmax attention should match two-pass (scores + softmax + weighted sum)."""
     var head_dim = 8
     var seq_len = 6
@@ -281,7 +281,7 @@ fn test_online_vs_twopass_attention() raises:
     print("  online_vs_twopass_attention: PASS")
 
 
-fn test_tiled_matvec_benchmark() raises:
+def test_tiled_matvec_benchmark() raises:
     """Benchmark tiled vs plain matvec (256x1024)."""
     var rows = 256
     var cols = 1024
@@ -318,7 +318,7 @@ fn test_tiled_matvec_benchmark() raises:
     print("  tiled_matvec_benchmark: PASS")
 
 
-fn test_online_attention_benchmark() raises:
+def test_online_attention_benchmark() raises:
     """Benchmark online vs two-pass attention."""
     var head_dim = 64
     var seq_len = 128
@@ -365,7 +365,7 @@ fn test_online_attention_benchmark() raises:
     print("  online_attention_benchmark: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_tiled_matvec:")
 
     test_tiled_matvec_correctness()

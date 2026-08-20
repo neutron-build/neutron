@@ -24,6 +24,7 @@ Usage:
 """
 
 from neutron_mojo.tensor.tensor import Tensor
+from std.math import exp, tanh, sqrt
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.simd_math import (
     simd_q8_matvec,
@@ -46,7 +47,7 @@ from neutron_mojo.nn.q4_model import _quantize_projection_q4
 # Layer Sensitivity
 # ===----------------------------------------------------------------------=== #
 
-struct LayerSensitivity(Copyable, Movable):
+struct LayerSensitivity(Copyable, Movable, ImplicitlyCopyable):
     """Quantization error measurements for a single layer.
 
     Fields:
@@ -56,24 +57,24 @@ struct LayerSensitivity(Copyable, Movable):
     var q8_error: Float32
     var q4_error: Float32
 
-    fn __init__(out self):
+    def __init__(out self):
         self.q8_error = 0.0
         self.q4_error = 0.0
 
-    fn __copyinit__(out self, existing: Self):
-        self.q8_error = existing.q8_error
-        self.q4_error = existing.q4_error
+    def __init__(out self, *, copy: Self):
+        self.q8_error = copy.q8_error
+        self.q4_error = copy.q4_error
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.q8_error = other.q8_error
-        self.q4_error = other.q4_error
+    def __init__(out self, *, deinit move: Self):
+        self.q8_error = move.q8_error^
+        self.q4_error = move.q4_error^
 
 
 # ===----------------------------------------------------------------------=== #
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _compute_offsets(params: ModelParams, layer: Int) -> LayerWeightOffsets:
+def _compute_offsets(params: ModelParams, layer: Int) -> LayerWeightOffsets:
     """Compute layer weight offsets (standalone version of Model._layer_offsets)."""
     var base = layer * params.layer_weight_count()
     var p = params.copy()
@@ -104,7 +105,7 @@ fn _compute_offsets(params: ModelParams, layer: Int) -> LayerWeightOffsets:
     return off^
 
 
-fn _compute_scale_offsets(
+def _compute_scale_offsets(
     params: ModelParams, layer: Int, scales_per_layer: Int, block_size: Int,
 ) -> LayerScaleOffsets:
     """Compute scale offsets for a layer's projections."""
@@ -134,7 +135,7 @@ fn _compute_scale_offsets(
     return soff^
 
 
-fn _quant_roundtrip_error(
+def _quant_roundtrip_error(
     weights: Tensor[DType.float32],
     offset: Int,
     out_features: Int,
@@ -208,7 +209,7 @@ fn _quant_roundtrip_error(
 # Sensitivity Analysis
 # ===----------------------------------------------------------------------=== #
 
-fn measure_layer_sensitivity(
+def measure_layer_sensitivity(
     model: Model,
     layer: Int,
     block_size: Int = 32,
@@ -266,7 +267,7 @@ fn measure_layer_sensitivity(
     return result^
 
 
-fn analyze_sensitivity(
+def analyze_sensitivity(
     model: Model,
     block_size: Int = 32,
 ) -> List[LayerSensitivity]:
@@ -285,7 +286,7 @@ fn analyze_sensitivity(
     return results^
 
 
-fn auto_calibrate(
+def auto_calibrate(
     sensitivities: List[LayerSensitivity],
     q4_threshold: Float32 = 0.01,
 ) -> List[Int]:
@@ -339,7 +340,7 @@ struct MixedQuantModel(Movable):
     var block_size: Int
     var scales_per_layer: Int
 
-    fn __init__(out self, params: ModelParams, layer_modes: List[Int],
+    def __init__(out self, params: ModelParams, layer_modes: List[Int],
                 block_size: Int = 32):
         self.params = params.copy()
         self.layer_size = params.layer_weight_count()
@@ -382,25 +383,25 @@ struct MixedQuantModel(Movable):
                 self.layer_weights.set(offsets.attn_norm + i, 1.0)
                 self.layer_weights.set(offsets.ffn_norm + i, 1.0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.params = other.params.copy()
-        self.embed = other.embed^
-        self.final_norm = other.final_norm^
-        self.lm_head = other.lm_head^
-        self.layer_weights = other.layer_weights^
-        self.layer_scales = other.layer_scales^
-        self.layer_modes = other.layer_modes^
-        self.layer_size = other.layer_size
-        self.block_size = other.block_size
-        self.scales_per_layer = other.scales_per_layer
+    def __init__(out self, *, deinit move: Self):
+        self.params = move.params.copy()
+        self.embed = move.embed^
+        self.final_norm = move.final_norm^
+        self.lm_head = move.lm_head^
+        self.layer_weights = move.layer_weights^
+        self.layer_scales = move.layer_scales^
+        self.layer_modes = move.layer_modes^
+        self.layer_size = move.layer_size^
+        self.block_size = move.block_size^
+        self.scales_per_layer = move.scales_per_layer^
 
-    fn _layer_scale_offsets(self, layer: Int) -> LayerScaleOffsets:
+    def _layer_scale_offsets(self, layer: Int) -> LayerScaleOffsets:
         """Compute scale offsets for a layer's projections."""
         return _compute_scale_offsets(
             self.params, layer, self.scales_per_layer, self.block_size
         )
 
-    fn _mixed_linear(
+    def _mixed_linear(
         self,
         x: Tensor[DType.float32],
         mode: Int,
@@ -424,7 +425,7 @@ struct MixedQuantModel(Movable):
             )
         return result^
 
-    fn forward_layer(
+    def forward_layer(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -506,7 +507,6 @@ struct MixedQuantModel(Movable):
         # Activation dispatch based on architecture
         var ffn_out = Tensor[DType.float32](Shape(p.ffn_dim))
         if p.arch.use_gelu:
-            from math import exp, tanh, sqrt
             for i in range(p.ffn_dim):
                 var xi = gate.get(i)
                 var x64 = Float64(xi)
@@ -526,7 +526,7 @@ struct MixedQuantModel(Movable):
 
         return output^
 
-    fn forward(
+    def forward(
         self,
         token_id: Int,
         mut cache: MultiLayerKVCache,
@@ -550,7 +550,7 @@ struct MixedQuantModel(Movable):
         )
         return logits^
 
-    fn mode_summary(self) -> String:
+    def mode_summary(self) -> String:
         """Return a human-readable summary of per-layer modes."""
         var s = String("[")
         for i in range(len(self.layer_modes)):
@@ -570,7 +570,7 @@ struct MixedQuantModel(Movable):
 # Quantization
 # ===----------------------------------------------------------------------=== #
 
-fn quantize_mixed(
+def quantize_mixed(
     model: Model,
     layer_modes: List[Int],
     block_size: Int = 32,
@@ -720,7 +720,7 @@ fn quantize_mixed(
 # One-Call Auto-Quantize
 # ===----------------------------------------------------------------------=== #
 
-fn auto_quantize(
+def auto_quantize(
     model: Model,
     q4_threshold: Float32 = 0.01,
     block_size: Int = 32,
@@ -748,7 +748,7 @@ fn auto_quantize(
 # Generation
 # ===----------------------------------------------------------------------=== #
 
-fn mixed_generate(
+def mixed_generate(
     model: MixedQuantModel,
     prompt_tokens: List[Int],
     max_new_tokens: Int,

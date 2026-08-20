@@ -16,7 +16,7 @@ hierarchical quantization with multiple scale levels.
 Reference: GGML k-quants
 """
 
-from math import abs
+from std.math import abs
 
 # ===----------------------------------------------------------------------=== #
 # Q4_K Constants
@@ -27,17 +27,17 @@ comptime Q4_K_NUM_SUBBLOCKS = 8
 comptime Q4_K_SUBBLOCK_SIZE = 32
 
 
-fn q4_k_block_size() -> Int:
+def q4_k_block_size() -> Int:
     """Return the Q4_K super-block size (256)."""
     return 256
 
 
-fn q4_k_subblock_size() -> Int:
+def q4_k_subblock_size() -> Int:
     """Return the Q4_K sub-block size (32)."""
     return 32
 
 
-fn q4_k_bytes_per_block() -> Int:
+def q4_k_bytes_per_block() -> Int:
     """Calculate bytes per Q4_K super-block.
 
     Structure:
@@ -59,7 +59,7 @@ fn q4_k_bytes_per_block() -> Int:
 # Q4_K Quantization (Simplified)
 # ===----------------------------------------------------------------------=== #
 
-fn quantize_q4_k(value: Float32, scale: Float32, min_val: Float32) -> UInt8:
+def quantize_q4_k(value: Float32, scale: Float32, min_val: Float32) -> UInt8:
     """Quantize a single FP32 value to 4-bit.
 
     Args:
@@ -83,7 +83,7 @@ fn quantize_q4_k(value: Float32, scale: Float32, min_val: Float32) -> UInt8:
     return UInt8(quantized)
 
 
-fn dequantize_q4_k(index: UInt8, scale: Float32, min_val: Float32) -> Float32:
+def dequantize_q4_k(index: UInt8, scale: Float32, min_val: Float32) -> Float32:
     """Dequantize a 4-bit value to FP32.
 
     Args:
@@ -101,25 +101,23 @@ fn dequantize_q4_k(index: UInt8, scale: Float32, min_val: Float32) -> Float32:
 # Q4_K Block Quantization (Simplified Single-Scale Version)
 # ===----------------------------------------------------------------------=== #
 
-struct Q4KParams(Copyable):
+struct Q4KParams(Copyable, ImplicitlyCopyable):
     """Quantization parameters for Q4_K block."""
     var scale: Float32
     var min_val: Float32
 
-    fn __init__(out self, scale: Float32, min_val: Float32):
+    def __init__(out self, scale: Float32, min_val: Float32):
         self.scale = scale
         self.min_val = min_val
 
-    fn __copyinit__(out self, existing: Self):
-        self.scale = existing.scale
-        self.min_val = existing.min_val
+    def __init__(out self, *, copy: Self):
+        self.scale = copy.scale
+        self.min_val = copy.min_val
 
 
-fn quantize_q4_k_block[
-    input_origin: Origin, output_origin: Origin where output_origin.mut
-](
-    input: UnsafePointer[Float32, input_origin],
-    output: UnsafePointer[UInt8, output_origin],
+def quantize_q4_k_block(
+    input: Pointer[Float32, ...],
+    output: Pointer[mut=True, UInt8, ...],
     block_size: Int,
 ) -> Q4KParams:
     """Quantize a block of FP32 values to Q4_K (simplified).
@@ -160,18 +158,16 @@ fn quantize_q4_k_block[
 
         # Pack two 4-bit values into one byte: [q1 | q0]
         var packed = (Int(q1) << 4) | Int(q0)
-        output.store(i // 2, UInt8(packed))
+        output.unsafe_store(i // 2, UInt8(packed))
 
     return Q4KParams(scale, min_val)
 
 
-fn dequantize_q4_k_block[
-    input_origin: Origin, output_origin: Origin where output_origin.mut
-](
-    input: UnsafePointer[UInt8, input_origin],
+def dequantize_q4_k_block(
+    input: Pointer[UInt8, ...],
     scale: Float32,
     min_val: Float32,
-    output: UnsafePointer[Float32, output_origin],
+    output: Pointer[mut=True, Float32, ...],
     block_size: Int,
 ):
     """Dequantize a block of Q4_K values to FP32 (simplified).
@@ -192,15 +188,15 @@ fn dequantize_q4_k_block[
         var q0 = UInt8(Int(packed) & 0xF)
         var q1 = UInt8((Int(packed) >> 4) & 0xF)
 
-        output.store(i, dequantize_q4_k(q0, scale, min_val))
-        output.store(i + 1, dequantize_q4_k(q1, scale, min_val))
+        output.unsafe_store(i, dequantize_q4_k(q0, scale, min_val))
+        output.unsafe_store(i + 1, dequantize_q4_k(q1, scale, min_val))
 
 
 # ===----------------------------------------------------------------------=== #
 # Utilities
 # ===----------------------------------------------------------------------=== #
 
-fn calc_q4_k_buffer_size(num_elements: Int) -> Int:
+def calc_q4_k_buffer_size(num_elements: Int) -> Int:
     """Calculate total bytes needed for Q4_K quantized storage.
 
     Args:

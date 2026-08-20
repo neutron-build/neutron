@@ -4,7 +4,7 @@
 
 """Tests for Q4-quantized model: Q4Model, quantize_from_model_q4, q4_generate."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.simd_math import simd_q8_matvec
@@ -16,19 +16,19 @@ from neutron_mojo.nn.pipeline import PipelineConfig, default_pipeline_config
 from neutron_mojo.nn.q4_pipeline import q4_pipeline_generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Create a small model with non-trivial weights for testing."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -54,7 +54,7 @@ fn _build_tiny_model() -> Model:
 # Q4Model Creation Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_q4_model_creation() raises:
+def test_q4_model_creation() raises:
     """Test Q4Model struct creation."""
     var p = tiny_test_params()
     var qm = Q4Model(p, block_size=2)
@@ -66,7 +66,7 @@ fn test_q4_model_creation() raises:
     print("  q4_model_creation: PASS")
 
 
-fn test_quantize_from_model_q4() raises:
+def test_quantize_from_model_q4() raises:
     """Test converting FP32 Model to Q4Model."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -95,7 +95,7 @@ fn test_quantize_from_model_q4() raises:
     print("  quantize_from_model_q4: PASS")
 
 
-fn test_q4_values_in_range() raises:
+def test_q4_values_in_range() raises:
     """Verify all Q4 projection values are in [-8, 7]."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -120,7 +120,7 @@ fn test_q4_values_in_range() raises:
 # Q4 Forward Pass Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_q4_forward_produces_output() raises:
+def test_q4_forward_produces_output() raises:
     """Test that Q4Model forward pass produces valid logits."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -139,7 +139,7 @@ fn test_q4_forward_produces_output() raises:
     print("  q4_forward_produces_output: PASS")
 
 
-fn test_q4_vs_fp32() raises:
+def test_q4_vs_fp32() raises:
     """Test that Q4 model produces valid tokens (may differ from FP32)."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -164,7 +164,7 @@ fn test_q4_vs_fp32() raises:
     print("  q4_vs_fp32: PASS")
 
 
-fn test_q4_vs_q8_memory() raises:
+def test_q4_vs_q8_memory() raises:
     """Verify Q4 uses same memory layout but different value range than Q8."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -209,7 +209,7 @@ fn test_q4_vs_q8_memory() raises:
 # Q4 Offset Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_q4_offsets_consistency() raises:
+def test_q4_offsets_consistency() raises:
     """Test that data and scale offsets are computed consistently."""
     var p = tiny_test_params()
     var qm = Q4Model(p, block_size=2)
@@ -238,7 +238,7 @@ fn test_q4_offsets_consistency() raises:
 # Q4 Pipeline Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_q4_pipeline_generate() raises:
+def test_q4_pipeline_generate() raises:
     """Test Q4 pipeline text-in/text-out."""
     var model = _build_tiny_model()
     var qm = quantize_from_model_q4(model, block_size=2)
@@ -248,12 +248,12 @@ fn test_q4_pipeline_generate() raises:
     config.max_new_tokens = 3
 
     var result = q4_pipeline_generate(qm, tok, "hello", config)
-    assert_true(len(result) > 0, "Q4 pipeline produced output")
+    assert_true(result.byte_length() > 0, "Q4 pipeline produced output")
 
     print("  q4_pipeline_generate: PASS")
 
 
-fn test_q4_pipeline_with_chat_template() raises:
+def test_q4_pipeline_with_chat_template() raises:
     """Test Q4 pipeline with llama chat template."""
     var model = _build_tiny_model()
     var qm = quantize_from_model_q4(model, block_size=2)
@@ -264,12 +264,12 @@ fn test_q4_pipeline_with_chat_template() raises:
     config.chat_template = "llama"
 
     var result = q4_pipeline_generate(qm, tok, "hello", config)
-    assert_true(len(result) >= 0, "Q4 pipeline with template ran")
+    assert_true(result.byte_length() >= 0, "Q4 pipeline with template ran")
 
     print("  q4_pipeline_with_chat_template: PASS")
 
 
-fn test_q4_pipeline_with_penalties() raises:
+def test_q4_pipeline_with_penalties() raises:
     """Test Q4 pipeline with repetition and frequency penalties."""
     var model = _build_tiny_model()
     var qm = quantize_from_model_q4(model, block_size=2)
@@ -282,12 +282,12 @@ fn test_q4_pipeline_with_penalties() raises:
     config.presence_penalty = 0.3
 
     var result = q4_pipeline_generate(qm, tok, "test", config)
-    assert_true(len(result) >= 0, "Q4 pipeline with penalties ran")
+    assert_true(result.byte_length() >= 0, "Q4 pipeline with penalties ran")
 
     print("  q4_pipeline_with_penalties: PASS")
 
 
-fn test_q4_pipeline_config_reuse() raises:
+def test_q4_pipeline_config_reuse() raises:
     """Verify Q4 pipeline reuses same PipelineConfig as FP32/Q8."""
     var config = default_pipeline_config()
     # PipelineConfig is shared across FP32, Q8, and Q4 pipelines
@@ -298,7 +298,7 @@ fn test_q4_pipeline_config_reuse() raises:
     print("  q4_pipeline_config_reuse: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_q4_model:")
 
     # Q4Model creation

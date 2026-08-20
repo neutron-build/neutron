@@ -4,8 +4,8 @@
 
 """Tests for CLI argument parsing and command dispatch."""
 
-from math import abs
-from testing import assert_true
+from std.math import abs
+from std.testing import assert_true
 
 from neutron_mojo.cli.inference import (
     CLIArgs, parse_cli_args, is_known_command,
@@ -16,7 +16,7 @@ from neutron_mojo.cli.inference import (
 from neutron_mojo.nn.bench import ModelInfo, MemoryEstimate
 
 
-fn test_parse_run_command() raises:
+def test_parse_run_command() raises:
     """Parse run command with basic args."""
     var args = List[String]()
     args.append("neutron")
@@ -30,7 +30,7 @@ fn test_parse_run_command() raises:
     print("PASS: test_parse_run_command")
 
 
-fn test_parse_run_with_options() raises:
+def test_parse_run_with_options() raises:
     """Parse run command with all options."""
     var args = List[String]()
     args.append("neutron")
@@ -51,7 +51,7 @@ fn test_parse_run_with_options() raises:
     print("PASS: test_parse_run_with_options")
 
 
-fn test_parse_serve_command() raises:
+def test_parse_serve_command() raises:
     """Parse serve command."""
     var args = List[String]()
     args.append("neutron")
@@ -65,7 +65,7 @@ fn test_parse_serve_command() raises:
     print("PASS: test_parse_serve_command")
 
 
-fn test_parse_train_command() raises:
+def test_parse_train_command() raises:
     """Parse train command with training-specific args."""
     var args = List[String]()
     args.append("neutron")
@@ -87,7 +87,7 @@ fn test_parse_train_command() raises:
     print("PASS: test_parse_train_command")
 
 
-fn test_parse_train_lora() raises:
+def test_parse_train_lora() raises:
     """Parse train command with --lora flag."""
     var args = List[String]()
     args.append("neutron")
@@ -102,7 +102,7 @@ fn test_parse_train_lora() raises:
     print("PASS: test_parse_train_lora")
 
 
-fn test_parse_convert_command() raises:
+def test_parse_convert_command() raises:
     """Parse convert command."""
     var args = List[String]()
     args.append("neutron")
@@ -116,7 +116,7 @@ fn test_parse_convert_command() raises:
     print("PASS: test_parse_convert_command")
 
 
-fn test_is_known_command() raises:
+def test_is_known_command() raises:
     """Known command detection."""
     assert_true(is_known_command("run"), "run is known")
     assert_true(is_known_command("serve"), "serve is known")
@@ -129,7 +129,7 @@ fn test_is_known_command() raises:
     print("PASS: test_is_known_command")
 
 
-fn test_list_model_files() raises:
+def test_list_model_files() raises:
     """Filter model files from a list."""
     var files = List[String]()
     files.append("model.gguf")
@@ -142,7 +142,7 @@ fn test_list_model_files() raises:
     print("PASS: test_list_model_files")
 
 
-fn test_ends_with() raises:
+def test_ends_with() raises:
     """String suffix checking."""
     assert_true(_ends_with("model.gguf", ".gguf"), ".gguf suffix")
     assert_true(_ends_with("weights.safetensors", ".safetensors"), ".safetensors suffix")
@@ -151,14 +151,14 @@ fn test_ends_with() raises:
     print("PASS: test_ends_with")
 
 
-fn test_format_bench_result() raises:
+def test_format_bench_result() raises:
     """Format benchmark result string."""
     var result = format_bench_result(100, 5, 10, 50, 500)
-    assert_true(len(result) > 10, "bench result has content")
+    assert_true(result.byte_length() > 10, "bench result has content")
     print("PASS: test_format_bench_result")
 
 
-fn test_default_args() raises:
+def test_default_args() raises:
     """Default CLIArgs values."""
     var a = CLIArgs()
     assert_true(a.port == 8080, "default port")
@@ -169,7 +169,7 @@ fn test_default_args() raises:
     print("PASS: test_default_args")
 
 
-fn test_parse_models_with_dir() raises:
+def test_parse_models_with_dir() raises:
     """Parse models command with directory argument."""
     var args = List[String]()
     args.append("neutron")
@@ -181,7 +181,7 @@ fn test_parse_models_with_dir() raises:
     print("PASS: test_parse_models_with_dir")
 
 
-fn main() raises:
+def main() raises:
     print("=== Sprint 71: CLI Commands Tests ===")
     test_parse_run_command()
     test_parse_run_with_options()

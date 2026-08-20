@@ -14,12 +14,12 @@ from neutron_mojo.io.json import (
 from neutron_mojo.io.safetensors import TensorInfo
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -27,7 +27,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
         )
 
 
-fn test_skip_whitespace() raises:
+def test_skip_whitespace() raises:
     """Test skipping whitespace."""
     assert_eq(json_skip_whitespace("  hello", 0), 2, "skip 2 spaces")
     assert_eq(json_skip_whitespace("hello", 0), 0, "no whitespace")
@@ -35,7 +35,7 @@ fn test_skip_whitespace() raises:
     print("  skip_whitespace: PASS")
 
 
-fn test_parse_string() raises:
+def test_parse_string() raises:
     """Test parsing JSON strings."""
     var r1 = json_parse_string('"hello"', 0)
     assert_true(r1.value == "hello", "simple string")
@@ -45,7 +45,7 @@ fn test_parse_string() raises:
     assert_true(r2.value == 'ab"cd', "escaped quote")
 
     var r3 = json_parse_string('"line\\nbreak"', 0)
-    assert_true(len(r3.value) > 0, "string with newline escape")
+    assert_true(r3.value.byte_length() > 0, "string with newline escape")
 
     var r4 = json_parse_string('""', 0)
     assert_true(r4.value == "", "empty string")
@@ -53,7 +53,7 @@ fn test_parse_string() raises:
     print("  parse_string: PASS")
 
 
-fn test_parse_int() raises:
+def test_parse_int() raises:
     """Test parsing JSON integers."""
     var r1 = json_parse_int("42", 0)
     assert_eq(r1.value, 42, "positive int")
@@ -72,7 +72,7 @@ fn test_parse_int() raises:
     print("  parse_int: PASS")
 
 
-fn test_parse_int_array() raises:
+def test_parse_int_array() raises:
     """Test parsing JSON integer arrays."""
     var r1 = json_parse_int_array("[1, 2, 3]", 0)
     assert_eq(len(r1.values), 3, "3 elements")
@@ -90,7 +90,7 @@ fn test_parse_int_array() raises:
     print("  parse_int_array: PASS")
 
 
-fn test_parse_safetensors_header_simple() raises:
+def test_parse_safetensors_header_simple() raises:
     """Test parsing a simple SafeTensors header."""
     var json = '{"weight": {"dtype": "F32", "shape": [4, 8], "data_offsets": [0, 128]}}'
     var result = parse_safetensors_header(json)
@@ -107,7 +107,7 @@ fn test_parse_safetensors_header_simple() raises:
     print("  parse_safetensors_header_simple: PASS")
 
 
-fn test_parse_safetensors_header_metadata() raises:
+def test_parse_safetensors_header_metadata() raises:
     """Test that __metadata__ is skipped."""
     var json = '{"__metadata__": {"format": "pt"}, "bias": {"dtype": "F32", "shape": [8], "data_offsets": [0, 32]}}'
     var result = parse_safetensors_header(json)
@@ -122,7 +122,7 @@ fn test_parse_safetensors_header_metadata() raises:
     print("  parse_safetensors_header_metadata: PASS")
 
 
-fn test_multiple_dtypes() raises:
+def test_multiple_dtypes() raises:
     """Test parsing headers with various dtype strings."""
     var json = '{"a": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]}, "b": {"dtype": "BF16", "shape": [3], "data_offsets": [4, 10]}}'
     var result = parse_safetensors_header(json)
@@ -137,7 +137,7 @@ fn test_multiple_dtypes() raises:
     print("  multiple_dtypes: PASS")
 
 
-fn test_empty_shape() raises:
+def test_empty_shape() raises:
     """Test parsing a tensor with empty shape (scalar)."""
     var json = '{"scalar": {"dtype": "F32", "shape": [], "data_offsets": [0, 4]}}'
     var result = parse_safetensors_header(json)
@@ -148,7 +148,7 @@ fn test_empty_shape() raises:
     print("  empty_shape: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_json_parser:")
 
     test_skip_whitespace()

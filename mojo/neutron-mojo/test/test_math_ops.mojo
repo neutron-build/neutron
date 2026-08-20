@@ -5,14 +5,14 @@
 """Tests for extended math operations: neg, abs_val, exp_op, log_op, sqrt_op,
 sigmoid, tanh_op, pow_scalar, clamp, scalar_mul, scalar_add."""
 
-from math import exp, log, sqrt, tanh
+from std.math import exp, log, sqrt, tanh
 from neutron_mojo.tensor import (
     Tensor, neg, abs_val, exp_op, log_op, sqrt_op,
     sigmoid, tanh_op, pow_scalar, clamp, scalar_mul, scalar_add,
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
@@ -21,7 +21,7 @@ fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e
         )
 
 
-fn test_neg() raises:
+def test_neg() raises:
     """Negate reverses sign."""
     var x = Tensor[DType.float32](4)
     x.set(0, 1.0)
@@ -36,7 +36,7 @@ fn test_neg() raises:
     print("  neg: PASS")
 
 
-fn test_abs_val() raises:
+def test_abs_val() raises:
     """Absolute value makes all elements non-negative."""
     var x = Tensor[DType.float32](4)
     x.set(0, -3.0)
@@ -51,7 +51,7 @@ fn test_abs_val() raises:
     print("  abs_val: PASS")
 
 
-fn test_exp_op() raises:
+def test_exp_op() raises:
     """Elementwise exp."""
     var x = Tensor[DType.float32](3)
     x.set(0, 0.0)
@@ -64,7 +64,7 @@ fn test_exp_op() raises:
     print("  exp_op: PASS")
 
 
-fn test_log_op() raises:
+def test_log_op() raises:
     """Elementwise natural log."""
     var x = Tensor[DType.float32](3)
     x.set(0, 1.0)
@@ -77,7 +77,7 @@ fn test_log_op() raises:
     print("  log_op: PASS")
 
 
-fn test_sqrt_op() raises:
+def test_sqrt_op() raises:
     """Elementwise sqrt."""
     var x = Tensor[DType.float32](3)
     x.set(0, 4.0)
@@ -90,7 +90,7 @@ fn test_sqrt_op() raises:
     print("  sqrt_op: PASS")
 
 
-fn test_sigmoid() raises:
+def test_sigmoid() raises:
     """Sigmoid activation values."""
     var x = Tensor[DType.float32](3)
     x.set(0, 0.0)
@@ -103,7 +103,7 @@ fn test_sigmoid() raises:
     print("  sigmoid: PASS")
 
 
-fn test_tanh_op() raises:
+def test_tanh_op() raises:
     """Elementwise tanh."""
     var x = Tensor[DType.float32](3)
     x.set(0, 0.0)
@@ -116,7 +116,7 @@ fn test_tanh_op() raises:
     print("  tanh_op: PASS")
 
 
-fn test_pow_scalar() raises:
+def test_pow_scalar() raises:
     """Raise elements to a power."""
     var x = Tensor[DType.float32](3)
     x.set(0, 2.0)
@@ -129,7 +129,7 @@ fn test_pow_scalar() raises:
     print("  pow_scalar: PASS")
 
 
-fn test_clamp() raises:
+def test_clamp() raises:
     """Clamp elements to [min, max]."""
     var x = Tensor[DType.float32](5)
     x.set(0, -5.0)
@@ -146,7 +146,7 @@ fn test_clamp() raises:
     print("  clamp: PASS")
 
 
-fn test_scalar_mul() raises:
+def test_scalar_mul() raises:
     """Multiply all elements by a scalar."""
     var x = Tensor[DType.float32](3)
     x.set(0, 1.0)
@@ -159,7 +159,7 @@ fn test_scalar_mul() raises:
     print("  scalar_mul: PASS")
 
 
-fn test_scalar_add() raises:
+def test_scalar_add() raises:
     """Add a scalar to all elements."""
     var x = Tensor[DType.float32](3)
     x.set(0, 1.0)
@@ -172,7 +172,7 @@ fn test_scalar_add() raises:
     print("  scalar_add: PASS")
 
 
-fn test_exp_log_roundtrip() raises:
+def test_exp_log_roundtrip() raises:
     """exp(log(x)) ≈ x for positive x."""
     var x = Tensor[DType.float32](3)
     x.set(0, 1.0)
@@ -186,7 +186,7 @@ fn test_exp_log_roundtrip() raises:
     print("  exp_log_roundtrip: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_math_ops:")
     test_neg()
     test_abs_val()

@@ -4,7 +4,7 @@
 
 """Tests for quantized linear projections."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.quantized_linear import (
     Q8Weight,
     Q4Weight,
@@ -19,19 +19,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_q8_weight_creation() raises:
+def test_q8_weight_creation() raises:
     """Test Q8Weight struct creation."""
     var qw = Q8Weight(out_features=4, in_features=8, block_size=4)
     assert_true(qw.out_features == 4, "out_features")
@@ -42,7 +42,7 @@ fn test_q8_weight_creation() raises:
     print("  q8_weight_creation: PASS")
 
 
-fn test_q8_quantize_identity() raises:
+def test_q8_quantize_identity() raises:
     """Test Q8 quantization of identity-like matrix."""
     var w = Tensor[DType.float32](Shape(2, 2))
     w.set(0, 1.0)   # [0,0]
@@ -64,7 +64,7 @@ fn test_q8_quantize_identity() raises:
     print("  q8_quantize_identity: PASS")
 
 
-fn test_q8_linear_vs_fp32() raises:
+def test_q8_linear_vs_fp32() raises:
     """Test that Q8 linear matches FP32 linear closely."""
     var w = Tensor[DType.float32](Shape(3, 4))
     # Fill with known values
@@ -101,7 +101,7 @@ fn test_q8_linear_vs_fp32() raises:
     print("  q8_linear_vs_fp32: PASS")
 
 
-fn test_q8_large_values() raises:
+def test_q8_large_values() raises:
     """Test Q8 with larger weight values."""
     var w = Tensor[DType.float32](Shape(2, 4))
     w.set(0, 10.0)
@@ -129,7 +129,7 @@ fn test_q8_large_values() raises:
     print("  q8_large_values: PASS")
 
 
-fn test_q4_weight_creation() raises:
+def test_q4_weight_creation() raises:
     """Test Q4Weight struct creation."""
     var qw = Q4Weight(out_features=4, in_features=16, block_size=8)
     assert_true(qw.num_blocks_per_row == 2, "num_blocks 16/8=2")
@@ -137,7 +137,7 @@ fn test_q4_weight_creation() raises:
     print("  q4_weight_creation: PASS")
 
 
-fn test_q4_linear_vs_fp32() raises:
+def test_q4_linear_vs_fp32() raises:
     """Test Q4 linear (lower precision, higher error tolerated)."""
     var w = Tensor[DType.float32](Shape(2, 4))
     w.set(0, 0.5)
@@ -166,7 +166,7 @@ fn test_q4_linear_vs_fp32() raises:
     print("  q4_linear_vs_fp32: PASS")
 
 
-fn test_q8_zero_weights() raises:
+def test_q8_zero_weights() raises:
     """Test Q8 with zero weight matrix."""
     var w = Tensor[DType.float32](Shape(2, 2))
     # All zeros
@@ -183,7 +183,7 @@ fn test_q8_zero_weights() raises:
     print("  q8_zero_weights: PASS")
 
 
-fn test_q8_multi_block() raises:
+def test_q8_multi_block() raises:
     """Test Q8 with multiple blocks per row."""
     # 2 rows, 8 cols, block_size=4 → 2 blocks per row
     var w = Tensor[DType.float32](Shape(2, 8))
@@ -204,7 +204,7 @@ fn test_q8_multi_block() raises:
     print("  q8_multi_block: PASS")
 
 
-fn test_quantization_error_fn() raises:
+def test_quantization_error_fn() raises:
     """Test the error measurement function."""
     var a = Tensor[DType.float32](Shape(3))
     var b = Tensor[DType.float32](Shape(3))
@@ -222,7 +222,7 @@ fn test_quantization_error_fn() raises:
     print("  quantization_error_fn: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_quantized_linear:")
 
     test_q8_weight_creation()

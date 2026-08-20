@@ -1,7 +1,7 @@
-from math import tanh
+from std.math import tanh
 from neutron_mojo.tensor import Tensor
 
-fn main() raises:
+def main() raises:
     print("Testing tanh(0):")
     var t = tanh(0.0)
     print("  tanh(0.0) = " + String(t))

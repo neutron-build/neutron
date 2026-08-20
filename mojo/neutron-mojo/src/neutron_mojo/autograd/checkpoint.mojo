@@ -34,24 +34,24 @@ struct CheckpointSegment(ImplicitlyCopyable, Copyable, Movable):
     var end_entry: Int    # last tape entry index (exclusive)
     var saved_var_indices: List[Int]  # variable indices to save (inputs)
 
-    fn __init__(out self, start_entry: Int, end_entry: Int):
+    def __init__(out self, start_entry: Int, end_entry: Int):
         self.start_entry = start_entry
         self.end_entry = end_entry
         self.saved_var_indices = List[Int]()
 
-    fn __copyinit__(out self, other: Self):
-        self.start_entry = other.start_entry
-        self.end_entry = other.end_entry
+    def __init__(out self, *, copy: Self):
+        self.start_entry = copy.start_entry
+        self.end_entry = copy.end_entry
         self.saved_var_indices = List[Int]()
-        for i in range(len(other.saved_var_indices)):
-            self.saved_var_indices.append(other.saved_var_indices[i])
+        for i in range(len(copy.saved_var_indices)):
+            self.saved_var_indices.append(copy.saved_var_indices[i])
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.start_entry = other.start_entry
-        self.end_entry = other.end_entry
-        self.saved_var_indices = other.saved_var_indices^
+    def __init__(out self, *, deinit move: Self):
+        self.start_entry = move.start_entry^
+        self.end_entry = move.end_entry^
+        self.saved_var_indices = move.saved_var_indices^
 
-    fn copy(self) -> CheckpointSegment:
+    def copy(self) -> CheckpointSegment:
         """Explicit copy."""
         var seg = CheckpointSegment(self.start_entry, self.end_entry)
         for i in range(len(self.saved_var_indices)):
@@ -64,7 +64,7 @@ struct CheckpointSegment(ImplicitlyCopyable, Copyable, Movable):
 # ===----------------------------------------------------------------------=== #
 
 
-fn mark_checkpoint(tape: Tape) -> Int:
+def mark_checkpoint(tape: Tape) -> Int:
     """Record the current tape entry count as a checkpoint boundary.
 
     Call this during forward between segments (e.g., between layers).
@@ -78,7 +78,7 @@ fn mark_checkpoint(tape: Tape) -> Int:
 # ===----------------------------------------------------------------------=== #
 
 
-fn auto_checkpoint_segments(
+def auto_checkpoint_segments(
     tape: Tape, num_segments: Int
 ) -> List[CheckpointSegment]:
     """Divide the tape into roughly equal segments for checkpointing.
@@ -119,7 +119,7 @@ fn auto_checkpoint_segments(
     return result^
 
 
-fn _collect_input_vars(tape: Tape, mut seg: CheckpointSegment):
+def _collect_input_vars(tape: Tape, mut seg: CheckpointSegment):
     """Collect input variable indices for a segment.
 
     Input variables are those referenced as inputs by entries in the
@@ -144,7 +144,7 @@ fn _collect_input_vars(tape: Tape, mut seg: CheckpointSegment):
                     seg.saved_var_indices.append(entry.input1_idx)
 
 
-fn _list_contains(lst: List[Int], val: Int) -> Bool:
+def _list_contains(lst: List[Int], val: Int) -> Bool:
     """Check if a list contains a value."""
     for i in range(len(lst)):
         if lst[i] == val:
@@ -157,7 +157,7 @@ fn _list_contains(lst: List[Int], val: Int) -> Bool:
 # ===----------------------------------------------------------------------=== #
 
 
-fn run_backward_checkpointed(
+def run_backward_checkpointed(
     mut tape: Tape,
     loss_idx: Int,
     segments: List[CheckpointSegment],
@@ -199,7 +199,7 @@ fn run_backward_checkpointed(
         seg_idx -= 1
 
 
-fn _backward_segment(mut tape: Tape, seg: CheckpointSegment):
+def _backward_segment(mut tape: Tape, seg: CheckpointSegment):
     """Run backward through a single segment's entries in reverse.
 
     Args:
@@ -213,7 +213,7 @@ fn _backward_segment(mut tape: Tape, seg: CheckpointSegment):
         i -= 1
 
 
-fn _backward_all_entries(mut tape: Tape):
+def _backward_all_entries(mut tape: Tape):
     """Run backward through all tape entries (no checkpointing)."""
     var num_entries = tape.num_entries()
     var i = num_entries - 1
@@ -228,7 +228,7 @@ fn _backward_all_entries(mut tape: Tape):
 # ===----------------------------------------------------------------------=== #
 
 
-fn gradients_match(
+def gradients_match(
     tape_a: Tape,
     tape_b: Tape,
     var_idx: Int,

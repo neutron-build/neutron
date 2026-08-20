@@ -4,7 +4,7 @@
 
 """Tests for quantized tensor reading and dequantization."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.io.binary_reader import BinaryReader
@@ -30,12 +30,12 @@ from neutron_mojo.model.weight_reader import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg
@@ -43,7 +43,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
         )
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -55,7 +55,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # Helpers: write FP16 bytes
 # ===----------------------------------------------------------------------=== #
 
-fn _write_fp16_le(mut buf: List[UInt8], bits: Int):
+def _write_fp16_le(mut buf: List[UInt8], bits: Int):
     """Write a 16-bit FP16 value as little-endian bytes.
 
     Args:
@@ -70,7 +70,7 @@ fn _write_fp16_le(mut buf: List[UInt8], bits: Int):
 # Tests: Q8_0
 # ===----------------------------------------------------------------------=== #
 
-fn test_read_q8_0_single_block() raises:
+def test_read_q8_0_single_block() raises:
     """Test reading a single Q8_0 block (32 elements)."""
     var buf = List[UInt8]()
 
@@ -94,7 +94,7 @@ fn test_read_q8_0_single_block() raises:
     print("  read_q8_0_single_block: PASS")
 
 
-fn test_read_q8_0_multi_block() raises:
+def test_read_q8_0_multi_block() raises:
     """Test reading Q8_0 across 2 blocks (64 elements)."""
     var buf = List[UInt8]()
 
@@ -137,7 +137,7 @@ fn test_read_q8_0_multi_block() raises:
 # Tests: Q4_0
 # ===----------------------------------------------------------------------=== #
 
-fn test_read_q4_0_single_block() raises:
+def test_read_q4_0_single_block() raises:
     """Test reading a single Q4_0 block (32 elements)."""
     var buf = List[UInt8]()
 
@@ -162,7 +162,7 @@ fn test_read_q4_0_single_block() raises:
     print("  read_q4_0_single_block: PASS")
 
 
-fn test_read_q4_0_multi_block() raises:
+def test_read_q4_0_multi_block() raises:
     """Test reading Q4_0 across 2 blocks (64 elements) with non-trivial values."""
     var buf = List[UInt8]()
 
@@ -203,7 +203,7 @@ fn test_read_q4_0_multi_block() raises:
 # Tests: _try_load_tensor with Q8_0 / Q4_0
 # ===----------------------------------------------------------------------=== #
 
-fn _build_gguf_with_q8_tensor() raises -> List[UInt8]:
+def _build_gguf_with_q8_tensor() raises -> List[UInt8]:
     """Build a GGUF with a Q8_0 embedding tensor and F32 norm/lm_head."""
     var buf = List[UInt8]()
 
@@ -286,7 +286,7 @@ fn _build_gguf_with_q8_tensor() raises -> List[UInt8]:
     return buf^
 
 
-fn test_try_load_tensor_q8_0() raises:
+def test_try_load_tensor_q8_0() raises:
     """Test loading a Q8_0 tensor through the model pipeline."""
     var buf = _build_gguf_with_q8_tensor()
     var model = load_gguf_model_from_buffer(buf^)
@@ -304,7 +304,7 @@ fn test_try_load_tensor_q8_0() raises:
     print("  try_load_tensor_q8_0: PASS")
 
 
-fn _build_gguf_with_q4_tensor() raises -> List[UInt8]:
+def _build_gguf_with_q4_tensor() raises -> List[UInt8]:
     """Build a GGUF with a Q4_0 embedding tensor and F32 norm/lm_head."""
     var buf = List[UInt8]()
 
@@ -387,7 +387,7 @@ fn _build_gguf_with_q4_tensor() raises -> List[UInt8]:
     return buf^
 
 
-fn test_try_load_tensor_q4_0() raises:
+def test_try_load_tensor_q4_0() raises:
     """Test loading a Q4_0 tensor through the model pipeline."""
     var buf = _build_gguf_with_q4_tensor()
     var model = load_gguf_model_from_buffer(buf^)
@@ -404,7 +404,7 @@ fn test_try_load_tensor_q4_0() raises:
     print("  try_load_tensor_q4_0: PASS")
 
 
-fn test_mixed_tensor_types() raises:
+def test_mixed_tensor_types() raises:
     """Test GGUF with F32 embed + Q8_0 lm_head in same file."""
     var buf = List[UInt8]()
 
@@ -503,7 +503,7 @@ fn test_mixed_tensor_types() raises:
     print("  mixed_tensor_types: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_quant_weight_reader:")
 
     test_read_q8_0_single_block()

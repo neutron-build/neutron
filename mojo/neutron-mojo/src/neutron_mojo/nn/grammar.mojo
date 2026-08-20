@@ -22,15 +22,15 @@ from neutron_mojo.tensor.shape import Shape
 # Character Classification
 # ===----------------------------------------------------------------------=== #
 
-fn is_digit(c: Int) -> Bool:
+def is_digit(c: Int) -> Bool:
     """Check if byte is ASCII digit 0-9."""
     return c >= 48 and c <= 57
 
-fn is_whitespace(c: Int) -> Bool:
+def is_whitespace(c: Int) -> Bool:
     """Check if byte is JSON whitespace (space, tab, newline, CR)."""
     return c == 32 or c == 9 or c == 10 or c == 13
 
-fn is_hex(c: Int) -> Bool:
+def is_hex(c: Int) -> Bool:
     """Check if byte is hex digit."""
     return is_digit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
 
@@ -39,7 +39,7 @@ fn is_hex(c: Int) -> Bool:
 # Grammar State
 # ===----------------------------------------------------------------------=== #
 
-struct GrammarState(Copyable, Movable):
+struct GrammarState(Copyable, Movable, ImplicitlyCopyable):
     """FSM state for JSON grammar tracking."""
     var _value: Int
 
@@ -64,22 +64,22 @@ struct GrammarState(Copyable, Movable):
     comptime ERROR = 17          # Invalid state
 
     @implicit
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self._value = value
 
-    fn __copyinit__(out self, existing: Self):
-        self._value = existing._value
+    def __init__(out self, *, copy: Self):
+        self._value = copy._value
 
-    fn __moveinit__(out self, deinit other: Self):
-        self._value = other._value
+    def __init__(out self, *, deinit move: Self):
+        self._value = move._value^
 
-    fn __eq__(self, other: GrammarState) -> Bool:
+    def __eq__(self, other: GrammarState) -> Bool:
         return self._value == other._value
 
-    fn __ne__(self, other: GrammarState) -> Bool:
+    def __ne__(self, other: GrammarState) -> Bool:
         return self._value != other._value
 
-    fn value(self) -> Int:
+    def value(self) -> Int:
         return self._value
 
 
@@ -87,7 +87,7 @@ struct GrammarState(Copyable, Movable):
 # JSON FSM
 # ===----------------------------------------------------------------------=== #
 
-struct JsonFSM(Copyable, Movable):
+struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
     """Finite state machine for JSON grammar validation.
 
     Tracks parsing state through JSON structure. Supports nested objects/arrays
@@ -101,7 +101,7 @@ struct JsonFSM(Copyable, Movable):
     var num_stack: List[Int]      # Stack of container types (0=object, 1=array)
     var after_stack: List[Int]    # Stack of states to return to after value
 
-    fn __init__(out self, max_depth: Int = 32):
+    def __init__(out self, max_depth: Int = 32):
         self.state = GrammarState(GrammarState.START)
         self.depth = 0
         self.max_depth = max_depth
@@ -109,27 +109,27 @@ struct JsonFSM(Copyable, Movable):
         self.num_stack = List[Int]()
         self.after_stack = List[Int]()
 
-    fn __copyinit__(out self, existing: Self):
-        self.state = GrammarState(existing.state.value())
-        self.depth = existing.depth
-        self.max_depth = existing.max_depth
-        self.literal_pos = existing.literal_pos
+    def __init__(out self, *, copy: Self):
+        self.state = GrammarState(copy.state.value())
+        self.depth = copy.depth
+        self.max_depth = copy.max_depth
+        self.literal_pos = copy.literal_pos
         self.num_stack = List[Int]()
-        for i in range(len(existing.num_stack)):
-            self.num_stack.append(existing.num_stack[i])
+        for i in range(len(copy.num_stack)):
+            self.num_stack.append(copy.num_stack[i])
         self.after_stack = List[Int]()
-        for i in range(len(existing.after_stack)):
-            self.after_stack.append(existing.after_stack[i])
+        for i in range(len(copy.after_stack)):
+            self.after_stack.append(copy.after_stack[i])
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.state = GrammarState(other.state.value())
-        self.depth = other.depth
-        self.max_depth = other.max_depth
-        self.literal_pos = other.literal_pos
-        self.num_stack = other.num_stack^
-        self.after_stack = other.after_stack^
+    def __init__(out self, *, deinit move: Self):
+        self.state = GrammarState(move.state.value())
+        self.depth = move.depth^
+        self.max_depth = move.max_depth^
+        self.literal_pos = move.literal_pos^
+        self.num_stack = move.num_stack^
+        self.after_stack = move.after_stack^
 
-    fn copy(self) -> JsonFSM:
+    def copy(self) -> JsonFSM:
         """Return a copy of this FSM."""
         var fsm = JsonFSM(self.max_depth)
         fsm.state = GrammarState(self.state.value())
@@ -141,24 +141,24 @@ struct JsonFSM(Copyable, Movable):
             fsm.after_stack.append(self.after_stack[i])
         return fsm^
 
-    fn is_done(self) -> Bool:
+    def is_done(self) -> Bool:
         """Check if FSM has accepted complete valid JSON."""
         return self.state == GrammarState(GrammarState.DONE)
 
-    fn is_error(self) -> Bool:
+    def is_error(self) -> Bool:
         """Check if FSM is in error state."""
         return self.state == GrammarState(GrammarState.ERROR)
 
-    fn can_end(self) -> Bool:
+    def can_end(self) -> Bool:
         """Check if current state allows generation to end (valid JSON so far)."""
         return self.state == GrammarState(GrammarState.DONE) or self.state == GrammarState(GrammarState.AFTER_VALUE)
 
-    fn _push_container(mut self, container_type: Int):
+    def _push_container(mut self, container_type: Int):
         """Push a container (0=object, 1=array) onto the stack."""
         self.num_stack.append(container_type)
         self.depth += 1
 
-    fn _pop_container(mut self) -> Int:
+    def _pop_container(mut self) -> Int:
         """Pop a container from the stack. Returns container type."""
         if len(self.num_stack) > 0:
             var ct = self.num_stack[len(self.num_stack) - 1]
@@ -171,13 +171,13 @@ struct JsonFSM(Copyable, Movable):
             return ct
         return -1
 
-    fn _current_container(self) -> Int:
+    def _current_container(self) -> Int:
         """Get current container type (-1 if none)."""
         if len(self.num_stack) > 0:
             return self.num_stack[len(self.num_stack) - 1]
         return -1
 
-    fn feed_char(mut self, c: Int):
+    def feed_char(mut self, c: Int):
         """Feed a single character (byte value) to the FSM.
 
         Transitions the state based on the character and current state.
@@ -225,7 +225,7 @@ struct JsonFSM(Copyable, Movable):
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _feed_value_start(mut self, c: Int):
+    def _feed_value_start(mut self, c: Int):
         """Handle character when expecting a value."""
         if is_whitespace(c):
             return  # skip whitespace
@@ -257,7 +257,7 @@ struct JsonFSM(Copyable, Movable):
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _feed_in_object(mut self, c: Int):
+    def _feed_in_object(mut self, c: Int):
         """Handle character inside object (expecting key or })."""
         if is_whitespace(c):
             return
@@ -269,7 +269,7 @@ struct JsonFSM(Copyable, Movable):
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _feed_in_array(mut self, c: Int):
+    def _feed_in_array(mut self, c: Int):
         """Handle character inside array (expecting value or ])."""
         if is_whitespace(c):
             return
@@ -280,7 +280,7 @@ struct JsonFSM(Copyable, Movable):
             # Any value start
             self._feed_value_start(c)
 
-    fn _feed_in_string(mut self, c: Int):
+    def _feed_in_string(mut self, c: Int):
         """Handle character inside string value."""
         if c == 92:  # '\\' — escape
             self.state = GrammarState(GrammarState.IN_STRING_ESCAPE)
@@ -288,7 +288,7 @@ struct JsonFSM(Copyable, Movable):
             self._finish_value()
         # else: any other character stays in string
 
-    fn _feed_string_escape(mut self, c: Int):
+    def _feed_string_escape(mut self, c: Int):
         """Handle character after backslash in string."""
         # Valid escapes: " \ / b f n r t u
         if c == 34 or c == 92 or c == 47 or c == 98 or c == 102 or c == 110 or c == 114 or c == 116 or c == 117:
@@ -296,7 +296,7 @@ struct JsonFSM(Copyable, Movable):
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _feed_in_key(mut self, c: Int):
+    def _feed_in_key(mut self, c: Int):
         """Handle character inside key string."""
         if c == 92:  # '\\' — escape
             self.state = GrammarState(GrammarState.IN_KEY_ESCAPE)
@@ -304,14 +304,14 @@ struct JsonFSM(Copyable, Movable):
             self.state = GrammarState(GrammarState.AFTER_KEY)
         # else: any other character stays in key
 
-    fn _feed_key_escape(mut self, c: Int):
+    def _feed_key_escape(mut self, c: Int):
         """Handle character after backslash in key."""
         if c == 34 or c == 92 or c == 47 or c == 98 or c == 102 or c == 110 or c == 114 or c == 116 or c == 117:
             self.state = GrammarState(GrammarState.IN_KEY)
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _feed_after_key(mut self, c: Int):
+    def _feed_after_key(mut self, c: Int):
         """Handle character after key (expecting colon)."""
         if is_whitespace(c):
             return
@@ -320,7 +320,7 @@ struct JsonFSM(Copyable, Movable):
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _feed_in_number(mut self, c: Int):
+    def _feed_in_number(mut self, c: Int):
         """Handle character in number."""
         if is_digit(c):
             return  # continue reading digits
@@ -333,7 +333,7 @@ struct JsonFSM(Copyable, Movable):
             self._finish_value()
             self._feed_after_value(c)
 
-    fn _feed_in_number_frac(mut self, c: Int):
+    def _feed_in_number_frac(mut self, c: Int):
         """Handle character after decimal point."""
         if is_digit(c):
             return
@@ -343,7 +343,7 @@ struct JsonFSM(Copyable, Movable):
             self._finish_value()
             self._feed_after_value(c)
 
-    fn _feed_in_number_exp(mut self, c: Int):
+    def _feed_in_number_exp(mut self, c: Int):
         """Handle character in exponent."""
         if is_digit(c) or c == 43 or c == 45:  # digit, +, -
             return
@@ -351,9 +351,9 @@ struct JsonFSM(Copyable, Movable):
             self._finish_value()
             self._feed_after_value(c)
 
-    fn _feed_literal(mut self, c: Int, expected: String):
+    def _feed_literal(mut self, c: Int, expected: String):
         """Handle character in literal (true/false/null)."""
-        if self.literal_pos >= len(expected):
+        if self.literal_pos >= expected.byte_length():
             self._finish_value()
             self._feed_after_value(c)
             return
@@ -361,12 +361,12 @@ struct JsonFSM(Copyable, Movable):
         var expected_byte = ord(expected[byte=self.literal_pos])
         if c == expected_byte:
             self.literal_pos += 1
-            if self.literal_pos >= len(expected):
+            if self.literal_pos >= expected.byte_length():
                 self._finish_value()
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _feed_after_value(mut self, c: Int):
+    def _feed_after_value(mut self, c: Int):
         """Handle character after a complete value."""
         if is_whitespace(c):
             return
@@ -393,14 +393,14 @@ struct JsonFSM(Copyable, Movable):
                 return
             self.state = GrammarState(GrammarState.ERROR)
 
-    fn _finish_value(mut self):
+    def _finish_value(mut self):
         """Called when a complete value has been parsed."""
         if self.depth == 0:
             self.state = GrammarState(GrammarState.DONE)
         else:
             self.state = GrammarState(GrammarState.AFTER_VALUE)
 
-    fn get_valid_chars(self) -> List[Int]:
+    def get_valid_chars(self) -> List[Int]:
         """Get list of valid next character byte values.
 
         Returns:
@@ -510,17 +510,17 @@ struct JsonFSM(Copyable, Movable):
 
         elif s == GrammarState.IN_TRUE:
             var expected = "true"
-            if self.literal_pos < len(expected):
+            if self.literal_pos < expected.byte_length():
                 valid.append(ord(expected[byte=self.literal_pos]))
 
         elif s == GrammarState.IN_FALSE:
             var expected = "false"
-            if self.literal_pos < len(expected):
+            if self.literal_pos < expected.byte_length():
                 valid.append(ord(expected[byte=self.literal_pos]))
 
         elif s == GrammarState.IN_NULL:
             var expected = "null"
-            if self.literal_pos < len(expected):
+            if self.literal_pos < expected.byte_length():
                 valid.append(ord(expected[byte=self.literal_pos]))
 
         elif s == GrammarState.AFTER_VALUE:
@@ -528,7 +528,7 @@ struct JsonFSM(Copyable, Movable):
 
         return valid^
 
-    fn _add_after_value_chars(self, mut valid: List[Int]):
+    def _add_after_value_chars(self, mut valid: List[Int]):
         """Add characters valid after a complete value."""
         var ct = self._current_container()
         if ct == 0:  # in object
@@ -548,7 +548,7 @@ struct JsonFSM(Copyable, Movable):
 # Grammar Mask Application
 # ===----------------------------------------------------------------------=== #
 
-fn apply_grammar_mask(
+def apply_grammar_mask(
     mut logits: Tensor[DType.float32],
     vocab_size: Int,
     fsm: JsonFSM,
@@ -582,7 +582,7 @@ fn apply_grammar_mask(
             continue
 
         var token_str = tokenizer_vocab[tok_id]
-        if len(token_str) == 0:
+        if token_str.byte_length() == 0:
             logits.set(tok_id, Float32(-1e30))
             continue
 
@@ -598,7 +598,7 @@ fn apply_grammar_mask(
             logits.set(tok_id, Float32(-1e30))
 
 
-fn apply_grammar_mask_full(
+def apply_grammar_mask_full(
     mut logits: Tensor[DType.float32],
     vocab_size: Int,
     fsm: JsonFSM,
@@ -629,14 +629,14 @@ fn apply_grammar_mask_full(
             continue
 
         var token_str = tokenizer_vocab[tok_id]
-        if len(token_str) == 0:
+        if token_str.byte_length() == 0:
             logits.set(tok_id, Float32(-1e30))
             continue
 
         # Simulate feeding all bytes through a copy of the FSM
         var test_fsm = fsm.copy()
         var valid = True
-        for i in range(len(token_str)):
+        for i in range(token_str.byte_length()):
             test_fsm.feed_char(ord(token_str[byte=i]))
             if test_fsm.is_error():
                 valid = False
@@ -646,7 +646,7 @@ fn apply_grammar_mask_full(
             logits.set(tok_id, Float32(-1e30))
 
 
-fn advance_fsm(mut fsm: JsonFSM, token_str: String):
+def advance_fsm(mut fsm: JsonFSM, token_str: String):
     """Advance FSM state by feeding all bytes of a token string.
 
     Call this after sampling a token to update the FSM state.
@@ -655,5 +655,5 @@ fn advance_fsm(mut fsm: JsonFSM, token_str: String):
         fsm: FSM to advance (modified in-place).
         token_str: The token string that was sampled.
     """
-    for i in range(len(token_str)):
+    for i in range(token_str.byte_length()):
         fsm.feed_char(ord(token_str[byte=i]))

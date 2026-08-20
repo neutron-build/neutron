@@ -17,7 +17,7 @@ Usage:
     print(decode_result.summary())
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.simd_math import (
@@ -34,7 +34,7 @@ from neutron_mojo.nn.causal_lm import embed_token, argmax
 # Profile Result
 # ===----------------------------------------------------------------------=== #
 
-struct ProfileResult(Copyable, Movable):
+struct ProfileResult(Copyable, Movable, ImplicitlyCopyable):
     """Per-operation timing breakdown for one forward pass (nanoseconds)."""
     var embed_ns: Int
     var attn_norm_ns: Int
@@ -51,7 +51,7 @@ struct ProfileResult(Copyable, Movable):
     var total_ns: Int
     var num_layers: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.embed_ns = 0
         self.attn_norm_ns = 0
         self.qkv_proj_ns = 0
@@ -67,39 +67,39 @@ struct ProfileResult(Copyable, Movable):
         self.total_ns = 0
         self.num_layers = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.embed_ns = existing.embed_ns
-        self.attn_norm_ns = existing.attn_norm_ns
-        self.qkv_proj_ns = existing.qkv_proj_ns
-        self.rope_ns = existing.rope_ns
-        self.kv_cache_ns = existing.kv_cache_ns
-        self.attention_ns = existing.attention_ns
-        self.output_proj_ns = existing.output_proj_ns
-        self.ffn_norm_ns = existing.ffn_norm_ns
-        self.ffn_proj_ns = existing.ffn_proj_ns
-        self.swiglu_ns = existing.swiglu_ns
-        self.final_norm_ns = existing.final_norm_ns
-        self.lm_head_ns = existing.lm_head_ns
-        self.total_ns = existing.total_ns
-        self.num_layers = existing.num_layers
+    def __init__(out self, *, copy: Self):
+        self.embed_ns = copy.embed_ns
+        self.attn_norm_ns = copy.attn_norm_ns
+        self.qkv_proj_ns = copy.qkv_proj_ns
+        self.rope_ns = copy.rope_ns
+        self.kv_cache_ns = copy.kv_cache_ns
+        self.attention_ns = copy.attention_ns
+        self.output_proj_ns = copy.output_proj_ns
+        self.ffn_norm_ns = copy.ffn_norm_ns
+        self.ffn_proj_ns = copy.ffn_proj_ns
+        self.swiglu_ns = copy.swiglu_ns
+        self.final_norm_ns = copy.final_norm_ns
+        self.lm_head_ns = copy.lm_head_ns
+        self.total_ns = copy.total_ns
+        self.num_layers = copy.num_layers
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.embed_ns = other.embed_ns
-        self.attn_norm_ns = other.attn_norm_ns
-        self.qkv_proj_ns = other.qkv_proj_ns
-        self.rope_ns = other.rope_ns
-        self.kv_cache_ns = other.kv_cache_ns
-        self.attention_ns = other.attention_ns
-        self.output_proj_ns = other.output_proj_ns
-        self.ffn_norm_ns = other.ffn_norm_ns
-        self.ffn_proj_ns = other.ffn_proj_ns
-        self.swiglu_ns = other.swiglu_ns
-        self.final_norm_ns = other.final_norm_ns
-        self.lm_head_ns = other.lm_head_ns
-        self.total_ns = other.total_ns
-        self.num_layers = other.num_layers
+    def __init__(out self, *, deinit move: Self):
+        self.embed_ns = move.embed_ns^
+        self.attn_norm_ns = move.attn_norm_ns^
+        self.qkv_proj_ns = move.qkv_proj_ns^
+        self.rope_ns = move.rope_ns^
+        self.kv_cache_ns = move.kv_cache_ns^
+        self.attention_ns = move.attention_ns^
+        self.output_proj_ns = move.output_proj_ns^
+        self.ffn_norm_ns = move.ffn_norm_ns^
+        self.ffn_proj_ns = move.ffn_proj_ns^
+        self.swiglu_ns = move.swiglu_ns^
+        self.final_norm_ns = move.final_norm_ns^
+        self.lm_head_ns = move.lm_head_ns^
+        self.total_ns = move.total_ns^
+        self.num_layers = move.num_layers^
 
-    fn copy(self) -> Self:
+    def copy(self) -> Self:
         """Create a copy."""
         var r = ProfileResult()
         r.embed_ns = self.embed_ns
@@ -118,13 +118,13 @@ struct ProfileResult(Copyable, Movable):
         r.num_layers = self.num_layers
         return r^
 
-    fn layer_total_ns(self) -> Int:
+    def layer_total_ns(self) -> Int:
         """Total time spent in transformer layers (all per-layer ops)."""
         return (self.attn_norm_ns + self.qkv_proj_ns + self.rope_ns +
                 self.kv_cache_ns + self.attention_ns + self.output_proj_ns +
                 self.ffn_norm_ns + self.ffn_proj_ns + self.swiglu_ns)
 
-    fn overhead_ns(self) -> Int:
+    def overhead_ns(self) -> Int:
         """Time not accounted for by measured operations (residuals, etc)."""
         var measured = (self.embed_ns + self.layer_total_ns() +
                         self.final_norm_ns + self.lm_head_ns)
@@ -132,36 +132,36 @@ struct ProfileResult(Copyable, Movable):
             return self.total_ns - measured
         return 0
 
-    fn _pct(self, ns: Int) -> Float64:
+    def _pct(self, ns: Int) -> Float64:
         """Compute percentage of total time."""
         if self.total_ns == 0:
             return 0.0
         return Float64(ns) * 100.0 / Float64(self.total_ns)
 
-    fn _us(self, ns: Int) -> Float64:
+    def _us(self, ns: Int) -> Float64:
         """Convert nanoseconds to microseconds."""
         return Float64(ns) / 1000.0
 
-    fn _format_line(self, name: String, ns: Int) -> String:
+    def _format_line(self, name: String, ns: Int) -> String:
         """Format one line of the summary table."""
         var us = self._us(ns)
         var pct = self._pct(ns)
         var s = String("  ")
         s += name
         # Pad name to 16 chars
-        var pad = 16 - len(name)
+        var pad = 16 - name.byte_length()
         for _ in range(pad):
             s += " "
         s += String(Int(us)) + " us"
         # Pad to align percentage
         var us_str = String(Int(us))
-        var pad2 = 10 - len(us_str)
+        var pad2 = 10 - us_str.byte_length()
         for _ in range(pad2):
             s += " "
         s += String(Int(pct)) + "%"
         return s^
 
-    fn summary(self) -> String:
+    def summary(self) -> String:
         """Format a human-readable profiling summary."""
         var s = String("Profile (")
         s += String(self.num_layers) + " layers, "
@@ -181,7 +181,7 @@ struct ProfileResult(Copyable, Movable):
         s += self._format_line("overhead", self.overhead_ns())
         return s^
 
-    fn add(mut self, other: Self):
+    def add(mut self, other: Self):
         """Accumulate another ProfileResult into this one."""
         self.embed_ns += other.embed_ns
         self.attn_norm_ns += other.attn_norm_ns
@@ -202,34 +202,34 @@ struct ProfileResult(Copyable, Movable):
 # Decode Profile Result
 # ===----------------------------------------------------------------------=== #
 
-struct DecodeProfileResult(Copyable, Movable):
+struct DecodeProfileResult(Copyable, Movable, ImplicitlyCopyable):
     """Aggregate profiling over multiple decode steps."""
     var aggregate: ProfileResult  # Summed across all steps
     var num_steps: Int
     var tokens_per_sec: Float64
 
-    fn __init__(out self):
+    def __init__(out self):
         self.aggregate = ProfileResult()
         self.num_steps = 0
         self.tokens_per_sec = 0.0
 
-    fn __copyinit__(out self, existing: Self):
-        self.aggregate = existing.aggregate.copy()
-        self.num_steps = existing.num_steps
-        self.tokens_per_sec = existing.tokens_per_sec
+    def __init__(out self, *, copy: Self):
+        self.aggregate = copy.aggregate.copy()
+        self.num_steps = copy.num_steps
+        self.tokens_per_sec = copy.tokens_per_sec
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.aggregate = other.aggregate^
-        self.num_steps = other.num_steps
-        self.tokens_per_sec = other.tokens_per_sec
+    def __init__(out self, *, deinit move: Self):
+        self.aggregate = move.aggregate^
+        self.num_steps = move.num_steps^
+        self.tokens_per_sec = move.tokens_per_sec^
 
-    fn avg_step_ns(self) -> Int:
+    def avg_step_ns(self) -> Int:
         """Average time per decode step in nanoseconds."""
         if self.num_steps == 0:
             return 0
         return self.aggregate.total_ns // self.num_steps
 
-    fn summary(self) -> String:
+    def summary(self) -> String:
         """Format decode profiling summary with per-step averages."""
         var s = String("Decode Profile (")
         s += String(self.num_steps) + " steps, "
@@ -243,7 +243,7 @@ struct DecodeProfileResult(Copyable, Movable):
 # Profiled Forward Pass
 # ===----------------------------------------------------------------------=== #
 
-fn profile_forward(
+def profile_forward(
     model: Model,
     token_id: Int,
     mut cache: MultiLayerKVCache,
@@ -388,7 +388,7 @@ fn profile_forward(
 # Profiled Decode Loop
 # ===----------------------------------------------------------------------=== #
 
-fn profile_decode(
+def profile_decode(
     model: Model,
     prompt_tokens: List[Int],
     num_steps: Int,

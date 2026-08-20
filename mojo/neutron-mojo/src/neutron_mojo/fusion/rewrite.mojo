@@ -14,7 +14,7 @@ or iteration limit is reached. Implements the core equality saturation algorithm
 Reference: "egg: Fast and Extensible Equality Saturation" (Willsey et al., 2021)
 """
 
-from collections import List
+from std.collections import List
 from .egraph import EGraph, CanonicalNode
 from .eclass import ClassId
 from .rules import RewriteRule, RuleSet
@@ -26,7 +26,7 @@ from .graph import OpKind
 # Match — A pattern match result
 # ===----------------------------------------------------------------------=== #
 
-struct Match(Copyable, Movable):
+struct Match(Copyable, Movable, ImplicitlyCopyable):
     """A successful pattern match.
 
     Records which rule matched, which e-class it matched in, the variable
@@ -37,20 +37,20 @@ struct Match(Copyable, Movable):
     var bindings: Bindings
     var rhs: Pattern  # RHS pattern for instantiation
 
-    fn __init__(out self, rule_name: String, matched_class: ClassId,
+    def __init__(out self, rule_name: String, matched_class: ClassId,
                 var bindings: Bindings, var rhs: Pattern):
         self.rule_name = rule_name
         self.matched_class = matched_class
         self.bindings = bindings^
         self.rhs = rhs^
 
-    fn __copyinit__(out self, existing: Self):
-        self.rule_name = existing.rule_name
-        self.matched_class = existing.matched_class
-        self.bindings = existing.bindings.copy()
-        self.rhs = existing.rhs.copy()
+    def __init__(out self, *, copy: Self):
+        self.rule_name = copy.rule_name
+        self.matched_class = copy.matched_class
+        self.bindings = copy.bindings.copy()
+        self.rhs = copy.rhs.copy()
 
-    fn copy(self) -> Match:
+    def copy(self) -> Match:
         """Return a copy of this match."""
         return Match(self.rule_name, self.matched_class,
                      self.bindings.copy(), self.rhs.copy())
@@ -67,7 +67,7 @@ struct RewriteStats(Movable):
     var rules_applied: Int
     var nodes_added: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.iterations = 0
         self.total_matches = 0
         self.rules_applied = 0
@@ -89,11 +89,11 @@ struct RewriteEngine:
     var max_iterations: Int
     var max_nodes: Int  # Stop if e-graph grows too large
 
-    fn __init__(out self, max_iterations: Int = 10, max_nodes: Int = 10000):
+    def __init__(out self, max_iterations: Int = 10, max_nodes: Int = 10000):
         self.max_iterations = max_iterations
         self.max_nodes = max_nodes
 
-    fn run_phase1(self, mut egraph: EGraph, ruleset: RuleSet) raises -> RewriteStats:
+    def run_phase1(self, mut egraph: EGraph, ruleset: RuleSet) raises -> RewriteStats:
         """Run Phase 1: directed simplifications.
 
         Apply Phase 1 rules (identity, cancellation, collapse) until no more
@@ -125,7 +125,7 @@ struct RewriteEngine:
         stats.nodes_added = egraph.num_nodes()
         return stats^
 
-    fn run_phase2(self, mut egraph: EGraph, ruleset: RuleSet) raises -> RewriteStats:
+    def run_phase2(self, mut egraph: EGraph, ruleset: RuleSet) raises -> RewriteStats:
         """Run Phase 2: equality saturation.
 
         Apply Phase 2 rules (commutativity, associativity, distribution) for a
@@ -158,7 +158,7 @@ struct RewriteEngine:
         stats.nodes_added = egraph.num_nodes()
         return stats^
 
-    fn _find_matches(self, mut egraph: EGraph, rules: List[RewriteRule]) raises -> List[Match]:
+    def _find_matches(self, mut egraph: EGraph, rules: List[RewriteRule]) raises -> List[Match]:
         """Find all pattern matches in the e-graph.
 
         For each rule, try to match its LHS pattern against all canonical nodes
@@ -191,7 +191,7 @@ struct RewriteEngine:
 
         return matches^
 
-    fn _apply_matches(self, mut egraph: EGraph, matches: List[Match]) raises -> Int:
+    def _apply_matches(self, mut egraph: EGraph, matches: List[Match]) raises -> Int:
         """Apply all matches by adding RHS patterns and merging.
 
         For each match:
@@ -222,7 +222,7 @@ struct RewriteEngine:
 # Simplified Runner — For testing basic rewrite scenarios
 # ===----------------------------------------------------------------------=== #
 
-fn apply_simple_rewrite(
+def apply_simple_rewrite(
     mut egraph: EGraph,
     lhs_class: ClassId,
     rhs_class: ClassId
@@ -244,7 +244,7 @@ fn apply_simple_rewrite(
     return True
 
 
-fn count_rewrites_applied(
+def count_rewrites_applied(
     mut egraph: EGraph,
     ruleset: RuleSet,
     max_iterations: Int = 5
@@ -267,7 +267,7 @@ fn count_rewrites_applied(
         return 0
 
 
-fn _count_vars(pattern: Pattern) -> Int:
+def _count_vars(pattern: Pattern) -> Int:
     """Count the max variable index + 1 in a pattern tree."""
     var max_var = -1
     if pattern.kind == PatternKind.Var:
@@ -280,7 +280,7 @@ fn _count_vars(pattern: Pattern) -> Int:
     return max_var + 1
 
 
-fn _instantiate_pattern(pattern: Pattern, bindings: Bindings, mut egraph: EGraph) raises -> ClassId:
+def _instantiate_pattern(pattern: Pattern, bindings: Bindings, mut egraph: EGraph) raises -> ClassId:
     """Instantiate a pattern RHS using bindings.
 
     Recursively creates e-graph nodes for the RHS pattern:

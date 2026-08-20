@@ -4,7 +4,7 @@
 
 """Adam optimizer with optional decoupled weight decay (AdamW)."""
 
-from math import sqrt
+from std.math import sqrt
 
 from neutron_mojo.autograd.tape import Tape
 
@@ -21,7 +21,7 @@ struct Adam(Movable):
     var step_count: Int
     var initialized: Bool
 
-    fn __init__(out self, lr: Float64 = 1e-3, beta1: Float64 = 0.9,
+    def __init__(out self, lr: Float64 = 1e-3, beta1: Float64 = 0.9,
                 beta2: Float64 = 0.999, eps: Float64 = 1e-8,
                 weight_decay: Float64 = 0.0):
         self.lr = lr
@@ -34,18 +34,18 @@ struct Adam(Movable):
         self.step_count = 0
         self.initialized = False
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.lr = other.lr
-        self.beta1 = other.beta1
-        self.beta2 = other.beta2
-        self.eps = other.eps
-        self.weight_decay = other.weight_decay
-        self.m = other.m^
-        self.v = other.v^
-        self.step_count = other.step_count
-        self.initialized = other.initialized
+    def __init__(out self, *, deinit move: Self):
+        self.lr = move.lr^
+        self.beta1 = move.beta1^
+        self.beta2 = move.beta2^
+        self.eps = move.eps^
+        self.weight_decay = move.weight_decay^
+        self.m = move.m^
+        self.v = move.v^
+        self.step_count = move.step_count^
+        self.initialized = move.initialized^
 
-    fn step(mut self, mut tape: Tape, param_indices: List[Int]):
+    def step(mut self, mut tape: Tape, param_indices: List[Int]):
         """Perform one Adam update step."""
         self.step_count += 1
 
@@ -62,7 +62,7 @@ struct Adam(Movable):
             self.initialized = True
 
         # Bias correction
-        from math import pow
+        from std.math import pow
         var bc1 = 1.0 - pow(self.beta1, Float64(self.step_count))
         var bc2 = 1.0 - pow(self.beta2, Float64(self.step_count))
 

@@ -20,18 +20,18 @@ struct HFLoadResult(Movable):
     var tokenizer: BPETokenizer
     var model_path: String
 
-    fn __init__(out self, var model: Model, var tokenizer: BPETokenizer, model_path: String):
+    def __init__(out self, var model: Model, var tokenizer: BPETokenizer, model_path: String):
         self.model = model^
         self.tokenizer = tokenizer^
         self.model_path = model_path
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.model = other.model^
-        self.tokenizer = other.tokenizer^
-        self.model_path = other.model_path^
+    def __init__(out self, *, deinit move: Self):
+        self.model = move.model^
+        self.tokenizer = move.tokenizer^
+        self.model_path = move.model_path^
 
 
-fn hf_load_model(repo_id: String) raises -> Model:
+def hf_load_model(repo_id: String) raises -> Model:
     """Download and load a GGUF model from HuggingFace.
 
     Finds the first .gguf file in the repo, downloads it,
@@ -48,7 +48,7 @@ fn hf_load_model(repo_id: String) raises -> Model:
     return load_gguf_model(path)
 
 
-fn hf_load_tokenizer(repo_id: String) raises -> BPETokenizer:
+def hf_load_tokenizer(repo_id: String) raises -> BPETokenizer:
     """Download and load a tokenizer from a GGUF file on HuggingFace.
 
     Args:
@@ -77,7 +77,7 @@ fn hf_load_tokenizer(repo_id: String) raises -> BPETokenizer:
     return tok^
 
 
-fn hf_auto_load(repo_id: String) raises -> HFLoadResult:
+def hf_auto_load(repo_id: String) raises -> HFLoadResult:
     """Download, load, and return both model and tokenizer from HuggingFace.
 
     Args:

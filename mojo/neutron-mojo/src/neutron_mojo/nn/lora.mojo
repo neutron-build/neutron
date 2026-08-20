@@ -22,32 +22,32 @@ from neutron_mojo.tensor.simd_math import simd_dot, simd_matvec
 # LoRA Configuration
 # ===----------------------------------------------------------------------=== #
 
-struct LoRAConfig(Copyable, Movable):
+struct LoRAConfig(Copyable, Movable, ImplicitlyCopyable):
     """Configuration for a LoRA adapter."""
     var rank: Int           # Low-rank dimension (typically 4, 8, 16, 32, 64)
     var alpha: Float32      # Scaling factor (typically same as rank or 2*rank)
     var in_features: Int    # Input dimension of base weight
     var out_features: Int   # Output dimension of base weight
 
-    fn __init__(out self, rank: Int, alpha: Float32, in_features: Int, out_features: Int):
+    def __init__(out self, rank: Int, alpha: Float32, in_features: Int, out_features: Int):
         self.rank = rank
         self.alpha = alpha
         self.in_features = in_features
         self.out_features = out_features
 
-    fn __copyinit__(out self, existing: Self):
-        self.rank = existing.rank
-        self.alpha = existing.alpha
-        self.in_features = existing.in_features
-        self.out_features = existing.out_features
+    def __init__(out self, *, copy: Self):
+        self.rank = copy.rank
+        self.alpha = copy.alpha
+        self.in_features = copy.in_features
+        self.out_features = copy.out_features
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.rank = other.rank
-        self.alpha = other.alpha
-        self.in_features = other.in_features
-        self.out_features = other.out_features
+    def __init__(out self, *, deinit move: Self):
+        self.rank = move.rank^
+        self.alpha = move.alpha^
+        self.in_features = move.in_features^
+        self.out_features = move.out_features^
 
-    fn scaling(self) -> Float32:
+    def scaling(self) -> Float32:
         """Compute the LoRA scaling factor: alpha / rank."""
         if self.rank > 0:
             return self.alpha / Float32(self.rank)
@@ -71,23 +71,23 @@ struct LoRAWeight(Movable):
     var lora_b: Tensor[DType.float32]   # [out_features * rank]
     var config: LoRAConfig
 
-    fn __init__(out self, config: LoRAConfig):
+    def __init__(out self, config: LoRAConfig):
         self.config = config.copy()
         self.lora_a = Tensor[DType.float32](Shape(config.rank * config.in_features))
         self.lora_b = Tensor[DType.float32](Shape(config.out_features * config.rank))
         # B initialized to zero → LoRA initially contributes nothing
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.lora_a = other.lora_a^
-        self.lora_b = other.lora_b^
-        self.config = other.config.copy()
+    def __init__(out self, *, deinit move: Self):
+        self.lora_a = move.lora_a^
+        self.lora_b = move.lora_b^
+        self.config = move.config.copy()
 
 
 # ===----------------------------------------------------------------------=== #
 # LoRA Operations
 # ===----------------------------------------------------------------------=== #
 
-fn lora_forward(
+def lora_forward(
     x: Tensor[DType.float32],
     lora: LoRAWeight,
 ) -> Tensor[DType.float32]:
@@ -125,7 +125,7 @@ fn lora_forward(
     return output^
 
 
-fn lora_linear(
+def lora_linear(
     x: Tensor[DType.float32],
     base_weight: Tensor[DType.float32],
     lora: LoRAWeight,
@@ -155,7 +155,7 @@ fn lora_linear(
     return output^
 
 
-fn merge_lora(
+def merge_lora(
     mut base_weight: Tensor[DType.float32],
     lora: LoRAWeight,
 ):
@@ -183,7 +183,7 @@ fn merge_lora(
             base_weight.set(idx, base_weight.get(idx) + scale * delta)
 
 
-fn unmerge_lora(
+def unmerge_lora(
     mut base_weight: Tensor[DType.float32],
     lora: LoRAWeight,
 ):

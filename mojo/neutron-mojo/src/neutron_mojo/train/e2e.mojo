@@ -8,7 +8,7 @@ Combines autograd, modules, losses, optimizers, data loading,
 and trainable transformer for end-to-end language model training.
 """
 
-from math import sqrt
+from std.math import sqrt
 
 from neutron_mojo.autograd import Tape, run_backward
 from neutron_mojo.train.trainable import TrainableLM, causal_lm_loss
@@ -24,21 +24,21 @@ struct TrainResult(Movable):
     var final_loss: Float64
     var total_steps: Int
 
-    fn __init__(out self, var tape: Tape, var metrics: TrainingMetrics,
+    def __init__(out self, var tape: Tape, var metrics: TrainingMetrics,
                 final_loss: Float64, total_steps: Int):
         self.tape = tape^
         self.metrics = metrics^
         self.final_loss = final_loss
         self.total_steps = total_steps
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.tape = other.tape^
-        self.metrics = other.metrics^
-        self.final_loss = other.final_loss
-        self.total_steps = other.total_steps
+    def __init__(out self, *, deinit move: Self):
+        self.tape = move.tape^
+        self.metrics = move.metrics^
+        self.final_loss = move.final_loss^
+        self.total_steps = move.total_steps^
 
 
-fn train_tiny_lm(
+def train_tiny_lm(
     dataset: Dataset,
     config: TrainingConfig,
     vocab_size: Int,
@@ -174,7 +174,7 @@ fn train_tiny_lm(
     return TrainResult(tape^, metrics^, final_loss, total_steps)
 
 
-fn create_simple_dataset(token_sequence: List[Int], seq_len: Int) -> Dataset:
+def create_simple_dataset(token_sequence: List[Int], seq_len: Int) -> Dataset:
     """Create a simple next-token prediction dataset from a token sequence.
 
     Uses a sliding window: input = [t0..t_{seq_len-1}], target = t_{seq_len}.

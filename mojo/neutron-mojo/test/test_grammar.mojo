@@ -36,23 +36,23 @@ from neutron_mojo.nn.grammar import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error("FAIL: " + msg + " expected=" + String(b) + " got=" + String(a))
 
 
-fn _feed_string(mut fsm: JsonFSM, s: String):
+def _feed_string(mut fsm: JsonFSM, s: String):
     """Feed all bytes of a string into the FSM."""
-    for i in range(len(s)):
+    for i in range(s.byte_length()):
         fsm.feed_char(ord(s[byte=i]))
 
 
-fn _char_in_list(c: Int, valid: List[Int]) -> Bool:
+def _char_in_list(c: Int, valid: List[Int]) -> Bool:
     """Check if char is in valid list."""
     for i in range(len(valid)):
         if valid[i] == c:
@@ -64,7 +64,7 @@ fn _char_in_list(c: Int, valid: List[Int]) -> Bool:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_char_classification() raises:
+def test_char_classification() raises:
     """Character classification helpers work correctly."""
     assert_true(is_digit(48), "0 is digit")
     assert_true(is_digit(57), "9 is digit")
@@ -86,7 +86,7 @@ fn test_char_classification() raises:
     print("  char_classification: PASS")
 
 
-fn test_fsm_initial_state() raises:
+def test_fsm_initial_state() raises:
     """FSM starts in START state."""
     var fsm = JsonFSM()
 
@@ -98,7 +98,7 @@ fn test_fsm_initial_state() raises:
     print("  fsm_initial_state: PASS")
 
 
-fn test_json_string() raises:
+def test_json_string() raises:
     """FSM correctly parses a JSON string."""
     var fsm = JsonFSM()
     _feed_string(fsm, '"hello"')
@@ -109,7 +109,7 @@ fn test_json_string() raises:
     print("  json_string: PASS")
 
 
-fn test_json_number() raises:
+def test_json_number() raises:
     """FSM correctly parses JSON numbers."""
     # Integer
     var fsm1 = JsonFSM()
@@ -134,7 +134,7 @@ fn test_json_number() raises:
     print("  json_number: PASS")
 
 
-fn test_json_literals() raises:
+def test_json_literals() raises:
     """FSM correctly parses true, false, null."""
     var fsm1 = JsonFSM()
     _feed_string(fsm1, "true")
@@ -151,7 +151,7 @@ fn test_json_literals() raises:
     print("  json_literals: PASS")
 
 
-fn test_json_object() raises:
+def test_json_object() raises:
     """FSM correctly parses a JSON object."""
     var fsm = JsonFSM()
     _feed_string(fsm, '{"key":"val"}')
@@ -168,7 +168,7 @@ fn test_json_object() raises:
     print("  json_object: PASS")
 
 
-fn test_json_array() raises:
+def test_json_array() raises:
     """FSM correctly parses a JSON array."""
     var fsm = JsonFSM()
     _feed_string(fsm, "[1,2,3]")
@@ -183,7 +183,7 @@ fn test_json_array() raises:
     print("  json_array: PASS")
 
 
-fn test_nested_json() raises:
+def test_nested_json() raises:
     """FSM handles nested objects and arrays."""
     var fsm = JsonFSM()
     _feed_string(fsm, '{"a":[1,{"b":true}]}')
@@ -194,7 +194,7 @@ fn test_nested_json() raises:
     print("  nested_json: PASS")
 
 
-fn test_invalid_json() raises:
+def test_invalid_json() raises:
     """FSM detects invalid JSON."""
     # Leading comma
     var fsm1 = JsonFSM()
@@ -215,7 +215,7 @@ fn test_invalid_json() raises:
     print("  invalid_json: PASS")
 
 
-fn test_valid_chars_start() raises:
+def test_valid_chars_start() raises:
     """Valid chars from START state include value starters."""
     var fsm = JsonFSM()
     var valid = fsm.get_valid_chars()
@@ -234,7 +234,7 @@ fn test_valid_chars_start() raises:
     print("  valid_chars_start: PASS")
 
 
-fn test_valid_chars_after_value() raises:
+def test_valid_chars_after_value() raises:
     """Valid chars after value in object include , and }."""
     var fsm = JsonFSM()
     _feed_string(fsm, '{"k":"v"')
@@ -249,7 +249,7 @@ fn test_valid_chars_after_value() raises:
     print("  valid_chars_after_value: PASS")
 
 
-fn test_grammar_mask_first_byte() raises:
+def test_grammar_mask_first_byte() raises:
     """apply_grammar_mask masks invalid first-byte tokens."""
     var vocab = List[String]()
     vocab.append("{")    # 0 — valid at start
@@ -276,7 +276,7 @@ fn test_grammar_mask_first_byte() raises:
     print("  grammar_mask_first_byte: PASS")
 
 
-fn test_grammar_mask_full() raises:
+def test_grammar_mask_full() raises:
     """apply_grammar_mask_full validates all bytes of tokens."""
     var vocab = List[String]()
     vocab.append('{"')    # 0 — valid: { then start key
@@ -299,7 +299,7 @@ fn test_grammar_mask_full() raises:
     print("  grammar_mask_full: PASS")
 
 
-fn test_advance_fsm() raises:
+def test_advance_fsm() raises:
     """advance_fsm correctly updates FSM state."""
     var fsm = JsonFSM()
     advance_fsm(fsm, '{"key"')
@@ -319,7 +319,7 @@ fn test_advance_fsm() raises:
     print("  advance_fsm: PASS")
 
 
-fn test_fsm_copy_independence() raises:
+def test_fsm_copy_independence() raises:
     """Copied FSM is independent of original."""
     var fsm = JsonFSM()
     _feed_string(fsm, '{"a"')
@@ -336,7 +336,7 @@ fn test_fsm_copy_independence() raises:
     print("  fsm_copy_independence: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_grammar:")
 
     test_char_classification()

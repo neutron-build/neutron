@@ -15,15 +15,15 @@ from neutron_mojo.nn.kv_cache import MultiLayerKVCache
 from neutron_mojo.nn.rope import RoPETable
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn make_tiny_model(arch: ArchitectureConfig) raises -> Model:
+def make_tiny_model(arch: ArchitectureConfig) raises -> Model:
     """Create a tiny model with a specific architecture."""
     var p = tiny_test_params()
     p.arch = arch.copy()
@@ -34,7 +34,7 @@ fn make_tiny_model(arch: ArchitectureConfig) raises -> Model:
 # Llama (baseline)
 # ===----------------------------------------------------------------------=== #
 
-fn test_llama_forward() raises:
+def test_llama_forward() raises:
     """Llama forward pass produces valid logits."""
     var model = make_tiny_model(llama_arch())
     var p = model.params.copy()
@@ -52,7 +52,7 @@ fn test_llama_forward() raises:
     print("  llama_forward: PASS")
 
 
-fn test_llama_generates_tokens() raises:
+def test_llama_generates_tokens() raises:
     """Llama generates multiple tokens without error."""
     var model = make_tiny_model(llama_arch())
     var p = model.params.copy()
@@ -67,7 +67,7 @@ fn test_llama_generates_tokens() raises:
 # Phi (GeLU + partial rotary)
 # ===----------------------------------------------------------------------=== #
 
-fn test_phi_forward() raises:
+def test_phi_forward() raises:
     """Phi forward pass with GeLU activation."""
     var model = make_tiny_model(phi_arch(0.5))
     var p = model.params.copy()
@@ -78,7 +78,7 @@ fn test_phi_forward() raises:
     print("  phi_forward: PASS")
 
 
-fn test_phi_partial_rotary() raises:
+def test_phi_partial_rotary() raises:
     """Phi partial rotary config is set correctly and forward pass works at multiple positions."""
     var p = tiny_test_params()
     p.arch = phi_arch(0.5)
@@ -96,7 +96,7 @@ fn test_phi_partial_rotary() raises:
     print("  phi_partial_rotary: PASS")
 
 
-fn test_phi_generates_tokens() raises:
+def test_phi_generates_tokens() raises:
     """Phi generates multiple tokens without error."""
     var model = make_tiny_model(phi_arch(0.5))
     var p = model.params.copy()
@@ -111,7 +111,7 @@ fn test_phi_generates_tokens() raises:
 # Gemma
 # ===----------------------------------------------------------------------=== #
 
-fn test_gemma_forward() raises:
+def test_gemma_forward() raises:
     """Gemma forward pass."""
     var model = make_tiny_model(gemma_arch())
     var p = model.params.copy()
@@ -126,7 +126,7 @@ fn test_gemma_forward() raises:
 # Mistral (sliding window config present, uses standard attention in test)
 # ===----------------------------------------------------------------------=== #
 
-fn test_mistral_config() raises:
+def test_mistral_config() raises:
     """Mistral config has sliding window set."""
     var arch = mistral_arch(4096)
     var p = tiny_test_params()
@@ -136,7 +136,7 @@ fn test_mistral_config() raises:
     print("  mistral_config: PASS")
 
 
-fn test_mistral_forward() raises:
+def test_mistral_forward() raises:
     """Mistral forward pass (uses standard attention path for tiny model)."""
     var model = make_tiny_model(mistral_arch(4096))
     var p = model.params.copy()
@@ -151,7 +151,7 @@ fn test_mistral_forward() raises:
 # Q8 variants
 # ===----------------------------------------------------------------------=== #
 
-fn test_q8_phi_forward() raises:
+def test_q8_phi_forward() raises:
     """Q8 model with Phi architecture."""
     var p = tiny_test_params()
     p.arch = phi_arch(0.5)
@@ -164,7 +164,7 @@ fn test_q8_phi_forward() raises:
     print("  q8_phi_forward: PASS")
 
 
-fn test_q8_gemma_forward() raises:
+def test_q8_gemma_forward() raises:
     """Q8 model with Gemma architecture."""
     var p = tiny_test_params()
     p.arch = gemma_arch()
@@ -177,7 +177,7 @@ fn test_q8_gemma_forward() raises:
     print("  q8_gemma_forward: PASS")
 
 
-fn test_arch_name_roundtrip() raises:
+def test_arch_name_roundtrip() raises:
     """Architecture name -> config -> kind roundtrip."""
     var names = List[String]()
     names.append("llama")
@@ -201,7 +201,7 @@ fn test_arch_name_roundtrip() raises:
     print("  arch_name_roundtrip: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_multi_arch")
     test_llama_forward()
     test_llama_generates_tokens()

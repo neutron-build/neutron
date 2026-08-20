@@ -4,7 +4,7 @@
 
 """Tests for repetition penalty, stop tokens, and beam search."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.generation import (
     apply_repetition_penalty,
     apply_frequency_penalty,
@@ -19,19 +19,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_repetition_penalty_basic() raises:
+def test_repetition_penalty_basic() raises:
     """Test repetition penalty reduces repeated token scores."""
     var logits = Tensor[DType.float32](Shape(5))
     logits.set(0, 2.0)
@@ -62,7 +62,7 @@ fn test_repetition_penalty_basic() raises:
     print("  repetition_penalty_basic: PASS")
 
 
-fn test_repetition_penalty_negative_logits() raises:
+def test_repetition_penalty_negative_logits() raises:
     """Test repetition penalty with negative logits (multiplied, not divided)."""
     var logits = Tensor[DType.float32](Shape(3))
     logits.set(0, -2.0)
@@ -83,7 +83,7 @@ fn test_repetition_penalty_negative_logits() raises:
     print("  repetition_penalty_negative_logits: PASS")
 
 
-fn test_repetition_penalty_no_effect_at_1() raises:
+def test_repetition_penalty_no_effect_at_1() raises:
     """Test penalty=1.0 has no effect."""
     var logits = Tensor[DType.float32](Shape(3))
     logits.set(0, 1.0)
@@ -102,7 +102,7 @@ fn test_repetition_penalty_no_effect_at_1() raises:
     print("  repetition_penalty_no_effect_at_1: PASS")
 
 
-fn test_frequency_penalty() raises:
+def test_frequency_penalty() raises:
     """Test frequency penalty scales with occurrence count."""
     var logits = Tensor[DType.float32](Shape(4))
     logits.set(0, 5.0)
@@ -130,7 +130,7 @@ fn test_frequency_penalty() raises:
     print("  frequency_penalty: PASS")
 
 
-fn test_presence_penalty() raises:
+def test_presence_penalty() raises:
     """Test presence penalty applies flat penalty per unique token."""
     var logits = Tensor[DType.float32](Shape(4))
     logits.set(0, 5.0)
@@ -156,7 +156,7 @@ fn test_presence_penalty() raises:
     print("  presence_penalty: PASS")
 
 
-fn test_should_stop() raises:
+def test_should_stop() raises:
     """Test stop token detection."""
     var stop_tokens = List[Int]()
     stop_tokens.append(2)
@@ -172,7 +172,7 @@ fn test_should_stop() raises:
     print("  should_stop: PASS")
 
 
-fn test_generation_config() raises:
+def test_generation_config() raises:
     """Test GenerationConfig struct."""
     var config = GenerationConfig()
     config.repetition_penalty = 1.2
@@ -196,7 +196,7 @@ fn test_generation_config() raises:
     print("  generation_config: PASS")
 
 
-fn test_generation_config_copy() raises:
+def test_generation_config_copy() raises:
     """Test GenerationConfig is copyable."""
     var config = GenerationConfig()
     config.repetition_penalty = 1.5
@@ -209,7 +209,7 @@ fn test_generation_config_copy() raises:
     print("  generation_config_copy: PASS")
 
 
-fn test_beam_entry() raises:
+def test_beam_entry() raises:
     """Test BeamEntry struct."""
     var entry = BeamEntry()
     entry.tokens.append(1)
@@ -228,7 +228,7 @@ fn test_beam_entry() raises:
     print("  beam_entry: PASS")
 
 
-fn test_beam_search_step() raises:
+def test_beam_search_step() raises:
     """Test beam search expansion step."""
     var logits = Tensor[DType.float32](Shape(4))
     logits.set(0, 1.0)
@@ -255,7 +255,7 @@ fn test_beam_search_step() raises:
     print("  beam_search_step: PASS")
 
 
-fn test_select_top_beams() raises:
+def test_select_top_beams() raises:
     """Test selecting top beams by score."""
     var candidates = List[BeamEntry]()
 
@@ -287,7 +287,7 @@ fn test_select_top_beams() raises:
     print("  select_top_beams: PASS")
 
 
-fn test_repetition_penalty_changes_sampling() raises:
+def test_repetition_penalty_changes_sampling() raises:
     """Test that repetition penalty actually changes which token is sampled."""
     # Logits slightly favor token 1
     var logits = Tensor[DType.float32](Shape(4))
@@ -314,7 +314,7 @@ fn test_repetition_penalty_changes_sampling() raises:
     print("  repetition_penalty_changes_sampling: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_generation:")
 
     test_repetition_penalty_basic()

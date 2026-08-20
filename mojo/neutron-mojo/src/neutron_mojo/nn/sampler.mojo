@@ -8,7 +8,7 @@ Supports greedy, top-k, top-p (nucleus), and temperature-scaled sampling.
 Uses a simple LCG PRNG for reproducible random sampling.
 """
 
-from math import exp
+from std.math import exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
@@ -17,30 +17,30 @@ from neutron_mojo.tensor.shape import Shape
 # PRNG (Linear Congruential Generator)
 # ===----------------------------------------------------------------------=== #
 
-struct LCG(Copyable, Movable):
+struct LCG(Copyable, Movable, ImplicitlyCopyable):
     """Simple LCG pseudo-random number generator.
 
     Parameters from Numerical Recipes (period 2^32).
     """
     var state: Int
 
-    fn __init__(out self, seed: Int = 42):
+    def __init__(out self, seed: Int = 42):
         self.state = seed
 
-    fn __copyinit__(out self, existing: Self):
-        self.state = existing.state
+    def __init__(out self, *, copy: Self):
+        self.state = copy.state
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.state = other.state
+    def __init__(out self, *, deinit move: Self):
+        self.state = move.state^
 
-    fn next_int(mut self) -> Int:
+    def next_int(mut self) -> Int:
         """Generate next pseudo-random integer."""
         # LCG: state = (a * state + c) mod m
         # Using Numerical Recipes constants
         self.state = (1664525 * self.state + 1013904223) & 0x7FFFFFFF
         return self.state
 
-    fn next_float(mut self) -> Float32:
+    def next_float(mut self) -> Float32:
         """Generate next uniform random float in [0, 1)."""
         return Float32(self.next_int()) / Float32(0x7FFFFFFF)
 
@@ -49,39 +49,39 @@ struct LCG(Copyable, Movable):
 # Sampler Config
 # ===----------------------------------------------------------------------=== #
 
-struct SamplerConfig(Copyable, Movable):
+struct SamplerConfig(Copyable, Movable, ImplicitlyCopyable):
     """Configuration for token sampling."""
     var temperature: Float32    # >1 = more random, <1 = more peaked, 0 = greedy
     var top_k: Int              # 0 = disabled
     var top_p: Float32          # 1.0 = disabled, 0.9 = nucleus sampling
     var seed: Int               # PRNG seed
 
-    fn __init__(out self):
+    def __init__(out self):
         """Default: greedy decoding."""
         self.temperature = 0.0
         self.top_k = 0
         self.top_p = 1.0
         self.seed = 42
 
-    fn __copyinit__(out self, existing: Self):
-        self.temperature = existing.temperature
-        self.top_k = existing.top_k
-        self.top_p = existing.top_p
-        self.seed = existing.seed
+    def __init__(out self, *, copy: Self):
+        self.temperature = copy.temperature
+        self.top_k = copy.top_k
+        self.top_p = copy.top_p
+        self.seed = copy.seed
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.temperature = other.temperature
-        self.top_k = other.top_k
-        self.top_p = other.top_p
-        self.seed = other.seed
+    def __init__(out self, *, deinit move: Self):
+        self.temperature = move.temperature^
+        self.top_k = move.top_k^
+        self.top_p = move.top_p^
+        self.seed = move.seed^
 
 
-fn greedy_config() -> SamplerConfig:
+def greedy_config() -> SamplerConfig:
     """Greedy decoding config."""
     return SamplerConfig()
 
 
-fn creative_config() -> SamplerConfig:
+def creative_config() -> SamplerConfig:
     """Creative sampling: temperature=0.8, top_p=0.9, top_k=40."""
     var c = SamplerConfig()
     c.temperature = 0.8
@@ -90,7 +90,7 @@ fn creative_config() -> SamplerConfig:
     return c^
 
 
-fn random_config(temperature: Float32 = 1.0, seed: Int = 42) -> SamplerConfig:
+def random_config(temperature: Float32 = 1.0, seed: Int = 42) -> SamplerConfig:
     """Temperature sampling config."""
     var c = SamplerConfig()
     c.temperature = temperature
@@ -107,15 +107,15 @@ struct Sampler(Movable):
     var config: SamplerConfig
     var rng: LCG
 
-    fn __init__(out self, config: SamplerConfig):
+    def __init__(out self, config: SamplerConfig):
         self.config = config.copy()
         self.rng = LCG(config.seed)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.config = other.config.copy()
-        self.rng = other.rng^
+    def __init__(out self, *, deinit move: Self):
+        self.config = move.config.copy()
+        self.rng = move.rng^
 
-    fn sample(mut self, logits: Tensor[DType.float32], vocab_size: Int) raises -> Int:
+    def sample(mut self, logits: Tensor[DType.float32], vocab_size: Int) raises -> Int:
         """Sample a token from logits.
 
         Applies temperature, top-k, top-p, then samples.
@@ -155,7 +155,7 @@ struct Sampler(Movable):
         # Sample from probability distribution
         return self._categorical_sample(scores, vocab_size)
 
-    fn _argmax(self, logits: Tensor[DType.float32], size: Int) -> Int:
+    def _argmax(self, logits: Tensor[DType.float32], size: Int) -> Int:
         """Return index of maximum value."""
         var best = 0
         var best_val = logits.get(0)
@@ -166,7 +166,7 @@ struct Sampler(Movable):
                 best = i
         return best
 
-    fn _softmax(self, mut scores: Tensor[DType.float32], size: Int):
+    def _softmax(self, mut scores: Tensor[DType.float32], size: Int):
         """Apply softmax in-place."""
         var max_val = scores.get(0)
         for i in range(1, size):
@@ -184,7 +184,7 @@ struct Sampler(Movable):
             for i in range(size):
                 scores.set(i, scores.get(i) / sum_exp)
 
-    fn _top_k_filter(self, mut scores: Tensor[DType.float32], size: Int):
+    def _top_k_filter(self, mut scores: Tensor[DType.float32], size: Int):
         """Zero out all but top-k logits."""
         var k = self.config.top_k
         var neg_inf: Float32 = -1e30
@@ -208,7 +208,7 @@ struct Sampler(Movable):
             if used.get(j) == 0.0:
                 scores.set(j, neg_inf)
 
-    fn _top_p_filter(self, mut probs: Tensor[DType.float32], size: Int):
+    def _top_p_filter(self, mut probs: Tensor[DType.float32], size: Int):
         """Apply nucleus (top-p) filtering on probability distribution.
 
         Zeroes out tokens whose cumulative probability exceeds top_p.
@@ -262,7 +262,7 @@ struct Sampler(Movable):
             for i in range(size):
                 probs.set(i, probs.get(i) / new_sum)
 
-    fn _categorical_sample(mut self, probs: Tensor[DType.float32], size: Int) -> Int:
+    def _categorical_sample(mut self, probs: Tensor[DType.float32], size: Int) -> Int:
         """Sample from a categorical distribution."""
         var u = self.rng.next_float()
         var cumsum: Float32 = 0.0

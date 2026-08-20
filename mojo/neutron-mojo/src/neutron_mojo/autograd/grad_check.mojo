@@ -11,29 +11,29 @@ gradients. Essential for testing new backward implementations.
 from neutron_mojo.tensor.tensor import Tensor
 
 
-struct GradCheckResult(Copyable, Movable):
+struct GradCheckResult(Copyable, Movable, ImplicitlyCopyable):
     """Result of comparing analytical vs numerical gradients."""
     var max_abs_diff: Float64
     var max_rel_diff: Float64
     var passed: Bool
 
-    fn __init__(out self, max_abs_diff: Float64, max_rel_diff: Float64, passed: Bool):
+    def __init__(out self, max_abs_diff: Float64, max_rel_diff: Float64, passed: Bool):
         self.max_abs_diff = max_abs_diff
         self.max_rel_diff = max_rel_diff
         self.passed = passed
 
-    fn __copyinit__(out self, other: Self):
-        self.max_abs_diff = other.max_abs_diff
-        self.max_rel_diff = other.max_rel_diff
-        self.passed = other.passed
+    def __init__(out self, *, copy: Self):
+        self.max_abs_diff = copy.max_abs_diff
+        self.max_rel_diff = copy.max_rel_diff
+        self.passed = copy.passed
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.max_abs_diff = other.max_abs_diff
-        self.max_rel_diff = other.max_rel_diff
-        self.passed = other.passed
+    def __init__(out self, *, deinit move: Self):
+        self.max_abs_diff = move.max_abs_diff^
+        self.max_rel_diff = move.max_rel_diff^
+        self.passed = move.passed^
 
 
-fn compare_gradients(
+def compare_gradients(
     analytical: Tensor[DType.float32],
     numerical: Tensor[DType.float32],
     rtol: Float64 = 1e-3,

@@ -9,9 +9,9 @@ Supports broadcasting for elementwise ops. Tiled matmul with configurable
 tile size.
 """
 
-from algorithm import vectorize
-from math import exp, sqrt, tanh
-from sys import simd_width_of
+from std.algorithm import vectorize
+from std.math import exp, sqrt, tanh
+from std.sys import simd_width_of
 
 from .shape import Shape
 from .storage import Storage
@@ -23,12 +23,12 @@ from .tensor import Tensor
 # ===----------------------------------------------------------------------=== #
 
 
-fn _broadcast_shapes(a: Shape, b: Shape) raises -> Shape:
+def _broadcast_shapes(a: Shape, b: Shape) raises -> Shape:
     """Compute broadcast-compatible output shape."""
     return a.broadcast_with(b)
 
 
-fn _broadcast_linear_index(
+def _broadcast_linear_index(
     flat_idx: Int,
     out_shape: Shape,
     src_shape: Shape,
@@ -66,9 +66,9 @@ fn _broadcast_linear_index(
 # ===----------------------------------------------------------------------=== #
 
 
-fn _elementwise_binary_op[
+def _elementwise_binary_op[
     dtype: DType,
-    op_fn: fn[w: Int] (SIMD[dtype, w], SIMD[dtype, w]) -> SIMD[dtype, w],
+    op_fn: def[w: Int] (SIMD[dtype, w], SIMD[dtype, w]) thin -> SIMD[dtype, w],
 ](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Generic elementwise binary operation with broadcast support.
 
@@ -85,7 +85,7 @@ fn _elementwise_binary_op[
 
         comptime simd_width = simd_width_of[dtype]()
 
-        fn vec_op[w: Int](i: Int) unified {mut}:
+        def vec_op[w: Int](i: Int) {var a_ptr, var b_ptr, var r_ptr}:
             var va = a_ptr.load[width=w](i)
             var vb = b_ptr.load[width=w](i)
             r_ptr.store(i, op_fn[w](va, vb))
@@ -111,25 +111,25 @@ fn _elementwise_binary_op[
     return result^
 
 
-fn _simd_add[dtype: DType, w: Int](
+def _simd_add[dtype: DType, w: Int](
     a: SIMD[dtype, w], b: SIMD[dtype, w]
 ) -> SIMD[dtype, w]:
     return a + b
 
 
-fn _simd_sub[dtype: DType, w: Int](
+def _simd_sub[dtype: DType, w: Int](
     a: SIMD[dtype, w], b: SIMD[dtype, w]
 ) -> SIMD[dtype, w]:
     return a - b
 
 
-fn _simd_mul[dtype: DType, w: Int](
+def _simd_mul[dtype: DType, w: Int](
     a: SIMD[dtype, w], b: SIMD[dtype, w]
 ) -> SIMD[dtype, w]:
     return a * b
 
 
-fn _simd_div[dtype: DType, w: Int](
+def _simd_div[dtype: DType, w: Int](
     a: SIMD[dtype, w], b: SIMD[dtype, w]
 ) -> SIMD[dtype, w]:
     return a / b
@@ -140,24 +140,24 @@ fn _simd_div[dtype: DType, w: Int](
 # ===----------------------------------------------------------------------=== #
 
 
-fn add[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def add[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise addition with broadcast support."""
-    return _elementwise_binary_op[dtype, _simd_add[dtype]](a, b)
+    return _elementwise_binary_op[dtype, _simd_add[dtype, ...]](a, b)
 
 
-fn sub[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def sub[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise subtraction with broadcast support."""
-    return _elementwise_binary_op[dtype, _simd_sub[dtype]](a, b)
+    return _elementwise_binary_op[dtype, _simd_sub[dtype, ...]](a, b)
 
 
-fn mul[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def mul[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise multiplication with broadcast support."""
-    return _elementwise_binary_op[dtype, _simd_mul[dtype]](a, b)
+    return _elementwise_binary_op[dtype, _simd_mul[dtype, ...]](a, b)
 
 
-fn div[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def div[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise division with broadcast support."""
-    return _elementwise_binary_op[dtype, _simd_div[dtype]](a, b)
+    return _elementwise_binary_op[dtype, _simd_div[dtype, ...]](a, b)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -167,12 +167,12 @@ fn div[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]
 comptime TILE_SIZE: Int = 32
 
 
-fn _matmul_2d_kernel[
+def _matmul_2d_kernel[
     dtype: DType
 ](
-    a_ptr: UnsafePointer[Scalar[dtype], MutExternalOrigin],
-    b_ptr: UnsafePointer[Scalar[dtype], MutExternalOrigin],
-    c_ptr: UnsafePointer[Scalar[dtype], MutExternalOrigin],
+    a_ptr: Pointer[mut=True, Scalar[dtype], ...],
+    b_ptr: Pointer[mut=True, Scalar[dtype], ...],
+    c_ptr: Pointer[mut=True, Scalar[dtype], ...],
     a_offset: Int,
     b_offset: Int,
     c_offset: Int,
@@ -244,7 +244,7 @@ fn _matmul_2d_kernel[
         ti += TILE_SIZE
 
 
-fn matmul[
+def matmul[
     dtype: DType
 ](a: Tensor[dtype], b: Tensor[dtype], transpose_a: Bool = False, transpose_b: Bool = False) raises -> Tensor[dtype]:
     """Matrix multiplication: C = A @ B (with optional transposes).
@@ -371,7 +371,7 @@ fn matmul[
 # ===----------------------------------------------------------------------=== #
 
 
-fn relu[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def relu[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """ReLU activation: max(0, x).
 
     Scalar loop — SIMD blocked by Mojo 0.26.2 limitation: SIMD comparison
@@ -391,7 +391,7 @@ fn relu[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn softmax[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
+def softmax[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
     """Numerically stable softmax along the given axis.
 
     Supports 1D tensors and 2D tensors (softmax along last axis).
@@ -409,7 +409,7 @@ fn softmax[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtyp
         raise Error("softmax currently supports 1D or 2D (axis=-1) tensors")
 
 
-fn _softmax_1d[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def _softmax_1d[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Softmax for a 1D tensor."""
     var n = x.numel()
     var x_ptr = x.data_ptr()
@@ -438,7 +438,7 @@ fn _softmax_1d[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn _softmax_2d_last[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def _softmax_2d_last[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Softmax along last axis of a 2D tensor."""
     var rows = x.shape()[0]
     var cols = x.shape()[1]
@@ -477,7 +477,7 @@ fn _softmax_2d_last[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
 # ===----------------------------------------------------------------------=== #
 
 
-fn reduce_sum[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
+def reduce_sum[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
     """Sum reduction along the given axis.
 
     axis=-1 reduces the last dimension.
@@ -532,7 +532,7 @@ fn reduce_sum[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[d
         )
 
 
-fn reduce_max[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
+def reduce_max[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
     """Max reduction along the given axis.
 
     axis=-1 reduces the last dimension.
@@ -591,7 +591,7 @@ fn reduce_max[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[d
         )
 
 
-fn reduce_mean[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
+def reduce_mean[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dtype]:
     """Mean reduction along the specified axis.
 
     Same as reduce_sum but divides by the count along the axis.
@@ -608,7 +608,7 @@ fn reduce_mean[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[
     return sum_result^
 
 
-fn sum_all[dtype: DType](x: Tensor[dtype]) -> Scalar[dtype]:
+def sum_all[dtype: DType](x: Tensor[dtype]) -> Scalar[dtype]:
     """Sum all elements to a scalar."""
     var sum_val = Float64(0.0)
     var x_ptr = x.data_ptr()
@@ -617,7 +617,7 @@ fn sum_all[dtype: DType](x: Tensor[dtype]) -> Scalar[dtype]:
     return Scalar[dtype](sum_val)
 
 
-fn max_all[dtype: DType](x: Tensor[dtype]) raises -> Scalar[dtype]:
+def max_all[dtype: DType](x: Tensor[dtype]) raises -> Scalar[dtype]:
     """Max of all elements to a scalar."""
     if x.numel() == 0:
         raise Error("max_all: empty tensor")
@@ -636,7 +636,7 @@ fn max_all[dtype: DType](x: Tensor[dtype]) raises -> Scalar[dtype]:
 # ===----------------------------------------------------------------------=== #
 
 
-fn rmsnorm[dtype: DType](
+def rmsnorm[dtype: DType](
     x: Tensor[dtype], gamma: Tensor[dtype], eps: Float64 = 1e-6
 ) raises -> Tensor[dtype]:
     """RMS Normalization along the last axis.
@@ -719,7 +719,7 @@ fn rmsnorm[dtype: DType](
         raise Error("rmsnorm: only 1D and 2D tensors supported, got ndim=" + String(x.ndim()))
 
 
-fn layernorm[dtype: DType](
+def layernorm[dtype: DType](
     x: Tensor[dtype], gamma: Tensor[dtype], beta: Tensor[dtype], eps: Float64 = 1e-5
 ) raises -> Tensor[dtype]:
     """Layer Normalization along the last axis.
@@ -822,7 +822,7 @@ fn layernorm[dtype: DType](
 # ===----------------------------------------------------------------------=== #
 
 
-fn gelu[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
+def gelu[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """GeLU activation (tanh approximation).
 
     GeLU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -864,7 +864,7 @@ fn gelu[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     return result^
 
 
-fn silu[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
+def silu[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """SiLU (Swish) activation: x * sigmoid(x).
 
     SiLU(x) = x / (1 + exp(-x))
@@ -898,7 +898,7 @@ fn silu[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     return result^
 
 
-fn swiglu[dtype: DType](x: Tensor[dtype], gate: Tensor[dtype]) raises -> Tensor[dtype]:
+def swiglu[dtype: DType](x: Tensor[dtype], gate: Tensor[dtype]) raises -> Tensor[dtype]:
     """SwiGLU gated activation: silu(gate) * x.
 
     Used in Llama-3 FFN: a linear layer produces [x, gate], then
@@ -951,7 +951,7 @@ fn swiglu[dtype: DType](x: Tensor[dtype], gate: Tensor[dtype]) raises -> Tensor[
 # ===----------------------------------------------------------------------=== #
 
 
-fn neg[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def neg[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Negate all elements: -x."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -962,7 +962,7 @@ fn neg[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn abs_val[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def abs_val[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Absolute value of all elements."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -975,7 +975,7 @@ fn abs_val[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn exp_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def exp_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Elementwise exponential: exp(x)."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -986,9 +986,9 @@ fn exp_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn log_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def log_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Elementwise natural log: log(x)."""
-    from math import log
+    from std.math import log
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
     var x_ptr = x.data_ptr()
@@ -998,7 +998,7 @@ fn log_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn sqrt_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def sqrt_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Elementwise square root: sqrt(x)."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1009,7 +1009,7 @@ fn sqrt_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn sigmoid[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def sigmoid[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Sigmoid activation: 1 / (1 + exp(-x))."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1021,7 +1021,7 @@ fn sigmoid[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn tanh_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def tanh_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     """Elementwise hyperbolic tangent: tanh(x)."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1032,9 +1032,9 @@ fn tanh_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-fn pow_scalar[dtype: DType](x: Tensor[dtype], exponent: Float64) -> Tensor[dtype]:
+def pow_scalar[dtype: DType](x: Tensor[dtype], exponent: Float64) -> Tensor[dtype]:
     """Raise all elements to a power: x^exponent."""
-    from math import pow
+    from std.math import pow
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
     var x_ptr = x.data_ptr()
@@ -1044,7 +1044,7 @@ fn pow_scalar[dtype: DType](x: Tensor[dtype], exponent: Float64) -> Tensor[dtype
     return result^
 
 
-fn clamp[dtype: DType](x: Tensor[dtype], min_val: Float64, max_val: Float64) -> Tensor[dtype]:
+def clamp[dtype: DType](x: Tensor[dtype], min_val: Float64, max_val: Float64) -> Tensor[dtype]:
     """Clamp all elements to [min_val, max_val]."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1063,7 +1063,7 @@ fn clamp[dtype: DType](x: Tensor[dtype], min_val: Float64, max_val: Float64) -> 
     return result^
 
 
-fn scalar_mul[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
+def scalar_mul[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
     """Multiply all elements by a scalar."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1075,7 +1075,7 @@ fn scalar_mul[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
     return result^
 
 
-fn scalar_add[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
+def scalar_add[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
     """Add a scalar to all elements."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1092,25 +1092,25 @@ fn scalar_add[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
 # ===----------------------------------------------------------------------=== #
 
 
-struct ArgResult(Copyable, Movable):
+struct ArgResult(Copyable, Movable, ImplicitlyCopyable):
     """Result of argmax/argmin: index and value."""
     var index: Int
     var value: Float64
 
-    fn __init__(out self, index: Int, value: Float64):
+    def __init__(out self, index: Int, value: Float64):
         self.index = index
         self.value = value
 
-    fn __copyinit__(out self, other: Self):
-        self.index = other.index
-        self.value = other.value
+    def __init__(out self, *, copy: Self):
+        self.index = copy.index
+        self.value = copy.value
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.index = other.index
-        self.value = other.value
+    def __init__(out self, *, deinit move: Self):
+        self.index = move.index^
+        self.value = move.value^
 
 
-fn argmax_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
+def argmax_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
     """Find the index and value of the maximum element (1D)."""
     var n = x.numel()
     var x_ptr = x.data_ptr()
@@ -1124,7 +1124,7 @@ fn argmax_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
     return ArgResult(best_idx, best_val)
 
 
-fn argmin_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
+def argmin_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
     """Find the index and value of the minimum element (1D)."""
     var n = x.numel()
     var x_ptr = x.data_ptr()
@@ -1138,7 +1138,7 @@ fn argmin_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
     return ArgResult(best_idx, best_val)
 
 
-fn argmax_axis[dtype: DType](x: Tensor[dtype], axis: Int) raises -> Tensor[dtype]:
+def argmax_axis[dtype: DType](x: Tensor[dtype], axis: Int) raises -> Tensor[dtype]:
     """Argmax along axis for 2D tensor. Returns indices as float values."""
     if x.ndim() != 2:
         raise Error("argmax_axis: only 2D tensors supported")
@@ -1179,7 +1179,7 @@ fn argmax_axis[dtype: DType](x: Tensor[dtype], axis: Int) raises -> Tensor[dtype
         raise Error("argmax_axis: axis must be 0 or 1")
 
 
-fn topk[dtype: DType](x: Tensor[dtype], k: Int) raises -> Tensor[dtype]:
+def topk[dtype: DType](x: Tensor[dtype], k: Int) raises -> Tensor[dtype]:
     """Top-k values from a 1D tensor. Returns a tensor of the k largest values sorted descending.
 
     Also stores indices in a secondary pattern — but since we can't return
@@ -1217,7 +1217,7 @@ fn topk[dtype: DType](x: Tensor[dtype], k: Int) raises -> Tensor[dtype]:
     return result^
 
 
-fn where_op[dtype: DType](
+def where_op[dtype: DType](
     condition: Tensor[dtype], x: Tensor[dtype], y: Tensor[dtype]
 ) raises -> Tensor[dtype]:
     """Conditional select: result[i] = x[i] if condition[i] > 0 else y[i]."""
@@ -1238,7 +1238,7 @@ fn where_op[dtype: DType](
     return result^
 
 
-fn gather[dtype: DType](
+def gather[dtype: DType](
     x: Tensor[dtype], dim: Int, indices: List[Int]
 ) raises -> Tensor[dtype]:
     """Gather elements along a dimension using indices.
@@ -1281,14 +1281,14 @@ fn gather[dtype: DType](
         raise Error("gather: only 1D and 2D tensors supported")
 
 
-fn index_select[dtype: DType](
+def index_select[dtype: DType](
     x: Tensor[dtype], dim: Int, indices: List[Int]
 ) raises -> Tensor[dtype]:
     """Select rows or columns by indices. Alias for gather with clearer semantics."""
     return gather(x, dim, indices)
 
 
-fn eq[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def eq[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise equal: returns 1.0 where equal, 0.0 otherwise."""
     if a.numel() != b.numel():
         raise Error("eq: tensors must have same size")
@@ -1305,7 +1305,7 @@ fn eq[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     return result^
 
 
-fn ne[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def ne[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise not-equal: returns 1.0 where not equal, 0.0 otherwise."""
     if a.numel() != b.numel():
         raise Error("ne: tensors must have same size")
@@ -1322,7 +1322,7 @@ fn ne[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     return result^
 
 
-fn gt[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def gt[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise greater-than: returns 1.0 where a > b, 0.0 otherwise."""
     if a.numel() != b.numel():
         raise Error("gt: tensors must have same size")
@@ -1339,7 +1339,7 @@ fn gt[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     return result^
 
 
-fn lt[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def lt[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise less-than: returns 1.0 where a < b, 0.0 otherwise."""
     if a.numel() != b.numel():
         raise Error("lt: tensors must have same size")
@@ -1356,7 +1356,7 @@ fn lt[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     return result^
 
 
-fn ge[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def ge[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise greater-or-equal: returns 1.0 where a >= b, 0.0 otherwise."""
     if a.numel() != b.numel():
         raise Error("ge: tensors must have same size")
@@ -1373,7 +1373,7 @@ fn ge[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     return result^
 
 
-fn le[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
+def le[dtype: DType](a: Tensor[dtype], b: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise less-or-equal: returns 1.0 where a <= b, 0.0 otherwise."""
     if a.numel() != b.numel():
         raise Error("le: tensors must have same size")

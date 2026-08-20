@@ -41,7 +41,7 @@ Current code state in this workspace:
 
 ## Tooling
 
-- `max >= 25.1` (see `mojoproject.toml`)
+- `mojo >= 1.0`, `max >= 26.5` (see `mojoproject.toml`)
 - Mojo toolchain availability is required to run tests/benchmarks
 
 ## Validation

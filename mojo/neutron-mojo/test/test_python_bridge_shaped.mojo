@@ -7,8 +7,8 @@
 Tests that require numpy/torch are skipped if not available.
 """
 
-from math import abs
-from testing import assert_true
+from std.math import abs
+from std.testing import assert_true
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
@@ -21,7 +21,7 @@ from neutron_mojo.python.bridge import (
 )
 
 
-fn test_numpy_available_returns_bool() raises:
+def test_numpy_available_returns_bool() raises:
     """numpy_available() returns a boolean."""
     var result = numpy_available()
     # Just check it doesn't crash — result depends on environment
@@ -29,14 +29,14 @@ fn test_numpy_available_returns_bool() raises:
     print("PASS: test_numpy_available_returns_bool (numpy=" + String(result) + ")")
 
 
-fn test_torch_available_returns_bool() raises:
+def test_torch_available_returns_bool() raises:
     """torch_available() returns a boolean."""
     var result = torch_available()
     assert_true(result or not result, "torch_available returns bool")
     print("PASS: test_torch_available_returns_bool (torch=" + String(result) + ")")
 
 
-fn test_to_numpy_shaped_2d() raises:
+def test_to_numpy_shaped_2d() raises:
     """to_numpy_shaped preserves 2D shape."""
     if not numpy_available():
         print("SKIP: test_to_numpy_shaped_2d (no numpy)")
@@ -45,7 +45,7 @@ fn test_to_numpy_shaped_2d() raises:
     for i in range(6):
         t.set(i, Float32(i + 1))
     var arr = to_numpy_shaped(t, Shape(2, 3))
-    from python import Python
+    from std.python import Python
     var np = Python.import_module("numpy")
     var shape = arr.shape
     assert_true(Int(py=shape[0]) == 2, "2D shape dim 0")
@@ -55,7 +55,7 @@ fn test_to_numpy_shaped_2d() raises:
     print("PASS: test_to_numpy_shaped_2d")
 
 
-fn test_to_numpy_shaped_3d() raises:
+def test_to_numpy_shaped_3d() raises:
     """to_numpy_shaped preserves 3D shape."""
     if not numpy_available():
         print("SKIP: test_to_numpy_shaped_3d (no numpy)")
@@ -71,12 +71,12 @@ fn test_to_numpy_shaped_3d() raises:
     print("PASS: test_to_numpy_shaped_3d")
 
 
-fn test_from_numpy_shaped() raises:
+def test_from_numpy_shaped() raises:
     """from_numpy_shaped copies data from shaped array."""
     if not numpy_available():
         print("SKIP: test_from_numpy_shaped (no numpy)")
         return
-    from python import Python
+    from std.python import Python
     var np = Python.import_module("numpy")
     var builtins = Python.import_module("builtins")
     var row0 = builtins.list()
@@ -96,7 +96,7 @@ fn test_from_numpy_shaped() raises:
     print("PASS: test_from_numpy_shaped")
 
 
-fn test_numpy_roundtrip_shaped() raises:
+def test_numpy_roundtrip_shaped() raises:
     """Roundtrip: tensor -> shaped numpy -> tensor preserves data."""
     if not numpy_available():
         print("SKIP: test_numpy_roundtrip_shaped (no numpy)")
@@ -117,7 +117,7 @@ fn test_numpy_roundtrip_shaped() raises:
     print("PASS: test_numpy_roundtrip_shaped")
 
 
-fn test_run_python_script_basic() raises:
+def test_run_python_script_basic() raises:
     """run_python_script executes code and returns namespace."""
     if not numpy_available():
         print("SKIP: test_run_python_script_basic (no numpy)")
@@ -130,7 +130,7 @@ fn test_run_python_script_basic() raises:
     print("PASS: test_run_python_script_basic")
 
 
-fn test_run_python_script_numpy() raises:
+def test_run_python_script_numpy() raises:
     """run_python_script can use numpy."""
     if not numpy_available():
         print("SKIP: test_run_python_script_numpy (no numpy)")
@@ -143,7 +143,7 @@ fn test_run_python_script_numpy() raises:
     print("PASS: test_run_python_script_numpy")
 
 
-fn test_to_pytorch_roundtrip() raises:
+def test_to_pytorch_roundtrip() raises:
     """to_pytorch + from_pytorch roundtrip."""
     if not torch_available():
         print("SKIP: test_to_pytorch_roundtrip (no torch)")
@@ -162,7 +162,7 @@ fn test_to_pytorch_roundtrip() raises:
     print("PASS: test_to_pytorch_roundtrip")
 
 
-fn test_to_pytorch_shape() raises:
+def test_to_pytorch_shape() raises:
     """to_pytorch preserves shape."""
     if not torch_available():
         print("SKIP: test_to_pytorch_shape (no torch)")
@@ -177,12 +177,12 @@ fn test_to_pytorch_shape() raises:
     print("PASS: test_to_pytorch_shape")
 
 
-fn test_from_numpy_1d() raises:
+def test_from_numpy_1d() raises:
     """from_numpy_shaped works with 1D arrays."""
     if not numpy_available():
         print("SKIP: test_from_numpy_1d (no numpy)")
         return
-    from python import Python
+    from std.python import Python
     var np = Python.import_module("numpy")
     var builtins = Python.import_module("builtins")
     var vals = builtins.list()
@@ -196,7 +196,7 @@ fn test_from_numpy_1d() raises:
     print("PASS: test_from_numpy_1d")
 
 
-fn main() raises:
+def main() raises:
     print("=== Sprint 63: Python Bridge Shaped Tests ===")
     print("SKIP: Python bridge shaped tests require Python/libpython runtime.")
     print("All 11 python bridge shaped tests skipped by default.")

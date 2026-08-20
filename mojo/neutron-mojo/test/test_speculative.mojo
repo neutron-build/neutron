@@ -4,7 +4,7 @@
 
 """Tests for speculative decoding verification, sampling, and tracking."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.speculative import (
     SpeculativeResult,
     compute_probs,
@@ -19,19 +19,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn set_flat_probs(
+def set_flat_probs(
     mut flat: Tensor[DType.float32],
     step: Int,
     vocab_size: Int,
@@ -45,7 +45,7 @@ fn set_flat_probs(
     flat.set(base + 3, p3)
 
 
-fn test_speculative_result() raises:
+def test_speculative_result() raises:
     """Test SpeculativeResult struct."""
     var result = SpeculativeResult()
     assert_true(result.num_accepted == 0, "initial num_accepted")
@@ -62,7 +62,7 @@ fn test_speculative_result() raises:
     print("  speculative_result: PASS")
 
 
-fn test_draft_greedy() raises:
+def test_draft_greedy() raises:
     """Test greedy argmax selection."""
     var logits = Tensor[DType.float32](Shape(5))
     logits.set(0, 1.0)
@@ -77,7 +77,7 @@ fn test_draft_greedy() raises:
     print("  draft_greedy: PASS")
 
 
-fn test_compute_probs() raises:
+def test_compute_probs() raises:
     """Test softmax probability computation."""
     var logits = Tensor[DType.float32](Shape(3))
     logits.set(0, 1.0)
@@ -95,7 +95,7 @@ fn test_compute_probs() raises:
     print("  compute_probs: PASS")
 
 
-fn test_verify_all_accepted() raises:
+def test_verify_all_accepted() raises:
     """Test verification when target always agrees with draft."""
     var vocab_size = 4
     var k = 2
@@ -127,7 +127,7 @@ fn test_verify_all_accepted() raises:
     print("  verify_all_accepted: PASS")
 
 
-fn test_verify_rejection() raises:
+def test_verify_rejection() raises:
     """Test verification when target rejects a draft token."""
     var vocab_size = 3
     var k = 1
@@ -163,7 +163,7 @@ fn test_verify_rejection() raises:
     print("  verify_rejection: PASS")
 
 
-fn test_sample_from_probs() raises:
+def test_sample_from_probs() raises:
     """Test sampling from probability distribution."""
     var probs = Tensor[DType.float32](Shape(3))
     probs.set(0, 0.0)
@@ -184,7 +184,7 @@ fn test_sample_from_probs() raises:
     print("  sample_from_probs: PASS")
 
 
-fn test_sample_from_flat() raises:
+def test_sample_from_flat() raises:
     """Test sampling from flat prob tensor at a specific step."""
     var flat = Tensor[DType.float32](Shape(6))
     # Step 0: [0, 0, 1]
@@ -207,7 +207,7 @@ fn test_sample_from_flat() raises:
     print("  sample_from_flat: PASS")
 
 
-fn test_acceptance_tracker() raises:
+def test_acceptance_tracker() raises:
     """Test acceptance rate tracking."""
     var tracker = AcceptanceTracker()
     assert_near(tracker.acceptance_rate(), 0.0, 0.01, "initial rate = 0")
@@ -243,7 +243,7 @@ fn test_acceptance_tracker() raises:
     print("  acceptance_tracker: PASS")
 
 
-fn test_verify_preserves_distribution() raises:
+def test_verify_preserves_distribution() raises:
     """Test that identical distributions yield 100% acceptance."""
     var vocab_size = 4
     var k = 3
@@ -287,7 +287,7 @@ fn test_verify_preserves_distribution() raises:
     print("  verify_preserves_distribution: PASS")
 
 
-fn test_compute_probs_numerical_stability() raises:
+def test_compute_probs_numerical_stability() raises:
     """Test softmax stability with large logits."""
     var logits = Tensor[DType.float32](Shape(3))
     logits.set(0, 1000.0)
@@ -304,7 +304,7 @@ fn test_compute_probs_numerical_stability() raises:
     print("  compute_probs_numerical_stability: PASS")
 
 
-fn test_residual_sampling_direction() raises:
+def test_residual_sampling_direction() raises:
     """Test that rejection samples from residual favoring target's preference."""
     var vocab_size = 4
     var k = 1
@@ -358,7 +358,7 @@ fn test_residual_sampling_direction() raises:
     print("  residual_sampling_direction: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_speculative:")
 
     test_speculative_result()

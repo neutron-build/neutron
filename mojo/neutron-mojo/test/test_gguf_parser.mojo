@@ -25,12 +25,12 @@ from neutron_mojo.io.gguf import (
 from neutron_mojo.model.config import ModelConfig
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -38,7 +38,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
         )
 
 
-fn test_alignment() raises:
+def test_alignment() raises:
     """Test _align_offset produces correct aligned offsets."""
     assert_eq(_align_offset(0, 32), 0, "0 aligned to 32")
     assert_eq(_align_offset(1, 32), 32, "1 aligned to 32")
@@ -48,7 +48,7 @@ fn test_alignment() raises:
     print("  alignment: PASS")
 
 
-fn test_parse_minimal_gguf() raises:
+def test_parse_minimal_gguf() raises:
     """Test parsing a minimal GGUF with no metadata and no tensors."""
     var buf = List[UInt8]()
     _write_u32_le(buf, GGUF_MAGIC)
@@ -64,7 +64,7 @@ fn test_parse_minimal_gguf() raises:
     print("  parse_minimal_gguf: PASS")
 
 
-fn test_invalid_magic() raises:
+def test_invalid_magic() raises:
     """Test that invalid magic raises Error."""
     var buf = List[UInt8]()
     _write_u32_le(buf, 0x12345678)
@@ -82,7 +82,7 @@ fn test_invalid_magic() raises:
     print("  invalid_magic: PASS")
 
 
-fn test_version_2_accepted() raises:
+def test_version_2_accepted() raises:
     """Test that version 2 is accepted."""
     var buf = List[UInt8]()
     _write_u32_le(buf, GGUF_MAGIC)
@@ -95,7 +95,7 @@ fn test_version_2_accepted() raises:
     print("  version_2_accepted: PASS")
 
 
-fn test_metadata_string() raises:
+def test_metadata_string() raises:
     """Test parsing string metadata."""
     var buf = List[UInt8]()
     _write_u32_le(buf, GGUF_MAGIC)
@@ -113,7 +113,7 @@ fn test_metadata_string() raises:
     print("  metadata_string: PASS")
 
 
-fn test_metadata_int_and_float() raises:
+def test_metadata_int_and_float() raises:
     """Test parsing int and float metadata."""
     var buf = List[UInt8]()
     _write_u32_le(buf, GGUF_MAGIC)
@@ -139,7 +139,7 @@ fn test_metadata_int_and_float() raises:
     print("  metadata_int_and_float: PASS")
 
 
-fn test_tensor_info_parsing() raises:
+def test_tensor_info_parsing() raises:
     """Test parsing tensor info entries."""
     var buf = List[UInt8]()
     _write_u32_le(buf, GGUF_MAGIC)
@@ -181,7 +181,7 @@ fn test_tensor_info_parsing() raises:
     print("  tensor_info_parsing: PASS")
 
 
-fn test_build_and_parse_gguf() raises:
+def test_build_and_parse_gguf() raises:
     """Test building GGUF with build_test_gguf and parsing it back."""
     var sk = List[String]()
     sk.append("general.architecture")
@@ -236,7 +236,7 @@ fn test_build_and_parse_gguf() raises:
     print("  build_and_parse_gguf: PASS")
 
 
-fn test_gguf_to_model_config() raises:
+def test_gguf_to_model_config() raises:
     """Test extracting ModelConfig from parsed GGUF metadata."""
     var sk = List[String]()
     sk.append("general.architecture")
@@ -290,7 +290,7 @@ fn test_gguf_to_model_config() raises:
     print("  gguf_to_model_config: PASS")
 
 
-fn test_data_offset_alignment() raises:
+def test_data_offset_alignment() raises:
     """Test that data_offset is correctly aligned."""
     var sk = List[String]()
     var sv = List[String]()
@@ -317,7 +317,7 @@ fn test_data_offset_alignment() raises:
     print("  data_offset_alignment: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_gguf_parser:")
 
     test_alignment()

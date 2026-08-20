@@ -10,7 +10,7 @@ Architecture:
 Supports greedy, top-k, and temperature-scaled sampling.
 """
 
-from math import exp
+from std.math import exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import rmsnorm
@@ -48,7 +48,7 @@ struct CausalLMWeights(Movable):
     var head_dim: Int
     var ffn_dim: Int
 
-    fn __init__(
+    def __init__(
         out self,
         num_layers: Int,
         vocab_size: Int,
@@ -90,25 +90,25 @@ struct CausalLMWeights(Movable):
         for i in range(num_layers):
             self.layers.append(i)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.embed = other.embed^
-        self.final_norm = other.final_norm^
-        self.lm_head = other.lm_head^
-        self.layers = other.layers^
-        self.num_layers = other.num_layers
-        self.vocab_size = other.vocab_size
-        self.hidden_dim = other.hidden_dim
-        self.num_q_heads = other.num_q_heads
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
-        self.ffn_dim = other.ffn_dim
+    def __init__(out self, *, deinit move: Self):
+        self.embed = move.embed^
+        self.final_norm = move.final_norm^
+        self.lm_head = move.lm_head^
+        self.layers = move.layers^
+        self.num_layers = move.num_layers^
+        self.vocab_size = move.vocab_size^
+        self.hidden_dim = move.hidden_dim^
+        self.num_q_heads = move.num_q_heads^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
+        self.ffn_dim = move.ffn_dim^
 
 
 # ===----------------------------------------------------------------------=== #
 # Embedding Lookup
 # ===----------------------------------------------------------------------=== #
 
-fn embed_token(
+def embed_token(
     embed_table: Tensor[DType.float32],
     token_id: Int,
     hidden_dim: Int,
@@ -133,7 +133,7 @@ fn embed_token(
 # Logits and Sampling
 # ===----------------------------------------------------------------------=== #
 
-fn compute_logits(
+def compute_logits(
     hidden: Tensor[DType.float32],
     lm_head: Tensor[DType.float32],
     vocab_size: Int,
@@ -159,7 +159,7 @@ fn compute_logits(
     return logits^
 
 
-fn argmax(logits: Tensor[DType.float32], size: Int) -> Int:
+def argmax(logits: Tensor[DType.float32], size: Int) -> Int:
     """Return index of maximum value.
 
     Args:
@@ -179,7 +179,7 @@ fn argmax(logits: Tensor[DType.float32], size: Int) -> Int:
     return best_idx
 
 
-fn apply_temperature(
+def apply_temperature(
     mut logits: Tensor[DType.float32], size: Int, temperature: Float32
 ):
     """Scale logits by temperature.
@@ -195,7 +195,7 @@ fn apply_temperature(
         logits.set(i, logits.get(i) / temperature)
 
 
-fn top_k_filter(
+def top_k_filter(
     mut logits: Tensor[DType.float32], size: Int, k: Int
 ):
     """Zero out all logits outside the top-k.
@@ -234,7 +234,7 @@ fn top_k_filter(
 # Forward Pass (single token)
 # ===----------------------------------------------------------------------=== #
 
-fn causal_lm_forward(
+def causal_lm_forward(
     token_id: Int,
     model_weights: CausalLMWeights,
     layer_weights: List[Int],                 # indices into external weight store
@@ -260,7 +260,7 @@ fn causal_lm_forward(
 # Simple Generate Loop (1-layer for testing)
 # ===----------------------------------------------------------------------=== #
 
-fn generate_greedy_one_layer(
+def generate_greedy_one_layer(
     prompt_tokens: List[Int],
     model_weights: CausalLMWeights,
     layer_weights: TransformerWeights,

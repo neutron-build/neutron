@@ -7,22 +7,22 @@
 from neutron_mojo.nn.kv_cache import KVCache, MultiLayerKVCache
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_kv_cache_creation() raises:
+def test_kv_cache_creation() raises:
     """Test KV cache initialization."""
     var cache = KVCache(max_seq_len=128, num_kv_heads=8, head_dim=64)
 
@@ -36,7 +36,7 @@ fn test_kv_cache_creation() raises:
     print("  kv_cache_creation: PASS")
 
 
-fn test_kv_cache_append_single() raises:
+def test_kv_cache_append_single() raises:
     """Test appending a single token's KV."""
     var cache = KVCache(max_seq_len=8, num_kv_heads=2, head_dim=4)
 
@@ -63,7 +63,7 @@ fn test_kv_cache_append_single() raises:
     print("  kv_cache_append_single: PASS")
 
 
-fn test_kv_cache_append_multi() raises:
+def test_kv_cache_append_multi() raises:
     """Test appending multiple tokens at once."""
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=2)
 
@@ -94,7 +94,7 @@ fn test_kv_cache_append_multi() raises:
     print("  kv_cache_append_multi: PASS")
 
 
-fn test_kv_cache_sequential_append() raises:
+def test_kv_cache_sequential_append() raises:
     """Test appending tokens one at a time (autoregressive)."""
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=2)
 
@@ -127,7 +127,7 @@ fn test_kv_cache_sequential_append() raises:
     print("  kv_cache_sequential_append: PASS")
 
 
-fn test_kv_cache_head_vector() raises:
+def test_kv_cache_head_vector() raises:
     """Test extracting full head vectors."""
     var cache = KVCache(max_seq_len=4, num_kv_heads=2, head_dim=3)
 
@@ -163,7 +163,7 @@ fn test_kv_cache_head_vector() raises:
     print("  kv_cache_head_vector: PASS")
 
 
-fn test_kv_cache_overflow() raises:
+def test_kv_cache_overflow() raises:
     """Test that cache overflow raises error."""
     var cache = KVCache(max_seq_len=2, num_kv_heads=1, head_dim=2)
 
@@ -190,7 +190,7 @@ fn test_kv_cache_overflow() raises:
     print("  kv_cache_overflow: PASS")
 
 
-fn test_kv_cache_reset() raises:
+def test_kv_cache_reset() raises:
     """Test cache reset."""
     var cache = KVCache(max_seq_len=4, num_kv_heads=1, head_dim=2)
 
@@ -213,7 +213,7 @@ fn test_kv_cache_reset() raises:
     print("  kv_cache_reset: PASS")
 
 
-fn test_kv_cache_stride() raises:
+def test_kv_cache_stride() raises:
     """Test stride_per_pos calculation."""
     var cache = KVCache(max_seq_len=4, num_kv_heads=8, head_dim=128)
 
@@ -222,7 +222,7 @@ fn test_kv_cache_stride() raises:
     print("  kv_cache_stride: PASS")
 
 
-fn test_multi_layer_creation() raises:
+def test_multi_layer_creation() raises:
     """Test multi-layer KV cache creation."""
     var ml = MultiLayerKVCache(
         num_layers=32,
@@ -238,7 +238,7 @@ fn test_multi_layer_creation() raises:
     print("  multi_layer_creation: PASS")
 
 
-fn test_multi_layer_usage() raises:
+def test_multi_layer_usage() raises:
     """Test using multi-layer cache."""
     var ml = MultiLayerKVCache(
         num_layers=2,
@@ -278,7 +278,7 @@ fn test_multi_layer_usage() raises:
     print("  multi_layer_usage: PASS")
 
 
-fn test_multi_layer_reset() raises:
+def test_multi_layer_reset() raises:
     """Test resetting all layers."""
     var ml = MultiLayerKVCache(
         num_layers=2,
@@ -303,7 +303,7 @@ fn test_multi_layer_reset() raises:
     print("  multi_layer_reset: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_kv_cache:")
 
     test_kv_cache_creation()

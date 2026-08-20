@@ -4,18 +4,18 @@
 
 """Tests for the binary file reader."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.io.binary_reader import BinaryReader, _fp16_to_fp32
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg
@@ -27,7 +27,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helper: build a buffer with known bytes
 # ===----------------------------------------------------------------------=== #
 
-fn make_test_buffer() -> List[UInt8]:
+def make_test_buffer() -> List[UInt8]:
     """Create a buffer with known test data.
 
     Layout:
@@ -76,7 +76,7 @@ fn make_test_buffer() -> List[UInt8]:
     return buf^
 
 
-fn test_read_u8() raises:
+def test_read_u8() raises:
     """Test reading a single byte."""
     var buf = make_test_buffer()
     var r = BinaryReader(buf^)
@@ -86,7 +86,7 @@ fn test_read_u8() raises:
     print("  read_u8: PASS")
 
 
-fn test_read_u16_le() raises:
+def test_read_u16_le() raises:
     """Test reading a little-endian u16."""
     var buf = make_test_buffer()
     var r = BinaryReader(buf^)
@@ -97,7 +97,7 @@ fn test_read_u16_le() raises:
     print("  read_u16_le: PASS")
 
 
-fn test_read_u32_le() raises:
+def test_read_u32_le() raises:
     """Test reading a little-endian u32."""
     var buf = make_test_buffer()
     var r = BinaryReader(buf^)
@@ -107,7 +107,7 @@ fn test_read_u32_le() raises:
     print("  read_u32_le: PASS")
 
 
-fn test_read_u64_le() raises:
+def test_read_u64_le() raises:
     """Test reading a little-endian u64."""
     var buf = make_test_buffer()
     var r = BinaryReader(buf^)
@@ -117,7 +117,7 @@ fn test_read_u64_le() raises:
     print("  read_u64_le: PASS")
 
 
-fn test_read_i32_le() raises:
+def test_read_i32_le() raises:
     """Test reading a signed little-endian i32."""
     var buf = make_test_buffer()
     var r = BinaryReader(buf^)
@@ -127,7 +127,7 @@ fn test_read_i32_le() raises:
     print("  read_i32_le: PASS")
 
 
-fn test_read_f32_le() raises:
+def test_read_f32_le() raises:
     """Test reading a little-endian float32."""
     var buf = make_test_buffer()
     var r = BinaryReader(buf^)
@@ -137,7 +137,7 @@ fn test_read_f32_le() raises:
     print("  read_f32_le: PASS")
 
 
-fn test_read_f64_le() raises:
+def test_read_f64_le() raises:
     """Test reading a little-endian float64."""
     var buf = make_test_buffer()
     var r = BinaryReader(buf^)
@@ -150,7 +150,7 @@ fn test_read_f64_le() raises:
     print("  read_f64_le: PASS")
 
 
-fn test_seek_tell_skip() raises:
+def test_seek_tell_skip() raises:
     """Test seek, tell, skip, and remaining."""
     var buf = make_test_buffer()
     var total = len(buf)
@@ -169,7 +169,7 @@ fn test_seek_tell_skip() raises:
     print("  seek_tell_skip: PASS")
 
 
-fn test_read_f32_array() raises:
+def test_read_f32_array() raises:
     """Test reading an array of f32 values."""
     # Build buffer with 3 known floats: 1.0, 2.0, 0.5
     var buf = List[UInt8]()
@@ -200,7 +200,7 @@ fn test_read_f32_array() raises:
     print("  read_f32_array: PASS")
 
 
-fn test_read_f16_to_f32_array() raises:
+def test_read_f16_to_f32_array() raises:
     """Test reading FP16 values and converting to FP32."""
     var buf = List[UInt8]()
 
@@ -228,7 +228,7 @@ fn test_read_f16_to_f32_array() raises:
     print("  read_f16_to_f32_array: PASS")
 
 
-fn test_read_string_gguf() raises:
+def test_read_string_gguf() raises:
     """Test reading a GGUF-formatted string (u64 len + bytes)."""
     var buf = List[UInt8]()
 
@@ -251,7 +251,7 @@ fn test_read_string_gguf() raises:
     print("  read_string_gguf: PASS")
 
 
-fn test_out_of_bounds() raises:
+def test_out_of_bounds() raises:
     """Test that reading past the end raises an error."""
     var buf = List[UInt8]()
     buf.append(1)
@@ -281,7 +281,7 @@ fn test_out_of_bounds() raises:
     print("  out_of_bounds: PASS")
 
 
-fn test_fp16_special_values() raises:
+def test_fp16_special_values() raises:
     """Test FP16→FP32 conversion for special values."""
     # Positive infinity: 0x7C00
     var inf_val = _fp16_to_fp32(0x7C00)
@@ -300,7 +300,7 @@ fn test_fp16_special_values() raises:
     print("  fp16_special_values: PASS")
 
 
-fn test_read_bytes() raises:
+def test_read_bytes() raises:
     """Test reading raw bytes."""
     var buf = List[UInt8]()
     buf.append(0x10)
@@ -319,7 +319,7 @@ fn test_read_bytes() raises:
     print("  read_bytes: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_binary_reader:")
 
     test_read_u8()

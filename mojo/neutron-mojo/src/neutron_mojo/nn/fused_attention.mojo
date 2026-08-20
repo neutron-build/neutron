@@ -10,7 +10,7 @@ Uses the "online softmax" trick (Milakov & Gimelshein, 2018):
 Keep running max and sum of exponentials, correct at the end.
 """
 
-from math import exp
+from std.math import exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.kv_cache import KVCache
@@ -21,7 +21,7 @@ from neutron_mojo.nn.q_kv_cache import Q8KVCache
 # Fused Attention (FP32 KV Cache)
 # ===----------------------------------------------------------------------=== #
 
-fn fused_attention_head(
+def fused_attention_head(
     query: Tensor[DType.float32],
     cache: KVCache,
     kv_head: Int,
@@ -102,7 +102,7 @@ fn fused_attention_head(
     return output^
 
 
-fn fused_gqa_attention(
+def fused_gqa_attention(
     query: Tensor[DType.float32],
     cache: KVCache,
     num_q_heads: Int,
@@ -146,7 +146,7 @@ fn fused_gqa_attention(
 # Fused Attention (Quantized KV Cache)
 # ===----------------------------------------------------------------------=== #
 
-fn fused_q8_attention_head(
+def fused_q8_attention_head(
     query: Tensor[DType.float32],
     cache: Q8KVCache,
     kv_head: Int,
@@ -226,7 +226,7 @@ fn fused_q8_attention_head(
     return output^
 
 
-fn fused_q8_gqa_attention(
+def fused_q8_gqa_attention(
     query: Tensor[DType.float32],
     cache: Q8KVCache,
     num_q_heads: Int,

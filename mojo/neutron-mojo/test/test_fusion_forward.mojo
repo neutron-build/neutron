@@ -36,15 +36,15 @@ from neutron_mojo.fusion.rules import (
     rule_swiglu_fusion,
 )
 from neutron_mojo.fusion.rewrite import RewriteEngine
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny model with small random-ish weights for testing."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -75,7 +75,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn test_fused_forward_produces_logits() raises:
+def test_fused_forward_produces_logits() raises:
     """Fused forward should produce valid logits tensor."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -103,7 +103,7 @@ fn test_fused_forward_produces_logits() raises:
     print("  fused_forward_produces_logits: PASS")
 
 
-fn test_fused_vs_unfused_equivalence() raises:
+def test_fused_vs_unfused_equivalence() raises:
     """Fused and unfused forward should produce similar logits."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -143,7 +143,7 @@ fn test_fused_vs_unfused_equivalence() raises:
     print("  fused_vs_unfused_equivalence: PASS")
 
 
-fn test_fused_forward_generation() raises:
+def test_fused_forward_generation() raises:
     """Fused forward can be used in a generation loop."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -182,7 +182,7 @@ fn test_fused_forward_generation() raises:
     print("  fused_forward_generation: PASS")
 
 
-fn test_fusion_opkinds() raises:
+def test_fusion_opkinds() raises:
     """New fusion OpKinds should be properly defined."""
     assert_true(OpKind.FusedRMSNormLinear._value == 60, "FusedRMSNormLinear should be 60")
     assert_true(OpKind.FusedLinearResAdd._value == 61, "FusedLinearResAdd should be 61")
@@ -202,7 +202,7 @@ fn test_fusion_opkinds() raises:
     print("  fusion_opkinds: PASS")
 
 
-fn test_egraph_op_pattern_matching() raises:
+def test_egraph_op_pattern_matching() raises:
     """Op pattern matching should work with EGraph access."""
     var eg = EGraph()
 
@@ -229,7 +229,7 @@ fn test_egraph_op_pattern_matching() raises:
     print("  egraph_op_pattern_matching: PASS")
 
 
-fn test_rmsnorm_matmul_fusion_pattern() raises:
+def test_rmsnorm_matmul_fusion_pattern() raises:
     """RMSNorm+Matmul fusion pattern should match e-graph nodes."""
     var eg = EGraph()
 
@@ -258,7 +258,7 @@ fn test_rmsnorm_matmul_fusion_pattern() raises:
     print("  rmsnorm_matmul_fusion_pattern: PASS")
 
 
-fn test_linear_resadd_fusion_pattern() raises:
+def test_linear_resadd_fusion_pattern() raises:
     """Linear+ResAdd fusion pattern should match e-graph nodes."""
     var eg = EGraph()
 
@@ -284,7 +284,7 @@ fn test_linear_resadd_fusion_pattern() raises:
     print("  linear_resadd_fusion_pattern: PASS")
 
 
-fn test_swiglu_fusion_pattern() raises:
+def test_swiglu_fusion_pattern() raises:
     """SwiGLU fusion pattern should match e-graph nodes."""
     var eg = EGraph()
 
@@ -309,7 +309,7 @@ fn test_swiglu_fusion_pattern() raises:
     print("  swiglu_fusion_pattern: PASS")
 
 
-fn test_default_ruleset_has_fusion_rules() raises:
+def test_default_ruleset_has_fusion_rules() raises:
     """Default ruleset should include 3 fusion rules + 8 algebraic rules."""
     var ruleset = create_default_ruleset()
 
@@ -326,7 +326,7 @@ fn test_default_ruleset_has_fusion_rules() raises:
     print("  default_ruleset_has_fusion_rules: PASS")
 
 
-fn test_rewrite_engine_with_fusion() raises:
+def test_rewrite_engine_with_fusion() raises:
     """Rewrite engine should process fusion rules."""
     var eg = EGraph()
 
@@ -352,7 +352,7 @@ fn test_rewrite_engine_with_fusion() raises:
     print("  rewrite_engine_with_fusion: PASS")
 
 
-fn test_graph_builder_fused_ops() raises:
+def test_graph_builder_fused_ops() raises:
     """ComputationGraph should have builder methods for fused ops."""
     var g = ComputationGraph()
 
@@ -372,7 +372,7 @@ fn test_graph_builder_fused_ops() raises:
     print("  graph_builder_fused_ops: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_fusion_forward:")
 
     test_fused_forward_produces_logits()

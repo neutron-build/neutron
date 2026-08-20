@@ -9,12 +9,12 @@ from neutron_mojo.fusion.eclass import ClassId
 from neutron_mojo.fusion.graph import OpKind
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_add_leaf_nodes() raises:
+def test_add_leaf_nodes() raises:
     """Add leaf nodes (constants, inputs) to e-graph."""
     var eg = EGraph()
 
@@ -31,7 +31,7 @@ fn test_add_leaf_nodes() raises:
     print("  add_leaf_nodes: PASS")
 
 
-fn test_hash_consing_same_op() raises:
+def test_hash_consing_same_op() raises:
     """Hash-consing: duplicate nodes should return same e-class."""
     var eg = EGraph()
 
@@ -49,7 +49,7 @@ fn test_hash_consing_same_op() raises:
     print("  hash_consing_same_op: PASS")
 
 
-fn test_hash_consing_different_ops() raises:
+def test_hash_consing_different_ops() raises:
     """Hash-consing: different ops should create different classes."""
     var eg = EGraph()
 
@@ -66,7 +66,7 @@ fn test_hash_consing_different_ops() raises:
     print("  hash_consing_different_ops: PASS")
 
 
-fn test_add_binary_op() raises:
+def test_add_binary_op() raises:
     """Add a binary operation node to e-graph."""
     var eg = EGraph()
 
@@ -88,7 +88,7 @@ fn test_add_binary_op() raises:
     print("  add_binary_op: PASS")
 
 
-fn test_hash_consing_binary_same_inputs() raises:
+def test_hash_consing_binary_same_inputs() raises:
     """Hash-consing: (add x y) added twice should hash-cons."""
     var eg = EGraph()
 
@@ -109,7 +109,7 @@ fn test_hash_consing_binary_same_inputs() raises:
     print("  hash_consing_binary_same_inputs: PASS")
 
 
-fn test_hash_consing_binary_different_order() raises:
+def test_hash_consing_binary_different_order() raises:
     """Hash-consing: (add x y) and (add y x) are different (not commutative yet)."""
     var eg = EGraph()
 
@@ -131,7 +131,7 @@ fn test_hash_consing_binary_different_order() raises:
     print("  hash_consing_binary_different_order: PASS")
 
 
-fn test_merge_classes() raises:
+def test_merge_classes() raises:
     """Merge two e-classes and verify they're equivalent."""
     var eg = EGraph()
 
@@ -152,7 +152,7 @@ fn test_merge_classes() raises:
     print("  merge_classes: PASS")
 
 
-fn test_canonicalize_after_merge() raises:
+def test_canonicalize_after_merge() raises:
     """Canonicalize node inputs after merging classes."""
     var eg = EGraph()
 
@@ -175,7 +175,7 @@ fn test_canonicalize_after_merge() raises:
     print("  canonicalize_after_merge: PASS")
 
 
-fn test_algebraic_example() raises:
+def test_algebraic_example() raises:
     """E-graph example: (add x 0) and x should merge via rewrite rule.
 
     This tests the typical e-graph workflow:
@@ -204,7 +204,7 @@ fn test_algebraic_example() raises:
     print("  algebraic_example: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_egraph:")
 
     test_add_leaf_nodes()

@@ -11,7 +11,7 @@ NOTE: All functions use tape.get_data()/get_grad()/accumulate_grad()
 instead of data_ptr() to avoid the Mojo 0.26.2 aliasing bug.
 """
 
-from math import exp, sqrt, tanh, log
+from std.math import exp, sqrt, tanh, log
 
 from neutron_mojo.tensor.tensor import Tensor
 from .tape import (
@@ -26,10 +26,10 @@ from .tape import (
 )
 
 # SIMD width for vectorized backward loops
-alias BACKWARD_SIMD_WIDTH = 4
+comptime BACKWARD_SIMD_WIDTH = 4
 
 
-fn run_backward(mut tape: Tape, loss_var_idx: Int):
+def run_backward(mut tape: Tape, loss_var_idx: Int):
     """Run backward pass: seed loss gradient with 1.0, reverse-walk tape.
 
     Args:
@@ -48,7 +48,7 @@ fn run_backward(mut tape: Tape, loss_var_idx: Int):
         i -= 1
 
 
-fn _dispatch_backward(mut tape: Tape, entry: TapeEntry):
+def _dispatch_backward(mut tape: Tape, entry: TapeEntry):
     """Dispatch to the appropriate backward function based on op code."""
     var op = entry.op_kind
     if op == OP_ADD():
@@ -128,7 +128,7 @@ fn _dispatch_backward(mut tape: Tape, entry: TapeEntry):
 # ===----------------------------------------------------------------------=== #
 
 
-fn _backward_add(mut tape: Tape, entry: TapeEntry):
+def _backward_add(mut tape: Tape, entry: TapeEntry):
     """d/da(a+b) = 1, d/db(a+b) = 1. SIMD gradient pass-through."""
     var n = tape.var_numel(entry.output_idx)
     var out_off = tape.var_offset(entry.output_idx)
@@ -143,11 +143,11 @@ fn _backward_add(mut tape: Tape, entry: TapeEntry):
         _backward_add_single(tape, entry.input1_idx, n, out_off)
 
 
-fn _backward_add_both(mut tape: Tape, entry: TapeEntry, n: Int, out_off: Int):
+def _backward_add_both(mut tape: Tape, entry: TapeEntry, n: Int, out_off: Int):
     """SIMD add backward for both inputs."""
     var a_off = tape.var_offset(entry.input0_idx)
     var b_off = tape.var_offset(entry.input1_idx)
-    alias W = BACKWARD_SIMD_WIDTH
+    comptime W = BACKWARD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var g0 = tape.grad_flat.get(out_off + i)
@@ -170,10 +170,10 @@ fn _backward_add_both(mut tape: Tape, entry: TapeEntry, n: Int, out_off: Int):
         i += 1
 
 
-fn _backward_add_single(mut tape: Tape, in_idx: Int, n: Int, out_off: Int):
+def _backward_add_single(mut tape: Tape, in_idx: Int, n: Int, out_off: Int):
     """SIMD add backward for single input."""
     var in_off = tape.var_offset(in_idx)
-    alias W = BACKWARD_SIMD_WIDTH
+    comptime W = BACKWARD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var g0 = tape.grad_flat.get(out_off + i)
@@ -191,7 +191,7 @@ fn _backward_add_single(mut tape: Tape, in_idx: Int, n: Int, out_off: Int):
         i += 1
 
 
-fn _backward_sub(mut tape: Tape, entry: TapeEntry):
+def _backward_sub(mut tape: Tape, entry: TapeEntry):
     """d/da(a-b) = 1, d/db(a-b) = -1."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -202,7 +202,7 @@ fn _backward_sub(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(entry.input1_idx, i, -grad_out)
 
 
-fn _backward_mul(mut tape: Tape, entry: TapeEntry):
+def _backward_mul(mut tape: Tape, entry: TapeEntry):
     """d/da(a*b) = b, d/db(a*b) = a. SIMD cross-multiply."""
     var n = tape.var_numel(entry.output_idx)
     var out_off = tape.var_offset(entry.output_idx)
@@ -211,7 +211,7 @@ fn _backward_mul(mut tape: Tape, entry: TapeEntry):
     var has_a = entry.input0_idx >= 0 and tape.var_requires_grad[entry.input0_idx]
     var has_b = entry.input1_idx >= 0 and tape.var_requires_grad[entry.input1_idx]
 
-    alias W = BACKWARD_SIMD_WIDTH
+    comptime W = BACKWARD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var g0 = tape.grad_flat.get(out_off + i)
@@ -250,7 +250,7 @@ fn _backward_mul(mut tape: Tape, entry: TapeEntry):
         i += 1
 
 
-fn _backward_matmul(mut tape: Tape, entry: TapeEntry):
+def _backward_matmul(mut tape: Tape, entry: TapeEntry):
     """C = A @ B where A:(M,K), B:(K,N), C:(M,N).
     dA = dC @ B^T, dB = A^T @ dC. SIMD inner loops.
     """
@@ -267,14 +267,14 @@ fn _backward_matmul(mut tape: Tape, entry: TapeEntry):
         _backward_matmul_dB(tape, entry, M, K, N)
 
 
-fn _backward_matmul_dA(
+def _backward_matmul_dA(
     mut tape: Tape, entry: TapeEntry, M: Int, K: Int, N: Int
 ):
     """dA = dC @ B^T with SIMD inner dot product over N."""
     var out_off = tape.var_offset(entry.output_idx)
     var b_off = tape.var_offset(entry.input1_idx)
     var a_off = tape.var_offset(entry.input0_idx)
-    alias W = BACKWARD_SIMD_WIDTH
+    comptime W = BACKWARD_SIMD_WIDTH
 
     for i in range(M):
         for k in range(K):
@@ -301,14 +301,14 @@ fn _backward_matmul_dA(
             )
 
 
-fn _backward_matmul_dB(
+def _backward_matmul_dB(
     mut tape: Tape, entry: TapeEntry, M: Int, K: Int, N: Int
 ):
     """dB = A^T @ dC with SIMD inner dot product over M."""
     var out_off = tape.var_offset(entry.output_idx)
     var a_off = tape.var_offset(entry.input0_idx)
     var b_off = tape.var_offset(entry.input1_idx)
-    alias W = BACKWARD_SIMD_WIDTH
+    comptime W = BACKWARD_SIMD_WIDTH
 
     for k in range(K):
         for j in range(N):
@@ -335,7 +335,7 @@ fn _backward_matmul_dB(
             )
 
 
-fn _backward_relu(mut tape: Tape, entry: TapeEntry):
+def _backward_relu(mut tape: Tape, entry: TapeEntry):
     """d/dx ReLU(x) = 1 if x > 0 else 0. SIMD mask."""
     var n = tape.var_numel(entry.output_idx)
     if not tape.var_requires_grad[entry.input0_idx]:
@@ -344,7 +344,7 @@ fn _backward_relu(mut tape: Tape, entry: TapeEntry):
     var x_off = tape.var_offset(entry.input0_idx)
     var zero = Float32(0.0)
 
-    alias W = BACKWARD_SIMD_WIDTH
+    comptime W = BACKWARD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var x0 = tape.data_flat.get(x_off + i)
@@ -375,7 +375,7 @@ fn _backward_relu(mut tape: Tape, entry: TapeEntry):
         i += 1
 
 
-fn _backward_sigmoid(mut tape: Tape, entry: TapeEntry):
+def _backward_sigmoid(mut tape: Tape, entry: TapeEntry):
     """d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x)).
     We use the output value s directly.
     """
@@ -387,7 +387,7 @@ fn _backward_sigmoid(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, grad_out * local_grad)
 
 
-fn _backward_tanh(mut tape: Tape, entry: TapeEntry):
+def _backward_tanh(mut tape: Tape, entry: TapeEntry):
     """d/dx tanh(x) = 1 - tanh(x)^2. Use output value."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -397,7 +397,7 @@ fn _backward_tanh(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, grad_out * local_grad)
 
 
-fn _backward_exp(mut tape: Tape, entry: TapeEntry):
+def _backward_exp(mut tape: Tape, entry: TapeEntry):
     """d/dx exp(x) = exp(x). Use output value."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -406,7 +406,7 @@ fn _backward_exp(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, grad_out * y)
 
 
-fn _backward_log(mut tape: Tape, entry: TapeEntry):
+def _backward_log(mut tape: Tape, entry: TapeEntry):
     """d/dx log(x) = 1/x."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -416,7 +416,7 @@ fn _backward_log(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(entry.input0_idx, i, Float32(Float64(grad_out) / Float64(x_val)))
 
 
-fn _backward_neg(mut tape: Tape, entry: TapeEntry):
+def _backward_neg(mut tape: Tape, entry: TapeEntry):
     """d/dx (-x) = -1."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -424,7 +424,7 @@ fn _backward_neg(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, -grad_out)
 
 
-fn _backward_scalar_mul(mut tape: Tape, entry: TapeEntry):
+def _backward_scalar_mul(mut tape: Tape, entry: TapeEntry):
     """d/dx (x * s) = s. SIMD broadcast multiply."""
     var n = tape.var_numel(entry.output_idx)
     if not tape.var_requires_grad[entry.input0_idx]:
@@ -433,7 +433,7 @@ fn _backward_scalar_mul(mut tape: Tape, entry: TapeEntry):
     var out_off = tape.var_offset(entry.output_idx)
     var x_off = tape.var_offset(entry.input0_idx)
 
-    alias W = BACKWARD_SIMD_WIDTH
+    comptime W = BACKWARD_SIMD_WIDTH
     var i = 0
     while i + W <= n:
         var g0 = tape.grad_flat.get(out_off + i) * s
@@ -453,7 +453,7 @@ fn _backward_scalar_mul(mut tape: Tape, entry: TapeEntry):
         i += 1
 
 
-fn _backward_scalar_add(mut tape: Tape, entry: TapeEntry):
+def _backward_scalar_add(mut tape: Tape, entry: TapeEntry):
     """d/dx (x + s) = 1. Gradient passes through."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -461,7 +461,7 @@ fn _backward_scalar_add(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, grad_out)
 
 
-fn _backward_softmax(mut tape: Tape, entry: TapeEntry):
+def _backward_softmax(mut tape: Tape, entry: TapeEntry):
     """Softmax backward: dy_i/dx_j = s_i * (delta_ij - s_j).
 
     For each element i: grad_in[i] = sum_j(grad_out[j] * s[j] * (delta_ij - s[i]))
@@ -482,7 +482,7 @@ fn _backward_softmax(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, local_grad)
 
 
-fn _backward_sum(mut tape: Tape, entry: TapeEntry):
+def _backward_sum(mut tape: Tape, entry: TapeEntry):
     """d/dx_i sum(x) = 1 for all i. Broadcast gradient."""
     var n = entry.cached_int  # original input size
     var grad_out = tape.get_grad(entry.output_idx, 0)
@@ -490,7 +490,7 @@ fn _backward_sum(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, grad_out)
 
 
-fn _backward_mean(mut tape: Tape, entry: TapeEntry):
+def _backward_mean(mut tape: Tape, entry: TapeEntry):
     """d/dx_i mean(x) = 1/n for all i."""
     var n = entry.cached_int
     var grad_out = tape.get_grad(entry.output_idx, 0)
@@ -504,7 +504,7 @@ fn _backward_mean(mut tape: Tape, entry: TapeEntry):
 # ===----------------------------------------------------------------------=== #
 
 
-fn _backward_div(mut tape: Tape, entry: TapeEntry):
+def _backward_div(mut tape: Tape, entry: TapeEntry):
     """d/da(a/b) = 1/b, d/db(a/b) = -a/b^2."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -517,11 +517,11 @@ fn _backward_div(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(entry.input1_idx, i, Float32(-Float64(grad_out) * a_val / (b_val * b_val)))
 
 
-fn _backward_pow(mut tape: Tape, entry: TapeEntry):
+def _backward_pow(mut tape: Tape, entry: TapeEntry):
     """d/dx(x^n) = n * x^(n-1)."""
     var n = tape.var_numel(entry.output_idx)
     var exponent = entry.cached_scalar
-    from math import pow
+    from std.math import pow
     for i in range(n):
         var grad_out = tape.get_grad(entry.output_idx, i)
         var x_val = Float64(tape.get_data(entry.input0_idx, i))
@@ -529,7 +529,7 @@ fn _backward_pow(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, grad_out * local_grad)
 
 
-fn _backward_sqrt(mut tape: Tape, entry: TapeEntry):
+def _backward_sqrt(mut tape: Tape, entry: TapeEntry):
     """d/dx sqrt(x) = 0.5 / sqrt(x)."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -540,7 +540,7 @@ fn _backward_sqrt(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(entry.input0_idx, i, grad_out * local_grad)
 
 
-fn _backward_clamp(mut tape: Tape, entry: TapeEntry):
+def _backward_clamp(mut tape: Tape, entry: TapeEntry):
     """d/dx clamp(x) = 1 if min <= x <= max, else 0."""
     var n = tape.var_numel(entry.output_idx)
     var min_val = Float32(entry.cached_scalar)
@@ -552,7 +552,7 @@ fn _backward_clamp(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(entry.input0_idx, i, grad_out)
 
 
-fn _backward_rmsnorm(mut tape: Tape, entry: TapeEntry):
+def _backward_rmsnorm(mut tape: Tape, entry: TapeEntry):
     """RMSNorm backward: compute d_x and d_gamma properly.
 
     y = (x / rms) * gamma, where rms = sqrt(mean(x^2) + eps).
@@ -600,7 +600,7 @@ fn _backward_rmsnorm(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(gamma_idx, i, Float32(dg))
 
 
-fn _backward_layernorm(mut tape: Tape, entry: TapeEntry):
+def _backward_layernorm(mut tape: Tape, entry: TapeEntry):
     """LayerNorm backward: compute d_x, d_gamma, d_beta.
 
     y = ((x - mean) / std) * gamma + beta
@@ -658,7 +658,7 @@ fn _backward_layernorm(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(beta_idx, i, Float32(go))
 
 
-fn _backward_gelu(mut tape: Tape, entry: TapeEntry):
+def _backward_gelu(mut tape: Tape, entry: TapeEntry):
     """GeLU backward: approximate derivative."""
     var n = tape.var_numel(entry.output_idx)
     var pi = 3.14159265358979323846
@@ -676,7 +676,7 @@ fn _backward_gelu(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, Float32(Float64(grad_out) * d_gelu))
 
 
-fn _backward_silu(mut tape: Tape, entry: TapeEntry):
+def _backward_silu(mut tape: Tape, entry: TapeEntry):
     """SiLU backward: d/dx(x*sigmoid(x)) = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -687,7 +687,7 @@ fn _backward_silu(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, Float32(Float64(grad_out) * d_silu))
 
 
-fn _backward_swiglu(mut tape: Tape, entry: TapeEntry):
+def _backward_swiglu(mut tape: Tape, entry: TapeEntry):
     """SwiGLU backward: d/dx(silu(gate)*x) and d/dgate."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -703,7 +703,7 @@ fn _backward_swiglu(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input1_idx, i, Float32(Float64(grad_out) * x_val * d_silu_g))
 
 
-fn _backward_reshape(mut tape: Tape, entry: TapeEntry):
+def _backward_reshape(mut tape: Tape, entry: TapeEntry):
     """Reshape backward: just pass gradient through (same flat data)."""
     var n = tape.var_numel(entry.output_idx)
     for i in range(n):
@@ -711,7 +711,7 @@ fn _backward_reshape(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, grad_out)
 
 
-fn _backward_transpose(mut tape: Tape, entry: TapeEntry):
+def _backward_transpose(mut tape: Tape, entry: TapeEntry):
     """Transpose backward for 2D: transpose the gradient back."""
     var rows = entry.cached_int   # original rows (output cols)
     var cols = entry.cached_int2  # original cols (output rows)
@@ -722,7 +722,7 @@ fn _backward_transpose(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(entry.input0_idx, j * cols + i, g)
 
 
-fn _backward_concat(mut tape: Tape, entry: TapeEntry):
+def _backward_concat(mut tape: Tape, entry: TapeEntry):
     """Concat backward: split gradient back to inputs."""
     var n0 = tape.var_numel(entry.input0_idx)
     # First input gets first n0 gradients
@@ -737,7 +737,7 @@ fn _backward_concat(mut tape: Tape, entry: TapeEntry):
             tape.accumulate_grad(entry.input1_idx, i, g)
 
 
-fn _backward_split(mut tape: Tape, entry: TapeEntry):
+def _backward_split(mut tape: Tape, entry: TapeEntry):
     """Split backward: concatenate gradients back to input."""
     var n = tape.var_numel(entry.output_idx)
     var split_offset = entry.cached_int  # offset within input
@@ -746,7 +746,7 @@ fn _backward_split(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, split_offset + i, grad_out)
 
 
-fn _backward_log_softmax(mut tape: Tape, entry: TapeEntry):
+def _backward_log_softmax(mut tape: Tape, entry: TapeEntry):
     """Log-softmax backward: grad_in = grad_out - softmax * sum(grad_out)."""
     var n = tape.var_numel(entry.output_idx)
 
@@ -763,7 +763,7 @@ fn _backward_log_softmax(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, Float32(g - s * sum_grad))
 
 
-fn _backward_cross_entropy(mut tape: Tape, entry: TapeEntry):
+def _backward_cross_entropy(mut tape: Tape, entry: TapeEntry):
     """Cross-entropy backward: grad = softmax(logits) - one_hot(target).
 
     Fused and numerically stable. Target stored in cached_int.
@@ -791,7 +791,7 @@ fn _backward_cross_entropy(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, g)
 
 
-fn _backward_mse(mut tape: Tape, entry: TapeEntry):
+def _backward_mse(mut tape: Tape, entry: TapeEntry):
     """MSE backward: d/dx MSE = 2*(pred-target)/n."""
     var n = tape.var_numel(entry.input0_idx)
     var loss_grad = tape.get_grad(entry.output_idx, 0)
@@ -804,7 +804,7 @@ fn _backward_mse(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input1_idx, i, -g)
 
 
-fn _backward_embedding(mut tape: Tape, entry: TapeEntry):
+def _backward_embedding(mut tape: Tape, entry: TapeEntry):
     """Embedding backward: accumulate gradient into the looked-up row."""
     var embed_dim = entry.cached_int
     var token_id = entry.cached_int2
@@ -814,7 +814,7 @@ fn _backward_embedding(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, token_id * embed_dim + d, g)
 
 
-fn _backward_l1(mut tape: Tape, entry: TapeEntry):
+def _backward_l1(mut tape: Tape, entry: TapeEntry):
     """L1 loss backward: d/dx L1 = sign(pred - target) / n."""
     var n = tape.var_numel(entry.input0_idx)
     var loss_grad = tape.get_grad(entry.output_idx, 0)
@@ -832,7 +832,7 @@ fn _backward_l1(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input1_idx, i, -sign_val * inv_n)
 
 
-fn _backward_bce(mut tape: Tape, entry: TapeEntry):
+def _backward_bce(mut tape: Tape, entry: TapeEntry):
     """Binary cross-entropy backward: d/dp BCE = (-t/p + (1-t)/(1-p)) / n."""
     var n = tape.var_numel(entry.input0_idx)
     var loss_grad = tape.get_grad(entry.output_idx, 0)
@@ -845,7 +845,7 @@ fn _backward_bce(mut tape: Tape, entry: TapeEntry):
         tape.accumulate_grad(entry.input0_idx, i, Float32(Float64(loss_grad) * dp))
 
 
-fn _backward_kl_div(mut tape: Tape, entry: TapeEntry):
+def _backward_kl_div(mut tape: Tape, entry: TapeEntry):
     """KL divergence backward w.r.t. q: d/dq KL(p||q) = -p/q."""
     var n = tape.var_numel(entry.input0_idx)
     var loss_grad = tape.get_grad(entry.output_idx, 0)

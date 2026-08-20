@@ -13,24 +13,24 @@ Configurations mirror the HuggingFace config.json format.
 # Activation Type
 # ===----------------------------------------------------------------------=== #
 
-struct ActivationType(Writable, Copyable, Movable):
+struct ActivationType(Writable, Copyable, Movable, ImplicitlyCopyable):
     """Activation function type."""
     var _value: Int
 
     @implicit
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self._value = value
 
-    fn __copyinit__(out self, existing: Self):
-        self._value = existing._value
+    def __init__(out self, *, copy: Self):
+        self._value = copy._value
 
-    fn __eq__(self, other: ActivationType) -> Bool:
+    def __eq__(self, other: ActivationType) -> Bool:
         return self._value == other._value
 
-    fn __ne__(self, other: ActivationType) -> Bool:
+    def __ne__(self, other: ActivationType) -> Bool:
         return self._value != other._value
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         if self._value == 0:
             writer.write("silu")
         elif self._value == 1:
@@ -43,16 +43,16 @@ struct ActivationType(Writable, Copyable, Movable):
             writer.write("unknown")
 
 
-fn ACT_SILU() -> ActivationType:
+def ACT_SILU() -> ActivationType:
     return ActivationType(0)
 
-fn ACT_GELU() -> ActivationType:
+def ACT_GELU() -> ActivationType:
     return ActivationType(1)
 
-fn ACT_RELU() -> ActivationType:
+def ACT_RELU() -> ActivationType:
     return ActivationType(2)
 
-fn ACT_SWIGLU() -> ActivationType:
+def ACT_SWIGLU() -> ActivationType:
     return ActivationType(3)
 
 
@@ -60,31 +60,31 @@ fn ACT_SWIGLU() -> ActivationType:
 # RoPE Configuration
 # ===----------------------------------------------------------------------=== #
 
-struct RoPEConfig(Copyable):
+struct RoPEConfig(Copyable, ImplicitlyCopyable):
     """Rotary Position Embedding configuration."""
     var theta: Float64          # Base frequency (default 10000.0)
     var max_position: Int       # Maximum sequence length for RoPE
     var scaling_factor: Float64 # For extended context (YaRN, etc.)
     var scaling_type: String    # "linear", "dynamic", "yarn", "none"
 
-    fn __init__(out self):
+    def __init__(out self):
         self.theta = 10000.0
         self.max_position = 8192
         self.scaling_factor = 1.0
         self.scaling_type = String("none")
 
-    fn __copyinit__(out self, existing: Self):
-        self.theta = existing.theta
-        self.max_position = existing.max_position
-        self.scaling_factor = existing.scaling_factor
-        self.scaling_type = existing.scaling_type
+    def __init__(out self, *, copy: Self):
+        self.theta = copy.theta
+        self.max_position = copy.max_position
+        self.scaling_factor = copy.scaling_factor
+        self.scaling_type = copy.scaling_type
 
 
 # ===----------------------------------------------------------------------=== #
 # Model Configuration
 # ===----------------------------------------------------------------------=== #
 
-struct ModelConfig(Copyable):
+struct ModelConfig(Copyable, ImplicitlyCopyable):
     """Configuration for a transformer language model.
 
     Covers Llama-3, Mistral, and similar architectures.
@@ -124,7 +124,7 @@ struct ModelConfig(Copyable):
     var is_quantized: Bool
     var quant_method: String        # "gptq", "awq", "gguf", "none"
 
-    fn __init__(out self):
+    def __init__(out self):
         self.model_type = String("llama")
         self.architecture = String("LlamaForCausalLM")
         self.vocab_size = 32000
@@ -144,35 +144,35 @@ struct ModelConfig(Copyable):
         self.is_quantized = False
         self.quant_method = String("none")
 
-    fn __copyinit__(out self, existing: Self):
-        self.model_type = existing.model_type
-        self.architecture = existing.architecture
-        self.vocab_size = existing.vocab_size
-        self.hidden_size = existing.hidden_size
-        self.intermediate_size = existing.intermediate_size
-        self.num_hidden_layers = existing.num_hidden_layers
-        self.num_attention_heads = existing.num_attention_heads
-        self.num_key_value_heads = existing.num_key_value_heads
-        self.head_dim = existing.head_dim
-        self.rms_norm_eps = existing.rms_norm_eps
-        self.hidden_act = existing.hidden_act.copy()
-        self.max_position_embeddings = existing.max_position_embeddings
-        self.rope = existing.rope.copy()
-        self.bos_token_id = existing.bos_token_id
-        self.eos_token_id = existing.eos_token_id
-        self.pad_token_id = existing.pad_token_id
-        self.is_quantized = existing.is_quantized
-        self.quant_method = existing.quant_method
+    def __init__(out self, *, copy: Self):
+        self.model_type = copy.model_type
+        self.architecture = copy.architecture
+        self.vocab_size = copy.vocab_size
+        self.hidden_size = copy.hidden_size
+        self.intermediate_size = copy.intermediate_size
+        self.num_hidden_layers = copy.num_hidden_layers
+        self.num_attention_heads = copy.num_attention_heads
+        self.num_key_value_heads = copy.num_key_value_heads
+        self.head_dim = copy.head_dim
+        self.rms_norm_eps = copy.rms_norm_eps
+        self.hidden_act = copy.hidden_act.copy()
+        self.max_position_embeddings = copy.max_position_embeddings
+        self.rope = copy.rope.copy()
+        self.bos_token_id = copy.bos_token_id
+        self.eos_token_id = copy.eos_token_id
+        self.pad_token_id = copy.pad_token_id
+        self.is_quantized = copy.is_quantized
+        self.quant_method = copy.quant_method
 
-    fn is_gqa(self) -> Bool:
+    def is_gqa(self) -> Bool:
         """Check if model uses Grouped Query Attention."""
         return self.num_key_value_heads < self.num_attention_heads
 
-    fn kv_group_size(self) -> Int:
+    def kv_group_size(self) -> Int:
         """Get number of query heads per KV head."""
         return self.num_attention_heads // self.num_key_value_heads
 
-    fn total_params_estimate(self) -> Int:
+    def total_params_estimate(self) -> Int:
         """Estimate total parameter count (rough).
 
         Returns:
@@ -199,7 +199,7 @@ struct ModelConfig(Copyable):
 # Predefined Model Configurations
 # ===----------------------------------------------------------------------=== #
 
-fn llama3_8b_config() -> ModelConfig:
+def llama3_8b_config() -> ModelConfig:
     """Llama-3 8B configuration."""
     var cfg = ModelConfig()
     cfg.model_type = String("llama")
@@ -221,7 +221,7 @@ fn llama3_8b_config() -> ModelConfig:
     return cfg^
 
 
-fn llama3_70b_config() -> ModelConfig:
+def llama3_70b_config() -> ModelConfig:
     """Llama-3 70B configuration."""
     var cfg = ModelConfig()
     cfg.model_type = String("llama")
@@ -243,7 +243,7 @@ fn llama3_70b_config() -> ModelConfig:
     return cfg^
 
 
-fn tinyllama_1_1b_config() -> ModelConfig:
+def tinyllama_1_1b_config() -> ModelConfig:
     """TinyLlama-1.1B configuration.
 
     TinyLlama-1.1B-Chat: 22 layers, hidden=2048, GQA 32:4 (8:1 ratio).
@@ -269,7 +269,7 @@ fn tinyllama_1_1b_config() -> ModelConfig:
     return cfg^
 
 
-fn mini_tinyllama_config() -> ModelConfig:
+def mini_tinyllama_config() -> ModelConfig:
     """Scaled-down TinyLlama config for testing.
 
     Same architecture ratios as TinyLlama-1.1B but with dimensions
@@ -296,7 +296,7 @@ fn mini_tinyllama_config() -> ModelConfig:
     return cfg^
 
 
-fn mistral_7b_config() -> ModelConfig:
+def mistral_7b_config() -> ModelConfig:
     """Mistral 7B configuration."""
     var cfg = ModelConfig()
     cfg.model_type = String("mistral")
@@ -322,7 +322,7 @@ fn mistral_7b_config() -> ModelConfig:
 # Layer Weight Names
 # ===----------------------------------------------------------------------=== #
 
-fn layer_weight_name(layer_idx: Int, suffix: String) -> String:
+def layer_weight_name(layer_idx: Int, suffix: String) -> String:
     """Generate standard HuggingFace layer weight name.
 
     Args:
@@ -335,16 +335,16 @@ fn layer_weight_name(layer_idx: Int, suffix: String) -> String:
     return "model.layers." + String(layer_idx) + "." + suffix
 
 
-fn embed_weight_name() -> String:
+def embed_weight_name() -> String:
     """Get embedding weight name."""
     return "model.embed_tokens.weight"
 
 
-fn final_norm_weight_name() -> String:
+def final_norm_weight_name() -> String:
     """Get final layer norm weight name."""
     return "model.norm.weight"
 
 
-fn lm_head_weight_name() -> String:
+def lm_head_weight_name() -> String:
     """Get language model head weight name."""
     return "lm_head.weight"

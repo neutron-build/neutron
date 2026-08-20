@@ -7,7 +7,7 @@
 Extends the core sampler with production-quality generation features.
 """
 
-from math import log, exp
+from std.math import log, exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.sampler import Sampler, SamplerConfig, greedy_config
@@ -17,7 +17,7 @@ from neutron_mojo.nn.sampler import Sampler, SamplerConfig, greedy_config
 # Repetition Penalty
 # ===----------------------------------------------------------------------=== #
 
-fn apply_repetition_penalty(
+def apply_repetition_penalty(
     mut logits: Tensor[DType.float32],
     vocab_size: Int,
     generated_tokens: List[Int],
@@ -48,7 +48,7 @@ fn apply_repetition_penalty(
                 logits.set(tok, score * penalty)
 
 
-fn apply_frequency_penalty(
+def apply_frequency_penalty(
     mut logits: Tensor[DType.float32],
     vocab_size: Int,
     generated_tokens: List[Int],
@@ -95,7 +95,7 @@ fn apply_frequency_penalty(
 # Stop Tokens
 # ===----------------------------------------------------------------------=== #
 
-fn should_stop(token: Int, stop_tokens: List[Int]) -> Bool:
+def should_stop(token: Int, stop_tokens: List[Int]) -> Bool:
     """Check if a generated token is a stop token.
 
     Args:
@@ -115,7 +115,7 @@ fn should_stop(token: Int, stop_tokens: List[Int]) -> Bool:
 # Generation Config
 # ===----------------------------------------------------------------------=== #
 
-struct GenerationConfig(Copyable, Movable):
+struct GenerationConfig(Copyable, Movable, ImplicitlyCopyable):
     """Full generation configuration combining sampling + penalties + stopping."""
     var sampler_config: SamplerConfig
     var repetition_penalty: Float32
@@ -128,7 +128,7 @@ struct GenerationConfig(Copyable, Movable):
     var stop_token_2: Int
     var stop_token_3: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.sampler_config = SamplerConfig()
         self.repetition_penalty = 1.0
         self.frequency_penalty = 0.0
@@ -140,31 +140,31 @@ struct GenerationConfig(Copyable, Movable):
         self.stop_token_2 = -1
         self.stop_token_3 = -1
 
-    fn __copyinit__(out self, existing: Self):
-        self.sampler_config = existing.sampler_config.copy()
-        self.repetition_penalty = existing.repetition_penalty
-        self.frequency_penalty = existing.frequency_penalty
-        self.presence_penalty = existing.presence_penalty
-        self.max_tokens = existing.max_tokens
-        self.num_stop_tokens = existing.num_stop_tokens
-        self.stop_token_0 = existing.stop_token_0
-        self.stop_token_1 = existing.stop_token_1
-        self.stop_token_2 = existing.stop_token_2
-        self.stop_token_3 = existing.stop_token_3
+    def __init__(out self, *, copy: Self):
+        self.sampler_config = copy.sampler_config.copy()
+        self.repetition_penalty = copy.repetition_penalty
+        self.frequency_penalty = copy.frequency_penalty
+        self.presence_penalty = copy.presence_penalty
+        self.max_tokens = copy.max_tokens
+        self.num_stop_tokens = copy.num_stop_tokens
+        self.stop_token_0 = copy.stop_token_0
+        self.stop_token_1 = copy.stop_token_1
+        self.stop_token_2 = copy.stop_token_2
+        self.stop_token_3 = copy.stop_token_3
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.sampler_config = other.sampler_config.copy()
-        self.repetition_penalty = other.repetition_penalty
-        self.frequency_penalty = other.frequency_penalty
-        self.presence_penalty = other.presence_penalty
-        self.max_tokens = other.max_tokens
-        self.num_stop_tokens = other.num_stop_tokens
-        self.stop_token_0 = other.stop_token_0
-        self.stop_token_1 = other.stop_token_1
-        self.stop_token_2 = other.stop_token_2
-        self.stop_token_3 = other.stop_token_3
+    def __init__(out self, *, deinit move: Self):
+        self.sampler_config = move.sampler_config.copy()
+        self.repetition_penalty = move.repetition_penalty^
+        self.frequency_penalty = move.frequency_penalty^
+        self.presence_penalty = move.presence_penalty^
+        self.max_tokens = move.max_tokens^
+        self.num_stop_tokens = move.num_stop_tokens^
+        self.stop_token_0 = move.stop_token_0^
+        self.stop_token_1 = move.stop_token_1^
+        self.stop_token_2 = move.stop_token_2^
+        self.stop_token_3 = move.stop_token_3^
 
-    fn add_stop_token(mut self, token_id: Int):
+    def add_stop_token(mut self, token_id: Int):
         """Add a stop token (up to 4)."""
         if self.num_stop_tokens == 0:
             self.stop_token_0 = token_id
@@ -177,7 +177,7 @@ struct GenerationConfig(Copyable, Movable):
         if self.num_stop_tokens < 4:
             self.num_stop_tokens += 1
 
-    fn get_stop_tokens(self) -> List[Int]:
+    def get_stop_tokens(self) -> List[Int]:
         """Get stop tokens as a list."""
         var result = List[Int]()
         if self.num_stop_tokens > 0:
@@ -190,7 +190,7 @@ struct GenerationConfig(Copyable, Movable):
             result.append(self.stop_token_3)
         return result^
 
-    fn is_stop_token(self, token: Int) -> Bool:
+    def is_stop_token(self, token: Int) -> Bool:
         """Check if token is a stop token."""
         if self.num_stop_tokens > 0 and token == self.stop_token_0:
             return True
@@ -207,31 +207,31 @@ struct GenerationConfig(Copyable, Movable):
 # Beam Search
 # ===----------------------------------------------------------------------=== #
 
-struct BeamEntry(Copyable, Movable):
+struct BeamEntry(Copyable, Movable, ImplicitlyCopyable):
     """A single beam hypothesis."""
     var tokens: List[Int]
     var score: Float32
     var finished: Bool
 
-    fn __init__(out self):
+    def __init__(out self):
         self.tokens = List[Int]()
         self.score = 0.0
         self.finished = False
 
-    fn __copyinit__(out self, existing: Self):
+    def __init__(out self, *, copy: Self):
         self.tokens = List[Int]()
-        for i in range(len(existing.tokens)):
-            self.tokens.append(existing.tokens[i])
-        self.score = existing.score
-        self.finished = existing.finished
+        for i in range(len(copy.tokens)):
+            self.tokens.append(copy.tokens[i])
+        self.score = copy.score
+        self.finished = copy.finished
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.tokens = other.tokens^
-        self.score = other.score
-        self.finished = other.finished
+    def __init__(out self, *, deinit move: Self):
+        self.tokens = move.tokens^
+        self.score = move.score^
+        self.finished = move.finished^
 
 
-fn beam_search_step(
+def beam_search_step(
     logits: Tensor[DType.float32],
     vocab_size: Int,
     beams: List[BeamEntry],
@@ -295,7 +295,7 @@ fn beam_search_step(
     return candidates^
 
 
-fn select_top_beams(
+def select_top_beams(
     candidates: List[BeamEntry],
     beam_width: Int,
 ) -> List[BeamEntry]:

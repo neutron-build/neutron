@@ -1,14 +1,14 @@
 # Test transpose-aware matmul
 
 from neutron_mojo.tensor import Tensor, matmul
-from math import abs
+from std.math import abs
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5) raises:
     var diff = abs(Float64(a) - Float64(b))
     if diff > rtol * abs(Float64(b)) + 1e-6:
         raise Error("Not close: " + String(a) + " vs " + String(b))
 
-fn main() raises:
+def main() raises:
     print("test_matmul_transpose:")
 
     # Test data: A = [[1, 2], [3, 4]]  (2x2)

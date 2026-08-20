@@ -4,7 +4,7 @@
 
 """Tests for the full N-layer model."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.model import (
     Model,
     ModelParams,
@@ -18,19 +18,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_model_params() raises:
+def test_model_params() raises:
     """Test ModelParams creation."""
     var p = tiny_test_params()
     assert_true(p.num_layers == 2, "num_layers")
@@ -43,7 +43,7 @@ fn test_model_params() raises:
     print("  model_params: PASS")
 
 
-fn test_model_creation() raises:
+def test_model_creation() raises:
     """Test Model struct creation."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -58,7 +58,7 @@ fn test_model_creation() raises:
     print("  model_creation: PASS")
 
 
-fn test_model_forward_single_token() raises:
+def test_model_forward_single_token() raises:
     """Test single-token forward pass through model."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -86,7 +86,7 @@ fn test_model_forward_single_token() raises:
     print("  model_forward_single_token: PASS")
 
 
-fn test_model_forward_multi_token() raises:
+def test_model_forward_multi_token() raises:
     """Test multi-token forward pass."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -113,7 +113,7 @@ fn test_model_forward_multi_token() raises:
     print("  model_forward_multi_token: PASS")
 
 
-fn test_model_residual_with_zero_weights() raises:
+def test_model_residual_with_zero_weights() raises:
     """Test that zero projection weights preserve input through residual."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -140,7 +140,7 @@ fn test_model_residual_with_zero_weights() raises:
     print("  model_residual_with_zero_weights: PASS")
 
 
-fn test_generate_basic() raises:
+def test_generate_basic() raises:
     """Test basic generation loop."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -164,7 +164,7 @@ fn test_generate_basic() raises:
     print("  generate_basic: PASS")
 
 
-fn test_generate_deterministic() raises:
+def test_generate_deterministic() raises:
     """Test that generation is deterministic."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -185,7 +185,7 @@ fn test_generate_deterministic() raises:
     print("  generate_deterministic: PASS")
 
 
-fn test_generate_with_longer_prompt() raises:
+def test_generate_with_longer_prompt() raises:
     """Test generation with multi-token prompt."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -205,7 +205,7 @@ fn test_generate_with_longer_prompt() raises:
     print("  generate_with_longer_prompt: PASS")
 
 
-fn test_layer_weight_offsets() raises:
+def test_layer_weight_offsets() raises:
     """Test that layer weight offsets don't overlap."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -222,7 +222,7 @@ fn test_layer_weight_offsets() raises:
     print("  layer_weight_offsets: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_model:")
 
     test_model_params()

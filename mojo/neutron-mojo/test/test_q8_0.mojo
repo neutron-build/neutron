@@ -13,27 +13,27 @@ from neutron_mojo.quant.q8_0 import (
     dequantize_q8_0_block,
     calc_q8_0_buffer_size,
 )
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
     if abs(a - b) > tol:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn test_q8_0_block_size() raises:
+def test_q8_0_block_size() raises:
     """Test Q8_0 block size."""
     assert_true(q8_0_block_size() == 32, "Q8_0 block size should be 32")
 
     print("  q8_0_block_size: PASS")
 
 
-fn test_q8_0_bytes_per_block() raises:
+def test_q8_0_bytes_per_block() raises:
     """Test Q8_0 bytes per block."""
     # 2 bytes (FP16 scale) + 32 bytes (INT8 data) = 34 bytes
     assert_true(q8_0_bytes_per_block() == 34, "Q8_0 block should be 34 bytes")
@@ -41,7 +41,7 @@ fn test_q8_0_bytes_per_block() raises:
     print("  q8_0_bytes_per_block: PASS")
 
 
-fn test_quantize_q8_0_zero() raises:
+def test_quantize_q8_0_zero() raises:
     """Test quantizing zero."""
     var scale = Float32(1.0)
     var q = quantize_q8_0(Float32(0.0), scale)
@@ -52,7 +52,7 @@ fn test_quantize_q8_0_zero() raises:
     print("  quantize_q8_0_zero: PASS")
 
 
-fn test_quantize_q8_0_positive() raises:
+def test_quantize_q8_0_positive() raises:
     """Test quantizing positive values."""
     var scale = Float32(1.0 / 127.0)  # Scale for full range
 
@@ -67,7 +67,7 @@ fn test_quantize_q8_0_positive() raises:
     print("  quantize_q8_0_positive: PASS")
 
 
-fn test_quantize_q8_0_negative() raises:
+def test_quantize_q8_0_negative() raises:
     """Test quantizing negative values."""
     var scale = Float32(1.0 / 127.0)
 
@@ -82,7 +82,7 @@ fn test_quantize_q8_0_negative() raises:
     print("  quantize_q8_0_negative: PASS")
 
 
-fn test_quantize_q8_0_clamping() raises:
+def test_quantize_q8_0_clamping() raises:
     """Test that quantization clamps to INT8 range."""
     var scale = Float32(0.001)  # Very small scale
 
@@ -96,7 +96,7 @@ fn test_quantize_q8_0_clamping() raises:
     print("  quantize_q8_0_clamping: PASS")
 
 
-fn test_dequantize_q8_0() raises:
+def test_dequantize_q8_0() raises:
     """Test dequantizing Q8_0 values."""
     var scale = Float32(2.0)
 
@@ -111,7 +111,7 @@ fn test_dequantize_q8_0() raises:
     print("  dequantize_q8_0: PASS")
 
 
-fn test_quantize_dequantize_roundtrip() raises:
+def test_quantize_dequantize_roundtrip() raises:
     """Test Q8_0 roundtrip accuracy."""
     var scale = Float32(1.0 / 127.0)
     var original = Float32(0.456)
@@ -125,7 +125,7 @@ fn test_quantize_dequantize_roundtrip() raises:
     print("  quantize_dequantize_roundtrip: PASS")
 
 
-fn test_q8_0_block_quantize() raises:
+def test_q8_0_block_quantize() raises:
     """Test Q8_0 block quantization."""
     # Create input data using List
     var input_list = List[Float32]()
@@ -147,7 +147,7 @@ fn test_q8_0_block_quantize() raises:
     print("  q8_0_block_quantize: PASS")
 
 
-fn test_q8_0_block_dequantize() raises:
+def test_q8_0_block_dequantize() raises:
     """Test Q8_0 block dequantization roundtrip."""
     # Original data using List
     var input_list = List[Float32]()
@@ -183,7 +183,7 @@ fn test_q8_0_block_dequantize() raises:
     print("  q8_0_block_dequantize: PASS")
 
 
-fn test_calc_q8_0_buffer_size() raises:
+def test_calc_q8_0_buffer_size() raises:
     """Test Q8_0 buffer size calculation."""
     # 64 elements = 2 blocks * 34 bytes = 68 bytes
     var size_64 = calc_q8_0_buffer_size(64)
@@ -196,7 +196,7 @@ fn test_calc_q8_0_buffer_size() raises:
     print("  calc_q8_0_buffer_size: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_q8_0:")
 
     test_q8_0_block_size()

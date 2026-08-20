@@ -43,7 +43,7 @@ from neutron_mojo.serve.handler import InferenceRequest, InferenceResponse
 # Request Parsing
 # ===----------------------------------------------------------------------=== #
 
-fn _parse_int_or(value: String, fallback: Int) -> Int:
+def _parse_int_or(value: String, fallback: Int) -> Int:
     """Parse an integer and return fallback if parsing fails."""
     try:
         return atol(value)
@@ -51,14 +51,14 @@ fn _parse_int_or(value: String, fallback: Int) -> Int:
         return fallback
 
 
-fn _parse_float_or(value: String, fallback: Float32) -> Float32:
+def _parse_float_or(value: String, fallback: Float32) -> Float32:
     """Parse a float and return fallback if parsing fails."""
     try:
         return Float32(atof(value))
     except:
         return fallback
 
-fn parse_request_line(mut request: InferenceRequest, line: String):
+def parse_request_line(mut request: InferenceRequest, line: String):
     """Parse a single key=value line into an InferenceRequest field.
 
     Args:
@@ -67,7 +67,7 @@ fn parse_request_line(mut request: InferenceRequest, line: String):
     """
     # Find first '='
     var eq_pos = -1
-    for i in range(len(line)):
+    for i in range(line.byte_length()):
         if String(line[byte=i]) == "=":
             eq_pos = i
             break
@@ -75,8 +75,8 @@ fn parse_request_line(mut request: InferenceRequest, line: String):
     if eq_pos < 0:
         return  # No '=' found, skip
 
-    var key = String(line[0:eq_pos])
-    var value = String(line[eq_pos + 1:len(line)])
+    var key = String(line[byte=0:eq_pos])
+    var value = String(line[byte=eq_pos + 1:])
 
     if key == "prompt":
         request.prompt = value
@@ -106,7 +106,7 @@ fn parse_request_line(mut request: InferenceRequest, line: String):
         request.request_id = value  # Reuse request_id field for session tracking
 
 
-fn parse_request_block(lines: List[String]) -> InferenceRequest:
+def parse_request_block(lines: List[String]) -> InferenceRequest:
     """Parse a list of key=value lines into an InferenceRequest.
 
     Expects lines between REQUEST and END markers (markers excluded).
@@ -120,7 +120,7 @@ fn parse_request_block(lines: List[String]) -> InferenceRequest:
     var request = InferenceRequest()
     for i in range(len(lines)):
         var line = lines[i]
-        if len(line) > 0 and line != "REQUEST" and line != "END":
+        if line.byte_length() > 0 and line != "REQUEST" and line != "END":
             parse_request_line(request, line)
     return request^
 
@@ -129,7 +129,7 @@ fn parse_request_block(lines: List[String]) -> InferenceRequest:
 # Response Formatting
 # ===----------------------------------------------------------------------=== #
 
-fn format_response(response: InferenceResponse) -> String:
+def format_response(response: InferenceResponse) -> String:
     """Format an InferenceResponse as protocol text block.
 
     Args:
@@ -140,7 +140,7 @@ fn format_response(response: InferenceResponse) -> String:
     """
     var result = String("RESPONSE\n")
 
-    if len(response.request_id) > 0:
+    if response.request_id.byte_length() > 0:
         result += "request_id=" + response.request_id + "\n"
 
     if response.is_error():
@@ -160,7 +160,7 @@ fn format_response(response: InferenceResponse) -> String:
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _strip_trailing_newline(s: String) -> String:
+def _strip_trailing_newline(s: String) -> String:
     """Remove trailing newline/carriage return from a string."""
     var end = len(s)
     while end > 0:

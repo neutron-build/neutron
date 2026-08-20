@@ -26,26 +26,26 @@ struct WeightMapping(ImplicitlyCopyable, Copyable, Movable):
     var numel: Int          # number of elements
     var source: Int         # 0=layer_weights, 1=embed, 2=final_norm, 3=lm_head
 
-    fn __init__(out self, model_offset: Int, tape_var_idx: Int, numel: Int, source: Int = 0):
+    def __init__(out self, model_offset: Int, tape_var_idx: Int, numel: Int, source: Int = 0):
         self.model_offset = model_offset
         self.tape_var_idx = tape_var_idx
         self.numel = numel
         self.source = source
 
-    fn __copyinit__(out self, other: Self):
-        self.model_offset = other.model_offset
-        self.tape_var_idx = other.tape_var_idx
-        self.numel = other.numel
-        self.source = other.source
+    def __init__(out self, *, copy: Self):
+        self.model_offset = copy.model_offset
+        self.tape_var_idx = copy.tape_var_idx
+        self.numel = copy.numel
+        self.source = copy.source
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.model_offset = other.model_offset
-        self.tape_var_idx = other.tape_var_idx
-        self.numel = other.numel
-        self.source = other.source
+    def __init__(out self, *, deinit move: Self):
+        self.model_offset = move.model_offset^
+        self.tape_var_idx = move.tape_var_idx^
+        self.numel = move.numel^
+        self.source = move.source^
 
 
-fn _add_layer_mappings(
+def _add_layer_mappings(
     mut mappings: List[WeightMapping],
     block: TrainableTransformerBlock,
     off: LayerWeightOffsets,
@@ -77,7 +77,7 @@ fn _add_layer_mappings(
     mappings.append(WeightMapping(off.w_down, block.down_proj.weight_idx, hd * fd, 0))
 
 
-fn build_weight_mapping(model: Model, trainable: TrainableLM) -> List[WeightMapping]:
+def build_weight_mapping(model: Model, trainable: TrainableLM) -> List[WeightMapping]:
     """Build mapping between Model weights and TrainableLM tape variables.
 
     Returns a list of WeightMapping entries covering all weights.
@@ -104,7 +104,7 @@ fn build_weight_mapping(model: Model, trainable: TrainableLM) -> List[WeightMapp
     return mappings^
 
 
-fn _copy_embed_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int):
+def _copy_embed_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int):
     """Copy model.embed data into tape variable."""
     for i in range(numel):
         var row = i // model.params.hidden_dim
@@ -112,13 +112,13 @@ fn _copy_embed_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int):
         tape.set_data(tape_idx, i, model.embed.get(row, col))
 
 
-fn _copy_final_norm_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int):
+def _copy_final_norm_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int):
     """Copy model.final_norm data into tape variable."""
     for i in range(numel):
         tape.set_data(tape_idx, i, model.final_norm.get(i))
 
 
-fn _copy_lm_head_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int):
+def _copy_lm_head_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int):
     """Copy model.lm_head data into tape variable."""
     for i in range(numel):
         var row = i // model.params.hidden_dim
@@ -126,7 +126,7 @@ fn _copy_lm_head_to_tape(model: Model, mut tape: Tape, tape_idx: Int, numel: Int
         tape.set_data(tape_idx, i, model.lm_head.get(row, col))
 
 
-fn _copy_layer_weights_to_tape(
+def _copy_layer_weights_to_tape(
     model: Model, mut tape: Tape, model_offset: Int, tape_idx: Int, numel: Int,
 ):
     """Copy a slice of model.layer_weights into tape variable."""
@@ -134,7 +134,7 @@ fn _copy_layer_weights_to_tape(
         tape.set_data(tape_idx, i, model.layer_weights.get(model_offset + i))
 
 
-fn model_to_tape(model: Model, mut tape: Tape, trainable: TrainableLM):
+def model_to_tape(model: Model, mut tape: Tape, trainable: TrainableLM):
     """Copy Model weights into the tape for training.
 
     Transfers all weights from the inference Model's flat storage
@@ -153,19 +153,19 @@ fn model_to_tape(model: Model, mut tape: Tape, trainable: TrainableLM):
             _copy_layer_weights_to_tape(model, tape, m.model_offset, m.tape_var_idx, m.numel)
 
 
-fn _copy_tape_to_embed(tape: Tape, tape_idx: Int, mut embed: Tensor[DType.float32], numel: Int):
+def _copy_tape_to_embed(tape: Tape, tape_idx: Int, mut embed: Tensor[DType.float32], numel: Int):
     """Copy tape variable into embed tensor."""
     for i in range(numel):
         embed.set(i, tape.get_data(tape_idx, i))
 
 
-fn _copy_tape_to_norm(tape: Tape, tape_idx: Int, mut norm: Tensor[DType.float32], numel: Int):
+def _copy_tape_to_norm(tape: Tape, tape_idx: Int, mut norm: Tensor[DType.float32], numel: Int):
     """Copy tape variable into norm tensor."""
     for i in range(numel):
         norm.set(i, tape.get_data(tape_idx, i))
 
 
-fn _copy_tape_to_layer(
+def _copy_tape_to_layer(
     tape: Tape, tape_idx: Int, mut lw: Tensor[DType.float32], offset: Int, numel: Int,
 ):
     """Copy tape variable into layer_weights at offset."""
@@ -173,7 +173,7 @@ fn _copy_tape_to_layer(
         lw.set(offset + i, tape.get_data(tape_idx, i))
 
 
-fn tape_to_model(tape: Tape, trainable: TrainableLM, params: ModelParams) -> Model:
+def tape_to_model(tape: Tape, trainable: TrainableLM, params: ModelParams) -> Model:
     """Copy trained weights from tape back into a new Model for inference.
 
     Creates a fresh Model and populates it from the tape variables

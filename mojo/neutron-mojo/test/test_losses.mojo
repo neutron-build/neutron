@@ -4,7 +4,7 @@
 
 """Tests for cross_entropy, mse, l1, binary_cross_entropy, kl_divergence."""
 
-from math import exp, log
+from std.math import exp, log
 from neutron_mojo.autograd import Tape, run_backward
 from neutron_mojo.train.losses import (
     log_softmax, cross_entropy_loss, mse_loss, l1_loss,
@@ -12,14 +12,14 @@ from neutron_mojo.train.losses import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b) + " (diff=" + String(diff) + ")")
 
 
-fn test_log_softmax() raises:
+def test_log_softmax() raises:
     """Log-softmax produces correct values."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -42,7 +42,7 @@ fn test_log_softmax() raises:
     print("  log_softmax: PASS")
 
 
-fn test_cross_entropy_loss() raises:
+def test_cross_entropy_loss() raises:
     """Cross-entropy loss is positive and reasonable."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -65,7 +65,7 @@ fn test_cross_entropy_loss() raises:
     print("  cross_entropy_loss: PASS")
 
 
-fn test_cross_entropy_backward() raises:
+def test_cross_entropy_backward() raises:
     """Cross-entropy backward produces softmax - one_hot."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -90,7 +90,7 @@ fn test_cross_entropy_backward() raises:
     print("  cross_entropy_backward: PASS")
 
 
-fn test_mse_loss() raises:
+def test_mse_loss() raises:
     """MSE loss computation."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -110,7 +110,7 @@ fn test_mse_loss() raises:
     print("  mse_loss_zero: PASS")
 
 
-fn test_mse_loss_nonzero() raises:
+def test_mse_loss_nonzero() raises:
     """MSE loss with difference."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -128,7 +128,7 @@ fn test_mse_loss_nonzero() raises:
     print("  mse_loss_nonzero: PASS")
 
 
-fn test_mse_backward() raises:
+def test_mse_backward() raises:
     """MSE backward produces correct gradients."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -149,7 +149,7 @@ fn test_mse_backward() raises:
     print("  mse_backward: PASS")
 
 
-fn test_l1_loss() raises:
+def test_l1_loss() raises:
     """L1 loss computation."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -169,7 +169,7 @@ fn test_l1_loss() raises:
     print("  l1_loss: PASS")
 
 
-fn test_binary_cross_entropy() raises:
+def test_binary_cross_entropy() raises:
     """Binary cross-entropy with perfect prediction is near zero."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -188,7 +188,7 @@ fn test_binary_cross_entropy() raises:
     print("  binary_cross_entropy: PASS")
 
 
-fn test_kl_divergence() raises:
+def test_kl_divergence() raises:
     """KL divergence: identical distributions give 0."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -207,7 +207,7 @@ fn test_kl_divergence() raises:
     print("  kl_divergence_zero: PASS")
 
 
-fn test_kl_divergence_positive() raises:
+def test_kl_divergence_positive() raises:
     """KL divergence is positive for different distributions."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -228,7 +228,7 @@ fn test_kl_divergence_positive() raises:
     print("  kl_divergence_positive: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_losses:")
     test_log_softmax()
     test_cross_entropy_loss()

@@ -37,7 +37,7 @@ from neutron_mojo.nn.pipeline import PipelineConfig
 # ChatMessage — A single message in a conversation
 # ===----------------------------------------------------------------------=== #
 
-struct ChatMessage(Copyable, Movable):
+struct ChatMessage(Copyable, Movable, ImplicitlyCopyable):
     """A single message in a conversation with a role tag.
 
     Roles: "system", "user", "assistant"
@@ -45,29 +45,29 @@ struct ChatMessage(Copyable, Movable):
     var role: String
     var content: String
 
-    fn __init__(out self, role: String, content: String):
+    def __init__(out self, role: String, content: String):
         self.role = role
         self.content = content
 
-    fn __copyinit__(out self, existing: Self):
-        self.role = existing.role
-        self.content = existing.content
+    def __init__(out self, *, copy: Self):
+        self.role = copy.role
+        self.content = copy.content
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.role = other.role^
-        self.content = other.content^
+    def __init__(out self, *, deinit move: Self):
+        self.role = move.role^
+        self.content = move.content^
 
-    fn copy(self) -> ChatMessage:
+    def copy(self) -> ChatMessage:
         """Return a copy of this message."""
         return ChatMessage(self.role, self.content)
 
-    fn is_system(self) -> Bool:
+    def is_system(self) -> Bool:
         return self.role == "system"
 
-    fn is_user(self) -> Bool:
+    def is_user(self) -> Bool:
         return self.role == "user"
 
-    fn is_assistant(self) -> Bool:
+    def is_assistant(self) -> Bool:
         return self.role == "assistant"
 
 
@@ -87,7 +87,7 @@ struct ConversationSession(Movable):
     var turn_count: Int          # Number of user-assistant exchanges
     var max_history: Int         # Max messages to keep (0 = unlimited)
 
-    fn __init__(out self, session_id: String, system_prompt: String = ""):
+    def __init__(out self, session_id: String, system_prompt: String = ""):
         """Create a new conversation session.
 
         Args:
@@ -100,7 +100,7 @@ struct ConversationSession(Movable):
         self.turn_count = 0
         self.max_history = 0  # unlimited
 
-    fn __init__(out self, session_id: String, system_prompt: String,
+    def __init__(out self, session_id: String, system_prompt: String,
                 max_history: Int):
         self.session_id = session_id
         self.system_prompt = system_prompt
@@ -108,14 +108,14 @@ struct ConversationSession(Movable):
         self.turn_count = 0
         self.max_history = max_history
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.session_id = other.session_id^
-        self.system_prompt = other.system_prompt^
-        self.messages = other.messages^
-        self.turn_count = other.turn_count
-        self.max_history = other.max_history
+    def __init__(out self, *, deinit move: Self):
+        self.session_id = move.session_id^
+        self.system_prompt = move.system_prompt^
+        self.messages = move.messages^
+        self.turn_count = move.turn_count^
+        self.max_history = move.max_history^
 
-    fn add_message(mut self, role: String, content: String):
+    def add_message(mut self, role: String, content: String):
         """Add a message to the conversation history.
 
         Args:
@@ -127,23 +127,23 @@ struct ConversationSession(Movable):
             self.turn_count += 1
         self._enforce_history_limit()
 
-    fn add_user_message(mut self, content: String):
+    def add_user_message(mut self, content: String):
         """Add a user message."""
         self.add_message("user", content)
 
-    fn add_assistant_message(mut self, content: String):
+    def add_assistant_message(mut self, content: String):
         """Add an assistant response."""
         self.add_message("assistant", content)
 
-    fn add_system_message(mut self, content: String):
+    def add_system_message(mut self, content: String):
         """Add a system message."""
         self.add_message("system", content)
 
-    fn num_messages(self) -> Int:
+    def num_messages(self) -> Int:
         """Total number of messages in history."""
         return len(self.messages)
 
-    fn get_last_user_message(self) -> String:
+    def get_last_user_message(self) -> String:
         """Get the most recent user message content.
 
         Returns:
@@ -156,7 +156,7 @@ struct ConversationSession(Movable):
             i -= 1
         return String("")
 
-    fn get_last_assistant_message(self) -> String:
+    def get_last_assistant_message(self) -> String:
         """Get the most recent assistant message content.
 
         Returns:
@@ -169,12 +169,12 @@ struct ConversationSession(Movable):
             i -= 1
         return String("")
 
-    fn clear(mut self):
+    def clear(mut self):
         """Clear all messages and reset turn count."""
         self.messages = List[ChatMessage]()
         self.turn_count = 0
 
-    fn _enforce_history_limit(mut self):
+    def _enforce_history_limit(mut self):
         """Trim old messages if max_history is set.
 
         Keeps system messages and trims oldest user/assistant pairs
@@ -197,7 +197,7 @@ struct ConversationSession(Movable):
 # Multi-Turn Template Formatting
 # ===----------------------------------------------------------------------=== #
 
-fn format_conversation_llama(session: ConversationSession) -> String:
+def format_conversation_llama(session: ConversationSession) -> String:
     """Format full conversation history using Llama instruct template.
 
     Format:
@@ -218,7 +218,7 @@ fn format_conversation_llama(session: ConversationSession) -> String:
     var result = String("")
 
     # System prompt
-    if len(session.system_prompt) > 0:
+    if session.system_prompt.byte_length() > 0:
         result += "<<SYS>>\n" + session.system_prompt + "\n<</SYS>>\n\n"
 
     # Messages
@@ -243,7 +243,7 @@ fn format_conversation_llama(session: ConversationSession) -> String:
     return result^
 
 
-fn format_conversation_chatml(session: ConversationSession) -> String:
+def format_conversation_chatml(session: ConversationSession) -> String:
     """Format full conversation history using ChatML template.
 
     Format:
@@ -266,7 +266,7 @@ fn format_conversation_chatml(session: ConversationSession) -> String:
     var result = String("")
 
     # System prompt
-    if len(session.system_prompt) > 0:
+    if session.system_prompt.byte_length() > 0:
         result += "<|im_start|>system\n" + session.system_prompt + "<|im_end|>\n"
 
     # Messages
@@ -280,7 +280,7 @@ fn format_conversation_chatml(session: ConversationSession) -> String:
     return result^
 
 
-fn format_conversation(session: ConversationSession, template: String) -> String:
+def format_conversation(session: ConversationSession, template: String) -> String:
     """Format conversation using the specified template.
 
     Args:
@@ -297,7 +297,7 @@ fn format_conversation(session: ConversationSession, template: String) -> String
 
     # "none" — just concatenate messages with role prefixes
     var result = String("")
-    if len(session.system_prompt) > 0:
+    if session.system_prompt.byte_length() > 0:
         result += "System: " + session.system_prompt + "\n"
     for i in range(len(session.messages)):
         var msg = session.messages[i].copy()
@@ -315,7 +315,7 @@ fn format_conversation(session: ConversationSession, template: String) -> String
 # Conversation Generate — Multi-turn generation with session
 # ===----------------------------------------------------------------------=== #
 
-fn conversation_generate(
+def conversation_generate(
     model: Model,
     tokenizer: BPETokenizer,
     session: ConversationSession,

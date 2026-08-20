@@ -4,7 +4,7 @@
 
 """Tests for MoE routing, expert FFN, and combined layer."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.moe import (
     MoEConfig,
     MoERouter,
@@ -18,19 +18,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_moe_config() raises:
+def test_moe_config() raises:
     """Test MoEConfig creation."""
     var config = MoEConfig(num_experts=8, top_k=2, hidden_dim=256, expert_dim=512)
     assert_true(config.num_experts == 8, "num_experts")
@@ -44,7 +44,7 @@ fn test_moe_config() raises:
     print("  moe_config: PASS")
 
 
-fn test_router_creation() raises:
+def test_router_creation() raises:
     """Test MoERouter creation."""
     var router = MoERouter(num_experts=4, top_k=2, hidden_dim=8)
     assert_true(router.num_experts == 4, "num_experts")
@@ -54,7 +54,7 @@ fn test_router_creation() raises:
     print("  router_creation: PASS")
 
 
-fn test_router_selects_top_k() raises:
+def test_router_selects_top_k() raises:
     """Test router selects correct top-k experts."""
     var router = MoERouter(num_experts=4, top_k=2, hidden_dim=2)
 
@@ -85,7 +85,7 @@ fn test_router_selects_top_k() raises:
     print("  router_selects_top_k: PASS")
 
 
-fn test_router_weights_softmax() raises:
+def test_router_weights_softmax() raises:
     """Test router weights are proper softmax."""
     var router = MoERouter(num_experts=3, top_k=3, hidden_dim=1)
 
@@ -107,7 +107,7 @@ fn test_router_weights_softmax() raises:
     print("  router_weights_softmax: PASS")
 
 
-fn test_expert_weights_creation() raises:
+def test_expert_weights_creation() raises:
     """Test ExpertWeights struct."""
     var ew = ExpertWeights(num_experts=4, hidden_dim=8, expert_dim=16)
     assert_true(ew.num_experts == 4, "num_experts")
@@ -124,7 +124,7 @@ fn test_expert_weights_creation() raises:
     print("  expert_weights_creation: PASS")
 
 
-fn test_expert_ffn_identity() raises:
+def test_expert_ffn_identity() raises:
     """Test expert FFN with identity-like weights."""
     var ew = ExpertWeights(num_experts=1, hidden_dim=2, expert_dim=2)
 
@@ -163,7 +163,7 @@ fn test_expert_ffn_identity() raises:
     print("  expert_ffn_identity: PASS")
 
 
-fn test_expert_ffn_zero_weights() raises:
+def test_expert_ffn_zero_weights() raises:
     """Test expert FFN with zero weights returns zeros."""
     var ew = ExpertWeights(num_experts=2, hidden_dim=3, expert_dim=4)
     # All weights are zero by default
@@ -180,7 +180,7 @@ fn test_expert_ffn_zero_weights() raises:
     print("  expert_ffn_zero_weights: PASS")
 
 
-fn test_moe_forward_basic() raises:
+def test_moe_forward_basic() raises:
     """Test full MoE forward pass."""
     var router = MoERouter(num_experts=2, top_k=1, hidden_dim=2)
     var ew = ExpertWeights(num_experts=2, hidden_dim=2, expert_dim=2)
@@ -214,7 +214,7 @@ fn test_moe_forward_basic() raises:
     print("  moe_forward_basic: PASS")
 
 
-fn test_moe_forward_top2() raises:
+def test_moe_forward_top2() raises:
     """Test MoE with top-2 routing combines two experts."""
     var router = MoERouter(num_experts=2, top_k=2, hidden_dim=2)
     var ew = ExpertWeights(num_experts=2, hidden_dim=2, expert_dim=2)
@@ -251,7 +251,7 @@ fn test_moe_forward_top2() raises:
     print("  moe_forward_top2: PASS")
 
 
-fn test_load_balance_loss() raises:
+def test_load_balance_loss() raises:
     """Test load balancing loss computation."""
     var counts = Tensor[DType.float32](Shape(4))
 
@@ -276,7 +276,7 @@ fn test_load_balance_loss() raises:
     print("  load_balance_loss: PASS")
 
 
-fn test_different_experts_different_outputs() raises:
+def test_different_experts_different_outputs() raises:
     """Test that different experts produce different outputs."""
     var ew = ExpertWeights(num_experts=2, hidden_dim=2, expert_dim=2)
 
@@ -316,7 +316,7 @@ fn test_different_experts_different_outputs() raises:
     print("  different_experts_different_outputs: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_moe:")
 
     test_moe_config()

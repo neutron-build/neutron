@@ -4,7 +4,7 @@
 
 """Tests for sliding window attention and ring-buffer KV cache."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.sliding_window import (
     SlidingWindowKVCache,
     sliding_window_attention_head,
@@ -17,19 +17,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_sw_cache_creation() raises:
+def test_sw_cache_creation() raises:
     """Test sliding window cache creation."""
     var cache = SlidingWindowKVCache(window_size=4, num_kv_heads=2, head_dim=3)
     assert_true(cache.window_size == 4, "window_size")
@@ -39,7 +39,7 @@ fn test_sw_cache_creation() raises:
     print("  sw_cache_creation: PASS")
 
 
-fn test_sw_cache_append_within_window() raises:
+def test_sw_cache_append_within_window() raises:
     """Test appending within window size."""
     var cache = SlidingWindowKVCache(window_size=4, num_kv_heads=1, head_dim=2)
 
@@ -63,7 +63,7 @@ fn test_sw_cache_append_within_window() raises:
     print("  sw_cache_append_within_window: PASS")
 
 
-fn test_sw_cache_ring_buffer_wraps() raises:
+def test_sw_cache_ring_buffer_wraps() raises:
     """Test that ring buffer wraps correctly beyond window size."""
     var cache = SlidingWindowKVCache(window_size=3, num_kv_heads=1, head_dim=1)
 
@@ -89,7 +89,7 @@ fn test_sw_cache_ring_buffer_wraps() raises:
     print("  sw_cache_ring_buffer_wraps: PASS")
 
 
-fn test_sw_cache_memory_bounded() raises:
+def test_sw_cache_memory_bounded() raises:
     """Test that memory stays constant regardless of sequence length."""
     var cache = SlidingWindowKVCache(window_size=8, num_kv_heads=4, head_dim=16)
 
@@ -111,7 +111,7 @@ fn test_sw_cache_memory_bounded() raises:
     print("  sw_cache_memory_bounded: PASS")
 
 
-fn test_sw_attention_single_pos() raises:
+def test_sw_attention_single_pos() raises:
     """Test sliding window attention with a single position."""
     var cache = SlidingWindowKVCache(window_size=4, num_kv_heads=1, head_dim=2)
 
@@ -134,7 +134,7 @@ fn test_sw_attention_single_pos() raises:
     print("  sw_attention_single_pos: PASS")
 
 
-fn test_sw_attention_only_sees_window() raises:
+def test_sw_attention_only_sees_window() raises:
     """Test that attention only considers tokens within the window."""
     var cache = SlidingWindowKVCache(window_size=2, num_kv_heads=1, head_dim=2)
 
@@ -180,7 +180,7 @@ fn test_sw_attention_only_sees_window() raises:
     print("  sw_attention_only_sees_window: PASS")
 
 
-fn test_sw_gqa() raises:
+def test_sw_gqa() raises:
     """Test GQA with sliding window cache."""
     var cache = SlidingWindowKVCache(window_size=8, num_kv_heads=2, head_dim=2)
 
@@ -210,7 +210,7 @@ fn test_sw_gqa() raises:
     print("  sw_gqa: PASS")
 
 
-fn test_windowed_standard_cache() raises:
+def test_windowed_standard_cache() raises:
     """Test windowed attention on standard KV cache."""
     var cache = KVCache(max_seq_len=16, num_kv_heads=1, head_dim=2)
 
@@ -247,7 +247,7 @@ fn test_windowed_standard_cache() raises:
     print("  windowed_standard_cache: PASS")
 
 
-fn test_sw_cache_reset() raises:
+def test_sw_cache_reset() raises:
     """Test sliding window cache reset."""
     var cache = SlidingWindowKVCache(window_size=4, num_kv_heads=1, head_dim=2)
 
@@ -268,7 +268,7 @@ fn test_sw_cache_reset() raises:
     print("  sw_cache_reset: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sliding_window:")
 
     test_sw_cache_creation()

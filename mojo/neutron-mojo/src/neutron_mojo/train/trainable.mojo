@@ -8,7 +8,7 @@ Combines autograd + modules + losses for end-to-end differentiable
 transformer blocks with simplified attention (no KV cache for training).
 """
 
-from math import sqrt, exp
+from std.math import sqrt, exp
 
 from neutron_mojo.autograd.tape import Tape, TapeEntry, OP_SOFTMAX
 from neutron_mojo.autograd.ops import (
@@ -44,7 +44,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
     var ffn_dim: Int
     var registered: Bool
 
-    fn __init__(out self, hidden_dim: Int, ffn_dim: Int = 0):
+    def __init__(out self, hidden_dim: Int, ffn_dim: Int = 0):
         var actual_ffn = ffn_dim if ffn_dim > 0 else hidden_dim * 4
         self.hidden_dim = hidden_dim
         self.head_dim = hidden_dim  # single-head for simplicity
@@ -60,37 +60,37 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         self.down_proj = Linear(actual_ffn, hidden_dim, has_bias=False)
         self.registered = False
 
-    fn __copyinit__(out self, other: Self):
-        self.attn_norm = other.attn_norm.copy()
-        self.q_proj = other.q_proj.copy()
-        self.k_proj = other.k_proj.copy()
-        self.v_proj = other.v_proj.copy()
-        self.o_proj = other.o_proj.copy()
-        self.ffn_norm = other.ffn_norm.copy()
-        self.gate_proj = other.gate_proj.copy()
-        self.up_proj = other.up_proj.copy()
-        self.down_proj = other.down_proj.copy()
-        self.hidden_dim = other.hidden_dim
-        self.head_dim = other.head_dim
-        self.ffn_dim = other.ffn_dim
-        self.registered = other.registered
+    def __init__(out self, *, copy: Self):
+        self.attn_norm = copy.attn_norm.copy()
+        self.q_proj = copy.q_proj.copy()
+        self.k_proj = copy.k_proj.copy()
+        self.v_proj = copy.v_proj.copy()
+        self.o_proj = copy.o_proj.copy()
+        self.ffn_norm = copy.ffn_norm.copy()
+        self.gate_proj = copy.gate_proj.copy()
+        self.up_proj = copy.up_proj.copy()
+        self.down_proj = copy.down_proj.copy()
+        self.hidden_dim = copy.hidden_dim
+        self.head_dim = copy.head_dim
+        self.ffn_dim = copy.ffn_dim
+        self.registered = copy.registered
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.attn_norm = other.attn_norm^
-        self.q_proj = other.q_proj^
-        self.k_proj = other.k_proj^
-        self.v_proj = other.v_proj^
-        self.o_proj = other.o_proj^
-        self.ffn_norm = other.ffn_norm^
-        self.gate_proj = other.gate_proj^
-        self.up_proj = other.up_proj^
-        self.down_proj = other.down_proj^
-        self.hidden_dim = other.hidden_dim
-        self.head_dim = other.head_dim
-        self.ffn_dim = other.ffn_dim
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.attn_norm = move.attn_norm^
+        self.q_proj = move.q_proj^
+        self.k_proj = move.k_proj^
+        self.v_proj = move.v_proj^
+        self.o_proj = move.o_proj^
+        self.ffn_norm = move.ffn_norm^
+        self.gate_proj = move.gate_proj^
+        self.up_proj = move.up_proj^
+        self.down_proj = move.down_proj^
+        self.hidden_dim = move.hidden_dim^
+        self.head_dim = move.head_dim^
+        self.ffn_dim = move.ffn_dim^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register all parameters on the tape."""
         self.attn_norm.register(tape)
         self.q_proj.register(tape)
@@ -103,7 +103,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         self.down_proj.register(tape)
         self.registered = True
 
-    fn forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
         """Forward pass through one transformer block (single token).
 
         For a single token, Q @ K^T is a scalar and softmax of one value = 1.0,
@@ -111,7 +111,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         """
         return self.forward_with_seq(tape, x_idx, 1)
 
-    fn forward_with_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) -> Int:
+    def forward_with_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) -> Int:
         """Forward pass through one transformer block with sequence support.
 
         For seq_len=1: single-token optimization (attn = O(V)).
@@ -122,7 +122,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
             return self._forward_single(tape, x_idx)
         return self._forward_seq(tape, x_idx, seq_len)
 
-    fn _forward_single(self, mut tape: Tape, x_idx: Int) -> Int:
+    def _forward_single(self, mut tape: Tape, x_idx: Int) -> Int:
         """Single-token forward: attention is just O(V)."""
         var normed = self.attn_norm.forward(tape, x_idx)
         var q_idx = self.q_proj.forward(tape, normed)
@@ -135,7 +135,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         var post_attn = tracked_add(tape, x_idx, attn_out)
         return self._ffn_block(tape, post_attn)
 
-    fn _forward_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) -> Int:
+    def _forward_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) -> Int:
         """Multi-token forward with real causal self-attention.
 
         x_idx has shape (seq_len * hidden_dim).
@@ -166,7 +166,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         # Residual + FFN for each position, pack into flat output
         return self._seq_residual_ffn(tape, x_idx, attn_outputs, seq_len, hd)
 
-    fn _extract_token(self, mut tape: Tape, x_idx: Int, t: Int, hd: Int) -> Int:
+    def _extract_token(self, mut tape: Tape, x_idx: Int, t: Int, hd: Int) -> Int:
         """Extract token t from flat (seq_len * hd) tensor."""
         var dims = List[Int]()
         dims.append(hd)
@@ -179,7 +179,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         tape.record(TapeEntry(OP_SPLIT(), x_idx, -1, tok_idx, cached_int=off))
         return tok_idx
 
-    fn _causal_attn_pos(
+    def _causal_attn_pos(
         self, mut tape: Tape,
         q_list: List[Int], k_list: List[Int], v_list: List[Int],
         t: Int, hd: Int,
@@ -217,7 +217,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
 
         return out_idx
 
-    fn _seq_residual_ffn(
+    def _seq_residual_ffn(
         self, mut tape: Tape, x_idx: Int,
         attn_outputs: List[Int], seq_len: Int, hd: Int,
     ) -> Int:
@@ -240,7 +240,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
 
         return result_idx
 
-    fn _ffn_block(self, mut tape: Tape, x_idx: Int) -> Int:
+    def _ffn_block(self, mut tape: Tape, x_idx: Int) -> Int:
         """FFN sub-block: norm -> gate * up (relu) -> down + residual."""
         var ffn_normed = self.ffn_norm.forward(tape, x_idx)
         var gate = self.gate_proj.forward(tape, ffn_normed)
@@ -251,7 +251,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         var output = tracked_add(tape, x_idx, ffn_out)
         return output
 
-    fn param_indices(self) -> List[Int]:
+    def param_indices(self) -> List[Int]:
         """Return all parameter indices."""
         var params = List[Int]()
         var lists = List[List[Int]]()
@@ -285,7 +285,7 @@ struct TrainableLM(Movable):
     var num_layers: Int
     var registered: Bool
 
-    fn __init__(out self, vocab_size: Int, hidden_dim: Int, num_layers: Int, ffn_dim: Int = 0):
+    def __init__(out self, vocab_size: Int, hidden_dim: Int, num_layers: Int, ffn_dim: Int = 0):
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -297,17 +297,17 @@ struct TrainableLM(Movable):
         self.lm_head = Linear(hidden_dim, vocab_size, has_bias=False)
         self.registered = False
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.embedding = other.embedding^
-        self.blocks = other.blocks^
-        self.final_norm = other.final_norm^
-        self.lm_head = other.lm_head^
-        self.vocab_size = other.vocab_size
-        self.hidden_dim = other.hidden_dim
-        self.num_layers = other.num_layers
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.embedding = move.embedding^
+        self.blocks = move.blocks^
+        self.final_norm = move.final_norm^
+        self.lm_head = move.lm_head^
+        self.vocab_size = move.vocab_size^
+        self.hidden_dim = move.hidden_dim^
+        self.num_layers = move.num_layers^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register all parameters on the tape."""
         self.embedding.register(tape)
         for i in range(len(self.blocks)):
@@ -316,7 +316,7 @@ struct TrainableLM(Movable):
         self.lm_head.register(tape)
         self.registered = True
 
-    fn forward(self, mut tape: Tape, token_id: Int) -> Int:
+    def forward(self, mut tape: Tape, token_id: Int) -> Int:
         """Forward pass: token_id -> logits.
 
         Returns the variable index of the logits (shape: vocab_size).
@@ -330,7 +330,7 @@ struct TrainableLM(Movable):
         var logits_idx = self.lm_head.forward(tape, normed)
         return logits_idx
 
-    fn all_param_indices(self) -> List[Int]:
+    def all_param_indices(self) -> List[Int]:
         """Return all parameter indices for the model."""
         var params = List[Int]()
         var embed_params = self.embedding.param_indices()
@@ -348,7 +348,7 @@ struct TrainableLM(Movable):
             params.append(head_params[i])
         return params^
 
-    fn num_parameters(self, tape: Tape) -> Int:
+    def num_parameters(self, tape: Tape) -> Int:
         """Count total trainable parameters."""
         var params = self.all_param_indices()
         var total = 0
@@ -356,7 +356,7 @@ struct TrainableLM(Movable):
             total += tape.var_numel(params[i])
         return total
 
-    fn forward_seq(self, mut tape: Tape, token_ids: List[Int]) -> List[Int]:
+    def forward_seq(self, mut tape: Tape, token_ids: List[Int]) -> List[Int]:
         """Forward pass for a sequence: token_ids -> per-position logits.
 
         Embeds all tokens, processes through blocks with causal attention,
@@ -396,7 +396,7 @@ struct TrainableLM(Movable):
         return logits_list^
 
 
-fn causal_lm_loss(mut tape: Tape, model: TrainableLM, token_id: Int, target_id: Int) -> Int:
+def causal_lm_loss(mut tape: Tape, model: TrainableLM, token_id: Int, target_id: Int) -> Int:
     """Compute language modeling loss for a single token prediction.
 
     Forward passes the token through the model and computes

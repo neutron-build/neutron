@@ -24,8 +24,8 @@ Tests:
 13. Performance benchmark: FP32 vs Q8
 """
 
-from math import abs
-from time import perf_counter_ns
+from std.math import abs
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.model.config import (
@@ -65,12 +65,12 @@ from neutron_mojo.io.gguf import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -82,7 +82,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # Mini-TinyLlama GGUF Builder
 # ===----------------------------------------------------------------------=== #
 
-fn _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[String]):
+def _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[String]):
     """Write a string array metadata entry to GGUF."""
     _write_string_gguf(buf, key)
     _write_u32_le(buf, 9)   # GGUF_TYPE_ARRAY
@@ -92,7 +92,7 @@ fn _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[Stri
         _write_string_gguf(buf, values[i])
 
 
-fn _build_mini_tinyllama_gguf() raises -> List[UInt8]:
+def _build_mini_tinyllama_gguf() raises -> List[UInt8]:
     """Build complete GGUF with mini-TinyLlama architecture + tokenizer.
 
     Config: hidden=64, layers=2, heads=8, kv_heads=2, head_dim=8,
@@ -171,7 +171,7 @@ fn _build_mini_tinyllama_gguf() raises -> List[UInt8]:
     tokens.append(" ")        # 4
     # Byte tokens 5..260 → characters a-z, A-Z, digits, symbols
     var chars = String("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?;:'-\"()[]{}/@#$%^&*+=~`|\\<> ")
-    for i in range(len(chars)):
+    for i in range(chars.byte_length()):
         if len(tokens) >= vocab:
             break
         tokens.append(String(chars[byte=i]))
@@ -350,7 +350,7 @@ fn _build_mini_tinyllama_gguf() raises -> List[UInt8]:
     return buf^
 
 
-fn _load_tokenizer_from_gguf(mut buf: List[UInt8]) raises -> BPETokenizer:
+def _load_tokenizer_from_gguf(mut buf: List[UInt8]) raises -> BPETokenizer:
     """Load tokenizer from mini-TinyLlama GGUF buffer."""
     var buf_copy = buf.copy()
     var gguf = parse_gguf_from_buffer(buf_copy^)
@@ -367,7 +367,7 @@ fn _load_tokenizer_from_gguf(mut buf: List[UInt8]) raises -> BPETokenizer:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_tinyllama_config() raises:
+def test_tinyllama_config() raises:
     """Verify TinyLlama-1.1B config matches published architecture."""
     var cfg = tinyllama_1_1b_config()
 
@@ -390,7 +390,7 @@ fn test_tinyllama_config() raises:
     print("  tinyllama_config: PASS")
 
 
-fn test_mini_tinyllama_config() raises:
+def test_mini_tinyllama_config() raises:
     """Verify mini-TinyLlama config preserves architecture ratios."""
     var cfg = mini_tinyllama_config()
 
@@ -407,7 +407,7 @@ fn test_mini_tinyllama_config() raises:
     print("  mini_tinyllama_config: PASS")
 
 
-fn test_gguf_load_fp32() raises:
+def test_gguf_load_fp32() raises:
     """Build mini-TinyLlama GGUF and load as FP32 Model."""
     var buf = _build_mini_tinyllama_gguf()
     var model = load_gguf_model_from_buffer(buf^)
@@ -424,7 +424,7 @@ fn test_gguf_load_fp32() raises:
     print("  gguf_load_fp32: PASS")
 
 
-fn test_forward_pass_logits() raises:
+def test_forward_pass_logits() raises:
     """FP32 forward pass produces valid logits with correct shape."""
     var buf = _build_mini_tinyllama_gguf()
     var model = load_gguf_model_from_buffer(buf^)
@@ -463,7 +463,7 @@ fn test_forward_pass_logits() raises:
     print("  forward_pass_logits: PASS")
 
 
-fn test_fp32_pipeline() raises:
+def test_fp32_pipeline() raises:
     """FP32 pipeline generates text successfully."""
     var buf = _build_mini_tinyllama_gguf()
     var buf2 = buf.copy()
@@ -475,12 +475,12 @@ fn test_fp32_pipeline() raises:
     cfg.max_new_tokens = 10
 
     var result = pipeline_generate(model, tok, "hello", cfg)
-    assert_true(len(result) >= 0, "FP32 pipeline should produce output")
+    assert_true(result.byte_length() >= 0, "FP32 pipeline should produce output")
 
     print("  fp32_pipeline: PASS")
 
 
-fn test_q8_quantize_forward() raises:
+def test_q8_quantize_forward() raises:
     """Q8 quantized forward pass produces valid logits."""
     var buf = _build_mini_tinyllama_gguf()
     var model = load_gguf_model_from_buffer(buf^)
@@ -509,7 +509,7 @@ fn test_q8_quantize_forward() raises:
     print("  q8_quantize_forward: PASS")
 
 
-fn test_q8_pipeline() raises:
+def test_q8_pipeline() raises:
     """Q8 pipeline generates text successfully."""
     var buf = _build_mini_tinyllama_gguf()
     var buf2 = buf.copy()
@@ -522,12 +522,12 @@ fn test_q8_pipeline() raises:
     cfg.max_new_tokens = 10
 
     var result = q_pipeline_generate(qm, tok, "hello", cfg)
-    assert_true(len(result) >= 0, "Q8 pipeline should produce output")
+    assert_true(result.byte_length() >= 0, "Q8 pipeline should produce output")
 
     print("  q8_pipeline: PASS")
 
 
-fn test_direct_q8_loading() raises:
+def test_direct_q8_loading() raises:
     """Direct Q8 loading produces valid model and forward pass."""
     var buf = _build_mini_tinyllama_gguf()
 
@@ -552,7 +552,7 @@ fn test_direct_q8_loading() raises:
     print("  direct_q8_loading: PASS")
 
 
-fn test_fp32_vs_q8_logits() raises:
+def test_fp32_vs_q8_logits() raises:
     """FP32 and Q8 forward passes produce similar logits."""
     var buf = _build_mini_tinyllama_gguf()
     var buf2 = buf.copy()
@@ -611,7 +611,7 @@ fn test_fp32_vs_q8_logits() raises:
     print("  fp32_vs_q8_logits: PASS (max_diff=" + String(max_diff) + ")")
 
 
-fn test_chat_templates() raises:
+def test_chat_templates() raises:
     """Chat template formatting produces expected structures."""
     # Llama template
     var llama_no_sys = format_llama("Hello world", "")
@@ -634,7 +634,7 @@ fn test_chat_templates() raises:
     print("  chat_templates: PASS")
 
 
-fn test_q8_cache_pipeline() raises:
+def test_q8_cache_pipeline() raises:
     """Q8 KV cache pipeline generates successfully."""
     var buf = _build_mini_tinyllama_gguf()
     var buf2 = buf.copy()
@@ -647,12 +647,12 @@ fn test_q8_cache_pipeline() raises:
     cfg.use_q8_cache = True
 
     var result = pipeline_generate(model, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "Q8 cache pipeline should produce output")
+    assert_true(result.byte_length() >= 0, "Q8 cache pipeline should produce output")
 
     print("  q8_cache_pipeline: PASS")
 
 
-fn test_memory_estimation() raises:
+def test_memory_estimation() raises:
     """Memory estimation for TinyLlama config is reasonable."""
     var cfg = tinyllama_1_1b_config()
     var params = cfg.total_params_estimate()
@@ -678,7 +678,7 @@ fn test_memory_estimation() raises:
     print("  memory_estimation: PASS (TinyLlama FP32=" + String(Int(fp32_gb * 10.0)) + "/10 GB, Q8=" + String(Int(q8_gb * 10.0)) + "/10 GB)")
 
 
-fn test_benchmark_fp32_vs_q8() raises:
+def test_benchmark_fp32_vs_q8() raises:
     """Benchmark FP32 vs Q8 generation at mini-TinyLlama scale."""
     var buf = _build_mini_tinyllama_gguf()
     var buf2 = buf.copy()
@@ -716,7 +716,7 @@ fn test_benchmark_fp32_vs_q8() raises:
     print("    PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_validation:")
 
     test_tinyllama_config()

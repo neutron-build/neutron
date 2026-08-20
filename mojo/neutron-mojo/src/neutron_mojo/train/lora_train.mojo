@@ -12,8 +12,8 @@ Key idea: Instead of updating W directly, learn delta W = B @ A
 where A is (rank, in_features) and B is (out_features, rank).
 """
 
-from math import sqrt
-from random import random_float64
+from std.math import sqrt
+from std.random import random_float64
 
 from neutron_mojo.autograd.tape import Tape, TapeEntry
 from neutron_mojo.autograd.ops import tracked_add, tracked_matmul
@@ -35,7 +35,7 @@ struct TrainableLoRA(ImplicitlyCopyable, Copyable, Movable):
     var rank: Int
     var registered: Bool
 
-    fn __init__(out self, in_features: Int, out_features: Int, rank: Int):
+    def __init__(out self, in_features: Int, out_features: Int, rank: Int):
         self.a_idx = -1
         self.b_idx = -1
         self.in_features = in_features
@@ -43,23 +43,23 @@ struct TrainableLoRA(ImplicitlyCopyable, Copyable, Movable):
         self.rank = rank
         self.registered = False
 
-    fn __copyinit__(out self, other: Self):
-        self.a_idx = other.a_idx
-        self.b_idx = other.b_idx
-        self.in_features = other.in_features
-        self.out_features = other.out_features
-        self.rank = other.rank
-        self.registered = other.registered
+    def __init__(out self, *, copy: Self):
+        self.a_idx = copy.a_idx
+        self.b_idx = copy.b_idx
+        self.in_features = copy.in_features
+        self.out_features = copy.out_features
+        self.rank = copy.rank
+        self.registered = copy.registered
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.a_idx = other.a_idx
-        self.b_idx = other.b_idx
-        self.in_features = other.in_features
-        self.out_features = other.out_features
-        self.rank = other.rank
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.a_idx = move.a_idx^
+        self.b_idx = move.b_idx^
+        self.in_features = move.in_features^
+        self.out_features = move.out_features^
+        self.rank = move.rank^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register A (random init) and B (zero init) on tape."""
         # A: (rank, in_features)
         var a_dims = List[Int]()
@@ -83,7 +83,7 @@ struct TrainableLoRA(ImplicitlyCopyable, Copyable, Movable):
 
         self.registered = True
 
-    fn forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
         """LoRA forward: x @ A^T @ B^T (additive delta).
 
         x: (in_features,) -> intermediate: (rank,) -> delta: (out_features,).
@@ -97,7 +97,7 @@ struct TrainableLoRA(ImplicitlyCopyable, Copyable, Movable):
             1, self.rank, self.out_features)
         return delta_idx
 
-    fn param_indices(self) -> List[Int]:
+    def param_indices(self) -> List[Int]:
         """Return LoRA parameter indices."""
         var params = List[Int]()
         if self.a_idx >= 0:
@@ -119,7 +119,7 @@ struct LoRATrainableLM(Movable):
     var rank: Int
     var registered: Bool
 
-    fn __init__(out self, vocab_size: Int, hidden_dim: Int,
+    def __init__(out self, vocab_size: Int, hidden_dim: Int,
                 num_layers: Int, rank: Int, ffn_dim: Int = 0):
         self.base = TrainableLM(vocab_size, hidden_dim, num_layers, ffn_dim)
         self.lora_q = List[TrainableLoRA]()
@@ -131,14 +131,14 @@ struct LoRATrainableLM(Movable):
             self.lora_q.append(TrainableLoRA(hidden_dim, hidden_dim, rank))
             self.lora_v.append(TrainableLoRA(hidden_dim, hidden_dim, rank))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.base = other.base^
-        self.lora_q = other.lora_q^
-        self.lora_v = other.lora_v^
-        self.rank = other.rank
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.base = move.base^
+        self.lora_q = move.lora_q^
+        self.lora_v = move.lora_v^
+        self.rank = move.rank^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register base model and LoRA adapters."""
         self.base.register(tape)
         for i in range(len(self.lora_q)):
@@ -146,13 +146,13 @@ struct LoRATrainableLM(Movable):
             self.lora_v[i].register(tape)
         self.registered = True
 
-    fn freeze_base(self, mut tape: Tape):
+    def freeze_base(self, mut tape: Tape):
         """Freeze base model parameters (set requires_grad=False)."""
         var base_params = self.base.all_param_indices()
         for i in range(len(base_params)):
             tape.var_requires_grad[base_params[i]] = False
 
-    fn forward(self, mut tape: Tape, token_id: Int) -> Int:
+    def forward(self, mut tape: Tape, token_id: Int) -> Int:
         """Forward with LoRA: base forward + LoRA deltas on Q/V."""
         var x_idx = self.base.embedding.forward(tape, token_id)
 
@@ -163,7 +163,7 @@ struct LoRATrainableLM(Movable):
         var logits = self.base.lm_head.forward(tape, normed)
         return logits
 
-    fn _forward_block_lora(self, mut tape: Tape, layer: Int, x_idx: Int) -> Int:
+    def _forward_block_lora(self, mut tape: Tape, layer: Int, x_idx: Int) -> Int:
         """Forward one block with LoRA on Q and V projections."""
         var block = self.base.blocks[layer]
         var normed = block.attn_norm.forward(tape, x_idx)
@@ -188,7 +188,7 @@ struct LoRATrainableLM(Movable):
         # FFN (no LoRA)
         return block._ffn_block(tape, post_attn)
 
-    fn lora_param_indices(self) -> List[Int]:
+    def lora_param_indices(self) -> List[Int]:
         """Return only LoRA parameter indices (for optimizer)."""
         var params = List[Int]()
         for i in range(len(self.lora_q)):
@@ -200,7 +200,7 @@ struct LoRATrainableLM(Movable):
                 params.append(vp[j])
         return params^
 
-    fn total_lora_params(self, tape: Tape) -> Int:
+    def total_lora_params(self, tape: Tape) -> Int:
         """Count total LoRA trainable parameters."""
         var params = self.lora_param_indices()
         var total = 0

@@ -9,7 +9,7 @@ reducing memory usage by ~4x compared to FP32. Dequantizes on-the-fly
 during attention computation.
 """
 
-from math import abs as math_abs
+from std.math import abs as math_abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
@@ -23,16 +23,16 @@ struct QuantResult(Movable):
     var scale: Float32
     var data: Tensor[DType.float32]
 
-    fn __init__(out self, scale: Float32, var data: Tensor[DType.float32]):
+    def __init__(out self, scale: Float32, var data: Tensor[DType.float32]):
         self.scale = scale
         self.data = data^
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.scale = other.scale
-        self.data = other.data^
+    def __init__(out self, *, deinit move: Self):
+        self.scale = move.scale^
+        self.data = move.data^
 
 
-fn quantize_vector_q8(
+def quantize_vector_q8(
     src: Tensor[DType.float32],
     offset: Int,
     length: Int,
@@ -80,7 +80,7 @@ fn quantize_vector_q8(
     return QuantResult(scale, quantized^)
 
 
-fn dequantize_value(quantized_val: Float32, scale: Float32) -> Float32:
+def dequantize_value(quantized_val: Float32, scale: Float32) -> Float32:
     """Dequantize a single INT8 value back to FP32."""
     return quantized_val * scale
 
@@ -110,7 +110,7 @@ struct Q8KVCache(Movable):
     var head_dim: Int
     var length: Int
 
-    fn __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int):
+    def __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int):
         self.max_seq_len = max_seq_len
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -123,17 +123,17 @@ struct Q8KVCache(Movable):
         self.key_scales = Tensor[DType.float32](Shape(scale_size))
         self.value_scales = Tensor[DType.float32](Shape(scale_size))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.key_data = other.key_data^
-        self.value_data = other.value_data^
-        self.key_scales = other.key_scales^
-        self.value_scales = other.value_scales^
-        self.max_seq_len = other.max_seq_len
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
-        self.length = other.length
+    def __init__(out self, *, deinit move: Self):
+        self.key_data = move.key_data^
+        self.value_data = move.value_data^
+        self.key_scales = move.key_scales^
+        self.value_scales = move.value_scales^
+        self.max_seq_len = move.max_seq_len^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
+        self.length = move.length^
 
-    fn append_kv(
+    def append_kv(
         mut self,
         key: Tensor[DType.float32],
         value: Tensor[DType.float32],
@@ -172,19 +172,19 @@ struct Q8KVCache(Movable):
 
         self.length += num_new_tokens
 
-    fn get_key_at(self, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_key_at(self, pos: Int, head: Int, dim: Int) -> Float32:
         """Get dequantized key value."""
         var data_offset = pos * self.num_kv_heads * self.head_dim + head * self.head_dim + dim
         var scale_idx = pos * self.num_kv_heads + head
         return self.key_data.get(data_offset) * self.key_scales.get(scale_idx)
 
-    fn get_value_at(self, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_value_at(self, pos: Int, head: Int, dim: Int) -> Float32:
         """Get dequantized value."""
         var data_offset = pos * self.num_kv_heads * self.head_dim + head * self.head_dim + dim
         var scale_idx = pos * self.num_kv_heads + head
         return self.value_data.get(data_offset) * self.value_scales.get(scale_idx)
 
-    fn get_key_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_key_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
         """Get dequantized key vector for a position and head."""
         var result = Tensor[DType.float32](Shape(self.head_dim))
         var scale_idx = pos * self.num_kv_heads + head
@@ -194,7 +194,7 @@ struct Q8KVCache(Movable):
             result.set(d, self.key_data.get(base + d) * scale)
         return result^
 
-    fn get_value_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_value_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
         """Get dequantized value vector for a position and head."""
         var result = Tensor[DType.float32](Shape(self.head_dim))
         var scale_idx = pos * self.num_kv_heads + head
@@ -204,7 +204,7 @@ struct Q8KVCache(Movable):
             result.set(d, self.value_data.get(base + d) * scale)
         return result^
 
-    fn memory_bytes(self) -> Int:
+    def memory_bytes(self) -> Int:
         """Approximate memory used by filled portion.
 
         INT8 data (simulated as FP32 here, but represents 1 byte/element) +
@@ -216,11 +216,11 @@ struct Q8KVCache(Movable):
         # scales: 2 * length * num_kv_heads * 4 bytes (FP32)
         return filled * self.head_dim * 2 + filled * 4 * 2
 
-    fn fp32_equivalent_bytes(self) -> Int:
+    def fp32_equivalent_bytes(self) -> Int:
         """What the FP32 cache would use for the same data."""
         return self.length * self.num_kv_heads * self.head_dim * 4 * 2
 
-    fn reset(mut self):
+    def reset(mut self):
         """Clear the cache."""
         self.length = 0
 
@@ -229,7 +229,7 @@ struct Q8KVCache(Movable):
 # Quantized Attention (using Q8KVCache)
 # ===----------------------------------------------------------------------=== #
 
-fn q8_attention_single_head(
+def q8_attention_single_head(
     query: Tensor[DType.float32],
     cache: Q8KVCache,
     q_head: Int,
@@ -282,7 +282,7 @@ fn q8_attention_single_head(
         if v > max_score:
             max_score = v
 
-    from math import exp
+    from std.math import exp
     var sum_exp: Float32 = 0.0
     for i in range(seq_len):
         var e = Float32(exp(Float64(scores.get(i) - max_score)))
@@ -335,7 +335,7 @@ struct MultiLayerQ8KVCache(Movable):
     var num_kv_heads: Int
     var head_dim: Int
 
-    fn __init__(
+    def __init__(
         out self,
         num_layers: Int,
         max_seq_len: Int,
@@ -361,30 +361,30 @@ struct MultiLayerQ8KVCache(Movable):
         for _ in range(num_layers):
             self.lengths.append(0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.key_data = other.key_data^
-        self.value_data = other.value_data^
-        self.key_scales = other.key_scales^
-        self.value_scales = other.value_scales^
-        self.lengths = other.lengths^
-        self.num_layers = other.num_layers
-        self.max_seq_len = other.max_seq_len
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
+    def __init__(out self, *, deinit move: Self):
+        self.key_data = move.key_data^
+        self.value_data = move.value_data^
+        self.key_scales = move.key_scales^
+        self.value_scales = move.value_scales^
+        self.lengths = move.lengths^
+        self.num_layers = move.num_layers^
+        self.max_seq_len = move.max_seq_len^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
 
-    fn _data_offset(self, layer: Int) -> Int:
+    def _data_offset(self, layer: Int) -> Int:
         """Base offset for a layer's KV data."""
         return layer * self.max_seq_len * self.num_kv_heads * self.head_dim
 
-    fn _scale_offset(self, layer: Int) -> Int:
+    def _scale_offset(self, layer: Int) -> Int:
         """Base offset for a layer's scale data."""
         return layer * self.max_seq_len * self.num_kv_heads
 
-    fn _stride_per_pos(self) -> Int:
+    def _stride_per_pos(self) -> Int:
         """Elements per position (num_kv_heads * head_dim)."""
         return self.num_kv_heads * self.head_dim
 
-    fn append_kv(
+    def append_kv(
         mut self,
         layer: Int,
         key: Tensor[DType.float32],
@@ -428,7 +428,7 @@ struct MultiLayerQ8KVCache(Movable):
 
         self.lengths[layer] = cur_len + num_new_tokens
 
-    fn get_layer_cache(self, layer: Int) -> Q8KVCache:
+    def get_layer_cache(self, layer: Int) -> Q8KVCache:
         """Extract a single layer's cache as a Q8KVCache (copy).
 
         Args:
@@ -459,13 +459,13 @@ struct MultiLayerQ8KVCache(Movable):
         cache.length = cur_len
         return cache^
 
-    fn current_length(self) -> Int:
+    def current_length(self) -> Int:
         """Current sequence length (assumes all layers in sync)."""
         if self.num_layers > 0:
             return self.lengths[0]
         return 0
 
-    fn memory_bytes(self) -> Int:
+    def memory_bytes(self) -> Int:
         """Approximate memory used (INT8 data + FP32 scales)."""
         var total = 0
         for i in range(self.num_layers):
@@ -473,20 +473,20 @@ struct MultiLayerQ8KVCache(Movable):
             total += filled * self.head_dim * 2 + filled * 4 * 2
         return total
 
-    fn fp32_equivalent_bytes(self) -> Int:
+    def fp32_equivalent_bytes(self) -> Int:
         """What FP32 cache would use for the same data."""
         var total = 0
         for i in range(self.num_layers):
             total += self.lengths[i] * self.num_kv_heads * self.head_dim * 4 * 2
         return total
 
-    fn reset_all(mut self):
+    def reset_all(mut self):
         """Reset all layer caches."""
         for i in range(self.num_layers):
             self.lengths[i] = 0
 
 
-fn q8_gqa_attention(
+def q8_gqa_attention(
     query: Tensor[DType.float32],
     cache: Q8KVCache,
     num_q_heads: Int,

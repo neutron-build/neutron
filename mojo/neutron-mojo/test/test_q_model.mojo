@@ -4,7 +4,7 @@
 
 """Tests for Q8-quantized model: simd_q8_matvec, QuantizedModel, quantize_from_model."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.simd_math import simd_q8_matvec, simd_matvec
@@ -17,12 +17,12 @@ from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
 from neutron_mojo.nn.q_model import QuantizedModel, quantize_from_model, q_generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
@@ -33,7 +33,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # simd_q8_matvec Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_simd_q8_matvec_basic() raises:
+def test_simd_q8_matvec_basic() raises:
     """Verify simd_q8_matvec matches manual Q8 computation."""
     # 2x4 weight, block_size=4 (1 block per row)
     var q_data = Tensor[DType.float32](Shape(8))
@@ -72,7 +72,7 @@ fn test_simd_q8_matvec_basic() raises:
     print("  simd_q8_matvec_basic: PASS")
 
 
-fn test_simd_q8_matvec_multi_block() raises:
+def test_simd_q8_matvec_multi_block() raises:
     """Test simd_q8_matvec with multiple blocks per row."""
     # 1x8 weight, block_size=4 (2 blocks)
     var q_data = Tensor[DType.float32](Shape(8))
@@ -107,7 +107,7 @@ fn test_simd_q8_matvec_multi_block() raises:
     print("  simd_q8_matvec_multi_block: PASS")
 
 
-fn test_simd_q8_matches_q8_linear() raises:
+def test_simd_q8_matches_q8_linear() raises:
     """Verify simd_q8_matvec matches q8_linear for realistic sizes."""
     var out_features = 8
     var in_features = 16
@@ -144,7 +144,7 @@ fn test_simd_q8_matches_q8_linear() raises:
 # QuantizedModel Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_quantized_model_creation() raises:
+def test_quantized_model_creation() raises:
     """Test QuantizedModel struct creation."""
     var p = tiny_test_params()
     var qm = QuantizedModel(p, block_size=2)
@@ -156,7 +156,7 @@ fn test_quantized_model_creation() raises:
     print("  quantized_model_creation: PASS")
 
 
-fn test_quantize_from_model() raises:
+def test_quantize_from_model() raises:
     """Test converting FP32 Model to QuantizedModel."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -202,7 +202,7 @@ fn test_quantize_from_model() raises:
     print("  quantize_from_model: PASS")
 
 
-fn test_q8_forward_produces_output() raises:
+def test_q8_forward_produces_output() raises:
     """Test that QuantizedModel forward pass produces valid logits."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -229,7 +229,7 @@ fn test_q8_forward_produces_output() raises:
     print("  q8_forward_produces_output: PASS")
 
 
-fn test_q8_vs_fp32_similarity() raises:
+def test_q8_vs_fp32_similarity() raises:
     """Test that Q8 model output is reasonably close to FP32."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -274,7 +274,7 @@ fn test_q8_vs_fp32_similarity() raises:
     print("  q8_vs_fp32_similarity: PASS")
 
 
-fn test_q8_offsets_consistency() raises:
+def test_q8_offsets_consistency() raises:
     """Test that data and scale offsets are computed consistently."""
     var p = tiny_test_params()
     var qm = QuantizedModel(p, block_size=2)
@@ -299,7 +299,7 @@ fn test_q8_offsets_consistency() raises:
     print("  q8_offsets_consistency: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_q_model:")
 
     # simd_q8_matvec

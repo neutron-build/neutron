@@ -7,12 +7,12 @@
 from neutron_mojo.fusion.eclass import UnionFind, ClassId, EClass
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_make_set() raises:
+def test_make_set() raises:
     """Create singleton sets and verify they're distinct."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -27,7 +27,7 @@ fn test_make_set() raises:
     print("  make_set: PASS")
 
 
-fn test_find_singleton() raises:
+def test_find_singleton() raises:
     """Find on a singleton returns itself."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -42,7 +42,7 @@ fn test_find_singleton() raises:
     print("  find_singleton: PASS")
 
 
-fn test_merge_basic() raises:
+def test_merge_basic() raises:
     """Merge two sets and verify they're in the same class."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -65,7 +65,7 @@ fn test_merge_basic() raises:
     print("  merge_basic: PASS")
 
 
-fn test_merge_transitive() raises:
+def test_merge_transitive() raises:
     """Merge forms transitive equivalence: if a~b and b~c, then a~c."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -86,7 +86,7 @@ fn test_merge_transitive() raises:
     print("  merge_transitive: PASS")
 
 
-fn test_merge_idempotent() raises:
+def test_merge_idempotent() raises:
     """Merging already-merged sets is a no-op."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -101,7 +101,7 @@ fn test_merge_idempotent() raises:
     print("  merge_idempotent: PASS")
 
 
-fn test_path_compression() raises:
+def test_path_compression() raises:
     """Verify that path compression flattens the tree."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -126,7 +126,7 @@ fn test_path_compression() raises:
     print("  path_compression: PASS")
 
 
-fn test_eclass_basic() raises:
+def test_eclass_basic() raises:
     """Test EClass node management."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -147,7 +147,7 @@ fn test_eclass_basic() raises:
     print("  eclass_basic: PASS")
 
 
-fn test_eclass_copy() raises:
+def test_eclass_copy() raises:
     """Test EClass copy constructor."""
     var uf = UnionFind()
     var c0 = uf.make_set()
@@ -168,7 +168,7 @@ fn test_eclass_copy() raises:
     print("  eclass_copy: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_union_find:")
 
     test_make_set()

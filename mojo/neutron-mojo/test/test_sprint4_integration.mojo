@@ -6,7 +6,7 @@
 tokenizer → quantized linear → multi-layer model → sampler.
 """
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import rmsnorm
@@ -37,19 +37,19 @@ from neutron_mojo.nn.kv_cache import MultiLayerKVCache
 from neutron_mojo.nn.rope import RoPETable
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_tokenizer_to_model_pipeline() raises:
+def test_tokenizer_to_model_pipeline() raises:
     """Test: tokenize text → feed token IDs to model → generate."""
     var tok = build_test_tokenizer()
 
@@ -80,7 +80,7 @@ fn test_tokenizer_to_model_pipeline() raises:
     print("  tokenizer_to_model_pipeline: PASS")
 
 
-fn test_quantized_projection_in_model() raises:
+def test_quantized_projection_in_model() raises:
     """Test: quantize a weight matrix → use Q8 linear as substitute for FP32."""
     # Create a small weight matrix [4, 8]
     var w = Tensor[DType.float32](Shape(4, 8))
@@ -105,7 +105,7 @@ fn test_quantized_projection_in_model() raises:
     print("  quantized_projection_in_model: PASS")
 
 
-fn test_sampler_with_model_logits() raises:
+def test_sampler_with_model_logits() raises:
     """Test: run model forward → feed logits to sampler."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -143,7 +143,7 @@ fn test_sampler_with_model_logits() raises:
     print("  sampler_with_model_logits: PASS")
 
 
-fn test_full_generation_with_sampler() raises:
+def test_full_generation_with_sampler() raises:
     """Test: model generate loop using sampler for token selection."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -178,7 +178,7 @@ fn test_full_generation_with_sampler() raises:
     print("  full_generation_with_sampler: PASS")
 
 
-fn test_sampler_reproducibility_in_generation() raises:
+def test_sampler_reproducibility_in_generation() raises:
     """Test: same seed produces same generation sequence."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -227,7 +227,7 @@ fn test_sampler_reproducibility_in_generation() raises:
     print("  sampler_reproducibility_in_generation: PASS")
 
 
-fn test_top_k_with_model() raises:
+def test_top_k_with_model() raises:
     """Test: top-k sampling with model-generated logits."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -264,7 +264,7 @@ fn test_top_k_with_model() raises:
     print("  top_k_with_model: PASS")
 
 
-fn test_tokenizer_roundtrip_with_ids() raises:
+def test_tokenizer_roundtrip_with_ids() raises:
     """Test: encode → decode roundtrip preserves text."""
     var tok = build_test_tokenizer()
 
@@ -279,7 +279,7 @@ fn test_tokenizer_roundtrip_with_ids() raises:
     print("  tokenizer_roundtrip_with_ids: PASS")
 
 
-fn test_multi_layer_model_deterministic() raises:
+def test_multi_layer_model_deterministic() raises:
     """Test: multi-layer model produces deterministic outputs."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -300,7 +300,7 @@ fn test_multi_layer_model_deterministic() raises:
     print("  multi_layer_model_deterministic: PASS")
 
 
-fn test_q8_preserves_model_quality() raises:
+def test_q8_preserves_model_quality() raises:
     """Test: Q8 quantized linear gives close results to FP32 for model-like weights."""
     # Simulate a model projection: hidden_dim=4 → ffn_dim=8
     var w = Tensor[DType.float32](Shape(8, 4))
@@ -324,7 +324,7 @@ fn test_q8_preserves_model_quality() raises:
     print("  q8_preserves_model_quality: PASS")
 
 
-fn test_end_to_end_pipeline() raises:
+def test_end_to_end_pipeline() raises:
     """Test: full pipeline tokenize → model → sampler → detokenize."""
     var tok = build_test_tokenizer()
 
@@ -366,7 +366,7 @@ fn test_end_to_end_pipeline() raises:
     print("  end_to_end_pipeline: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sprint4_integration:")
 
     test_tokenizer_to_model_pipeline()

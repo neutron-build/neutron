@@ -4,7 +4,7 @@
 
 """Tests for mmap-backed BinaryReader and mmap model loading."""
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.io.binary_reader import BinaryReader, mmap_reader
 from neutron_mojo.io.gguf import (
     _write_u32_le,
@@ -19,12 +19,12 @@ from neutron_mojo.model.weight_reader import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     var diff = a - b
     if diff < 0:
         diff = -diff
@@ -39,7 +39,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _write_test_file(path: String) raises:
+def _write_test_file(path: String) raises:
     """Write a small binary test file with known values."""
     var buf = List[UInt8]()
     # Write 4 bytes: 0x01 0x02 0x03 0x04
@@ -63,7 +63,7 @@ fn _write_test_file(path: String) raises:
     f.write_bytes(bytes_span)
 
 
-fn _build_tiny_gguf_file(path: String) raises:
+def _build_tiny_gguf_file(path: String) raises:
     """Build a tiny GGUF model file on disk for mmap testing."""
     var buf = _build_tiny_gguf_buffer()
     var f = open(path, "w")
@@ -71,7 +71,7 @@ fn _build_tiny_gguf_file(path: String) raises:
     f.write_bytes(bytes_span)
 
 
-fn _build_tiny_gguf_buffer() -> List[UInt8]:
+def _build_tiny_gguf_buffer() -> List[UInt8]:
     """Build a tiny GGUF buffer with known structure."""
     var buf = List[UInt8]()
     # Magic
@@ -136,7 +136,7 @@ fn _build_tiny_gguf_buffer() -> List[UInt8]:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_mmap_reader_basic_reads() raises:
+def test_mmap_reader_basic_reads() raises:
     """Mmap reader reads same bytes as slurp reader."""
     _write_test_file("/tmp/test_mmap_basic.bin")
 
@@ -164,7 +164,7 @@ fn test_mmap_reader_basic_reads() raises:
     print("  mmap_reader_basic_reads: PASS")
 
 
-fn test_mmap_reader_seek_tell() raises:
+def test_mmap_reader_seek_tell() raises:
     """Seek and tell work correctly with mmap."""
     _write_test_file("/tmp/test_mmap_seek.bin")
 
@@ -187,7 +187,7 @@ fn test_mmap_reader_seek_tell() raises:
     print("  mmap_reader_seek_tell: PASS")
 
 
-fn test_mmap_reader_skip_remaining() raises:
+def test_mmap_reader_skip_remaining() raises:
     """Skip and remaining work with mmap."""
     _write_test_file("/tmp/test_mmap_skip.bin")
 
@@ -202,7 +202,7 @@ fn test_mmap_reader_skip_remaining() raises:
     print("  mmap_reader_skip_remaining: PASS")
 
 
-fn test_mmap_reader_f32_array() raises:
+def test_mmap_reader_f32_array() raises:
     """F32 array reading via mmap matches slurp."""
     _write_test_file("/tmp/test_mmap_f32arr.bin")
 
@@ -225,7 +225,7 @@ fn test_mmap_reader_f32_array() raises:
     print("  mmap_reader_f32_array: PASS")
 
 
-fn test_mmap_gguf_model_load() raises:
+def test_mmap_gguf_model_load() raises:
     """Load a GGUF model via mmap and verify weights match buffer loading."""
     _build_tiny_gguf_file("/tmp/test_mmap_gguf.gguf")
 
@@ -250,7 +250,7 @@ fn test_mmap_gguf_model_load() raises:
     print("  mmap_gguf_model_load: PASS")
 
 
-fn test_mmap_vs_slurp_benchmark() raises:
+def test_mmap_vs_slurp_benchmark() raises:
     """Benchmark mmap vs slurp loading (informational)."""
     _build_tiny_gguf_file("/tmp/test_mmap_bench.gguf")
 
@@ -279,7 +279,7 @@ fn test_mmap_vs_slurp_benchmark() raises:
     )
 
 
-fn test_mmap_cleanup() raises:
+def test_mmap_cleanup() raises:
     """Mmap reader cleans up without errors."""
     _write_test_file("/tmp/test_mmap_cleanup.bin")
 
@@ -296,7 +296,7 @@ fn test_mmap_cleanup() raises:
     print("  mmap_cleanup: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_mmap_reader:")
 
     test_mmap_reader_basic_reads()

@@ -6,8 +6,8 @@
 Includes timing benchmarks comparing SIMD vs scalar at realistic sizes.
 """
 
-from math import abs
-from time import perf_counter_ns
+from std.math import abs
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.simd_math import (
     simd_dot,
     simd_matvec,
@@ -22,12 +22,12 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
@@ -38,7 +38,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Scalar references for comparison
 # ===----------------------------------------------------------------------=== #
 
-fn scalar_matvec(
+def scalar_matvec(
     mut out: Tensor[DType.float32], o_off: Int,
     w: Tensor[DType.float32], w_off: Int,
     x: Tensor[DType.float32], x_off: Int,
@@ -51,7 +51,7 @@ fn scalar_matvec(
         out.set(o_off + i, dot)
 
 
-fn scalar_dot(a: Tensor[DType.float32], b: Tensor[DType.float32], n: Int) -> Float32:
+def scalar_dot(a: Tensor[DType.float32], b: Tensor[DType.float32], n: Int) -> Float32:
     var result: Float32 = 0.0
     for i in range(n):
         result += a.get(i) * b.get(i)
@@ -62,7 +62,7 @@ fn scalar_dot(a: Tensor[DType.float32], b: Tensor[DType.float32], n: Int) -> Flo
 # Correctness Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_simd_matvec_matches_scalar_at_scale() raises:
+def test_simd_matvec_matches_scalar_at_scale() raises:
     """Verify SIMD matvec matches scalar at LLaMA-sized dimensions."""
     var rows = 256
     var cols = 1024
@@ -89,7 +89,7 @@ fn test_simd_matvec_matches_scalar_at_scale() raises:
     print("  simd_matvec_matches_scalar_at_scale: PASS")
 
 
-fn test_par_matvec_matches_sequential() raises:
+def test_par_matvec_matches_sequential() raises:
     """Verify parallel matvec matches sequential at scale."""
     var rows = 512
     var cols = 256
@@ -116,7 +116,7 @@ fn test_par_matvec_matches_sequential() raises:
     print("  par_matvec_matches_sequential: PASS")
 
 
-fn test_rmsnorm_simd_matches_reference() raises:
+def test_rmsnorm_simd_matches_reference() raises:
     """Verify SIMD RMSNorm matches manual computation at scale."""
     var n = 512
     var x = Tensor[DType.float32](Shape(n))
@@ -132,7 +132,7 @@ fn test_rmsnorm_simd_matches_reference() raises:
     var ss: Float32 = 0.0
     for i in range(n):
         ss += x.get(i) * x.get(i)
-    from math import sqrt
+    from std.math import sqrt
     var rms = Float32(sqrt(Float64(ss / Float32(n) + 1e-6)))
 
     # Check a few values
@@ -143,7 +143,7 @@ fn test_rmsnorm_simd_matches_reference() raises:
     print("  rmsnorm_simd_matches_reference: PASS")
 
 
-fn test_full_pipeline_simd() raises:
+def test_full_pipeline_simd() raises:
     """Test: matvec → rmsnorm → swiglu → matvec (mini transformer layer)."""
     var hidden = 64
     var ffn = 128
@@ -200,7 +200,7 @@ fn test_full_pipeline_simd() raises:
     print("  full_pipeline_simd: PASS")
 
 
-fn test_model_end_to_end_with_simd() raises:
+def test_model_end_to_end_with_simd() raises:
     """Test that Model (which now uses SIMD internally) still generates."""
     from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
 
@@ -232,7 +232,7 @@ fn test_model_end_to_end_with_simd() raises:
 # Benchmarks
 # ===----------------------------------------------------------------------=== #
 
-fn bench_matvec() raises:
+def bench_matvec() raises:
     """Benchmark: SIMD vs scalar matvec at realistic sizes."""
     var rows = 4096
     var cols = 4096
@@ -285,7 +285,7 @@ fn bench_matvec() raises:
         assert_near(simd_out.get(i), scalar_out.get(i), 0.1, "bench correctness")
 
 
-fn bench_dot() raises:
+def bench_dot() raises:
     """Benchmark: SIMD vs scalar dot product at transformer scale."""
     var n = 4096
     var iters = 100
@@ -322,7 +322,7 @@ fn bench_dot() raises:
     assert_near(v_result, s_result, 1.0, "dot bench correctness")
 
 
-fn main() raises:
+def main() raises:
     print("test_sprint7_integration:")
 
     # Correctness

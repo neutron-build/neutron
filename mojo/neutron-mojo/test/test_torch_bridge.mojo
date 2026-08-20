@@ -4,8 +4,8 @@
 
 """Tests for tape <-> PyTorch state_dict exchange. Skip if no torch."""
 
-from math import abs
-from testing import assert_true
+from std.math import abs
+from std.testing import assert_true
 
 from neutron_mojo.autograd.tape import Tape
 from neutron_mojo.autograd.backward import run_backward
@@ -13,7 +13,7 @@ from neutron_mojo.autograd.ops import tracked_add, tracked_sum
 from neutron_mojo.python.bridge import torch_available, numpy_available
 
 
-fn _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
     var dims = List[Int]()
     dims.append(len(vals))
     var idx = tape.add_variable(dims^, requires_grad=True)
@@ -22,7 +22,7 @@ fn _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
     return idx
 
 
-fn _make_2d_var(mut tape: Tape, rows: Int, cols: Int, vals: List[Float32]) -> Int:
+def _make_2d_var(mut tape: Tape, rows: Int, cols: Int, vals: List[Float32]) -> Int:
     var dims = List[Int]()
     dims.append(rows)
     dims.append(cols)
@@ -32,7 +32,7 @@ fn _make_2d_var(mut tape: Tape, rows: Int, cols: Int, vals: List[Float32]) -> In
     return idx
 
 
-fn test_tape_to_state_dict() raises:
+def test_tape_to_state_dict() raises:
     """Export tape variables as state_dict."""
     if not torch_available():
         print("SKIP: test_tape_to_state_dict (no torch)")
@@ -51,7 +51,7 @@ fn test_tape_to_state_dict() raises:
     names.append("weight")
     var sd = tape_to_state_dict(tape, indices, names)
 
-    from python import Python
+    from std.python import Python
     var builtins = Python.import_module("builtins")
     assert_true(Int(py=builtins.len(sd)) == 1, "state_dict has 1 entry")
     var w = sd["weight"]
@@ -59,14 +59,14 @@ fn test_tape_to_state_dict() raises:
     print("PASS: test_tape_to_state_dict")
 
 
-fn test_state_dict_to_tape() raises:
+def test_state_dict_to_tape() raises:
     """Import state_dict into tape."""
     if not torch_available():
         print("SKIP: test_state_dict_to_tape (no torch)")
         return
 
     from neutron_mojo.python.torch_bridge import tape_to_state_dict, state_dict_to_tape
-    from python import Python
+    from std.python import Python
     var torch = Python.import_module("torch")
     var np = Python.import_module("numpy")
 
@@ -95,7 +95,7 @@ fn test_state_dict_to_tape() raises:
     print("PASS: test_state_dict_to_tape")
 
 
-fn test_roundtrip_state_dict() raises:
+def test_roundtrip_state_dict() raises:
     """Roundtrip: tape -> state_dict -> tape preserves values."""
     if not torch_available():
         print("SKIP: test_roundtrip_state_dict (no torch)")
@@ -130,7 +130,7 @@ fn test_roundtrip_state_dict() raises:
     print("PASS: test_roundtrip_state_dict")
 
 
-fn test_tape_grads_export() raises:
+def test_tape_grads_export() raises:
     """Export gradients to state_dict."""
     if not torch_available():
         print("SKIP: test_tape_grads_export (no torch)")
@@ -156,7 +156,7 @@ fn test_tape_grads_export() raises:
     names.append("a")
     var gd = tape_grads_to_state_dict(tape, indices, names)
 
-    from python import Python
+    from std.python import Python
     var builtins = Python.import_module("builtins")
     var g = gd["a"]
     # grad of sum(a+b) w.r.t. a = [1, 1]
@@ -165,7 +165,7 @@ fn test_tape_grads_export() raises:
     print("PASS: test_tape_grads_export")
 
 
-fn test_2d_state_dict() raises:
+def test_2d_state_dict() raises:
     """2D variable preserves shape in state_dict."""
     if not torch_available():
         print("SKIP: test_2d_state_dict (no torch)")
@@ -193,7 +193,7 @@ fn test_2d_state_dict() raises:
     print("PASS: test_2d_state_dict")
 
 
-fn test_multiple_params() raises:
+def test_multiple_params() raises:
     """Export multiple params to state_dict."""
     if not torch_available():
         print("SKIP: test_multiple_params (no torch)")
@@ -217,20 +217,20 @@ fn test_multiple_params() raises:
     names.append("layer.bias")
     var sd = tape_to_state_dict(tape, indices, names)
 
-    from python import Python
+    from std.python import Python
     var builtins = Python.import_module("builtins")
     assert_true(Int(py=builtins.len(sd)) == 2, "state_dict has 2 entries")
     print("PASS: test_multiple_params")
 
 
-fn test_state_dict_import_2d() raises:
+def test_state_dict_import_2d() raises:
     """Import 2D tensor from state_dict."""
     if not torch_available():
         print("SKIP: test_state_dict_import_2d (no torch)")
         return
 
     from neutron_mojo.python.torch_bridge import state_dict_to_tape
-    from python import Python
+    from std.python import Python
     var torch = Python.import_module("torch")
     var np = Python.import_module("numpy")
     var builtins = Python.import_module("builtins")
@@ -267,14 +267,14 @@ fn test_state_dict_import_2d() raises:
     print("PASS: test_state_dict_import_2d")
 
 
-fn test_empty_params() raises:
+def test_empty_params() raises:
     """Export with no params produces empty dict."""
     if not torch_available():
         print("SKIP: test_empty_params (no torch)")
         return
 
     from neutron_mojo.python.torch_bridge import tape_to_state_dict
-    from python import Python
+    from std.python import Python
     var builtins = Python.import_module("builtins")
     var tape = Tape(1024)
     var indices = List[Int]()
@@ -284,7 +284,7 @@ fn test_empty_params() raises:
     print("PASS: test_empty_params")
 
 
-fn test_grad_zero_after_zero_grads() raises:
+def test_grad_zero_after_zero_grads() raises:
     """Exported grads are zero after zero_all_grads."""
     if not torch_available():
         print("SKIP: test_grad_zero_after_zero_grads (no torch)")
@@ -311,7 +311,7 @@ fn test_grad_zero_after_zero_grads() raises:
     print("PASS: test_grad_zero_after_zero_grads")
 
 
-fn test_large_roundtrip() raises:
+def test_large_roundtrip() raises:
     """Roundtrip with larger variable."""
     if not torch_available():
         print("SKIP: test_large_roundtrip (no torch)")
@@ -347,7 +347,7 @@ fn test_large_roundtrip() raises:
     print("PASS: test_large_roundtrip")
 
 
-fn main() raises:
+def main() raises:
     print("=== Sprint 64: PyTorch Training Bridge Tests ===")
     print("SKIP: PyTorch bridge tests require Python/libpython runtime.")
     print("All 10 PyTorch bridge tests skipped by default.")

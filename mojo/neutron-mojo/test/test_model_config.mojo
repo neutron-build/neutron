@@ -20,12 +20,12 @@ from neutron_mojo.model.config import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_activation_type() raises:
+def test_activation_type() raises:
     """Test activation type enum."""
     var silu = ACT_SILU()
     var gelu = ACT_GELU()
@@ -36,7 +36,7 @@ fn test_activation_type() raises:
     print("  activation_type: PASS")
 
 
-fn test_rope_config_defaults() raises:
+def test_rope_config_defaults() raises:
     """Test RoPE config defaults."""
     var rope = RoPEConfig()
 
@@ -48,7 +48,7 @@ fn test_rope_config_defaults() raises:
     print("  rope_config_defaults: PASS")
 
 
-fn test_model_config_defaults() raises:
+def test_model_config_defaults() raises:
     """Test ModelConfig default construction."""
     var cfg = ModelConfig()
 
@@ -62,7 +62,7 @@ fn test_model_config_defaults() raises:
     print("  model_config_defaults: PASS")
 
 
-fn test_llama3_8b_config() raises:
+def test_llama3_8b_config() raises:
     """Test Llama-3 8B config."""
     var cfg = llama3_8b_config()
 
@@ -79,7 +79,7 @@ fn test_llama3_8b_config() raises:
     print("  llama3_8b_config: PASS")
 
 
-fn test_llama3_70b_config() raises:
+def test_llama3_70b_config() raises:
     """Test Llama-3 70B config."""
     var cfg = llama3_70b_config()
 
@@ -92,7 +92,7 @@ fn test_llama3_70b_config() raises:
     print("  llama3_70b_config: PASS")
 
 
-fn test_mistral_7b_config() raises:
+def test_mistral_7b_config() raises:
     """Test Mistral 7B config."""
     var cfg = mistral_7b_config()
 
@@ -105,7 +105,7 @@ fn test_mistral_7b_config() raises:
     print("  mistral_7b_config: PASS")
 
 
-fn test_gqa_detection() raises:
+def test_gqa_detection() raises:
     """Test GQA detection."""
     var llama3 = llama3_8b_config()
     var default_cfg = ModelConfig()
@@ -118,7 +118,7 @@ fn test_gqa_detection() raises:
     print("  gqa_detection: PASS")
 
 
-fn test_param_estimate() raises:
+def test_param_estimate() raises:
     """Test parameter estimation."""
     var cfg = llama3_8b_config()
     var params = cfg.total_params_estimate()
@@ -130,7 +130,7 @@ fn test_param_estimate() raises:
     print("  param_estimate: PASS")
 
 
-fn test_layer_weight_names() raises:
+def test_layer_weight_names() raises:
     """Test weight name generation."""
     var name0 = layer_weight_name(0, "self_attn.q_proj.weight")
     var name5 = layer_weight_name(5, "mlp.gate_proj.weight")
@@ -145,7 +145,7 @@ fn test_layer_weight_names() raises:
     print("  layer_weight_names: PASS")
 
 
-fn test_model_config_copy() raises:
+def test_model_config_copy() raises:
     """Test ModelConfig copy semantics."""
     var original = llama3_8b_config()
     var copied = original.copy()
@@ -157,7 +157,7 @@ fn test_model_config_copy() raises:
     print("  model_config_copy: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_model_config:")
 
     test_activation_type()

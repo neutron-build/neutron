@@ -16,7 +16,7 @@ struct SGD(Movable):
     var velocity: List[Float64]
     var initialized: Bool
 
-    fn __init__(out self, lr: Float64 = 0.01, momentum: Float64 = 0.0,
+    def __init__(out self, lr: Float64 = 0.01, momentum: Float64 = 0.0,
                 weight_decay: Float64 = 0.0, dampening: Float64 = 0.0):
         self.lr = lr
         self.momentum = momentum
@@ -25,15 +25,15 @@ struct SGD(Movable):
         self.velocity = List[Float64]()
         self.initialized = False
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.lr = other.lr
-        self.momentum = other.momentum
-        self.weight_decay = other.weight_decay
-        self.dampening = other.dampening
-        self.velocity = other.velocity^
-        self.initialized = other.initialized
+    def __init__(out self, *, deinit move: Self):
+        self.lr = move.lr^
+        self.momentum = move.momentum^
+        self.weight_decay = move.weight_decay^
+        self.dampening = move.dampening^
+        self.velocity = move.velocity^
+        self.initialized = move.initialized^
 
-    fn step(mut self, mut tape: Tape, param_indices: List[Int]):
+    def step(mut self, mut tape: Tape, param_indices: List[Int]):
         """Perform one SGD update step."""
         # Initialize velocity on first call
         if not self.initialized:

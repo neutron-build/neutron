@@ -4,7 +4,7 @@
 
 """Tests for INT8-quantized KV cache."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.q_kv_cache import (
     Q8KVCache,
     QuantResult,
@@ -18,19 +18,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_quantize_vector() raises:
+def test_quantize_vector() raises:
     """Test vector quantization to INT8 range."""
     var src = Tensor[DType.float32](Shape(4))
     src.set(0, 1.0)
@@ -53,7 +53,7 @@ fn test_quantize_vector() raises:
     print("  quantize_vector: PASS")
 
 
-fn test_q8_cache_creation() raises:
+def test_q8_cache_creation() raises:
     """Test Q8KVCache creation."""
     var cache = Q8KVCache(max_seq_len=16, num_kv_heads=2, head_dim=4)
     assert_true(cache.length == 0, "empty cache")
@@ -64,7 +64,7 @@ fn test_q8_cache_creation() raises:
     print("  q8_cache_creation: PASS")
 
 
-fn test_q8_cache_append() raises:
+def test_q8_cache_append() raises:
     """Test appending to quantized cache."""
     var cache = Q8KVCache(max_seq_len=8, num_kv_heads=1, head_dim=4)
 
@@ -91,7 +91,7 @@ fn test_q8_cache_append() raises:
     print("  q8_cache_append: PASS")
 
 
-fn test_q8_cache_multi_position() raises:
+def test_q8_cache_multi_position() raises:
     """Test appending multiple positions."""
     var cache = Q8KVCache(max_seq_len=8, num_kv_heads=1, head_dim=2)
 
@@ -113,7 +113,7 @@ fn test_q8_cache_multi_position() raises:
     print("  q8_cache_multi_position: PASS")
 
 
-fn test_q8_cache_multi_head() raises:
+def test_q8_cache_multi_head() raises:
     """Test with multiple KV heads."""
     var cache = Q8KVCache(max_seq_len=8, num_kv_heads=2, head_dim=2)
 
@@ -139,7 +139,7 @@ fn test_q8_cache_multi_head() raises:
     print("  q8_cache_multi_head: PASS")
 
 
-fn test_q8_cache_head_vector() raises:
+def test_q8_cache_head_vector() raises:
     """Test getting dequantized head vectors."""
     var cache = Q8KVCache(max_seq_len=8, num_kv_heads=1, head_dim=4)
 
@@ -168,7 +168,7 @@ fn test_q8_cache_head_vector() raises:
     print("  q8_cache_head_vector: PASS")
 
 
-fn test_q8_memory_savings() raises:
+def test_q8_memory_savings() raises:
     """Test memory calculation shows savings."""
     var cache = Q8KVCache(max_seq_len=128, num_kv_heads=8, head_dim=64)
 
@@ -193,7 +193,7 @@ fn test_q8_memory_savings() raises:
     print("  q8_memory_savings: PASS")
 
 
-fn test_q8_attention_vs_fp32() raises:
+def test_q8_attention_vs_fp32() raises:
     """Test Q8 attention gives similar results to FP32 attention."""
     var head_dim = 4
     var seq_len = 3
@@ -244,7 +244,7 @@ fn test_q8_attention_vs_fp32() raises:
     print("  q8_attention_vs_fp32: PASS")
 
 
-fn test_q8_gqa_attention() raises:
+def test_q8_gqa_attention() raises:
     """Test GQA with quantized KV cache."""
     var head_dim = 2
     var num_q_heads = 4
@@ -283,7 +283,7 @@ fn test_q8_gqa_attention() raises:
     print("  q8_gqa_attention: PASS")
 
 
-fn test_q8_cache_reset() raises:
+def test_q8_cache_reset() raises:
     """Test cache reset."""
     var cache = Q8KVCache(max_seq_len=8, num_kv_heads=1, head_dim=2)
 
@@ -302,7 +302,7 @@ fn test_q8_cache_reset() raises:
     print("  q8_cache_reset: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_q_kv_cache:")
 
     test_quantize_vector()

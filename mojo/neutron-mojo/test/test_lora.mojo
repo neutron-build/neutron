@@ -4,7 +4,7 @@
 
 """Tests for LoRA configuration, forward, linear, merge, and unmerge."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.lora import (
     LoRAConfig,
     LoRAWeight,
@@ -17,19 +17,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_lora_config() raises:
+def test_lora_config() raises:
     """Test LoRAConfig creation and scaling."""
     var config = LoRAConfig(rank=8, alpha=16.0, in_features=64, out_features=32)
     assert_true(config.rank == 8, "rank")
@@ -49,7 +49,7 @@ fn test_lora_config() raises:
     print("  lora_config: PASS")
 
 
-fn test_lora_weight_creation() raises:
+def test_lora_weight_creation() raises:
     """Test LoRAWeight creation with correct sizes."""
     var config = LoRAConfig(rank=4, alpha=4.0, in_features=8, out_features=6)
     var lora = LoRAWeight(config)
@@ -71,7 +71,7 @@ fn test_lora_weight_creation() raises:
     print("  lora_weight_creation: PASS")
 
 
-fn test_lora_forward_basic() raises:
+def test_lora_forward_basic() raises:
     """Test LoRA forward with known weights."""
     var config = LoRAConfig(rank=1, alpha=1.0, in_features=2, out_features=2)
     var lora = LoRAWeight(config)
@@ -97,7 +97,7 @@ fn test_lora_forward_basic() raises:
     print("  lora_forward_basic: PASS")
 
 
-fn test_lora_forward_scaling() raises:
+def test_lora_forward_scaling() raises:
     """Test that alpha/rank scaling is applied correctly."""
     var config = LoRAConfig(rank=2, alpha=4.0, in_features=2, out_features=1)
     var lora = LoRAWeight(config)
@@ -124,7 +124,7 @@ fn test_lora_forward_scaling() raises:
     print("  lora_forward_scaling: PASS")
 
 
-fn test_lora_linear() raises:
+def test_lora_linear() raises:
     """Test lora_linear combines base + LoRA correctly."""
     var config = LoRAConfig(rank=1, alpha=1.0, in_features=2, out_features=2)
     var lora = LoRAWeight(config)
@@ -156,7 +156,7 @@ fn test_lora_linear() raises:
     print("  lora_linear: PASS")
 
 
-fn test_merge_lora() raises:
+def test_merge_lora() raises:
     """Test merge_lora adds LoRA into base weights."""
     var config = LoRAConfig(rank=1, alpha=2.0, in_features=2, out_features=2)
     var lora = LoRAWeight(config)
@@ -189,7 +189,7 @@ fn test_merge_lora() raises:
     print("  merge_lora: PASS")
 
 
-fn test_unmerge_lora() raises:
+def test_unmerge_lora() raises:
     """Test unmerge_lora reverses merge."""
     var config = LoRAConfig(rank=1, alpha=2.0, in_features=2, out_features=2)
     var lora = LoRAWeight(config)
@@ -218,7 +218,7 @@ fn test_unmerge_lora() raises:
     print("  unmerge_lora: PASS")
 
 
-fn test_merge_equals_separate() raises:
+def test_merge_equals_separate() raises:
     """Test that merged weights produce same output as separate LoRA."""
     var config = LoRAConfig(rank=2, alpha=4.0, in_features=3, out_features=2)
     var lora = LoRAWeight(config)
@@ -273,7 +273,7 @@ fn test_merge_equals_separate() raises:
     print("  merge_equals_separate: PASS")
 
 
-fn test_lora_higher_rank() raises:
+def test_lora_higher_rank() raises:
     """Test LoRA with higher rank (4)."""
     var config = LoRAConfig(rank=4, alpha=4.0, in_features=3, out_features=2)
     var lora = LoRAWeight(config)
@@ -302,7 +302,7 @@ fn test_lora_higher_rank() raises:
     print("  lora_higher_rank: PASS")
 
 
-fn test_lora_zero_input() raises:
+def test_lora_zero_input() raises:
     """Test LoRA with zero input returns zero."""
     var config = LoRAConfig(rank=2, alpha=8.0, in_features=4, out_features=3)
     var lora = LoRAWeight(config)
@@ -323,7 +323,7 @@ fn test_lora_zero_input() raises:
     print("  lora_zero_input: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_lora:")
 
     test_lora_config()

@@ -5,7 +5,7 @@
 """End-to-end tests: synthetic GGUF with GGUF tensor names + tokenizer data
 → parse → model + tokenizer → pipeline_generate → valid text."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.io.gguf import (
@@ -32,12 +32,12 @@ from neutron_mojo.nn.pipeline import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -45,7 +45,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
         )
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg
@@ -57,7 +57,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # GGUF Metadata Encoding Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[String]):
+def _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[String]):
     """Write a string array metadata entry.
 
     Format: key (GGUF string) + type ARRAY (9) + elem_type STRING (8)
@@ -75,7 +75,7 @@ fn _write_gguf_string_array(mut buf: List[UInt8], key: String, values: List[Stri
 # Full Synthetic GGUF Builder
 # ===----------------------------------------------------------------------=== #
 
-fn _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
+def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     """Build a complete GGUF with model tensors (GGUF names) + tokenizer data.
 
     Model: 1 layer, hidden=4, heads=2, kv_heads=1, head_dim=2, ffn=8, vocab=16
@@ -347,7 +347,7 @@ fn _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_full_gguf_parses() raises:
+def test_full_gguf_parses() raises:
     """Test that the full synthetic GGUF parses correctly."""
     var buf = _build_full_gguf_with_tokenizer()
     var gguf = parse_gguf_from_buffer(buf^)
@@ -365,7 +365,7 @@ fn test_full_gguf_parses() raises:
     print("  full_gguf_parses: PASS")
 
 
-fn test_full_gguf_extracts_config() raises:
+def test_full_gguf_extracts_config() raises:
     """Test config extraction from full GGUF."""
     var buf = _build_full_gguf_with_tokenizer()
     var gguf = parse_gguf_from_buffer(buf^)
@@ -384,7 +384,7 @@ fn test_full_gguf_extracts_config() raises:
     print("  full_gguf_extracts_config: PASS")
 
 
-fn test_full_gguf_loads_model() raises:
+def test_full_gguf_loads_model() raises:
     """Test model loading from full GGUF with GGUF tensor names."""
     var buf = _build_full_gguf_with_tokenizer()
     var model = load_gguf_model_from_buffer(buf^)
@@ -407,7 +407,7 @@ fn test_full_gguf_loads_model() raises:
     print("  full_gguf_loads_model: PASS")
 
 
-fn test_full_gguf_model_generates() raises:
+def test_full_gguf_model_generates() raises:
     """Test that loaded model can generate valid tokens."""
     var buf = _build_full_gguf_with_tokenizer()
     var model = load_gguf_model_from_buffer(buf^)
@@ -426,7 +426,7 @@ fn test_full_gguf_model_generates() raises:
     print("  full_gguf_model_generates: PASS")
 
 
-fn test_full_gguf_tokenizer_loads() raises:
+def test_full_gguf_tokenizer_loads() raises:
     """Test tokenizer loading from GGUF metadata."""
     var buf = _build_full_gguf_with_tokenizer()
     var gguf = parse_gguf_from_buffer(buf^)
@@ -444,7 +444,7 @@ fn test_full_gguf_tokenizer_loads() raises:
     print("  full_gguf_tokenizer_loads: PASS")
 
 
-fn test_full_gguf_tokenizer_roundtrip() raises:
+def test_full_gguf_tokenizer_roundtrip() raises:
     """Test encode→decode roundtrip with loaded tokenizer."""
     var buf = _build_full_gguf_with_tokenizer()
     var gguf = parse_gguf_from_buffer(buf^)
@@ -467,7 +467,7 @@ fn test_full_gguf_tokenizer_roundtrip() raises:
     print("  full_gguf_tokenizer_roundtrip: PASS")
 
 
-fn test_pipeline_end_to_end() raises:
+def test_pipeline_end_to_end() raises:
     """Test full pipeline: model + tokenizer + pipeline_generate."""
     var buf = _build_full_gguf_with_tokenizer()
     var buf2 = buf.copy()
@@ -487,12 +487,12 @@ fn test_pipeline_end_to_end() raises:
 
     var result = pipeline_generate(model, tok, "ab", cfg)
     # Just verify it produces output and doesn't crash
-    assert_true(len(result) >= 0, "pipeline produces output")
+    assert_true(result.byte_length() >= 0, "pipeline produces output")
 
     print("  pipeline_end_to_end: PASS")
 
 
-fn test_pipeline_chat_template() raises:
+def test_pipeline_chat_template() raises:
     """Test pipeline with chat template on full GGUF model."""
     var buf = _build_full_gguf_with_tokenizer()
     var buf2 = buf.copy()
@@ -512,12 +512,12 @@ fn test_pipeline_chat_template() raises:
     cfg.chat_template = String("llama")
 
     var result = pipeline_generate(model, tok, "hello", cfg)
-    assert_true(len(result) >= 0, "chat pipeline produces output")
+    assert_true(result.byte_length() >= 0, "chat pipeline produces output")
 
     print("  pipeline_chat_template: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sprint10_integration:")
 
     test_full_gguf_parses()

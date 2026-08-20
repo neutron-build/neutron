@@ -9,17 +9,17 @@ from neutron_mojo.fusion.eclass import ClassId
 from neutron_mojo.fusion.graph import OpKind
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_false(cond: Bool, msg: String) raises:
+def assert_false(cond: Bool, msg: String) raises:
     if cond:
         raise Error("Assertion failed (expected false): " + msg)
 
 
-fn test_variable_pattern() raises:
+def test_variable_pattern() raises:
     """Variable patterns should match any e-class."""
     var p = Pattern.variable(0)
 
@@ -29,7 +29,7 @@ fn test_variable_pattern() raises:
     print("  variable_pattern: PASS")
 
 
-fn test_constant_pattern() raises:
+def test_constant_pattern() raises:
     """Constant patterns should store a ClassId."""
     var c = ClassId(42)
     var p = Pattern.constant(c)
@@ -40,7 +40,7 @@ fn test_constant_pattern() raises:
     print("  constant_pattern: PASS")
 
 
-fn test_operation_pattern() raises:
+def test_operation_pattern() raises:
     """Operation patterns should store an OpKind."""
     var p = Pattern.operation(OpKind.Add)
 
@@ -51,7 +51,7 @@ fn test_operation_pattern() raises:
     print("  operation_pattern: PASS")
 
 
-fn test_operation_pattern_with_children() raises:
+def test_operation_pattern_with_children() raises:
     """Operation patterns can have sub-patterns."""
     var p = Pattern.operation(OpKind.Add)
     p.add_child(Pattern.variable(0)^)
@@ -66,7 +66,7 @@ fn test_operation_pattern_with_children() raises:
     print("  operation_pattern_with_children: PASS")
 
 
-fn test_bindings_creation() raises:
+def test_bindings_creation() raises:
     """Create bindings for multiple variables."""
     var b = Bindings(3)
 
@@ -77,7 +77,7 @@ fn test_bindings_creation() raises:
     print("  bindings_creation: PASS")
 
 
-fn test_bindings_bind() raises:
+def test_bindings_bind() raises:
     """Bind variables to ClassIds."""
     var b = Bindings(2)
     var c1 = ClassId(10)
@@ -98,7 +98,7 @@ fn test_bindings_bind() raises:
     print("  bindings_bind: PASS")
 
 
-fn test_bindings_rebind_same() raises:
+def test_bindings_rebind_same() raises:
     """Rebinding a variable to the same ClassId should succeed."""
     var b = Bindings(1)
     var c = ClassId(5)
@@ -113,7 +113,7 @@ fn test_bindings_rebind_same() raises:
     print("  bindings_rebind_same: PASS")
 
 
-fn test_bindings_rebind_different() raises:
+def test_bindings_rebind_different() raises:
     """Rebinding a variable to a different ClassId should raise an error."""
     var b = Bindings(1)
     var c1 = ClassId(5)
@@ -132,7 +132,7 @@ fn test_bindings_rebind_different() raises:
     print("  bindings_rebind_different: PASS")
 
 
-fn test_match_variable() raises:
+def test_match_variable() raises:
     """Variable pattern should match any e-class and bind."""
     var pattern = Pattern.variable(0)
     var class_id = ClassId(42)
@@ -148,7 +148,7 @@ fn test_match_variable() raises:
     print("  match_variable: PASS")
 
 
-fn test_match_constant_success() raises:
+def test_match_constant_success() raises:
     """Constant pattern should match if ClassIds are equal."""
     var class_id = ClassId(42)
     var pattern = Pattern.constant(class_id)
@@ -161,7 +161,7 @@ fn test_match_constant_success() raises:
     print("  match_constant_success: PASS")
 
 
-fn test_match_constant_failure() raises:
+def test_match_constant_failure() raises:
     """Constant pattern should not match if ClassIds differ."""
     var pattern_class = ClassId(42)
     var target_class = ClassId(99)
@@ -175,7 +175,7 @@ fn test_match_constant_failure() raises:
     print("  match_constant_failure: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_pattern:")
 
     test_variable_pattern()

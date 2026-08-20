@@ -10,19 +10,19 @@ from neutron_mojo.train.modules import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b) + " (diff=" + String(diff) + ")")
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_linear_register() raises:
+def test_linear_register() raises:
     """Linear layer registers weight and bias."""
     var tape = Tape(4096)
     var layer = Linear(4, 3, has_bias=True)
@@ -33,7 +33,7 @@ fn test_linear_register() raises:
     print("  linear_register: PASS")
 
 
-fn test_linear_forward() raises:
+def test_linear_forward() raises:
     """Linear forward produces output."""
     var tape = Tape(8192)
     var layer = Linear(4, 3)
@@ -56,7 +56,7 @@ fn test_linear_forward() raises:
     print("  linear_forward: PASS")
 
 
-fn test_linear_backward() raises:
+def test_linear_backward() raises:
     """Linear backward produces gradients."""
     var tape = Tape(16384)
     var layer = Linear(4, 3, has_bias=False)
@@ -79,7 +79,7 @@ fn test_linear_backward() raises:
     print("  linear_backward: PASS")
 
 
-fn test_linear_no_bias() raises:
+def test_linear_no_bias() raises:
     """Linear without bias."""
     var tape = Tape(4096)
     var layer = Linear(3, 2, has_bias=False)
@@ -88,7 +88,7 @@ fn test_linear_no_bias() raises:
     print("  linear_no_bias: PASS")
 
 
-fn test_embedding_register() raises:
+def test_embedding_register() raises:
     """Embedding registers lookup table."""
     var tape = Tape(8192)
     var embed = Embedding(100, 16)
@@ -97,7 +97,7 @@ fn test_embedding_register() raises:
     print("  embedding_register: PASS")
 
 
-fn test_embedding_forward() raises:
+def test_embedding_forward() raises:
     """Embedding lookup returns correct dim."""
     var tape = Tape(8192)
     var embed = Embedding(10, 4)
@@ -114,7 +114,7 @@ fn test_embedding_forward() raises:
     print("  embedding_forward: PASS")
 
 
-fn test_embedding_backward() raises:
+def test_embedding_backward() raises:
     """Embedding backward accumulates into table."""
     var tape = Tape(8192)
     var embed = Embedding(10, 4)
@@ -130,7 +130,7 @@ fn test_embedding_backward() raises:
     print("  embedding_backward: PASS")
 
 
-fn test_rmsnorm_module() raises:
+def test_rmsnorm_module() raises:
     """RMSNorm module forward."""
     var tape = Tape(4096)
     var norm = RMSNormModule(4)
@@ -153,7 +153,7 @@ fn test_rmsnorm_module() raises:
     print("  rmsnorm_module: PASS")
 
 
-fn test_layernorm_module() raises:
+def test_layernorm_module() raises:
     """LayerNorm module forward."""
     var tape = Tape(4096)
     var norm = LayerNormModule(4)
@@ -178,7 +178,7 @@ fn test_layernorm_module() raises:
     print("  layernorm_module: PASS")
 
 
-fn test_dropout_training() raises:
+def test_dropout_training() raises:
     """Dropout zeros some elements in training mode."""
     var tape = Tape(4096)
     var drop = Dropout(0.5)
@@ -200,7 +200,7 @@ fn test_dropout_training() raises:
     print("  dropout_training: PASS")
 
 
-fn test_dropout_eval() raises:
+def test_dropout_eval() raises:
     """Dropout passes through in eval mode."""
     var tape = Tape(4096)
     var drop = Dropout(0.5)
@@ -218,7 +218,7 @@ fn test_dropout_eval() raises:
     print("  dropout_eval: PASS")
 
 
-fn test_linear_xavier_init() raises:
+def test_linear_xavier_init() raises:
     """Xavier init produces reasonable magnitude values."""
     var tape = Tape(16384)
     var layer = Linear(256, 128)
@@ -236,7 +236,7 @@ fn test_linear_xavier_init() raises:
     print("  linear_xavier_init: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_modules:")
     test_linear_register()
     test_linear_forward()

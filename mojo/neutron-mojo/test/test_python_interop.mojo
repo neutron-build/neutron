@@ -9,25 +9,25 @@ Python-dependent tests are skipped if numpy is not available.
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
-from python import PythonObject
+from std.python import PythonObject
 from neutron_mojo.python.bridge import (
     to_python_list, from_python_list, to_numpy, from_numpy, numpy_available,
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_to_python_list_basic() raises:
+def test_to_python_list_basic() raises:
     """Convert tensor to Python list."""
     if not numpy_available():
         print("  to_python_list_basic: SKIP (no numpy)")
@@ -41,12 +41,12 @@ fn test_to_python_list_basic() raises:
     print("  to_python_list_basic: PASS")
 
 
-fn test_from_python_list_basic() raises:
+def test_from_python_list_basic() raises:
     """Convert Python list to tensor."""
     if not numpy_available():
         print("  from_python_list_basic: SKIP (no numpy)")
         return
-    from python import Python
+    from std.python import Python
     var builtins = Python.import_module("builtins")
     var py_list = builtins.list()
     py_list.append(1.0)
@@ -58,7 +58,7 @@ fn test_from_python_list_basic() raises:
     print("  from_python_list_basic: PASS")
 
 
-fn test_numpy_roundtrip() raises:
+def test_numpy_roundtrip() raises:
     """Tensor -> numpy -> tensor roundtrip."""
     if not numpy_available():
         print("  numpy_roundtrip: SKIP (no numpy)")
@@ -75,7 +75,7 @@ fn test_numpy_roundtrip() raises:
     print("  numpy_roundtrip: PASS")
 
 
-fn test_to_numpy_shaped() raises:
+def test_to_numpy_shaped() raises:
     """Convert tensor to numpy with shape preservation."""
     if not numpy_available():
         print("  to_numpy_shaped: SKIP (no numpy)")
@@ -85,7 +85,7 @@ fn test_to_numpy_shaped() raises:
         t.set(i, Float32(i + 1))
     var arr = to_numpy_shaped(t)
     # Verify shape
-    from python import Python
+    from std.python import Python
     var np = Python.import_module("numpy")
     var shape = arr.shape
     if Int(py=shape[0]) != 2 or Int(py=shape[1]) != 3:
@@ -93,12 +93,12 @@ fn test_to_numpy_shaped() raises:
     print("  to_numpy_shaped: PASS")
 
 
-fn test_from_numpy_shaped() raises:
+def test_from_numpy_shaped() raises:
     """Convert shaped numpy array to tensor."""
     if not numpy_available():
         print("  from_numpy_shaped: SKIP (no numpy)")
         return
-    from python import Python
+    from std.python import Python
     var np = Python.import_module("numpy")
     var builtins = Python.import_module("builtins")
     var row0 = builtins.list()
@@ -118,7 +118,7 @@ fn test_from_numpy_shaped() raises:
     print("  from_numpy_shaped: PASS")
 
 
-fn test_run_python_script() raises:
+def test_run_python_script() raises:
     """Execute a Python script."""
     if not numpy_available():
         print("  run_python_script: SKIP (no numpy)")
@@ -134,9 +134,9 @@ fn test_run_python_script() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn to_numpy_shaped(tensor: Tensor[DType.float32]) raises -> PythonObject:
+def to_numpy_shaped(tensor: Tensor[DType.float32]) raises -> PythonObject:
     """Convert tensor to numpy with shape."""
-    from python import Python, PythonObject
+    from std.python import Python, PythonObject
     var np = Python.import_module("numpy")
     var n = tensor.numel()
     var py_list = to_python_list(tensor, n)
@@ -147,33 +147,33 @@ fn to_numpy_shaped(tensor: Tensor[DType.float32]) raises -> PythonObject:
     return arr
 
 
-fn from_numpy_shaped(arr: PythonObject) raises -> Tensor[DType.float32]:
+def from_numpy_shaped(arr: PythonObject) raises -> Tensor[DType.float32]:
     """Convert shaped numpy to tensor."""
     return from_numpy(arr)
 
 
-fn run_python_script(code: String) raises -> PythonObject:
+def run_python_script(code: String) raises -> PythonObject:
     """Execute Python code."""
-    from python import Python, PythonObject
+    from std.python import Python, PythonObject
     var builtins = Python.import_module("builtins")
     var result = builtins.eval("None")
     return result
 
 
-fn test_bridge_exists() raises:
+def test_bridge_exists() raises:
     """Verify bridge module imports work."""
     # Just importing is the test
     print("  bridge_exists: PASS")
 
 
-fn test_numpy_check() raises:
+def test_numpy_check() raises:
     """Check numpy availability detection."""
     var available = numpy_available()
     # Either True or False is fine, just shouldn't crash
     print("  numpy_check: PASS (numpy=" + String(available) + ")")
 
 
-fn test_empty_tensor_roundtrip() raises:
+def test_empty_tensor_roundtrip() raises:
     """Empty tensor doesn't crash."""
     if not numpy_available():
         print("  empty_tensor_roundtrip: SKIP (no numpy)")
@@ -183,7 +183,7 @@ fn test_empty_tensor_roundtrip() raises:
     print("  empty_tensor_roundtrip: PASS")
 
 
-fn test_large_tensor_roundtrip() raises:
+def test_large_tensor_roundtrip() raises:
     """Larger tensor roundtrip."""
     if not numpy_available():
         print("  large_tensor_roundtrip: SKIP (no numpy)")
@@ -198,7 +198,7 @@ fn test_large_tensor_roundtrip() raises:
     print("  large_tensor_roundtrip: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_python_interop:")
     print("SKIP: Python interop tests require Python/libpython runtime.")
     print("ALL PASSED (10 tests, skipped by default)")

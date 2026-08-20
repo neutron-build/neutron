@@ -18,7 +18,7 @@ Usage:
         print(event.text, end="")
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams
@@ -38,7 +38,7 @@ from neutron_mojo.nn.pipeline import PipelineConfig, _apply_template
 # Token Event
 # ===----------------------------------------------------------------------=== #
 
-struct TokenEvent(Copyable, Movable):
+struct TokenEvent(Copyable, Movable, ImplicitlyCopyable):
     """A single token emission from streaming generation.
 
     Contains the decoded text, token ID, and timing information.
@@ -49,14 +49,14 @@ struct TokenEvent(Copyable, Movable):
     var is_eos: Bool          # Whether this is the end-of-sequence token
     var elapsed_ns: UInt       # Nanoseconds since generation started
 
-    fn __init__(out self):
+    def __init__(out self):
         self.text = String("")
         self.token_id = -1
         self.position = 0
         self.is_eos = False
         self.elapsed_ns = UInt(0)
 
-    fn __init__(out self, text: String, token_id: Int, position: Int,
+    def __init__(out self, text: String, token_id: Int, position: Int,
                 is_eos: Bool, elapsed_ns: UInt):
         self.text = text
         self.token_id = token_id
@@ -64,21 +64,21 @@ struct TokenEvent(Copyable, Movable):
         self.is_eos = is_eos
         self.elapsed_ns = elapsed_ns
 
-    fn __copyinit__(out self, existing: Self):
-        self.text = existing.text
-        self.token_id = existing.token_id
-        self.position = existing.position
-        self.is_eos = existing.is_eos
-        self.elapsed_ns = existing.elapsed_ns
+    def __init__(out self, *, copy: Self):
+        self.text = copy.text
+        self.token_id = copy.token_id
+        self.position = copy.position
+        self.is_eos = copy.is_eos
+        self.elapsed_ns = copy.elapsed_ns
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.text = other.text^
-        self.token_id = other.token_id
-        self.position = other.position
-        self.is_eos = other.is_eos
-        self.elapsed_ns = other.elapsed_ns
+    def __init__(out self, *, deinit move: Self):
+        self.text = move.text^
+        self.token_id = move.token_id^
+        self.position = move.position^
+        self.is_eos = move.is_eos^
+        self.elapsed_ns = move.elapsed_ns^
 
-    fn tokens_per_sec(self) -> Float64:
+    def tokens_per_sec(self) -> Float64:
         """Compute tokens/sec based on elapsed time and position."""
         if self.elapsed_ns == 0 or self.position <= 0:
             return 0.0
@@ -111,7 +111,7 @@ struct StreamingGenerator(Movable):
     var input_ids: List[Int]
     var start_ns: UInt
 
-    fn __init__(out self, var model: Model, var tokenizer: BPETokenizer,
+    def __init__(out self, var model: Model, var tokenizer: BPETokenizer,
                 prompt: String, config: PipelineConfig) raises:
         """Initialize streaming generator with model and prompt.
 
@@ -165,36 +165,36 @@ struct StreamingGenerator(Movable):
         self.prefilled = False
         self.start_ns = UInt(0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.model = other.model^
-        self.tokenizer = other.tokenizer^
-        self.config = other.config^
-        self.cache = other.cache^
-        self.rope = other.rope^
-        self.sampler = other.sampler^
-        self.logits = other.logits^
-        self.generated = other.generated^
-        self.stop_tokens = other.stop_tokens^
-        self.input_ids = other.input_ids^
-        self.input_len = other.input_len
-        self.step = other.step
-        self.finished = other.finished
-        self.prefilled = other.prefilled
-        self.start_ns = other.start_ns
+    def __init__(out self, *, deinit move: Self):
+        self.model = move.model^
+        self.tokenizer = move.tokenizer^
+        self.config = move.config^
+        self.cache = move.cache^
+        self.rope = move.rope^
+        self.sampler = move.sampler^
+        self.logits = move.logits^
+        self.generated = move.generated^
+        self.stop_tokens = move.stop_tokens^
+        self.input_ids = move.input_ids^
+        self.input_len = move.input_len^
+        self.step = move.step^
+        self.finished = move.finished^
+        self.prefilled = move.prefilled^
+        self.start_ns = move.start_ns^
 
-    fn is_finished(self) -> Bool:
+    def is_finished(self) -> Bool:
         """Check if generation is complete."""
         return self.finished
 
-    fn tokens_generated(self) -> Int:
+    def tokens_generated(self) -> Int:
         """Number of tokens generated so far."""
         return len(self.generated)
 
-    fn get_text(self) -> String:
+    def get_text(self) -> String:
         """Get all generated text so far."""
         return self.tokenizer.decode(self.generated)
 
-    fn next_token(mut self) raises -> TokenEvent:
+    def next_token(mut self) raises -> TokenEvent:
         """Generate and return the next token.
 
         On first call, performs prefill of all prompt tokens.
@@ -210,7 +210,7 @@ struct StreamingGenerator(Movable):
 
         # Prefill on first call
         if not self.prefilled:
-            self.start_ns = perf_counter_ns()
+            self.start_ns = UInt(perf_counter_ns())
             for i in range(self.input_len):
                 self.logits = self.model.forward(
                     self.input_ids[i], self.cache, self.rope, pos=i,
@@ -235,13 +235,13 @@ struct StreamingGenerator(Movable):
         # Check stop
         if should_stop(next_tok, self.stop_tokens):
             self.finished = True
-            var elapsed = perf_counter_ns() - self.start_ns
+            var elapsed = UInt(perf_counter_ns()) - self.start_ns
             return TokenEvent(String(""), next_tok, self.step, True, elapsed)
 
         # Record and advance
         self.generated.append(next_tok)
         var text = self.tokenizer.decode_single(next_tok)
-        var elapsed = perf_counter_ns() - self.start_ns
+        var elapsed = UInt(perf_counter_ns()) - self.start_ns
 
         var event = TokenEvent(text, next_tok, self.step, False, elapsed)
         self.step += 1
@@ -261,7 +261,7 @@ struct StreamingGenerator(Movable):
 # Convenience: Collect all tokens
 # ===----------------------------------------------------------------------=== #
 
-fn streaming_collect(
+def streaming_collect(
     var model: Model,
     var tokenizer: BPETokenizer,
     prompt: String,

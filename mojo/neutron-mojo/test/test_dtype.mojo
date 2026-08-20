@@ -4,7 +4,7 @@
 
 """Tests: DType utils, QuantConfig, cast rules, DLPack code mapping."""
 
-from testing import assert_true, assert_false, assert_equal
+from std.testing import assert_true, assert_false, assert_equal
 
 from neutron_mojo.tensor.dtype import (
     QuantConfig,
@@ -30,28 +30,28 @@ from neutron_mojo.tensor.dtype import (
 # --- QuantConfig ---
 
 
-fn test_quant_config_nf4() raises:
+def test_quant_config_nf4() raises:
     assert_equal(NF4_CONFIG.block_size, 64)
     assert_equal(NF4_CONFIG.bits_per_element, 4)
     assert_true(NF4_CONFIG.has_zero_point)
     print("  quant_config_nf4: PASS")
 
 
-fn test_quant_config_q8_0() raises:
+def test_quant_config_q8_0() raises:
     assert_equal(Q8_0_CONFIG.block_size, 32)
     assert_equal(Q8_0_CONFIG.bits_per_element, 8)
     assert_false(Q8_0_CONFIG.has_zero_point)
     print("  quant_config_q8_0: PASS")
 
 
-fn test_quant_config_q4_k() raises:
+def test_quant_config_q4_k() raises:
     assert_equal(Q4_K_CONFIG.block_size, 256)
     assert_equal(Q4_K_CONFIG.bits_per_element, 4)
     assert_true(Q4_K_CONFIG.has_zero_point)
     print("  quant_config_q4_k: PASS")
 
 
-fn test_quant_config_writable() raises:
+def test_quant_config_writable() raises:
     var s = String(NF4_CONFIG)
     # Just check it doesn't crash and contains expected substrings
     assert_true("QuantConfig" in s)
@@ -62,7 +62,7 @@ fn test_quant_config_writable() raises:
 # --- Bitwidth ---
 
 
-fn test_bitwidth() raises:
+def test_bitwidth() raises:
     assert_equal(bitwidth_of(DType.float32), 32)
     assert_equal(bitwidth_of(DType.float16), 16)
     assert_equal(bitwidth_of(DType.float64), 64)
@@ -76,7 +76,7 @@ fn test_bitwidth() raises:
 # --- Type predicates ---
 
 
-fn test_is_floating_point() raises:
+def test_is_floating_point() raises:
     assert_true(is_floating_point(DType.float32))
     assert_true(is_floating_point(DType.float16))
     assert_true(is_floating_point(DType.float64))
@@ -86,7 +86,7 @@ fn test_is_floating_point() raises:
     print("  is_floating_point: PASS")
 
 
-fn test_is_integer() raises:
+def test_is_integer() raises:
     assert_true(is_integer(DType.int8))
     assert_true(is_integer(DType.int32))
     assert_true(is_integer(DType.uint64))
@@ -95,7 +95,7 @@ fn test_is_integer() raises:
     print("  is_integer: PASS")
 
 
-fn test_is_signed() raises:
+def test_is_signed() raises:
     assert_true(is_signed(DType.int8))
     assert_true(is_signed(DType.int32))
     assert_true(is_signed(DType.float32))
@@ -107,13 +107,13 @@ fn test_is_signed() raises:
 # --- Cast rules ---
 
 
-fn test_can_cast_same_type() raises:
+def test_can_cast_same_type() raises:
     assert_true(can_cast(DType.float32, DType.float32))
     assert_true(can_cast(DType.int8, DType.int8))
     print("  can_cast_same_type: PASS")
 
 
-fn test_can_cast_widening_float() raises:
+def test_can_cast_widening_float() raises:
     assert_true(can_cast(DType.float16, DType.float32))
     assert_true(can_cast(DType.float32, DType.float64))
     assert_false(can_cast(DType.float64, DType.float32))
@@ -121,14 +121,14 @@ fn test_can_cast_widening_float() raises:
     print("  can_cast_widening_float: PASS")
 
 
-fn test_can_cast_widening_int() raises:
+def test_can_cast_widening_int() raises:
     assert_true(can_cast(DType.int8, DType.int32))
     assert_true(can_cast(DType.int16, DType.int64))
     assert_false(can_cast(DType.int32, DType.int8))
     print("  can_cast_widening_int: PASS")
 
 
-fn test_can_cast_unsigned_to_signed() raises:
+def test_can_cast_unsigned_to_signed() raises:
     # uint8 -> int16 (needs extra bit, 16 > 8 so OK)
     assert_true(can_cast(DType.uint8, DType.int16))
     # uint8 -> int8 (needs extra bit, 8 == 8, not strictly greater)
@@ -136,7 +136,7 @@ fn test_can_cast_unsigned_to_signed() raises:
     print("  can_cast_unsigned_to_signed: PASS")
 
 
-fn test_can_cast_int_to_float() raises:
+def test_can_cast_int_to_float() raises:
     # int8 (8 bits) -> float32 (24-bit mantissa) — safe
     assert_true(can_cast(DType.int8, DType.float32))
     # int32 (32 bits) -> float32 (24-bit mantissa) — not enough mantissa
@@ -149,7 +149,7 @@ fn test_can_cast_int_to_float() raises:
 # --- SIMD width ---
 
 
-fn test_optimal_simd_width() raises:
+def test_optimal_simd_width() raises:
     # Just verify it returns a positive power of 2
     var w = optimal_simd_width[DType.float32]()
     assert_true(w >= 1)
@@ -161,7 +161,7 @@ fn test_optimal_simd_width() raises:
 # --- DLPack code mapping ---
 
 
-fn test_dtype_to_dlpack_code() raises:
+def test_dtype_to_dlpack_code() raises:
     assert_equal(dtype_to_dlpack_code(DType.float32), DLPACK_FLOAT)
     assert_equal(dtype_to_dlpack_code(DType.float16), DLPACK_FLOAT)
     assert_equal(dtype_to_dlpack_code(DType.float64), DLPACK_FLOAT)
@@ -173,7 +173,7 @@ fn test_dtype_to_dlpack_code() raises:
     print("  dtype_to_dlpack_code: PASS")
 
 
-fn test_dlpack_round_trip() raises:
+def test_dlpack_round_trip() raises:
     """Verify dtype -> dlpack code -> dtype round-trip for common types."""
     var types = List[DType]()
     types.append(DType.float16)
@@ -207,7 +207,7 @@ fn test_dlpack_round_trip() raises:
 # --- Main ---
 
 
-fn main() raises:
+def main() raises:
     print("test_dtype:")
     test_quant_config_nf4()
     test_quant_config_q8_0()

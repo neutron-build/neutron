@@ -13,7 +13,7 @@ For quantized models, the format includes quantized int8 data and scale data
 in addition to FP32 norm weights.
 """
 
-from memory import UnsafePointer, alloc
+from std.memory import Pointer, alloc
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams
@@ -23,11 +23,11 @@ from neutron_mojo.nn.model import Model, ModelParams
 # Constants
 # ===----------------------------------------------------------------------=== #
 
-fn NMF_MAGIC() -> Int:
+def NMF_MAGIC() -> Int:
     return 0x00464D4E  # "NMF\0" little-endian
 
 
-fn NMF_VERSION() -> Int:
+def NMF_VERSION() -> Int:
     return 1
 
 
@@ -35,7 +35,7 @@ fn NMF_VERSION() -> Int:
 # Params serialization (simple key=value text format)
 # ===----------------------------------------------------------------------=== #
 
-fn serialize_params(p: ModelParams) -> String:
+def serialize_params(p: ModelParams) -> String:
     """Serialize ModelParams to a simple text format."""
     var s = String("")
     s += "num_layers=" + String(p.num_layers) + "\n"
@@ -50,19 +50,19 @@ fn serialize_params(p: ModelParams) -> String:
     return s^
 
 
-fn _parse_int_field(data: String, key: String, default: Int) -> Int:
+def _parse_int_field(data: String, key: String, default: Int) -> Int:
     """Parse an integer field from serialized params."""
     var search = key + "="
-    for i in range(len(data) - len(search)):
+    for i in range(data.byte_length() - search.byte_length()):
         var found = True
-        for j in range(len(search)):
+        for j in range(search.byte_length()):
             if ord(data[byte=i + j]) != ord(search[byte=j]):
                 found = False
                 break
         if found:
-            var start = i + len(search)
+            var start = i + search.byte_length()
             var end_idx = start
-            while end_idx < len(data) and ord(data[byte=end_idx]) != ord('\n') and ord(data[byte=end_idx]) != ord('\r'):
+            while end_idx < data.byte_length() and ord(data[byte=end_idx]) != ord('\n') and ord(data[byte=end_idx]) != ord('\r'):
                 end_idx += 1
             var result = 0
             for k in range(start, end_idx):
@@ -73,19 +73,19 @@ fn _parse_int_field(data: String, key: String, default: Int) -> Int:
     return default
 
 
-fn _parse_string_field(data: String, key: String, default: String) -> String:
+def _parse_string_field(data: String, key: String, default: String) -> String:
     """Parse a string field from serialized params."""
     var search = key + "="
-    for i in range(len(data) - len(search)):
+    for i in range(data.byte_length() - search.byte_length()):
         var found = True
-        for j in range(len(search)):
+        for j in range(search.byte_length()):
             if ord(data[byte=i + j]) != ord(search[byte=j]):
                 found = False
                 break
         if found:
-            var start = i + len(search)
+            var start = i + search.byte_length()
             var end_idx = start
-            while end_idx < len(data) and ord(data[byte=end_idx]) != ord('\n') and ord(data[byte=end_idx]) != ord('\r'):
+            while end_idx < data.byte_length() and ord(data[byte=end_idx]) != ord('\n') and ord(data[byte=end_idx]) != ord('\r'):
                 end_idx += 1
             var result = String("")
             for k in range(start, end_idx):
@@ -94,7 +94,7 @@ fn _parse_string_field(data: String, key: String, default: String) -> String:
     return default
 
 
-fn deserialize_params(data: String) -> ModelParams:
+def deserialize_params(data: String) -> ModelParams:
     """Deserialize ModelParams from text format."""
     var p = ModelParams()
     p.num_layers = _parse_int_field(data, "num_layers", 1)
@@ -124,19 +124,19 @@ struct NMFBuffer(Movable):
     """
     var data: List[UInt8]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.data = List[UInt8]()
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data = other.data^
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
 
-    fn _write_u32(mut self, val: Int):
+    def _write_u32(mut self, val: Int):
         self.data.append(UInt8(val & 0xFF))
         self.data.append(UInt8((val >> 8) & 0xFF))
         self.data.append(UInt8((val >> 16) & 0xFF))
         self.data.append(UInt8((val >> 24) & 0xFF))
 
-    fn _write_f32(mut self, val: Float32):
+    def _write_f32(mut self, val: Float32):
         # Float32 -> UInt32 bits -> 4 LE bytes
         var p = alloc[Float32](1)
         p.store(val)
@@ -147,14 +147,14 @@ struct NMFBuffer(Movable):
         self.data.append(UInt8((bits >> 16) & 0xFF))
         self.data.append(UInt8((bits >> 24) & 0xFF))
 
-    fn _read_u32(self, offset: Int) -> Int:
+    def _read_u32(self, offset: Int) -> Int:
         var b0 = Int(self.data[offset])
         var b1 = Int(self.data[offset + 1])
         var b2 = Int(self.data[offset + 2])
         var b3 = Int(self.data[offset + 3])
         return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
-    fn _read_f32(self, offset: Int) -> Float32:
+    def _read_f32(self, offset: Int) -> Float32:
         # 4 LE bytes -> UInt32 bits -> Float32
         var b0 = Int(self.data[offset])
         var b1 = Int(self.data[offset + 1])
@@ -167,11 +167,11 @@ struct NMFBuffer(Movable):
         p.free()
         return result
 
-    fn size(self) -> Int:
+    def size(self) -> Int:
         return len(self.data)
 
 
-fn save_model_to_buffer(model: Model) -> NMFBuffer:
+def save_model_to_buffer(model: Model) -> NMFBuffer:
     """Save FP32 model to an NMF buffer.
 
     Args:
@@ -188,8 +188,8 @@ fn save_model_to_buffer(model: Model) -> NMFBuffer:
 
     # Params section
     var params_str = serialize_params(model.params)
-    buf._write_u32(len(params_str))
-    for i in range(len(params_str)):
+    buf._write_u32(params_str.byte_length())
+    for i in range(params_str.byte_length()):
         buf.data.append(UInt8(ord(params_str[byte=i])))
 
     # Weight sections: layer_weights, embed, final_norm, lm_head
@@ -224,7 +224,7 @@ fn save_model_to_buffer(model: Model) -> NMFBuffer:
     return buf^
 
 
-fn load_model_from_buffer(buf: NMFBuffer) raises -> Model:
+def load_model_from_buffer(buf: NMFBuffer) raises -> Model:
     """Load FP32 model from an NMF buffer.
 
     Args:

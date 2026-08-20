@@ -19,15 +19,15 @@ from neutron_mojo.model.loader import (
 from neutron_mojo.model.config import ModelConfig, llama3_8b_config
 from neutron_mojo.io.safetensors import TensorInfo
 from neutron_mojo.io.gguf import GGUFTensorInfo, GGUF_F16, GGUF_Q4_0, GGUF_Q8_0
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_detect_format() raises:
+def test_detect_format() raises:
     """Test file format detection from extension."""
     var st = detect_format("model.safetensors")
     var gguf = detect_format("model-q4.gguf")
@@ -40,7 +40,7 @@ fn test_detect_format() raises:
     print("  detect_format: PASS")
 
 
-fn test_weight_descriptor_creation() raises:
+def test_weight_descriptor_creation() raises:
     """Test WeightDescriptor struct."""
     var desc = WeightDescriptor()
     desc.name = String("layer.0.weight")
@@ -58,7 +58,7 @@ fn test_weight_descriptor_creation() raises:
     print("  weight_descriptor_creation: PASS")
 
 
-fn test_weight_index_creation() raises:
+def test_weight_index_creation() raises:
     """Test WeightIndex struct."""
     var index = WeightIndex()
 
@@ -68,7 +68,7 @@ fn test_weight_index_creation() raises:
     print("  weight_index_creation: PASS")
 
 
-fn test_weight_index_add() raises:
+def test_weight_index_add() raises:
     """Test adding weights to index."""
     var index = WeightIndex()
 
@@ -92,7 +92,7 @@ fn test_weight_index_add() raises:
     print("  weight_index_add: PASS")
 
 
-fn test_weight_index_get() raises:
+def test_weight_index_get() raises:
     """Test getting weight from index."""
     var index = WeightIndex()
 
@@ -112,7 +112,7 @@ fn test_weight_index_get() raises:
     print("  weight_index_get: PASS")
 
 
-fn test_total_size_mb() raises:
+def test_total_size_mb() raises:
     """Test total size in MB."""
     var index = WeightIndex()
 
@@ -127,7 +127,7 @@ fn test_total_size_mb() raises:
     print("  total_size_mb: PASS")
 
 
-fn test_register_safetensors_weight() raises:
+def test_register_safetensors_weight() raises:
     """Test registering a SafeTensors weight."""
     var index = WeightIndex()
     index.format = FMT_SAFETENSORS()
@@ -151,7 +151,7 @@ fn test_register_safetensors_weight() raises:
     print("  register_safetensors_weight: PASS")
 
 
-fn test_register_gguf_weight() raises:
+def test_register_gguf_weight() raises:
     """Test registering a GGUF weight."""
     var index = WeightIndex()
     index.format = FMT_GGUF()
@@ -177,7 +177,7 @@ fn test_register_gguf_weight() raises:
     print("  register_gguf_weight: PASS")
 
 
-fn test_register_gguf_weight_q4() raises:
+def test_register_gguf_weight_q4() raises:
     """Test registering a Q4_0 GGUF weight."""
     var index = WeightIndex()
 
@@ -198,7 +198,7 @@ fn test_register_gguf_weight_q4() raises:
     print("  register_gguf_weight_q4: PASS")
 
 
-fn test_register_gguf_weight_f16() raises:
+def test_register_gguf_weight_f16() raises:
     """Test registering an F16 GGUF weight (not quantized)."""
     var index = WeightIndex()
 
@@ -220,7 +220,7 @@ fn test_register_gguf_weight_f16() raises:
     print("  register_gguf_weight_f16: PASS")
 
 
-fn test_validate_weights_pass() raises:
+def test_validate_weights_pass() raises:
     """Test weight validation with all required weights."""
     var index = WeightIndex()
     var config = llama3_8b_config()
@@ -247,7 +247,7 @@ fn test_validate_weights_pass() raises:
     print("  validate_weights_pass: PASS")
 
 
-fn test_validate_weights_fail() raises:
+def test_validate_weights_fail() raises:
     """Test weight validation with missing weights."""
     var index = WeightIndex()
     var config = llama3_8b_config()
@@ -264,7 +264,7 @@ fn test_validate_weights_fail() raises:
     print("  validate_weights_fail: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_loader:")
 
     test_detect_format()

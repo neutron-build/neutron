@@ -40,7 +40,7 @@ struct Q8Weight(Movable):
     var block_size: Int
     var num_blocks_per_row: Int
 
-    fn __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32):
+    def __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32):
         """Create storage for Q8_0 quantized weights.
 
         Args:
@@ -56,16 +56,16 @@ struct Q8Weight(Movable):
         self.data = Tensor[DType.float32](Shape(out_features * in_features))
         self.scales = Tensor[DType.float32](Shape(out_features * self.num_blocks_per_row))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data = other.data^
-        self.scales = other.scales^
-        self.out_features = other.out_features
-        self.in_features = other.in_features
-        self.block_size = other.block_size
-        self.num_blocks_per_row = other.num_blocks_per_row
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
+        self.scales = move.scales^
+        self.out_features = move.out_features^
+        self.in_features = move.in_features^
+        self.block_size = move.block_size^
+        self.num_blocks_per_row = move.num_blocks_per_row^
 
 
-fn quantize_weight_q8(
+def quantize_weight_q8(
     weight: Tensor[DType.float32],
     out_features: Int,
     in_features: Int,
@@ -126,7 +126,7 @@ fn quantize_weight_q8(
     return qw^
 
 
-fn q8_linear(
+def q8_linear(
     x: Tensor[DType.float32],
     qw: Q8Weight,
 ) -> Tensor[DType.float32]:
@@ -167,7 +167,7 @@ struct Q4Weight(Movable):
     var block_size: Int
     var num_blocks_per_row: Int
 
-    fn __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32):
+    def __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32):
         self.out_features = out_features
         self.in_features = in_features
         self.block_size = block_size
@@ -177,16 +177,16 @@ struct Q4Weight(Movable):
         self.data = Tensor[DType.float32](Shape(out_features * in_features))
         self.scales = Tensor[DType.float32](Shape(out_features * self.num_blocks_per_row))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data = other.data^
-        self.scales = other.scales^
-        self.out_features = other.out_features
-        self.in_features = other.in_features
-        self.block_size = other.block_size
-        self.num_blocks_per_row = other.num_blocks_per_row
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
+        self.scales = move.scales^
+        self.out_features = move.out_features^
+        self.in_features = move.in_features^
+        self.block_size = move.block_size^
+        self.num_blocks_per_row = move.num_blocks_per_row^
 
 
-fn quantize_weight_q4(
+def quantize_weight_q4(
     weight: Tensor[DType.float32],
     out_features: Int,
     in_features: Int,
@@ -245,7 +245,7 @@ fn quantize_weight_q4(
     return qw^
 
 
-fn q4_linear(
+def q4_linear(
     x: Tensor[DType.float32],
     qw: Q4Weight,
 ) -> Tensor[DType.float32]:
@@ -284,7 +284,7 @@ fn q4_linear(
 # Error Measurement
 # ===----------------------------------------------------------------------=== #
 
-fn quantization_error(
+def quantization_error(
     original: Tensor[DType.float32],
     quantized_output: Tensor[DType.float32],
     size: Int,

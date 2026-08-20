@@ -11,7 +11,7 @@ weights (common in neural networks after training).
 Reference: "QLoRA: Efficient Finetuning of Quantized LLMs" (Dettmers et al., 2023)
 """
 
-from math import abs
+from std.math import abs
 
 # ===----------------------------------------------------------------------=== #
 # NF4 Lookup Table
@@ -39,7 +39,7 @@ comptime NF4_TABLE = (
 )
 
 
-fn get_nf4_value(index: Int) -> Float32:
+def get_nf4_value(index: Int) -> Float32:
     """Get the NF4 table value for a given 4-bit index.
 
     Args:
@@ -82,7 +82,7 @@ fn get_nf4_value(index: Int) -> Float32:
         return Float32(1.0)
 
 
-fn quantize_nf4(value: Float32, scale: Float32) -> UInt8:
+def quantize_nf4(value: Float32, scale: Float32) -> UInt8:
     """Quantize a single FP32 value to 4-bit NF4.
 
     Finds the closest NF4 table entry to (value / scale).
@@ -117,7 +117,7 @@ fn quantize_nf4(value: Float32, scale: Float32) -> UInt8:
     return UInt8(best_idx)
 
 
-fn dequantize_nf4(index: UInt8, scale: Float32) -> Float32:
+def dequantize_nf4(index: UInt8, scale: Float32) -> Float32:
     """Dequantize a 4-bit NF4 value to FP32.
 
     Args:
@@ -131,11 +131,9 @@ fn dequantize_nf4(index: UInt8, scale: Float32) -> Float32:
     return table_val * scale
 
 
-fn quantize_nf4_block[
-    input_origin: Origin, output_origin: Origin where output_origin.mut
-](
-    input: UnsafePointer[Float32, input_origin],
-    output: UnsafePointer[UInt8, output_origin],
+def quantize_nf4_block(
+    input: Pointer[Float32, ...],
+    output: Pointer[mut=True, UInt8, ...],
     block_size: Int,
 ) -> Float32:
     """Quantize a block of FP32 values to NF4.
@@ -171,15 +169,15 @@ fn quantize_nf4_block[
 
         # Pack two 4-bit values into one byte: [q1 | q0]
         var packed = (Int(q1) << 4) | Int(q0)
-        output.store(i // 2, UInt8(packed))
+        output.unsafe_store(i // 2, UInt8(packed))
 
     return scale
 
 
-fn dequantize_nf4_block[input_origin: Origin, output_origin: Origin where output_origin.mut](
-    input: UnsafePointer[UInt8, input_origin],
+def dequantize_nf4_block(
+    input: Pointer[UInt8, ...],
     scale: Float32,
-    output: UnsafePointer[Float32, output_origin],
+    output: Pointer[mut=True, Float32, ...],
     block_size: Int,
 ):
     """Dequantize a block of NF4 values to FP32.
@@ -199,20 +197,20 @@ fn dequantize_nf4_block[input_origin: Origin, output_origin: Origin where output
         var q0 = UInt8(Int(packed) & 0xF)
         var q1 = UInt8((Int(packed) >> 4) & 0xF)
 
-        output.store(i, dequantize_nf4(q0, scale))
-        output.store(i + 1, dequantize_nf4(q1, scale))
+        output.unsafe_store(i, dequantize_nf4(q0, scale))
+        output.unsafe_store(i + 1, dequantize_nf4(q1, scale))
 
 
 # ===----------------------------------------------------------------------=== #
 # Utilities
 # ===----------------------------------------------------------------------=== #
 
-fn nf4_table_size() -> Int:
+def nf4_table_size() -> Int:
     """Return the NF4 lookup table size (16)."""
     return 16
 
 
-fn nf4_bytes_per_block(block_size: Int) -> Int:
+def nf4_bytes_per_block(block_size: Int) -> Int:
     """Calculate bytes needed for NF4 block storage.
 
     Args:

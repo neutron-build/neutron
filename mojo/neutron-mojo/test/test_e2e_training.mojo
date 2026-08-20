@@ -18,19 +18,19 @@ from neutron_mojo.data import Dataset, DataSample
 from neutron_mojo.optim import Adam, SGD, clip_grad_norm
 
 
-fn assert_close(a: Float64, b: Float64, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
+def assert_close(a: Float64, b: Float64, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
     var diff = abs(a - b)
     var threshold = atol + rtol * abs(b)
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_create_simple_dataset() raises:
+def test_create_simple_dataset() raises:
     """Create dataset from token sequence."""
     var tokens = List[Int]()
     for i in range(10):
@@ -43,7 +43,7 @@ fn test_create_simple_dataset() raises:
     print("  create_simple_dataset: PASS")
 
 
-fn test_create_dataset_too_short() raises:
+def test_create_dataset_too_short() raises:
     """Dataset with too-short sequence."""
     var tokens = List[Int]()
     tokens.append(1)
@@ -53,7 +53,7 @@ fn test_create_dataset_too_short() raises:
     print("  create_dataset_too_short: PASS")
 
 
-fn test_train_loss_adam() raises:
+def test_train_loss_adam() raises:
     """End-to-end training with Adam optimizer."""
     var tokens = List[Int]()
     for i in range(20):
@@ -88,7 +88,7 @@ fn test_train_loss_adam() raises:
           + " steps=" + String(total_steps) + ")")
 
 
-fn test_train_sgd() raises:
+def test_train_sgd() raises:
     """Training with SGD optimizer."""
     var tokens = List[Int]()
     for i in range(12):
@@ -120,7 +120,7 @@ fn test_train_sgd() raises:
     print("  train_sgd: PASS (loss=" + String(last_loss) + ")")
 
 
-fn test_overfit_one_example() raises:
+def test_overfit_one_example() raises:
     """Model can overfit a single training example."""
     var ds = Dataset()
     for _ in range(5):
@@ -151,7 +151,7 @@ fn test_overfit_one_example() raises:
     print("  overfit_one_example: PASS (loss=" + String(last_loss) + ")")
 
 
-fn test_training_metrics() raises:
+def test_training_metrics() raises:
     """TrainingMetrics records losses."""
     var metrics = TrainingMetrics()
     metrics.record(2.5, 0.01)
@@ -164,7 +164,7 @@ fn test_training_metrics() raises:
     print("  training_metrics: PASS")
 
 
-fn test_manual_training_loop() raises:
+def test_manual_training_loop() raises:
     """Manual training loop with loss tracking."""
     var tape = Tape(262144)
     var model = TrainableLM(vocab_size=4, hidden_dim=4, num_layers=1, ffn_dim=8)
@@ -189,7 +189,7 @@ fn test_manual_training_loop() raises:
     print("  manual_training_loop: PASS")
 
 
-fn test_multilayer_training() raises:
+def test_multilayer_training() raises:
     """Training with 2 transformer layers."""
     var tokens = List[Int]()
     for i in range(12):
@@ -221,7 +221,7 @@ fn test_multilayer_training() raises:
     print("  multilayer_training: PASS (loss=" + String(last_loss) + ")")
 
 
-fn test_grad_clipping_effect() raises:
+def test_grad_clipping_effect() raises:
     """Gradient clipping prevents explosion."""
     var tape = Tape(262144)
     var model = TrainableLM(vocab_size=4, hidden_dim=4, num_layers=1, ffn_dim=8)
@@ -235,7 +235,7 @@ fn test_grad_clipping_effect() raises:
     print("  grad_clipping_effect: PASS (orig_norm=" + String(norm_before) + ")")
 
 
-fn test_empty_dataset() raises:
+def test_empty_dataset() raises:
     """Training with empty dataset doesn't crash."""
     var ds = Dataset()
     var tape = Tape(262144)
@@ -259,7 +259,7 @@ fn test_empty_dataset() raises:
     print("  empty_dataset: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_e2e_training:")
     test_create_simple_dataset()
     test_create_dataset_too_short()

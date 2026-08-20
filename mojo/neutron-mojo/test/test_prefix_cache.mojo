@@ -30,16 +30,16 @@ from neutron_mojo.nn.prefix_cache import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error("FAIL: " + msg + " expected=" + String(b) + " got=" + String(a))
 
 
-fn _make_tokens(values: List[Int]) -> List[Int]:
+def _make_tokens(values: List[Int]) -> List[Int]:
     """Helper to create token list."""
     var result = List[Int]()
     for i in range(len(values)):
@@ -47,7 +47,7 @@ fn _make_tokens(values: List[Int]) -> List[Int]:
     return result^
 
 
-fn _make_cache(num_layers: Int, max_seq: Int, heads: Int, dim: Int) -> MultiLayerKVCache:
+def _make_cache(num_layers: Int, max_seq: Int, heads: Int, dim: Int) -> MultiLayerKVCache:
     """Create a KV cache with known values."""
     var cache = MultiLayerKVCache(
         num_layers=num_layers, max_seq_len=max_seq,
@@ -60,7 +60,7 @@ fn _make_cache(num_layers: Int, max_seq: Int, heads: Int, dim: Int) -> MultiLaye
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_hash_sequence() raises:
+def test_hash_sequence() raises:
     """Token sequence hashing produces consistent results."""
     var tok1 = List[Int]()
     tok1.append(1)
@@ -91,7 +91,7 @@ fn test_hash_sequence() raises:
     print("  hash_sequence: PASS")
 
 
-fn test_tokens_match() raises:
+def test_tokens_match() raises:
     """Token matching works correctly."""
     var a = List[Int]()
     a.append(10)
@@ -118,7 +118,7 @@ fn test_tokens_match() raises:
     print("  tokens_match: PASS")
 
 
-fn test_prefix_match_defaults() raises:
+def test_prefix_match_defaults() raises:
     """PrefixMatch defaults indicate no match."""
     var m = PrefixMatch()
     assert_eq(m.entry_idx, -1, "default entry_idx")
@@ -127,7 +127,7 @@ fn test_prefix_match_defaults() raises:
     print("  prefix_match_defaults: PASS")
 
 
-fn test_cache_creation() raises:
+def test_cache_creation() raises:
     """PrefixCache creates with correct params."""
     var pc = PrefixCache(max_entries=4, num_layers=2,
                          num_kv_heads=2, head_dim=4, max_seq_len=16)
@@ -137,7 +137,7 @@ fn test_cache_creation() raises:
     print("  cache_creation: PASS")
 
 
-fn test_store_and_find() raises:
+def test_store_and_find() raises:
     """Store a prefix and find it."""
     var pc = PrefixCache(max_entries=4, num_layers=2,
                          num_kv_heads=2, head_dim=4, max_seq_len=16)
@@ -170,7 +170,7 @@ fn test_store_and_find() raises:
     print("  store_and_find: PASS")
 
 
-fn test_longest_match() raises:
+def test_longest_match() raises:
     """Finds the longest matching prefix."""
     var pc = PrefixCache(max_entries=4, num_layers=1,
                          num_kv_heads=1, head_dim=4, max_seq_len=16)
@@ -209,7 +209,7 @@ fn test_longest_match() raises:
     print("  longest_match: PASS")
 
 
-fn test_cache_miss() raises:
+def test_cache_miss() raises:
     """Cache miss returns no match."""
     var pc = PrefixCache(max_entries=4, num_layers=1,
                          num_kv_heads=1, head_dim=4, max_seq_len=16)
@@ -233,7 +233,7 @@ fn test_cache_miss() raises:
     print("  cache_miss: PASS")
 
 
-fn test_restore_to_cache() raises:
+def test_restore_to_cache() raises:
     """Restoring cached KV data produces correct values."""
     var pc = PrefixCache(max_entries=4, num_layers=1,
                          num_kv_heads=1, head_dim=4, max_seq_len=16)
@@ -274,7 +274,7 @@ fn test_restore_to_cache() raises:
     print("  restore_to_cache: PASS")
 
 
-fn test_eviction() raises:
+def test_eviction() raises:
     """LRU eviction removes least-used entry."""
     var pc = PrefixCache(max_entries=2, num_layers=1,
                          num_kv_heads=1, head_dim=2, max_seq_len=8)
@@ -319,7 +319,7 @@ fn test_eviction() raises:
     print("  eviction: PASS")
 
 
-fn test_hit_rate() raises:
+def test_hit_rate() raises:
     """Hit rate tracking works."""
     var pc = PrefixCache(max_entries=4, num_layers=1,
                          num_kv_heads=1, head_dim=2, max_seq_len=8)
@@ -347,7 +347,7 @@ fn test_hit_rate() raises:
     print("  hit_rate: PASS")
 
 
-fn test_cache_clear() raises:
+def test_cache_clear() raises:
     """Clear removes all entries and resets stats."""
     var pc = PrefixCache(max_entries=4, num_layers=1,
                          num_kv_heads=1, head_dim=2, max_seq_len=8)
@@ -368,7 +368,7 @@ fn test_cache_clear() raises:
     print("  cache_clear: PASS")
 
 
-fn test_prefix_reuse_correctness() raises:
+def test_prefix_reuse_correctness() raises:
     """Prefix reuse produces same KV values as full prefill."""
     # This tests that storing and restoring preserves exact values
     var pc = PrefixCache(max_entries=4, num_layers=2,
@@ -413,7 +413,7 @@ fn test_prefix_reuse_correctness() raises:
     print("  prefix_reuse_correctness: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_prefix_cache:")
 
     test_hash_sequence()

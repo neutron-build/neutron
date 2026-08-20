@@ -10,37 +10,37 @@ Encode: text -> token IDs. Decode: token IDs -> text.
 Design: lean core — vocab + ordered merge rules, no regex pre-tokenization.
 """
 
-from collections import Dict
+from std.collections import Dict
 
 
 # ===----------------------------------------------------------------------=== #
 # Merge Rule
 # ===----------------------------------------------------------------------=== #
 
-struct MergeRule(Copyable, Movable):
+struct MergeRule(Copyable, Movable, ImplicitlyCopyable):
     """A single BPE merge: (left, right) -> merged."""
     var left: String
     var right: String
     var merged: String
     var priority: Int  # Lower = higher priority (applied first)
 
-    fn __init__(out self, left: String, right: String, priority: Int):
+    def __init__(out self, left: String, right: String, priority: Int):
         self.left = left
         self.right = right
         self.merged = left + right
         self.priority = priority
 
-    fn __copyinit__(out self, existing: Self):
-        self.left = existing.left
-        self.right = existing.right
-        self.merged = existing.merged
-        self.priority = existing.priority
+    def __init__(out self, *, copy: Self):
+        self.left = copy.left
+        self.right = copy.right
+        self.merged = copy.merged
+        self.priority = copy.priority
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.left = other.left^
-        self.right = other.right^
-        self.merged = other.merged^
-        self.priority = other.priority
+    def __init__(out self, *, deinit move: Self):
+        self.left = move.left^
+        self.right = move.right^
+        self.merged = move.merged^
+        self.priority = move.priority^
 
 
 # ===----------------------------------------------------------------------=== #
@@ -68,7 +68,7 @@ struct BPETokenizer(Movable):
     var pad_id: Int
     var vocab_size: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         """Create an empty tokenizer."""
         self.id_to_token = List[String]()
         self.token_to_id = Dict[String, Int]()
@@ -80,18 +80,18 @@ struct BPETokenizer(Movable):
         self.pad_id = -1
         self.vocab_size = 0
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.id_to_token = other.id_to_token^
-        self.token_to_id = other.token_to_id^
-        self.merges = other.merges^
-        self.merge_index = other.merge_index^
-        self.bos_id = other.bos_id
-        self.eos_id = other.eos_id
-        self.unk_id = other.unk_id
-        self.pad_id = other.pad_id
-        self.vocab_size = other.vocab_size
+    def __init__(out self, *, deinit move: Self):
+        self.id_to_token = move.id_to_token^
+        self.token_to_id = move.token_to_id^
+        self.merges = move.merges^
+        self.merge_index = move.merge_index^
+        self.bos_id = move.bos_id^
+        self.eos_id = move.eos_id^
+        self.unk_id = move.unk_id^
+        self.pad_id = move.pad_id^
+        self.vocab_size = move.vocab_size^
 
-    fn add_token(mut self, token: String) -> Int:
+    def add_token(mut self, token: String) -> Int:
         """Add a token to the vocabulary.
 
         Args:
@@ -106,7 +106,7 @@ struct BPETokenizer(Movable):
         self.vocab_size += 1
         return id
 
-    fn add_special_token(mut self, token: String, role: String) -> Int:
+    def add_special_token(mut self, token: String, role: String) -> Int:
         """Add a special token and assign its role.
 
         Args:
@@ -127,7 +127,7 @@ struct BPETokenizer(Movable):
             self.pad_id = id
         return id
 
-    fn add_merge(mut self, left: String, right: String):
+    def add_merge(mut self, left: String, right: String):
         """Add a merge rule (order of addition = priority).
 
         Args:
@@ -140,7 +140,7 @@ struct BPETokenizer(Movable):
         var key = left + "|" + right
         self.merge_index[key] = priority
 
-    fn get_merge_priority(self, left: String, right: String) raises -> Int:
+    def get_merge_priority(self, left: String, right: String) raises -> Int:
         """Get merge priority for a pair (-1 if no merge exists).
 
         Args:
@@ -157,7 +157,7 @@ struct BPETokenizer(Movable):
 
     # === Encode ===
 
-    fn encode(self, text: String) raises -> List[Int]:
+    def encode(self, text: String) raises -> List[Int]:
         """Encode text to token IDs using BPE.
 
         Steps:
@@ -171,7 +171,7 @@ struct BPETokenizer(Movable):
         Returns:
             List of token IDs.
         """
-        if len(text) == 0:
+        if text.byte_length() == 0:
             return List[Int]()
 
         # Step 1: Initialize with individual characters
@@ -224,7 +224,7 @@ struct BPETokenizer(Movable):
                 raise Error("Unknown token and no UNK: '" + tok + "'")
         return ids^
 
-    fn encode_with_special(self, text: String, add_bos: Bool = True) raises -> List[Int]:
+    def encode_with_special(self, text: String, add_bos: Bool = True) raises -> List[Int]:
         """Encode text with optional BOS/EOS tokens.
 
         Args:
@@ -245,7 +245,7 @@ struct BPETokenizer(Movable):
 
     # === Decode ===
 
-    fn decode(self, ids: List[Int]) -> String:
+    def decode(self, ids: List[Int]) -> String:
         """Decode token IDs back to text.
 
         Args:
@@ -265,7 +265,7 @@ struct BPETokenizer(Movable):
                 result += "<unk>"
         return result^
 
-    fn decode_single(self, id: Int) -> String:
+    def decode_single(self, id: Int) -> String:
         """Decode a single token ID.
 
         Args:
@@ -283,14 +283,14 @@ struct BPETokenizer(Movable):
 # Tokenizer Builder Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _hex_char(v: Int) -> String:
+def _hex_char(v: Int) -> String:
     """Convert 0-15 to hex character."""
     if v < 10:
         return chr(48 + v)  # '0' + v
     return chr(97 + v - 10)  # 'a' + (v - 10)
 
 
-fn build_byte_level_vocab(mut tokenizer: BPETokenizer):
+def build_byte_level_vocab(mut tokenizer: BPETokenizer):
     """Add all 256 single-byte tokens to the vocabulary.
 
     This is the foundation for byte-level BPE — every possible byte
@@ -307,7 +307,7 @@ fn build_byte_level_vocab(mut tokenizer: BPETokenizer):
             _ = tokenizer.add_token(s)
 
 
-fn build_test_tokenizer() -> BPETokenizer:
+def build_test_tokenizer() -> BPETokenizer:
     """Build a small test tokenizer with a handful of tokens and merges.
 
     Vocab: single ascii chars + common pairs/words.
@@ -372,16 +372,16 @@ struct MergePair(Movable):
     var left: String
     var right: String
 
-    fn __init__(out self, left: String, right: String):
+    def __init__(out self, left: String, right: String):
         self.left = left
         self.right = right
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.left = other.left^
-        self.right = other.right^
+    def __init__(out self, *, deinit move: Self):
+        self.left = move.left^
+        self.right = move.right^
 
 
-fn _parse_merge_rule(s: String) -> MergePair:
+def _parse_merge_rule(s: String) -> MergePair:
     """Split a merge rule "tok1 tok2" on space.
 
     Args:
@@ -391,7 +391,7 @@ fn _parse_merge_rule(s: String) -> MergePair:
         MergePair with left and right tokens.
     """
     var space_idx = -1
-    for i in range(len(s)):
+    for i in range(s.byte_length()):
         if ord(s[byte=i]) == 32:  # space
             space_idx = i
             break
@@ -399,8 +399,8 @@ fn _parse_merge_rule(s: String) -> MergePair:
     if space_idx < 0:
         return MergePair(String(s), String(""))
 
-    var left = String(s[:space_idx])
-    var right = String(s[space_idx + 1:])
+    var left = String(s[byte=:space_idx])
+    var right = String(s[byte=space_idx + 1:])
     return MergePair(left, right)
 
 
@@ -408,7 +408,7 @@ fn _parse_merge_rule(s: String) -> MergePair:
 # GGUF Tokenizer Loading
 # ===----------------------------------------------------------------------=== #
 
-fn load_gguf_tokenizer(
+def load_gguf_tokenizer(
     token_vocab: List[String],
     token_scores: List[Float64],
     token_merges: List[String],
@@ -442,13 +442,13 @@ fn load_gguf_tokenizer(
     # Add merge rules
     for i in range(len(token_merges)):
         var pair = _parse_merge_rule(String(token_merges[i]))
-        if len(pair.right) > 0:
+        if pair.right.byte_length() > 0:
             tok.add_merge(pair.left, pair.right)
 
     return tok^
 
 
-fn load_vocab_file(path: String) raises -> BPETokenizer:
+def load_vocab_file(path: String) raises -> BPETokenizer:
     """Load a tokenizer from a simple vocab file.
 
     Supports two formats:
@@ -461,7 +461,7 @@ fn load_vocab_file(path: String) raises -> BPETokenizer:
     Returns:
         BPETokenizer with vocabulary loaded.
     """
-    from pathlib import Path
+    from std.pathlib import Path
 
     var content = Path(path).read_text()
     var tok = BPETokenizer()

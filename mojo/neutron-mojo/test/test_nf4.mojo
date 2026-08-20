@@ -13,27 +13,27 @@ from neutron_mojo.quant.nf4 import (
     nf4_table_size,
     nf4_bytes_per_block,
 )
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
     if abs(a - b) > tol:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn test_nf4_table_size() raises:
+def test_nf4_table_size() raises:
     """Test NF4 table size."""
     assert_true(nf4_table_size() == 16, "NF4 table should have 16 entries")
 
     print("  nf4_table_size: PASS")
 
 
-fn test_nf4_table_values() raises:
+def test_nf4_table_values() raises:
     """Test NF4 lookup table values."""
     # Check symmetric values around 0
     assert_close(get_nf4_value(0), Float32(-1.0), tol=1e-6)
@@ -49,7 +49,7 @@ fn test_nf4_table_values() raises:
     print("  nf4_table_values: PASS")
 
 
-fn test_quantize_nf4_zero() raises:
+def test_quantize_nf4_zero() raises:
     """Test quantizing zero."""
     var scale = Float32(1.0)
     var q = quantize_nf4(Float32(0.0), scale)
@@ -60,7 +60,7 @@ fn test_quantize_nf4_zero() raises:
     print("  quantize_nf4_zero: PASS")
 
 
-fn test_quantize_nf4_extremes() raises:
+def test_quantize_nf4_extremes() raises:
     """Test quantizing extreme values."""
     var scale = Float32(1.0)
 
@@ -74,7 +74,7 @@ fn test_quantize_nf4_extremes() raises:
     print("  quantize_nf4_extremes: PASS")
 
 
-fn test_quantize_nf4_clamping() raises:
+def test_quantize_nf4_clamping() raises:
     """Test that quantization clamps values outside [-1, 1]."""
     var scale = Float32(1.0)
 
@@ -88,7 +88,7 @@ fn test_quantize_nf4_clamping() raises:
     print("  quantize_nf4_clamping: PASS")
 
 
-fn test_dequantize_nf4() raises:
+def test_dequantize_nf4() raises:
     """Test dequantizing NF4 values."""
     var scale = Float32(1.0)
 
@@ -103,7 +103,7 @@ fn test_dequantize_nf4() raises:
     print("  dequantize_nf4: PASS")
 
 
-fn test_dequantize_nf4_with_scale() raises:
+def test_dequantize_nf4_with_scale() raises:
     """Test dequantization with non-unit scale."""
     var scale = Float32(2.0)
 
@@ -115,7 +115,7 @@ fn test_dequantize_nf4_with_scale() raises:
     print("  dequantize_nf4_with_scale: PASS")
 
 
-fn test_quantize_dequantize_roundtrip() raises:
+def test_quantize_dequantize_roundtrip() raises:
     """Test quantize-dequantize roundtrip."""
     var scale = Float32(1.0)
     var original = Float32(0.5)
@@ -129,7 +129,7 @@ fn test_quantize_dequantize_roundtrip() raises:
     print("  quantize_dequantize_roundtrip: PASS")
 
 
-fn test_nf4_block_quantize() raises:
+def test_nf4_block_quantize() raises:
     """Test NF4 block quantization."""
     # Create input data using List
     var input_list = List[Float32]()
@@ -159,7 +159,7 @@ fn test_nf4_block_quantize() raises:
     print("  nf4_block_quantize: PASS")
 
 
-fn test_nf4_block_dequantize() raises:
+def test_nf4_block_dequantize() raises:
     """Test NF4 block dequantization roundtrip."""
     # Original data using List
     var input_list = List[Float32]()
@@ -194,7 +194,7 @@ fn test_nf4_block_dequantize() raises:
     print("  nf4_block_dequantize: PASS")
 
 
-fn test_nf4_bytes_per_block() raises:
+def test_nf4_bytes_per_block() raises:
     """Test NF4 bytes calculation."""
     # Block size 64: 2 bytes (scale) + 32 bytes (packed data)
     var bytes = nf4_bytes_per_block(64)
@@ -204,7 +204,7 @@ fn test_nf4_bytes_per_block() raises:
     print("  nf4_bytes_per_block: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_nf4:")
 
     test_nf4_table_size()

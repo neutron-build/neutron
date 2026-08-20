@@ -4,7 +4,7 @@
 
 """Tests for fused attention kernel with online softmax."""
 
-from math import abs, exp
+from std.math import abs, exp
 from neutron_mojo.nn.fused_attention import (
     fused_attention_head,
     fused_gqa_attention,
@@ -18,19 +18,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn _inv_sqrt(d: Int) -> Float32:
+def _inv_sqrt(d: Int) -> Float32:
     """Compute 1/sqrt(d) via Newton's method."""
     var df = Float32(d)
     var x: Float32 = 0.5
@@ -39,7 +39,7 @@ fn _inv_sqrt(d: Int) -> Float32:
     return x
 
 
-fn test_fused_single_position() raises:
+def test_fused_single_position() raises:
     """Test fused attention with single cached position."""
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=4)
 
@@ -70,7 +70,7 @@ fn test_fused_single_position() raises:
     print("  fused_single_position: PASS")
 
 
-fn test_fused_vs_reference() raises:
+def test_fused_vs_reference() raises:
     """Test fused attention matches reference implementation."""
     var head_dim = 4
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=4)
@@ -111,7 +111,7 @@ fn test_fused_vs_reference() raises:
     print("  fused_vs_reference: PASS")
 
 
-fn test_fused_causal_masking() raises:
+def test_fused_causal_masking() raises:
     """Test that fused attention respects causal masking."""
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=2)
 
@@ -160,7 +160,7 @@ fn test_fused_causal_masking() raises:
     print("  fused_causal_masking: PASS")
 
 
-fn test_fused_gqa() raises:
+def test_fused_gqa() raises:
     """Test fused GQA attention."""
     var head_dim = 2
     var num_q_heads = 4
@@ -197,7 +197,7 @@ fn test_fused_gqa() raises:
     print("  fused_gqa: PASS")
 
 
-fn test_fused_q8_vs_fp32() raises:
+def test_fused_q8_vs_fp32() raises:
     """Test fused Q8 attention matches fused FP32 attention."""
     var head_dim = 4
     var fp32_cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=4)
@@ -234,7 +234,7 @@ fn test_fused_q8_vs_fp32() raises:
     print("  fused_q8_vs_fp32: PASS")
 
 
-fn test_fused_q8_gqa() raises:
+def test_fused_q8_gqa() raises:
     """Test fused Q8 GQA attention."""
     var q8_cache = Q8KVCache(max_seq_len=8, num_kv_heads=2, head_dim=2)
 
@@ -264,7 +264,7 @@ fn test_fused_q8_gqa() raises:
     print("  fused_q8_gqa: PASS")
 
 
-fn test_online_softmax_accuracy() raises:
+def test_online_softmax_accuracy() raises:
     """Test online softmax matches standard softmax for various score distributions."""
     var cache = KVCache(max_seq_len=16, num_kv_heads=1, head_dim=2)
 
@@ -306,7 +306,7 @@ fn test_online_softmax_accuracy() raises:
     print("  online_softmax_accuracy: PASS")
 
 
-fn test_fused_empty_cache() raises:
+def test_fused_empty_cache() raises:
     """Test fused attention with empty cache returns zeros."""
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=4)
     var query = Tensor[DType.float32](Shape(4))
@@ -322,7 +322,7 @@ fn test_fused_empty_cache() raises:
     print("  fused_empty_cache: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_fused_attention:")
 
     test_fused_single_position()

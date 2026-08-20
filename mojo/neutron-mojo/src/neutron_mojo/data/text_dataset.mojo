@@ -7,7 +7,7 @@
 from .dataset import DataSample, Dataset
 
 
-fn create_text_dataset(token_ids: List[Int], seq_len: Int) -> Dataset:
+def create_text_dataset(token_ids: List[Int], seq_len: Int) -> Dataset:
     """Create a Dataset from a sequence of token IDs using a sliding window.
 
     Each sample has `seq_len` input tokens and the next token as target.

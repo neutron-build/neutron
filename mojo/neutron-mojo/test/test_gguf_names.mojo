@@ -4,7 +4,7 @@
 
 """Tests for GGUF → HuggingFace tensor name normalization and loading."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.model.populate import normalize_weight_name
@@ -21,12 +21,12 @@ from neutron_mojo.io.gguf import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq_str(a: String, b: String, msg: String) raises:
+def assert_eq_str(a: String, b: String, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -34,7 +34,7 @@ fn assert_eq_str(a: String, b: String, msg: String) raises:
         )
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg
@@ -46,7 +46,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Tests: normalize_weight_name
 # ===----------------------------------------------------------------------=== #
 
-fn test_normalize_global_names() raises:
+def test_normalize_global_names() raises:
     """Test global tensor name mappings."""
     assert_eq_str(
         normalize_weight_name("token_embd.weight"),
@@ -67,7 +67,7 @@ fn test_normalize_global_names() raises:
     print("  normalize_global_names: PASS")
 
 
-fn test_normalize_layer_names() raises:
+def test_normalize_layer_names() raises:
     """Test all 9 per-layer suffix mappings."""
     var layer = "0"
     var gp = "blk." + layer + "."
@@ -93,7 +93,7 @@ fn test_normalize_layer_names() raises:
     print("  normalize_layer_names: PASS")
 
 
-fn test_normalize_passthrough() raises:
+def test_normalize_passthrough() raises:
     """Test that HF names pass through unchanged."""
     assert_eq_str(
         normalize_weight_name("model.embed_tokens.weight"),
@@ -118,7 +118,7 @@ fn test_normalize_passthrough() raises:
 # Tests: Loading GGUF with GGUF-convention names
 # ===----------------------------------------------------------------------=== #
 
-fn _build_gguf_with_gguf_names() raises -> List[UInt8]:
+def _build_gguf_with_gguf_names() raises -> List[UInt8]:
     """Build a GGUF with GGUF-convention tensor names."""
     var buf = List[UInt8]()
 
@@ -201,7 +201,7 @@ fn _build_gguf_with_gguf_names() raises -> List[UInt8]:
     return buf^
 
 
-fn test_load_gguf_named_weights() raises:
+def test_load_gguf_named_weights() raises:
     """Test loading GGUF with GGUF-convention tensor names."""
     var buf = _build_gguf_with_gguf_names()
     var model = load_gguf_model_from_buffer(buf^)
@@ -228,7 +228,7 @@ fn test_load_gguf_named_weights() raises:
     print("  load_gguf_named_weights: PASS")
 
 
-fn test_mixed_naming() raises:
+def test_mixed_naming() raises:
     """Test GGUF where some tensors use GGUF names and some use HF names."""
     var buf = List[UInt8]()
 
@@ -321,7 +321,7 @@ fn test_mixed_naming() raises:
     print("  mixed_naming: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_gguf_names:")
 
     test_normalize_global_names()

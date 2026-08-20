@@ -14,7 +14,7 @@ Only supports the subset of JSON needed for SafeTensors:
 NOT a general-purpose JSON parser.
 """
 
-from collections import Dict
+from std.collections import Dict
 from neutron_mojo.io.safetensors import TensorInfo
 
 
@@ -27,13 +27,13 @@ struct StringParseResult(Movable):
     var value: String
     var pos: Int
 
-    fn __init__(out self, value: String, pos: Int):
+    def __init__(out self, value: String, pos: Int):
         self.value = value
         self.pos = pos
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.value = other.value^
-        self.pos = other.pos
+    def __init__(out self, *, deinit move: Self):
+        self.value = move.value^
+        self.pos = move.pos^
 
 
 struct IntParseResult(Movable):
@@ -41,13 +41,13 @@ struct IntParseResult(Movable):
     var value: Int
     var pos: Int
 
-    fn __init__(out self, value: Int, pos: Int):
+    def __init__(out self, value: Int, pos: Int):
         self.value = value
         self.pos = pos
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.value = other.value
-        self.pos = other.pos
+    def __init__(out self, *, deinit move: Self):
+        self.value = move.value^
+        self.pos = move.pos^
 
 
 struct IntArrayParseResult(Movable):
@@ -55,20 +55,20 @@ struct IntArrayParseResult(Movable):
     var values: List[Int]
     var pos: Int
 
-    fn __init__(out self, var values: List[Int], pos: Int):
+    def __init__(out self, var values: List[Int], pos: Int):
         self.values = values^
         self.pos = pos
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.values = other.values^
-        self.pos = other.pos
+    def __init__(out self, *, deinit move: Self):
+        self.values = move.values^
+        self.pos = move.pos^
 
 
 # ===----------------------------------------------------------------------=== #
 # JSON Primitives
 # ===----------------------------------------------------------------------=== #
 
-fn json_skip_whitespace(s: String, pos: Int) -> Int:
+def json_skip_whitespace(s: String, pos: Int) -> Int:
     """Skip whitespace characters (space, tab, newline, CR).
 
     Args:
@@ -79,7 +79,7 @@ fn json_skip_whitespace(s: String, pos: Int) -> Int:
         Position after whitespace.
     """
     var p = pos
-    var n = len(s)
+    var n = s.byte_length()
     while p < n:
         var c = ord(s[byte=p])
         if c == 32 or c == 9 or c == 10 or c == 13:  # space, tab, LF, CR
@@ -89,7 +89,7 @@ fn json_skip_whitespace(s: String, pos: Int) -> Int:
     return p
 
 
-fn json_parse_string(s: String, pos: Int) raises -> StringParseResult:
+def json_parse_string(s: String, pos: Int) raises -> StringParseResult:
     """Parse a JSON string starting at pos (must be at opening quote).
 
     Handles basic escapes: \\", \\\\, \\n, \\t
@@ -101,12 +101,12 @@ fn json_parse_string(s: String, pos: Int) raises -> StringParseResult:
     Returns:
         StringParseResult with value and position after closing quote.
     """
-    if pos >= len(s) or ord(s[byte=pos]) != 34:  # '"'
+    if pos >= s.byte_length() or ord(s[byte=pos]) != 34:  # '"'
         raise Error("Expected '\"' at position " + String(pos))
 
     var p = pos + 1
     var result = String("")
-    var n = len(s)
+    var n = s.byte_length()
 
     while p < n:
         var c = ord(s[byte=p])
@@ -135,7 +135,7 @@ fn json_parse_string(s: String, pos: Int) raises -> StringParseResult:
     raise Error("Unterminated string")
 
 
-fn json_parse_int(s: String, pos: Int) raises -> IntParseResult:
+def json_parse_int(s: String, pos: Int) raises -> IntParseResult:
     """Parse a JSON integer starting at pos.
 
     Args:
@@ -147,7 +147,7 @@ fn json_parse_int(s: String, pos: Int) raises -> IntParseResult:
     """
     var p = pos
     var negative = False
-    var n = len(s)
+    var n = s.byte_length()
 
     if p < n and ord(s[byte=p]) == 45:  # '-'
         negative = True
@@ -171,7 +171,7 @@ fn json_parse_int(s: String, pos: Int) raises -> IntParseResult:
     return IntParseResult(value, p)
 
 
-fn json_parse_int_array(s: String, pos: Int) raises -> IntArrayParseResult:
+def json_parse_int_array(s: String, pos: Int) raises -> IntArrayParseResult:
     """Parse a JSON integer array: [1, 2, 3]
 
     Args:
@@ -181,12 +181,12 @@ fn json_parse_int_array(s: String, pos: Int) raises -> IntArrayParseResult:
     Returns:
         IntArrayParseResult with values and position after closing bracket.
     """
-    if pos >= len(s) or ord(s[byte=pos]) != 91:  # '['
+    if pos >= s.byte_length() or ord(s[byte=pos]) != 91:  # '['
         raise Error("Expected '[' at position " + String(pos))
 
     var p = pos + 1
     var values = List[Int]()
-    var n = len(s)
+    var n = s.byte_length()
 
     p = json_skip_whitespace(s, p)
 
@@ -216,7 +216,7 @@ fn json_parse_int_array(s: String, pos: Int) raises -> IntArrayParseResult:
 # SafeTensors Header Parser
 # ===----------------------------------------------------------------------=== #
 
-fn _skip_json_value(s: String, pos: Int) raises -> Int:
+def _skip_json_value(s: String, pos: Int) raises -> Int:
     """Skip a JSON value (string, number, object, array, bool, null).
 
     Args:
@@ -227,7 +227,7 @@ fn _skip_json_value(s: String, pos: Int) raises -> Int:
         Position after the value.
     """
     var p = json_skip_whitespace(s, pos)
-    if p >= len(s):
+    if p >= s.byte_length():
         raise Error("Unexpected end of JSON")
 
     var c = ord(s[byte=p])
@@ -251,10 +251,10 @@ fn _skip_json_value(s: String, pos: Int) raises -> Int:
         raise Error("Unexpected character in JSON at " + String(p))
 
 
-fn _skip_json_object(s: String, pos: Int) raises -> Int:
+def _skip_json_object(s: String, pos: Int) raises -> Int:
     """Skip a JSON object {...}."""
     var p = pos + 1
-    var n = len(s)
+    var n = s.byte_length()
     p = json_skip_whitespace(s, p)
     if p < n and ord(s[byte=p]) == 125:  # '}'
         return p + 1
@@ -276,10 +276,10 @@ fn _skip_json_object(s: String, pos: Int) raises -> Int:
     raise Error("Unterminated object")
 
 
-fn _skip_json_array(s: String, pos: Int) raises -> Int:
+def _skip_json_array(s: String, pos: Int) raises -> Int:
     """Skip a JSON array [...]."""
     var p = pos + 1
-    var n = len(s)
+    var n = s.byte_length()
     p = json_skip_whitespace(s, p)
     if p < n and ord(s[byte=p]) == 93:  # ']'
         return p + 1
@@ -295,10 +295,10 @@ fn _skip_json_array(s: String, pos: Int) raises -> Int:
     raise Error("Unterminated array")
 
 
-fn _skip_json_number(s: String, pos: Int) -> Int:
+def _skip_json_number(s: String, pos: Int) -> Int:
     """Skip a JSON number (int or float)."""
     var p = pos
-    var n = len(s)
+    var n = s.byte_length()
     if p < n and ord(s[byte=p]) == 45:
         p += 1
     while p < n:
@@ -310,7 +310,7 @@ fn _skip_json_number(s: String, pos: Int) -> Int:
     return p
 
 
-fn parse_safetensors_header(json: String) raises -> Dict[String, TensorInfo]:
+def parse_safetensors_header(json: String) raises -> Dict[String, TensorInfo]:
     """Parse SafeTensors JSON header to extract tensor metadata.
 
     Expected format:
@@ -332,7 +332,7 @@ fn parse_safetensors_header(json: String) raises -> Dict[String, TensorInfo]:
     """
     var result = Dict[String, TensorInfo]()
     var p = json_skip_whitespace(json, 0)
-    var n = len(json)
+    var n = json.byte_length()
 
     if p >= n or ord(json[byte=p]) != 123:  # '{'
         raise Error("Expected '{' at start of header")
@@ -378,16 +378,16 @@ struct _TensorInfoParseResult(Movable):
     var info: TensorInfo
     var end_pos: Int
 
-    fn __init__(out self, var info: TensorInfo, end_pos: Int):
+    def __init__(out self, var info: TensorInfo, end_pos: Int):
         self.info = info^
         self.end_pos = end_pos
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.info = other.info^
-        self.end_pos = other.end_pos
+    def __init__(out self, *, deinit move: Self):
+        self.info = move.info^
+        self.end_pos = move.end_pos^
 
 
-fn _parse_tensor_info_object(
+def _parse_tensor_info_object(
     json: String, pos: Int
 ) raises -> _TensorInfoParseResult:
     """Parse a tensor info JSON object: {"dtype":"F32","shape":[...],"data_offsets":[...]}"""
@@ -398,7 +398,7 @@ fn _parse_tensor_info_object(
         raise Error("Expected '{' for tensor info")
     p += 1
 
-    var n = len(json)
+    var n = json.byte_length()
     while p < n:
         p = json_skip_whitespace(json, p)
         if ord(json[byte=p]) == 125:  # '}'
@@ -442,7 +442,7 @@ fn _parse_tensor_info_object(
 # Weight Map Parser (for model.safetensors.index.json)
 # ===----------------------------------------------------------------------=== #
 
-fn parse_weight_map(json: String) raises -> Dict[String, String]:
+def parse_weight_map(json: String) raises -> Dict[String, String]:
     """Parse a weight map JSON: {"weight_map": {"name": "shard_file", ...}}
 
     Extracts the weight_map object from a SafeTensors index JSON.
@@ -465,7 +465,7 @@ fn parse_weight_map(json: String) raises -> Dict[String, String]:
     """
     var result = Dict[String, String]()
     var p = json_skip_whitespace(json, 0)
-    var n = len(json)
+    var n = json.byte_length()
 
     if p >= n or ord(json[byte=p]) != 123:  # '{'
         raise Error("Expected '{' at start of index JSON")
@@ -504,7 +504,7 @@ fn parse_weight_map(json: String) raises -> Dict[String, String]:
     return result^
 
 
-fn _parse_string_dict(json: String, pos: Int) raises -> Dict[String, String]:
+def _parse_string_dict(json: String, pos: Int) raises -> Dict[String, String]:
     """Parse a JSON object of string->string pairs.
 
     Args:
@@ -516,7 +516,7 @@ fn _parse_string_dict(json: String, pos: Int) raises -> Dict[String, String]:
     """
     var result = Dict[String, String]()
     var p = pos
-    var n = len(json)
+    var n = json.byte_length()
 
     if p >= n or ord(json[byte=p]) != 123:  # '{'
         raise Error("Expected '{' for string dict")
@@ -551,7 +551,7 @@ fn _parse_string_dict(json: String, pos: Int) raises -> Dict[String, String]:
     return result^
 
 
-fn parse_config_json(json: String) raises -> Dict[String, Int]:
+def parse_config_json(json: String) raises -> Dict[String, Int]:
     """Parse a minimal HuggingFace config.json into string->int dict.
 
     Extracts only integer-valued fields (sufficient for model dimensions).
@@ -565,7 +565,7 @@ fn parse_config_json(json: String) raises -> Dict[String, Int]:
     """
     var result = Dict[String, Int]()
     var p = json_skip_whitespace(json, 0)
-    var n = len(json)
+    var n = json.byte_length()
 
     if p >= n or ord(json[byte=p]) != 123:
         raise Error("Expected '{' at start of config JSON")

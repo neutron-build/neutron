@@ -11,14 +11,14 @@ Sizes tested: 1K, 10K, 100K, 1M, 10M elements
 DType: float32 (Sprint 1 — CPU only)
 """
 
-from time import now
+from std.time import perf_counter_ns
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import add, mul
 
 
-fn bench_op(name: String, size: Int, warmup: Int = 2, iters: Int = 20) raises:
+def bench_op(name: String, size: Int, warmup: Int = 2, iters: Int = 20) raises:
     """Benchmark an elementwise op."""
     var a = Tensor[DType.float32].rand(Shape(size))
     var b = Tensor[DType.float32].rand(Shape(size))
@@ -30,9 +30,9 @@ fn bench_op(name: String, size: Int, warmup: Int = 2, iters: Int = 20) raises:
     # Timed iterations — add
     var total_ns: Int = 0
     for _ in range(iters):
-        var t0 = now()
+        var t0 = perf_counter_ns()
         var c = add(a, b)
-        var t1 = now()
+        var t1 = perf_counter_ns()
         total_ns += t1 - t0
 
     var avg_ms = Float64(total_ns) / Float64(iters) / 1_000_000.0
@@ -41,13 +41,13 @@ fn bench_op(name: String, size: Int, warmup: Int = 2, iters: Int = 20) raises:
     var gbps = bytes / (avg_ms / 1000.0) / 1e9
 
     print(
-        name + " n=" + str(size)
-        + ": " + str(avg_ms) + " ms"
-        + " (" + str(gbps) + " GB/s)"
+        name + " n=" + String(size)
+        + ": " + String(avg_ms) + " ms"
+        + " (" + String(gbps) + " GB/s)"
     )
 
 
-fn main() raises:
+def main() raises:
     print("=" * 60)
     print("Neutron Mojo — Elementwise Benchmark (CPU, float32)")
     print("=" * 60)

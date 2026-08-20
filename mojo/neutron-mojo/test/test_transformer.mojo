@@ -4,7 +4,7 @@
 
 """Tests for transformer block components."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.transformer import (
     linear,
     TransformerWeights,
@@ -16,19 +16,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_linear_identity() raises:
+def test_linear_identity() raises:
     """Test linear projection with identity matrix."""
     var x = Tensor[DType.float32](Shape(3))
     x.set(0, 1.0)
@@ -60,7 +60,7 @@ fn test_linear_identity() raises:
     print("  linear_identity: PASS")
 
 
-fn test_linear_projection() raises:
+def test_linear_projection() raises:
     """Test linear projection with known matrix."""
     var x = Tensor[DType.float32](Shape(2))
     x.set(0, 1.0)
@@ -87,7 +87,7 @@ fn test_linear_projection() raises:
     print("  linear_projection: PASS")
 
 
-fn test_transformer_weights_creation() raises:
+def test_transformer_weights_creation() raises:
     """Test TransformerWeights initialization."""
     var w = TransformerWeights(
         hidden_dim=8,
@@ -118,7 +118,7 @@ fn test_transformer_weights_creation() raises:
     print("  transformer_weights_creation: PASS")
 
 
-fn test_transformer_block_smoke() raises:
+def test_transformer_block_smoke() raises:
     """Smoke test: transformer block runs without error."""
     # Tiny model: hidden=4, 2 Q heads, 1 KV head, head_dim=2, ffn=8
     var hidden_dim = 4
@@ -174,7 +174,7 @@ fn test_transformer_block_smoke() raises:
     print("  transformer_block_smoke: PASS")
 
 
-fn test_transformer_block_residual() raises:
+def test_transformer_block_residual() raises:
     """Test that residual connections are working.
 
     With zero weights (except norms), output should equal input
@@ -215,7 +215,7 @@ fn test_transformer_block_residual() raises:
     print("  transformer_block_residual: PASS")
 
 
-fn test_transformer_block_sequential() raises:
+def test_transformer_block_sequential() raises:
     """Test running multiple tokens through a transformer block."""
     var hidden_dim = 4
     var num_q_heads = 2
@@ -272,7 +272,7 @@ fn test_transformer_block_sequential() raises:
     print("  transformer_block_sequential: PASS")
 
 
-fn test_linear_zero_weight() raises:
+def test_linear_zero_weight() raises:
     """Test linear with zero weight matrix."""
     var x = Tensor[DType.float32](Shape(3))
     x.set(0, 1.0)
@@ -290,7 +290,7 @@ fn test_linear_zero_weight() raises:
     print("  linear_zero_weight: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_transformer:")
 
     test_linear_identity()

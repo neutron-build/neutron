@@ -10,7 +10,7 @@ and returns an InferenceResponse with generated text and stats.
 Supports both FP32 Model and Q8 QuantizedModel inference.
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams
@@ -26,7 +26,7 @@ from neutron_mojo.nn.conversation import ConversationSession, conversation_gener
 # Request / Response
 # ===----------------------------------------------------------------------=== #
 
-struct InferenceRequest(Copyable, Movable):
+struct InferenceRequest(Copyable, Movable, ImplicitlyCopyable):
     """Inference request with all generation parameters."""
     var prompt: String
     var max_tokens: Int
@@ -41,7 +41,7 @@ struct InferenceRequest(Copyable, Movable):
     var use_q8_cache: Bool
     var request_id: String
 
-    fn __init__(out self):
+    def __init__(out self):
         self.prompt = String("")
         self.max_tokens = 128
         self.temperature = 1.0
@@ -55,7 +55,7 @@ struct InferenceRequest(Copyable, Movable):
         self.use_q8_cache = False
         self.request_id = String("")
 
-    fn __init__(out self, prompt: String):
+    def __init__(out self, prompt: String):
         self.prompt = prompt
         self.max_tokens = 128
         self.temperature = 1.0
@@ -69,35 +69,35 @@ struct InferenceRequest(Copyable, Movable):
         self.use_q8_cache = False
         self.request_id = String("")
 
-    fn __copyinit__(out self, existing: Self):
-        self.prompt = existing.prompt
-        self.max_tokens = existing.max_tokens
-        self.temperature = existing.temperature
-        self.top_k = existing.top_k
-        self.top_p = existing.top_p
-        self.repetition_penalty = existing.repetition_penalty
-        self.frequency_penalty = existing.frequency_penalty
-        self.presence_penalty = existing.presence_penalty
-        self.chat_template = existing.chat_template
-        self.system_prompt = existing.system_prompt
-        self.use_q8_cache = existing.use_q8_cache
-        self.request_id = existing.request_id
+    def __init__(out self, *, copy: Self):
+        self.prompt = copy.prompt
+        self.max_tokens = copy.max_tokens
+        self.temperature = copy.temperature
+        self.top_k = copy.top_k
+        self.top_p = copy.top_p
+        self.repetition_penalty = copy.repetition_penalty
+        self.frequency_penalty = copy.frequency_penalty
+        self.presence_penalty = copy.presence_penalty
+        self.chat_template = copy.chat_template
+        self.system_prompt = copy.system_prompt
+        self.use_q8_cache = copy.use_q8_cache
+        self.request_id = copy.request_id
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.prompt = other.prompt^
-        self.max_tokens = other.max_tokens
-        self.temperature = other.temperature
-        self.top_k = other.top_k
-        self.top_p = other.top_p
-        self.repetition_penalty = other.repetition_penalty
-        self.frequency_penalty = other.frequency_penalty
-        self.presence_penalty = other.presence_penalty
-        self.chat_template = other.chat_template^
-        self.system_prompt = other.system_prompt^
-        self.use_q8_cache = other.use_q8_cache
-        self.request_id = other.request_id^
+    def __init__(out self, *, deinit move: Self):
+        self.prompt = move.prompt^
+        self.max_tokens = move.max_tokens^
+        self.temperature = move.temperature^
+        self.top_k = move.top_k^
+        self.top_p = move.top_p^
+        self.repetition_penalty = move.repetition_penalty^
+        self.frequency_penalty = move.frequency_penalty^
+        self.presence_penalty = move.presence_penalty^
+        self.chat_template = move.chat_template^
+        self.system_prompt = move.system_prompt^
+        self.use_q8_cache = move.use_q8_cache^
+        self.request_id = move.request_id^
 
-    fn to_pipeline_config(self) -> PipelineConfig:
+    def to_pipeline_config(self) -> PipelineConfig:
         """Convert request parameters to PipelineConfig."""
         var cfg = PipelineConfig()
         cfg.max_new_tokens = self.max_tokens
@@ -117,7 +117,7 @@ struct InferenceRequest(Copyable, Movable):
         return cfg^
 
 
-struct InferenceResponse(Copyable, Movable):
+struct InferenceResponse(Copyable, Movable, ImplicitlyCopyable):
     """Inference response with generated text and performance stats."""
     var text: String
     var request_id: String
@@ -127,7 +127,7 @@ struct InferenceResponse(Copyable, Movable):
     var tokens_per_sec: Float64
     var error: String
 
-    fn __init__(out self):
+    def __init__(out self):
         self.text = String("")
         self.request_id = String("")
         self.tokens_generated = 0
@@ -136,30 +136,30 @@ struct InferenceResponse(Copyable, Movable):
         self.tokens_per_sec = 0.0
         self.error = String("")
 
-    fn __copyinit__(out self, existing: Self):
-        self.text = existing.text
-        self.request_id = existing.request_id
-        self.tokens_generated = existing.tokens_generated
-        self.prompt_tokens = existing.prompt_tokens
-        self.elapsed_ms = existing.elapsed_ms
-        self.tokens_per_sec = existing.tokens_per_sec
-        self.error = existing.error
+    def __init__(out self, *, copy: Self):
+        self.text = copy.text
+        self.request_id = copy.request_id
+        self.tokens_generated = copy.tokens_generated
+        self.prompt_tokens = copy.prompt_tokens
+        self.elapsed_ms = copy.elapsed_ms
+        self.tokens_per_sec = copy.tokens_per_sec
+        self.error = copy.error
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.text = other.text^
-        self.request_id = other.request_id^
-        self.tokens_generated = other.tokens_generated
-        self.prompt_tokens = other.prompt_tokens
-        self.elapsed_ms = other.elapsed_ms
-        self.tokens_per_sec = other.tokens_per_sec
-        self.error = other.error^
+    def __init__(out self, *, deinit move: Self):
+        self.text = move.text^
+        self.request_id = move.request_id^
+        self.tokens_generated = move.tokens_generated^
+        self.prompt_tokens = move.prompt_tokens^
+        self.elapsed_ms = move.elapsed_ms^
+        self.tokens_per_sec = move.tokens_per_sec^
+        self.error = move.error^
 
-    fn is_error(self) -> Bool:
+    def is_error(self) -> Bool:
         """Check if response contains an error."""
-        return len(self.error) > 0
+        return self.error.byte_length() > 0
 
 
-fn make_success_response(text: String, request_id: String, tokens: Int,
+def make_success_response(text: String, request_id: String, tokens: Int,
                          prompt_tokens: Int, elapsed_ms: Int,
                          tps: Float64) -> InferenceResponse:
     """Create a successful response."""
@@ -173,7 +173,7 @@ fn make_success_response(text: String, request_id: String, tokens: Int,
     return resp^
 
 
-fn make_error_response(msg: String, request_id: String) -> InferenceResponse:
+def make_error_response(msg: String, request_id: String) -> InferenceResponse:
     """Create an error response."""
     var resp = InferenceResponse()
     resp.error = msg
@@ -185,7 +185,7 @@ fn make_error_response(msg: String, request_id: String) -> InferenceResponse:
 # FP32 Handler
 # ===----------------------------------------------------------------------=== #
 
-fn handle_inference_request(
+def handle_inference_request(
     model: Model,
     tokenizer: BPETokenizer,
     request: InferenceRequest,
@@ -226,7 +226,7 @@ fn handle_inference_request(
 # Q8 Handler
 # ===----------------------------------------------------------------------=== #
 
-fn handle_q8_inference_request(
+def handle_q8_inference_request(
     model: QuantizedModel,
     tokenizer: BPETokenizer,
     request: InferenceRequest,
@@ -266,7 +266,7 @@ fn handle_q8_inference_request(
 # Batch Handler
 # ===----------------------------------------------------------------------=== #
 
-fn handle_batch_requests(
+def handle_batch_requests(
     model: Model,
     tokenizer: BPETokenizer,
     requests: List[InferenceRequest],
@@ -290,7 +290,7 @@ fn handle_batch_requests(
     return responses^
 
 
-fn handle_q8_batch_requests(
+def handle_q8_batch_requests(
     model: QuantizedModel,
     tokenizer: BPETokenizer,
     requests: List[InferenceRequest],
@@ -318,7 +318,7 @@ fn handle_q8_batch_requests(
 # Conversation Handler
 # ===----------------------------------------------------------------------=== #
 
-fn handle_conversation_request(
+def handle_conversation_request(
     model: Model,
     tokenizer: BPETokenizer,
     mut session: ConversationSession,

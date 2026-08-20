@@ -7,7 +7,7 @@
 Tests the full stack: embedding → RoPE → attention → transformer → generate.
 """
 
-from math import abs, sqrt, sin, cos, exp
+from std.math import abs, sqrt, sin, cos, exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import rmsnorm
@@ -30,19 +30,19 @@ from neutron_mojo.nn.causal_lm import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_rope_to_attention_pipeline() raises:
+def test_rope_to_attention_pipeline() raises:
     """Test RoPE rotation feeds correctly into attention."""
     var head_dim = 4
     var num_kv_heads = 1
@@ -79,7 +79,7 @@ fn test_rope_to_attention_pipeline() raises:
     print("  rope_to_attention_pipeline: PASS")
 
 
-fn test_multi_layer_kv_cache_with_attention() raises:
+def test_multi_layer_kv_cache_with_attention() raises:
     """Test MultiLayerKVCache works with attention across layers."""
     var head_dim = 2
     var num_kv_heads = 1
@@ -114,7 +114,7 @@ fn test_multi_layer_kv_cache_with_attention() raises:
     print("  multi_layer_kv_cache_with_attention: PASS")
 
 
-fn test_transformer_block_with_rope_position() raises:
+def test_transformer_block_with_rope_position() raises:
     """Test transformer block applies RoPE at correct positions."""
     var hidden_dim = 4
     var num_q_heads = 2
@@ -145,7 +145,7 @@ fn test_transformer_block_with_rope_position() raises:
     print("  transformer_block_with_rope_position: PASS")
 
 
-fn test_full_forward_pass_consistency() raises:
+def test_full_forward_pass_consistency() raises:
     """Test that a full forward pass produces consistent results."""
     var model = CausalLMWeights(
         num_layers=1,
@@ -181,7 +181,7 @@ fn test_full_forward_pass_consistency() raises:
     print("  full_forward_pass_consistency: PASS")
 
 
-fn test_rmsnorm_to_linear_pipeline() raises:
+def test_rmsnorm_to_linear_pipeline() raises:
     """Test RMSNorm → Linear projection pipeline."""
     var x = Tensor[DType.float32](Shape(4))
     x.set(0, 2.0)
@@ -213,7 +213,7 @@ fn test_rmsnorm_to_linear_pipeline() raises:
     print("  rmsnorm_to_linear_pipeline: PASS")
 
 
-fn test_gqa_with_different_group_sizes() raises:
+def test_gqa_with_different_group_sizes() raises:
     """Test GQA with group_size=1 (MHA), 2, and 4."""
     var head_dim = 2
 
@@ -251,7 +251,7 @@ fn test_gqa_with_different_group_sizes() raises:
     print("  gqa_with_different_group_sizes: PASS")
 
 
-fn test_kv_cache_grows_through_generation() raises:
+def test_kv_cache_grows_through_generation() raises:
     """Test that KV cache length increases during generation."""
     var model = CausalLMWeights(
         num_layers=1,
@@ -278,7 +278,7 @@ fn test_kv_cache_grows_through_generation() raises:
     print("  kv_cache_grows_through_generation: PASS")
 
 
-fn test_softmax_with_attention_scores() raises:
+def test_softmax_with_attention_scores() raises:
     """Test softmax applied to realistic attention score patterns."""
     # Simulate attention scores where one key matches strongly
     var scores = Tensor[DType.float32](Shape(4))
@@ -305,7 +305,7 @@ fn test_softmax_with_attention_scores() raises:
     print("  softmax_with_attention_scores: PASS")
 
 
-fn test_embedding_to_logit_roundtrip() raises:
+def test_embedding_to_logit_roundtrip() raises:
     """Test embed → process → logits → argmax roundtrip."""
     var vocab_size = 4
     var hidden_dim = 2
@@ -344,7 +344,7 @@ fn test_embedding_to_logit_roundtrip() raises:
     print("  embedding_to_logit_roundtrip: PASS")
 
 
-fn test_temperature_affects_generation() raises:
+def test_temperature_affects_generation() raises:
     """Test that temperature changes sampling distribution."""
     var logits = Tensor[DType.float32](Shape(4))
     logits.set(0, 1.0)
@@ -374,7 +374,7 @@ fn test_temperature_affects_generation() raises:
     print("  temperature_affects_generation: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sprint3_integration:")
 
     test_rope_to_attention_pipeline()

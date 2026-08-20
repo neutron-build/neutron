@@ -14,7 +14,7 @@ Architecture:
     3. Combine: weighted sum of selected expert outputs
 """
 
-from math import exp
+from std.math import exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.simd_math import simd_dot, simd_matvec, simd_swiglu
@@ -24,30 +24,30 @@ from neutron_mojo.tensor.simd_math import simd_dot, simd_matvec, simd_swiglu
 # MoE Configuration
 # ===----------------------------------------------------------------------=== #
 
-struct MoEConfig(Copyable, Movable):
+struct MoEConfig(Copyable, Movable, ImplicitlyCopyable):
     """Configuration for Mixture of Experts layer."""
     var num_experts: Int        # Total number of experts (e.g., 8)
     var top_k: Int              # Experts per token (e.g., 2)
     var hidden_dim: Int         # Input/output dimension
     var expert_dim: Int         # Expert FFN intermediate dimension
 
-    fn __init__(out self, num_experts: Int, top_k: Int, hidden_dim: Int, expert_dim: Int):
+    def __init__(out self, num_experts: Int, top_k: Int, hidden_dim: Int, expert_dim: Int):
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_dim = hidden_dim
         self.expert_dim = expert_dim
 
-    fn __copyinit__(out self, existing: Self):
-        self.num_experts = existing.num_experts
-        self.top_k = existing.top_k
-        self.hidden_dim = existing.hidden_dim
-        self.expert_dim = existing.expert_dim
+    def __init__(out self, *, copy: Self):
+        self.num_experts = copy.num_experts
+        self.top_k = copy.top_k
+        self.hidden_dim = copy.hidden_dim
+        self.expert_dim = copy.expert_dim
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.num_experts = other.num_experts
-        self.top_k = other.top_k
-        self.hidden_dim = other.hidden_dim
-        self.expert_dim = other.expert_dim
+    def __init__(out self, *, deinit move: Self):
+        self.num_experts = move.num_experts^
+        self.top_k = move.top_k^
+        self.hidden_dim = move.hidden_dim^
+        self.expert_dim = move.expert_dim^
 
 
 # ===----------------------------------------------------------------------=== #
@@ -65,19 +65,19 @@ struct MoERouter(Movable):
     var top_k: Int
     var hidden_dim: Int
 
-    fn __init__(out self, num_experts: Int, top_k: Int, hidden_dim: Int):
+    def __init__(out self, num_experts: Int, top_k: Int, hidden_dim: Int):
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_dim = hidden_dim
         self.gate_weight = Tensor[DType.float32](Shape(num_experts * hidden_dim))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.gate_weight = other.gate_weight^
-        self.num_experts = other.num_experts
-        self.top_k = other.top_k
-        self.hidden_dim = other.hidden_dim
+    def __init__(out self, *, deinit move: Self):
+        self.gate_weight = move.gate_weight^
+        self.num_experts = move.num_experts^
+        self.top_k = move.top_k^
+        self.hidden_dim = move.hidden_dim^
 
-    fn route(self, x: Tensor[DType.float32]) -> RoutingResult:
+    def route(self, x: Tensor[DType.float32]) -> RoutingResult:
         """Compute routing for a single token.
 
         Args:
@@ -136,7 +136,7 @@ struct RoutingResult(Movable):
     var expert_weights: Tensor[DType.float32]  # [top_k] — softmax weights
     var top_k: Int
 
-    fn __init__(
+    def __init__(
         out self,
         var expert_indices: Tensor[DType.float32],
         var expert_weights: Tensor[DType.float32],
@@ -146,16 +146,16 @@ struct RoutingResult(Movable):
         self.expert_weights = expert_weights^
         self.top_k = top_k
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.expert_indices = other.expert_indices^
-        self.expert_weights = other.expert_weights^
-        self.top_k = other.top_k
+    def __init__(out self, *, deinit move: Self):
+        self.expert_indices = move.expert_indices^
+        self.expert_weights = move.expert_weights^
+        self.top_k = move.top_k^
 
-    fn get_expert_id(self, k: Int) -> Int:
+    def get_expert_id(self, k: Int) -> Int:
         """Get the expert index for the k-th selected expert."""
         return Int(self.expert_indices.get(k))
 
-    fn get_weight(self, k: Int) -> Float32:
+    def get_weight(self, k: Int) -> Float32:
         """Get the routing weight for the k-th selected expert."""
         return self.expert_weights.get(k)
 
@@ -176,7 +176,7 @@ struct ExpertWeights(Movable):
     var expert_dim: Int
     var expert_stride: Int  # Elements per expert
 
-    fn __init__(out self, num_experts: Int, hidden_dim: Int, expert_dim: Int):
+    def __init__(out self, num_experts: Int, hidden_dim: Int, expert_dim: Int):
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.expert_dim = expert_dim
@@ -184,27 +184,27 @@ struct ExpertWeights(Movable):
         self.expert_stride = expert_dim * hidden_dim * 2 + hidden_dim * expert_dim
         self.data = Tensor[DType.float32](Shape(num_experts * self.expert_stride))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data = other.data^
-        self.num_experts = other.num_experts
-        self.hidden_dim = other.hidden_dim
-        self.expert_dim = other.expert_dim
-        self.expert_stride = other.expert_stride
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
+        self.num_experts = move.num_experts^
+        self.hidden_dim = move.hidden_dim^
+        self.expert_dim = move.expert_dim^
+        self.expert_stride = move.expert_stride^
 
-    fn gate_offset(self, expert: Int) -> Int:
+    def gate_offset(self, expert: Int) -> Int:
         """Offset of gate weights for an expert."""
         return expert * self.expert_stride
 
-    fn up_offset(self, expert: Int) -> Int:
+    def up_offset(self, expert: Int) -> Int:
         """Offset of up-projection weights for an expert."""
         return expert * self.expert_stride + self.expert_dim * self.hidden_dim
 
-    fn down_offset(self, expert: Int) -> Int:
+    def down_offset(self, expert: Int) -> Int:
         """Offset of down-projection weights for an expert."""
         return expert * self.expert_stride + self.expert_dim * self.hidden_dim * 2
 
 
-fn expert_ffn(
+def expert_ffn(
     x: Tensor[DType.float32],
     weights: ExpertWeights,
     expert_id: Int,
@@ -245,7 +245,7 @@ fn expert_ffn(
 # MoE Layer
 # ===----------------------------------------------------------------------=== #
 
-fn moe_forward(
+def moe_forward(
     x: Tensor[DType.float32],
     router: MoERouter,
     expert_weights: ExpertWeights,
@@ -281,7 +281,7 @@ fn moe_forward(
     return output^
 
 
-fn compute_load_balance_loss(
+def compute_load_balance_loss(
     routing_counts: Tensor[DType.float32],
     num_experts: Int,
     num_tokens: Int,

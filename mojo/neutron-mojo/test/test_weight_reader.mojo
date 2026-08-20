@@ -4,7 +4,7 @@
 
 """Tests for loading tensor data from GGUF files into Model."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.io.binary_reader import BinaryReader
@@ -30,12 +30,12 @@ from neutron_mojo.model.weight_reader import (
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -43,7 +43,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
         )
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg
@@ -51,7 +51,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
         )
 
 
-fn test_read_tensor_f32() raises:
+def test_read_tensor_f32() raises:
     """Test reading F32 tensor from raw bytes."""
     var buf = List[UInt8]()
     # Write 3 floats: 1.0, 2.0, 3.0
@@ -68,7 +68,7 @@ fn test_read_tensor_f32() raises:
     print("  read_tensor_f32: PASS")
 
 
-fn test_read_tensor_f16() raises:
+def test_read_tensor_f16() raises:
     """Test reading FP16 tensor and converting to F32."""
     var buf = List[UInt8]()
     # FP16 1.0 = 0x3C00
@@ -90,7 +90,7 @@ fn test_read_tensor_f16() raises:
 # Helper: build a tiny GGUF with actual float data
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_gguf_with_data() raises -> List[UInt8]:
+def _build_tiny_gguf_with_data() raises -> List[UInt8]:
     """Build a GGUF with tiny model weights (vocab=8, hidden=4, 2 layers).
 
     Weight layout matches tiny_test_params():
@@ -190,7 +190,7 @@ fn _build_tiny_gguf_with_data() raises -> List[UInt8]:
     return buf^
 
 
-fn test_load_gguf_model_from_buffer() raises:
+def test_load_gguf_model_from_buffer() raises:
     """Test loading a model from a synthetic GGUF buffer."""
     var buf = _build_tiny_gguf_with_data()
 
@@ -215,7 +215,7 @@ fn test_load_gguf_model_from_buffer() raises:
     print("  load_gguf_model_from_buffer: PASS")
 
 
-fn test_loaded_model_generates() raises:
+def test_loaded_model_generates() raises:
     """Test that a loaded model can generate tokens without crashing."""
     var buf = _build_tiny_gguf_with_data()
     var model = load_gguf_model_from_buffer(buf^)
@@ -233,7 +233,7 @@ fn test_loaded_model_generates() raises:
     print("  loaded_model_generates: PASS")
 
 
-fn test_embed_weight_values() raises:
+def test_embed_weight_values() raises:
     """Test that specific weight values match what was written."""
     var buf = _build_tiny_gguf_with_data()
     var model = load_gguf_model_from_buffer(buf^)
@@ -249,7 +249,7 @@ fn test_embed_weight_values() raises:
     print("  embed_weight_values: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_weight_reader:")
 
     test_read_tensor_f32()

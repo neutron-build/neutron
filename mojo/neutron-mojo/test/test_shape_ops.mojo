@@ -17,7 +17,7 @@ from neutron_mojo.tensor.shape_ops import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
@@ -26,19 +26,19 @@ fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e
         )
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn _idx2(r: Int, c: Int) -> List[Int]:
+def _idx2(r: Int, c: Int) -> List[Int]:
     var l = List[Int]()
     l.append(r)
     l.append(c)
     return l^
 
 
-fn test_concat2_1d() raises:
+def test_concat2_1d() raises:
     """Concatenate two 1D tensors."""
     var a = Tensor[DType.float32](3)
     a.set(0, 1.0)
@@ -55,7 +55,7 @@ fn test_concat2_1d() raises:
     print("  concat2_1d: PASS")
 
 
-fn test_concat2_2d_dim0() raises:
+def test_concat2_2d_dim0() raises:
     """Concatenate two 2D tensors along rows."""
     var a = Tensor[DType.float32](2, 3)
     a.set(_idx2(0, 0), Float32(1.0))
@@ -70,7 +70,7 @@ fn test_concat2_2d_dim0() raises:
     print("  concat2_2d_dim0: PASS")
 
 
-fn test_concat3() raises:
+def test_concat3() raises:
     """Concatenate three 1D tensors."""
     var a = Tensor[DType.float32](2)
     a.set(0, 1.0)
@@ -87,7 +87,7 @@ fn test_concat3() raises:
     print("  concat3: PASS")
 
 
-fn test_split2_1d() raises:
+def test_split2_1d() raises:
     """Split a 1D tensor into two parts."""
     var x = Tensor[DType.float32](5)
     x.set(0, 1.0)
@@ -103,7 +103,7 @@ fn test_split2_1d() raises:
     print("  split2_1d: PASS")
 
 
-fn test_split2_2d() raises:
+def test_split2_2d() raises:
     """Split a 2D tensor along rows."""
     var x = Tensor[DType.float32](4, 2)
     for i in range(8):
@@ -116,7 +116,7 @@ fn test_split2_2d() raises:
     print("  split2_2d: PASS")
 
 
-fn test_squeeze() raises:
+def test_squeeze() raises:
     """Remove size-1 dimension."""
     var x = Tensor[DType.float32](3, 1)
     x.set(_idx2(0, 0), Float32(1.0))
@@ -130,7 +130,7 @@ fn test_squeeze() raises:
     print("  squeeze: PASS")
 
 
-fn test_unsqueeze() raises:
+def test_unsqueeze() raises:
     """Insert size-1 dimension."""
     var x = Tensor[DType.float32](3)
     x.set(0, 1.0)
@@ -144,7 +144,7 @@ fn test_unsqueeze() raises:
     print("  unsqueeze: PASS")
 
 
-fn test_flatten() raises:
+def test_flatten() raises:
     """Flatten 2D to 1D."""
     var x = Tensor[DType.float32](2, 3)
     for i in range(6):
@@ -157,7 +157,7 @@ fn test_flatten() raises:
     print("  flatten: PASS")
 
 
-fn test_arange() raises:
+def test_arange() raises:
     """Create range tensor."""
     var out = arange[DType.float32](0.0, 5.0, 1.0)
     assert_eq(out.numel(), 5)
@@ -166,7 +166,7 @@ fn test_arange() raises:
     print("  arange: PASS")
 
 
-fn test_linspace() raises:
+def test_linspace() raises:
     """Create linspace tensor."""
     var out = linspace[DType.float32](0.0, 1.0, 5)
     assert_eq(out.numel(), 5)
@@ -176,7 +176,7 @@ fn test_linspace() raises:
     print("  linspace: PASS")
 
 
-fn test_eye() raises:
+def test_eye() raises:
     """Create identity matrix."""
     var out = eye[DType.float32](3)
     assert_eq(out.shape()[0], 3)
@@ -188,7 +188,7 @@ fn test_eye() raises:
     print("  eye: PASS")
 
 
-fn test_tril() raises:
+def test_tril() raises:
     """Lower triangular mask."""
     var x = Tensor[DType.float32].ones(Shape(3, 3))
     var out = tril(x)
@@ -201,7 +201,7 @@ fn test_tril() raises:
     print("  tril: PASS")
 
 
-fn test_triu() raises:
+def test_triu() raises:
     """Upper triangular mask."""
     var x = Tensor[DType.float32].ones(Shape(3, 3))
     var out = triu(x)
@@ -213,7 +213,7 @@ fn test_triu() raises:
     print("  triu: PASS")
 
 
-fn test_sort_ascending() raises:
+def test_sort_ascending() raises:
     """Sort ascending."""
     var x = Tensor[DType.float32](5)
     x.set(0, 3.0)
@@ -229,7 +229,7 @@ fn test_sort_ascending() raises:
     print("  sort_ascending: PASS")
 
 
-fn test_sort_descending() raises:
+def test_sort_descending() raises:
     """Sort descending."""
     var x = Tensor[DType.float32](4)
     x.set(0, 1.0)
@@ -242,7 +242,7 @@ fn test_sort_descending() raises:
     print("  sort_descending: PASS")
 
 
-fn test_argsort() raises:
+def test_argsort() raises:
     """Argsort returns indices."""
     var x = Tensor[DType.float32](3)
     x.set(0, 3.0)
@@ -255,7 +255,7 @@ fn test_argsort() raises:
     print("  argsort: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_shape_ops:")
     test_concat2_1d()
     test_concat2_2d_dim0()

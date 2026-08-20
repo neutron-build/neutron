@@ -31,42 +31,42 @@ from .rules import RuleSet
 # TensorValue — Wraps a Tensor with shape metadata for the executor
 # ===----------------------------------------------------------------------=== #
 
-struct TensorValue(Copyable, Movable):
+struct TensorValue(Copyable, Movable, ImplicitlyCopyable):
     """Tensor with shape metadata for graph execution."""
     var data: Tensor[DType.float32]
     var rows: Int
     var cols: Int
 
-    fn __init__(out self, var data: Tensor[DType.float32], rows: Int, cols: Int):
+    def __init__(out self, var data: Tensor[DType.float32], rows: Int, cols: Int):
         self.data = data^
         self.rows = rows
         self.cols = cols
 
-    fn __init__(out self, var data: Tensor[DType.float32]):
+    def __init__(out self, var data: Tensor[DType.float32]):
         """Create a 1D TensorValue (vector)."""
         var n = data.numel()
         self.data = data^
         self.rows = 1
         self.cols = n
 
-    fn __copyinit__(out self, existing: Self):
-        var n = existing.data.numel()
-        var t = Tensor[DType.float32](existing.data.shape())
+    def __init__(out self, *, copy: Self):
+        var n = copy.data.numel()
+        var t = Tensor[DType.float32](copy.data.shape())
         for i in range(n):
-            t.set(i, existing.data.get(i))
+            t.set(i, copy.data.get(i))
         self.data = t^
-        self.rows = existing.rows
-        self.cols = existing.cols
+        self.rows = copy.rows
+        self.cols = copy.cols
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data = other.data^
-        self.rows = other.rows
-        self.cols = other.cols
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
+        self.rows = move.rows^
+        self.cols = move.cols^
 
-    fn numel(self) -> Int:
+    def numel(self) -> Int:
         return self.data.numel()
 
-    fn copy(self) -> TensorValue:
+    def copy(self) -> TensorValue:
         """Return a deep copy."""
         var t = Tensor[DType.float32](self.data.shape())
         var n = self.data.numel()
@@ -79,7 +79,7 @@ struct TensorValue(Copyable, Movable):
 # Helper: elementwise ops via get/set (safe against data_ptr aliasing)
 # ===----------------------------------------------------------------------=== #
 
-fn _elementwise_add(
+def _elementwise_add(
     a: Tensor[DType.float32],
     b: Tensor[DType.float32],
     n: Int,
@@ -90,7 +90,7 @@ fn _elementwise_add(
     return out^
 
 
-fn _elementwise_mul(
+def _elementwise_mul(
     a: Tensor[DType.float32],
     b: Tensor[DType.float32],
     n: Int,
@@ -109,10 +109,10 @@ struct GraphExecutor:
     """Executes a ComputationGraph by walking nodes in order."""
     var _state: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self._state = 0
 
-    fn execute(
+    def execute(
         self,
         graph: ComputationGraph,
         inputs: List[TensorValue],
@@ -216,7 +216,7 @@ struct GraphExecutor:
 # Convenience: optimize then execute
 # ===----------------------------------------------------------------------=== #
 
-fn optimize_and_execute(
+def optimize_and_execute(
     graph: ComputationGraph,
     inputs: List[TensorValue],
     ruleset: RuleSet,

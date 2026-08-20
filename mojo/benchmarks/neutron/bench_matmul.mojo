@@ -11,14 +11,14 @@ Sizes tested: 128, 256, 512, 1024, 2048, 4096
 DType: float32 (Sprint 1 — CPU only)
 """
 
-from time import now
+from std.time import perf_counter_ns
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import matmul
 
 
-fn bench_matmul(M: Int, K: Int, N: Int, warmup: Int = 2, iters: Int = 10) raises:
+def bench_matmul(M: Int, K: Int, N: Int, warmup: Int = 2, iters: Int = 10) raises:
     """Benchmark matmul at a given size."""
     var a = Tensor[DType.float32].rand(Shape(M, K))
     var b = Tensor[DType.float32].rand(Shape(K, N))
@@ -30,9 +30,9 @@ fn bench_matmul(M: Int, K: Int, N: Int, warmup: Int = 2, iters: Int = 10) raises
     # Timed iterations
     var total_ns: Int = 0
     for _ in range(iters):
-        var t0 = now()
+        var t0 = perf_counter_ns()
         var c = matmul(a, b)
-        var t1 = now()
+        var t1 = perf_counter_ns()
         total_ns += t1 - t0
 
     var avg_ms = Float64(total_ns) / Float64(iters) / 1_000_000.0
@@ -40,13 +40,13 @@ fn bench_matmul(M: Int, K: Int, N: Int, warmup: Int = 2, iters: Int = 10) raises
     var gflops = flops / (avg_ms / 1000.0) / 1e9
 
     print(
-        str(M) + "x" + str(K) + " @ " + str(K) + "x" + str(N)
-        + ": " + str(avg_ms) + " ms"
-        + " (" + str(gflops) + " GFLOPS)"
+        String(M) + "x" + String(K) + " @ " + String(K) + "x" + String(N)
+        + ": " + String(avg_ms) + " ms"
+        + " (" + String(gflops) + " GFLOPS)"
     )
 
 
-fn main() raises:
+def main() raises:
     print("=" * 60)
     print("Neutron Mojo — Matmul Benchmark (CPU, float32)")
     print("=" * 60)

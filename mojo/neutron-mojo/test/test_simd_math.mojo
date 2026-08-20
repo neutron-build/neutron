@@ -8,7 +8,7 @@ Each test verifies that the SIMD implementation produces identical results
 to a naive scalar reference. This ensures correctness before wiring into nn/.
 """
 
-from math import abs, exp, sqrt
+from std.math import abs, exp, sqrt
 from neutron_mojo.tensor.simd_math import (
     simd_dot,
     simd_matvec,
@@ -23,12 +23,12 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
@@ -39,14 +39,14 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Scalar references for validation
 # ===----------------------------------------------------------------------=== #
 
-fn scalar_dot(a: Tensor[DType.float32], a_off: Int, b: Tensor[DType.float32], b_off: Int, n: Int) -> Float32:
+def scalar_dot(a: Tensor[DType.float32], a_off: Int, b: Tensor[DType.float32], b_off: Int, n: Int) -> Float32:
     var result: Float32 = 0.0
     for i in range(n):
         result += a.get(a_off + i) * b.get(b_off + i)
     return result
 
 
-fn scalar_matvec(
+def scalar_matvec(
     mut out: Tensor[DType.float32], o_off: Int,
     w: Tensor[DType.float32], w_off: Int,
     x: Tensor[DType.float32], x_off: Int,
@@ -63,7 +63,7 @@ fn scalar_matvec(
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_simd_dot_basic() raises:
+def test_simd_dot_basic() raises:
     """Test SIMD dot product with known values."""
     var a = Tensor[DType.float32](Shape(4))
     var b = Tensor[DType.float32](Shape(4))
@@ -83,7 +83,7 @@ fn test_simd_dot_basic() raises:
     print("  simd_dot_basic: PASS")
 
 
-fn test_simd_dot_large() raises:
+def test_simd_dot_large() raises:
     """Test SIMD dot vs scalar on large vector (exercises SIMD + tail)."""
     var n = 257  # Not a multiple of any SIMD width
     var a = Tensor[DType.float32](Shape(n))
@@ -99,7 +99,7 @@ fn test_simd_dot_large() raises:
     print("  simd_dot_large: PASS")
 
 
-fn test_simd_dot_with_offset() raises:
+def test_simd_dot_with_offset() raises:
     """Test SIMD dot product with non-zero offsets."""
     var a = Tensor[DType.float32](Shape(10))
     var b = Tensor[DType.float32](Shape(10))
@@ -115,7 +115,7 @@ fn test_simd_dot_with_offset() raises:
     print("  simd_dot_with_offset: PASS")
 
 
-fn test_simd_matvec_basic() raises:
+def test_simd_matvec_basic() raises:
     """Test SIMD matvec with identity-like matrix."""
     # 2x3 matrix: [[1,0,0],[0,1,0]]
     var w = Tensor[DType.float32](Shape(6))
@@ -135,7 +135,7 @@ fn test_simd_matvec_basic() raises:
     print("  simd_matvec_basic: PASS")
 
 
-fn test_simd_matvec_large() raises:
+def test_simd_matvec_large() raises:
     """Test SIMD matvec vs scalar on realistic sizes."""
     var rows = 64
     var cols = 128
@@ -159,7 +159,7 @@ fn test_simd_matvec_large() raises:
     print("  simd_matvec_large: PASS")
 
 
-fn test_simd_matvec_with_offset() raises:
+def test_simd_matvec_with_offset() raises:
     """Test SIMD matvec with weight offset (like flat layer storage)."""
     # Simulate: weights at offset 100 in a large flat tensor
     var total = 200
@@ -190,7 +190,7 @@ fn test_simd_matvec_with_offset() raises:
     print("  simd_matvec_with_offset: PASS")
 
 
-fn test_simd_rmsnorm() raises:
+def test_simd_rmsnorm() raises:
     """Test SIMD RMSNorm matches manual computation."""
     var n = 4
     var x = Tensor[DType.float32](Shape(n))
@@ -219,7 +219,7 @@ fn test_simd_rmsnorm() raises:
     print("  simd_rmsnorm: PASS")
 
 
-fn test_simd_rmsnorm_with_scale() raises:
+def test_simd_rmsnorm_with_scale() raises:
     """Test RMSNorm with non-unit scale weights."""
     var n = 3
     var x = Tensor[DType.float32](Shape(n))
@@ -243,7 +243,7 @@ fn test_simd_rmsnorm_with_scale() raises:
     print("  simd_rmsnorm_with_scale: PASS")
 
 
-fn test_simd_softmax() raises:
+def test_simd_softmax() raises:
     """Test SIMD softmax produces valid probability distribution."""
     var n = 4
     var x = Tensor[DType.float32](Shape(n))
@@ -267,7 +267,7 @@ fn test_simd_softmax() raises:
     print("  simd_softmax: PASS")
 
 
-fn test_simd_softmax_stability() raises:
+def test_simd_softmax_stability() raises:
     """Test softmax numerical stability with large values."""
     var n = 3
     var x = Tensor[DType.float32](Shape(n))
@@ -285,7 +285,7 @@ fn test_simd_softmax_stability() raises:
     print("  simd_softmax_stability: PASS")
 
 
-fn test_simd_silu() raises:
+def test_simd_silu() raises:
     """Test SiLU activation."""
     var n = 4
     var x = Tensor[DType.float32](Shape(n))
@@ -307,7 +307,7 @@ fn test_simd_silu() raises:
     print("  simd_silu: PASS")
 
 
-fn test_simd_swiglu() raises:
+def test_simd_swiglu() raises:
     """Test fused SwiGLU: silu(gate) * up."""
     var n = 3
     var gate = Tensor[DType.float32](Shape(n))
@@ -331,7 +331,7 @@ fn test_simd_swiglu() raises:
     print("  simd_swiglu: PASS")
 
 
-fn test_simd_axpy() raises:
+def test_simd_axpy() raises:
     """Test BLAS-style axpy: y += alpha * x."""
     var n = 5
     var y = Tensor[DType.float32](Shape(n))
@@ -349,7 +349,7 @@ fn test_simd_axpy() raises:
     print("  simd_axpy: PASS")
 
 
-fn test_simd_axpy_large() raises:
+def test_simd_axpy_large() raises:
     """Test axpy on large vector with SIMD tail handling."""
     var n = 259
     var y = Tensor[DType.float32](Shape(n))
@@ -367,7 +367,7 @@ fn test_simd_axpy_large() raises:
     print("  simd_axpy_large: PASS")
 
 
-fn test_simd_dot_4096() raises:
+def test_simd_dot_4096() raises:
     """Test dot product at transformer scale (4096-dim)."""
     var n = 4096
     var a = Tensor[DType.float32](Shape(n))
@@ -383,7 +383,7 @@ fn test_simd_dot_4096() raises:
     print("  simd_dot_4096: PASS")
 
 
-fn test_simd_matvec_4096() raises:
+def test_simd_matvec_4096() raises:
     """Test matvec at transformer scale (32x4096)."""
     var rows = 32
     var cols = 4096
@@ -406,7 +406,7 @@ fn test_simd_matvec_4096() raises:
     print("  simd_matvec_4096: PASS")
 
 
-fn test_par_simd_matvec() raises:
+def test_par_simd_matvec() raises:
     """Test parallel matvec matches sequential."""
     var rows = 256
     var cols = 512
@@ -429,7 +429,7 @@ fn test_par_simd_matvec() raises:
     print("  par_simd_matvec: PASS")
 
 
-fn test_par_simd_matvec_small() raises:
+def test_par_simd_matvec_small() raises:
     """Test parallel matvec falls back to sequential for small inputs."""
     var w = Tensor[DType.float32](Shape(12))
     w.set(0, 1.0)
@@ -461,7 +461,7 @@ fn test_par_simd_matvec_small() raises:
     print("  par_simd_matvec_small: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_simd_math:")
 
     test_simd_dot_basic()

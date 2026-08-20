@@ -21,7 +21,7 @@ Usage:
             send_response(finished[i])
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams
@@ -42,7 +42,7 @@ from neutron_mojo.serve.handler import InferenceRequest, InferenceResponse, make
 # BatchEntry — Per-request state in the batch
 # ===----------------------------------------------------------------------=== #
 
-struct BatchEntry(Copyable, Movable):
+struct BatchEntry(Copyable, Movable, ImplicitlyCopyable):
     """State for a single request being processed in the batch.
 
     Each entry has its own KV cache, position counter, and generated tokens.
@@ -62,7 +62,7 @@ struct BatchEntry(Copyable, Movable):
     var enqueue_time_ns: Int     # For latency tracking
     var start_gen_time_ns: Int   # When generation started
 
-    fn __init__(out self, request_id: String, input_ids: List[Int],
+    def __init__(out self, request_id: String, input_ids: List[Int],
                 var cache: MultiLayerKVCache, config: PipelineConfig,
                 stop_tokens: List[Int], enqueue_time_ns: Int):
         self.request_id = request_id
@@ -82,58 +82,58 @@ struct BatchEntry(Copyable, Movable):
         self.enqueue_time_ns = enqueue_time_ns
         self.start_gen_time_ns = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.request_id = existing.request_id
+    def __init__(out self, *, copy: Self):
+        self.request_id = copy.request_id
         self.input_ids = List[Int]()
-        for i in range(len(existing.input_ids)):
-            self.input_ids.append(existing.input_ids[i])
+        for i in range(len(copy.input_ids)):
+            self.input_ids.append(copy.input_ids[i])
         self.generated = List[Int]()
-        for i in range(len(existing.generated)):
-            self.generated.append(existing.generated[i])
+        for i in range(len(copy.generated)):
+            self.generated.append(copy.generated[i])
         # Deep copy KV cache (MultiLayerKVCache is Movable-only)
         self.cache = MultiLayerKVCache(
-            num_layers=existing.cache.num_layers,
-            max_seq_len=existing.cache.max_seq_len,
-            num_kv_heads=existing.cache.num_kv_heads,
-            head_dim=existing.cache.head_dim,
+            num_layers=copy.cache.num_layers,
+            max_seq_len=copy.cache.max_seq_len,
+            num_kv_heads=copy.cache.num_kv_heads,
+            head_dim=copy.cache.head_dim,
         )
-        var total_kv = existing.cache.key_data.numel()
+        var total_kv = copy.cache.key_data.numel()
         for i in range(total_kv):
-            self.cache.key_data.set(i, existing.cache.key_data.get(i))
-            self.cache.value_data.set(i, existing.cache.value_data.get(i))
-        for i in range(len(existing.cache.lengths)):
-            self.cache.lengths[i] = existing.cache.lengths[i]
-        self.pos = existing.pos
-        self.prefilled = existing.prefilled
-        self.finished = existing.finished
-        self.max_new_tokens = existing.max_new_tokens
+            self.cache.key_data.set(i, copy.cache.key_data.get(i))
+            self.cache.value_data.set(i, copy.cache.value_data.get(i))
+        for i in range(len(copy.cache.lengths)):
+            self.cache.lengths[i] = copy.cache.lengths[i]
+        self.pos = copy.pos
+        self.prefilled = copy.prefilled
+        self.finished = copy.finished
+        self.max_new_tokens = copy.max_new_tokens
         self.stop_tokens = List[Int]()
-        for i in range(len(existing.stop_tokens)):
-            self.stop_tokens.append(existing.stop_tokens[i])
-        self.config = existing.config.copy()
-        self.enqueue_time_ns = existing.enqueue_time_ns
-        self.start_gen_time_ns = existing.start_gen_time_ns
+        for i in range(len(copy.stop_tokens)):
+            self.stop_tokens.append(copy.stop_tokens[i])
+        self.config = copy.config.copy()
+        self.enqueue_time_ns = copy.enqueue_time_ns
+        self.start_gen_time_ns = copy.start_gen_time_ns
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.request_id = other.request_id^
-        self.input_ids = other.input_ids^
-        self.generated = other.generated^
-        self.cache = other.cache^
-        self.pos = other.pos
-        self.prefilled = other.prefilled
-        self.finished = other.finished
-        self.max_new_tokens = other.max_new_tokens
-        self.stop_tokens = other.stop_tokens^
-        self.config = other.config^
-        self.enqueue_time_ns = other.enqueue_time_ns
-        self.start_gen_time_ns = other.start_gen_time_ns
+    def __init__(out self, *, deinit move: Self):
+        self.request_id = move.request_id^
+        self.input_ids = move.input_ids^
+        self.generated = move.generated^
+        self.cache = move.cache^
+        self.pos = move.pos^
+        self.prefilled = move.prefilled^
+        self.finished = move.finished^
+        self.max_new_tokens = move.max_new_tokens^
+        self.stop_tokens = move.stop_tokens^
+        self.config = move.config^
+        self.enqueue_time_ns = move.enqueue_time_ns^
+        self.start_gen_time_ns = move.start_gen_time_ns^
 
 
 # ===----------------------------------------------------------------------=== #
 # FinishedRequest — Completed request with response data
 # ===----------------------------------------------------------------------=== #
 
-struct FinishedRequest(Copyable, Movable):
+struct FinishedRequest(Copyable, Movable, ImplicitlyCopyable):
     """A completed request ready to return to the caller."""
     var request_id: String
     var text: String
@@ -141,7 +141,7 @@ struct FinishedRequest(Copyable, Movable):
     var prompt_tokens: Int
     var latency_ms: Int
 
-    fn __init__(out self, request_id: String, text: String,
+    def __init__(out self, request_id: String, text: String,
                 tokens_generated: Int, prompt_tokens: Int,
                 latency_ms: Int):
         self.request_id = request_id
@@ -150,41 +150,41 @@ struct FinishedRequest(Copyable, Movable):
         self.prompt_tokens = prompt_tokens
         self.latency_ms = latency_ms
 
-    fn __copyinit__(out self, existing: Self):
-        self.request_id = existing.request_id
-        self.text = existing.text
-        self.tokens_generated = existing.tokens_generated
-        self.prompt_tokens = existing.prompt_tokens
-        self.latency_ms = existing.latency_ms
+    def __init__(out self, *, copy: Self):
+        self.request_id = copy.request_id
+        self.text = copy.text
+        self.tokens_generated = copy.tokens_generated
+        self.prompt_tokens = copy.prompt_tokens
+        self.latency_ms = copy.latency_ms
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.request_id = other.request_id^
-        self.text = other.text^
-        self.tokens_generated = other.tokens_generated
-        self.prompt_tokens = other.prompt_tokens
-        self.latency_ms = other.latency_ms
+    def __init__(out self, *, deinit move: Self):
+        self.request_id = move.request_id^
+        self.text = move.text^
+        self.tokens_generated = move.tokens_generated^
+        self.prompt_tokens = move.prompt_tokens^
+        self.latency_ms = move.latency_ms^
 
 
 # ===----------------------------------------------------------------------=== #
 # RequestQueue — FIFO queue for pending requests
 # ===----------------------------------------------------------------------=== #
 
-struct QueuedRequest(Copyable, Movable):
+struct QueuedRequest(Copyable, Movable, ImplicitlyCopyable):
     """A request waiting in the queue."""
     var request: InferenceRequest
     var enqueue_time_ns: Int
 
-    fn __init__(out self, request: InferenceRequest, enqueue_time_ns: Int):
+    def __init__(out self, request: InferenceRequest, enqueue_time_ns: Int):
         self.request = request.copy()
         self.enqueue_time_ns = enqueue_time_ns
 
-    fn __copyinit__(out self, existing: Self):
-        self.request = existing.request.copy()
-        self.enqueue_time_ns = existing.enqueue_time_ns
+    def __init__(out self, *, copy: Self):
+        self.request = copy.request.copy()
+        self.enqueue_time_ns = copy.enqueue_time_ns
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.request = other.request^
-        self.enqueue_time_ns = other.enqueue_time_ns
+    def __init__(out self, *, deinit move: Self):
+        self.request = move.request^
+        self.enqueue_time_ns = move.enqueue_time_ns^
 
 
 struct RequestQueue(Movable):
@@ -197,19 +197,19 @@ struct RequestQueue(Movable):
     var total_enqueued: Int
     var total_dropped: Int
 
-    fn __init__(out self, max_depth: Int = 64):
+    def __init__(out self, max_depth: Int = 64):
         self.items = List[QueuedRequest]()
         self.max_depth = max_depth
         self.total_enqueued = 0
         self.total_dropped = 0
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.items = other.items^
-        self.max_depth = other.max_depth
-        self.total_enqueued = other.total_enqueued
-        self.total_dropped = other.total_dropped
+    def __init__(out self, *, deinit move: Self):
+        self.items = move.items^
+        self.max_depth = move.max_depth^
+        self.total_enqueued = move.total_enqueued^
+        self.total_dropped = move.total_dropped^
 
-    fn enqueue(mut self, request: InferenceRequest, time_ns: Int) -> Bool:
+    def enqueue(mut self, request: InferenceRequest, time_ns: Int) -> Bool:
         """Add a request to the queue.
 
         Args:
@@ -226,7 +226,7 @@ struct RequestQueue(Movable):
         self.total_enqueued += 1
         return True
 
-    fn dequeue(mut self) -> QueuedRequest:
+    def dequeue(mut self) -> QueuedRequest:
         """Remove and return the oldest request.
 
         Caller must check is_empty() first.
@@ -242,10 +242,10 @@ struct RequestQueue(Movable):
         self.items = new_items^
         return first^
 
-    fn is_empty(self) -> Bool:
+    def is_empty(self) -> Bool:
         return len(self.items) == 0
 
-    fn depth(self) -> Int:
+    def depth(self) -> Int:
         return len(self.items)
 
 
@@ -253,7 +253,7 @@ struct RequestQueue(Movable):
 # SchedulerStats — Throughput and latency tracking
 # ===----------------------------------------------------------------------=== #
 
-struct SchedulerStats(Copyable, Movable):
+struct SchedulerStats(Copyable, Movable, ImplicitlyCopyable):
     """Statistics for the batch scheduler."""
     var total_requests_processed: Int
     var total_tokens_generated: Int
@@ -263,7 +263,7 @@ struct SchedulerStats(Copyable, Movable):
     var peak_batch_size: Int
     var requests_dropped: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.total_requests_processed = 0
         self.total_tokens_generated = 0
         self.total_prefill_tokens = 0
@@ -272,31 +272,31 @@ struct SchedulerStats(Copyable, Movable):
         self.peak_batch_size = 0
         self.requests_dropped = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.total_requests_processed = existing.total_requests_processed
-        self.total_tokens_generated = existing.total_tokens_generated
-        self.total_prefill_tokens = existing.total_prefill_tokens
-        self.total_steps = existing.total_steps
-        self.total_latency_ms = existing.total_latency_ms
-        self.peak_batch_size = existing.peak_batch_size
-        self.requests_dropped = existing.requests_dropped
+    def __init__(out self, *, copy: Self):
+        self.total_requests_processed = copy.total_requests_processed
+        self.total_tokens_generated = copy.total_tokens_generated
+        self.total_prefill_tokens = copy.total_prefill_tokens
+        self.total_steps = copy.total_steps
+        self.total_latency_ms = copy.total_latency_ms
+        self.peak_batch_size = copy.peak_batch_size
+        self.requests_dropped = copy.requests_dropped
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.total_requests_processed = other.total_requests_processed
-        self.total_tokens_generated = other.total_tokens_generated
-        self.total_prefill_tokens = other.total_prefill_tokens
-        self.total_steps = other.total_steps
-        self.total_latency_ms = other.total_latency_ms
-        self.peak_batch_size = other.peak_batch_size
-        self.requests_dropped = other.requests_dropped
+    def __init__(out self, *, deinit move: Self):
+        self.total_requests_processed = move.total_requests_processed^
+        self.total_tokens_generated = move.total_tokens_generated^
+        self.total_prefill_tokens = move.total_prefill_tokens^
+        self.total_steps = move.total_steps^
+        self.total_latency_ms = move.total_latency_ms^
+        self.peak_batch_size = move.peak_batch_size^
+        self.requests_dropped = move.requests_dropped^
 
-    fn avg_latency_ms(self) -> Int:
+    def avg_latency_ms(self) -> Int:
         """Average per-request latency in milliseconds."""
         if self.total_requests_processed == 0:
             return 0
         return self.total_latency_ms // self.total_requests_processed
 
-    fn tokens_per_step(self) -> Float64:
+    def tokens_per_step(self) -> Float64:
         """Average tokens generated per step."""
         if self.total_steps == 0:
             return 0.0
@@ -325,7 +325,7 @@ struct BatchScheduler(Movable):
     var max_seq_len: Int
     var params: ModelParams
 
-    fn __init__(out self, params: ModelParams, max_batch_size: Int = 4,
+    def __init__(out self, params: ModelParams, max_batch_size: Int = 4,
                 max_seq_len: Int = 512, max_queue_depth: Int = 64):
         """Create a batch scheduler.
 
@@ -342,15 +342,15 @@ struct BatchScheduler(Movable):
         self.max_seq_len = max_seq_len
         self.params = params.copy()
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.active = other.active^
-        self.queue = other.queue^
-        self.stats = other.stats.copy()
-        self.max_batch_size = other.max_batch_size
-        self.max_seq_len = other.max_seq_len
-        self.params = other.params.copy()
+    def __init__(out self, *, deinit move: Self):
+        self.active = move.active^
+        self.queue = move.queue^
+        self.stats = move.stats.copy()
+        self.max_batch_size = move.max_batch_size^
+        self.max_seq_len = move.max_seq_len^
+        self.params = move.params.copy()
 
-    fn enqueue(mut self, request: InferenceRequest) -> Bool:
+    def enqueue(mut self, request: InferenceRequest) -> Bool:
         """Add a request to the pending queue.
 
         Args:
@@ -365,7 +365,7 @@ struct BatchScheduler(Movable):
             self.stats.requests_dropped += 1
         return ok
 
-    fn admit_from_queue(mut self, tokenizer: BPETokenizer) raises:
+    def admit_from_queue(mut self, tokenizer: BPETokenizer) raises:
         """Move requests from queue to active batch if slots available.
 
         Tokenizes the prompt and creates a KV cache for each admitted request.
@@ -407,7 +407,7 @@ struct BatchScheduler(Movable):
             if len(self.active) > self.stats.peak_batch_size:
                 self.stats.peak_batch_size = len(self.active)
 
-    fn step(mut self, model: Model, tokenizer: BPETokenizer,
+    def step(mut self, model: Model, tokenizer: BPETokenizer,
             rope: RoPETable) raises -> List[FinishedRequest]:
         """Run one decode step for all active requests.
 
@@ -516,23 +516,23 @@ struct BatchScheduler(Movable):
         self.active = keep^
         return finished_list^
 
-    fn has_active(self) -> Bool:
+    def has_active(self) -> Bool:
         """Check if there are active requests or queued requests."""
         return len(self.active) > 0 or not self.queue.is_empty()
 
-    fn has_pending(self) -> Bool:
+    def has_pending(self) -> Bool:
         """Check if there are requests waiting in the queue."""
         return not self.queue.is_empty()
 
-    fn active_count(self) -> Int:
+    def active_count(self) -> Int:
         """Number of currently active (processing) requests."""
         return len(self.active)
 
-    fn queue_depth(self) -> Int:
+    def queue_depth(self) -> Int:
         """Number of requests waiting in the queue."""
         return self.queue.depth()
 
-    fn get_stats(self) -> SchedulerStats:
+    def get_stats(self) -> SchedulerStats:
         """Get a copy of current scheduler statistics."""
         var s = SchedulerStats()
         s.total_requests_processed = self.stats.total_requests_processed
@@ -549,7 +549,7 @@ struct BatchScheduler(Movable):
 # Helper: Run scheduler to completion
 # ===----------------------------------------------------------------------=== #
 
-fn run_scheduler_to_completion(
+def run_scheduler_to_completion(
     mut scheduler: BatchScheduler,
     model: Model,
     tokenizer: BPETokenizer,

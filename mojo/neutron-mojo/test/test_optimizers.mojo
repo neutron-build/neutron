@@ -8,14 +8,14 @@ from neutron_mojo.autograd import Tape, run_backward, tracked_sum, tracked_scala
 from neutron_mojo.optim import SGD, Adam, LRScheduler, clip_grad_norm
 
 
-fn assert_close(a: Float64, b: Float64, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
+def assert_close(a: Float64, b: Float64, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
     var diff = abs(a - b)
     var threshold = atol + rtol * abs(b)
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn test_sgd_basic() raises:
+def test_sgd_basic() raises:
     """SGD moves parameters in the right direction."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -41,7 +41,7 @@ fn test_sgd_basic() raises:
     print("  sgd_basic: PASS")
 
 
-fn test_sgd_momentum() raises:
+def test_sgd_momentum() raises:
     """SGD with momentum accumulates velocity."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -74,7 +74,7 @@ fn test_sgd_momentum() raises:
     print("  sgd_momentum: PASS")
 
 
-fn test_adam_basic() raises:
+def test_adam_basic() raises:
     """Adam moves parameters."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -103,7 +103,7 @@ fn test_adam_basic() raises:
     print("  adam_basic: PASS")
 
 
-fn test_adam_convergence() raises:
+def test_adam_convergence() raises:
     """Adam converges on simple quadratic."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -128,7 +128,7 @@ fn test_adam_convergence() raises:
     print("  adam_convergence: PASS")
 
 
-fn test_lr_scheduler_constant() raises:
+def test_lr_scheduler_constant() raises:
     """Constant LR scheduler."""
     var sched = LRScheduler(base_lr=0.001, schedule_type=0)
     assert_close(sched.get_lr(0), 0.001)
@@ -136,7 +136,7 @@ fn test_lr_scheduler_constant() raises:
     print("  lr_scheduler_constant: PASS")
 
 
-fn test_lr_scheduler_warmup() raises:
+def test_lr_scheduler_warmup() raises:
     """Linear warmup phase."""
     var sched = LRScheduler(base_lr=0.01, warmup_steps=10, schedule_type=0)
     # At step 0: lr = 0.01 * 1/10 = 0.001
@@ -151,7 +151,7 @@ fn test_lr_scheduler_warmup() raises:
     print("  lr_scheduler_warmup: PASS")
 
 
-fn test_lr_scheduler_cosine() raises:
+def test_lr_scheduler_cosine() raises:
     """Cosine annealing."""
     var sched = LRScheduler(base_lr=0.01, total_steps=100, schedule_type=1)
     var lr0 = sched.get_lr(0)
@@ -166,7 +166,7 @@ fn test_lr_scheduler_cosine() raises:
     print("  lr_scheduler_cosine: PASS")
 
 
-fn test_lr_scheduler_linear() raises:
+def test_lr_scheduler_linear() raises:
     """Linear decay."""
     var sched = LRScheduler(base_lr=0.01, total_steps=100, schedule_type=2)
     var lr50 = sched.get_lr(50)
@@ -174,7 +174,7 @@ fn test_lr_scheduler_linear() raises:
     print("  lr_scheduler_linear: PASS")
 
 
-fn test_grad_clip() raises:
+def test_grad_clip() raises:
     """Gradient clipping scales gradients."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -195,13 +195,13 @@ fn test_grad_clip() raises:
     # After clipping, norm should be ~1.0
     var new_g0 = Float64(tape.get_grad(x_idx, 0))
     var new_g1 = Float64(tape.get_grad(x_idx, 1))
-    from math import sqrt
+    from std.math import sqrt
     var new_norm = sqrt(new_g0 * new_g0 + new_g1 * new_g1)
     assert_close(new_norm, 1.0, atol=0.01)
     print("  grad_clip: PASS")
 
 
-fn test_grad_clip_no_op() raises:
+def test_grad_clip_no_op() raises:
     """No clipping when norm is below threshold."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -220,7 +220,7 @@ fn test_grad_clip_no_op() raises:
     print("  grad_clip_no_op: PASS")
 
 
-fn test_adam_weight_decay() raises:
+def test_adam_weight_decay() raises:
     """Adam with weight decay shrinks parameters."""
     var tape = Tape(4096)
     var dims = List[Int]()
@@ -242,7 +242,7 @@ fn test_adam_weight_decay() raises:
     print("  adam_weight_decay: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_optimizers:")
     test_sgd_basic()
     test_sgd_momentum()

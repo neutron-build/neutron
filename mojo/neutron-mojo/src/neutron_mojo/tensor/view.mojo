@@ -16,7 +16,7 @@ from .shape import Shape
 # ===----------------------------------------------------------------------=== #
 
 
-struct TensorView[dtype: DType](Writable, Copyable, Movable):
+struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable):
     """A non-owning strided view into tensor data.
 
     Holds a raw pointer (borrowed from a Storage), along with shape, strides,
@@ -24,16 +24,16 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
     produce new views without copying data.
     """
 
-    var _ptr: UnsafePointer[Scalar[Self.dtype], MutExternalOrigin]
+    var _ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin]
     var shape: Shape
     var _strides: List[Int]
     var _offset: Int  # element offset from _ptr
 
     # --- Constructors ---
 
-    fn __init__(
+    def __init__(
         out self,
-        ptr: UnsafePointer[Scalar[Self.dtype], MutExternalOrigin],
+        ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin],
         shape: Shape,
         strides: List[Int],
         offset: Int = 0,
@@ -44,9 +44,9 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
         self._strides = strides.copy()
         self._offset = offset
 
-    fn __init__(
+    def __init__(
         out self,
-        ptr: UnsafePointer[Scalar[Self.dtype], MutExternalOrigin],
+        ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin],
         shape: Shape,
     ):
         """Create a contiguous view (computes row-major strides automatically)."""
@@ -55,23 +55,23 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
         self._strides = shape.strides()
         self._offset = 0
 
-    fn __copyinit__(out self, other: Self):
+    def __init__(out self, *, copy: Self):
         """Copy constructor — shallow copy (non-owning view)."""
-        self._ptr = other._ptr
-        self.shape = other.shape.copy()
-        self._strides = other._strides.copy()
-        self._offset = other._offset
+        self._ptr = copy._ptr
+        self.shape = copy.shape.copy()
+        self._strides = copy._strides.copy()
+        self._offset = copy._offset
 
-    fn __moveinit__(out self, deinit other: Self):
+    def __init__(out self, *, deinit move: Self):
         """Move constructor."""
-        self._ptr = other._ptr
-        self.shape = other.shape^
-        self._strides = other._strides^
-        self._offset = other._offset
+        self._ptr = move._ptr
+        self.shape = move.shape^
+        self._strides = move._strides^
+        self._offset = move._offset
 
     # --- Element access ---
 
-    fn _linear_index(self, *indices: Int) -> Int:
+    def _linear_index(self, *indices: Int) -> Int:
         """Compute the linear memory offset for the given multi-dimensional indices."""
         var offset = self._offset
         var n = len(indices)
@@ -79,7 +79,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
             offset += indices[i] * self._strides[i]
         return offset
 
-    fn load(self, *indices: Int) -> Scalar[Self.dtype]:
+    def load(self, *indices: Int) -> Scalar[Self.dtype]:
         """Load a single element at the given indices."""
         var n = len(indices)
         var offset = self._offset
@@ -87,7 +87,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
             offset += indices[i] * self._strides[i]
         return self._ptr.load(offset)
 
-    fn store(self, *indices: Int, value: Scalar[Self.dtype]):
+    def store(self, *indices: Int, value: Scalar[Self.dtype]):
         """Store a single element at the given indices."""
         var n = len(indices)
         var offset = self._offset
@@ -97,7 +97,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
 
     # --- View operations ---
 
-    fn transpose(self, dim0: Int, dim1: Int) -> TensorView[Self.dtype]:
+    def transpose(self, dim0: Int, dim1: Int) -> TensorView[Self.dtype]:
         """Returns a view with two dimensions swapped. No data copy.
 
         WARNING: The returned view borrows from the same memory as self.
@@ -128,7 +128,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
             self._offset,
         )
 
-    fn broadcast_to(self, target: Shape) raises -> TensorView[Self.dtype]:
+    def broadcast_to(self, target: Shape) raises -> TensorView[Self.dtype]:
         """Returns a view broadcast to target shape.
 
         Dimensions of size 1 get stride 0 (repeated without copying).
@@ -166,7 +166,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
             self._offset,
         )
 
-    fn slice_dim(self, dim: Int, start: Int, length: Int) -> TensorView[Self.dtype]:
+    def slice_dim(self, dim: Int, start: Int, length: Int) -> TensorView[Self.dtype]:
         """Returns a view sliced along a single dimension.
 
         WARNING: The returned view borrows from the same memory as self.
@@ -192,7 +192,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
             new_offset,
         )
 
-    fn reshape(self, new_shape: Shape) raises -> TensorView[Self.dtype]:
+    def reshape(self, new_shape: Shape) raises -> TensorView[Self.dtype]:
         """Returns a view with a new shape. Only valid for contiguous data.
 
         WARNING: The returned view borrows from the same memory as self.
@@ -215,7 +215,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
 
     # --- Properties ---
 
-    fn is_contiguous(self) -> Bool:
+    def is_contiguous(self) -> Bool:
         """Returns True if the view's memory layout is dense (C-contiguous)."""
         var expected = self.shape.strides()
         if len(expected) != len(self._strides):
@@ -226,27 +226,27 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable):
         return True
 
     @always_inline
-    fn ndim(self) -> Int:
+    def ndim(self) -> Int:
         """Returns the number of dimensions."""
         return self.shape.ndim()
 
     @always_inline
-    fn numel(self) -> Int:
+    def numel(self) -> Int:
         """Returns the total number of elements."""
         return self.shape.numel()
 
     @always_inline
-    fn offset(self) -> Int:
+    def offset(self) -> Int:
         """Returns the element offset."""
         return self._offset
 
-    fn strides(self) -> List[Int]:
+    def strides(self) -> List[Int]:
         """Returns a copy of the strides list."""
         return self._strides.copy()
 
     # --- Writable ---
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write("TensorView[", Self.dtype, "](shape=")
         self.shape.write_to(writer)
         writer.write(", contiguous=", self.is_contiguous(), ")")

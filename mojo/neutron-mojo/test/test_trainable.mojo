@@ -11,19 +11,19 @@ from neutron_mojo.train.trainable import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_block_init() raises:
+def test_block_init() raises:
     """TransformerBlock initializes correctly."""
     var block = TrainableTransformerBlock(hidden_dim=8, ffn_dim=32)
     assert_eq(block.hidden_dim, 8)
@@ -34,14 +34,14 @@ fn test_block_init() raises:
     print("  block_init: PASS")
 
 
-fn test_block_default_ffn() raises:
+def test_block_default_ffn() raises:
     """Default FFN dim is 4x hidden."""
     var block = TrainableTransformerBlock(hidden_dim=16)
     assert_eq(block.ffn_dim, 64)
     print("  block_default_ffn: PASS")
 
 
-fn test_block_register() raises:
+def test_block_register() raises:
     """Block registers all parameters on tape."""
     var tape = Tape(65536)
     var block = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
@@ -55,7 +55,7 @@ fn test_block_register() raises:
     print("  block_register: PASS")
 
 
-fn test_block_forward() raises:
+def test_block_forward() raises:
     """Block forward pass produces output."""
     var tape = Tape(65536)
     var block = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
@@ -66,7 +66,7 @@ fn test_block_forward() raises:
     dims.append(4)
     var x_idx = tape.add_variable(dims^)
     for i in range(4):
-        tape.set_data(x_idx, i, Float32(0.1 * (i + 1)))
+        tape.set_data(x_idx, i, Float32(0.1 * Float64(i + 1)))
 
     var out_idx = block.forward(tape, x_idx)
     # Output should be a valid variable index
@@ -77,7 +77,7 @@ fn test_block_forward() raises:
     print("  block_forward: PASS")
 
 
-fn test_lm_init() raises:
+def test_lm_init() raises:
     """TrainableLM initializes correctly."""
     var lm = TrainableLM(vocab_size=16, hidden_dim=4, num_layers=2)
     assert_eq(lm.vocab_size, 16)
@@ -88,7 +88,7 @@ fn test_lm_init() raises:
     print("  lm_init: PASS")
 
 
-fn test_lm_register() raises:
+def test_lm_register() raises:
     """TrainableLM registers all parameters."""
     var tape = Tape(262144)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1)
@@ -102,7 +102,7 @@ fn test_lm_register() raises:
     print("  lm_register: PASS")
 
 
-fn test_lm_forward() raises:
+def test_lm_forward() raises:
     """TrainableLM forward: token -> logits."""
     var tape = Tape(262144)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1)
@@ -114,7 +114,7 @@ fn test_lm_forward() raises:
     print("  lm_forward: PASS")
 
 
-fn test_lm_num_parameters() raises:
+def test_lm_num_parameters() raises:
     """Count trainable parameters."""
     var tape = Tape(262144)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, ffn_dim=8)
@@ -130,7 +130,7 @@ fn test_lm_num_parameters() raises:
     print("  lm_num_parameters: PASS (params=" + String(num_params) + ")")
 
 
-fn test_causal_lm_loss() raises:
+def test_causal_lm_loss() raises:
     """Causal LM loss produces a scalar."""
     var tape = Tape(262144)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1)
@@ -146,7 +146,7 @@ fn test_causal_lm_loss() raises:
     print("  causal_lm_loss: PASS (loss=" + String(loss_val) + ")")
 
 
-fn test_causal_lm_backward() raises:
+def test_causal_lm_backward() raises:
     """Backward through causal LM loss produces gradients."""
     var tape = Tape(262144)
     var lm = TrainableLM(vocab_size=8, hidden_dim=4, num_layers=1)
@@ -171,7 +171,7 @@ fn test_causal_lm_backward() raises:
     print("  causal_lm_backward: PASS")
 
 
-fn test_block_copy() raises:
+def test_block_copy() raises:
     """TransformerBlock is Copyable."""
     var block1 = TrainableTransformerBlock(hidden_dim=4, ffn_dim=8)
     var block2 = block1.copy()
@@ -180,7 +180,7 @@ fn test_block_copy() raises:
     print("  block_copy: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_trainable:")
     test_block_init()
     test_block_default_ffn()

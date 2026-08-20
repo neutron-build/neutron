@@ -4,7 +4,7 @@
 
 """Tests for causal language model and generation."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.causal_lm import (
     CausalLMWeights,
     embed_token,
@@ -19,19 +19,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_embed_token() raises:
+def test_embed_token() raises:
     """Test embedding lookup."""
     # vocab_size=3, hidden_dim=2
     var embed = Tensor[DType.float32](Shape(3, 2))
@@ -56,7 +56,7 @@ fn test_embed_token() raises:
     print("  embed_token: PASS")
 
 
-fn test_compute_logits() raises:
+def test_compute_logits() raises:
     """Test logit computation."""
     var hidden = Tensor[DType.float32](Shape(2))
     hidden.set(0, 1.0)
@@ -82,7 +82,7 @@ fn test_compute_logits() raises:
     print("  compute_logits: PASS")
 
 
-fn test_argmax() raises:
+def test_argmax() raises:
     """Test argmax."""
     var logits = Tensor[DType.float32](Shape(5))
     logits.set(0, 1.0)
@@ -97,7 +97,7 @@ fn test_argmax() raises:
     print("  argmax: PASS")
 
 
-fn test_argmax_first_element() raises:
+def test_argmax_first_element() raises:
     """Test argmax when maximum is first element."""
     var logits = Tensor[DType.float32](Shape(3))
     logits.set(0, 10.0)
@@ -110,7 +110,7 @@ fn test_argmax_first_element() raises:
     print("  argmax_first_element: PASS")
 
 
-fn test_temperature_scaling() raises:
+def test_temperature_scaling() raises:
     """Test temperature scaling."""
     var logits = Tensor[DType.float32](Shape(3))
     logits.set(0, 2.0)
@@ -125,7 +125,7 @@ fn test_temperature_scaling() raises:
     print("  temperature_scaling: PASS")
 
 
-fn test_top_k_filter() raises:
+def test_top_k_filter() raises:
     """Test top-k filtering."""
     var logits = Tensor[DType.float32](Shape(5))
     logits.set(0, 1.0)
@@ -147,7 +147,7 @@ fn test_top_k_filter() raises:
     print("  top_k_filter: PASS")
 
 
-fn test_causal_lm_weights_creation() raises:
+def test_causal_lm_weights_creation() raises:
     """Test CausalLMWeights initialization."""
     var w = CausalLMWeights(
         num_layers=2,
@@ -168,7 +168,7 @@ fn test_causal_lm_weights_creation() raises:
     print("  causal_lm_weights_creation: PASS")
 
 
-fn test_generate_greedy_deterministic() raises:
+def test_generate_greedy_deterministic() raises:
     """Test that greedy generation is deterministic.
 
     With a tiny model where the LM head has one clearly dominant logit,
@@ -219,7 +219,7 @@ fn test_generate_greedy_deterministic() raises:
     print("  generate_greedy_deterministic: PASS")
 
 
-fn test_generate_output_length() raises:
+def test_generate_output_length() raises:
     """Test that generation produces correct number of tokens."""
     var model = CausalLMWeights(
         num_layers=1,
@@ -242,7 +242,7 @@ fn test_generate_output_length() raises:
     print("  generate_output_length: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_causal_lm:")
 
     test_embed_token()

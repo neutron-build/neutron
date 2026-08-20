@@ -11,7 +11,7 @@ Reference: "RoFormer: Enhanced Transformer with Rotary Position Embedding"
            (Su et al., 2021)
 """
 
-from math import sin, cos
+from std.math import sin, cos
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
@@ -32,7 +32,7 @@ struct RoPETable(Movable):
     var max_seq_len: Int
     var theta_base: Float64
 
-    fn __init__(out self, head_dim: Int, max_seq_len: Int, theta: Float64 = 10000.0):
+    def __init__(out self, head_dim: Int, max_seq_len: Int, theta: Float64 = 10000.0):
         """Precompute RoPE cos/sin tables.
 
         Args:
@@ -58,19 +58,19 @@ struct RoPETable(Movable):
                 self.cos_table.set(pos * half_dim + i, Float32(cos(angle)))
                 self.sin_table.set(pos * half_dim + i, Float32(sin(angle)))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.cos_table = other.cos_table^
-        self.sin_table = other.sin_table^
-        self.head_dim = other.head_dim
-        self.max_seq_len = other.max_seq_len
-        self.theta_base = other.theta_base
+    def __init__(out self, *, deinit move: Self):
+        self.cos_table = move.cos_table^
+        self.sin_table = move.sin_table^
+        self.head_dim = move.head_dim^
+        self.max_seq_len = move.max_seq_len^
+        self.theta_base = move.theta_base^
 
 
 # ===----------------------------------------------------------------------=== #
 # Apply RoPE
 # ===----------------------------------------------------------------------=== #
 
-fn apply_rope(
+def apply_rope(
     mut x: Tensor[DType.float32],
     table: RoPETable,
     start_pos: Int,
@@ -115,7 +115,7 @@ fn apply_rope(
                 x.set(head_offset + 2 * i + 1, x0 * sin_val + x1 * cos_val)
 
 
-fn apply_rope_single_head(
+def apply_rope_single_head(
     mut x: Tensor[DType.float32],
     table: RoPETable,
     pos: Int,
@@ -141,7 +141,7 @@ fn apply_rope_single_head(
         x.set(2 * i + 1, x0 * sin_val + x1 * cos_val)
 
 
-fn apply_rope_batch(
+def apply_rope_batch(
     mut q_batch: Tensor[DType.float32],
     mut k_batch: Tensor[DType.float32],
     table: RoPETable,

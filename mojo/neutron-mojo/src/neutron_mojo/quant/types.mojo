@@ -13,7 +13,6 @@ Supports:
 Reference: GGML quantization schemes, QLoRA paper
 """
 
-from sys import bitwidthof
 
 # ===----------------------------------------------------------------------=== #
 # QuantType — Quantization format enumeration
@@ -38,16 +37,16 @@ struct QuantType(Writable, TrivialRegisterPassable):
     comptime FP8_E5M2 = QuantType(31) # 8-bit float, 5 exp, 2 mantissa
 
     @implicit
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self._value = value
 
-    fn __eq__(self, other: QuantType) -> Bool:
+    def __eq__(self, other: QuantType) -> Bool:
         return self._value == other._value
 
-    fn __ne__(self, other: QuantType) -> Bool:
+    def __ne__(self, other: QuantType) -> Bool:
         return self._value != other._value
 
-    fn bits_per_element(self) -> Int:
+    def bits_per_element(self) -> Int:
         """Return bits per element for this quantization type."""
         if self._value == 2 or self._value == 3:  # Q4_0, Q4_1
             return 4
@@ -61,7 +60,7 @@ struct QuantType(Writable, TrivialRegisterPassable):
             return 8
         return 16  # Default to FP16
 
-    fn block_size(self) -> Int:
+    def block_size(self) -> Int:
         """Return block size for block quantization formats."""
         if self._value == 2 or self._value == 3 or self._value == 8:
             return 32  # Q4_0, Q4_1, Q8_0
@@ -73,7 +72,7 @@ struct QuantType(Writable, TrivialRegisterPassable):
             return 64
         return 1  # No blocking
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         if self._value == 2:
             writer.write("Q4_0")
         elif self._value == 3:
@@ -98,7 +97,7 @@ struct QuantType(Writable, TrivialRegisterPassable):
 # QuantConfig — Quantization configuration
 # ===----------------------------------------------------------------------=== #
 
-struct QuantConfig(Copyable):
+struct QuantConfig(Copyable, ImplicitlyCopyable):
     """Configuration for a quantization scheme.
 
     Specifies the quantization format, block size, and metadata like
@@ -110,31 +109,31 @@ struct QuantConfig(Copyable):
     var has_min_max: Bool
     var scale_dtype: DType  # DType for scale factors (usually FP16 or FP32)
 
-    fn __init__(out self, qtype: QuantType):
+    def __init__(out self, qtype: QuantType):
         self.qtype = qtype
         self.block_size = qtype.block_size()
         self.has_zero_point = False
         self.has_min_max = False
         self.scale_dtype = DType.float16
 
-    fn __copyinit__(out self, existing: Self):
-        self.qtype = existing.qtype
-        self.block_size = existing.block_size
-        self.has_zero_point = existing.has_zero_point
-        self.has_min_max = existing.has_min_max
-        self.scale_dtype = existing.scale_dtype
+    def __init__(out self, *, copy: Self):
+        self.qtype = copy.qtype
+        self.block_size = copy.block_size
+        self.has_zero_point = copy.has_zero_point
+        self.has_min_max = copy.has_min_max
+        self.scale_dtype = copy.scale_dtype
 
-    fn with_zero_point(var self) -> Self:
+    def with_zero_point(var self) -> Self:
         """Enable zero-point offset."""
         self.has_zero_point = True
         return self^
 
-    fn with_min_max(var self) -> Self:
+    def with_min_max(var self) -> Self:
         """Enable min/max metadata (for Q4_1, etc.)."""
         self.has_min_max = True
         return self^
 
-    fn with_scale_dtype(var self, dtype: DType) -> Self:
+    def with_scale_dtype(var self, dtype: DType) -> Self:
         """Set the dtype for scale factors."""
         self.scale_dtype = dtype
         return self^
@@ -144,33 +143,33 @@ struct QuantConfig(Copyable):
 # Predefined Quantization Configurations
 # ===----------------------------------------------------------------------=== #
 
-fn q4_0_config() -> QuantConfig:
+def q4_0_config() -> QuantConfig:
     """Q4_0: 4-bit quantization, block size 32, FP16 scale."""
     return QuantConfig(QuantType.Q4_0)
 
-fn q4_1_config() -> QuantConfig:
+def q4_1_config() -> QuantConfig:
     """Q4_1: 4-bit quantization with min, block size 32, FP16 scale + min."""
     return QuantConfig(QuantType.Q4_1).with_min_max()
 
-fn q8_0_config() -> QuantConfig:
+def q8_0_config() -> QuantConfig:
     """Q8_0: 8-bit quantization, block size 32, FP16 scale."""
     return QuantConfig(QuantType.Q8_0)
 
-fn q4_k_m_config() -> QuantConfig:
+def q4_k_m_config() -> QuantConfig:
     """Q4_K_M: 4-bit K-quantization (medium), block size 256."""
     return QuantConfig(QuantType.Q4_K_M)
 
-fn nf4_config() -> QuantConfig:
+def nf4_config() -> QuantConfig:
     """NF4: 4-bit NormalFloat (QLoRA), block size 64, FP16 scale."""
     return QuantConfig(QuantType.NF4)
 
-fn fp8_e4m3_config() -> QuantConfig:
+def fp8_e4m3_config() -> QuantConfig:
     """FP8 E4M3: 8-bit float, 4 exp bits, 3 mantissa bits."""
     var cfg = QuantConfig(QuantType.FP8_E4M3)
     cfg.block_size = 1  # No blocking for FP8
     return cfg^
 
-fn fp8_e5m2_config() -> QuantConfig:
+def fp8_e5m2_config() -> QuantConfig:
     """FP8 E5M2: 8-bit float, 5 exp bits, 2 mantissa bits."""
     var cfg = QuantConfig(QuantType.FP8_E5M2)
     cfg.block_size = 1  # No blocking for FP8
@@ -181,7 +180,7 @@ fn fp8_e5m2_config() -> QuantConfig:
 # QuantBlock — A quantized block of values
 # ===----------------------------------------------------------------------=== #
 
-struct QuantBlock[qtype: QuantType](Copyable, Movable):
+struct QuantBlock[qtype: QuantType](Copyable, Movable, ImplicitlyCopyable):
     """A block of quantized values.
 
     For block quantization (Q4_0, Q8_0, etc.), data is divided into blocks,
@@ -191,7 +190,7 @@ struct QuantBlock[qtype: QuantType](Copyable, Movable):
     var min_val: Float16  # For Q4_1, etc.
     var data: List[UInt8]  # Packed quantized values
 
-    fn __init__(out self, block_size: Int):
+    def __init__(out self, block_size: Int):
         self.scale = Float16(1.0)
         self.min_val = Float16(0.0)
         self.data = List[UInt8]()
@@ -202,12 +201,12 @@ struct QuantBlock[qtype: QuantType](Copyable, Movable):
         for _ in range(bytes_needed):
             self.data.append(0)
 
-    fn __copyinit__(out self, existing: Self):
-        self.scale = existing.scale
-        self.min_val = existing.min_val
-        self.data = existing.data.copy()
+    def __init__(out self, *, copy: Self):
+        self.scale = copy.scale
+        self.min_val = copy.min_val
+        self.data = copy.data.copy()
 
-    fn size_bytes(self) -> Int:
+    def size_bytes(self) -> Int:
         """Return size in bytes for this block."""
         # Scale (2 bytes) + optional min (2 bytes) + data
         # Q4_1 (type 3) has min, others don't
@@ -219,7 +218,7 @@ struct QuantBlock[qtype: QuantType](Copyable, Movable):
 # Utility Functions
 # ===----------------------------------------------------------------------=== #
 
-fn calc_quant_size(num_elements: Int, qtype: QuantType) -> Int:
+def calc_quant_size(num_elements: Int, qtype: QuantType) -> Int:
     """Calculate total bytes needed for quantized storage.
 
     Args:
@@ -241,7 +240,7 @@ fn calc_quant_size(num_elements: Int, qtype: QuantType) -> Int:
     return num_blocks * (metadata_per_block + data_bytes_per_block)
 
 
-fn is_symmetric_quant(qtype: QuantType) -> Bool:
+def is_symmetric_quant(qtype: QuantType) -> Bool:
     """Check if quantization is symmetric (zero-centered).
 
     Symmetric: Q4_0, Q8_0, NF4

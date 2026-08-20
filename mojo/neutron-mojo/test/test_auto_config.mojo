@@ -17,19 +17,19 @@ from neutron_mojo.model.config import ModelConfig
 from neutron_mojo.nn.model import ModelParams, tiny_test_params
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn _make_gguf_with_arch(arch_name: String) -> GGUFFile:
+def _make_gguf_with_arch(arch_name: String) -> GGUFFile:
     """Create a mock GGUFFile with the given architecture name."""
     var gguf = GGUFFile()
     gguf.metadata_str["general.architecture"] = arch_name
     return gguf^
 
 
-fn test_detect_llama() raises:
+def test_detect_llama() raises:
     """Detect Llama architecture from GGUF metadata."""
     var gguf = _make_gguf_with_arch("llama")
     var arch = detect_arch_from_gguf(gguf)
@@ -39,7 +39,7 @@ fn test_detect_llama() raises:
     print("  detect_llama: PASS")
 
 
-fn test_detect_mistral() raises:
+def test_detect_mistral() raises:
     """Detect Mistral architecture from GGUF metadata."""
     var gguf = _make_gguf_with_arch("mistral")
     var arch = detect_arch_from_gguf(gguf)
@@ -47,7 +47,7 @@ fn test_detect_mistral() raises:
     print("  detect_mistral: PASS")
 
 
-fn test_detect_mistral_with_sliding_window() raises:
+def test_detect_mistral_with_sliding_window() raises:
     """Detect Mistral with sliding window metadata."""
     var gguf = _make_gguf_with_arch("mistral")
     gguf.metadata_int["mistral.attention.sliding_window"] = 4096
@@ -58,7 +58,7 @@ fn test_detect_mistral_with_sliding_window() raises:
     print("  detect_mistral_with_sliding_window: PASS")
 
 
-fn test_detect_phi() raises:
+def test_detect_phi() raises:
     """Detect Phi architecture from GGUF metadata."""
     var gguf = _make_gguf_with_arch("phi")
     var arch = detect_arch_from_gguf(gguf)
@@ -67,7 +67,7 @@ fn test_detect_phi() raises:
     print("  detect_phi: PASS")
 
 
-fn test_detect_gemma() raises:
+def test_detect_gemma() raises:
     """Detect Gemma architecture from GGUF metadata."""
     var gguf = _make_gguf_with_arch("gemma")
     var arch = detect_arch_from_gguf(gguf)
@@ -75,7 +75,7 @@ fn test_detect_gemma() raises:
     print("  detect_gemma: PASS")
 
 
-fn test_detect_qwen() raises:
+def test_detect_qwen() raises:
     """Detect Qwen architecture from GGUF metadata."""
     var gguf = _make_gguf_with_arch("qwen")
     var arch = detect_arch_from_gguf(gguf)
@@ -83,7 +83,7 @@ fn test_detect_qwen() raises:
     print("  detect_qwen: PASS")
 
 
-fn test_unknown_defaults_to_llama() raises:
+def test_unknown_defaults_to_llama() raises:
     """Unknown architecture defaults to Llama."""
     var gguf = _make_gguf_with_arch("foobar_unknown")
     var arch = detect_arch_from_gguf(gguf)
@@ -91,7 +91,7 @@ fn test_unknown_defaults_to_llama() raises:
     print("  unknown_defaults_to_llama: PASS")
 
 
-fn test_missing_arch_defaults_to_llama() raises:
+def test_missing_arch_defaults_to_llama() raises:
     """Missing general.architecture defaults to Llama."""
     var gguf = GGUFFile()  # No metadata set
     var arch = detect_arch_from_gguf(gguf)
@@ -99,7 +99,7 @@ fn test_missing_arch_defaults_to_llama() raises:
     print("  missing_arch_defaults_to_llama: PASS")
 
 
-fn test_model_from_config_sets_arch() raises:
+def test_model_from_config_sets_arch() raises:
     """model_from_config auto-detects arch from model_type."""
     var cfg = ModelConfig()
     cfg.model_type = "mistral"
@@ -116,7 +116,7 @@ fn test_model_from_config_sets_arch() raises:
     print("  model_from_config_sets_arch: PASS")
 
 
-fn test_gguf_to_model_config_preserves_model_type() raises:
+def test_gguf_to_model_config_preserves_model_type() raises:
     """gguf_to_model_config sets model_type from GGUF metadata."""
     var gguf = _make_gguf_with_arch("phi")
     var cfg = gguf_to_model_config(gguf)
@@ -124,7 +124,7 @@ fn test_gguf_to_model_config_preserves_model_type() raises:
     print("  gguf_to_model_config_preserves_model_type: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_auto_config")
     test_detect_llama()
     test_detect_mistral()

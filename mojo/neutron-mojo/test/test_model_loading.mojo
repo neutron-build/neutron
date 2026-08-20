@@ -6,7 +6,7 @@
 Also tests GGUF metadata → WeightIndex → Model population.
 """
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
@@ -32,12 +32,12 @@ from neutron_mojo.io.gguf import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
@@ -48,7 +48,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helper: tiny config matching tiny_test_params
 # ===----------------------------------------------------------------------=== #
 
-fn tiny_config() -> ModelConfig:
+def tiny_config() -> ModelConfig:
     """Create a tiny ModelConfig matching tiny_test_params."""
     var cfg = ModelConfig()
     cfg.vocab_size = 8
@@ -67,7 +67,7 @@ fn tiny_config() -> ModelConfig:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_model_from_config() raises:
+def test_model_from_config() raises:
     """Test creating a Model from ModelConfig."""
     var cfg = tiny_config()
     var model = model_from_config(cfg)
@@ -83,7 +83,7 @@ fn test_model_from_config() raises:
     print("  model_from_config: PASS")
 
 
-fn test_set_embed_direct() raises:
+def test_set_embed_direct() raises:
     """Test direct embedding weight setter."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -104,7 +104,7 @@ fn test_set_embed_direct() raises:
     print("  set_embed_direct: PASS")
 
 
-fn test_set_layer_projection() raises:
+def test_set_layer_projection() raises:
     """Test setting individual layer projections."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -126,7 +126,7 @@ fn test_set_layer_projection() raises:
     print("  set_layer_projection: PASS")
 
 
-fn test_load_named_weight_embed() raises:
+def test_load_named_weight_embed() raises:
     """Test loading a weight by HuggingFace name."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -145,7 +145,7 @@ fn test_load_named_weight_embed() raises:
     print("  load_named_weight_embed: PASS")
 
 
-fn test_load_named_weight_layer() raises:
+def test_load_named_weight_layer() raises:
     """Test loading layer weights by HuggingFace names."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -184,7 +184,7 @@ fn test_load_named_weight_layer() raises:
     print("  load_named_weight_layer: PASS")
 
 
-fn test_full_pipeline_config_to_generate() raises:
+def test_full_pipeline_config_to_generate() raises:
     """Test the complete pipeline: config → model → populate all weights → generate."""
     var cfg = tiny_config()
     var model = model_from_config(cfg)
@@ -280,7 +280,7 @@ fn test_full_pipeline_config_to_generate() raises:
     print("  full_pipeline_config_to_generate: PASS")
 
 
-fn test_gguf_metadata_to_weight_index() raises:
+def test_gguf_metadata_to_weight_index() raises:
     """Test GGUF metadata → WeightIndex pipeline."""
     # Simulate a GGUF file with tensor metadata
     var gguf = GGUFFile()
@@ -320,7 +320,7 @@ fn test_gguf_metadata_to_weight_index() raises:
     print("  gguf_metadata_to_weight_index: PASS")
 
 
-fn test_weight_index_roundtrip() raises:
+def test_weight_index_roundtrip() raises:
     """Test building a WeightIndex and querying it."""
     var index = WeightIndex()
     index.format = FMT_GGUF()
@@ -349,7 +349,7 @@ fn test_weight_index_roundtrip() raises:
     print("  weight_index_roundtrip: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_model_loading:")
 
     test_model_from_config()

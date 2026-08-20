@@ -22,109 +22,109 @@ from .variable import Variable
 # ===----------------------------------------------------------------------=== #
 
 # Unary ops
-fn OP_ADD() -> Int:
+def OP_ADD() -> Int:
     return 0
 
-fn OP_MUL() -> Int:
+def OP_MUL() -> Int:
     return 1
 
-fn OP_MATMUL() -> Int:
+def OP_MATMUL() -> Int:
     return 2
 
-fn OP_RELU() -> Int:
+def OP_RELU() -> Int:
     return 3
 
-fn OP_SIGMOID() -> Int:
+def OP_SIGMOID() -> Int:
     return 4
 
-fn OP_TANH() -> Int:
+def OP_TANH() -> Int:
     return 5
 
-fn OP_EXP() -> Int:
+def OP_EXP() -> Int:
     return 6
 
-fn OP_LOG() -> Int:
+def OP_LOG() -> Int:
     return 7
 
-fn OP_SOFTMAX() -> Int:
+def OP_SOFTMAX() -> Int:
     return 8
 
-fn OP_SUM() -> Int:
+def OP_SUM() -> Int:
     return 9
 
-fn OP_MEAN() -> Int:
+def OP_MEAN() -> Int:
     return 10
 
-fn OP_SUB() -> Int:
+def OP_SUB() -> Int:
     return 11
 
-fn OP_DIV() -> Int:
+def OP_DIV() -> Int:
     return 12
 
-fn OP_POW() -> Int:
+def OP_POW() -> Int:
     return 13
 
-fn OP_SQRT() -> Int:
+def OP_SQRT() -> Int:
     return 14
 
-fn OP_NEG() -> Int:
+def OP_NEG() -> Int:
     return 15
 
-fn OP_CLAMP() -> Int:
+def OP_CLAMP() -> Int:
     return 16
 
-fn OP_SCALAR_MUL() -> Int:
+def OP_SCALAR_MUL() -> Int:
     return 17
 
-fn OP_RMSNORM() -> Int:
+def OP_RMSNORM() -> Int:
     return 18
 
-fn OP_LAYERNORM() -> Int:
+def OP_LAYERNORM() -> Int:
     return 19
 
-fn OP_GELU() -> Int:
+def OP_GELU() -> Int:
     return 20
 
-fn OP_SILU() -> Int:
+def OP_SILU() -> Int:
     return 21
 
-fn OP_SWIGLU() -> Int:
+def OP_SWIGLU() -> Int:
     return 22
 
-fn OP_RESHAPE() -> Int:
+def OP_RESHAPE() -> Int:
     return 23
 
-fn OP_TRANSPOSE() -> Int:
+def OP_TRANSPOSE() -> Int:
     return 24
 
-fn OP_CONCAT() -> Int:
+def OP_CONCAT() -> Int:
     return 25
 
-fn OP_SPLIT() -> Int:
+def OP_SPLIT() -> Int:
     return 26
 
-fn OP_LOG_SOFTMAX() -> Int:
+def OP_LOG_SOFTMAX() -> Int:
     return 27
 
-fn OP_CROSS_ENTROPY() -> Int:
+def OP_CROSS_ENTROPY() -> Int:
     return 28
 
-fn OP_MSE() -> Int:
+def OP_MSE() -> Int:
     return 29
 
-fn OP_EMBEDDING() -> Int:
+def OP_EMBEDDING() -> Int:
     return 30
 
-fn OP_SCALAR_ADD() -> Int:
+def OP_SCALAR_ADD() -> Int:
     return 31
 
-fn OP_L1() -> Int:
+def OP_L1() -> Int:
     return 32
 
-fn OP_BCE() -> Int:
+def OP_BCE() -> Int:
     return 33
 
-fn OP_KL_DIV() -> Int:
+def OP_KL_DIV() -> Int:
     return 34
 
 
@@ -133,7 +133,7 @@ fn OP_KL_DIV() -> Int:
 # ===----------------------------------------------------------------------=== #
 
 
-struct TapeEntry(Copyable, Movable):
+struct TapeEntry(Copyable, Movable, ImplicitlyCopyable):
     """A single recorded operation on the tape.
 
     Fields:
@@ -158,7 +158,7 @@ struct TapeEntry(Copyable, Movable):
     var cached_int2: Int
     var cached_int3: Int
 
-    fn __init__(out self,
+    def __init__(out self,
         op_kind: Int,
         input0_idx: Int,
         input1_idx: Int,
@@ -179,29 +179,29 @@ struct TapeEntry(Copyable, Movable):
         self.cached_int2 = cached_int2
         self.cached_int3 = cached_int3
 
-    fn __copyinit__(out self, other: Self):
-        self.op_kind = other.op_kind
-        self.input0_idx = other.input0_idx
-        self.input1_idx = other.input1_idx
-        self.output_idx = other.output_idx
-        self.cached_scalar = other.cached_scalar
-        self.cached_scalar2 = other.cached_scalar2
-        self.cached_int = other.cached_int
-        self.cached_int2 = other.cached_int2
-        self.cached_int3 = other.cached_int3
+    def __init__(out self, *, copy: Self):
+        self.op_kind = copy.op_kind
+        self.input0_idx = copy.input0_idx
+        self.input1_idx = copy.input1_idx
+        self.output_idx = copy.output_idx
+        self.cached_scalar = copy.cached_scalar
+        self.cached_scalar2 = copy.cached_scalar2
+        self.cached_int = copy.cached_int
+        self.cached_int2 = copy.cached_int2
+        self.cached_int3 = copy.cached_int3
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.op_kind = other.op_kind
-        self.input0_idx = other.input0_idx
-        self.input1_idx = other.input1_idx
-        self.output_idx = other.output_idx
-        self.cached_scalar = other.cached_scalar
-        self.cached_scalar2 = other.cached_scalar2
-        self.cached_int = other.cached_int
-        self.cached_int2 = other.cached_int2
-        self.cached_int3 = other.cached_int3
+    def __init__(out self, *, deinit move: Self):
+        self.op_kind = move.op_kind^
+        self.input0_idx = move.input0_idx^
+        self.input1_idx = move.input1_idx^
+        self.output_idx = move.output_idx^
+        self.cached_scalar = move.cached_scalar^
+        self.cached_scalar2 = move.cached_scalar2^
+        self.cached_int = move.cached_int^
+        self.cached_int2 = move.cached_int2^
+        self.cached_int3 = move.cached_int3^
 
-    fn copy(self) -> TapeEntry:
+    def copy(self) -> TapeEntry:
         return TapeEntry(
             self.op_kind, self.input0_idx, self.input1_idx, self.output_idx,
             self.cached_scalar, self.cached_scalar2,
@@ -238,7 +238,7 @@ struct Tape(Movable):
     var total_used: Int
     var capacity: Int
 
-    fn __init__(out self, initial_capacity: Int = 65536):
+    def __init__(out self, initial_capacity: Int = 65536):
         """Create a tape with the given initial flat capacity."""
         self.capacity = initial_capacity
         self.data_flat = Tensor[DType.float32](initial_capacity)
@@ -250,18 +250,18 @@ struct Tape(Movable):
         self.entries = List[TapeEntry]()
         self.total_used = 0
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data_flat = other.data_flat^
-        self.grad_flat = other.grad_flat^
-        self.var_offsets = other.var_offsets^
-        self.var_sizes = other.var_sizes^
-        self.var_shapes = other.var_shapes^
-        self.var_requires_grad = other.var_requires_grad^
-        self.entries = other.entries^
-        self.total_used = other.total_used
-        self.capacity = other.capacity
+    def __init__(out self, *, deinit move: Self):
+        self.data_flat = move.data_flat^
+        self.grad_flat = move.grad_flat^
+        self.var_offsets = move.var_offsets^
+        self.var_sizes = move.var_sizes^
+        self.var_shapes = move.var_shapes^
+        self.var_requires_grad = move.var_requires_grad^
+        self.entries = move.entries^
+        self.total_used = move.total_used^
+        self.capacity = move.capacity^
 
-    fn _ensure_capacity(mut self, needed: Int):
+    def _ensure_capacity(mut self, needed: Int):
         """Grow flat tensors if needed."""
         if self.total_used + needed <= self.capacity:
             return
@@ -281,7 +281,7 @@ struct Tape(Movable):
         self.grad_flat = new_grad^
         self.capacity = new_cap
 
-    fn add_variable(mut self, shape_dims: List[Int], requires_grad: Bool = True) -> Int:
+    def add_variable(mut self, shape_dims: List[Int], requires_grad: Bool = True) -> Int:
         """Add a new variable to the tape. Returns its index."""
         var numel = 1
         for i in range(len(shape_dims)):
@@ -300,42 +300,42 @@ struct Tape(Movable):
         self.total_used += numel
         return idx
 
-    fn add_variable_from_shape(mut self, shape: Shape, requires_grad: Bool = True) -> Int:
+    def add_variable_from_shape(mut self, shape: Shape, requires_grad: Bool = True) -> Int:
         """Add a variable using a Shape object."""
         var dims = List[Int]()
         for i in range(shape.ndim()):
             dims.append(shape[i])
         return self.add_variable(dims^, requires_grad)
 
-    fn num_variables(self) -> Int:
+    def num_variables(self) -> Int:
         """Return the number of variables on the tape."""
         return len(self.var_offsets)
 
-    fn var_numel(self, var_idx: Int) -> Int:
+    def var_numel(self, var_idx: Int) -> Int:
         """Return the number of elements for a variable."""
         return self.var_sizes[var_idx]
 
-    fn var_offset(self, var_idx: Int) -> Int:
+    def var_offset(self, var_idx: Int) -> Int:
         """Return the flat offset for a variable."""
         return self.var_offsets[var_idx]
 
-    fn get_data(self, var_idx: Int, elem_idx: Int) -> Float32:
+    def get_data(self, var_idx: Int, elem_idx: Int) -> Float32:
         """Get a single data element from a variable."""
         return self.data_flat.get(self.var_offsets[var_idx] + elem_idx)
 
-    fn set_data(mut self, var_idx: Int, elem_idx: Int, value: Float32):
+    def set_data(mut self, var_idx: Int, elem_idx: Int, value: Float32):
         """Set a single data element in a variable."""
         self.data_flat.set(self.var_offsets[var_idx] + elem_idx, value)
 
-    fn get_grad(self, var_idx: Int, elem_idx: Int) -> Float32:
+    def get_grad(self, var_idx: Int, elem_idx: Int) -> Float32:
         """Get a single gradient element from a variable."""
         return self.grad_flat.get(self.var_offsets[var_idx] + elem_idx)
 
-    fn set_grad(mut self, var_idx: Int, elem_idx: Int, value: Float32):
+    def set_grad(mut self, var_idx: Int, elem_idx: Int, value: Float32):
         """Set a single gradient element in a variable."""
         self.grad_flat.set(self.var_offsets[var_idx] + elem_idx, value)
 
-    fn accumulate_grad(mut self, var_idx: Int, elem_idx: Int, value: Float32):
+    def accumulate_grad(mut self, var_idx: Int, elem_idx: Int, value: Float32):
         """Add to a gradient element (accumulate). Skips if requires_grad is False."""
         if not self.var_requires_grad[var_idx]:
             return
@@ -343,7 +343,7 @@ struct Tape(Movable):
         var current = self.grad_flat.get(offset)
         self.grad_flat.set(offset, current + value)
 
-    fn get_data_copy(self, var_idx: Int) -> Tensor[DType.float32]:
+    def get_data_copy(self, var_idx: Int) -> Tensor[DType.float32]:
         """Copy a variable's data into a new tensor."""
         var n = self.var_sizes[var_idx]
         var offset = self.var_offsets[var_idx]
@@ -352,7 +352,7 @@ struct Tape(Movable):
             result.set(i, self.data_flat.get(offset + i))
         return result^
 
-    fn get_grad_copy(self, var_idx: Int) -> Tensor[DType.float32]:
+    def get_grad_copy(self, var_idx: Int) -> Tensor[DType.float32]:
         """Copy a variable's gradient into a new tensor."""
         var n = self.var_sizes[var_idx]
         var offset = self.var_offsets[var_idx]
@@ -361,31 +361,31 @@ struct Tape(Movable):
             result.set(i, self.grad_flat.get(offset + i))
         return result^
 
-    fn set_data_from_tensor(mut self, var_idx: Int, tensor: Tensor[DType.float32]):
+    def set_data_from_tensor(mut self, var_idx: Int, tensor: Tensor[DType.float32]):
         """Copy tensor data into a variable's data slot."""
         var n = self.var_sizes[var_idx]
         var offset = self.var_offsets[var_idx]
         for i in range(n):
             self.data_flat.set(offset + i, tensor.get(i))
 
-    fn record(mut self, entry: TapeEntry):
+    def record(mut self, entry: TapeEntry):
         """Record an operation on the tape."""
         self.entries.append(entry.copy())
 
-    fn zero_all_grads(mut self):
+    def zero_all_grads(mut self):
         """Zero all gradients."""
         for i in range(self.total_used):
             self.grad_flat.set(i, Float32(0.0))
 
-    fn num_entries(self) -> Int:
+    def num_entries(self) -> Int:
         """Return the number of recorded operations."""
         return len(self.entries)
 
-    fn get_entry(self, idx: Int) -> TapeEntry:
+    def get_entry(self, idx: Int) -> TapeEntry:
         """Get a tape entry by index."""
         return self.entries[idx].copy()
 
-    fn make_variable(self, var_idx: Int) -> Variable:
+    def make_variable(self, var_idx: Int) -> Variable:
         """Create a Variable handle for the given tape index."""
         var dims = List[Int]()
         var shape = self.var_shapes[var_idx].copy()

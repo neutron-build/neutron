@@ -9,12 +9,12 @@ Uses Mojo's built-in Python interop. True zero-copy DLPack exchange is deferred
 to a future sprint when Mojo's UnsafePointer exposure to Python stabilizes.
 """
 
-from python import Python, PythonObject
+from std.python import Python, PythonObject
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn to_python_list(tensor: Tensor[DType.float32], size: Int) raises -> PythonObject:
+def to_python_list(tensor: Tensor[DType.float32], size: Int) raises -> PythonObject:
     """Copy tensor data to a Python list.
 
     Args:
@@ -31,7 +31,7 @@ fn to_python_list(tensor: Tensor[DType.float32], size: Int) raises -> PythonObje
     return py_list
 
 
-fn from_python_list(py_list: PythonObject, size: Int) raises -> Tensor[DType.float32]:
+def from_python_list(py_list: PythonObject, size: Int) raises -> Tensor[DType.float32]:
     """Copy Python list to a Mojo tensor.
 
     Args:
@@ -48,7 +48,7 @@ fn from_python_list(py_list: PythonObject, size: Int) raises -> Tensor[DType.flo
     return t^
 
 
-fn call_python(module_name: String, func_name: String, arg: PythonObject) raises -> PythonObject:
+def call_python(module_name: String, func_name: String, arg: PythonObject) raises -> PythonObject:
     """Call a Python function with a single argument.
 
     Args:
@@ -64,7 +64,7 @@ fn call_python(module_name: String, func_name: String, arg: PythonObject) raises
     return func(arg)
 
 
-fn numpy_available() -> Bool:
+def numpy_available() -> Bool:
     """Check if numpy is importable."""
     try:
         _ = Python.import_module("numpy")
@@ -73,7 +73,7 @@ fn numpy_available() -> Bool:
         return False
 
 
-fn to_numpy(tensor: Tensor[DType.float32]) raises -> PythonObject:
+def to_numpy(tensor: Tensor[DType.float32]) raises -> PythonObject:
     """Convert a Mojo tensor to a numpy array (copy-based).
 
     Args:
@@ -89,7 +89,7 @@ fn to_numpy(tensor: Tensor[DType.float32]) raises -> PythonObject:
     return arr
 
 
-fn from_numpy(arr: PythonObject) raises -> Tensor[DType.float32]:
+def from_numpy(arr: PythonObject) raises -> Tensor[DType.float32]:
     """Convert a numpy array to a Mojo tensor (copy-based).
 
     Args:
@@ -106,7 +106,7 @@ fn from_numpy(arr: PythonObject) raises -> Tensor[DType.float32]:
     return t^
 
 
-fn to_numpy_shaped(tensor: Tensor[DType.float32], shape: Shape) raises -> PythonObject:
+def to_numpy_shaped(tensor: Tensor[DType.float32], shape: Shape) raises -> PythonObject:
     """Convert a Mojo tensor to a shaped numpy array.
 
     Args:
@@ -129,7 +129,7 @@ fn to_numpy_shaped(tensor: Tensor[DType.float32], shape: Shape) raises -> Python
     return arr.reshape(shape_tuple)
 
 
-fn from_numpy_shaped(arr: PythonObject) raises -> Tensor[DType.float32]:
+def from_numpy_shaped(arr: PythonObject) raises -> Tensor[DType.float32]:
     """Convert a shaped numpy array to a Mojo tensor, preserving shape info.
 
     The returned tensor is flat but its numel matches the array's total size.
@@ -149,7 +149,7 @@ fn from_numpy_shaped(arr: PythonObject) raises -> Tensor[DType.float32]:
     return t^
 
 
-fn run_python_script(code: String) raises -> PythonObject:
+def run_python_script(code: String) raises -> PythonObject:
     """Execute a Python script string and return the result namespace.
 
     The code is executed via exec() in a fresh namespace dict.
@@ -167,7 +167,7 @@ fn run_python_script(code: String) raises -> PythonObject:
     return namespace
 
 
-fn torch_available() -> Bool:
+def torch_available() -> Bool:
     """Check if PyTorch is importable."""
     try:
         _ = Python.import_module("torch")
@@ -176,7 +176,7 @@ fn torch_available() -> Bool:
         return False
 
 
-fn to_pytorch(tensor: Tensor[DType.float32], shape: Shape) raises -> PythonObject:
+def to_pytorch(tensor: Tensor[DType.float32], shape: Shape) raises -> PythonObject:
     """Convert a Mojo tensor to a PyTorch tensor via numpy intermediate.
 
     Args:
@@ -191,7 +191,7 @@ fn to_pytorch(tensor: Tensor[DType.float32], shape: Shape) raises -> PythonObjec
     return torch.from_numpy(np_arr).clone()
 
 
-fn from_pytorch(pt_tensor: PythonObject) raises -> Tensor[DType.float32]:
+def from_pytorch(pt_tensor: PythonObject) raises -> Tensor[DType.float32]:
     """Convert a PyTorch tensor to a Mojo tensor via numpy intermediate.
 
     Args:

@@ -30,7 +30,7 @@ from neutron_mojo.tensor.shape import Shape
 # Page Allocator
 # ===----------------------------------------------------------------------=== #
 
-struct PageAllocator(Copyable, Movable):
+struct PageAllocator(Copyable, Movable, ImplicitlyCopyable):
     """Pool allocator for KV cache pages.
 
     Manages a flat buffer of pages. Each page holds `page_size` token
@@ -45,7 +45,7 @@ struct PageAllocator(Copyable, Movable):
     var kv_dim: Int       # num_kv_heads * head_dim
     var num_allocated: Int
 
-    fn __init__(
+    def __init__(
         out self,
         max_pages: Int,
         page_size: Int,
@@ -73,33 +73,33 @@ struct PageAllocator(Copyable, Movable):
         for i in range(max_pages):
             self.free_list.append(max_pages - 1 - i)
 
-    fn __copyinit__(out self, existing: Self):
-        self.max_pages = existing.max_pages
-        self.page_size = existing.page_size
-        self.kv_dim = existing.kv_dim
-        self.num_allocated = existing.num_allocated
+    def __init__(out self, *, copy: Self):
+        self.max_pages = copy.max_pages
+        self.page_size = copy.page_size
+        self.kv_dim = copy.kv_dim
+        self.num_allocated = copy.num_allocated
 
-        var total = existing.key_pool.numel()
+        var total = copy.key_pool.numel()
         self.key_pool = Tensor[DType.float32](Shape(total))
         self.value_pool = Tensor[DType.float32](Shape(total))
         for i in range(total):
-            self.key_pool.set(i, existing.key_pool.get(i))
-            self.value_pool.set(i, existing.value_pool.get(i))
+            self.key_pool.set(i, copy.key_pool.get(i))
+            self.value_pool.set(i, copy.value_pool.get(i))
 
         self.free_list = List[Int]()
-        for i in range(len(existing.free_list)):
-            self.free_list.append(existing.free_list[i])
+        for i in range(len(copy.free_list)):
+            self.free_list.append(copy.free_list[i])
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.key_pool = other.key_pool^
-        self.value_pool = other.value_pool^
-        self.free_list = other.free_list^
-        self.max_pages = other.max_pages
-        self.page_size = other.page_size
-        self.kv_dim = other.kv_dim
-        self.num_allocated = other.num_allocated
+    def __init__(out self, *, deinit move: Self):
+        self.key_pool = move.key_pool^
+        self.value_pool = move.value_pool^
+        self.free_list = move.free_list^
+        self.max_pages = move.max_pages^
+        self.page_size = move.page_size^
+        self.kv_dim = move.kv_dim^
+        self.num_allocated = move.num_allocated^
 
-    fn allocate(mut self) raises -> Int:
+    def allocate(mut self) raises -> Int:
         """Allocate one page from the pool.
 
         Returns:
@@ -115,7 +115,7 @@ struct PageAllocator(Copyable, Movable):
         self.num_allocated += 1
         return page_id
 
-    fn deallocate(mut self, page_id: Int):
+    def deallocate(mut self, page_id: Int):
         """Return a page to the pool.
 
         Args:
@@ -124,11 +124,11 @@ struct PageAllocator(Copyable, Movable):
         self.free_list.append(page_id)
         self.num_allocated -= 1
 
-    fn num_free(self) -> Int:
+    def num_free(self) -> Int:
         """Number of free pages remaining."""
         return len(self.free_list)
 
-    fn page_offset(self, page_id: Int) -> Int:
+    def page_offset(self, page_id: Int) -> Int:
         """Compute flat offset for a page's data in the pool.
 
         Args:
@@ -139,7 +139,7 @@ struct PageAllocator(Copyable, Movable):
         """
         return page_id * self.page_size * self.kv_dim
 
-    fn get_key(self, page_id: Int, slot: Int, head: Int, head_dim: Int, dim: Int) -> Float32:
+    def get_key(self, page_id: Int, slot: Int, head: Int, head_dim: Int, dim: Int) -> Float32:
         """Read a key value from a page.
 
         Args:
@@ -155,26 +155,26 @@ struct PageAllocator(Copyable, Movable):
         var offset = self.page_offset(page_id) + slot * self.kv_dim + head * head_dim + dim
         return self.key_pool.get(offset)
 
-    fn get_value(self, page_id: Int, slot: Int, head: Int, head_dim: Int, dim: Int) -> Float32:
+    def get_value(self, page_id: Int, slot: Int, head: Int, head_dim: Int, dim: Int) -> Float32:
         """Read a value from a page."""
         var offset = self.page_offset(page_id) + slot * self.kv_dim + head * head_dim + dim
         return self.value_pool.get(offset)
 
-    fn write_key(mut self, page_id: Int, slot: Int, flat_offset: Int, value: Float32):
+    def write_key(mut self, page_id: Int, slot: Int, flat_offset: Int, value: Float32):
         """Write a key value to a page at a flat offset within the slot."""
         var offset = self.page_offset(page_id) + slot * self.kv_dim + flat_offset
         self.key_pool.set(offset, value)
 
-    fn write_value(mut self, page_id: Int, slot: Int, flat_offset: Int, value: Float32):
+    def write_value(mut self, page_id: Int, slot: Int, flat_offset: Int, value: Float32):
         """Write a value to a page at a flat offset within the slot."""
         var offset = self.page_offset(page_id) + slot * self.kv_dim + flat_offset
         self.value_pool.set(offset, value)
 
-    fn total_memory_bytes(self) -> Int:
+    def total_memory_bytes(self) -> Int:
         """Total pool memory in bytes (key + value)."""
         return self.max_pages * self.page_size * self.kv_dim * 4 * 2
 
-    fn used_memory_bytes(self) -> Int:
+    def used_memory_bytes(self) -> Int:
         """Memory currently allocated in bytes."""
         return self.num_allocated * self.page_size * self.kv_dim * 4 * 2
 
@@ -183,7 +183,7 @@ struct PageAllocator(Copyable, Movable):
 # Page Table (per-layer, per-sequence)
 # ===----------------------------------------------------------------------=== #
 
-struct PageTable(Copyable, Movable):
+struct PageTable(Copyable, Movable, ImplicitlyCopyable):
     """Maps logical token positions to physical pages.
 
     Each layer of a sequence has its own PageTable. As tokens are appended,
@@ -193,38 +193,38 @@ struct PageTable(Copyable, Movable):
     var num_tokens: Int      # Total tokens stored
     var page_size: Int       # Tokens per page
 
-    fn __init__(out self, page_size: Int):
+    def __init__(out self, page_size: Int):
         self.pages = List[Int]()
         self.num_tokens = 0
         self.page_size = page_size
 
-    fn __copyinit__(out self, existing: Self):
-        self.pages = existing.pages.copy()
-        self.num_tokens = existing.num_tokens
-        self.page_size = existing.page_size
+    def __init__(out self, *, copy: Self):
+        self.pages = copy.pages.copy()
+        self.num_tokens = copy.num_tokens
+        self.page_size = copy.page_size
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.pages = other.pages^
-        self.num_tokens = other.num_tokens
-        self.page_size = other.page_size
+    def __init__(out self, *, deinit move: Self):
+        self.pages = move.pages^
+        self.num_tokens = move.num_tokens^
+        self.page_size = move.page_size^
 
-    fn num_pages(self) -> Int:
+    def num_pages(self) -> Int:
         """Number of pages currently allocated."""
         return len(self.pages)
 
-    fn current_page_slots_used(self) -> Int:
+    def current_page_slots_used(self) -> Int:
         """Slots used in the last page."""
         if self.num_tokens == 0:
             return 0
         return ((self.num_tokens - 1) % self.page_size) + 1
 
-    fn current_page_has_space(self) -> Bool:
+    def current_page_has_space(self) -> Bool:
         """Whether the current (last) page has room for more tokens."""
         if len(self.pages) == 0:
             return False
         return self.current_page_slots_used() < self.page_size
 
-    fn resolve(self, logical_pos: Int) -> Int:
+    def resolve(self, logical_pos: Int) -> Int:
         """Map a logical position to (page_index, slot_within_page).
 
         Returns the page index in the pages list. Use pages[page_index]
@@ -238,7 +238,7 @@ struct PageTable(Copyable, Movable):
         """
         return logical_pos // self.page_size
 
-    fn slot_in_page(self, logical_pos: Int) -> Int:
+    def slot_in_page(self, logical_pos: Int) -> Int:
         """Get the slot index within a page for a logical position.
 
         Args:
@@ -254,7 +254,7 @@ struct PageTable(Copyable, Movable):
 # Paged KV Cache
 # ===----------------------------------------------------------------------=== #
 
-struct PagedKVCache(Copyable, Movable):
+struct PagedKVCache(Copyable, Movable, ImplicitlyCopyable):
     """Multi-layer paged KV cache.
 
     Each layer has its own PageTable mapping logical positions to
@@ -271,7 +271,7 @@ struct PagedKVCache(Copyable, Movable):
     var head_dim: Int
     var page_size: Int
 
-    fn __init__(
+    def __init__(
         out self,
         max_pages: Int,
         page_size: Int,
@@ -299,27 +299,27 @@ struct PagedKVCache(Copyable, Movable):
         for _ in range(num_layers):
             self.page_tables.append(PageTable(page_size))
 
-    fn __copyinit__(out self, existing: Self):
-        self.allocator = existing.allocator.copy()
-        self.page_tables = existing.page_tables.copy()
-        self.num_layers = existing.num_layers
-        self.num_kv_heads = existing.num_kv_heads
-        self.head_dim = existing.head_dim
-        self.page_size = existing.page_size
+    def __init__(out self, *, copy: Self):
+        self.allocator = copy.allocator.copy()
+        self.page_tables = copy.page_tables.copy()
+        self.num_layers = copy.num_layers
+        self.num_kv_heads = copy.num_kv_heads
+        self.head_dim = copy.head_dim
+        self.page_size = copy.page_size
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.allocator = other.allocator^
-        self.page_tables = other.page_tables^
-        self.num_layers = other.num_layers
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
-        self.page_size = other.page_size
+    def __init__(out self, *, deinit move: Self):
+        self.allocator = move.allocator^
+        self.page_tables = move.page_tables^
+        self.num_layers = move.num_layers^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
+        self.page_size = move.page_size^
 
-    fn seq_len(self, layer: Int) -> Int:
+    def seq_len(self, layer: Int) -> Int:
         """Current sequence length for a layer."""
         return self.page_tables[layer].num_tokens
 
-    fn append_kv(
+    def append_kv(
         mut self,
         layer: Int,
         key: Tensor[DType.float32],
@@ -356,7 +356,7 @@ struct PagedKVCache(Copyable, Movable):
 
             self.page_tables[layer].num_tokens += 1
 
-    fn get_key_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_key_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
         """Get a key value from the paged cache.
 
         Same interface as MultiLayerKVCache.get_key_at.
@@ -375,7 +375,7 @@ struct PagedKVCache(Copyable, Movable):
         var phys_page = self.page_tables[layer].pages[page_idx]
         return self.allocator.get_key(phys_page, slot, head, self.head_dim, dim)
 
-    fn get_value_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_value_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
         """Get a value from the paged cache.
 
         Same interface as MultiLayerKVCache.get_value_at.
@@ -385,7 +385,7 @@ struct PagedKVCache(Copyable, Movable):
         var phys_page = self.page_tables[layer].pages[page_idx]
         return self.allocator.get_value(phys_page, slot, head, self.head_dim, dim)
 
-    fn free_layer(mut self, layer: Int):
+    def free_layer(mut self, layer: Int):
         """Free all pages for a specific layer.
 
         Args:
@@ -396,24 +396,24 @@ struct PagedKVCache(Copyable, Movable):
         self.page_tables[layer].pages = List[Int]()
         self.page_tables[layer].num_tokens = 0
 
-    fn free_all(mut self):
+    def free_all(mut self):
         """Free all pages across all layers."""
         for layer in range(self.num_layers):
             self.free_layer(layer)
 
-    fn total_pages_used(self) -> Int:
+    def total_pages_used(self) -> Int:
         """Total pages currently allocated across all layers."""
         return self.allocator.num_allocated
 
-    fn total_memory_bytes(self) -> Int:
+    def total_memory_bytes(self) -> Int:
         """Total pool memory in bytes."""
         return self.allocator.total_memory_bytes()
 
-    fn used_memory_bytes(self) -> Int:
+    def used_memory_bytes(self) -> Int:
         """Memory currently allocated in bytes."""
         return self.allocator.used_memory_bytes()
 
-    fn pages_needed(self, seq_len: Int) -> Int:
+    def pages_needed(self, seq_len: Int) -> Int:
         """Pages needed for a given sequence length (per layer).
 
         Args:
@@ -424,7 +424,7 @@ struct PagedKVCache(Copyable, Movable):
         """
         return (seq_len + self.page_size - 1) // self.page_size
 
-    fn can_fit(self, seq_len: Int) -> Bool:
+    def can_fit(self, seq_len: Int) -> Bool:
         """Check if enough free pages exist for a new sequence.
 
         Args:

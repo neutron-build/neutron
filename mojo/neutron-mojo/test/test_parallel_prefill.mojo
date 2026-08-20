@@ -5,8 +5,8 @@
 """Tests for parallel prefill: batch RoPE, batched causal attention, and
 the optimized forward_layer_prefill that eliminates per-token cache copies."""
 
-from math import abs, sqrt
-from time import perf_counter_ns
+from std.math import abs, sqrt
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.rope import RoPETable, apply_rope_single_head, apply_rope_batch
@@ -20,19 +20,19 @@ from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
 from neutron_mojo.nn.causal_lm import embed_token
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn _build_model() -> Model:
+def _build_model() -> Model:
     """Build a tiny model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -54,7 +54,7 @@ fn _build_model() -> Model:
 # Batch RoPE Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_batch_rope_matches_sequential() raises:
+def test_batch_rope_matches_sequential() raises:
     """Verify batch RoPE produces identical results to per-token RoPE."""
     var head_dim = 8
     var num_q_heads = 4
@@ -113,7 +113,7 @@ fn test_batch_rope_matches_sequential() raises:
     print("  batch_rope_matches_sequential: PASS")
 
 
-fn test_batch_rope_with_offset() raises:
+def test_batch_rope_with_offset() raises:
     """Test batch RoPE with non-zero start_pos."""
     var head_dim = 4
     var num_q_heads = 2
@@ -173,7 +173,7 @@ fn test_batch_rope_with_offset() raises:
 # Batched Prefill Attention Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_prefill_attention_single_token() raises:
+def test_prefill_attention_single_token() raises:
     """Prefill attention with 1 token matches direct attention."""
     var num_q_heads = 2
     var num_kv_heads = 1
@@ -216,7 +216,7 @@ fn test_prefill_attention_single_token() raises:
     print("  prefill_attention_single_token: PASS")
 
 
-fn test_prefill_attention_causal_mask() raises:
+def test_prefill_attention_causal_mask() raises:
     """Verify causal masking: token t can only see positions 0..t."""
     var num_q_heads = 1
     var num_kv_heads = 1
@@ -265,7 +265,7 @@ fn test_prefill_attention_causal_mask() raises:
     print("  prefill_attention_causal_mask: PASS")
 
 
-fn test_prefill_attention_matches_sequential() raises:
+def test_prefill_attention_matches_sequential() raises:
     """Verify prefill attention matches token-by-token attention."""
     var num_q_heads = 2
     var num_kv_heads = 1
@@ -333,7 +333,7 @@ fn test_prefill_attention_matches_sequential() raises:
 # Full Prefill Integration Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_forward_prefill_produces_valid_logits() raises:
+def test_forward_prefill_produces_valid_logits() raises:
     """Test that forward_prefill produces valid logits."""
     var model = _build_model()
     var p = model.params.copy()
@@ -361,7 +361,7 @@ fn test_forward_prefill_produces_valid_logits() raises:
     print("  forward_prefill_produces_valid_logits: PASS")
 
 
-fn test_prefill_matches_sequential_forward() raises:
+def test_prefill_matches_sequential_forward() raises:
     """Verify forward_prefill + decode matches sequential forward calls."""
     var model = _build_model()
     var p = model.params.copy()
@@ -418,7 +418,7 @@ fn test_prefill_matches_sequential_forward() raises:
     print("  prefill_matches_sequential_forward: PASS")
 
 
-fn test_prefill_then_decode() raises:
+def test_prefill_then_decode() raises:
     """Test that prefill followed by decode produces valid tokens."""
     var model = _build_model()
     var p = model.params.copy()
@@ -456,7 +456,7 @@ fn test_prefill_then_decode() raises:
     print("  prefill_then_decode: PASS")
 
 
-fn test_prefill_single_token() raises:
+def test_prefill_single_token() raises:
     """Edge case: prefill with just 1 token."""
     var model = _build_model()
     var p = model.params.copy()
@@ -482,7 +482,7 @@ fn test_prefill_single_token() raises:
 # Benchmark
 # ===----------------------------------------------------------------------=== #
 
-fn test_prefill_benchmark() raises:
+def test_prefill_benchmark() raises:
     """Benchmark parallel prefill vs sequential forward for prompt processing."""
     var model = _build_model()
     var p = model.params.copy()
@@ -528,7 +528,7 @@ fn test_prefill_benchmark() raises:
     print("  prefill_benchmark: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_parallel_prefill:")
 
     # Batch RoPE

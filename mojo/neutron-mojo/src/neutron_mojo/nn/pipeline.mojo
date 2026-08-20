@@ -27,7 +27,7 @@ from neutron_mojo.nn.tokenizer import BPETokenizer
 # Pipeline Config
 # ===----------------------------------------------------------------------=== #
 
-struct PipelineConfig(Copyable, Movable):
+struct PipelineConfig(Copyable, Movable, ImplicitlyCopyable):
     """Configuration for the generation pipeline."""
     var max_new_tokens: Int
     var sampler_config: SamplerConfig
@@ -39,7 +39,7 @@ struct PipelineConfig(Copyable, Movable):
     var system_prompt: String
     var use_q8_cache: Bool  # Use Q8-quantized KV cache (~4x memory reduction)
 
-    fn __init__(out self):
+    def __init__(out self):
         self.max_new_tokens = 128
         self.sampler_config = SamplerConfig()
         self.repetition_penalty = 1.0
@@ -50,34 +50,34 @@ struct PipelineConfig(Copyable, Movable):
         self.system_prompt = String("")
         self.use_q8_cache = False
 
-    fn __copyinit__(out self, existing: Self):
-        self.max_new_tokens = existing.max_new_tokens
-        self.sampler_config = existing.sampler_config.copy()
-        self.repetition_penalty = existing.repetition_penalty
-        self.frequency_penalty = existing.frequency_penalty
-        self.presence_penalty = existing.presence_penalty
-        self.add_bos = existing.add_bos
-        self.chat_template = existing.chat_template
-        self.system_prompt = existing.system_prompt
-        self.use_q8_cache = existing.use_q8_cache
+    def __init__(out self, *, copy: Self):
+        self.max_new_tokens = copy.max_new_tokens
+        self.sampler_config = copy.sampler_config.copy()
+        self.repetition_penalty = copy.repetition_penalty
+        self.frequency_penalty = copy.frequency_penalty
+        self.presence_penalty = copy.presence_penalty
+        self.add_bos = copy.add_bos
+        self.chat_template = copy.chat_template
+        self.system_prompt = copy.system_prompt
+        self.use_q8_cache = copy.use_q8_cache
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.max_new_tokens = other.max_new_tokens
-        self.sampler_config = other.sampler_config.copy()
-        self.repetition_penalty = other.repetition_penalty
-        self.frequency_penalty = other.frequency_penalty
-        self.presence_penalty = other.presence_penalty
-        self.add_bos = other.add_bos
-        self.chat_template = other.chat_template^
-        self.system_prompt = other.system_prompt^
-        self.use_q8_cache = other.use_q8_cache
+    def __init__(out self, *, deinit move: Self):
+        self.max_new_tokens = move.max_new_tokens^
+        self.sampler_config = move.sampler_config.copy()
+        self.repetition_penalty = move.repetition_penalty^
+        self.frequency_penalty = move.frequency_penalty^
+        self.presence_penalty = move.presence_penalty^
+        self.add_bos = move.add_bos^
+        self.chat_template = move.chat_template^
+        self.system_prompt = move.system_prompt^
+        self.use_q8_cache = move.use_q8_cache^
 
 
 # ===----------------------------------------------------------------------=== #
 # Chat Template Formatting
 # ===----------------------------------------------------------------------=== #
 
-fn format_llama(prompt: String, system_prompt: String) -> String:
+def format_llama(prompt: String, system_prompt: String) -> String:
     """Format prompt using Llama instruct template.
 
     Args:
@@ -87,12 +87,12 @@ fn format_llama(prompt: String, system_prompt: String) -> String:
     Returns:
         Formatted prompt string.
     """
-    if len(system_prompt) > 0:
+    if system_prompt.byte_length() > 0:
         return "<<SYS>>\n" + system_prompt + "\n<</SYS>>\n\n[INST] " + prompt + " [/INST]"
     return "[INST] " + prompt + " [/INST]"
 
 
-fn format_chatml(prompt: String, system_prompt: String) -> String:
+def format_chatml(prompt: String, system_prompt: String) -> String:
     """Format prompt using ChatML template.
 
     Args:
@@ -103,13 +103,13 @@ fn format_chatml(prompt: String, system_prompt: String) -> String:
         Formatted prompt string.
     """
     var result = String("")
-    if len(system_prompt) > 0:
+    if system_prompt.byte_length() > 0:
         result += "<|im_start|>system\n" + system_prompt + "<|im_end|>\n"
     result += "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
     return result^
 
 
-fn _apply_template(prompt: String, config: PipelineConfig) -> String:
+def _apply_template(prompt: String, config: PipelineConfig) -> String:
     """Apply chat template based on config.
 
     Args:
@@ -130,7 +130,7 @@ fn _apply_template(prompt: String, config: PipelineConfig) -> String:
 # Pipeline Generate
 # ===----------------------------------------------------------------------=== #
 
-fn pipeline_generate(
+def pipeline_generate(
     model: Model,
     tokenizer: BPETokenizer,
     prompt: String,
@@ -238,7 +238,7 @@ fn pipeline_generate(
 # Helper Configs
 # ===----------------------------------------------------------------------=== #
 
-fn default_pipeline_config() -> PipelineConfig:
+def default_pipeline_config() -> PipelineConfig:
     """Create a default pipeline config (greedy, no template, 128 tokens).
 
     Returns:
@@ -247,7 +247,7 @@ fn default_pipeline_config() -> PipelineConfig:
     return PipelineConfig()
 
 
-fn chat_pipeline_config(template: String) -> PipelineConfig:
+def chat_pipeline_config(template: String) -> PipelineConfig:
     """Create a chat-oriented pipeline config.
 
     Uses temperature=0.7, top_p=0.9, top_k=40, repetition_penalty=1.1.

@@ -9,7 +9,7 @@ for querying type properties and a QuantConfig struct for block-quantized
 types (NF4, Q4_K, Q8_0).
 """
 
-from sys import simd_width_of, bit_width_of
+from std.sys import simd_width_of, bit_width_of
 
 
 # ===----------------------------------------------------------------------=== #
@@ -30,7 +30,7 @@ struct QuantConfig(Writable, Copyable, Movable, ImplicitlyCopyable):
     var bits_per_element: Int
     var has_zero_point: Bool
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         var zp = String("yes") if self.has_zero_point else String("no")
         writer.write(
             "QuantConfig(block=",
@@ -73,7 +73,7 @@ comptime Q8_0_CONFIG = QuantConfig(
 # ===----------------------------------------------------------------------=== #
 
 
-fn bitwidth_of(dtype: DType) -> Int:
+def bitwidth_of(dtype: DType) -> Int:
     """Returns the number of bits per element for the given DType (runtime)."""
     if dtype == DType.float64:
         return 64
@@ -88,22 +88,22 @@ fn bitwidth_of(dtype: DType) -> Int:
     return 0
 
 
-fn is_floating_point(dtype: DType) -> Bool:
+def is_floating_point(dtype: DType) -> Bool:
     """Returns True if dtype is a floating-point type (including bfloat16)."""
     return dtype.is_floating_point()
 
 
-fn is_integer(dtype: DType) -> Bool:
+def is_integer(dtype: DType) -> Bool:
     """Returns True if dtype is a signed or unsigned integer type."""
     return dtype.is_integral()
 
 
-fn is_signed(dtype: DType) -> Bool:
+def is_signed(dtype: DType) -> Bool:
     """Returns True if dtype is a signed numeric type."""
     return dtype.is_signed()
 
 
-fn can_cast(source: DType, target: DType) -> Bool:
+def can_cast(source: DType, target: DType) -> Bool:
     """Returns True if source can be safely cast to target without data loss.
 
     Safe casts:
@@ -143,7 +143,7 @@ fn can_cast(source: DType, target: DType) -> Bool:
     return False
 
 
-fn optimal_simd_width[dtype: DType]() -> Int:
+def optimal_simd_width[dtype: DType]() -> Int:
     """Returns the optimal SIMD vector width for the given DType on the current hardware."""
     return simd_width_of[dtype]()
 
@@ -160,7 +160,7 @@ comptime DLPACK_BFLOAT: Int = 4
 comptime DLPACK_BOOL: Int = 6
 
 
-fn dtype_to_dlpack_code(dtype: DType) -> Int:
+def dtype_to_dlpack_code(dtype: DType) -> Int:
     """Maps a Mojo DType to the corresponding DLPack type code.
 
     Returns -1 for unsupported types.
@@ -178,10 +178,10 @@ fn dtype_to_dlpack_code(dtype: DType) -> Int:
     return -1
 
 
-fn dlpack_code_to_dtype(code: Int, bits: Int) -> DType:
+def dlpack_code_to_dtype(code: Int, bits: Int) raises -> DType:
     """Maps a DLPack type code and bit-width back to a Mojo DType.
 
-    Returns DType.invalid for unrecognized combinations.
+    Raises an error for unrecognized combinations.
     """
     if code == DLPACK_BOOL:
         return DType.bool
@@ -212,4 +212,4 @@ fn dlpack_code_to_dtype(code: Int, bits: Int) -> DType:
             return DType.uint32
         if bits == 64:
             return DType.uint64
-    return DType.invalid
+    raise Error("unsupported DLPack type code / bit-width combination")

@@ -13,14 +13,14 @@ Sizes tested:
 DType: float32 (Sprint 1 — CPU only)
 """
 
-from time import now
+from std.time import perf_counter_ns
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import softmax
 
 
-fn bench_softmax_1d(size: Int, warmup: Int = 2, iters: Int = 20) raises:
+def bench_softmax_1d(size: Int, warmup: Int = 2, iters: Int = 20) raises:
     """Benchmark 1D softmax."""
     var x = Tensor[DType.float32].rand(Shape(size))
 
@@ -29,16 +29,16 @@ fn bench_softmax_1d(size: Int, warmup: Int = 2, iters: Int = 20) raises:
 
     var total_ns: Int = 0
     for _ in range(iters):
-        var t0 = now()
+        var t0 = perf_counter_ns()
         var s = softmax(x)
-        var t1 = now()
+        var t1 = perf_counter_ns()
         total_ns += t1 - t0
 
     var avg_ms = Float64(total_ns) / Float64(iters) / 1_000_000.0
-    print("softmax_1d n=" + str(size) + ": " + str(avg_ms) + " ms")
+    print("softmax_1d n=" + String(size) + ": " + String(avg_ms) + " ms")
 
 
-fn bench_softmax_2d(rows: Int, cols: Int, warmup: Int = 2, iters: Int = 20) raises:
+def bench_softmax_2d(rows: Int, cols: Int, warmup: Int = 2, iters: Int = 20) raises:
     """Benchmark 2D softmax along last axis."""
     var x = Tensor[DType.float32].rand(Shape(rows, cols))
 
@@ -47,19 +47,19 @@ fn bench_softmax_2d(rows: Int, cols: Int, warmup: Int = 2, iters: Int = 20) rais
 
     var total_ns: Int = 0
     for _ in range(iters):
-        var t0 = now()
+        var t0 = perf_counter_ns()
         var s = softmax(x, axis=-1)
-        var t1 = now()
+        var t1 = perf_counter_ns()
         total_ns += t1 - t0
 
     var avg_ms = Float64(total_ns) / Float64(iters) / 1_000_000.0
     print(
-        "softmax_2d (" + str(rows) + "," + str(cols) + "): "
-        + str(avg_ms) + " ms"
+        "softmax_2d (" + String(rows) + "," + String(cols) + "): "
+        + String(avg_ms) + " ms"
     )
 
 
-fn main() raises:
+def main() raises:
     print("=" * 60)
     print("Neutron Mojo — Softmax Benchmark (CPU, float32)")
     print("=" * 60)

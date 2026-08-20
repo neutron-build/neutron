@@ -1,6 +1,73 @@
 # Mojo 1.0 Migration Gap List
 
-Date: 2026-08-19
+Date: 2026-08-19 (audit) — **updated 2026-08-20: migration applied (S91)**
+
+## Status: MIGRATED — 125/125 tests pass on Mojo 1.0.0 (osx-arm64, native)
+
+Toolchain: conda `mojo 1.0.0` + `max 26.5.0` from `https://conda.modular.com/max/`
+(stable channel), resolved by pixi inside `neutron-mojo/` (`mojoproject.toml`:
+`mojo = ">=1.0"`, `max = ">=26.5"`). Validation: `scripts/validate-core.sh` →
+125 passed, 0 failed (see `reports/core-validation-latest.md`). All three
+benchmark harnesses also compile and run.
+
+Per-gap outcome:
+
+| Gap | Status | Notes |
+|---|---|---|
+| G1 `fn`→`def` | applied | 3,382 lines, 225 files (scripted) |
+| G2 `std.`-qualified imports | applied | 204 lines (172 module-level + 32 function-scoped the first pass missed) |
+| G3 copy/move init | applied | 79 `__copyinit__` + 119 `__moveinit__` + 1 `__del__` translated to `__init__`/`__deinit__` keyword form; 69 conformance lists gained `ImplicitlyCopyable`/`Movable`. Custom ownership rewritten by hand: `Storage` (Optional pointer, null-on-move), `BinaryReader` (same), `Pattern` (manual `__deinit__` + `deinit_with`) |
+| G4 `write_to` | applied | 20 sites → `def write_to(self, mut writer: Some[Writer])` |
+| G5 nullable pointers | applied | `dlpack` structs + `BinaryReader._mmap_ptr` → `Optional[Pointer[...]]`; `Pointer[mut=True, T, ...]` unbound-origin idiom in quant kernels |
+| G6 `parallelize` | applied | `from max.algorithm import parallelize` (+ explicit `max` dep in mojoproject.toml) |
+| G7 `alias`→`comptime` | applied | 13 sites |
+| G8 `__del__`→`__deinit__` | applied | both sites (correct spelling: `def __deinit__(deinit self)`) |
+| G9 `@parameter if` | N/A | audit misread: both sites are `@parameter def` closures, still valid at 1.0; zero `@parameter if/for` code sites exist |
+| G10 `constrained` | applied | → `comptime assert` |
+| G11 negative indexing | N/A | neutron's `Shape.__getitem__` normalizes negatives before hitting `List`; tests still pass unchanged |
+| G12 toolchain switch | applied | pixi re-solved on stable channel; `mojo package`/`.mojopkg` steps: none exist to migrate |
+| P1 `sys.bitwidthof` | applied | line deleted |
+| P2 `time.now` | applied | `perf_counter_ns` in 3 bench files + `str()`→`String()` (alias removed at 1.0) |
+
+New gaps found during the compile-driven pass (not in the original audit),
+all applied:
+
+- `len(String)` removed — ~180 sites → `.byte_length()` (byte semantics preserved).
+- String positional slicing removed — 11 sites → `s[byte=a:b]`.
+- `DType.invalid` removed — 2 converters now `raises` + `raise Error`; 1 test expects the raise.
+- `str()` removed — 14 bench sites → `String()`.
+- Implicit `Int`→`Float` literals removed (audit's B1, confirmed hot) — ~30 test sites wrapped in `Float64()`.
+- Implicit lvalue copy requires `ImplicitlyCopyable` (audit understated) — see G3 notes.
+- `List` is explicitly-copyable only — structs with `List` fields keep hand-written `__init__(out self, *, copy: Self)`.
+- `'where' clauses inside parameter lists` removed — 10 quant kernels → trailing `where`; then simplified away entirely via `Pointer[mut=True, T, ...]`.
+- Function-type params: `fn[w: Int](...)` → `def[w: Int](...) thin`; closures need capture lists (`{var a, ...}`); passing a parameterized function needs explicit unbinding (`_simd_add[dtype, ...]`).
+- `external_call` on variadic C functions requires `num_fixed_args=` (`open`).
+- Imports are illegal in nested scopes (try/if blocks) — 4 sites hoisted.
+- `Pointer.store/load` on origin-generic pointers fails overload resolution → `unsafe_store`/`unsafe_load` in quant kernels.
+
+Known residuals (documented, not blocking):
+
+1. **`Pattern` destroy is not recursive** — `List[Pattern]` cannot be
+   `Deinitable` (recursive type); `Pattern.__deinit__` frees only the top-level
+   list storage via `deinit_with`. Nested children lists leak at destruction.
+   Proper fix is an arena/index-based pattern tree, out of migration scope.
+2. **Mojo 1.0.0 codegen bug (worked around)** — passing a List-parameter
+   subscript directly into the variadic `Tensor.get(...)` miscompiles at
+   `-O1+` on osx-arm64 (reproduced standalone; pure-stdlib variants pass).
+   Workaround applied in `eviction.mojo::compact_scores` (hoist the index into
+   a local; noted with a comment).
+3. **~6.8k deprecation warnings** across the suite (`^` transfers on trivial
+   types, `load/store/__getitem__/alloc/free` → `unsafe_*` and Layout-based
+   `alloc`). Cosmetic; belongs to a B-list cleanup pass, not the migration.
+4. Move semantics at 1.0 destroy the moved-from value (its `__deinit__` runs
+   after a user move ctor) — owner types must neutralize their source. Done
+   for `Storage` and `BinaryReader`; the stdlib's own types either guard on
+   capacity (`List`) or use `@explicit_destroy`.
+
+---
+
+The remainder of this file is the original 2026-08-19 audit, kept as evidence.
+
 Scope: everything under `mojo/` (primarily `neutron-mojo/`).
 From: `max` **26.2.0.dev2026021605** (nightly, pinned in `neutron-mojo/pixi.lock`; stdlib
 vendored at `neutron-mojo/.pixi/envs/default/.../mojo/stdlib/std/`).

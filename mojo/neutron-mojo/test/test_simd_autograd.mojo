@@ -8,7 +8,7 @@ Verifies that SIMD implementations produce identical results to scalar
 for various tensor sizes (aligned, non-aligned, small).
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 
 from neutron_mojo.autograd import (
     Tape, run_backward,
@@ -17,7 +17,7 @@ from neutron_mojo.autograd import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e-5) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
@@ -27,7 +27,7 @@ fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e
         )
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
@@ -37,7 +37,7 @@ fn assert_eq(a: Int, b: Int) raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_simd_add_aligned() raises:
+def test_simd_add_aligned() raises:
     """SIMD add with aligned size (divisible by 4)."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -54,7 +54,7 @@ fn test_simd_add_aligned() raises:
     print("  simd_add_aligned: PASS")
 
 
-fn test_simd_add_non_aligned() raises:
+def test_simd_add_non_aligned() raises:
     """SIMD add with non-aligned size (not divisible by 4)."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -71,7 +71,7 @@ fn test_simd_add_non_aligned() raises:
     print("  simd_add_non_aligned: PASS")
 
 
-fn test_simd_mul_aligned() raises:
+def test_simd_mul_aligned() raises:
     """SIMD mul with aligned size."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -87,7 +87,7 @@ fn test_simd_mul_aligned() raises:
     print("  simd_mul_aligned: PASS")
 
 
-fn test_simd_relu_mixed() raises:
+def test_simd_relu_mixed() raises:
     """SIMD relu with mixed positive/negative values."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -116,7 +116,7 @@ fn test_simd_relu_mixed() raises:
     print("  simd_relu_mixed: PASS")
 
 
-fn test_simd_scalar_mul_aligned() raises:
+def test_simd_scalar_mul_aligned() raises:
     """SIMD scalar_mul with aligned size."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -130,7 +130,7 @@ fn test_simd_scalar_mul_aligned() raises:
     print("  simd_scalar_mul_aligned: PASS")
 
 
-fn test_simd_scalar_mul_non_aligned() raises:
+def test_simd_scalar_mul_non_aligned() raises:
     """SIMD scalar_mul with non-aligned size (size=5)."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -150,7 +150,7 @@ fn test_simd_scalar_mul_non_aligned() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_simd_backward_add() raises:
+def test_simd_backward_add() raises:
     """SIMD backward add with larger vector."""
     var tape = Tape(8192)
     var d = List[Int]()
@@ -170,7 +170,7 @@ fn test_simd_backward_add() raises:
     print("  simd_backward_add: PASS")
 
 
-fn test_simd_backward_mul_large() raises:
+def test_simd_backward_mul_large() raises:
     """SIMD backward mul with size > 4 to exercise SIMD path."""
     var tape = Tape(8192)
     var d = List[Int]()
@@ -190,7 +190,7 @@ fn test_simd_backward_mul_large() raises:
     print("  simd_backward_mul_large: PASS")
 
 
-fn test_simd_backward_relu_large() raises:
+def test_simd_backward_relu_large() raises:
     """SIMD backward relu with larger vector."""
     var tape = Tape(8192)
     var d = List[Int]()
@@ -213,7 +213,7 @@ fn test_simd_backward_relu_large() raises:
     print("  simd_backward_relu_large: PASS")
 
 
-fn test_simd_backward_scalar_mul_large() raises:
+def test_simd_backward_scalar_mul_large() raises:
     """SIMD backward scalar_mul with larger vector."""
     var tape = Tape(8192)
     var d = List[Int]()
@@ -229,7 +229,7 @@ fn test_simd_backward_scalar_mul_large() raises:
     print("  simd_backward_scalar_mul_large: PASS")
 
 
-fn test_simd_backward_matmul() raises:
+def test_simd_backward_matmul() raises:
     """SIMD backward matmul correctness."""
     var tape = Tape(8192)
     var da = List[Int]()
@@ -263,7 +263,7 @@ fn test_simd_backward_matmul() raises:
     print("  simd_backward_matmul: PASS")
 
 
-fn test_simd_small_size() raises:
+def test_simd_small_size() raises:
     """SIMD with size=1 (scalar remainder only, no SIMD bulk)."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -281,7 +281,7 @@ fn test_simd_small_size() raises:
     print("  simd_small_size: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_simd_autograd:")
 
     # Forward SIMD tests

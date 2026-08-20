@@ -22,12 +22,12 @@ from neutron_mojo.fusion.pattern import PatternKind
 from neutron_mojo.fusion.graph import OpKind
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_add_identity_rule() raises:
+def test_add_identity_rule() raises:
     """Test add identity rule construction."""
     var rule = rule_add_identity()
 
@@ -48,7 +48,7 @@ fn test_add_identity_rule() raises:
     print("  add_identity_rule: PASS")
 
 
-fn test_mul_identity_rule() raises:
+def test_mul_identity_rule() raises:
     """Test mul identity rule construction."""
     var rule = rule_mul_identity()
 
@@ -59,7 +59,7 @@ fn test_mul_identity_rule() raises:
     print("  mul_identity_rule: PASS")
 
 
-fn test_mul_zero_rule() raises:
+def test_mul_zero_rule() raises:
     """Test mul zero rule construction."""
     var rule = rule_mul_zero()
 
@@ -70,7 +70,7 @@ fn test_mul_zero_rule() raises:
     print("  mul_zero_rule: PASS")
 
 
-fn test_transpose_involution_rule() raises:
+def test_transpose_involution_rule() raises:
     """Test transpose involution rule construction."""
     var rule = rule_transpose_involution()
 
@@ -90,7 +90,7 @@ fn test_transpose_involution_rule() raises:
     print("  transpose_involution_rule: PASS")
 
 
-fn test_add_commutativity_rule() raises:
+def test_add_commutativity_rule() raises:
     """Test add commutativity rule construction."""
     var rule = rule_add_commutativity()
 
@@ -111,7 +111,7 @@ fn test_add_commutativity_rule() raises:
     print("  add_commutativity_rule: PASS")
 
 
-fn test_mul_commutativity_rule() raises:
+def test_mul_commutativity_rule() raises:
     """Test mul commutativity rule construction."""
     var rule = rule_mul_commutativity()
 
@@ -123,7 +123,7 @@ fn test_mul_commutativity_rule() raises:
     print("  mul_commutativity_rule: PASS")
 
 
-fn test_add_associativity_rule() raises:
+def test_add_associativity_rule() raises:
     """Test add associativity rule construction."""
     var rule = rule_add_associativity()
 
@@ -144,7 +144,7 @@ fn test_add_associativity_rule() raises:
     print("  add_associativity_rule: PASS")
 
 
-fn test_mul_associativity_rule() raises:
+def test_mul_associativity_rule() raises:
     """Test mul associativity rule construction."""
     var rule = rule_mul_associativity()
 
@@ -155,7 +155,7 @@ fn test_mul_associativity_rule() raises:
     print("  mul_associativity_rule: PASS")
 
 
-fn test_ruleset_creation() raises:
+def test_ruleset_creation() raises:
     """Test RuleSet basic operations."""
     var rs = RuleSet()
 
@@ -169,7 +169,7 @@ fn test_ruleset_creation() raises:
     print("  ruleset_creation: PASS")
 
 
-fn test_ruleset_phase_filtering() raises:
+def test_ruleset_phase_filtering() raises:
     """Test RuleSet phase filtering."""
     var rs = RuleSet()
 
@@ -190,7 +190,7 @@ fn test_ruleset_phase_filtering() raises:
     print("  ruleset_phase_filtering: PASS")
 
 
-fn test_default_ruleset() raises:
+def test_default_ruleset() raises:
     """Test default ruleset creation."""
     var rs = create_default_ruleset()
 
@@ -205,7 +205,7 @@ fn test_default_ruleset() raises:
     print("  default_ruleset: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_rules:")
 
     test_add_identity_rule()

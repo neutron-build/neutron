@@ -39,7 +39,7 @@ from neutron_mojo.nn.causal_lm import embed_token, argmax, apply_temperature
 # FP32 Model + Paged KV Cache
 # ===----------------------------------------------------------------------=== #
 
-fn paged_forward_layer(
+def paged_forward_layer(
     model: Model,
     x: Tensor[DType.float32],
     layer: Int,
@@ -131,7 +131,7 @@ fn paged_forward_layer(
     return output^
 
 
-fn paged_forward(
+def paged_forward(
     model: Model,
     token_id: Int,
     mut cache: PagedKVCache,
@@ -167,7 +167,7 @@ fn paged_forward(
     return logits^
 
 
-fn paged_generate(
+def paged_generate(
     model: Model,
     prompt_tokens: List[Int],
     max_new_tokens: Int,
@@ -229,7 +229,7 @@ fn paged_generate(
 # Q8 QuantizedModel + Paged KV Cache
 # ===----------------------------------------------------------------------=== #
 
-fn paged_q8_forward_layer(
+def paged_q8_forward_layer(
     model: QuantizedModel,
     x: Tensor[DType.float32],
     layer: Int,
@@ -298,7 +298,7 @@ fn paged_q8_forward_layer(
     return output^
 
 
-fn paged_q8_forward(
+def paged_q8_forward(
     model: QuantizedModel,
     token_id: Int,
     mut cache: PagedKVCache,
@@ -323,7 +323,7 @@ fn paged_q8_forward(
     return logits^
 
 
-fn paged_q8_generate(
+def paged_q8_generate(
     model: QuantizedModel,
     prompt_tokens: List[Int],
     max_new_tokens: Int,
@@ -365,7 +365,7 @@ fn paged_q8_generate(
 # Q4 Model + Paged KV Cache
 # ===----------------------------------------------------------------------=== #
 
-fn paged_q4_forward_layer(
+def paged_q4_forward_layer(
     model: Q4Model,
     x: Tensor[DType.float32],
     layer: Int,
@@ -434,7 +434,7 @@ fn paged_q4_forward_layer(
     return output^
 
 
-fn paged_q4_forward(
+def paged_q4_forward(
     model: Q4Model,
     token_id: Int,
     mut cache: PagedKVCache,
@@ -459,7 +459,7 @@ fn paged_q4_forward(
     return logits^
 
 
-fn paged_q4_generate(
+def paged_q4_generate(
     model: Q4Model,
     prompt_tokens: List[Int],
     max_new_tokens: Int,

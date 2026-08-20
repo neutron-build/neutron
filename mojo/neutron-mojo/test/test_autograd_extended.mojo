@@ -4,7 +4,7 @@
 
 """Tests for extended autograd backward ops and gradient checking."""
 
-from math import exp, sqrt, tanh
+from std.math import exp, sqrt, tanh
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.autograd import (
     Tape, run_backward, GradCheckResult, compare_gradients,
@@ -19,7 +19,7 @@ from neutron_mojo.autograd.tape import (
 from neutron_mojo.autograd.backward import run_backward
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
@@ -28,7 +28,7 @@ fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e
         )
 
 
-fn test_backward_div() raises:
+def test_backward_div() raises:
     """Division backward: d/da(a/b) = 1/b, d/db(a/b) = -a/b^2."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -62,7 +62,7 @@ fn test_backward_div() raises:
     print("  backward_div: PASS")
 
 
-fn test_backward_pow() raises:
+def test_backward_pow() raises:
     """Power backward: d/dx(x^n) = n*x^(n-1)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -72,7 +72,7 @@ fn test_backward_pow() raises:
     tape.set_data(x_idx, 1, Float32(2.0))
 
     # Manual tracked pow
-    from math import pow
+    from std.math import pow
     var y_dims = List[Int]()
     y_dims.append(2)
     var y_idx = tape.add_variable(y_dims^, requires_grad=True)
@@ -93,7 +93,7 @@ fn test_backward_pow() raises:
     print("  backward_pow: PASS")
 
 
-fn test_backward_sqrt() raises:
+def test_backward_sqrt() raises:
     """Sqrt backward: d/dx sqrt(x) = 0.5/sqrt(x)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -122,7 +122,7 @@ fn test_backward_sqrt() raises:
     print("  backward_sqrt: PASS")
 
 
-fn test_backward_clamp() raises:
+def test_backward_clamp() raises:
     """Clamp backward: 1 if in range, 0 otherwise."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -161,7 +161,7 @@ fn test_backward_clamp() raises:
     print("  backward_clamp: PASS")
 
 
-fn test_backward_gelu() raises:
+def test_backward_gelu() raises:
     """GeLU backward via recorded op."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -201,7 +201,7 @@ fn test_backward_gelu() raises:
     print("  backward_gelu: PASS")
 
 
-fn test_backward_silu() raises:
+def test_backward_silu() raises:
     """SiLU backward: sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -230,7 +230,7 @@ fn test_backward_silu() raises:
     print("  backward_silu: PASS")
 
 
-fn test_backward_reshape() raises:
+def test_backward_reshape() raises:
     """Reshape backward: pass-through."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -258,7 +258,7 @@ fn test_backward_reshape() raises:
     print("  backward_reshape: PASS")
 
 
-fn test_backward_mse() raises:
+def test_backward_mse() raises:
     """MSE backward: 2*(pred-target)/n."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -293,7 +293,7 @@ fn test_backward_mse() raises:
     print("  backward_mse: PASS")
 
 
-fn test_grad_check_utility() raises:
+def test_grad_check_utility() raises:
     """GradCheckResult comparison."""
     var a = Tensor[DType.float32](3)
     a.set(0, 1.0)
@@ -309,7 +309,7 @@ fn test_grad_check_utility() raises:
     print("  grad_check_utility: PASS")
 
 
-fn test_grad_check_fail() raises:
+def test_grad_check_fail() raises:
     """GradCheckResult detects large differences."""
     var a = Tensor[DType.float32](3)
     a.set(0, 1.0)
@@ -325,7 +325,7 @@ fn test_grad_check_fail() raises:
     print("  grad_check_fail: PASS")
 
 
-fn test_numerical_grad_add() raises:
+def test_numerical_grad_add() raises:
     """Numerical gradient verification for add."""
     var eps = 1e-4
 
@@ -381,7 +381,7 @@ fn test_numerical_grad_add() raises:
     print("  numerical_grad_add: PASS")
 
 
-fn test_numerical_grad_mul() raises:
+def test_numerical_grad_mul() raises:
     """Numerical gradient verification for mul."""
     var eps = 1e-4
     var d = List[Int]()
@@ -435,7 +435,7 @@ fn test_numerical_grad_mul() raises:
     print("  numerical_grad_mul: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_autograd_extended:")
     test_backward_div()
     test_backward_pow()

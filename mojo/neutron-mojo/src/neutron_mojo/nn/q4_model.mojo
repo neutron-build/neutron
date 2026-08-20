@@ -51,7 +51,7 @@ struct Q4Model(Movable):
     var block_size: Int
     var scales_per_layer: Int
 
-    fn __init__(out self, params: ModelParams, block_size: Int = 32):
+    def __init__(out self, params: ModelParams, block_size: Int = 32):
         self.params = params.copy()
         self.layer_size = params.layer_weight_count()
         self.block_size = block_size
@@ -89,18 +89,18 @@ struct Q4Model(Movable):
                 self.layer_weights.set(offsets.attn_norm + i, 1.0)
                 self.layer_weights.set(offsets.ffn_norm + i, 1.0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.params = other.params.copy()
-        self.embed = other.embed^
-        self.final_norm = other.final_norm^
-        self.lm_head = other.lm_head^
-        self.layer_weights = other.layer_weights^
-        self.layer_scales = other.layer_scales^
-        self.layer_size = other.layer_size
-        self.block_size = other.block_size
-        self.scales_per_layer = other.scales_per_layer
+    def __init__(out self, *, deinit move: Self):
+        self.params = move.params.copy()
+        self.embed = move.embed^
+        self.final_norm = move.final_norm^
+        self.lm_head = move.lm_head^
+        self.layer_weights = move.layer_weights^
+        self.layer_scales = move.layer_scales^
+        self.layer_size = move.layer_size^
+        self.block_size = move.block_size^
+        self.scales_per_layer = move.scales_per_layer^
 
-    fn _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
+    def _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
         """Compute data offsets (same layout as Model)."""
         var base = layer * self.layer_size
         var p = self.params.copy()
@@ -130,7 +130,7 @@ struct Q4Model(Movable):
         off.w_down = cursor
         return off^
 
-    fn _layer_scale_offsets(self, layer: Int) -> LayerScaleOffsets:
+    def _layer_scale_offsets(self, layer: Int) -> LayerScaleOffsets:
         """Compute scale offsets for a layer's projections."""
         var base = layer * self.scales_per_layer
         var p = self.params.copy()
@@ -157,7 +157,7 @@ struct Q4Model(Movable):
         soff.w_down = cursor
         return soff^
 
-    fn _q4_linear_from_flat(
+    def _q4_linear_from_flat(
         self,
         x: Tensor[DType.float32],
         data_offset: Int,
@@ -179,7 +179,7 @@ struct Q4Model(Movable):
         )
         return result^
 
-    fn forward_layer(
+    def forward_layer(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -266,7 +266,7 @@ struct Q4Model(Movable):
 
         return output^
 
-    fn forward(
+    def forward(
         self,
         token_id: Int,
         mut cache: MultiLayerKVCache,
@@ -291,7 +291,7 @@ struct Q4Model(Movable):
         )
         return logits^
 
-    fn forward_layer_q8cache(
+    def forward_layer_q8cache(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -370,7 +370,7 @@ struct Q4Model(Movable):
 
         return output^
 
-    fn forward_q8cache(
+    def forward_q8cache(
         self,
         token_id: Int,
         mut cache: MultiLayerQ8KVCache,
@@ -399,7 +399,7 @@ struct Q4Model(Movable):
 # Quantization (Q4)
 # ===----------------------------------------------------------------------=== #
 
-fn _quantize_projection_q4(
+def _quantize_projection_q4(
     src: Tensor[DType.float32],
     src_offset: Int,
     mut dst: Tensor[DType.float32],
@@ -450,7 +450,7 @@ fn _quantize_projection_q4(
                 dst.set(dst_offset + row * in_features + j, q)
 
 
-fn quantize_from_model_q4(model: Model, block_size: Int = 32) -> Q4Model:
+def quantize_from_model_q4(model: Model, block_size: Int = 32) -> Q4Model:
     """Convert FP32 Model to Q4 Q4Model.
 
     Quantizes all 7 projection weight matrices per layer to Q4_0.
@@ -539,7 +539,7 @@ fn quantize_from_model_q4(model: Model, block_size: Int = 32) -> Q4Model:
 # Generation
 # ===----------------------------------------------------------------------=== #
 
-fn q4_generate(
+def q4_generate(
     model: Q4Model,
     prompt_tokens: List[Int],
     max_new_tokens: Int,

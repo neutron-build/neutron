@@ -31,7 +31,7 @@ struct KVCache(Movable):
     var head_dim: Int
     var length: Int  # Number of positions currently cached
 
-    fn __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int):
+    def __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int):
         """Create an empty KV cache.
 
         Args:
@@ -48,19 +48,19 @@ struct KVCache(Movable):
         self.key_cache = Tensor[DType.float32](Shape(total))
         self.value_cache = Tensor[DType.float32](Shape(total))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.key_cache = other.key_cache^
-        self.value_cache = other.value_cache^
-        self.max_seq_len = other.max_seq_len
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
-        self.length = other.length
+    def __init__(out self, *, deinit move: Self):
+        self.key_cache = move.key_cache^
+        self.value_cache = move.value_cache^
+        self.max_seq_len = move.max_seq_len^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
+        self.length = move.length^
 
-    fn stride_per_pos(self) -> Int:
+    def stride_per_pos(self) -> Int:
         """Elements per position (num_kv_heads * head_dim)."""
         return self.num_kv_heads * self.head_dim
 
-    fn append_kv(
+    def append_kv(
         mut self,
         key: Tensor[DType.float32],
         value: Tensor[DType.float32],
@@ -87,7 +87,7 @@ struct KVCache(Movable):
 
         self.length += num_new_tokens
 
-    fn get_key_at(self, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_key_at(self, pos: Int, head: Int, dim: Int) -> Float32:
         """Get a single key value.
 
         Args:
@@ -101,7 +101,7 @@ struct KVCache(Movable):
         var offset = pos * self.num_kv_heads * self.head_dim + head * self.head_dim + dim
         return self.key_cache.get(offset)
 
-    fn get_value_at(self, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_value_at(self, pos: Int, head: Int, dim: Int) -> Float32:
         """Get a single value value.
 
         Args:
@@ -115,7 +115,7 @@ struct KVCache(Movable):
         var offset = pos * self.num_kv_heads * self.head_dim + head * self.head_dim + dim
         return self.value_cache.get(offset)
 
-    fn get_key_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_key_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
         """Get the key vector for a specific position and head.
 
         Args:
@@ -131,7 +131,7 @@ struct KVCache(Movable):
             result.set(d, self.key_cache.get(base + d))
         return result^
 
-    fn get_value_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_value_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
         """Get the value vector for a specific position and head.
 
         Args:
@@ -147,15 +147,15 @@ struct KVCache(Movable):
             result.set(d, self.value_cache.get(base + d))
         return result^
 
-    fn remaining_capacity(self) -> Int:
+    def remaining_capacity(self) -> Int:
         """Positions still available."""
         return self.max_seq_len - self.length
 
-    fn is_full(self) -> Bool:
+    def is_full(self) -> Bool:
         """Whether the cache is at capacity."""
         return self.length >= self.max_seq_len
 
-    fn reset(mut self):
+    def reset(mut self):
         """Clear the cache (reset length, zero data)."""
         self.length = 0
         var total = self.max_seq_len * self.num_kv_heads * self.head_dim
@@ -182,7 +182,7 @@ struct MultiLayerKVCache(Movable):
     var num_kv_heads: Int
     var head_dim: Int
 
-    fn __init__(
+    def __init__(
         out self,
         num_layers: Int,
         max_seq_len: Int,
@@ -211,24 +211,24 @@ struct MultiLayerKVCache(Movable):
         for _ in range(num_layers):
             self.lengths.append(0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.key_data = other.key_data^
-        self.value_data = other.value_data^
-        self.lengths = other.lengths^
-        self.num_layers = other.num_layers
-        self.max_seq_len = other.max_seq_len
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
+    def __init__(out self, *, deinit move: Self):
+        self.key_data = move.key_data^
+        self.value_data = move.value_data^
+        self.lengths = move.lengths^
+        self.num_layers = move.num_layers^
+        self.max_seq_len = move.max_seq_len^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
 
-    fn _layer_offset(self, layer: Int) -> Int:
+    def _layer_offset(self, layer: Int) -> Int:
         """Base offset for a layer's data."""
         return layer * self.max_seq_len * self.num_kv_heads * self.head_dim
 
-    fn _stride_per_pos(self) -> Int:
+    def _stride_per_pos(self) -> Int:
         """Elements per position."""
         return self.num_kv_heads * self.head_dim
 
-    fn append_kv(
+    def append_kv(
         mut self,
         layer: Int,
         key: Tensor[DType.float32],
@@ -257,24 +257,24 @@ struct MultiLayerKVCache(Movable):
 
         self.lengths[layer] = cur_len + num_new_tokens
 
-    fn get_key_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_key_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
         """Get a key value from a specific layer."""
         var offset = self._layer_offset(layer) + pos * self._stride_per_pos() + head * self.head_dim + dim
         return self.key_data.get(offset)
 
-    fn get_value_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
+    def get_value_at(self, layer: Int, pos: Int, head: Int, dim: Int) -> Float32:
         """Get a value from a specific layer."""
         var offset = self._layer_offset(layer) + pos * self._stride_per_pos() + head * self.head_dim + dim
         return self.value_data.get(offset)
 
-    fn total_memory_bytes(self) -> Int:
+    def total_memory_bytes(self) -> Int:
         """Total memory used by all caches (filled portion only)."""
         var total = 0
         for i in range(self.num_layers):
             total += self.lengths[i] * self.num_kv_heads * self.head_dim * 4 * 2
         return total
 
-    fn reset_all(mut self):
+    def reset_all(mut self):
         """Reset all layer caches."""
         for i in range(self.num_layers):
             self.lengths[i] = 0
@@ -283,7 +283,7 @@ struct MultiLayerKVCache(Movable):
             self.key_data.set(i, 0.0)
             self.value_data.set(i, 0.0)
 
-    fn current_length(self) -> Int:
+    def current_length(self) -> Int:
         """Current sequence length (assumes all layers in sync)."""
         if self.num_layers > 0:
             return self.lengths[0]

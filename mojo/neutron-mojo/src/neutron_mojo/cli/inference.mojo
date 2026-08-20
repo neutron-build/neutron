@@ -27,8 +27,8 @@ Run options:
     --quiet            Only print generated text (no stats)
 """
 
-from sys import argv
-from time import perf_counter_ns
+from std.sys import argv
+from std.time import perf_counter_ns
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
@@ -63,35 +63,35 @@ from neutron_mojo.io.model_export import (
 # Command Constants
 # ===----------------------------------------------------------------------=== #
 
-fn CMD_RUN() -> String:
+def CMD_RUN() -> String:
     return "run"
 
 
-fn CMD_SERVE() -> String:
+def CMD_SERVE() -> String:
     return "serve"
 
 
-fn CMD_INFO() -> String:
+def CMD_INFO() -> String:
     return "info"
 
 
-fn CMD_BENCH() -> String:
+def CMD_BENCH() -> String:
     return "bench"
 
 
-fn CMD_CONVERT() -> String:
+def CMD_CONVERT() -> String:
     return "convert"
 
 
-fn CMD_MODELS() -> String:
+def CMD_MODELS() -> String:
     return "models"
 
 
-fn CMD_TRAIN() -> String:
+def CMD_TRAIN() -> String:
     return "train"
 
 
-fn KNOWN_COMMANDS() -> List[String]:
+def KNOWN_COMMANDS() -> List[String]:
     var cmds = List[String]()
     cmds.append(CMD_RUN())
     cmds.append(CMD_SERVE())
@@ -136,7 +136,7 @@ struct CLIArgs(Movable):
     var use_lora: Bool
     var lora_rank: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.command = String("")
         self.model_path = String("")
         self.prompt = String("")
@@ -163,34 +163,34 @@ struct CLIArgs(Movable):
         self.use_lora = False
         self.lora_rank = 4
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.command = other.command^
-        self.model_path = other.model_path^
-        self.prompt = other.prompt^
-        self.output_path = other.output_path^
-        self.port = other.port
-        self.max_tokens = other.max_tokens
-        self.template = other.template^
-        self.system_prompt = other.system_prompt^
-        self.temperature = other.temperature
-        self.top_k = other.top_k
-        self.top_p = other.top_p
-        self.rep_penalty = other.rep_penalty
-        self.freq_penalty = other.freq_penalty
-        self.use_q8 = other.use_q8
-        self.q8_direct = other.q8_direct
-        self.q8_cache = other.q8_cache
-        self.use_mmap = other.use_mmap
-        self.quiet = other.quiet
-        self.epochs = other.epochs
-        self.lr = other.lr
-        self.hidden_dim = other.hidden_dim
-        self.num_layers = other.num_layers
-        self.vocab_size = other.vocab_size
-        self.use_lora = other.use_lora
-        self.lora_rank = other.lora_rank
+    def __init__(out self, *, deinit move: Self):
+        self.command = move.command^
+        self.model_path = move.model_path^
+        self.prompt = move.prompt^
+        self.output_path = move.output_path^
+        self.port = move.port^
+        self.max_tokens = move.max_tokens^
+        self.template = move.template^
+        self.system_prompt = move.system_prompt^
+        self.temperature = move.temperature^
+        self.top_k = move.top_k^
+        self.top_p = move.top_p^
+        self.rep_penalty = move.rep_penalty^
+        self.freq_penalty = move.freq_penalty^
+        self.use_q8 = move.use_q8^
+        self.q8_direct = move.q8_direct^
+        self.q8_cache = move.q8_cache^
+        self.use_mmap = move.use_mmap^
+        self.quiet = move.quiet^
+        self.epochs = move.epochs^
+        self.lr = move.lr^
+        self.hidden_dim = move.hidden_dim^
+        self.num_layers = move.num_layers^
+        self.vocab_size = move.vocab_size^
+        self.use_lora = move.use_lora^
+        self.lora_rank = move.lora_rank^
 
-    fn copy(self) -> CLIArgs:
+    def copy(self) -> CLIArgs:
         var c = CLIArgs()
         c.command = self.command
         c.model_path = self.model_path
@@ -220,7 +220,7 @@ struct CLIArgs(Movable):
         return c^
 
 
-fn is_known_command(cmd: String) -> Bool:
+def is_known_command(cmd: String) -> Bool:
     """Check if a string is a known CLI command."""
     if cmd == CMD_RUN():
         return True
@@ -239,7 +239,7 @@ fn is_known_command(cmd: String) -> Bool:
     return False
 
 
-fn print_usage():
+def print_usage():
     """Print help text for the CLI."""
     print("Neutron Mojo -- Inference Engine CLI")
     print("")
@@ -258,7 +258,7 @@ fn print_usage():
     print("Run 'neutron <command> --help' for command-specific options.")
 
 
-fn print_run_help():
+def print_run_help():
     """Print help text for the run command."""
     print("Usage: neutron run <model.gguf> \"<prompt>\" [options]")
     print("")
@@ -278,7 +278,7 @@ fn print_run_help():
     print("  --quiet            Only print generated text")
 
 
-fn parse_cli_args(args: List[String]) raises -> CLIArgs:
+def parse_cli_args(args: List[String]) raises -> CLIArgs:
     """Parse CLI arguments from a list of strings.
 
     This is the testable core of argument parsing. Takes a list of strings
@@ -402,7 +402,7 @@ fn parse_cli_args(args: List[String]) raises -> CLIArgs:
             elif arg == "--mmap":
                 result.use_mmap = True
             i += 1
-        if len(result.output_path) == 0:
+        if result.output_path.byte_length() == 0:
             raise Error("convert requires -o <output.nmf>")
 
     elif cmd == CMD_MODELS():
@@ -444,7 +444,7 @@ fn parse_cli_args(args: List[String]) raises -> CLIArgs:
     return result^
 
 
-fn parse_args() raises -> CLIArgs:
+def parse_args() raises -> CLIArgs:
     """Parse command-line arguments from sys.argv.
 
     Returns:
@@ -462,7 +462,7 @@ fn parse_args() raises -> CLIArgs:
 # Output Formatting
 # ===----------------------------------------------------------------------=== #
 
-fn format_info_output(info: ModelInfo, mem: MemoryEstimate) -> String:
+def format_info_output(info: ModelInfo, mem: MemoryEstimate) -> String:
     """Format model info and memory estimate for display.
 
     Args:
@@ -483,7 +483,7 @@ fn format_info_output(info: ModelInfo, mem: MemoryEstimate) -> String:
     return s^
 
 
-fn format_bench_header(mode: String, io_mode: String) -> String:
+def format_bench_header(mode: String, io_mode: String) -> String:
     """Format benchmark header text.
 
     Args:
@@ -500,7 +500,7 @@ fn format_bench_header(mode: String, io_mode: String) -> String:
     return s^
 
 
-fn format_bench_result(
+def format_bench_result(
     load_ms: Int,
     prefill_tokens: Int,
     prefill_ms: Int,
@@ -533,18 +533,18 @@ fn format_bench_result(
     return s^
 
 
-fn _ends_with(s: String, suffix: String) -> Bool:
+def _ends_with(s: String, suffix: String) -> Bool:
     """Check if a string ends with a given suffix."""
-    if len(suffix) > len(s):
+    if suffix.byte_length() > s.byte_length():
         return False
-    var start = len(s) - len(suffix)
-    for i in range(len(suffix)):
+    var start = s.byte_length() - suffix.byte_length()
+    for i in range(suffix.byte_length()):
         if ord(s[byte=start + i]) != ord(suffix[byte=i]):
             return False
     return True
 
 
-fn list_model_files(filenames: List[String]) -> List[String]:
+def list_model_files(filenames: List[String]) -> List[String]:
     """Filter a list of filenames to model files (.gguf, .nmf, .safetensors).
 
     Args:
@@ -565,7 +565,7 @@ fn list_model_files(filenames: List[String]) -> List[String]:
 # Tokenizer Loading
 # ===----------------------------------------------------------------------=== #
 
-fn _load_tokenizer(model_path: String) raises -> BPETokenizer:
+def _load_tokenizer(model_path: String) raises -> BPETokenizer:
     """Load tokenizer from a GGUF file.
 
     Args:
@@ -596,7 +596,7 @@ fn _load_tokenizer(model_path: String) raises -> BPETokenizer:
 # Command Handlers
 # ===----------------------------------------------------------------------=== #
 
-fn cmd_run(args: CLIArgs) raises:
+def cmd_run(args: CLIArgs) raises:
     """Execute the 'run' command — one-shot inference."""
     if not args.quiet:
         print("Neutron Mojo Inference Runner")
@@ -706,7 +706,7 @@ fn cmd_run(args: CLIArgs) raises:
             print("Generation: " + String(Int(gen_ms)) + " ms")
 
 
-fn cmd_info(args: CLIArgs) raises:
+def cmd_info(args: CLIArgs) raises:
     """Execute the 'info' command — print model architecture info."""
     var gguf = parse_gguf_file(args.model_path)
     var cfg = gguf_to_model_config(gguf)
@@ -725,7 +725,7 @@ fn cmd_info(args: CLIArgs) raises:
     print(format_info_output(info, mem))
 
 
-fn cmd_serve(args: CLIArgs) raises:
+def cmd_serve(args: CLIArgs) raises:
     """Execute the 'serve' command — start HTTP API server via Python.
 
     Uses Python http.server for the HTTP transport layer and routes
@@ -780,7 +780,7 @@ fn cmd_serve(args: CLIArgs) raises:
     _ = run_python_script(server_code)
 
 
-fn cmd_bench(args: CLIArgs) raises:
+def cmd_bench(args: CLIArgs) raises:
     """Execute the 'bench' command — benchmark performance."""
     var mode = "Q8-direct" if args.q8_direct else ("Q8" if args.use_q8 else "FP32")
     var io_mode = "mmap" if args.use_mmap else "slurp"
@@ -831,7 +831,7 @@ fn cmd_bench(args: CLIArgs) raises:
     print(format_bench_result(load_ms, prefill_tokens, prefill_ms, decode_tokens, decode_ms))
 
 
-fn cmd_convert(args: CLIArgs) raises:
+def cmd_convert(args: CLIArgs) raises:
     """Execute the 'convert' command — export to NMF format via Python file I/O."""
     print("Neutron Mojo -- Convert to NMF")
     print("=" * 40)
@@ -852,7 +852,7 @@ fn cmd_convert(args: CLIArgs) raises:
     print("NMF buffer: " + String(buf_size) + " bytes")
 
     # Write buffer to file via Python
-    from python import Python, PythonObject
+    from std.python import Python, PythonObject
     var builtins = Python.import_module("builtins")
     var f = builtins.open(args.output_path, "wb")
     var ba = builtins.bytearray(buf_size)
@@ -863,7 +863,7 @@ fn cmd_convert(args: CLIArgs) raises:
     print("Written to: " + args.output_path)
 
 
-fn cmd_train(args: CLIArgs) raises:
+def cmd_train(args: CLIArgs) raises:
     """Execute the 'train' command — train a tiny language model.
 
     Runs an inline training loop (avoids train_tiny_lm which can hang).
@@ -930,7 +930,7 @@ fn cmd_train(args: CLIArgs) raises:
         print("Training complete.")
 
 
-fn cmd_models(args: CLIArgs) raises:
+def cmd_models(args: CLIArgs) raises:
     """Execute the 'models' command — list available models via Python os.listdir."""
     var dir_path = args.model_path
     if len(dir_path) == 0:
@@ -940,7 +940,7 @@ fn cmd_models(args: CLIArgs) raises:
     print("Directory: " + dir_path)
     print("")
 
-    from python import Python, PythonObject
+    from std.python import Python, PythonObject
     var os = Python.import_module("os")
     var builtins = Python.import_module("builtins")
 
@@ -966,7 +966,7 @@ fn cmd_models(args: CLIArgs) raises:
 # Main Entry Point
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     """Multi-command CLI entry point."""
     var args = parse_args()
 

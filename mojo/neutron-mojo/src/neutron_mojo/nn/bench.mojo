@@ -20,7 +20,7 @@ Usage:
     print("Decode: " + String(result.decode_tokens_per_sec) + " tok/s")
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.nn.model import Model, ModelParams
 from neutron_mojo.nn.kv_cache import MultiLayerKVCache
 from neutron_mojo.nn.rope import RoPETable
@@ -39,7 +39,7 @@ from neutron_mojo.tensor.shape import Shape
 # Memory Estimation
 # ===----------------------------------------------------------------------=== #
 
-struct MemoryEstimate(Copyable, Movable):
+struct MemoryEstimate(Copyable, Movable, ImplicitlyCopyable):
     """Memory usage estimate for model inference."""
     var model_params_bytes: Int    # Total model parameter memory
     var embed_bytes: Int           # Embedding table
@@ -49,7 +49,7 @@ struct MemoryEstimate(Copyable, Movable):
     var activation_bytes: Int      # Peak activation memory estimate
     var total_bytes: Int           # Sum of all components
 
-    fn __init__(out self):
+    def __init__(out self):
         self.model_params_bytes = 0
         self.embed_bytes = 0
         self.layer_weights_bytes = 0
@@ -58,38 +58,38 @@ struct MemoryEstimate(Copyable, Movable):
         self.activation_bytes = 0
         self.total_bytes = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.model_params_bytes = existing.model_params_bytes
-        self.embed_bytes = existing.embed_bytes
-        self.layer_weights_bytes = existing.layer_weights_bytes
-        self.lm_head_bytes = existing.lm_head_bytes
-        self.kv_cache_bytes = existing.kv_cache_bytes
-        self.activation_bytes = existing.activation_bytes
-        self.total_bytes = existing.total_bytes
+    def __init__(out self, *, copy: Self):
+        self.model_params_bytes = copy.model_params_bytes
+        self.embed_bytes = copy.embed_bytes
+        self.layer_weights_bytes = copy.layer_weights_bytes
+        self.lm_head_bytes = copy.lm_head_bytes
+        self.kv_cache_bytes = copy.kv_cache_bytes
+        self.activation_bytes = copy.activation_bytes
+        self.total_bytes = copy.total_bytes
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.model_params_bytes = other.model_params_bytes
-        self.embed_bytes = other.embed_bytes
-        self.layer_weights_bytes = other.layer_weights_bytes
-        self.lm_head_bytes = other.lm_head_bytes
-        self.kv_cache_bytes = other.kv_cache_bytes
-        self.activation_bytes = other.activation_bytes
-        self.total_bytes = other.total_bytes
+    def __init__(out self, *, deinit move: Self):
+        self.model_params_bytes = move.model_params_bytes^
+        self.embed_bytes = move.embed_bytes^
+        self.layer_weights_bytes = move.layer_weights_bytes^
+        self.lm_head_bytes = move.lm_head_bytes^
+        self.kv_cache_bytes = move.kv_cache_bytes^
+        self.activation_bytes = move.activation_bytes^
+        self.total_bytes = move.total_bytes^
 
-    fn total_mb(self) -> Float64:
+    def total_mb(self) -> Float64:
         """Total memory in megabytes."""
         return Float64(self.total_bytes) / (1024.0 * 1024.0)
 
-    fn model_mb(self) -> Float64:
+    def model_mb(self) -> Float64:
         """Model parameter memory in megabytes."""
         return Float64(self.model_params_bytes) / (1024.0 * 1024.0)
 
-    fn kv_cache_mb(self) -> Float64:
+    def kv_cache_mb(self) -> Float64:
         """KV cache memory in megabytes."""
         return Float64(self.kv_cache_bytes) / (1024.0 * 1024.0)
 
 
-fn estimate_memory(
+def estimate_memory(
     params: ModelParams,
     batch_size: Int = 1,
     seq_len: Int = 512,
@@ -141,7 +141,7 @@ fn estimate_memory(
 # Model Info
 # ===----------------------------------------------------------------------=== #
 
-struct ModelInfo(Copyable, Movable):
+struct ModelInfo(Copyable, Movable, ImplicitlyCopyable):
     """Displayable model architecture information."""
     var num_layers: Int
     var vocab_size: Int
@@ -154,7 +154,7 @@ struct ModelInfo(Copyable, Movable):
     var total_params: Int         # Total parameter count
     var total_params_millions: Float64
 
-    fn __init__(out self):
+    def __init__(out self):
         self.num_layers = 0
         self.vocab_size = 0
         self.hidden_dim = 0
@@ -166,41 +166,41 @@ struct ModelInfo(Copyable, Movable):
         self.total_params = 0
         self.total_params_millions = 0.0
 
-    fn __copyinit__(out self, existing: Self):
-        self.num_layers = existing.num_layers
-        self.vocab_size = existing.vocab_size
-        self.hidden_dim = existing.hidden_dim
-        self.num_q_heads = existing.num_q_heads
-        self.num_kv_heads = existing.num_kv_heads
-        self.head_dim = existing.head_dim
-        self.ffn_dim = existing.ffn_dim
-        self.max_seq_len = existing.max_seq_len
-        self.total_params = existing.total_params
-        self.total_params_millions = existing.total_params_millions
+    def __init__(out self, *, copy: Self):
+        self.num_layers = copy.num_layers
+        self.vocab_size = copy.vocab_size
+        self.hidden_dim = copy.hidden_dim
+        self.num_q_heads = copy.num_q_heads
+        self.num_kv_heads = copy.num_kv_heads
+        self.head_dim = copy.head_dim
+        self.ffn_dim = copy.ffn_dim
+        self.max_seq_len = copy.max_seq_len
+        self.total_params = copy.total_params
+        self.total_params_millions = copy.total_params_millions
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.num_layers = other.num_layers
-        self.vocab_size = other.vocab_size
-        self.hidden_dim = other.hidden_dim
-        self.num_q_heads = other.num_q_heads
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
-        self.ffn_dim = other.ffn_dim
-        self.max_seq_len = other.max_seq_len
-        self.total_params = other.total_params
-        self.total_params_millions = other.total_params_millions
+    def __init__(out self, *, deinit move: Self):
+        self.num_layers = move.num_layers^
+        self.vocab_size = move.vocab_size^
+        self.hidden_dim = move.hidden_dim^
+        self.num_q_heads = move.num_q_heads^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
+        self.ffn_dim = move.ffn_dim^
+        self.max_seq_len = move.max_seq_len^
+        self.total_params = move.total_params^
+        self.total_params_millions = move.total_params_millions^
 
-    fn is_gqa(self) -> Bool:
+    def is_gqa(self) -> Bool:
         """Whether model uses Grouped Query Attention."""
         return self.num_kv_heads < self.num_q_heads
 
-    fn gqa_ratio(self) -> Int:
+    def gqa_ratio(self) -> Int:
         """GQA ratio (Q heads per KV head)."""
         if self.num_kv_heads == 0:
             return 0
         return self.num_q_heads // self.num_kv_heads
 
-    fn summary(self) -> String:
+    def summary(self) -> String:
         """Format a human-readable summary."""
         var s = String("Model: ")
         s += String(self.total_params_millions) + "M params\n"
@@ -216,7 +216,7 @@ struct ModelInfo(Copyable, Movable):
         return s^
 
 
-fn model_info(params: ModelParams) -> ModelInfo:
+def model_info(params: ModelParams) -> ModelInfo:
     """Extract displayable info from model parameters.
 
     Args:
@@ -251,7 +251,7 @@ fn model_info(params: ModelParams) -> ModelInfo:
 # Benchmark Harness
 # ===----------------------------------------------------------------------=== #
 
-struct BenchmarkResult(Copyable, Movable):
+struct BenchmarkResult(Copyable, Movable, ImplicitlyCopyable):
     """Results from a benchmark run."""
     var prefill_tokens: Int
     var decode_tokens: Int
@@ -262,7 +262,7 @@ struct BenchmarkResult(Copyable, Movable):
     var decode_tokens_per_sec: Float64
     var overall_tokens_per_sec: Float64
 
-    fn __init__(out self):
+    def __init__(out self):
         self.prefill_tokens = 0
         self.decode_tokens = 0
         self.prefill_ns = 0
@@ -272,27 +272,27 @@ struct BenchmarkResult(Copyable, Movable):
         self.decode_tokens_per_sec = 0.0
         self.overall_tokens_per_sec = 0.0
 
-    fn __copyinit__(out self, existing: Self):
-        self.prefill_tokens = existing.prefill_tokens
-        self.decode_tokens = existing.decode_tokens
-        self.prefill_ns = existing.prefill_ns
-        self.decode_ns = existing.decode_ns
-        self.total_ns = existing.total_ns
-        self.prefill_tokens_per_sec = existing.prefill_tokens_per_sec
-        self.decode_tokens_per_sec = existing.decode_tokens_per_sec
-        self.overall_tokens_per_sec = existing.overall_tokens_per_sec
+    def __init__(out self, *, copy: Self):
+        self.prefill_tokens = copy.prefill_tokens
+        self.decode_tokens = copy.decode_tokens
+        self.prefill_ns = copy.prefill_ns
+        self.decode_ns = copy.decode_ns
+        self.total_ns = copy.total_ns
+        self.prefill_tokens_per_sec = copy.prefill_tokens_per_sec
+        self.decode_tokens_per_sec = copy.decode_tokens_per_sec
+        self.overall_tokens_per_sec = copy.overall_tokens_per_sec
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.prefill_tokens = other.prefill_tokens
-        self.decode_tokens = other.decode_tokens
-        self.prefill_ns = other.prefill_ns
-        self.decode_ns = other.decode_ns
-        self.total_ns = other.total_ns
-        self.prefill_tokens_per_sec = other.prefill_tokens_per_sec
-        self.decode_tokens_per_sec = other.decode_tokens_per_sec
-        self.overall_tokens_per_sec = other.overall_tokens_per_sec
+    def __init__(out self, *, deinit move: Self):
+        self.prefill_tokens = move.prefill_tokens^
+        self.decode_tokens = move.decode_tokens^
+        self.prefill_ns = move.prefill_ns^
+        self.decode_ns = move.decode_ns^
+        self.total_ns = move.total_ns^
+        self.prefill_tokens_per_sec = move.prefill_tokens_per_sec^
+        self.decode_tokens_per_sec = move.decode_tokens_per_sec^
+        self.overall_tokens_per_sec = move.overall_tokens_per_sec^
 
-    fn summary(self) -> String:
+    def summary(self) -> String:
         """Format benchmark results."""
         var s = String("Benchmark Results:\n")
         s += "  Prefill: " + String(self.prefill_tokens) + " tokens in "
@@ -306,7 +306,7 @@ struct BenchmarkResult(Copyable, Movable):
         return s^
 
 
-fn benchmark_inference(
+def benchmark_inference(
     model: Model,
     tokenizer: BPETokenizer,
     prompt: String,
@@ -391,7 +391,7 @@ fn benchmark_inference(
     return result^
 
 
-fn benchmark_prefill_comparison(
+def benchmark_prefill_comparison(
     model: Model,
     tokenizer: BPETokenizer,
     prompt: String,

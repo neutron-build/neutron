@@ -23,8 +23,8 @@ Tests:
 16. Benchmark: profiled vs unprofiled overhead
 """
 
-from math import abs
-from time import perf_counter_ns
+from std.math import abs
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params
@@ -38,12 +38,12 @@ from neutron_mojo.nn.profiler import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error("FAIL: " + msg + " a=" + String(a) + " b=" + String(b))
 
@@ -52,7 +52,7 @@ fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     var p = tiny_test_params()
     var model = Model(p)
     for v in range(p.vocab_size):
@@ -73,7 +73,7 @@ fn _build_tiny_model() -> Model:
 # ProfileResult Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_profile_result_default() raises:
+def test_profile_result_default() raises:
     """ProfileResult initializes to all zeros."""
     var r = ProfileResult()
     assert_true(r.embed_ns == 0, "embed_ns should be 0")
@@ -93,7 +93,7 @@ fn test_profile_result_default() raises:
     print("  profile_result_default: PASS")
 
 
-fn test_profile_result_copy() raises:
+def test_profile_result_copy() raises:
     """ProfileResult copy preserves values."""
     var r = ProfileResult()
     r.embed_ns = 100
@@ -109,7 +109,7 @@ fn test_profile_result_copy() raises:
     print("  profile_result_copy: PASS")
 
 
-fn test_profile_result_add() raises:
+def test_profile_result_add() raises:
     """ProfileResult add accumulates values."""
     var a = ProfileResult()
     a.embed_ns = 100
@@ -128,7 +128,7 @@ fn test_profile_result_add() raises:
     print("  profile_result_add: PASS")
 
 
-fn test_profile_result_summary() raises:
+def test_profile_result_summary() raises:
     """ProfileResult summary produces formatted output."""
     var r = ProfileResult()
     r.embed_ns = 1000
@@ -147,7 +147,7 @@ fn test_profile_result_summary() raises:
     r.num_layers = 2
 
     var s = r.summary()
-    assert_true(len(s) > 50, "summary has content")
+    assert_true(s.byte_length() > 50, "summary has content")
     assert_true("embed" in s, "summary contains embed")
     assert_true("qkv_proj" in s, "summary contains qkv_proj")
     assert_true("attention" in s, "summary contains attention")
@@ -156,7 +156,7 @@ fn test_profile_result_summary() raises:
     print("  profile_result_summary: PASS")
 
 
-fn test_profile_result_layer_total() raises:
+def test_profile_result_layer_total() raises:
     """Layer total sums all per-layer operations."""
     var r = ProfileResult()
     r.attn_norm_ns = 100
@@ -175,7 +175,7 @@ fn test_profile_result_layer_total() raises:
     print("  profile_result_layer_total: PASS")
 
 
-fn test_profile_result_overhead() raises:
+def test_profile_result_overhead() raises:
     """Overhead computes unaccounted time."""
     var r = ProfileResult()
     r.embed_ns = 100
@@ -195,7 +195,7 @@ fn test_profile_result_overhead() raises:
 # Profiled Forward Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_profile_forward_produces_output() raises:
+def test_profile_forward_produces_output() raises:
     """Profile forward produces logits and fills profile data."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -213,7 +213,7 @@ fn test_profile_forward_produces_output() raises:
     print("  profile_forward_produces_output: PASS")
 
 
-fn test_profile_forward_timing_nonzero() raises:
+def test_profile_forward_timing_nonzero() raises:
     """Profiled forward has non-zero timing for key operations."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -238,7 +238,7 @@ fn test_profile_forward_timing_nonzero() raises:
     print("  profile_forward_timing_nonzero: PASS")
 
 
-fn test_profile_forward_all_ops_measured() raises:
+def test_profile_forward_all_ops_measured() raises:
     """All operation categories get timing entries after warmup."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -262,7 +262,7 @@ fn test_profile_forward_all_ops_measured() raises:
     print("  profile_forward_all_ops_measured: PASS")
 
 
-fn test_profile_matches_model_forward() raises:
+def test_profile_matches_model_forward() raises:
     """Profiled forward produces identical logits to Model.forward."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -296,7 +296,7 @@ fn test_profile_matches_model_forward() raises:
 # Decode Profile Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_profile_decode_runs() raises:
+def test_profile_decode_runs() raises:
     """Decode profiling runs without error."""
     var model = _build_tiny_model()
     var prompt = List[Int]()
@@ -310,7 +310,7 @@ fn test_profile_decode_runs() raises:
     print("  profile_decode_runs: PASS")
 
 
-fn test_profile_decode_accumulates() raises:
+def test_profile_decode_accumulates() raises:
     """Decode profiling accumulates across steps."""
     var model = _build_tiny_model()
     var prompt = List[Int]()
@@ -323,7 +323,7 @@ fn test_profile_decode_accumulates() raises:
     print("  profile_decode_accumulates: PASS")
 
 
-fn test_profile_decode_tokens_per_sec() raises:
+def test_profile_decode_tokens_per_sec() raises:
     """Decode profiling computes positive tokens/sec."""
     var model = _build_tiny_model()
     var prompt = List[Int]()
@@ -334,7 +334,7 @@ fn test_profile_decode_tokens_per_sec() raises:
     print("  profile_decode_tokens_per_sec: PASS")
 
 
-fn test_decode_profile_avg_step() raises:
+def test_decode_profile_avg_step() raises:
     """DecodeProfileResult computes average step time."""
     var dr = DecodeProfileResult()
     dr.num_steps = 5
@@ -348,7 +348,7 @@ fn test_decode_profile_avg_step() raises:
     print("  decode_profile_avg_step: PASS")
 
 
-fn test_decode_profile_summary() raises:
+def test_decode_profile_summary() raises:
     """DecodeProfileResult summary produces formatted output."""
     var model = _build_tiny_model()
     var prompt = List[Int]()
@@ -356,7 +356,7 @@ fn test_decode_profile_summary() raises:
 
     var result = profile_decode(model, prompt, num_steps=5)
     var s = result.summary()
-    assert_true(len(s) > 50, "summary has content")
+    assert_true(s.byte_length() > 50, "summary has content")
     assert_true("Decode Profile" in s, "summary has header")
     assert_true("tok/s" in s, "summary has tok/s")
     assert_true("Avg step" in s, "summary has avg step")
@@ -367,7 +367,7 @@ fn test_decode_profile_summary() raises:
 # Benchmark: Profiling Overhead
 # ===----------------------------------------------------------------------=== #
 
-fn test_benchmark_profiling_overhead() raises:
+def test_benchmark_profiling_overhead() raises:
     """Benchmark profiled vs unprofiled forward to measure overhead."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -412,7 +412,7 @@ fn test_benchmark_profiling_overhead() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_profiler:")
 
     # ProfileResult tests

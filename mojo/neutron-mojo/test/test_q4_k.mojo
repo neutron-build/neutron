@@ -14,20 +14,20 @@ from neutron_mojo.quant.q4_k import (
     dequantize_q4_k_block,
     calc_q4_k_buffer_size,
 )
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
     if abs(a - b) > tol:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn test_q4_k_block_size() raises:
+def test_q4_k_block_size() raises:
     """Test Q4_K block size."""
     assert_true(q4_k_block_size() == 256, "Q4_K block size should be 256")
     assert_true(q4_k_subblock_size() == 32, "Q4_K sub-block size should be 32")
@@ -35,7 +35,7 @@ fn test_q4_k_block_size() raises:
     print("  q4_k_block_size: PASS")
 
 
-fn test_q4_k_bytes_per_block() raises:
+def test_q4_k_bytes_per_block() raises:
     """Test Q4_K bytes per block."""
     # Approximate: 156 bytes per super-block
     var bytes = q4_k_bytes_per_block()
@@ -45,7 +45,7 @@ fn test_q4_k_bytes_per_block() raises:
     print("  q4_k_bytes_per_block: PASS")
 
 
-fn test_quantize_q4_k_zero() raises:
+def test_quantize_q4_k_zero() raises:
     """Test quantizing zero."""
     var scale = Float32(1.0)
     var min_val = Float32(0.0)
@@ -57,7 +57,7 @@ fn test_quantize_q4_k_zero() raises:
     print("  quantize_q4_k_zero: PASS")
 
 
-fn test_quantize_q4_k_range() raises:
+def test_quantize_q4_k_range() raises:
     """Test quantizing values in range."""
     var scale = Float32(1.0)
     var min_val = Float32(0.0)
@@ -74,7 +74,7 @@ fn test_quantize_q4_k_range() raises:
     print("  quantize_q4_k_range: PASS")
 
 
-fn test_quantize_q4_k_clamping() raises:
+def test_quantize_q4_k_clamping() raises:
     """Test that quantization clamps to [0, 15]."""
     var scale = Float32(1.0)
     var min_val = Float32(0.0)
@@ -89,7 +89,7 @@ fn test_quantize_q4_k_clamping() raises:
     print("  quantize_q4_k_clamping: PASS")
 
 
-fn test_dequantize_q4_k() raises:
+def test_dequantize_q4_k() raises:
     """Test dequantizing Q4_K values."""
     var scale = Float32(2.0)
     var min_val = Float32(10.0)
@@ -108,7 +108,7 @@ fn test_dequantize_q4_k() raises:
     print("  dequantize_q4_k: PASS")
 
 
-fn test_quantize_dequantize_roundtrip() raises:
+def test_quantize_dequantize_roundtrip() raises:
     """Test Q4_K roundtrip accuracy."""
     var scale = Float32(2.0)
     var min_val = Float32(5.0)
@@ -123,7 +123,7 @@ fn test_quantize_dequantize_roundtrip() raises:
     print("  quantize_dequantize_roundtrip: PASS")
 
 
-fn test_q4_k_block_quantize() raises:
+def test_q4_k_block_quantize() raises:
     """Test Q4_K block quantization."""
     # Create input data using List (64 elements for speed)
     var input_list = List[Float32]()
@@ -147,7 +147,7 @@ fn test_q4_k_block_quantize() raises:
     print("  q4_k_block_quantize: PASS")
 
 
-fn test_q4_k_block_dequantize() raises:
+def test_q4_k_block_dequantize() raises:
     """Test Q4_K block dequantization roundtrip."""
     # Original data using List (64 elements)
     var input_list = List[Float32]()
@@ -186,7 +186,7 @@ fn test_q4_k_block_dequantize() raises:
     print("  q4_k_block_dequantize: PASS")
 
 
-fn test_calc_q4_k_buffer_size() raises:
+def test_calc_q4_k_buffer_size() raises:
     """Test Q4_K buffer size calculation."""
     # 256 elements = 1 block * 156 bytes = 156 bytes
     var size_256 = calc_q4_k_buffer_size(256)
@@ -199,7 +199,7 @@ fn test_calc_q4_k_buffer_size() raises:
     print("  calc_q4_k_buffer_size: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_q4_k:")
 
     test_q4_k_block_size()

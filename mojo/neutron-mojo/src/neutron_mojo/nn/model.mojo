@@ -10,6 +10,7 @@ in a flat indexed structure.
 """
 
 from neutron_mojo.tensor.tensor import Tensor
+from std.math import exp, tanh, sqrt
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import rmsnorm
 from neutron_mojo.tensor.simd_math import (
@@ -34,7 +35,7 @@ from neutron_mojo.model.architecture import ArchitectureConfig, ArchitectureKind
 # Per-Layer Weight Offsets (flat storage)
 # ===----------------------------------------------------------------------=== #
 
-struct LayerWeightOffsets(Copyable, Movable):
+struct LayerWeightOffsets(Copyable, Movable, ImplicitlyCopyable):
     """Byte/element offsets for one layer's weights in the flat tensor."""
     var attn_norm: Int
     var wq: Int
@@ -46,7 +47,7 @@ struct LayerWeightOffsets(Copyable, Movable):
     var w_up: Int
     var w_down: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.attn_norm = 0
         self.wq = 0
         self.wk = 0
@@ -57,34 +58,34 @@ struct LayerWeightOffsets(Copyable, Movable):
         self.w_up = 0
         self.w_down = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.attn_norm = existing.attn_norm
-        self.wq = existing.wq
-        self.wk = existing.wk
-        self.wv = existing.wv
-        self.wo = existing.wo
-        self.ffn_norm = existing.ffn_norm
-        self.w_gate = existing.w_gate
-        self.w_up = existing.w_up
-        self.w_down = existing.w_down
+    def __init__(out self, *, copy: Self):
+        self.attn_norm = copy.attn_norm
+        self.wq = copy.wq
+        self.wk = copy.wk
+        self.wv = copy.wv
+        self.wo = copy.wo
+        self.ffn_norm = copy.ffn_norm
+        self.w_gate = copy.w_gate
+        self.w_up = copy.w_up
+        self.w_down = copy.w_down
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.attn_norm = other.attn_norm
-        self.wq = other.wq
-        self.wk = other.wk
-        self.wv = other.wv
-        self.wo = other.wo
-        self.ffn_norm = other.ffn_norm
-        self.w_gate = other.w_gate
-        self.w_up = other.w_up
-        self.w_down = other.w_down
+    def __init__(out self, *, deinit move: Self):
+        self.attn_norm = move.attn_norm^
+        self.wq = move.wq^
+        self.wk = move.wk^
+        self.wv = move.wv^
+        self.wo = move.wo^
+        self.ffn_norm = move.ffn_norm^
+        self.w_gate = move.w_gate^
+        self.w_up = move.w_up^
+        self.w_down = move.w_down^
 
 
 # ===----------------------------------------------------------------------=== #
 # Model Configuration
 # ===----------------------------------------------------------------------=== #
 
-struct ModelParams(Copyable):
+struct ModelParams(Copyable, ImplicitlyCopyable):
     """Model architecture parameters."""
     var num_layers: Int
     var vocab_size: Int
@@ -97,7 +98,7 @@ struct ModelParams(Copyable):
     var rope_theta: Float64
     var arch: ArchitectureConfig
 
-    fn __init__(out self):
+    def __init__(out self):
         self.num_layers = 1
         self.vocab_size = 32000
         self.hidden_dim = 4096
@@ -109,25 +110,25 @@ struct ModelParams(Copyable):
         self.rope_theta = 500000.0
         self.arch = ArchitectureConfig()
 
-    fn __copyinit__(out self, existing: Self):
-        self.num_layers = existing.num_layers
-        self.vocab_size = existing.vocab_size
-        self.hidden_dim = existing.hidden_dim
-        self.num_q_heads = existing.num_q_heads
-        self.num_kv_heads = existing.num_kv_heads
-        self.head_dim = existing.head_dim
-        self.ffn_dim = existing.ffn_dim
-        self.max_seq_len = existing.max_seq_len
-        self.rope_theta = existing.rope_theta
-        self.arch = existing.arch.copy()
+    def __init__(out self, *, copy: Self):
+        self.num_layers = copy.num_layers
+        self.vocab_size = copy.vocab_size
+        self.hidden_dim = copy.hidden_dim
+        self.num_q_heads = copy.num_q_heads
+        self.num_kv_heads = copy.num_kv_heads
+        self.head_dim = copy.head_dim
+        self.ffn_dim = copy.ffn_dim
+        self.max_seq_len = copy.max_seq_len
+        self.rope_theta = copy.rope_theta
+        self.arch = copy.arch.copy()
 
-    fn q_dim(self) -> Int:
+    def q_dim(self) -> Int:
         return self.num_q_heads * self.head_dim
 
-    fn kv_dim(self) -> Int:
+    def kv_dim(self) -> Int:
         return self.num_kv_heads * self.head_dim
 
-    fn layer_weight_count(self) -> Int:
+    def layer_weight_count(self) -> Int:
         """Total FP32 elements for one layer's weights."""
         var qd = self.q_dim()
         var kvd = self.kv_dim()
@@ -146,7 +147,7 @@ struct ModelParams(Copyable):
         )
 
 
-fn tiny_test_params() -> ModelParams:
+def tiny_test_params() -> ModelParams:
     """Create tiny model params for testing."""
     var p = ModelParams()
     p.num_layers = 2
@@ -179,7 +180,7 @@ struct Model(Movable):
     var layer_weights: Tensor[DType.float32]
     var layer_size: Int  # elements per layer
 
-    fn __init__(out self, params: ModelParams):
+    def __init__(out self, params: ModelParams):
         self.params = params.copy()
         self.layer_size = params.layer_weight_count()
 
@@ -202,15 +203,15 @@ struct Model(Movable):
             for i in range(params.hidden_dim):
                 self.layer_weights.set(offsets.ffn_norm + i, 1.0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.params = other.params.copy()
-        self.embed = other.embed^
-        self.final_norm = other.final_norm^
-        self.lm_head = other.lm_head^
-        self.layer_weights = other.layer_weights^
-        self.layer_size = other.layer_size
+    def __init__(out self, *, deinit move: Self):
+        self.params = move.params.copy()
+        self.embed = move.embed^
+        self.final_norm = move.final_norm^
+        self.lm_head = move.lm_head^
+        self.layer_weights = move.layer_weights^
+        self.layer_size = move.layer_size^
 
-    fn _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
+    def _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
         """Compute element offsets for a layer's weights."""
         var base = layer * self.layer_size
         var p = self.params.copy()
@@ -240,14 +241,14 @@ struct Model(Movable):
         off.w_down = cursor
         return off^
 
-    fn _get_norm(self, offset: Int, size: Int) -> Tensor[DType.float32]:
+    def _get_norm(self, offset: Int, size: Int) -> Tensor[DType.float32]:
         """Extract a norm vector from layer weights."""
         var result = Tensor[DType.float32](Shape(size))
         for i in range(size):
             result.set(i, self.layer_weights.get(offset + i))
         return result^
 
-    fn _linear_from_flat(
+    def _linear_from_flat(
         self,
         x: Tensor[DType.float32],
         weight_offset: Int,
@@ -263,7 +264,7 @@ struct Model(Movable):
         par_simd_matvec(result, 0, self.layer_weights, weight_offset, x, 0, out_dim, in_dim)
         return result^
 
-    fn forward_layer(
+    def forward_layer(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -347,7 +348,6 @@ struct Model(Movable):
         var ffn_out = Tensor[DType.float32](Shape(p.ffn_dim))
         if p.arch.use_gelu:
             # GeLU (Phi-style): gelu(gate) * up
-            from math import exp, tanh, sqrt
             for i in range(p.ffn_dim):
                 var xi = gate.get(i)
                 var x64 = Float64(xi)
@@ -366,7 +366,7 @@ struct Model(Movable):
 
         return output^
 
-    fn forward(
+    def forward(
         self,
         token_id: Int,
         mut cache: MultiLayerKVCache,
@@ -396,7 +396,7 @@ struct Model(Movable):
         par_simd_matvec(logits, 0, self.lm_head, 0, normed, 0, self.params.vocab_size, self.params.hidden_dim)
         return logits^
 
-    fn forward_layer_q8cache(
+    def forward_layer_q8cache(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -469,7 +469,7 @@ struct Model(Movable):
 
         return output^
 
-    fn forward_q8cache(
+    def forward_q8cache(
         self,
         token_id: Int,
         mut cache: MultiLayerQ8KVCache,
@@ -490,7 +490,7 @@ struct Model(Movable):
 
     # === Fused Forward (Sprint 15) ===
 
-    fn forward_layer_fused(
+    def forward_layer_fused(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -607,7 +607,7 @@ struct Model(Movable):
 
         return output^
 
-    fn forward_fused(
+    def forward_fused(
         self,
         token_id: Int,
         mut cache: MultiLayerKVCache,
@@ -642,7 +642,7 @@ struct Model(Movable):
 
     # === Batch Prefill (Sprint 25) ===
 
-    fn _batch_linear_from_flat(
+    def _batch_linear_from_flat(
         self,
         x_batch: Tensor[DType.float32],
         num_tokens: Int,
@@ -661,7 +661,7 @@ struct Model(Movable):
         )
         return result^
 
-    fn forward_layer_prefill(
+    def forward_layer_prefill(
         self,
         x_batch: Tensor[DType.float32],
         num_tokens: Int,
@@ -750,7 +750,7 @@ struct Model(Movable):
 
         return output^
 
-    fn forward_prefill(
+    def forward_prefill(
         self,
         token_ids: List[Int],
         mut cache: MultiLayerKVCache,
@@ -807,7 +807,7 @@ struct Model(Movable):
 # Generation
 # ===----------------------------------------------------------------------=== #
 
-fn generate(
+def generate(
     model: Model,
     prompt_tokens: List[Int],
     max_new_tokens: Int,

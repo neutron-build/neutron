@@ -20,12 +20,12 @@ from neutron_mojo.quant.types import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_quant_type_bits() raises:
+def test_quant_type_bits() raises:
     """Test bits_per_element for different quant types."""
     assert_true(QuantType.Q4_0.bits_per_element() == 4, "Q4_0 should be 4 bits")
     assert_true(QuantType.Q8_0.bits_per_element() == 8, "Q8_0 should be 8 bits")
@@ -35,7 +35,7 @@ fn test_quant_type_bits() raises:
     print("  quant_type_bits: PASS")
 
 
-fn test_quant_type_block_size() raises:
+def test_quant_type_block_size() raises:
     """Test block_size for different quant types."""
     assert_true(QuantType.Q4_0.block_size() == 32, "Q4_0 block size should be 32")
     assert_true(QuantType.Q8_0.block_size() == 32, "Q8_0 block size should be 32")
@@ -46,7 +46,7 @@ fn test_quant_type_block_size() raises:
     print("  quant_type_block_size: PASS")
 
 
-fn test_quant_config_basic() raises:
+def test_quant_config_basic() raises:
     """Test basic QuantConfig creation."""
     var cfg = QuantConfig(QuantType.Q4_0)
 
@@ -57,7 +57,7 @@ fn test_quant_config_basic() raises:
     print("  quant_config_basic: PASS")
 
 
-fn test_quant_config_with_zero_point() raises:
+def test_quant_config_with_zero_point() raises:
     """Test QuantConfig with zero point."""
     var cfg = QuantConfig(QuantType.Q8_0).with_zero_point()
 
@@ -66,7 +66,7 @@ fn test_quant_config_with_zero_point() raises:
     print("  quant_config_with_zero_point: PASS")
 
 
-fn test_quant_config_with_min_max() raises:
+def test_quant_config_with_min_max() raises:
     """Test QuantConfig with min/max."""
     var cfg = QuantConfig(QuantType.Q4_1).with_min_max()
 
@@ -75,7 +75,7 @@ fn test_quant_config_with_min_max() raises:
     print("  quant_config_with_min_max: PASS")
 
 
-fn test_q4_0_config() raises:
+def test_q4_0_config() raises:
     """Test Q4_0 config factory."""
     var cfg = q4_0_config()
 
@@ -85,7 +85,7 @@ fn test_q4_0_config() raises:
     print("  q4_0_config: PASS")
 
 
-fn test_q8_0_config() raises:
+def test_q8_0_config() raises:
     """Test Q8_0 config factory."""
     var cfg = q8_0_config()
 
@@ -95,7 +95,7 @@ fn test_q8_0_config() raises:
     print("  q8_0_config: PASS")
 
 
-fn test_nf4_config() raises:
+def test_nf4_config() raises:
     """Test NF4 config factory."""
     var cfg = nf4_config()
 
@@ -105,7 +105,7 @@ fn test_nf4_config() raises:
     print("  nf4_config: PASS")
 
 
-fn test_fp8_e4m3_config() raises:
+def test_fp8_e4m3_config() raises:
     """Test FP8 E4M3 config factory."""
     var cfg = fp8_e4m3_config()
 
@@ -115,7 +115,7 @@ fn test_fp8_e4m3_config() raises:
     print("  fp8_e4m3_config: PASS")
 
 
-fn test_quant_block_creation() raises:
+def test_quant_block_creation() raises:
     """Test QuantBlock creation."""
     var block = QuantBlock[QuantType.Q4_0](32)
 
@@ -125,7 +125,7 @@ fn test_quant_block_creation() raises:
     print("  quant_block_creation: PASS")
 
 
-fn test_quant_block_size_bytes() raises:
+def test_quant_block_size_bytes() raises:
     """Test QuantBlock size calculation."""
     var block = QuantBlock[QuantType.Q4_0](32)
 
@@ -136,7 +136,7 @@ fn test_quant_block_size_bytes() raises:
     print("  quant_block_size_bytes: PASS")
 
 
-fn test_calc_quant_size_q4_0() raises:
+def test_calc_quant_size_q4_0() raises:
     """Test calc_quant_size for Q4_0."""
     # 1024 elements, block size 32 -> 32 blocks
     # Each block: 2 bytes (scale) + 16 bytes (data) = 18 bytes
@@ -148,7 +148,7 @@ fn test_calc_quant_size_q4_0() raises:
     print("  calc_quant_size_q4_0: PASS")
 
 
-fn test_calc_quant_size_q8_0() raises:
+def test_calc_quant_size_q8_0() raises:
     """Test calc_quant_size for Q8_0."""
     # 1024 elements, block size 32 -> 32 blocks
     # Each block: 2 bytes (scale) + 32 bytes (data) = 34 bytes
@@ -160,7 +160,7 @@ fn test_calc_quant_size_q8_0() raises:
     print("  calc_quant_size_q8_0: PASS")
 
 
-fn test_is_symmetric_quant() raises:
+def test_is_symmetric_quant() raises:
     """Test symmetric quantization detection."""
     assert_true(is_symmetric_quant(QuantType.Q4_0), "Q4_0 should be symmetric")
     assert_true(is_symmetric_quant(QuantType.Q8_0), "Q8_0 should be symmetric")
@@ -170,7 +170,7 @@ fn test_is_symmetric_quant() raises:
     print("  is_symmetric_quant: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_quant_types:")
 
     test_quant_type_bits()

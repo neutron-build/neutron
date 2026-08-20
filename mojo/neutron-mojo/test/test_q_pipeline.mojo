@@ -4,7 +4,7 @@
 
 """Tests for q_pipeline_generate: text-in -> text-out with QuantizedModel."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
@@ -14,12 +14,12 @@ from neutron_mojo.nn.pipeline import PipelineConfig, pipeline_generate, default_
 from neutron_mojo.nn.q_pipeline import q_pipeline_generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -31,7 +31,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build a minimal tokenizer for testing (8 tokens, IDs 0-7)."""
     var tok = BPETokenizer()
     _ = tok.add_token("<s>")     # 0
@@ -48,7 +48,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
     return tok^
 
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -73,7 +73,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_q_model() -> QuantizedModel:
+def _build_tiny_q_model() -> QuantizedModel:
     """Build a tiny QuantizedModel from FP32 model."""
     var model = _build_tiny_model()
     return quantize_from_model(model, block_size=2)
@@ -83,7 +83,7 @@ fn _build_tiny_q_model() -> QuantizedModel:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_q_pipeline_generate_basic() raises:
+def test_q_pipeline_generate_basic() raises:
     """Tiny quantized model + tokenizer -> non-empty string."""
     var qm = _build_tiny_q_model()
     var tok = _build_tiny_tokenizer()
@@ -93,12 +93,12 @@ fn test_q_pipeline_generate_basic() raises:
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
     # Should produce some output (possibly empty if EOS hit, but shouldn't crash)
-    assert_true(len(result) >= 0, "q_pipeline produces output")
+    assert_true(result.byte_length() >= 0, "q_pipeline produces output")
 
     print("  q_pipeline_generate_basic: PASS")
 
 
-fn test_q_pipeline_with_eos_stopping() raises:
+def test_q_pipeline_with_eos_stopping() raises:
     """Pipeline stops at EOS token."""
     var qm = _build_tiny_q_model()
     var tok = _build_tiny_tokenizer()
@@ -114,12 +114,12 @@ fn test_q_pipeline_with_eos_stopping() raises:
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
     # Should stop early due to EOS — result might be empty (EOS on first token)
-    assert_true(len(result) >= 0, "eos stopping works")
+    assert_true(result.byte_length() >= 0, "eos stopping works")
 
     print("  q_pipeline_with_eos_stopping: PASS")
 
 
-fn test_q_pipeline_with_repetition_penalty() raises:
+def test_q_pipeline_with_repetition_penalty() raises:
     """Repetition penalty runs without error."""
     var qm = _build_tiny_q_model()
     var tok = _build_tiny_tokenizer()
@@ -129,12 +129,12 @@ fn test_q_pipeline_with_repetition_penalty() raises:
     cfg.repetition_penalty = 1.5
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "repetition penalty runs")
+    assert_true(result.byte_length() >= 0, "repetition penalty runs")
 
     print("  q_pipeline_with_repetition_penalty: PASS")
 
 
-fn test_q_pipeline_with_chat_template() raises:
+def test_q_pipeline_with_chat_template() raises:
     """Llama chat template works with quantized pipeline."""
     var qm = _build_tiny_q_model()
     var tok = _build_tiny_tokenizer()
@@ -144,12 +144,12 @@ fn test_q_pipeline_with_chat_template() raises:
     cfg.chat_template = String("llama")
 
     var result = q_pipeline_generate(qm, tok, "hello", cfg)
-    assert_true(len(result) >= 0, "chat template works")
+    assert_true(result.byte_length() >= 0, "chat template works")
 
     print("  q_pipeline_with_chat_template: PASS")
 
 
-fn test_q_pipeline_config_reuse() raises:
+def test_q_pipeline_config_reuse() raises:
     """Same PipelineConfig works for both FP32 and Q8 pipelines."""
     var model = _build_tiny_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -162,13 +162,13 @@ fn test_q_pipeline_config_reuse() raises:
     var fp32_result = pipeline_generate(model, tok, "ab", cfg)
     var q8_result = q_pipeline_generate(qm, tok, "ab", cfg)
 
-    assert_true(len(fp32_result) >= 0, "fp32 pipeline works")
-    assert_true(len(q8_result) >= 0, "q8 pipeline works")
+    assert_true(fp32_result.byte_length() >= 0, "fp32 pipeline works")
+    assert_true(q8_result.byte_length() >= 0, "q8 pipeline works")
 
     print("  q_pipeline_config_reuse: PASS")
 
 
-fn test_q_pipeline_vs_fp32() raises:
+def test_q_pipeline_vs_fp32() raises:
     """Both pipelines produce output (no crash), output length similar."""
     var model = _build_tiny_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -181,13 +181,13 @@ fn test_q_pipeline_vs_fp32() raises:
     var q8_result = q_pipeline_generate(qm, tok, "abc", cfg)
 
     # Both should produce valid output
-    assert_true(len(fp32_result) >= 0, "fp32 output valid")
-    assert_true(len(q8_result) >= 0, "q8 output valid")
+    assert_true(fp32_result.byte_length() >= 0, "fp32 output valid")
+    assert_true(q8_result.byte_length() >= 0, "q8 output valid")
 
     print("  q_pipeline_vs_fp32: PASS")
 
 
-fn test_q_pipeline_frequency_penalty() raises:
+def test_q_pipeline_frequency_penalty() raises:
     """Frequency+presence penalties work with quantized pipeline."""
     var qm = _build_tiny_q_model()
     var tok = _build_tiny_tokenizer()
@@ -198,12 +198,12 @@ fn test_q_pipeline_frequency_penalty() raises:
     cfg.presence_penalty = 0.3
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "frequency+presence penalties work")
+    assert_true(result.byte_length() >= 0, "frequency+presence penalties work")
 
     print("  q_pipeline_frequency_penalty: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_q_pipeline:")
 
     test_q_pipeline_generate_basic()

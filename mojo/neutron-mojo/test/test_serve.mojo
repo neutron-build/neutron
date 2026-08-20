@@ -20,8 +20,8 @@ Tests:
 13. Error response formatting
 """
 
-from math import abs
-from time import perf_counter_ns
+from std.math import abs
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params
@@ -44,12 +44,12 @@ from neutron_mojo.serve.protocol import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error("Assertion failed: " + msg + " expected=" + String(b) + " got=" + String(a))
 
@@ -58,7 +58,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # Test Model Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -80,7 +80,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build a minimal tokenizer for testing."""
     var tok = BPETokenizer()
     _ = tok.add_token("<s>")     # 0
@@ -101,11 +101,11 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Request/Response Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_request_defaults() raises:
+def test_request_defaults() raises:
     """InferenceRequest has sensible defaults."""
     var req = InferenceRequest()
 
-    assert_true(len(req.prompt) == 0, "default prompt empty")
+    assert_true(req.prompt.byte_length() == 0, "default prompt empty")
     assert_eq(req.max_tokens, 128, "default max_tokens")
     assert_true(req.temperature == 1.0, "default temperature")
     assert_eq(req.top_k, 0, "default top_k")
@@ -117,7 +117,7 @@ fn test_request_defaults() raises:
     print("  request_defaults: PASS")
 
 
-fn test_request_with_prompt() raises:
+def test_request_with_prompt() raises:
     """InferenceRequest prompt constructor works."""
     var req = InferenceRequest("Hello world")
 
@@ -127,7 +127,7 @@ fn test_request_with_prompt() raises:
     print("  request_with_prompt: PASS")
 
 
-fn test_request_to_pipeline_config() raises:
+def test_request_to_pipeline_config() raises:
     """InferenceRequest converts to PipelineConfig correctly."""
     var req = InferenceRequest("test")
     req.max_tokens = 50
@@ -150,7 +150,7 @@ fn test_request_to_pipeline_config() raises:
     print("  request_to_pipeline_config: PASS")
 
 
-fn test_response_success() raises:
+def test_response_success() raises:
     """InferenceResponse success creation works."""
     var resp = make_success_response(
         "hello world", "req-1", 10, 3, 50, 200.0,
@@ -166,7 +166,7 @@ fn test_response_success() raises:
     print("  response_success: PASS")
 
 
-fn test_response_error() raises:
+def test_response_error() raises:
     """InferenceResponse error creation works."""
     var resp = make_error_response("model failed", "req-2")
 
@@ -182,7 +182,7 @@ fn test_response_error() raises:
 # Protocol Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_parse_request_line() raises:
+def test_parse_request_line() raises:
     """Protocol key=value line parsing works."""
     var req = InferenceRequest()
 
@@ -214,7 +214,7 @@ fn test_parse_request_line() raises:
     print("  parse_request_line: PASS")
 
 
-fn test_parse_request_block() raises:
+def test_parse_request_block() raises:
     """Protocol block parsing builds complete request."""
     var lines = List[String]()
     lines.append("REQUEST")
@@ -236,7 +236,7 @@ fn test_parse_request_block() raises:
     print("  parse_request_block: PASS")
 
 
-fn test_format_response() raises:
+def test_format_response() raises:
     """Protocol response formatting works."""
     var resp = make_success_response(
         "Generated text here", "req-5", 15, 4, 100, 150.0,
@@ -255,7 +255,7 @@ fn test_format_response() raises:
     print("  format_response: PASS")
 
 
-fn test_format_error_response() raises:
+def test_format_error_response() raises:
     """Protocol error response formatting works."""
     var resp = make_error_response("Out of memory", "req-err")
 
@@ -274,7 +274,7 @@ fn test_format_error_response() raises:
 # Handler Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_fp32_handler() raises:
+def test_fp32_handler() raises:
     """FP32 handler produces valid response."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -285,14 +285,14 @@ fn test_fp32_handler() raises:
     var resp = handle_inference_request(model, tok, req)
 
     assert_true(not resp.is_error(), "FP32 handler no error")
-    assert_true(len(resp.text) >= 0, "FP32 handler produces text")
+    assert_true(resp.text.byte_length() >= 0, "FP32 handler produces text")
     assert_true(resp.elapsed_ms >= 0, "FP32 handler has elapsed time")
     assert_true(resp.tokens_per_sec > 0.0, "FP32 handler has tps")
 
     print("  fp32_handler: PASS")
 
 
-fn test_q8_handler() raises:
+def test_q8_handler() raises:
     """Q8 handler produces valid response."""
     var model = _build_tiny_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -304,13 +304,13 @@ fn test_q8_handler() raises:
     var resp = handle_q8_inference_request(qm, tok, req)
 
     assert_true(not resp.is_error(), "Q8 handler no error")
-    assert_true(len(resp.text) >= 0, "Q8 handler produces text")
+    assert_true(resp.text.byte_length() >= 0, "Q8 handler produces text")
     assert_true(resp.elapsed_ms >= 0, "Q8 handler has elapsed time")
 
     print("  q8_handler: PASS")
 
 
-fn test_batch_handler() raises:
+def test_batch_handler() raises:
     """Batch handler processes multiple requests."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -340,7 +340,7 @@ fn test_batch_handler() raises:
     print("  batch_handler: PASS")
 
 
-fn test_handler_custom_params() raises:
+def test_handler_custom_params() raises:
     """Handler with custom sampling parameters works."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -355,12 +355,12 @@ fn test_handler_custom_params() raises:
     var resp = handle_inference_request(model, tok, req)
 
     assert_true(not resp.is_error(), "custom params handler no error")
-    assert_true(len(resp.text) >= 0, "custom params handler produces text")
+    assert_true(resp.text.byte_length() >= 0, "custom params handler produces text")
 
     print("  handler_custom_params: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_serve:")
 
     test_request_defaults()

@@ -4,10 +4,10 @@
 
 """Learning rate scheduling: constant, cosine, linear warmup, step decay."""
 
-from math import cos
+from std.math import cos
 
 
-struct LRScheduler(Copyable, Movable):
+struct LRScheduler(Copyable, Movable, ImplicitlyCopyable):
     """Learning rate scheduler with multiple strategies."""
     var base_lr: Float64
     var warmup_steps: Int
@@ -16,7 +16,7 @@ struct LRScheduler(Copyable, Movable):
     var step_decay_factor: Float64
     var step_decay_interval: Int
 
-    fn __init__(out self, base_lr: Float64, warmup_steps: Int = 0,
+    def __init__(out self, base_lr: Float64, warmup_steps: Int = 0,
                 total_steps: Int = 1000, schedule_type: Int = 0):
         self.base_lr = base_lr
         self.warmup_steps = warmup_steps
@@ -25,23 +25,23 @@ struct LRScheduler(Copyable, Movable):
         self.step_decay_factor = 0.1
         self.step_decay_interval = 100
 
-    fn __copyinit__(out self, other: Self):
-        self.base_lr = other.base_lr
-        self.warmup_steps = other.warmup_steps
-        self.total_steps = other.total_steps
-        self.schedule_type = other.schedule_type
-        self.step_decay_factor = other.step_decay_factor
-        self.step_decay_interval = other.step_decay_interval
+    def __init__(out self, *, copy: Self):
+        self.base_lr = copy.base_lr
+        self.warmup_steps = copy.warmup_steps
+        self.total_steps = copy.total_steps
+        self.schedule_type = copy.schedule_type
+        self.step_decay_factor = copy.step_decay_factor
+        self.step_decay_interval = copy.step_decay_interval
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.base_lr = other.base_lr
-        self.warmup_steps = other.warmup_steps
-        self.total_steps = other.total_steps
-        self.schedule_type = other.schedule_type
-        self.step_decay_factor = other.step_decay_factor
-        self.step_decay_interval = other.step_decay_interval
+    def __init__(out self, *, deinit move: Self):
+        self.base_lr = move.base_lr^
+        self.warmup_steps = move.warmup_steps^
+        self.total_steps = move.total_steps^
+        self.schedule_type = move.schedule_type^
+        self.step_decay_factor = move.step_decay_factor^
+        self.step_decay_interval = move.step_decay_interval^
 
-    fn get_lr(self, step: Int) -> Float64:
+    def get_lr(self, step: Int) -> Float64:
         """Get the learning rate for the given step."""
         # Warmup phase
         if step < self.warmup_steps and self.warmup_steps > 0:

@@ -12,26 +12,26 @@ from neutron_mojo.io.model_export import (
 )
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params
 from neutron_mojo.model.architecture import arch_from_name, ArchitectureKind
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
+def approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
     return abs(a - b) < tol
 
 
-fn test_nmf_magic() raises:
+def test_nmf_magic() raises:
     """NMF magic and version constants."""
     assert_true(NMF_MAGIC() == 0x00464D4E, "Magic should be NMF\\0")
     assert_true(NMF_VERSION() == 1, "Version should be 1")
     print("  nmf_magic: PASS")
 
 
-fn test_nmf_buffer_write_read_u32() raises:
+def test_nmf_buffer_write_read_u32() raises:
     """NMFBuffer u32 write/read round-trip."""
     var buf = NMFBuffer()
     buf._write_u32(42)
@@ -42,7 +42,7 @@ fn test_nmf_buffer_write_read_u32() raises:
     print("  nmf_buffer_write_read_u32: PASS")
 
 
-fn test_nmf_buffer_write_read_f32() raises:
+def test_nmf_buffer_write_read_f32() raises:
     """NMFBuffer f32 write/read round-trip."""
     var buf = NMFBuffer()
     buf._write_f32(3.14)
@@ -54,19 +54,19 @@ fn test_nmf_buffer_write_read_f32() raises:
     print("  nmf_buffer_write_read_f32: PASS")
 
 
-fn test_serialize_params() raises:
+def test_serialize_params() raises:
     """Serialize ModelParams to text."""
     var p = tiny_test_params()
     var s = serialize_params(p)
-    assert_true(len(s) > 0, "Serialized string should not be empty")
+    assert_true(s.byte_length() > 0, "Serialized string should not be empty")
 
     # Check key fields are present
-    fn contains(haystack: String, needle: String) -> Bool:
-        if len(needle) > len(haystack):
+    def contains(haystack: String, needle: String) -> Bool:
+        if needle.byte_length() > haystack.byte_length():
             return False
-        for i in range(len(haystack) - len(needle) + 1):
+        for i in range(haystack.byte_length() - needle.byte_length() + 1):
             var found = True
-            for j in range(len(needle)):
+            for j in range(needle.byte_length()):
                 if ord(haystack[byte=i + j]) != ord(needle[byte=j]):
                     found = False
                     break
@@ -81,7 +81,7 @@ fn test_serialize_params() raises:
     print("  serialize_params: PASS")
 
 
-fn test_deserialize_params() raises:
+def test_deserialize_params() raises:
     """Deserialize ModelParams from text."""
     var text = "num_layers=3\nvocab_size=100\nhidden_dim=16\nnum_q_heads=4\nnum_kv_heads=2\nhead_dim=4\nffn_dim=32\nmax_seq_len=64\narch=Llama\n"
     var p = deserialize_params(text)
@@ -97,7 +97,7 @@ fn test_deserialize_params() raises:
     print("  deserialize_params: PASS")
 
 
-fn test_params_roundtrip() raises:
+def test_params_roundtrip() raises:
     """Serialize then deserialize ModelParams."""
     var p = tiny_test_params()
     var s = serialize_params(p)
@@ -113,7 +113,7 @@ fn test_params_roundtrip() raises:
     print("  params_roundtrip: PASS")
 
 
-fn test_save_load_model() raises:
+def test_save_load_model() raises:
     """Save and load FP32 model via NMFBuffer."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -158,7 +158,7 @@ fn test_save_load_model() raises:
     print("  save_load_model: PASS")
 
 
-fn test_header_validation() raises:
+def test_header_validation() raises:
     """Invalid magic number raises error."""
     var buf = NMFBuffer()
     buf._write_u32(0x12345678)  # Wrong magic
@@ -173,7 +173,7 @@ fn test_header_validation() raises:
     print("  header_validation: PASS")
 
 
-fn test_version_validation() raises:
+def test_version_validation() raises:
     """Invalid version raises error."""
     var buf = NMFBuffer()
     buf._write_u32(NMF_MAGIC())
@@ -188,7 +188,7 @@ fn test_version_validation() raises:
     print("  version_validation: PASS")
 
 
-fn test_model_sizes_match() raises:
+def test_model_sizes_match() raises:
     """Loaded model has same tensor sizes as original."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -201,7 +201,7 @@ fn test_model_sizes_match() raises:
     print("  model_sizes_match: PASS")
 
 
-fn test_buffer_size() raises:
+def test_buffer_size() raises:
     """Buffer size is correct for the model."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -211,7 +211,7 @@ fn test_buffer_size() raises:
     # Params: variable
     # Weight sections: 4 sections, each has a u32 size prefix + N * 4 bytes
     var params_str = serialize_params(model.params)
-    var expected_header = 12 + len(params_str)
+    var expected_header = 12 + params_str.byte_length()
     var expected_weights = (
         4 + model.layer_weights.numel() * 4 +
         4 + model.embed.numel() * 4 +
@@ -222,7 +222,7 @@ fn test_buffer_size() raises:
     print("  buffer_size: PASS")
 
 
-fn test_arch_roundtrip() raises:
+def test_arch_roundtrip() raises:
     """Architecture info survives serialization."""
     var p = tiny_test_params()
     p.arch = arch_from_name("Mistral")
@@ -232,7 +232,7 @@ fn test_arch_roundtrip() raises:
     print("  arch_roundtrip: PASS")
 
 
-fn test_default_model_roundtrip() raises:
+def test_default_model_roundtrip() raises:
     """Save/load a default-initialized model (norms=1, weights=0, embed=0)."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -252,7 +252,7 @@ fn test_default_model_roundtrip() raises:
     print("  default_model_roundtrip: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_model_export")
     test_nmf_magic()
     test_nmf_buffer_write_read_u32()

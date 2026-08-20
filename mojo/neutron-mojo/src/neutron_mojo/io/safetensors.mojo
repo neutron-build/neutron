@@ -12,45 +12,45 @@ SafeTensors is a simple, safe file format for storing tensors:
 Reference: https://github.com/huggingface/safetensors
 """
 
-from collections import Dict
-from collections import Set
-from pathlib import Path
+from std.collections import Dict
+from std.collections import Set
+from std.pathlib import Path
 
 
 # ===----------------------------------------------------------------------=== #
 # SafeTensors Tensor Metadata
 # ===----------------------------------------------------------------------=== #
 
-struct TensorInfo(Copyable, Movable):
+struct TensorInfo(Copyable, Movable, ImplicitlyCopyable):
     """Metadata for a single tensor in SafeTensors file."""
     var dtype: String
     var shape: List[Int]
     var data_offset_start: Int
     var data_offset_end: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.dtype = String("")
         self.shape = List[Int]()
         self.data_offset_start = 0
         self.data_offset_end = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.dtype = existing.dtype
-        self.shape = existing.shape.copy()
-        self.data_offset_start = existing.data_offset_start
-        self.data_offset_end = existing.data_offset_end
+    def __init__(out self, *, copy: Self):
+        self.dtype = copy.dtype
+        self.shape = copy.shape.copy()
+        self.data_offset_start = copy.data_offset_start
+        self.data_offset_end = copy.data_offset_end
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.dtype = other.dtype^
-        self.shape = other.shape^
-        self.data_offset_start = other.data_offset_start
-        self.data_offset_end = other.data_offset_end
+    def __init__(out self, *, deinit move: Self):
+        self.dtype = move.dtype^
+        self.shape = move.shape^
+        self.data_offset_start = move.data_offset_start^
+        self.data_offset_end = move.data_offset_end^
 
-    fn size_bytes(self) -> Int:
+    def size_bytes(self) -> Int:
         """Calculate tensor size in bytes."""
         return self.data_offset_end - self.data_offset_start
 
-    fn numel(self) -> Int:
+    def numel(self) -> Int:
         """Calculate total number of elements."""
         var total = 1
         for i in range(len(self.shape)):
@@ -74,21 +74,21 @@ struct SafeTensorsFile(Movable):
     var file_size: Int
     var tensors: Dict[String, TensorInfo]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.header_size = 0
         self.metadata_json = String("")
         self.data_offset = 0
         self.file_size = 0
         self.tensors = Dict[String, TensorInfo]()
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.header_size = other.header_size
-        self.metadata_json = other.metadata_json^
-        self.data_offset = other.data_offset
-        self.file_size = other.file_size
-        self.tensors = other.tensors^
+    def __init__(out self, *, deinit move: Self):
+        self.header_size = move.header_size^
+        self.metadata_json = move.metadata_json^
+        self.data_offset = move.data_offset^
+        self.file_size = move.file_size^
+        self.tensors = move.tensors^
 
-    fn load(mut self, file_path: String) raises:
+    def load(mut self, file_path: String) raises:
         """Load and parse a SafeTensors file.
 
         Uses binary reading for correct handling of raw bytes.
@@ -124,7 +124,7 @@ struct SafeTensorsFile(Movable):
         # Parse tensor metadata from JSON
         self._parse_metadata()
 
-    fn _parse_metadata(mut self) raises:
+    def _parse_metadata(mut self) raises:
         """Parse JSON metadata to extract tensor information."""
         from neutron_mojo.io.json import parse_safetensors_header
 
@@ -137,7 +137,7 @@ struct SafeTensorsFile(Movable):
         # having populated the dict correctly
         self.tensors = parsed^
 
-    fn register_tensor(
+    def register_tensor(
         mut self,
         name: String,
         dtype: String,
@@ -161,22 +161,22 @@ struct SafeTensorsFile(Movable):
         info.data_offset_end = data_offset_end
         self.tensors[name] = info^
 
-    fn has_tensor(self, name: String) -> Bool:
+    def has_tensor(self, name: String) -> Bool:
         """Check if a tensor exists in the file."""
         return name in self.tensors
 
-    fn get_tensor_info(self, name: String) raises -> TensorInfo:
+    def get_tensor_info(self, name: String) raises -> TensorInfo:
         """Get metadata for a tensor."""
         if name not in self.tensors:
             raise Error("Tensor not found: " + name)
         return self.tensors[name].copy()
 
-    fn get_data_offset(self, name: String) raises -> Int:
+    def get_data_offset(self, name: String) raises -> Int:
         """Get absolute file offset for tensor data."""
         var info = self.get_tensor_info(name)
         return self.data_offset + info.data_offset_start
 
-    fn get_tensor_size(self, name: String) raises -> Int:
+    def get_tensor_size(self, name: String) raises -> Int:
         """Get tensor size in bytes."""
         var info = self.get_tensor_info(name)
         return info.size_bytes()
@@ -186,7 +186,7 @@ struct SafeTensorsFile(Movable):
 # Utility Functions
 # ===----------------------------------------------------------------------=== #
 
-fn parse_dtype_string(dtype: String) -> DType:
+def parse_dtype_string(dtype: String) -> DType:
     """Parse SafeTensors dtype string to Mojo DType."""
     if dtype == "F32":
         return DType.float32
@@ -206,7 +206,7 @@ fn parse_dtype_string(dtype: String) -> DType:
         return DType.float32  # Default
 
 
-fn dtype_to_safetensors(dtype: DType) -> String:
+def dtype_to_safetensors(dtype: DType) -> String:
     """Convert Mojo DType to SafeTensors dtype string."""
     if dtype == DType.float32:
         return "F32"
@@ -226,7 +226,7 @@ fn dtype_to_safetensors(dtype: DType) -> String:
         return "F32"  # Default
 
 
-fn dtype_element_size(dtype: String) -> Int:
+def dtype_element_size(dtype: String) -> Int:
     """Get element size in bytes for a SafeTensors dtype string.
 
     Args:
@@ -262,19 +262,19 @@ struct SafeTensorsIndex(Movable):
     var shard_files: List[String]         # unique shard filenames (ordered)
     var num_shards: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.base_dir = String("")
         self.weight_map = Dict[String, String]()
         self.shard_files = List[String]()
         self.num_shards = 0
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.base_dir = other.base_dir^
-        self.weight_map = other.weight_map^
-        self.shard_files = other.shard_files^
-        self.num_shards = other.num_shards
+    def __init__(out self, *, deinit move: Self):
+        self.base_dir = move.base_dir^
+        self.weight_map = move.weight_map^
+        self.shard_files = move.shard_files^
+        self.num_shards = move.num_shards^
 
-    fn get_shard(self, tensor_name: String) raises -> String:
+    def get_shard(self, tensor_name: String) raises -> String:
         """Get the shard filename for a tensor.
 
         Args:
@@ -287,7 +287,7 @@ struct SafeTensorsIndex(Movable):
             raise Error("Tensor not found in index: " + tensor_name)
         return self.weight_map[tensor_name]
 
-    fn get_shard_path(self, tensor_name: String) raises -> String:
+    def get_shard_path(self, tensor_name: String) raises -> String:
         """Get the full path to the shard file for a tensor.
 
         Args:
@@ -297,20 +297,20 @@ struct SafeTensorsIndex(Movable):
             Full path to the shard file.
         """
         var shard = self.get_shard(tensor_name)
-        if len(self.base_dir) > 0:
+        if self.base_dir.byte_length() > 0:
             return self.base_dir + "/" + shard
         return shard
 
-    fn has_tensor(self, tensor_name: String) -> Bool:
+    def has_tensor(self, tensor_name: String) -> Bool:
         """Check if a tensor exists in the index."""
         return tensor_name in self.weight_map
 
-    fn num_tensors(self) -> Int:
+    def num_tensors(self) -> Int:
         """Get total number of tensors."""
         return len(self.shard_files)  # approximation — real count from weight_map
 
 
-fn load_safetensors_index(index_path: String) raises -> SafeTensorsIndex:
+def load_safetensors_index(index_path: String) raises -> SafeTensorsIndex:
     """Load and parse a model.safetensors.index.json file.
 
     Args:
@@ -342,7 +342,7 @@ fn load_safetensors_index(index_path: String) raises -> SafeTensorsIndex:
     return index^
 
 
-fn load_safetensors_index_from_string(
+def load_safetensors_index_from_string(
     json_content: String, base_dir: String
 ) raises -> SafeTensorsIndex:
     """Load SafeTensors index from a JSON string (for testing).
@@ -363,7 +363,7 @@ fn load_safetensors_index_from_string(
     return index^
 
 
-fn _collect_unique_shards(mut index: SafeTensorsIndex):
+def _collect_unique_shards(mut index: SafeTensorsIndex):
     """Collect unique shard filenames from the weight map.
 
     Since we can't iterate Dict in Mojo, we check against a growing list
@@ -377,7 +377,7 @@ fn _collect_unique_shards(mut index: SafeTensorsIndex):
     index.num_shards = 0
 
 
-fn _shard_filename(shard_idx: Int, total_shards: Int) -> String:
+def _shard_filename(shard_idx: Int, total_shards: Int) -> String:
     """Generate a shard filename: model-NNNNN-of-MMMMM.safetensors
 
     Args:
@@ -397,7 +397,7 @@ fn _shard_filename(shard_idx: Int, total_shards: Int) -> String:
     return "model-" + idx_str + "-of-" + total_str + ".safetensors"
 
 
-fn build_safetensors_buffer(
+def build_safetensors_buffer(
     tensors: Dict[String, TensorInfo],
     tensor_data: List[UInt8],
 ) raises -> List[UInt8]:
@@ -426,7 +426,7 @@ fn build_safetensors_buffer(
     raise Error("Use build_safetensors_from_json() instead")
 
 
-fn build_safetensors_from_parts(
+def build_safetensors_from_parts(
     header_json: String,
     tensor_data: List[UInt8],
 ) -> List[UInt8]:
@@ -442,12 +442,12 @@ fn build_safetensors_from_parts(
     var result = List[UInt8]()
 
     # Write header size as u64 LE
-    var hsize = len(header_json)
+    var hsize = header_json.byte_length()
     for i in range(8):
         result.append(UInt8((hsize >> (i * 8)) & 0xFF))
 
     # Write JSON header
-    for i in range(len(header_json)):
+    for i in range(header_json.byte_length()):
         result.append(UInt8(ord(header_json[byte=i])))
 
     # Write tensor data

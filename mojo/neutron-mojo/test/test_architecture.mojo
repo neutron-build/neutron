@@ -20,15 +20,15 @@ from neutron_mojo.nn.kv_cache import MultiLayerKVCache
 from neutron_mojo.nn.rope import RoPETable
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_architecture_kind() raises:
+def test_architecture_kind() raises:
     """Architecture kind enum values."""
     assert_true(ArchitectureKind.Llama != ArchitectureKind.Mistral, "Llama != Mistral")
     assert_true(ArchitectureKind.Llama == ArchitectureKind.Llama, "Llama == Llama")
@@ -38,7 +38,7 @@ fn test_architecture_kind() raises:
     print("  architecture_kind: PASS")
 
 
-fn test_llama_config() raises:
+def test_llama_config() raises:
     """Default Llama config."""
     var c = llama_arch()
     assert_true(c.kind == ArchitectureKind.Llama, "Should be Llama")
@@ -48,7 +48,7 @@ fn test_llama_config() raises:
     print("  llama_config: PASS")
 
 
-fn test_mistral_config() raises:
+def test_mistral_config() raises:
     """Mistral config with sliding window."""
     var c = mistral_arch(4096)
     assert_true(c.kind == ArchitectureKind.Mistral, "Should be Mistral")
@@ -58,7 +58,7 @@ fn test_mistral_config() raises:
     print("  mistral_config: PASS")
 
 
-fn test_phi_config() raises:
+def test_phi_config() raises:
     """Phi config with partial rotary + GeLU."""
     var c = phi_arch(0.5)
     assert_true(c.kind == ArchitectureKind.Phi, "Should be Phi")
@@ -68,7 +68,7 @@ fn test_phi_config() raises:
     print("  phi_config: PASS")
 
 
-fn test_gemma_config() raises:
+def test_gemma_config() raises:
     """Gemma config."""
     var c = gemma_arch()
     assert_true(c.kind == ArchitectureKind.Gemma, "Should be Gemma")
@@ -77,7 +77,7 @@ fn test_gemma_config() raises:
     print("  gemma_config: PASS")
 
 
-fn test_qwen_config() raises:
+def test_qwen_config() raises:
     """Qwen config."""
     var c = qwen_arch()
     assert_true(c.kind == ArchitectureKind.Qwen, "Should be Qwen")
@@ -85,7 +85,7 @@ fn test_qwen_config() raises:
     print("  qwen_config: PASS")
 
 
-fn test_from_name_llama() raises:
+def test_from_name_llama() raises:
     """arch_from_name for Llama variants."""
     var c1 = arch_from_name("llama")
     assert_true(c1.kind == ArchitectureKind.Llama, "llama -> Llama")
@@ -94,7 +94,7 @@ fn test_from_name_llama() raises:
     print("  from_name_llama: PASS")
 
 
-fn test_from_name_all() raises:
+def test_from_name_all() raises:
     """arch_from_name for all architectures."""
     assert_true(arch_from_name("mistral").kind == ArchitectureKind.Mistral, "mistral")
     assert_true(arch_from_name("phi").kind == ArchitectureKind.Phi, "phi")
@@ -105,7 +105,7 @@ fn test_from_name_all() raises:
     print("  from_name_all: PASS")
 
 
-fn test_detect_architecture() raises:
+def test_detect_architecture() raises:
     """detect_architecture from metadata."""
     var c1 = detect_architecture("llama", False, 0)
     assert_true(c1.kind == ArchitectureKind.Llama, "Detected Llama")
@@ -118,7 +118,7 @@ fn test_detect_architecture() raises:
     print("  detect_architecture: PASS")
 
 
-fn test_config_copy() raises:
+def test_config_copy() raises:
     """ArchitectureConfig copy preserves all fields."""
     var orig = mistral_arch(2048)
     var copy = orig.copy()
@@ -128,7 +128,7 @@ fn test_config_copy() raises:
     print("  config_copy: PASS")
 
 
-fn test_model_params_has_arch() raises:
+def test_model_params_has_arch() raises:
     """ModelParams includes arch field."""
     var p = ModelParams()
     assert_true(p.arch.kind == ArchitectureKind.Llama, "Default arch is Llama")
@@ -138,7 +138,7 @@ fn test_model_params_has_arch() raises:
     print("  model_params_has_arch: PASS")
 
 
-fn test_forward_with_default_arch() raises:
+def test_forward_with_default_arch() raises:
     """Forward pass with default Llama arch still works."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -149,7 +149,7 @@ fn test_forward_with_default_arch() raises:
     print("  forward_with_default_arch: PASS")
 
 
-fn test_forward_with_gelu_arch() raises:
+def test_forward_with_gelu_arch() raises:
     """Forward pass with GeLU activation (Phi-like)."""
     var p = tiny_test_params()
     p.arch = phi_arch(0.5)
@@ -161,7 +161,7 @@ fn test_forward_with_gelu_arch() raises:
     print("  forward_with_gelu_arch: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_architecture")
     test_architecture_kind()
     test_llama_config()

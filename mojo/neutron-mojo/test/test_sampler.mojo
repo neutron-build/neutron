@@ -4,7 +4,7 @@
 
 """Tests for sampling strategies."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.nn.sampler import (
     LCG,
     SamplerConfig,
@@ -17,19 +17,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_lcg_deterministic() raises:
+def test_lcg_deterministic() raises:
     """Test LCG produces deterministic sequence."""
     var rng1 = LCG(seed=123)
     var rng2 = LCG(seed=123)
@@ -40,7 +40,7 @@ fn test_lcg_deterministic() raises:
     print("  lcg_deterministic: PASS")
 
 
-fn test_lcg_different_seeds() raises:
+def test_lcg_different_seeds() raises:
     """Test different seeds produce different sequences."""
     var rng1 = LCG(seed=1)
     var rng2 = LCG(seed=2)
@@ -55,7 +55,7 @@ fn test_lcg_different_seeds() raises:
     print("  lcg_different_seeds: PASS")
 
 
-fn test_lcg_float_range() raises:
+def test_lcg_float_range() raises:
     """Test next_float produces values in [0, 1)."""
     var rng = LCG(seed=42)
     for _ in range(100):
@@ -65,7 +65,7 @@ fn test_lcg_float_range() raises:
     print("  lcg_float_range: PASS")
 
 
-fn test_greedy_sampling() raises:
+def test_greedy_sampling() raises:
     """Test greedy (temperature=0) always picks argmax."""
     var config = greedy_config()
     var sampler = Sampler(config)
@@ -83,7 +83,7 @@ fn test_greedy_sampling() raises:
     print("  greedy_sampling: PASS")
 
 
-fn test_greedy_deterministic() raises:
+def test_greedy_deterministic() raises:
     """Test greedy sampling is deterministic."""
     var config = greedy_config()
 
@@ -100,7 +100,7 @@ fn test_greedy_deterministic() raises:
     print("  greedy_deterministic: PASS")
 
 
-fn test_temperature_sampling() raises:
+def test_temperature_sampling() raises:
     """Test that temperature > 0 enables sampling."""
     var config = random_config(temperature=1.0, seed=42)
     var sampler = Sampler(config)
@@ -127,7 +127,7 @@ fn test_temperature_sampling() raises:
     print("  temperature_sampling: PASS")
 
 
-fn test_top_k_filtering() raises:
+def test_top_k_filtering() raises:
     """Test top-k limits the candidate set."""
     var config = random_config(temperature=1.0, seed=42)
     config.top_k = 2
@@ -153,7 +153,7 @@ fn test_top_k_filtering() raises:
     print("  top_k_filtering: PASS")
 
 
-fn test_top_p_filtering() raises:
+def test_top_p_filtering() raises:
     """Test top-p (nucleus) sampling."""
     var config = random_config(temperature=1.0, seed=42)
     config.top_p = 0.5  # Only keep tokens summing to 50% probability
@@ -175,7 +175,7 @@ fn test_top_p_filtering() raises:
     print("  top_p_filtering: PASS")
 
 
-fn test_config_presets() raises:
+def test_config_presets() raises:
     """Test config presets."""
     var g = greedy_config()
     assert_true(g.temperature <= 0.0, "greedy temp=0")
@@ -192,7 +192,7 @@ fn test_config_presets() raises:
     print("  config_presets: PASS")
 
 
-fn test_sampler_reproducible() raises:
+def test_sampler_reproducible() raises:
     """Test that same seed produces same sequence."""
     var config = random_config(temperature=0.8, seed=12345)
 
@@ -215,7 +215,7 @@ fn test_sampler_reproducible() raises:
     print("  sampler_reproducible: PASS")
 
 
-fn test_high_temperature_diversity() raises:
+def test_high_temperature_diversity() raises:
     """Test that high temperature increases diversity."""
     var logits = Tensor[DType.float32](Shape(4))
     logits.set(0, 5.0)
@@ -258,7 +258,7 @@ fn test_high_temperature_diversity() raises:
     print("  high_temperature_diversity: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sampler:")
 
     test_lcg_deterministic()

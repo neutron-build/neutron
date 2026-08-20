@@ -4,7 +4,7 @@
 
 """Tests: Storage alloc/free, view slicing/transpose, tensor CRUD, factories."""
 
-from testing import assert_true, assert_false, assert_equal
+from std.testing import assert_true, assert_false, assert_equal
 
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.storage import Storage, DeviceKind
@@ -17,7 +17,7 @@ from neutron_mojo.tensor.tensor import Tensor
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_storage_alloc_and_zero() raises:
+def test_storage_alloc_and_zero() raises:
     """Storage should be zero-initialized."""
     var s = Storage[DType.float32](10)
     for i in range(10):
@@ -27,7 +27,7 @@ fn test_storage_alloc_and_zero() raises:
     print("  storage_alloc_and_zero: PASS")
 
 
-fn test_storage_load_store() raises:
+def test_storage_load_store() raises:
     var s = Storage[DType.float32](5)
     s.store(0, Float32(1.0))
     s.store(2, Float32(3.14))
@@ -38,7 +38,7 @@ fn test_storage_load_store() raises:
     print("  storage_load_store: PASS")
 
 
-fn test_storage_fill() raises:
+def test_storage_fill() raises:
     var s = Storage[DType.float32](8)
     s.fill(Float32(42.0))
     for i in range(8):
@@ -46,7 +46,7 @@ fn test_storage_fill() raises:
     print("  storage_fill: PASS")
 
 
-fn test_storage_copy_from() raises:
+def test_storage_copy_from() raises:
     var src = Storage[DType.float32](4)
     src.store(0, Float32(1.0))
     src.store(1, Float32(2.0))
@@ -61,7 +61,7 @@ fn test_storage_copy_from() raises:
     print("  storage_copy_from: PASS")
 
 
-fn test_storage_simd() raises:
+def test_storage_simd() raises:
     var s = Storage[DType.float32](8)
     var vec = SIMD[DType.float32, 4](1.0, 2.0, 3.0, 4.0)
     s.store_simd[4](0, vec)
@@ -73,13 +73,13 @@ fn test_storage_simd() raises:
     print("  storage_simd: PASS")
 
 
-fn test_storage_device() raises:
+def test_storage_device() raises:
     var s = Storage[DType.float32](4)
     assert_true(s.device() == DeviceKind.CPU)
     print("  storage_device: PASS")
 
 
-fn test_device_kind_writable() raises:
+def test_device_kind_writable() raises:
     var cpu = String(DeviceKind.CPU)
     var cuda = String(DeviceKind.CUDA)
     var rocm = String(DeviceKind.ROCm)
@@ -96,7 +96,7 @@ fn test_device_kind_writable() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_view_contiguous() raises:
+def test_view_contiguous() raises:
     var s = Storage[DType.float32](12)
     for i in range(12):
         s.store(i, Float32(i))
@@ -113,7 +113,7 @@ fn test_view_contiguous() raises:
     print("  view_contiguous: PASS")
 
 
-fn test_view_transpose() raises:
+def test_view_transpose() raises:
     var s = Storage[DType.float32](6)
     for i in range(6):
         s.store(i, Float32(i))
@@ -135,7 +135,7 @@ fn test_view_transpose() raises:
     print("  view_transpose: PASS")
 
 
-fn test_view_slice_dim() raises:
+def test_view_slice_dim() raises:
     var s = Storage[DType.float32](12)
     for i in range(12):
         s.store(i, Float32(i))
@@ -155,7 +155,7 @@ fn test_view_slice_dim() raises:
     print("  view_slice_dim: PASS")
 
 
-fn test_view_broadcast() raises:
+def test_view_broadcast() raises:
     var s = Storage[DType.float32](3)
     s.store(0, Float32(10.0))
     s.store(1, Float32(20.0))
@@ -177,7 +177,7 @@ fn test_view_broadcast() raises:
     print("  view_broadcast: PASS")
 
 
-fn test_view_reshape() raises:
+def test_view_reshape() raises:
     var s = Storage[DType.float32](12)
     for i in range(12):
         s.store(i, Float32(i))
@@ -201,7 +201,7 @@ fn test_view_reshape() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_tensor_zeros() raises:
+def test_tensor_zeros() raises:
     var t = Tensor[DType.float32].zeros(Shape(2, 3))
     assert_equal(t.ndim(), 2)
     assert_equal(t.numel(), 6)
@@ -210,7 +210,7 @@ fn test_tensor_zeros() raises:
     print("  tensor_zeros: PASS")
 
 
-fn test_tensor_ones() raises:
+def test_tensor_ones() raises:
     var t = Tensor[DType.float32].ones(Shape(3, 4))
     assert_equal(t.numel(), 12)
     for i in range(12):
@@ -218,14 +218,14 @@ fn test_tensor_ones() raises:
     print("  tensor_ones: PASS")
 
 
-fn test_tensor_full() raises:
+def test_tensor_full() raises:
     var t = Tensor[DType.float32].full(Shape(2, 2), Float32(3.14))
     for i in range(4):
         assert_equal(t.data_ptr().load(i), Float32(3.14))
     print("  tensor_full: PASS")
 
 
-fn test_tensor_get_set() raises:
+def test_tensor_get_set() raises:
     var t = Tensor[DType.float32](3, 4)
     var indices = List[Int]()
     indices.append(1)
@@ -235,7 +235,7 @@ fn test_tensor_get_set() raises:
     print("  tensor_get_set: PASS")
 
 
-fn test_tensor_rand() raises:
+def test_tensor_rand() raises:
     var t = Tensor[DType.float32].rand(Shape(100))
     # All values should be in [0, 1)
     var ptr = t.data_ptr()
@@ -246,7 +246,7 @@ fn test_tensor_rand() raises:
     print("  tensor_rand: PASS")
 
 
-fn test_tensor_simd_load_store() raises:
+def test_tensor_simd_load_store() raises:
     var t = Tensor[DType.float32](8)
     var vec = SIMD[DType.float32, 4](10.0, 20.0, 30.0, 40.0)
     t.store_simd[4](0, vec)
@@ -256,7 +256,7 @@ fn test_tensor_simd_load_store() raises:
     print("  tensor_simd_load_store: PASS")
 
 
-fn test_tensor_shape_properties() raises:
+def test_tensor_shape_properties() raises:
     var t = Tensor[DType.float32](2, 3, 4)
     assert_equal(t.ndim(), 3)
     assert_equal(t.numel(), 24)
@@ -268,7 +268,7 @@ fn test_tensor_shape_properties() raises:
     print("  tensor_shape_properties: PASS")
 
 
-fn test_tensor_transpose_view() raises:
+def test_tensor_transpose_view() raises:
     var t = Tensor[DType.float32](2, 3)
     # Fill: row 0 = [0,1,2], row 1 = [3,4,5]
     for i in range(6):
@@ -283,7 +283,7 @@ fn test_tensor_transpose_view() raises:
     print("  tensor_transpose_view: PASS")
 
 
-fn test_tensor_reshape_view() raises:
+def test_tensor_reshape_view() raises:
     var t = Tensor[DType.float32](3, 4)
     for i in range(12):
         t.data_ptr().store(i, Float32(i))
@@ -296,7 +296,7 @@ fn test_tensor_reshape_view() raises:
     print("  tensor_reshape_view: PASS")
 
 
-fn test_tensor_writable() raises:
+def test_tensor_writable() raises:
     var t = Tensor[DType.float32](3)
     t.data_ptr().store(0, Float32(1.0))
     t.data_ptr().store(1, Float32(2.0))
@@ -307,7 +307,7 @@ fn test_tensor_writable() raises:
     print("  tensor_writable: PASS")
 
 
-fn test_tensor_clone() raises:
+def test_tensor_clone() raises:
     """Clone produces an independent deep copy."""
     var t = Tensor[DType.float32](3)
     t.data_ptr().store(0, Float32(1.0))
@@ -328,7 +328,7 @@ fn test_tensor_clone() raises:
     print("  tensor_clone: PASS")
 
 
-fn test_tensor_from_transposed_view() raises:
+def test_tensor_from_transposed_view() raises:
     """Tensor(view) materializes a transposed view into an owned contiguous tensor."""
     var t = Tensor[DType.float32](2, 3)
     # [[0, 1, 2], [3, 4, 5]]
@@ -364,7 +364,7 @@ fn test_tensor_from_transposed_view() raises:
 # --- Main ---
 
 
-fn main() raises:
+def main() raises:
     print("test_tensor:")
 
     # Storage

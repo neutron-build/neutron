@@ -18,8 +18,8 @@ Tests:
 11. Benchmark: direct vs copy attention speedup
 """
 
-from math import abs, sqrt
-from time import perf_counter_ns
+from std.math import abs, sqrt
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
@@ -32,12 +32,12 @@ from neutron_mojo.nn.pipeline import PipelineConfig, pipeline_generate
 from neutron_mojo.nn.q_pipeline import q_pipeline_generate
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error("FAIL: " + msg + " a=" + String(a) + " b=" + String(b))
 
@@ -46,7 +46,7 @@ fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     var p = tiny_test_params()
     var model = Model(p)
     for v in range(p.vocab_size):
@@ -63,7 +63,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     var tok = BPETokenizer()
     _ = tok.add_token("<s>")
     _ = tok.add_token("</s>")
@@ -83,7 +83,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Direct KV Cache Attention Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_direct_attention_matches_copy() raises:
+def test_direct_attention_matches_copy() raises:
     """Direct cache attention produces same results as copy-based."""
     var p = tiny_test_params()
     var num_q = p.num_q_heads
@@ -129,7 +129,7 @@ fn test_direct_attention_matches_copy() raises:
     print("  direct_attention_matches_copy: PASS")
 
 
-fn test_direct_attention_multi_token() raises:
+def test_direct_attention_multi_token() raises:
     """Direct attention works with multiple cached tokens."""
     var num_q = 2
     var num_kv = 1
@@ -165,7 +165,7 @@ fn test_direct_attention_multi_token() raises:
     print("  direct_attention_multi_token: PASS")
 
 
-fn test_direct_attention_gqa_grouping() raises:
+def test_direct_attention_gqa_grouping() raises:
     """Direct attention correctly maps Q heads to KV heads in GQA."""
     var num_q = 4
     var num_kv = 2
@@ -215,7 +215,7 @@ fn test_direct_attention_gqa_grouping() raises:
 # Forward Pass Tests (with optimizations)
 # ===----------------------------------------------------------------------=== #
 
-fn test_forward_produces_valid_logits() raises:
+def test_forward_produces_valid_logits() raises:
     """Forward pass with parallel projections produces valid logits."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -239,7 +239,7 @@ fn test_forward_produces_valid_logits() raises:
     print("  forward_produces_valid_logits: PASS")
 
 
-fn test_forward_decode_loop() raises:
+def test_forward_decode_loop() raises:
     """Multiple forward passes (decode loop) work correctly."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -262,7 +262,7 @@ fn test_forward_decode_loop() raises:
     print("  forward_decode_loop: PASS")
 
 
-fn test_pipeline_generate_works() raises:
+def test_pipeline_generate_works() raises:
     """Pipeline generate still works with optimized forward."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -271,12 +271,12 @@ fn test_pipeline_generate_works() raises:
 
     var text = pipeline_generate(model, tok, "abc", cfg)
     # Just verify it runs without error and produces some output
-    assert_true(len(text) >= 0, "Pipeline produces text")
+    assert_true(text.byte_length() >= 0, "Pipeline produces text")
 
     print("  pipeline_generate_works: PASS")
 
 
-fn test_q8_model_forward() raises:
+def test_q8_model_forward() raises:
     """Q8 model forward with direct cache works."""
     var model = _build_tiny_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -300,7 +300,7 @@ fn test_q8_model_forward() raises:
     print("  q8_model_forward: PASS")
 
 
-fn test_q8_pipeline_generate_works() raises:
+def test_q8_pipeline_generate_works() raises:
     """Q8 pipeline generate still works with optimized forward."""
     var model = _build_tiny_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -309,12 +309,12 @@ fn test_q8_pipeline_generate_works() raises:
     cfg.max_new_tokens = 5
 
     var text = q_pipeline_generate(qm, tok, "abc", cfg)
-    assert_true(len(text) >= 0, "Q8 pipeline produces text")
+    assert_true(text.byte_length() >= 0, "Q8 pipeline produces text")
 
     print("  q8_pipeline_generate_works: PASS")
 
 
-fn test_fused_forward_works() raises:
+def test_fused_forward_works() raises:
     """Fused forward path with direct cache works."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -341,7 +341,7 @@ fn test_fused_forward_works() raises:
 # Benchmark Test
 # ===----------------------------------------------------------------------=== #
 
-fn test_benchmark_decode() raises:
+def test_benchmark_decode() raises:
     """Benchmark decode performance with optimizations."""
     var model = _build_tiny_model()
     var p = model.params.copy()
@@ -371,7 +371,7 @@ fn test_benchmark_decode() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_perf_opt:")
 
     # Direct KV cache attention

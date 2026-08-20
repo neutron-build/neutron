@@ -11,13 +11,13 @@ Enables:
 - Save/load PyTorch checkpoints via torch.save/load
 """
 
-from python import Python, PythonObject
+from std.python import Python, PythonObject
 from neutron_mojo.autograd.tape import Tape
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.python.bridge import to_numpy_shaped, from_numpy_shaped
 
 
-fn tape_to_state_dict(
+def tape_to_state_dict(
     tape: Tape,
     param_indices: List[Int],
     param_names: List[String],
@@ -62,7 +62,7 @@ fn tape_to_state_dict(
     return sd
 
 
-fn state_dict_to_tape(
+def state_dict_to_tape(
     mut tape: Tape,
     state_dict: PythonObject,
     param_indices: List[Int],
@@ -87,7 +87,7 @@ fn state_dict_to_tape(
             tape.set_data(idx, j, Float32(py=np_arr[j]))
 
 
-fn tape_grads_to_state_dict(
+def tape_grads_to_state_dict(
     tape: Tape,
     param_indices: List[Int],
     param_names: List[String],
@@ -130,7 +130,7 @@ fn tape_grads_to_state_dict(
     return gd
 
 
-fn save_pytorch_checkpoint(
+def save_pytorch_checkpoint(
     tape: Tape,
     param_indices: List[Int],
     param_names: List[String],
@@ -149,7 +149,7 @@ fn save_pytorch_checkpoint(
     torch.save(sd, path)
 
 
-fn load_pytorch_checkpoint(
+def load_pytorch_checkpoint(
     mut tape: Tape,
     param_indices: List[Int],
     param_names: List[String],

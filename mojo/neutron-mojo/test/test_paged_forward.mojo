@@ -4,7 +4,7 @@
 
 """Tests for paged forward pass: FP32, Q8, Q4 models with PagedKVCache."""
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
@@ -23,19 +23,19 @@ from neutron_mojo.nn.paged_forward import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn _build_model() -> Model:
+def _build_model() -> Model:
     """Build tiny model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -57,7 +57,7 @@ fn _build_model() -> Model:
 # FP32 Paged Forward Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_paged_forward_produces_logits() raises:
+def test_paged_forward_produces_logits() raises:
     """Test that paged forward produces valid logits."""
     var model = _build_model()
     var p = model.params.copy()
@@ -79,7 +79,7 @@ fn test_paged_forward_produces_logits() raises:
     print("  paged_forward_produces_logits: PASS")
 
 
-fn test_paged_forward_matches_contiguous() raises:
+def test_paged_forward_matches_contiguous() raises:
     """Verify paged forward matches contiguous forward."""
     var model = _build_model()
     var p = model.params.copy()
@@ -111,7 +111,7 @@ fn test_paged_forward_matches_contiguous() raises:
     print("  paged_forward_matches_contiguous: PASS")
 
 
-fn test_paged_generate() raises:
+def test_paged_generate() raises:
     """Test paged generation produces valid tokens."""
     var model = _build_model()
     var p = model.params.copy()
@@ -128,7 +128,7 @@ fn test_paged_generate() raises:
     print("  paged_generate: PASS")
 
 
-fn test_paged_vs_contiguous_generation() raises:
+def test_paged_vs_contiguous_generation() raises:
     """Verify paged generation matches contiguous generation."""
     var model = _build_model()
 
@@ -154,7 +154,7 @@ fn test_paged_vs_contiguous_generation() raises:
 # Q8 Paged Forward Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_paged_q8_forward() raises:
+def test_paged_q8_forward() raises:
     """Test Q8 paged forward produces valid logits."""
     var model = _build_model()
     var p = model.params.copy()
@@ -173,7 +173,7 @@ fn test_paged_q8_forward() raises:
     print("  paged_q8_forward: PASS")
 
 
-fn test_paged_q8_generate() raises:
+def test_paged_q8_generate() raises:
     """Test Q8 paged generation."""
     var model = _build_model()
     var p = model.params.copy()
@@ -190,7 +190,7 @@ fn test_paged_q8_generate() raises:
     print("  paged_q8_generate: PASS")
 
 
-fn test_paged_q8_matches_contiguous() raises:
+def test_paged_q8_matches_contiguous() raises:
     """Verify Q8 paged generation matches contiguous Q8 generation."""
     var model = _build_model()
     var qm = quantize_from_model(model, block_size=2)
@@ -214,7 +214,7 @@ fn test_paged_q8_matches_contiguous() raises:
 # Q4 Paged Forward Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_paged_q4_forward() raises:
+def test_paged_q4_forward() raises:
     """Test Q4 paged forward produces valid logits."""
     var model = _build_model()
     var p = model.params.copy()
@@ -233,7 +233,7 @@ fn test_paged_q4_forward() raises:
     print("  paged_q4_forward: PASS")
 
 
-fn test_paged_q4_generate() raises:
+def test_paged_q4_generate() raises:
     """Test Q4 paged generation."""
     var model = _build_model()
     var p = model.params.copy()
@@ -250,7 +250,7 @@ fn test_paged_q4_generate() raises:
     print("  paged_q4_generate: PASS")
 
 
-fn test_paged_q4_matches_contiguous() raises:
+def test_paged_q4_matches_contiguous() raises:
     """Verify Q4 paged generation matches contiguous Q4 generation."""
     var model = _build_model()
     var q4m = quantize_from_model_q4(model, block_size=2)
@@ -274,7 +274,7 @@ fn test_paged_q4_matches_contiguous() raises:
 # Memory Efficiency Test
 # ===----------------------------------------------------------------------=== #
 
-fn test_paged_memory_efficiency() raises:
+def test_paged_memory_efficiency() raises:
     """Verify paged cache uses less memory for short sequences."""
     var p = tiny_test_params()
     var max_seq = 64
@@ -312,7 +312,7 @@ fn test_paged_memory_efficiency() raises:
     print("  paged_memory_efficiency: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_paged_forward:")
 
     # FP32

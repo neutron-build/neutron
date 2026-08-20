@@ -22,15 +22,15 @@ from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params, generate
 from neutron_mojo.nn.rope import RoPETable
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
-from math import abs
+from std.math import abs
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error("FAIL: " + msg + " got " + String(a) + " vs " + String(b))
 
@@ -39,7 +39,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helper: build cache with known data
 # ===----------------------------------------------------------------------=== #
 
-fn _build_cache_with_data(
+def _build_cache_with_data(
     num_layers: Int, max_seq: Int, num_kv_heads: Int, head_dim: Int, fill_len: Int,
 ) raises -> MultiLayerKVCache:
     """Build a cache and fill it with identifiable data.
@@ -70,7 +70,7 @@ fn _build_cache_with_data(
 # Policy Creation Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_no_eviction_policy() raises:
+def test_no_eviction_policy() raises:
     """Test no-eviction policy creation."""
     var p = no_eviction()
     assert_true(p.mode == 0, "Mode should be 0")
@@ -78,7 +78,7 @@ fn test_no_eviction_policy() raises:
     print("  no_eviction_policy: PASS")
 
 
-fn test_streaming_policy_creation() raises:
+def test_streaming_policy_creation() raises:
     """Test StreamingLLM policy creation."""
     var p = streaming_policy(sink_tokens=4, window_size=32)
     assert_true(p.mode == 1, "Mode should be 1")
@@ -88,7 +88,7 @@ fn test_streaming_policy_creation() raises:
     print("  streaming_policy_creation: PASS")
 
 
-fn test_h2o_policy_creation() raises:
+def test_h2o_policy_creation() raises:
     """Test H2O policy creation."""
     var p = h2o_policy(budget=64, sink_tokens=8)
     assert_true(p.mode == 2, "Mode should be 2")
@@ -102,7 +102,7 @@ fn test_h2o_policy_creation() raises:
 # StreamingLLM Eviction Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_streaming_evict_basic() raises:
+def test_streaming_evict_basic() raises:
     """Test basic StreamingLLM eviction."""
     # Cache with 10 positions, keep sink=2 + window=3 = 5
     var cache = _build_cache_with_data(
@@ -129,7 +129,7 @@ fn test_streaming_evict_basic() raises:
     print("  streaming_evict_basic: PASS")
 
 
-fn test_streaming_no_evict_when_small() raises:
+def test_streaming_no_evict_when_small() raises:
     """Test that eviction is skipped when cache is below threshold."""
     var cache = _build_cache_with_data(
         num_layers=1, max_seq=20, num_kv_heads=1, head_dim=2, fill_len=5,
@@ -143,7 +143,7 @@ fn test_streaming_no_evict_when_small() raises:
     print("  streaming_no_evict_when_small: PASS")
 
 
-fn test_streaming_evict_multi_layer() raises:
+def test_streaming_evict_multi_layer() raises:
     """Test StreamingLLM eviction across multiple layers."""
     var cache = _build_cache_with_data(
         num_layers=3, max_seq=20, num_kv_heads=1, head_dim=2, fill_len=10,
@@ -165,7 +165,7 @@ fn test_streaming_evict_multi_layer() raises:
     print("  streaming_evict_multi_layer: PASS")
 
 
-fn test_streaming_should_evict() raises:
+def test_streaming_should_evict() raises:
     """Test should_evict predicate for StreamingLLM."""
     var cache = _build_cache_with_data(
         num_layers=1, max_seq=20, num_kv_heads=1, head_dim=2, fill_len=5,
@@ -191,7 +191,7 @@ fn test_streaming_should_evict() raises:
     print("  streaming_should_evict: PASS")
 
 
-fn test_streaming_evict_if_needed() raises:
+def test_streaming_evict_if_needed() raises:
     """Test evict_if_needed integration for StreamingLLM."""
     var cache = _build_cache_with_data(
         num_layers=1, max_seq=20, num_kv_heads=1, head_dim=2, fill_len=10,
@@ -214,7 +214,7 @@ fn test_streaming_evict_if_needed() raises:
 # H2O Eviction Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_h2o_score_tracking() raises:
+def test_h2o_score_tracking() raises:
     """Test AttentionScoreTracker accumulation."""
     var tracker = AttentionScoreTracker(10)
 
@@ -247,7 +247,7 @@ fn test_h2o_score_tracking() raises:
     print("  h2o_score_tracking: PASS")
 
 
-fn test_h2o_eviction_candidates() raises:
+def test_h2o_eviction_candidates() raises:
     """Test that eviction candidates are selected correctly."""
     var tracker = AttentionScoreTracker(8)
 
@@ -280,7 +280,7 @@ fn test_h2o_eviction_candidates() raises:
     print("  h2o_eviction_candidates: PASS")
 
 
-fn test_h2o_no_eviction_when_within_budget() raises:
+def test_h2o_no_eviction_when_within_budget() raises:
     """Test that H2O returns all positions when within budget."""
     var tracker = AttentionScoreTracker(8)
     var weights = Tensor[DType.float32](Shape(4))
@@ -294,7 +294,7 @@ fn test_h2o_no_eviction_when_within_budget() raises:
     print("  h2o_no_eviction_when_within_budget: PASS")
 
 
-fn test_h2o_evict_basic() raises:
+def test_h2o_evict_basic() raises:
     """Test H2O eviction on a cache."""
     var cache = _build_cache_with_data(
         num_layers=1, max_seq=20, num_kv_heads=1, head_dim=2, fill_len=8,
@@ -336,7 +336,7 @@ fn test_h2o_evict_basic() raises:
     print("  h2o_evict_basic: PASS")
 
 
-fn test_h2o_preserves_sink() raises:
+def test_h2o_preserves_sink() raises:
     """Test that H2O always preserves sink tokens even if low-scoring."""
     var tracker = AttentionScoreTracker(10)
 
@@ -359,7 +359,7 @@ fn test_h2o_preserves_sink() raises:
     print("  h2o_preserves_sink: PASS")
 
 
-fn test_h2o_evict_if_needed() raises:
+def test_h2o_evict_if_needed() raises:
     """Test evict_if_needed integration for H2O."""
     var cache = _build_cache_with_data(
         num_layers=1, max_seq=20, num_kv_heads=1, head_dim=2, fill_len=8,
@@ -389,7 +389,7 @@ fn test_h2o_evict_if_needed() raises:
 # End-to-End: Generation with Eviction
 # ===----------------------------------------------------------------------=== #
 
-fn test_generation_with_streaming_eviction() raises:
+def test_generation_with_streaming_eviction() raises:
     """Test that generation works with StreamingLLM eviction."""
     var params = tiny_test_params()
     var model = Model(params)
@@ -466,7 +466,7 @@ fn test_generation_with_streaming_eviction() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_eviction:")
 
     # Policy tests

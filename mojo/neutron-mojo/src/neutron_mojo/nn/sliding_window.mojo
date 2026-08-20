@@ -12,7 +12,7 @@ Mistral 7B uses window_size=4096, meaning each token attends to at most
 the 4096 most recent positions.
 """
 
-from math import exp
+from std.math import exp
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.kv_cache import KVCache
@@ -36,7 +36,7 @@ struct SlidingWindowKVCache(Movable):
     var total_length: Int  # Total tokens seen (may exceed window_size)
     var write_pos: Int     # Current write position in ring buffer
 
-    fn __init__(out self, window_size: Int, num_kv_heads: Int, head_dim: Int):
+    def __init__(out self, window_size: Int, num_kv_heads: Int, head_dim: Int):
         self.window_size = window_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -47,19 +47,19 @@ struct SlidingWindowKVCache(Movable):
         self.key_cache = Tensor[DType.float32](Shape(total))
         self.value_cache = Tensor[DType.float32](Shape(total))
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.key_cache = other.key_cache^
-        self.value_cache = other.value_cache^
-        self.window_size = other.window_size
-        self.num_kv_heads = other.num_kv_heads
-        self.head_dim = other.head_dim
-        self.total_length = other.total_length
-        self.write_pos = other.write_pos
+    def __init__(out self, *, deinit move: Self):
+        self.key_cache = move.key_cache^
+        self.value_cache = move.value_cache^
+        self.window_size = move.window_size^
+        self.num_kv_heads = move.num_kv_heads^
+        self.head_dim = move.head_dim^
+        self.total_length = move.total_length^
+        self.write_pos = move.write_pos^
 
-    fn _stride(self) -> Int:
+    def _stride(self) -> Int:
         return self.num_kv_heads * self.head_dim
 
-    fn append_kv(
+    def append_kv(
         mut self,
         key: Tensor[DType.float32],
         value: Tensor[DType.float32],
@@ -80,13 +80,13 @@ struct SlidingWindowKVCache(Movable):
         self.write_pos = (self.write_pos + 1) % self.window_size
         self.total_length += 1
 
-    fn active_length(self) -> Int:
+    def active_length(self) -> Int:
         """Number of valid positions in the cache."""
         if self.total_length < self.window_size:
             return self.total_length
         return self.window_size
 
-    fn get_ring_pos(self, logical_idx: Int) -> Int:
+    def get_ring_pos(self, logical_idx: Int) -> Int:
         """Map a logical index [0, active_length) to ring buffer position.
 
         When total_length <= window_size, logical == physical.
@@ -96,23 +96,23 @@ struct SlidingWindowKVCache(Movable):
             return logical_idx
         return (self.write_pos + logical_idx) % self.window_size
 
-    fn get_key_at(self, logical_idx: Int, head: Int, dim: Int) -> Float32:
+    def get_key_at(self, logical_idx: Int, head: Int, dim: Int) -> Float32:
         """Get key value at logical position."""
         var ring = self.get_ring_pos(logical_idx)
         var offset = ring * self._stride() + head * self.head_dim + dim
         return self.key_cache.get(offset)
 
-    fn get_value_at(self, logical_idx: Int, head: Int, dim: Int) -> Float32:
+    def get_value_at(self, logical_idx: Int, head: Int, dim: Int) -> Float32:
         """Get value at logical position."""
         var ring = self.get_ring_pos(logical_idx)
         var offset = ring * self._stride() + head * self.head_dim + dim
         return self.value_cache.get(offset)
 
-    fn memory_bytes(self) -> Int:
+    def memory_bytes(self) -> Int:
         """Fixed memory usage (always window_size, regardless of sequence length)."""
         return self.window_size * self.num_kv_heads * self.head_dim * 4 * 2
 
-    fn reset(mut self):
+    def reset(mut self):
         """Clear the cache."""
         self.total_length = 0
         self.write_pos = 0
@@ -122,7 +122,7 @@ struct SlidingWindowKVCache(Movable):
 # Sliding Window Fused Attention
 # ===----------------------------------------------------------------------=== #
 
-fn sliding_window_attention_head(
+def sliding_window_attention_head(
     query: Tensor[DType.float32],
     cache: SlidingWindowKVCache,
     kv_head: Int,
@@ -188,7 +188,7 @@ fn sliding_window_attention_head(
     return output^
 
 
-fn sliding_window_gqa_attention(
+def sliding_window_gqa_attention(
     query: Tensor[DType.float32],
     cache: SlidingWindowKVCache,
     num_q_heads: Int,
@@ -229,7 +229,7 @@ fn sliding_window_gqa_attention(
 # Windowed Attention on Standard KV Cache
 # ===----------------------------------------------------------------------=== #
 
-fn windowed_fused_attention_head(
+def windowed_fused_attention_head(
     query: Tensor[DType.float32],
     cache: KVCache,
     kv_head: Int,

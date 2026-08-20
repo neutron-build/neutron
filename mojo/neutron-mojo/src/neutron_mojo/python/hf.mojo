@@ -8,10 +8,10 @@ All downloads use Python interop. Model loading uses native Mojo GGUF/SafeTensor
 parsers after download.
 """
 
-from python import Python, PythonObject
+from std.python import Python, PythonObject
 
 
-fn hf_available() -> Bool:
+def hf_available() -> Bool:
     """Check if huggingface_hub is importable."""
     try:
         _ = Python.import_module("huggingface_hub")
@@ -20,7 +20,7 @@ fn hf_available() -> Bool:
         return False
 
 
-fn hf_download(repo_id: String, filename: String) raises -> String:
+def hf_download(repo_id: String, filename: String) raises -> String:
     """Download a file from HuggingFace Hub.
 
     Uses huggingface_hub.hf_hub_download() which handles caching automatically.
@@ -37,7 +37,7 @@ fn hf_download(repo_id: String, filename: String) raises -> String:
     return String(path)
 
 
-fn hf_list_files(repo_id: String) raises -> List[String]:
+def hf_list_files(repo_id: String) raises -> List[String]:
     """List files in a HuggingFace repository.
 
     Args:
@@ -57,7 +57,7 @@ fn hf_list_files(repo_id: String) raises -> List[String]:
     return result^
 
 
-fn hf_find_gguf(repo_id: String) raises -> String:
+def hf_find_gguf(repo_id: String) raises -> String:
     """Find the first .gguf file in a HuggingFace repository.
 
     Args:
@@ -77,7 +77,7 @@ fn hf_find_gguf(repo_id: String) raises -> String:
     raise Error("No .gguf file found in repo: " + repo_id)
 
 
-fn hf_find_safetensors(repo_id: String) raises -> String:
+def hf_find_safetensors(repo_id: String) raises -> String:
     """Find the first .safetensors file in a HuggingFace repository.
 
     Args:
@@ -97,24 +97,24 @@ fn hf_find_safetensors(repo_id: String) raises -> String:
     raise Error("No .safetensors file found in repo: " + repo_id)
 
 
-fn _ends_with(s: String, suffix: String) -> Bool:
+def _ends_with(s: String, suffix: String) -> Bool:
     """Check if string ends with suffix."""
-    if len(suffix) > len(s):
+    if suffix.byte_length() > s.byte_length():
         return False
-    var start = len(s) - len(suffix)
-    for i in range(len(suffix)):
+    var start = s.byte_length() - suffix.byte_length()
+    for i in range(suffix.byte_length()):
         if ord(s[byte=start + i]) != ord(suffix[byte=i]):
             return False
     return True
 
 
-fn _contains(haystack: String, needle: String) -> Bool:
+def _contains(haystack: String, needle: String) -> Bool:
     """Check if haystack contains needle."""
-    if len(needle) > len(haystack):
+    if needle.byte_length() > haystack.byte_length():
         return False
-    for i in range(len(haystack) - len(needle) + 1):
+    for i in range(haystack.byte_length() - needle.byte_length() + 1):
         var found = True
-        for j in range(len(needle)):
+        for j in range(needle.byte_length()):
             if ord(haystack[byte=i + j]) != ord(needle[byte=j]):
                 found = False
                 break

@@ -18,12 +18,12 @@ from neutron_mojo.fusion.pattern import Bindings, Pattern
 from neutron_mojo.fusion.graph import OpKind
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_rewrite_engine_creation() raises:
+def test_rewrite_engine_creation() raises:
     """Test RewriteEngine initialization."""
     var engine = RewriteEngine(max_iterations=10, max_nodes=1000)
 
@@ -33,7 +33,7 @@ fn test_rewrite_engine_creation() raises:
     print("  rewrite_engine_creation: PASS")
 
 
-fn test_rewrite_stats() raises:
+def test_rewrite_stats() raises:
     """Test RewriteStats initialization."""
     var stats = RewriteStats()
 
@@ -45,7 +45,7 @@ fn test_rewrite_stats() raises:
     print("  rewrite_stats: PASS")
 
 
-fn test_match_creation() raises:
+def test_match_creation() raises:
     """Test Match structure."""
     var bindings = Bindings(2)
     bindings.bind(0, ClassId(10))
@@ -61,7 +61,7 @@ fn test_match_creation() raises:
     print("  match_creation: PASS")
 
 
-fn test_match_copy() raises:
+def test_match_copy() raises:
     """Test Match copy."""
     var bindings = Bindings(1)
     bindings.bind(0, ClassId(42))
@@ -75,7 +75,7 @@ fn test_match_copy() raises:
     print("  match_copy: PASS")
 
 
-fn test_simple_rewrite_application() raises:
+def test_simple_rewrite_application() raises:
     """Test simple rewrite application (merge two classes)."""
     var eg = EGraph()
 
@@ -95,7 +95,7 @@ fn test_simple_rewrite_application() raises:
     print("  simple_rewrite_application: PASS")
 
 
-fn test_phase1_empty_egraph() raises:
+def test_phase1_empty_egraph() raises:
     """Test Phase 1 on an empty e-graph."""
     var eg = EGraph()
     var ruleset = create_default_ruleset()
@@ -110,7 +110,7 @@ fn test_phase1_empty_egraph() raises:
     print("  phase1_empty_egraph: PASS")
 
 
-fn test_phase2_empty_egraph() raises:
+def test_phase2_empty_egraph() raises:
     """Test Phase 2 on an empty e-graph."""
     var eg = EGraph()
     var ruleset = create_default_ruleset()
@@ -125,7 +125,7 @@ fn test_phase2_empty_egraph() raises:
     print("  phase2_empty_egraph: PASS")
 
 
-fn test_phase1_with_nodes() raises:
+def test_phase1_with_nodes() raises:
     """Test Phase 1 with some nodes in the e-graph."""
     var eg = EGraph()
     var ruleset = create_default_ruleset()
@@ -146,7 +146,7 @@ fn test_phase1_with_nodes() raises:
     print("  phase1_with_nodes: PASS")
 
 
-fn test_count_rewrites() raises:
+def test_count_rewrites() raises:
     """Test rewrite counting on empty e-graph."""
     var eg = EGraph()
     var ruleset = create_default_ruleset()
@@ -159,7 +159,7 @@ fn test_count_rewrites() raises:
     print("  count_rewrites: PASS")
 
 
-fn test_max_iterations_limit() raises:
+def test_max_iterations_limit() raises:
     """Test that engine respects max_iterations limit."""
     var engine = RewriteEngine(max_iterations=3)
 
@@ -168,7 +168,7 @@ fn test_max_iterations_limit() raises:
     print("  max_iterations_limit: PASS")
 
 
-fn test_max_nodes_limit() raises:
+def test_max_nodes_limit() raises:
     """Test that engine has max_nodes limit."""
     var engine = RewriteEngine(max_nodes=500)
 
@@ -177,7 +177,7 @@ fn test_max_nodes_limit() raises:
     print("  max_nodes_limit: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_rewrite:")
 
     test_rewrite_engine_creation()

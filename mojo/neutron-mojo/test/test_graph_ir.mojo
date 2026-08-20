@@ -2,7 +2,7 @@
 
 from neutron_mojo.fusion.graph import ComputationGraph, OpKind
 
-fn main() raises:
+def main() raises:
     print("test_graph_ir:")
 
     var g = ComputationGraph()

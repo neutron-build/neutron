@@ -22,7 +22,7 @@ from neutron_mojo.nn.attention import gqa_attention
 # Linear Projection (matrix-vector multiply)
 # ===----------------------------------------------------------------------=== #
 
-fn linear(
+def linear(
     x: Tensor[DType.float32],
     weight: Tensor[DType.float32],
 ) raises -> Tensor[DType.float32]:
@@ -65,7 +65,7 @@ struct TransformerWeights(Movable):
     var w_up: Tensor[DType.float32]         # [ffn_dim, hidden_dim]
     var w_down: Tensor[DType.float32]       # [hidden_dim, ffn_dim]
 
-    fn __init__(
+    def __init__(
         out self,
         hidden_dim: Int,
         num_q_heads: Int,
@@ -101,23 +101,23 @@ struct TransformerWeights(Movable):
             self.attn_norm.set(i, 1.0)
             self.ffn_norm.set(i, 1.0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.attn_norm = other.attn_norm^
-        self.wq = other.wq^
-        self.wk = other.wk^
-        self.wv = other.wv^
-        self.wo = other.wo^
-        self.ffn_norm = other.ffn_norm^
-        self.w_gate = other.w_gate^
-        self.w_up = other.w_up^
-        self.w_down = other.w_down^
+    def __init__(out self, *, deinit move: Self):
+        self.attn_norm = move.attn_norm^
+        self.wq = move.wq^
+        self.wk = move.wk^
+        self.wv = move.wv^
+        self.wo = move.wo^
+        self.ffn_norm = move.ffn_norm^
+        self.w_gate = move.w_gate^
+        self.w_up = move.w_up^
+        self.w_down = move.w_down^
 
 
 # ===----------------------------------------------------------------------=== #
 # Transformer Block Forward Pass
 # ===----------------------------------------------------------------------=== #
 
-fn transformer_block(
+def transformer_block(
     x: Tensor[DType.float32],
     weights: TransformerWeights,
     mut cache: KVCache,

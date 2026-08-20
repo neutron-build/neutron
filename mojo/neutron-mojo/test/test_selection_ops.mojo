@@ -10,7 +10,7 @@ from neutron_mojo.tensor import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
@@ -19,19 +19,19 @@ fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e
         )
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn _idx2(r: Int, c: Int) -> List[Int]:
+def _idx2(r: Int, c: Int) -> List[Int]:
     var l = List[Int]()
     l.append(r)
     l.append(c)
     return l^
 
 
-fn test_argmax_basic() raises:
+def test_argmax_basic() raises:
     var x = Tensor[DType.float32](5)
     x.set(0, 1.0)
     x.set(1, 5.0)
@@ -44,7 +44,7 @@ fn test_argmax_basic() raises:
     print("  argmax_basic: PASS")
 
 
-fn test_argmin_basic() raises:
+def test_argmin_basic() raises:
     var x = Tensor[DType.float32](5)
     x.set(0, 3.0)
     x.set(1, 1.0)
@@ -57,7 +57,7 @@ fn test_argmin_basic() raises:
     print("  argmin_basic: PASS")
 
 
-fn test_argmax_axis_0() raises:
+def test_argmax_axis_0() raises:
     """Argmax along axis 0 (rows) of 2D tensor."""
     var x = Tensor[DType.float32](3, 2)
     x.set(_idx2(0, 0), Float32(1.0))
@@ -73,7 +73,7 @@ fn test_argmax_axis_0() raises:
     print("  argmax_axis_0: PASS")
 
 
-fn test_argmax_axis_1() raises:
+def test_argmax_axis_1() raises:
     """Argmax along axis 1 (cols) of 2D tensor."""
     var x = Tensor[DType.float32](2, 3)
     x.set(_idx2(0, 0), Float32(1.0))
@@ -88,7 +88,7 @@ fn test_argmax_axis_1() raises:
     print("  argmax_axis_1: PASS")
 
 
-fn test_topk() raises:
+def test_topk() raises:
     """Top-3 from 5-element tensor."""
     var x = Tensor[DType.float32](5)
     x.set(0, 1.0)
@@ -103,7 +103,7 @@ fn test_topk() raises:
     print("  topk: PASS")
 
 
-fn test_where_op() raises:
+def test_where_op() raises:
     """Conditional select between two tensors."""
     var cond = Tensor[DType.float32](4)
     cond.set(0, 1.0)
@@ -128,7 +128,7 @@ fn test_where_op() raises:
     print("  where_op: PASS")
 
 
-fn test_gather_1d() raises:
+def test_gather_1d() raises:
     """Gather from 1D tensor."""
     var x = Tensor[DType.float32](5)
     x.set(0, 10.0)
@@ -147,7 +147,7 @@ fn test_gather_1d() raises:
     print("  gather_1d: PASS")
 
 
-fn test_gather_2d_rows() raises:
+def test_gather_2d_rows() raises:
     """Gather rows from 2D tensor."""
     var x = Tensor[DType.float32](3, 2)
     x.set(_idx2(0, 0), Float32(1.0))
@@ -167,7 +167,7 @@ fn test_gather_2d_rows() raises:
     print("  gather_2d_rows: PASS")
 
 
-fn test_eq_ne() raises:
+def test_eq_ne() raises:
     """Equality and not-equal comparison."""
     var a = Tensor[DType.float32](4)
     a.set(0, 1.0)
@@ -192,7 +192,7 @@ fn test_eq_ne() raises:
     print("  eq_ne: PASS")
 
 
-fn test_gt_lt() raises:
+def test_gt_lt() raises:
     """Greater-than and less-than."""
     var a = Tensor[DType.float32](3)
     a.set(0, 1.0)
@@ -213,7 +213,7 @@ fn test_gt_lt() raises:
     print("  gt_lt: PASS")
 
 
-fn test_ge_le() raises:
+def test_ge_le() raises:
     """Greater-or-equal and less-or-equal."""
     var a = Tensor[DType.float32](3)
     a.set(0, 1.0)
@@ -234,7 +234,7 @@ fn test_ge_le() raises:
     print("  ge_le: PASS")
 
 
-fn test_index_select() raises:
+def test_index_select() raises:
     """Index select is an alias for gather."""
     var x = Tensor[DType.float32](4)
     x.set(0, 10.0)
@@ -250,7 +250,7 @@ fn test_index_select() raises:
     print("  index_select: PASS")
 
 
-fn test_topk_full() raises:
+def test_topk_full() raises:
     """Top-k when k equals tensor size."""
     var x = Tensor[DType.float32](3)
     x.set(0, 3.0)
@@ -263,7 +263,7 @@ fn test_topk_full() raises:
     print("  topk_full: PASS")
 
 
-fn test_where_op_all_true() raises:
+def test_where_op_all_true() raises:
     """Where with all-true condition returns x."""
     var cond = Tensor[DType.float32](3)
     cond.set(0, 1.0)
@@ -284,7 +284,7 @@ fn test_where_op_all_true() raises:
     print("  where_op_all_true: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_selection_ops:")
     test_argmax_basic()
     test_argmin_basic()

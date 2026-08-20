@@ -19,12 +19,12 @@ from neutron_mojo.fusion.rewrite import RewriteEngine, apply_simple_rewrite
 from neutron_mojo.fusion.pattern import Pattern, Bindings
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_graph_to_egraph_conversion() raises:
+def test_graph_to_egraph_conversion() raises:
     """Test converting a computation graph to an e-graph."""
     var g = ComputationGraph()
 
@@ -39,7 +39,7 @@ fn test_graph_to_egraph_conversion() raises:
     print("  graph_to_egraph_conversion: PASS")
 
 
-fn test_egraph_hash_consing() raises:
+def test_egraph_hash_consing() raises:
     """Test that e-graph properly deduplicates nodes."""
     var eg = EGraph()
 
@@ -53,7 +53,7 @@ fn test_egraph_hash_consing() raises:
     print("  egraph_hash_consing: PASS")
 
 
-fn test_egraph_distinct_ops() raises:
+def test_egraph_distinct_ops() raises:
     """Test that different operations create different e-classes."""
     var eg = EGraph()
 
@@ -66,7 +66,7 @@ fn test_egraph_distinct_ops() raises:
     print("  egraph_distinct_ops: PASS")
 
 
-fn test_egraph_binary_op() raises:
+def test_egraph_binary_op() raises:
     """Test adding a binary operation to e-graph."""
     var eg = EGraph()
 
@@ -84,7 +84,7 @@ fn test_egraph_binary_op() raises:
     print("  egraph_binary_op: PASS")
 
 
-fn test_equivalence_merging() raises:
+def test_equivalence_merging() raises:
     """Test merging equivalent e-classes."""
     var eg = EGraph()
 
@@ -104,7 +104,7 @@ fn test_equivalence_merging() raises:
     print("  equivalence_merging: PASS")
 
 
-fn test_add_identity_rewrite_scenario() raises:
+def test_add_identity_rewrite_scenario() raises:
     """Test add identity rewrite scenario: (add x 0) ≡ x"""
     var eg = EGraph()
 
@@ -127,7 +127,7 @@ fn test_add_identity_rewrite_scenario() raises:
     print("  add_identity_rewrite_scenario: PASS")
 
 
-fn test_mul_commutativity_scenario() raises:
+def test_mul_commutativity_scenario() raises:
     """Test mul commutativity: (mul x y) can be rewritten to (mul y x)."""
     var eg = EGraph()
 
@@ -153,7 +153,7 @@ fn test_mul_commutativity_scenario() raises:
     print("  mul_commutativity_scenario: PASS")
 
 
-fn test_transpose_involution_scenario() raises:
+def test_transpose_involution_scenario() raises:
     """Test transpose involution: (transpose (transpose x)) ≡ x"""
     var eg = EGraph()
 
@@ -179,7 +179,7 @@ fn test_transpose_involution_scenario() raises:
     print("  transpose_involution_scenario: PASS")
 
 
-fn test_rewrite_engine_initialization() raises:
+def test_rewrite_engine_initialization() raises:
     """Test that RewriteEngine can be created and configured."""
     var engine = RewriteEngine(max_iterations=10, max_nodes=5000)
     var ruleset = create_default_ruleset()
@@ -190,7 +190,7 @@ fn test_rewrite_engine_initialization() raises:
     print("  rewrite_engine_initialization: PASS")
 
 
-fn test_phase1_execution() raises:
+def test_phase1_execution() raises:
     """Test Phase 1 (simplification) execution."""
     var eg = EGraph()
     var ruleset = create_default_ruleset()
@@ -208,7 +208,7 @@ fn test_phase1_execution() raises:
     print("  phase1_execution: PASS")
 
 
-fn test_phase2_execution() raises:
+def test_phase2_execution() raises:
     """Test Phase 2 (equality saturation) execution."""
     var eg = EGraph()
     var ruleset = create_default_ruleset()
@@ -226,7 +226,7 @@ fn test_phase2_execution() raises:
     print("  phase2_execution: PASS")
 
 
-fn test_complex_expression_graph() raises:
+def test_complex_expression_graph() raises:
     """Test building a complex expression in the e-graph."""
     var eg = EGraph()
 
@@ -254,7 +254,7 @@ fn test_complex_expression_graph() raises:
     print("  complex_expression_graph: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_fusion_integration:")
 
     test_graph_to_egraph_conversion()

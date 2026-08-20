@@ -12,18 +12,18 @@ from neutron_mojo.serve.http import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn contains(haystack: String, needle: String) -> Bool:
+def contains(haystack: String, needle: String) -> Bool:
     """Check if haystack contains needle."""
-    if len(needle) > len(haystack):
+    if needle.byte_length() > haystack.byte_length():
         return False
-    for i in range(len(haystack) - len(needle) + 1):
+    for i in range(haystack.byte_length() - needle.byte_length() + 1):
         var found = True
-        for j in range(len(needle)):
+        for j in range(needle.byte_length()):
             if ord(haystack[byte=i + j]) != ord(needle[byte=j]):
                 found = False
                 break
@@ -32,7 +32,7 @@ fn contains(haystack: String, needle: String) -> Bool:
     return False
 
 
-fn test_chat_message() raises:
+def test_chat_message() raises:
     """ChatMessage creation and copy."""
     var msg = ChatMessage("user", "Hello")
     assert_true(msg.role == "user", "Role should be user")
@@ -43,7 +43,7 @@ fn test_chat_message() raises:
     print("  chat_message: PASS")
 
 
-fn test_chat_request() raises:
+def test_chat_request() raises:
     """ChatCompletionRequest creation."""
     var req = ChatCompletionRequest()
     req.add_message("user", "Test prompt")
@@ -54,7 +54,7 @@ fn test_chat_request() raises:
     print("  chat_request: PASS")
 
 
-fn test_format_chat_response() raises:
+def test_format_chat_response() raises:
     """Format response as JSON."""
     var resp = ChatCompletionResponse("Hello world")
     resp.prompt_tokens = 5
@@ -68,7 +68,7 @@ fn test_format_chat_response() raises:
     print("  format_chat_response: PASS")
 
 
-fn test_format_models_response() raises:
+def test_format_models_response() raises:
     """Format models list."""
     var json = format_models_response()
     assert_true(contains(json, '"neutron-mojo"'), "Has model name")
@@ -76,14 +76,14 @@ fn test_format_models_response() raises:
     print("  format_models_response: PASS")
 
 
-fn test_format_health_response() raises:
+def test_format_health_response() raises:
     """Format health check."""
     var json = format_health_response()
     assert_true(contains(json, '"ok"'), "Has ok status")
     print("  format_health_response: PASS")
 
 
-fn test_format_error_response() raises:
+def test_format_error_response() raises:
     """Format error response."""
     var json = format_error_response("Model not found", 404)
     assert_true(contains(json, "Model not found"), "Has error message")
@@ -91,7 +91,7 @@ fn test_format_error_response() raises:
     print("  format_error_response: PASS")
 
 
-fn test_format_sse_event() raises:
+def test_format_sse_event() raises:
     """Format SSE event."""
     var sse = format_sse_event("token")
     assert_true(contains(sse, "data: "), "Has data prefix")
@@ -100,14 +100,14 @@ fn test_format_sse_event() raises:
     print("  format_sse_event: PASS")
 
 
-fn test_format_sse_done() raises:
+def test_format_sse_done() raises:
     """Format SSE done event."""
     var done = format_sse_done()
     assert_true(contains(done, "[DONE]"), "Has DONE marker")
     print("  format_sse_done: PASS")
 
 
-fn test_parse_chat_request() raises:
+def test_parse_chat_request() raises:
     """Parse chat request from JSON."""
     var json = '{"model":"gpt-4","messages":[{"role":"user","content":"Hello AI"}],"max_tokens":100}'
     var req = parse_chat_request(json)
@@ -119,7 +119,7 @@ fn test_parse_chat_request() raises:
     print("  parse_chat_request: PASS")
 
 
-fn test_parse_chat_request_streaming() raises:
+def test_parse_chat_request_streaming() raises:
     """Parse streaming chat request."""
     var json = '{"model":"test","messages":[{"role":"user","content":"Hi"}],"stream":true}'
     var req = parse_chat_request(json)
@@ -127,7 +127,7 @@ fn test_parse_chat_request_streaming() raises:
     print("  parse_chat_request_streaming: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_http")
     test_chat_message()
     test_chat_request()

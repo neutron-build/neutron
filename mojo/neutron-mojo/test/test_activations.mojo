@@ -11,7 +11,7 @@ Tolerance: FP32 1e-6
 from neutron_mojo.tensor import Tensor, gelu, silu, swiglu, relu
 
 
-fn assert_close[dtype: DType](
+def assert_close[dtype: DType](
     a: Scalar[dtype], b: Scalar[dtype], rtol: Float64 = 1e-5, atol: Float64 = 1e-8
 ) raises:
     var diff = abs(Float64(a) - Float64(b))
@@ -22,7 +22,7 @@ fn assert_close[dtype: DType](
         )
 
 
-fn assert_true(cond: Bool) raises:
+def assert_true(cond: Bool) raises:
     if not cond:
         raise Error("Assertion failed: condition is False")
 
@@ -32,7 +32,7 @@ fn assert_true(cond: Bool) raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_gelu_zero() raises:
+def test_gelu_zero() raises:
     """GeLU(0) = 0."""
     var x = Tensor[DType.float32](1)
     x.data_ptr().store(0, Float32(0.0))
@@ -45,7 +45,7 @@ fn test_gelu_zero() raises:
     print("  gelu_zero: PASS")
 
 
-fn test_gelu_large_positive() raises:
+def test_gelu_large_positive() raises:
     """GeLU(x) ≈ x for large positive x."""
     var x = Tensor[DType.float32](1)
     x.data_ptr().store(0, Float32(10.0))
@@ -58,7 +58,7 @@ fn test_gelu_large_positive() raises:
     print("  gelu_large_positive: PASS")
 
 
-fn test_gelu_large_negative() raises:
+def test_gelu_large_negative() raises:
     """GeLU(x) ≈ 0 for large negative x."""
     var x = Tensor[DType.float32](1)
     x.data_ptr().store(0, Float32(-10.0))
@@ -71,7 +71,7 @@ fn test_gelu_large_negative() raises:
     print("  gelu_large_negative: PASS")
 
 
-fn test_gelu_properties() raises:
+def test_gelu_properties() raises:
     """GeLU properties: smooth, approximately x for x>3, approximately 0 for x<-3."""
     var x = Tensor[DType.float32](5)
     x.data_ptr().store(0, Float32(-5.0))
@@ -99,7 +99,7 @@ fn test_gelu_properties() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_silu_zero() raises:
+def test_silu_zero() raises:
     """SiLU(0) = 0."""
     var x = Tensor[DType.float32](1)
     x.data_ptr().store(0, Float32(0.0))
@@ -112,7 +112,7 @@ fn test_silu_zero() raises:
     print("  silu_zero: PASS")
 
 
-fn test_silu_large_positive() raises:
+def test_silu_large_positive() raises:
     """SiLU(x) ≈ x for large positive x."""
     var x = Tensor[DType.float32](1)
     x.data_ptr().store(0, Float32(10.0))
@@ -126,7 +126,7 @@ fn test_silu_large_positive() raises:
     print("  silu_large_positive: PASS")
 
 
-fn test_silu_large_negative() raises:
+def test_silu_large_negative() raises:
     """SiLU(x) ≈ 0 for large negative x."""
     var x = Tensor[DType.float32](1)
     x.data_ptr().store(0, Float32(-10.0))
@@ -139,7 +139,7 @@ fn test_silu_large_negative() raises:
     print("  silu_large_negative: PASS")
 
 
-fn test_silu_specific_value() raises:
+def test_silu_specific_value() raises:
     """SiLU(1) ≈ 0.7311 (sigmoid(1) * 1)."""
     var x = Tensor[DType.float32](1)
     x.data_ptr().store(0, Float32(1.0))
@@ -158,7 +158,7 @@ fn test_silu_specific_value() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_swiglu_gate_zero() raises:
+def test_swiglu_gate_zero() raises:
     """SwiGLU with gate=0 should output 0 (since silu(0)=0)."""
     var x = Tensor[DType.float32](3)
     x.data_ptr().store(0, Float32(1.0))
@@ -183,7 +183,7 @@ fn test_swiglu_gate_zero() raises:
     print("  swiglu_gate_zero: PASS")
 
 
-fn test_swiglu_gate_one() raises:
+def test_swiglu_gate_one() raises:
     """SwiGLU with gate=1: output ≈ x * 0.7311."""
     var x = Tensor[DType.float32](2)
     x.data_ptr().store(0, Float32(2.0))
@@ -206,7 +206,7 @@ fn test_swiglu_gate_one() raises:
     print("  swiglu_gate_one: PASS")
 
 
-fn test_swiglu_large_gate() raises:
+def test_swiglu_large_gate() raises:
     """SwiGLU with large positive gate: output ≈ x (since silu(large)≈gate≈x when normalized)."""
     var x = Tensor[DType.float32](2)
     x.data_ptr().store(0, Float32(1.0))
@@ -233,7 +233,7 @@ fn test_swiglu_large_gate() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn main() raises:
+def main() raises:
     print("test_activations:")
 
     # GeLU

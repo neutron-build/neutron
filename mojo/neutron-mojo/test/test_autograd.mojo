@@ -4,7 +4,7 @@
 
 """Tests for autograd tape, variable, tracked ops, and backward pass."""
 
-from math import exp, log, sqrt, tanh
+from std.math import exp, log, sqrt, tanh
 from neutron_mojo.autograd import (
     Tape, Variable, TapeEntry, run_backward,
     tracked_add, tracked_sub, tracked_mul, tracked_matmul,
@@ -15,7 +15,7 @@ from neutron_mojo.autograd import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e-5) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
@@ -24,7 +24,7 @@ fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e
         )
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
@@ -34,7 +34,7 @@ fn assert_eq(a: Int, b: Int) raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_tape_add_variable() raises:
+def test_tape_add_variable() raises:
     """Add variables and check metadata."""
     var tape = Tape(1024)
     var dims = List[Int]()
@@ -46,7 +46,7 @@ fn test_tape_add_variable() raises:
     print("  tape_add_variable: PASS")
 
 
-fn test_tape_data_access() raises:
+def test_tape_data_access() raises:
     """Set and get data values."""
     var tape = Tape(1024)
     var dims = List[Int]()
@@ -61,7 +61,7 @@ fn test_tape_data_access() raises:
     print("  tape_data_access: PASS")
 
 
-fn test_tape_grad_access() raises:
+def test_tape_grad_access() raises:
     """Set and get gradient values."""
     var tape = Tape(1024)
     var dims = List[Int]()
@@ -73,7 +73,7 @@ fn test_tape_grad_access() raises:
     print("  tape_grad_access: PASS")
 
 
-fn test_tape_zero_grads() raises:
+def test_tape_zero_grads() raises:
     """Zero all gradients."""
     var tape = Tape(1024)
     var dims = List[Int]()
@@ -87,7 +87,7 @@ fn test_tape_zero_grads() raises:
     print("  tape_zero_grads: PASS")
 
 
-fn test_tape_multiple_vars() raises:
+def test_tape_multiple_vars() raises:
     """Multiple variables with correct offsets."""
     var tape = Tape(1024)
     var d1 = List[Int]()
@@ -106,7 +106,7 @@ fn test_tape_multiple_vars() raises:
     print("  tape_multiple_vars: PASS")
 
 
-fn test_tape_capacity_growth() raises:
+def test_tape_capacity_growth() raises:
     """Tape grows capacity when needed."""
     var tape = Tape(8)  # very small
     var d1 = List[Int]()
@@ -128,7 +128,7 @@ fn test_tape_capacity_growth() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_backward_add() raises:
+def test_backward_add() raises:
     """grad(a+b) = (1, 1)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -153,7 +153,7 @@ fn test_backward_add() raises:
     print("  backward_add: PASS")
 
 
-fn test_backward_mul() raises:
+def test_backward_mul() raises:
     """grad(a*b) = (b, a)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -177,7 +177,7 @@ fn test_backward_mul() raises:
     print("  backward_mul: PASS")
 
 
-fn test_backward_matmul() raises:
+def test_backward_matmul() raises:
     """Matmul backward: dA = dC @ B^T, dB = A^T @ dC."""
     var tape = Tape(1024)
     var da = List[Int]()
@@ -221,7 +221,7 @@ fn test_backward_matmul() raises:
     print("  backward_matmul: PASS")
 
 
-fn test_backward_relu() raises:
+def test_backward_relu() raises:
     """ReLU grad: 1 for x>0, 0 for x<=0."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -243,7 +243,7 @@ fn test_backward_relu() raises:
     print("  backward_relu: PASS")
 
 
-fn test_backward_sigmoid() raises:
+def test_backward_sigmoid() raises:
     """Sigmoid grad: s*(1-s)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -260,7 +260,7 @@ fn test_backward_sigmoid() raises:
     print("  backward_sigmoid: PASS")
 
 
-fn test_backward_tanh() raises:
+def test_backward_tanh() raises:
     """Tanh grad: 1 - tanh(x)^2."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -277,7 +277,7 @@ fn test_backward_tanh() raises:
     print("  backward_tanh: PASS")
 
 
-fn test_backward_exp() raises:
+def test_backward_exp() raises:
     """Exp grad: exp(x)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -293,7 +293,7 @@ fn test_backward_exp() raises:
     print("  backward_exp: PASS")
 
 
-fn test_backward_log() raises:
+def test_backward_log() raises:
     """Log grad: 1/x."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -309,7 +309,7 @@ fn test_backward_log() raises:
     print("  backward_log: PASS")
 
 
-fn test_backward_chain() raises:
+def test_backward_chain() raises:
     """Chain rule: y = relu(a*b + c), loss = sum(y)."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -344,7 +344,7 @@ fn test_backward_chain() raises:
     print("  backward_chain: PASS")
 
 
-fn test_backward_scalar_mul() raises:
+def test_backward_scalar_mul() raises:
     """Scalar mul grad: scalar."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -363,7 +363,7 @@ fn test_backward_scalar_mul() raises:
     print("  backward_scalar_mul: PASS")
 
 
-fn test_backward_mean() raises:
+def test_backward_mean() raises:
     """Mean grad: 1/n."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -382,7 +382,7 @@ fn test_backward_mean() raises:
     print("  backward_mean: PASS")
 
 
-fn test_backward_softmax() raises:
+def test_backward_softmax() raises:
     """Softmax backward."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -404,7 +404,7 @@ fn test_backward_softmax() raises:
     print("  backward_softmax: PASS")
 
 
-fn test_backward_sub() raises:
+def test_backward_sub() raises:
     """Sub grad: (1, -1)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -425,7 +425,7 @@ fn test_backward_sub() raises:
     print("  backward_sub: PASS")
 
 
-fn test_backward_neg() raises:
+def test_backward_neg() raises:
     """Neg grad: -1."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -443,7 +443,7 @@ fn test_backward_neg() raises:
     print("  backward_neg: PASS")
 
 
-fn test_backward_scalar_add() raises:
+def test_backward_scalar_add() raises:
     """Scalar add grad: 1 (pass-through)."""
     var tape = Tape(1024)
     var d = List[Int]()
@@ -461,7 +461,7 @@ fn test_backward_scalar_add() raises:
     print("  backward_scalar_add: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_autograd:")
 
     # Tape basics

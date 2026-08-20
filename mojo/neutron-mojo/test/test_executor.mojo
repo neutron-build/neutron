@@ -4,7 +4,7 @@
 
 """Tests for the computation graph executor."""
 
-from math import abs
+from std.math import abs
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
@@ -17,16 +17,16 @@ from neutron_mojo.fusion.executor import TensorValue, GraphExecutor, optimize_an
 from neutron_mojo.fusion.rules import create_default_ruleset
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
+def approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
     return abs(a - b) < tol
 
 
-fn make_vector(size: Int, val: Float32) -> Tensor[DType.float32]:
+def make_vector(size: Int, val: Float32) -> Tensor[DType.float32]:
     """Create a tensor filled with a constant value."""
     var t = Tensor[DType.float32](Shape(size))
     for i in range(size):
@@ -34,7 +34,7 @@ fn make_vector(size: Int, val: Float32) -> Tensor[DType.float32]:
     return t^
 
 
-fn make_range_vector(size: Int) -> Tensor[DType.float32]:
+def make_range_vector(size: Int) -> Tensor[DType.float32]:
     """Create a tensor with values 1.0, 2.0, ..., size."""
     var t = Tensor[DType.float32](Shape(size))
     for i in range(size):
@@ -42,7 +42,7 @@ fn make_range_vector(size: Int) -> Tensor[DType.float32]:
     return t^
 
 
-fn make_matrix(rows: Int, cols: Int, val: Float32) -> Tensor[DType.float32]:
+def make_matrix(rows: Int, cols: Int, val: Float32) -> Tensor[DType.float32]:
     """Create a matrix (flat row-major) filled with a constant."""
     var t = Tensor[DType.float32](Shape(rows * cols))
     for i in range(rows * cols):
@@ -50,7 +50,7 @@ fn make_matrix(rows: Int, cols: Int, val: Float32) -> Tensor[DType.float32]:
     return t^
 
 
-fn make_identity_matrix(dim: Int) -> Tensor[DType.float32]:
+def make_identity_matrix(dim: Int) -> Tensor[DType.float32]:
     """Create an identity matrix (flat row-major)."""
     var t = Tensor[DType.float32](Shape(dim * dim))
     for i in range(dim * dim):
@@ -64,7 +64,7 @@ fn make_identity_matrix(dim: Int) -> Tensor[DType.float32]:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_execute_input() raises:
+def test_execute_input() raises:
     """Pass-through input."""
     var graph = ComputationGraph()
     _ = graph.input()
@@ -82,7 +82,7 @@ fn test_execute_input() raises:
     print("  execute_input: PASS")
 
 
-fn test_execute_add() raises:
+def test_execute_add() raises:
     """Elementwise add."""
     var graph = ComputationGraph()
     var a = graph.input()
@@ -102,7 +102,7 @@ fn test_execute_add() raises:
     print("  execute_add: PASS")
 
 
-fn test_execute_mul() raises:
+def test_execute_mul() raises:
     """Elementwise mul."""
     var graph = ComputationGraph()
     var a = graph.input()
@@ -121,7 +121,7 @@ fn test_execute_mul() raises:
     print("  execute_mul: PASS")
 
 
-fn test_execute_matmul() raises:
+def test_execute_matmul() raises:
     """Matrix-vector multiply using identity matrix."""
     var dim = 4
     var graph = ComputationGraph()
@@ -144,7 +144,7 @@ fn test_execute_matmul() raises:
     print("  execute_matmul: PASS")
 
 
-fn test_execute_rmsnorm() raises:
+def test_execute_rmsnorm() raises:
     """RMSNorm with ones weight."""
     var dim = 4
     var graph = ComputationGraph()
@@ -167,7 +167,7 @@ fn test_execute_rmsnorm() raises:
     print("  execute_rmsnorm: PASS")
 
 
-fn test_execute_silu() raises:
+def test_execute_silu() raises:
     """SiLU activation."""
     var dim = 4
     var graph = ComputationGraph()
@@ -186,7 +186,7 @@ fn test_execute_silu() raises:
     print("  execute_silu: PASS")
 
 
-fn test_execute_swiglu() raises:
+def test_execute_swiglu() raises:
     """Fused SwiGLU."""
     var dim = 4
     var graph = ComputationGraph()
@@ -207,7 +207,7 @@ fn test_execute_swiglu() raises:
     print("  execute_swiglu: PASS")
 
 
-fn test_execute_chain() raises:
+def test_execute_chain() raises:
     """Multi-step chain: x -> rmsnorm -> matmul -> add residual."""
     var dim = 4
     var graph = ComputationGraph()
@@ -235,7 +235,7 @@ fn test_execute_chain() raises:
     print("  execute_chain: PASS")
 
 
-fn test_execute_fused_rmsnorm_linear() raises:
+def test_execute_fused_rmsnorm_linear() raises:
     """Fused RMSNorm + linear matches unfused sequence."""
     var dim = 4
     # Unfused: rmsnorm then matmul
@@ -274,7 +274,7 @@ fn test_execute_fused_rmsnorm_linear() raises:
     print("  execute_fused_rmsnorm_linear: PASS")
 
 
-fn test_execute_fused_linear_res_add() raises:
+def test_execute_fused_linear_res_add() raises:
     """Fused linear + residual add matches unfused sequence."""
     var dim = 4
     # Unfused: matmul then add
@@ -313,7 +313,7 @@ fn test_execute_fused_linear_res_add() raises:
     print("  execute_fused_linear_res_add: PASS")
 
 
-fn test_optimize_then_execute() raises:
+def test_optimize_then_execute() raises:
     """Build graph, optimize via e-graph, execute optimized version."""
     var dim = 4
     # Simple add graph — no fusions, just passes through
@@ -334,7 +334,7 @@ fn test_optimize_then_execute() raises:
     print("  optimize_then_execute: PASS")
 
 
-fn test_optimized_matches_unoptimized() raises:
+def test_optimized_matches_unoptimized() raises:
     """Results from optimized graph should match unoptimized within tolerance."""
     var dim = 4
     var graph = ComputationGraph()
@@ -369,7 +369,7 @@ fn test_optimized_matches_unoptimized() raises:
     print("  optimized_matches_unoptimized: PASS")
 
 
-fn test_swiglu_fusion_end_to_end() raises:
+def test_swiglu_fusion_end_to_end() raises:
     """Graph with silu+mul, optimize to swiglu, execute."""
     var dim = 4
     # Build: mul(silu(gate), up) — should fuse to swiglu
@@ -402,7 +402,7 @@ fn test_swiglu_fusion_end_to_end() raises:
     print("  swiglu_fusion_end_to_end: PASS")
 
 
-fn test_execute_with_constant() raises:
+def test_execute_with_constant() raises:
     """Const tensor in graph."""
     var graph = ComputationGraph()
     var x = graph.input()
@@ -421,7 +421,7 @@ fn test_execute_with_constant() raises:
     print("  execute_with_constant: PASS")
 
 
-fn test_execute_larger_matmul() raises:
+def test_execute_larger_matmul() raises:
     """Larger matmul to exercise SIMD paths."""
     var dim = 32
     var graph = ComputationGraph()
@@ -448,7 +448,7 @@ fn test_execute_larger_matmul() raises:
     print("  execute_larger_matmul: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_executor")
     test_execute_input()
     test_execute_add()

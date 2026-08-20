@@ -27,7 +27,7 @@ from neutron_mojo.nn.sampler import SamplerConfig, greedy_config
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny FP32 model with deterministic weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -41,12 +41,12 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tokenizer() raises -> BPETokenizer:
+def _build_tokenizer() raises -> BPETokenizer:
     """Build a test tokenizer."""
     return build_test_tokenizer()
 
 
-fn _build_mixed_all_q8() -> MixedQuantModel:
+def _build_mixed_all_q8() -> MixedQuantModel:
     """Build a tiny mixed model with all layers Q8."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -59,7 +59,7 @@ fn _build_mixed_all_q8() -> MixedQuantModel:
 # Tests — mixed_pipeline_generate
 # ===----------------------------------------------------------------------=== #
 
-fn test_mixed_pipeline_basic() raises:
+def test_mixed_pipeline_basic() raises:
     """mixed_pipeline_generate produces non-empty output."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -70,13 +70,13 @@ fn test_mixed_pipeline_basic() raises:
     var config = default_pipeline_config()
     config.max_new_tokens = 5
     var result = mixed_pipeline_generate(mixed, tok, "hello", config)
-    if len(result) == 0:
+    if result.byte_length() == 0:
         print("FAIL test_mixed_pipeline_basic: empty output")
         return
     print("PASS test_mixed_pipeline_basic")
 
 
-fn test_mixed_pipeline_with_eos() raises:
+def test_mixed_pipeline_with_eos() raises:
     """Pipeline stops at EOS token."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -92,7 +92,7 @@ fn test_mixed_pipeline_with_eos() raises:
     print("PASS test_mixed_pipeline_with_eos")
 
 
-fn test_mixed_pipeline_repetition_penalty() raises:
+def test_mixed_pipeline_repetition_penalty() raises:
     """Pipeline with repetition penalty runs without error."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -107,7 +107,7 @@ fn test_mixed_pipeline_repetition_penalty() raises:
     print("PASS test_mixed_pipeline_repetition_penalty")
 
 
-fn test_mixed_pipeline_frequency_penalty() raises:
+def test_mixed_pipeline_frequency_penalty() raises:
     """Pipeline with frequency + presence penalties works."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -123,7 +123,7 @@ fn test_mixed_pipeline_frequency_penalty() raises:
     print("PASS test_mixed_pipeline_frequency_penalty")
 
 
-fn test_mixed_pipeline_llama_template() raises:
+def test_mixed_pipeline_llama_template() raises:
     """Pipeline with llama chat template works."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -138,7 +138,7 @@ fn test_mixed_pipeline_llama_template() raises:
     print("PASS test_mixed_pipeline_llama_template")
 
 
-fn test_mixed_pipeline_chatml_template() raises:
+def test_mixed_pipeline_chatml_template() raises:
     """Pipeline with chatml chat template works."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -154,7 +154,7 @@ fn test_mixed_pipeline_chatml_template() raises:
     print("PASS test_mixed_pipeline_chatml_template")
 
 
-fn test_mixed_pipeline_config_reuse() raises:
+def test_mixed_pipeline_config_reuse() raises:
     """Same PipelineConfig works with both mixed and Q8 pipelines."""
     var model = _build_tiny_model()
     var q8 = quantize_from_model(model)
@@ -173,7 +173,7 @@ fn test_mixed_pipeline_config_reuse() raises:
     print("PASS test_mixed_pipeline_config_reuse")
 
 
-fn test_mixed_pipeline_mixed_modes() raises:
+def test_mixed_pipeline_mixed_modes() raises:
     """Pipeline with actual mixed modes (Q8 + Q4) runs correctly."""
     var model = _build_tiny_model()
     var modes = List[Int]()
@@ -188,7 +188,7 @@ fn test_mixed_pipeline_mixed_modes() raises:
     var config = default_pipeline_config()
     config.max_new_tokens = 5
     var result = mixed_pipeline_generate(mixed, tok, "hello", config)
-    if len(result) == 0:
+    if result.byte_length() == 0:
         print("FAIL test_mixed_pipeline_mixed_modes: empty output")
         return
     print("PASS test_mixed_pipeline_mixed_modes")
@@ -198,7 +198,7 @@ fn test_mixed_pipeline_mixed_modes() raises:
 # Tests — auto_quantize
 # ===----------------------------------------------------------------------=== #
 
-fn test_auto_quantize_basic() raises:
+def test_auto_quantize_basic() raises:
     """auto_quantize returns a valid MixedQuantModel."""
     var model = _build_tiny_model()
     var mixed = auto_quantize(model)
@@ -215,7 +215,7 @@ fn test_auto_quantize_basic() raises:
     print("PASS test_auto_quantize_basic")
 
 
-fn test_auto_quantize_generates() raises:
+def test_auto_quantize_generates() raises:
     """auto_quantize model can run forward pass and generate tokens."""
     var model = _build_tiny_model()
     var mixed = auto_quantize(model)
@@ -229,7 +229,7 @@ fn test_auto_quantize_generates() raises:
     print("PASS test_auto_quantize_generates")
 
 
-fn test_auto_quantize_pipeline() raises:
+def test_auto_quantize_pipeline() raises:
     """auto_quantize model works with mixed_pipeline_generate."""
     var model = _build_tiny_model()
     var mixed = auto_quantize(model)
@@ -240,7 +240,7 @@ fn test_auto_quantize_pipeline() raises:
     print("PASS test_auto_quantize_pipeline")
 
 
-fn test_auto_quantize_threshold_all_q4() raises:
+def test_auto_quantize_threshold_all_q4() raises:
     """Very high threshold makes all layers Q4."""
     var model = _build_tiny_model()
     var mixed = auto_quantize(model, q4_threshold=100.0)
@@ -251,7 +251,7 @@ fn test_auto_quantize_threshold_all_q4() raises:
     print("PASS test_auto_quantize_threshold_all_q4")
 
 
-fn test_auto_quantize_threshold_all_q8() raises:
+def test_auto_quantize_threshold_all_q8() raises:
     """Very low threshold makes all layers Q8."""
     var model = _build_tiny_model()
     var mixed = auto_quantize(model, q4_threshold=0.0)
@@ -262,12 +262,12 @@ fn test_auto_quantize_threshold_all_q8() raises:
     print("PASS test_auto_quantize_threshold_all_q8")
 
 
-fn test_auto_quantize_mode_summary() raises:
+def test_auto_quantize_mode_summary() raises:
     """auto_quantize model has valid mode summary."""
     var model = _build_tiny_model()
     var mixed = auto_quantize(model)
     var summary = mixed.mode_summary()
-    if len(summary) == 0:
+    if summary.byte_length() == 0:
         print("FAIL test_auto_quantize_mode_summary: empty summary")
         return
     # Should contain Q8 and/or Q4
@@ -275,7 +275,7 @@ fn test_auto_quantize_mode_summary() raises:
     print("PASS test_auto_quantize_mode_summary")
 
 
-fn test_auto_quantize_vs_manual() raises:
+def test_auto_quantize_vs_manual() raises:
     """auto_quantize matches manual analyze+calibrate+quantize chain."""
     var model = _build_tiny_model()
 
@@ -323,7 +323,7 @@ fn test_auto_quantize_vs_manual() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("=== Test Mixed Pipeline + Auto-Quantize ===")
     print()
 

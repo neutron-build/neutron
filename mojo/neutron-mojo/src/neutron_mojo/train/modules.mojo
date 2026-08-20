@@ -8,8 +8,8 @@ All modules are Copyable (store tape indices as Int, not Tensors).
 This enables List[TrainableTransformerBlock] pattern.
 """
 
-from math import sqrt
-from random import random_float64
+from std.math import sqrt
+from std.random import random_float64
 
 from neutron_mojo.autograd.tape import Tape, TapeEntry, OP_EMBEDDING
 from neutron_mojo.autograd.ops import (
@@ -31,7 +31,7 @@ struct Linear(ImplicitlyCopyable, Copyable, Movable):
     var has_bias: Bool
     var registered: Bool
 
-    fn __init__(out self, in_features: Int, out_features: Int, has_bias: Bool = True):
+    def __init__(out self, in_features: Int, out_features: Int, has_bias: Bool = True):
         self.in_features = in_features
         self.out_features = out_features
         self.has_bias = has_bias
@@ -39,23 +39,23 @@ struct Linear(ImplicitlyCopyable, Copyable, Movable):
         self.bias_idx = -1
         self.registered = False
 
-    fn __copyinit__(out self, other: Self):
-        self.weight_idx = other.weight_idx
-        self.bias_idx = other.bias_idx
-        self.in_features = other.in_features
-        self.out_features = other.out_features
-        self.has_bias = other.has_bias
-        self.registered = other.registered
+    def __init__(out self, *, copy: Self):
+        self.weight_idx = copy.weight_idx
+        self.bias_idx = copy.bias_idx
+        self.in_features = copy.in_features
+        self.out_features = copy.out_features
+        self.has_bias = copy.has_bias
+        self.registered = copy.registered
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.weight_idx = other.weight_idx
-        self.bias_idx = other.bias_idx
-        self.in_features = other.in_features
-        self.out_features = other.out_features
-        self.has_bias = other.has_bias
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.weight_idx = move.weight_idx^
+        self.bias_idx = move.bias_idx^
+        self.in_features = move.in_features^
+        self.out_features = move.out_features^
+        self.has_bias = move.has_bias^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register parameters on the tape with Xavier init."""
         var w_dims = List[Int]()
         w_dims.append(self.out_features)
@@ -77,7 +77,7 @@ struct Linear(ImplicitlyCopyable, Copyable, Movable):
 
         self.registered = True
 
-    fn forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
         """Forward pass: y = x @ W^T (+ b).
 
         x_idx points to a variable of shape (in_features,) or (batch, in_features).
@@ -106,7 +106,7 @@ struct Linear(ImplicitlyCopyable, Copyable, Movable):
                 y_idx = tracked_add(tape, y_idx, self.bias_idx)
             return y_idx
 
-    fn param_indices(self) -> List[Int]:
+    def param_indices(self) -> List[Int]:
         """Return list of parameter variable indices."""
         var params = List[Int]()
         if self.weight_idx >= 0:
@@ -123,25 +123,25 @@ struct Embedding(ImplicitlyCopyable, Copyable, Movable):
     var embedding_dim: Int
     var registered: Bool
 
-    fn __init__(out self, num_embeddings: Int, embedding_dim: Int):
+    def __init__(out self, num_embeddings: Int, embedding_dim: Int):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.embed_idx = -1
         self.registered = False
 
-    fn __copyinit__(out self, other: Self):
-        self.embed_idx = other.embed_idx
-        self.num_embeddings = other.num_embeddings
-        self.embedding_dim = other.embedding_dim
-        self.registered = other.registered
+    def __init__(out self, *, copy: Self):
+        self.embed_idx = copy.embed_idx
+        self.num_embeddings = copy.num_embeddings
+        self.embedding_dim = copy.embedding_dim
+        self.registered = copy.registered
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.embed_idx = other.embed_idx
-        self.num_embeddings = other.num_embeddings
-        self.embedding_dim = other.embedding_dim
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.embed_idx = move.embed_idx^
+        self.num_embeddings = move.num_embeddings^
+        self.embedding_dim = move.embedding_dim^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register the embedding table."""
         var dims = List[Int]()
         dims.append(self.num_embeddings)
@@ -155,7 +155,7 @@ struct Embedding(ImplicitlyCopyable, Copyable, Movable):
             tape.set_data(self.embed_idx, i, Float32((random_float64() * 2.0 - 1.0) * scale))
         self.registered = True
 
-    fn forward(self, mut tape: Tape, token_id: Int) -> Int:
+    def forward(self, mut tape: Tape, token_id: Int) -> Int:
         """Look up embedding for a single token."""
         var dims = List[Int]()
         dims.append(self.embedding_dim)
@@ -169,7 +169,7 @@ struct Embedding(ImplicitlyCopyable, Copyable, Movable):
             cached_int=self.embedding_dim, cached_int2=token_id))
         return y_idx
 
-    fn param_indices(self) -> List[Int]:
+    def param_indices(self) -> List[Int]:
         var params = List[Int]()
         if self.embed_idx >= 0:
             params.append(self.embed_idx)
@@ -183,25 +183,25 @@ struct RMSNormModule(ImplicitlyCopyable, Copyable, Movable):
     var eps: Float64
     var registered: Bool
 
-    fn __init__(out self, dim: Int, eps: Float64 = 1e-6):
+    def __init__(out self, dim: Int, eps: Float64 = 1e-6):
         self.dim = dim
         self.eps = eps
         self.gamma_idx = -1
         self.registered = False
 
-    fn __copyinit__(out self, other: Self):
-        self.gamma_idx = other.gamma_idx
-        self.dim = other.dim
-        self.eps = other.eps
-        self.registered = other.registered
+    def __init__(out self, *, copy: Self):
+        self.gamma_idx = copy.gamma_idx
+        self.dim = copy.dim
+        self.eps = copy.eps
+        self.registered = copy.registered
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.gamma_idx = other.gamma_idx
-        self.dim = other.dim
-        self.eps = other.eps
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.gamma_idx = move.gamma_idx^
+        self.dim = move.dim^
+        self.eps = move.eps^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register gamma parameter (initialized to ones)."""
         var dims = List[Int]()
         dims.append(self.dim)
@@ -210,7 +210,7 @@ struct RMSNormModule(ImplicitlyCopyable, Copyable, Movable):
             tape.set_data(self.gamma_idx, i, Float32(1.0))
         self.registered = True
 
-    fn forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
         """RMSNorm forward."""
         var n = tape.var_numel(x_idx)
         var dims = List[Int]()
@@ -234,7 +234,7 @@ struct RMSNormModule(ImplicitlyCopyable, Copyable, Movable):
             cached_scalar=self.eps, cached_int=n))
         return y_idx
 
-    fn param_indices(self) -> List[Int]:
+    def param_indices(self) -> List[Int]:
         var params = List[Int]()
         if self.gamma_idx >= 0:
             params.append(self.gamma_idx)
@@ -249,28 +249,28 @@ struct LayerNormModule(ImplicitlyCopyable, Copyable, Movable):
     var eps: Float64
     var registered: Bool
 
-    fn __init__(out self, dim: Int, eps: Float64 = 1e-5):
+    def __init__(out self, dim: Int, eps: Float64 = 1e-5):
         self.dim = dim
         self.eps = eps
         self.gamma_idx = -1
         self.beta_idx = -1
         self.registered = False
 
-    fn __copyinit__(out self, other: Self):
-        self.gamma_idx = other.gamma_idx
-        self.beta_idx = other.beta_idx
-        self.dim = other.dim
-        self.eps = other.eps
-        self.registered = other.registered
+    def __init__(out self, *, copy: Self):
+        self.gamma_idx = copy.gamma_idx
+        self.beta_idx = copy.beta_idx
+        self.dim = copy.dim
+        self.eps = copy.eps
+        self.registered = copy.registered
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.gamma_idx = other.gamma_idx
-        self.beta_idx = other.beta_idx
-        self.dim = other.dim
-        self.eps = other.eps
-        self.registered = other.registered
+    def __init__(out self, *, deinit move: Self):
+        self.gamma_idx = move.gamma_idx^
+        self.beta_idx = move.beta_idx^
+        self.dim = move.dim^
+        self.eps = move.eps^
+        self.registered = move.registered^
 
-    fn register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape):
         """Register gamma (ones) and beta (zeros) parameters."""
         var dims = List[Int]()
         dims.append(self.dim)
@@ -281,7 +281,7 @@ struct LayerNormModule(ImplicitlyCopyable, Copyable, Movable):
         # beta already zeros
         self.registered = True
 
-    fn forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
         """LayerNorm forward."""
         var n = tape.var_numel(x_idx)
         var dims = List[Int]()
@@ -310,7 +310,7 @@ struct LayerNormModule(ImplicitlyCopyable, Copyable, Movable):
             cached_scalar=self.eps, cached_int=n, cached_int3=self.beta_idx))
         return y_idx
 
-    fn param_indices(self) -> List[Int]:
+    def param_indices(self) -> List[Int]:
         var params = List[Int]()
         if self.gamma_idx >= 0:
             params.append(self.gamma_idx)
@@ -319,24 +319,24 @@ struct LayerNormModule(ImplicitlyCopyable, Copyable, Movable):
         return params^
 
 
-struct Dropout(Copyable, Movable):
+struct Dropout(Copyable, Movable, ImplicitlyCopyable):
     """Dropout layer (training mode only)."""
     var p: Float64
     var training: Bool
 
-    fn __init__(out self, p: Float64 = 0.1):
+    def __init__(out self, p: Float64 = 0.1):
         self.p = p
         self.training = True
 
-    fn __copyinit__(out self, other: Self):
-        self.p = other.p
-        self.training = other.training
+    def __init__(out self, *, copy: Self):
+        self.p = copy.p
+        self.training = copy.training
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.p = other.p
-        self.training = other.training
+    def __init__(out self, *, deinit move: Self):
+        self.p = move.p^
+        self.training = move.training^
 
-    fn forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
         """Apply dropout: randomly zero elements with probability p."""
         if not self.training or self.p == 0.0:
             return x_idx
@@ -360,8 +360,8 @@ struct Dropout(Copyable, Movable):
         tape.record(TapeEntry(OP_SCALAR_MUL(), x_idx, -1, y_idx, cached_scalar=1.0 / (1.0 - self.p)))
         return y_idx
 
-    fn eval_mode(mut self):
+    def eval_mode(mut self):
         self.training = False
 
-    fn train_mode(mut self):
+    def train_mode(mut self):
         self.training = True

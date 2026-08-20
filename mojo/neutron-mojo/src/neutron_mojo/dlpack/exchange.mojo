@@ -9,7 +9,7 @@ Uses copy semantics (not zero-copy) since Mojo's UnsafePointer exposure
 to external runtimes is not yet stable.
 """
 
-from memory import UnsafePointer, alloc
+from std.memory import Pointer, alloc
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.dlpack.dlpack import (
@@ -19,7 +19,7 @@ from neutron_mojo.dlpack.dlpack import (
 )
 
 
-fn tensor_to_dlpack(tensor: Tensor[DType.float32]) -> DLManagedTensorVersioned:
+def tensor_to_dlpack(tensor: Tensor[DType.float32]) -> DLManagedTensorVersioned:
     """Create a DLManagedTensorVersioned from a Mojo tensor (copy-based).
 
     The data is copied into a freshly allocated buffer owned by the
@@ -37,13 +37,13 @@ fn tensor_to_dlpack(tensor: Tensor[DType.float32]) -> DLManagedTensorVersioned:
     var data_ptr = alloc[UInt8](n * 4)
     var float_ptr = data_ptr.bitcast[Float32]()
     for i in range(n):
-        float_ptr.offset(i).init_pointee_copy(tensor.get(i))
+        float_ptr.unsafe_offset(i).init_pointee_copy(tensor.get(i))
 
     # Allocate shape (1D)
     var shape_ptr = alloc[Int64](1)
     shape_ptr.init_pointee_copy(Int64(n))
 
-    var strides_ptr = UnsafePointer[Int64, MutExternalOrigin]()
+    var strides_ptr: Optional[Pointer[Int64, MutUntrackedOrigin]] = None
 
     var dl = DLTensor(
         data=data_ptr,
@@ -62,7 +62,7 @@ fn tensor_to_dlpack(tensor: Tensor[DType.float32]) -> DLManagedTensorVersioned:
     return managed
 
 
-fn dlpack_to_tensor(managed: DLManagedTensorVersioned) -> Tensor[DType.float32]:
+def dlpack_to_tensor(managed: DLManagedTensorVersioned) -> Tensor[DType.float32]:
     """Create a Mojo tensor from a DLManagedTensorVersioned (copy-based).
 
     Copies data from the DLPack buffer into a new Mojo tensor.
@@ -76,16 +76,16 @@ fn dlpack_to_tensor(managed: DLManagedTensorVersioned) -> Tensor[DType.float32]:
     var ndim = Int(managed.dl_tensor.ndim)
     var total = 1
     for i in range(ndim):
-        total *= Int(managed.dl_tensor.shape.offset(i)[])
+        total *= Int(managed.dl_tensor.shape.unsafe_value().unsafe_offset(i)[])
 
     var t = Tensor[DType.float32](Shape(total))
-    var src = managed.dl_tensor.data.bitcast[Float32]()
+    var src = managed.dl_tensor.data.unsafe_value().unsafe_bitcast[Float32]()
     for i in range(total):
-        t.set(i, src.offset(i)[])
+        t.set(i, src.unsafe_offset(i)[])
     return t^
 
 
-fn dlpack_shape(managed: DLManagedTensorVersioned) -> List[Int]:
+def dlpack_shape(managed: DLManagedTensorVersioned) -> List[Int]:
     """Extract shape dimensions from a DLPack managed tensor.
 
     Args:
@@ -97,11 +97,11 @@ fn dlpack_shape(managed: DLManagedTensorVersioned) -> List[Int]:
     var ndim = Int(managed.dl_tensor.ndim)
     var dims = List[Int]()
     for i in range(ndim):
-        dims.append(Int(managed.dl_tensor.shape.offset(i)[]))
+        dims.append(Int(managed.dl_tensor.shape.unsafe_value().unsafe_offset(i)[]))
     return dims^
 
 
-fn dlpack_numel(managed: DLManagedTensorVersioned) -> Int:
+def dlpack_numel(managed: DLManagedTensorVersioned) -> Int:
     """Compute total number of elements from DLPack shape.
 
     Args:
@@ -113,11 +113,11 @@ fn dlpack_numel(managed: DLManagedTensorVersioned) -> Int:
     var ndim = Int(managed.dl_tensor.ndim)
     var total = 1
     for i in range(ndim):
-        total *= Int(managed.dl_tensor.shape.offset(i)[])
+        total *= Int(managed.dl_tensor.shape.unsafe_value().unsafe_offset(i)[])
     return total
 
 
-fn dlpack_free(mut managed: DLManagedTensorVersioned):
+def dlpack_free(mut managed: DLManagedTensorVersioned):
     """Free the data and shape buffers of a DLPack managed tensor.
 
     Only call this on tensors created by tensor_to_dlpack.
@@ -126,6 +126,6 @@ fn dlpack_free(mut managed: DLManagedTensorVersioned):
         managed: The managed tensor to free.
     """
     if managed.dl_tensor.data:
-        managed.dl_tensor.data.free()
+        managed.dl_tensor.data.unsafe_value().free()
     if managed.dl_tensor.shape:
-        managed.dl_tensor.shape.free()
+        managed.dl_tensor.shape.unsafe_value().free()

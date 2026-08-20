@@ -20,9 +20,10 @@ Key primitives:
     simd_add       — vector addition (y += alpha * x)
 """
 
-from algorithm import vectorize, parallelize
-from math import exp, sqrt
-from sys import simd_width_of, num_physical_cores
+from std.algorithm import vectorize
+from max.algorithm import parallelize
+from std.math import exp, sqrt
+from std.sys import simd_width_of, num_physical_cores
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
@@ -39,7 +40,7 @@ comptime F32_SIMD_WIDTH = simd_width_of[DType.float32]()
 # Dot Product
 # ===----------------------------------------------------------------------=== #
 
-fn simd_dot(
+def simd_dot(
     a: Tensor[DType.float32],
     a_offset: Int,
     b: Tensor[DType.float32],
@@ -87,7 +88,7 @@ fn simd_dot(
 # Matrix-Vector Multiply
 # ===----------------------------------------------------------------------=== #
 
-fn simd_matvec(
+def simd_matvec(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     weight: Tensor[DType.float32],
@@ -138,7 +139,7 @@ fn simd_matvec(
 # RMSNorm
 # ===----------------------------------------------------------------------=== #
 
-fn simd_rmsnorm(
+def simd_rmsnorm(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     x: Tensor[DType.float32],
@@ -195,7 +196,7 @@ fn simd_rmsnorm(
 # Softmax
 # ===----------------------------------------------------------------------=== #
 
-fn simd_softmax(
+def simd_softmax(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     x: Tensor[DType.float32],
@@ -246,7 +247,7 @@ fn simd_softmax(
 # SiLU + SwiGLU
 # ===----------------------------------------------------------------------=== #
 
-fn simd_silu(
+def simd_silu(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     x: Tensor[DType.float32],
@@ -271,7 +272,7 @@ fn simd_silu(
         o_ptr[i] = xi * sig
 
 
-fn simd_swiglu(
+def simd_swiglu(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     gate: Tensor[DType.float32],
@@ -307,7 +308,7 @@ fn simd_swiglu(
 # Vector Add (y += alpha * x)
 # ===----------------------------------------------------------------------=== #
 
-fn simd_axpy(
+def simd_axpy(
     mut y: Tensor[DType.float32],
     y_offset: Int,
     x: Tensor[DType.float32],
@@ -348,7 +349,7 @@ fn simd_axpy(
 # Minimum rows to justify parallelism overhead
 comptime PAR_MATVEC_THRESHOLD = 64
 
-fn par_simd_matvec(
+def par_simd_matvec(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     weight: Tensor[DType.float32],
@@ -383,7 +384,7 @@ fn par_simd_matvec(
     var simd_end = (cols // F32_SIMD_WIDTH) * F32_SIMD_WIDTH
 
     @parameter
-    fn compute_row(i: Int):
+    def compute_row(i: Int):
         var row_ptr = w_ptr + i * cols
         var acc = SIMD[DType.float32, F32_SIMD_WIDTH](0)
 
@@ -405,7 +406,7 @@ fn par_simd_matvec(
 # Quantized Matrix-Vector Multiply (Q8 dequant-on-the-fly)
 # ===----------------------------------------------------------------------=== #
 
-fn simd_q8_matvec(
+def simd_q8_matvec(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     q_data: Tensor[DType.float32],
@@ -480,7 +481,7 @@ fn simd_q8_matvec(
 # Fused RMSNorm + Matvec (Sprint 15)
 # ===----------------------------------------------------------------------=== #
 
-fn fused_rmsnorm_matvec(
+def fused_rmsnorm_matvec(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     x: Tensor[DType.float32],
@@ -554,7 +555,7 @@ fn fused_rmsnorm_matvec(
         o_ptr[i] = dot
 
 
-fn fused_matvec_residual_add(
+def fused_matvec_residual_add(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     residual: Tensor[DType.float32],
@@ -613,7 +614,7 @@ fn fused_matvec_residual_add(
 comptime TILE_COLS = 256  # Column tile size — fits 1KB in L1 cache
 comptime TILE_ROWS = 4    # Row tile size — process multiple rows per column pass
 
-fn tiled_simd_matvec(
+def tiled_simd_matvec(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     weight: Tensor[DType.float32],
@@ -716,7 +717,7 @@ fn tiled_simd_matvec(
         col += TILE_COLS
 
 
-fn par_tiled_simd_matvec(
+def par_tiled_simd_matvec(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     weight: Tensor[DType.float32],
@@ -751,7 +752,7 @@ fn par_tiled_simd_matvec(
     var simd_end = (cols // F32_SIMD_WIDTH) * F32_SIMD_WIDTH
 
     @parameter
-    fn compute_row(i: Int):
+    def compute_row(i: Int):
         var row_ptr = w_ptr + i * cols
         var acc = SIMD[DType.float32, F32_SIMD_WIDTH](0)
 
@@ -773,7 +774,7 @@ fn par_tiled_simd_matvec(
 # SIMD-Vectorized Attention Kernels
 # ===----------------------------------------------------------------------=== #
 
-fn simd_attention_scores(
+def simd_attention_scores(
     mut scores: Tensor[DType.float32],
     q: Tensor[DType.float32],
     q_offset: Int,
@@ -818,7 +819,7 @@ fn simd_attention_scores(
         scores.set(pos, dot * scale)
 
 
-fn simd_attention_weighted_sum(
+def simd_attention_weighted_sum(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     weights: Tensor[DType.float32],
@@ -863,7 +864,7 @@ fn simd_attention_weighted_sum(
             o_ptr[j] += w * v_ptr[j]
 
 
-fn simd_online_softmax_attention(
+def simd_online_softmax_attention(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     q: Tensor[DType.float32],
@@ -960,7 +961,7 @@ fn simd_online_softmax_attention(
 # Batch Operations (Batch Prefill)
 # ===----------------------------------------------------------------------=== #
 
-fn simd_batch_matvec(
+def simd_batch_matvec(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     weight: Tensor[DType.float32],
@@ -999,7 +1000,7 @@ fn simd_batch_matvec(
         )
 
 
-fn simd_batch_rmsnorm(
+def simd_batch_rmsnorm(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     x: Tensor[DType.float32],
@@ -1034,7 +1035,7 @@ fn simd_batch_rmsnorm(
         )
 
 
-fn simd_batch_swiglu(
+def simd_batch_swiglu(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     gate: Tensor[DType.float32],
@@ -1067,7 +1068,7 @@ fn simd_batch_swiglu(
         )
 
 
-fn simd_batch_add(
+def simd_batch_add(
     mut out: Tensor[DType.float32],
     out_offset: Int,
     a: Tensor[DType.float32],
@@ -1108,7 +1109,7 @@ fn simd_batch_add(
 # Utilities
 # ===----------------------------------------------------------------------=== #
 
-fn _fast_inv_sqrt(x: Float32) -> Float32:
+def _fast_inv_sqrt(x: Float32) -> Float32:
     """Fast inverse square root via Newton's method (6 iterations)."""
     if x <= 0.0:
         return 0.0

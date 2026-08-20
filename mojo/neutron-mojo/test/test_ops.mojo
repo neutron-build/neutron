@@ -4,8 +4,8 @@
 
 """Tests: add/sub/mul/div, broadcast ops, matmul vs known values, relu, softmax, reductions."""
 
-from testing import assert_true, assert_equal
-from math import abs
+from std.testing import assert_true, assert_equal
+from std.math import abs
 
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.tensor import Tensor
@@ -25,7 +25,7 @@ from neutron_mojo.tensor.ops import (
 )
 
 
-fn approx_equal(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) -> Bool:
+def approx_equal(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e-6) -> Bool:
     """Check approximate equality with relative and absolute tolerance."""
     var diff = abs(Float64(a) - Float64(b))
     return diff <= atol + rtol * abs(Float64(b))
@@ -36,7 +36,7 @@ fn approx_equal(a: Float32, b: Float32, rtol: Float64 = 1e-5, atol: Float64 = 1e
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_add_same_shape() raises:
+def test_add_same_shape() raises:
     var a = Tensor[DType.float32].full(Shape(4), Float32(2.0))
     var b = Tensor[DType.float32].full(Shape(4), Float32(3.0))
     var c = add(a, b)
@@ -45,7 +45,7 @@ fn test_add_same_shape() raises:
     print("  add_same_shape: PASS")
 
 
-fn test_sub_same_shape() raises:
+def test_sub_same_shape() raises:
     var a = Tensor[DType.float32].full(Shape(4), Float32(5.0))
     var b = Tensor[DType.float32].full(Shape(4), Float32(2.0))
     var c = sub(a, b)
@@ -54,7 +54,7 @@ fn test_sub_same_shape() raises:
     print("  sub_same_shape: PASS")
 
 
-fn test_mul_same_shape() raises:
+def test_mul_same_shape() raises:
     var a = Tensor[DType.float32].full(Shape(4), Float32(3.0))
     var b = Tensor[DType.float32].full(Shape(4), Float32(4.0))
     var c = mul(a, b)
@@ -63,7 +63,7 @@ fn test_mul_same_shape() raises:
     print("  mul_same_shape: PASS")
 
 
-fn test_div_same_shape() raises:
+def test_div_same_shape() raises:
     var a = Tensor[DType.float32].full(Shape(4), Float32(12.0))
     var b = Tensor[DType.float32].full(Shape(4), Float32(4.0))
     var c = div(a, b)
@@ -72,7 +72,7 @@ fn test_div_same_shape() raises:
     print("  div_same_shape: PASS")
 
 
-fn test_add_broadcast() raises:
+def test_add_broadcast() raises:
     """(3,) + (1,) = (3,) via broadcast."""
     var a = Tensor[DType.float32](3)
     a.data_ptr().store(0, Float32(1.0))
@@ -89,7 +89,7 @@ fn test_add_broadcast() raises:
     print("  add_broadcast: PASS")
 
 
-fn test_mul_broadcast_2d() raises:
+def test_mul_broadcast_2d() raises:
     """(2, 3) * (1, 3) = (2, 3) via broadcast."""
     var a = Tensor[DType.float32](2, 3)
     for i in range(6):
@@ -117,7 +117,7 @@ fn test_mul_broadcast_2d() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_matmul_basic() raises:
+def test_matmul_basic() raises:
     """2x3 @ 3x4 = 2x4 with known values from reference/matmul.py."""
     var a = Tensor[DType.float32](2, 3)
     # [[1, 2, 3], [4, 5, 6]]
@@ -159,7 +159,7 @@ fn test_matmul_basic() raises:
     print("  matmul_basic: PASS")
 
 
-fn test_matmul_identity() raises:
+def test_matmul_identity() raises:
     """A @ I = A for a 4x4 matrix."""
     var a = Tensor[DType.float32](4, 4)
     for i in range(4):
@@ -177,7 +177,7 @@ fn test_matmul_identity() raises:
     print("  matmul_identity: PASS")
 
 
-fn test_matmul_dimension_mismatch() raises:
+def test_matmul_dimension_mismatch() raises:
     """Matmul with incompatible inner dims should raise."""
     var a = Tensor[DType.float32](2, 3)
     var b = Tensor[DType.float32](4, 2)  # 3 != 4
@@ -195,7 +195,7 @@ fn test_matmul_dimension_mismatch() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_relu_basic() raises:
+def test_relu_basic() raises:
     var t = Tensor[DType.float32](5)
     t.data_ptr().store(0, Float32(-2))
     t.data_ptr().store(1, Float32(-1))
@@ -212,7 +212,7 @@ fn test_relu_basic() raises:
     print("  relu_basic: PASS")
 
 
-fn test_relu_all_negative() raises:
+def test_relu_all_negative() raises:
     var t = Tensor[DType.float32].full(Shape(4), Float32(-5.0))
     var r = relu(t)
     for i in range(4):
@@ -220,7 +220,7 @@ fn test_relu_all_negative() raises:
     print("  relu_all_negative: PASS")
 
 
-fn test_softmax_1d_basic() raises:
+def test_softmax_1d_basic() raises:
     """Softmax of [1, 2, 3] should sum to 1 and preserve ordering."""
     var t = Tensor[DType.float32](3)
     t.data_ptr().store(0, Float32(1.0))
@@ -239,7 +239,7 @@ fn test_softmax_1d_basic() raises:
     print("  softmax_1d_basic: PASS")
 
 
-fn test_softmax_stability() raises:
+def test_softmax_stability() raises:
     """softmax([1000, 1001, 1002]) should produce finite results."""
     var t = Tensor[DType.float32](3)
     t.data_ptr().store(0, Float32(1000.0))
@@ -260,7 +260,7 @@ fn test_softmax_stability() raises:
     print("  softmax_stability: PASS")
 
 
-fn test_softmax_2d() raises:
+def test_softmax_2d() raises:
     """Softmax along last axis of a 2x4 tensor."""
     var t = Tensor[DType.float32](2, 4)
     for i in range(8):
@@ -278,7 +278,7 @@ fn test_softmax_2d() raises:
     print("  softmax_2d: PASS")
 
 
-fn test_softmax_uniform() raises:
+def test_softmax_uniform() raises:
     """Uniform input -> uniform output."""
     var t = Tensor[DType.float32].full(Shape(5), Float32(5.0))
     var s = softmax(t)
@@ -294,7 +294,7 @@ fn test_softmax_uniform() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_reduce_sum_1d() raises:
+def test_reduce_sum_1d() raises:
     var t = Tensor[DType.float32](5)
     for i in range(5):
         t.data_ptr().store(i, Float32(i + 1))  # [1,2,3,4,5]
@@ -305,7 +305,7 @@ fn test_reduce_sum_1d() raises:
     print("  reduce_sum_1d: PASS")
 
 
-fn test_reduce_sum_2d_last() raises:
+def test_reduce_sum_2d_last() raises:
     """Sum along last axis of (2, 3) tensor."""
     var t = Tensor[DType.float32](2, 3)
     # [[1, 2, 3], [4, 5, 6]]
@@ -320,7 +320,7 @@ fn test_reduce_sum_2d_last() raises:
     print("  reduce_sum_2d_last: PASS")
 
 
-fn test_reduce_max_1d() raises:
+def test_reduce_max_1d() raises:
     var t = Tensor[DType.float32](5)
     t.data_ptr().store(0, Float32(3.0))
     t.data_ptr().store(1, Float32(1.0))
@@ -334,7 +334,7 @@ fn test_reduce_max_1d() raises:
     print("  reduce_max_1d: PASS")
 
 
-fn test_reduce_max_2d_last() raises:
+def test_reduce_max_2d_last() raises:
     """Max along last axis of (2, 3) tensor."""
     var t = Tensor[DType.float32](2, 3)
     t.data_ptr().store(0, Float32(1.0))
@@ -355,7 +355,7 @@ fn test_reduce_max_2d_last() raises:
 # --- Main ---
 
 
-fn main() raises:
+def main() raises:
     print("test_ops:")
 
     # Elementwise

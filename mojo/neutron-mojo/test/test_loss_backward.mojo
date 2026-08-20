@@ -4,8 +4,8 @@
 
 """Finite-difference gradient verification for L1, BCE, KL divergence losses."""
 
-from math import abs, log
-from testing import assert_true
+from std.math import abs, log
+from std.testing import assert_true
 
 from neutron_mojo.autograd.tape import Tape
 from neutron_mojo.autograd.backward import run_backward
@@ -14,7 +14,7 @@ from neutron_mojo.train.losses import (
 )
 
 
-fn _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
     """Helper: create a tape variable from a list of values."""
     var dims = List[Int]()
     dims.append(len(vals))
@@ -24,7 +24,7 @@ fn _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
     return idx
 
 
-fn test_l1_loss_forward() raises:
+def test_l1_loss_forward() raises:
     """L1 forward computes mean absolute error."""
     var tape = Tape(1024)
     var pred_vals = List[Float32]()
@@ -44,7 +44,7 @@ fn test_l1_loss_forward() raises:
     print("PASS: test_l1_loss_forward")
 
 
-fn test_l1_backward_sign() raises:
+def test_l1_backward_sign() raises:
     """L1 backward produces sign(pred - target) / n."""
     var tape = Tape(1024)
     var pred_vals = List[Float32]()
@@ -66,7 +66,7 @@ fn test_l1_backward_sign() raises:
     print("PASS: test_l1_backward_sign")
 
 
-fn test_l1_finite_diff() raises:
+def test_l1_finite_diff() raises:
     """L1 backward matches finite differences."""
     var eps = Float64(1e-4)
     var pred_vals = List[Float32]()
@@ -105,7 +105,7 @@ fn test_l1_finite_diff() raises:
     print("PASS: test_l1_finite_diff")
 
 
-fn test_bce_forward() raises:
+def test_bce_forward() raises:
     """BCE forward computes -mean(t*log(p) + (1-t)*log(1-p))."""
     var tape = Tape(1024)
     var pred_vals = List[Float32]()
@@ -124,7 +124,7 @@ fn test_bce_forward() raises:
     print("PASS: test_bce_forward")
 
 
-fn test_bce_backward() raises:
+def test_bce_backward() raises:
     """BCE backward computes (-t/p + (1-t)/(1-p)) / n."""
     var tape = Tape(1024)
     var pred_vals = List[Float32]()
@@ -146,7 +146,7 @@ fn test_bce_backward() raises:
     print("PASS: test_bce_backward")
 
 
-fn test_bce_finite_diff() raises:
+def test_bce_finite_diff() raises:
     """BCE backward matches finite differences."""
     var eps = Float64(1e-4)
     var pred_vals = List[Float32]()
@@ -181,7 +181,7 @@ fn test_bce_finite_diff() raises:
     print("PASS: test_bce_finite_diff")
 
 
-fn test_kl_forward() raises:
+def test_kl_forward() raises:
     """KL divergence forward: sum(p * log(p/q))."""
     var tape = Tape(1024)
     var p_vals = List[Float32]()
@@ -199,7 +199,7 @@ fn test_kl_forward() raises:
     print("PASS: test_kl_forward")
 
 
-fn test_kl_backward_q_grad() raises:
+def test_kl_backward_q_grad() raises:
     """KL backward w.r.t. q: d/dq KL = -p/q."""
     var tape = Tape(1024)
     var p_vals = List[Float32]()
@@ -221,7 +221,7 @@ fn test_kl_backward_q_grad() raises:
     print("PASS: test_kl_backward_q_grad")
 
 
-fn test_kl_finite_diff_q() raises:
+def test_kl_finite_diff_q() raises:
     """KL backward w.r.t. q matches finite differences."""
     var eps = Float64(1e-4)
     var p_vals = List[Float32]()
@@ -256,7 +256,7 @@ fn test_kl_finite_diff_q() raises:
     print("PASS: test_kl_finite_diff_q")
 
 
-fn test_mse_still_works() raises:
+def test_mse_still_works() raises:
     """Verify MSE loss is unaffected by the changes."""
     var tape = Tape(1024)
     var pred_vals = List[Float32]()
@@ -278,7 +278,7 @@ fn test_mse_still_works() raises:
     print("PASS: test_mse_still_works")
 
 
-fn test_l1_op_code_not_mse() raises:
+def test_l1_op_code_not_mse() raises:
     """Verify L1 uses OP_L1 op code, not OP_MSE."""
     var tape = Tape(1024)
     var pred_vals = List[Float32]()
@@ -293,7 +293,7 @@ fn test_l1_op_code_not_mse() raises:
     print("PASS: test_l1_op_code_not_mse")
 
 
-fn test_bce_op_code_not_mse() raises:
+def test_bce_op_code_not_mse() raises:
     """Verify BCE uses OP_BCE op code, not OP_MSE."""
     var tape = Tape(1024)
     var pred_vals = List[Float32]()
@@ -308,7 +308,7 @@ fn test_bce_op_code_not_mse() raises:
     print("PASS: test_bce_op_code_not_mse")
 
 
-fn main() raises:
+def main() raises:
     print("=== Sprint 61: Loss Backward Tests ===")
     test_l1_loss_forward()
     test_l1_backward_sign()

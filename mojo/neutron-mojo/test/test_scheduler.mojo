@@ -23,7 +23,7 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
@@ -32,7 +32,7 @@ fn assert_true(cond: Bool, msg: String) raises:
 # Helper builders
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny model for testing (1 layer, vocab=32, dim=16)."""
     var params = tiny_test_params()
     var model = Model(params)
@@ -50,7 +50,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build tokenizer for tiny model (vocab=32)."""
     var tok = BPETokenizer()
     _ = tok.add_special_token("<bos>", "bos")
@@ -62,14 +62,14 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
     return tok^
 
 
-fn _make_request(prompt: String, max_tokens: Int) -> InferenceRequest:
+def _make_request(prompt: String, max_tokens: Int) -> InferenceRequest:
     """Create an InferenceRequest."""
     var req = InferenceRequest(prompt)
     req.max_tokens = max_tokens
     return req^
 
 
-fn _make_request_with_id(prompt: String, max_tokens: Int, request_id: String) -> InferenceRequest:
+def _make_request_with_id(prompt: String, max_tokens: Int, request_id: String) -> InferenceRequest:
     """Create an InferenceRequest with a specific ID."""
     var req = InferenceRequest(prompt)
     req.max_tokens = max_tokens
@@ -81,7 +81,7 @@ fn _make_request_with_id(prompt: String, max_tokens: Int, request_id: String) ->
 # RequestQueue Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_queue_creation() raises:
+def test_queue_creation() raises:
     """Test RequestQueue initialization."""
     var q = RequestQueue(max_depth=8)
     assert_true(q.is_empty(), "Queue should start empty")
@@ -91,7 +91,7 @@ fn test_queue_creation() raises:
     print("  queue_creation: PASS")
 
 
-fn test_queue_enqueue_dequeue() raises:
+def test_queue_enqueue_dequeue() raises:
     """Test basic enqueue and dequeue."""
     var q = RequestQueue(max_depth=8)
     var req = _make_request("hello", 10)
@@ -109,7 +109,7 @@ fn test_queue_enqueue_dequeue() raises:
     print("  queue_enqueue_dequeue: PASS")
 
 
-fn test_queue_fifo_order() raises:
+def test_queue_fifo_order() raises:
     """Test FIFO ordering."""
     var q = RequestQueue(max_depth=8)
     _ = q.enqueue(_make_request_with_id("first", 5, "r1"), 100)
@@ -128,7 +128,7 @@ fn test_queue_fifo_order() raises:
     print("  queue_fifo_order: PASS")
 
 
-fn test_queue_max_depth() raises:
+def test_queue_max_depth() raises:
     """Test queue drops requests when full."""
     var q = RequestQueue(max_depth=2)
     _ = q.enqueue(_make_request("a", 5), 100)
@@ -146,7 +146,7 @@ fn test_queue_max_depth() raises:
 # SchedulerStats Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_scheduler_stats() raises:
+def test_scheduler_stats() raises:
     """Test SchedulerStats initialization and methods."""
     var stats = SchedulerStats()
     assert_true(stats.total_requests_processed == 0, "Should start at 0")
@@ -168,7 +168,7 @@ fn test_scheduler_stats() raises:
 # FinishedRequest Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_finished_request() raises:
+def test_finished_request() raises:
     """Test FinishedRequest creation and copy."""
     var fr = FinishedRequest("req-1", "Hello world", 10, 5, 42)
     assert_true(fr.request_id == "req-1", "ID should match")
@@ -187,7 +187,7 @@ fn test_finished_request() raises:
 # BatchScheduler Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_scheduler_creation() raises:
+def test_scheduler_creation() raises:
     """Test BatchScheduler initialization."""
     var params = tiny_test_params()
     var sched = BatchScheduler(params, max_batch_size=4, max_seq_len=256)
@@ -201,7 +201,7 @@ fn test_scheduler_creation() raises:
     print("  scheduler_creation: PASS")
 
 
-fn test_scheduler_enqueue() raises:
+def test_scheduler_enqueue() raises:
     """Test enqueueing requests."""
     var params = tiny_test_params()
     var sched = BatchScheduler(params, max_batch_size=2)
@@ -216,7 +216,7 @@ fn test_scheduler_enqueue() raises:
     print("  scheduler_enqueue: PASS")
 
 
-fn test_scheduler_admit() raises:
+def test_scheduler_admit() raises:
     """Test admitting requests from queue to active batch."""
     var params = tiny_test_params()
     var sched = BatchScheduler(params, max_batch_size=2, max_seq_len=64)
@@ -234,7 +234,7 @@ fn test_scheduler_admit() raises:
     print("  scheduler_admit: PASS")
 
 
-fn test_scheduler_single_request() raises:
+def test_scheduler_single_request() raises:
     """Test processing a single request to completion."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -258,7 +258,7 @@ fn test_scheduler_single_request() raises:
     print("  scheduler_single_request: PASS")
 
 
-fn test_scheduler_multiple_requests() raises:
+def test_scheduler_multiple_requests() raises:
     """Test processing multiple requests."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -285,7 +285,7 @@ fn test_scheduler_multiple_requests() raises:
     print("  scheduler_multiple_requests: PASS")
 
 
-fn test_scheduler_batch_overflow() raises:
+def test_scheduler_batch_overflow() raises:
     """Test that requests beyond batch size wait in queue."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -312,7 +312,7 @@ fn test_scheduler_batch_overflow() raises:
     print("  scheduler_batch_overflow: PASS")
 
 
-fn test_scheduler_stats_tracking() raises:
+def test_scheduler_stats_tracking() raises:
     """Test that statistics are tracked correctly."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -338,7 +338,7 @@ fn test_scheduler_stats_tracking() raises:
     print("  scheduler_stats_tracking: PASS")
 
 
-fn test_scheduler_queue_drop() raises:
+def test_scheduler_queue_drop() raises:
     """Test that queue drops are tracked."""
     var params = tiny_test_params()
     var sched = BatchScheduler(params, max_batch_size=2, max_seq_len=64,
@@ -355,7 +355,7 @@ fn test_scheduler_queue_drop() raises:
     print("  scheduler_queue_drop: PASS")
 
 
-fn test_scheduler_has_active() raises:
+def test_scheduler_has_active() raises:
     """Test has_active reflects both queue and active batch."""
     var params = tiny_test_params()
     var sched = BatchScheduler(params, max_batch_size=2, max_seq_len=64)
@@ -368,7 +368,7 @@ fn test_scheduler_has_active() raises:
     print("  scheduler_has_active: PASS")
 
 
-fn test_scheduler_peak_batch_tracking() raises:
+def test_scheduler_peak_batch_tracking() raises:
     """Test peak batch size tracking."""
     var params = tiny_test_params()
     var tok = _build_tiny_tokenizer()
@@ -390,7 +390,7 @@ fn test_scheduler_peak_batch_tracking() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_scheduler:")
 
     # Queue tests

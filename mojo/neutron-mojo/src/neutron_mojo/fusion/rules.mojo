@@ -12,7 +12,7 @@ expression patterns into equivalent forms. Rules are categorized by phase:
 Reference: tystack/mojo/specs/egraph_rules.md
 """
 
-from collections import List
+from std.collections import List
 from .graph import OpKind
 from .pattern import Pattern, PatternKind
 from .eclass import ClassId
@@ -30,10 +30,10 @@ struct RulePriority(TrivialRegisterPassable):
     comptime Low = RulePriority(0)
 
     @implicit
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self._value = value
 
-    fn __eq__(self, other: RulePriority) -> Bool:
+    def __eq__(self, other: RulePriority) -> Bool:
         return self._value == other._value
 
 
@@ -41,7 +41,7 @@ struct RulePriority(TrivialRegisterPassable):
 # RewriteRule — A single rewrite rule (pattern -> replacement)
 # ===----------------------------------------------------------------------=== #
 
-struct RewriteRule(Copyable, Movable):
+struct RewriteRule(Copyable, Movable, ImplicitlyCopyable):
     """A rewrite rule for equality saturation.
 
     Represents a transformation: `lhs -> rhs` where both are patterns.
@@ -53,21 +53,21 @@ struct RewriteRule(Copyable, Movable):
     var lhs: Pattern  # Left-hand side pattern to match
     var rhs: Pattern  # Right-hand side pattern (replacement)
 
-    fn __init__(out self, name: String, phase: Int, priority: RulePriority, var lhs: Pattern, var rhs: Pattern):
+    def __init__(out self, name: String, phase: Int, priority: RulePriority, var lhs: Pattern, var rhs: Pattern):
         self.name = name
         self.phase = phase
         self.priority = priority
         self.lhs = lhs^
         self.rhs = rhs^
 
-    fn __copyinit__(out self, existing: Self):
-        self.name = existing.name
-        self.phase = existing.phase
-        self.priority = existing.priority
-        self.lhs = existing.lhs.copy()
-        self.rhs = existing.rhs.copy()
+    def __init__(out self, *, copy: Self):
+        self.name = copy.name
+        self.phase = copy.phase
+        self.priority = copy.priority
+        self.lhs = copy.lhs.copy()
+        self.rhs = copy.rhs.copy()
 
-    fn copy(self) -> RewriteRule:
+    def copy(self) -> RewriteRule:
         """Return a deep copy of this rewrite rule."""
         return RewriteRule(self.name, self.phase, self.priority, self.lhs.copy(), self.rhs.copy())
 
@@ -76,7 +76,7 @@ struct RewriteRule(Copyable, Movable):
 # Rule Constructors — Factory functions for common rules
 # ===----------------------------------------------------------------------=== #
 
-fn rule_add_identity() -> RewriteRule:
+def rule_add_identity() -> RewriteRule:
     """Rule 1: Add Identity — (add ?x 0) -> ?x
 
     Category: Identity
@@ -94,7 +94,7 @@ fn rule_add_identity() -> RewriteRule:
     return RewriteRule("add_identity", 1, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_mul_identity() -> RewriteRule:
+def rule_mul_identity() -> RewriteRule:
     """Rule 2: Mul Identity — (mul ?x 1) -> ?x
 
     Category: Identity
@@ -110,7 +110,7 @@ fn rule_mul_identity() -> RewriteRule:
     return RewriteRule("mul_identity", 1, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_mul_zero() -> RewriteRule:
+def rule_mul_zero() -> RewriteRule:
     """Rule 3: Mul Zero — (mul ?x 0) -> 0
 
     Category: Collapse
@@ -127,7 +127,7 @@ fn rule_mul_zero() -> RewriteRule:
     return RewriteRule("mul_zero", 1, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_transpose_involution() -> RewriteRule:
+def rule_transpose_involution() -> RewriteRule:
     """Rule 26: Transpose Involution — (transpose (transpose ?x)) -> ?x
 
     Category: Cancellation
@@ -146,7 +146,7 @@ fn rule_transpose_involution() -> RewriteRule:
     return RewriteRule("transpose_involution", 1, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_add_commutativity() -> RewriteRule:
+def rule_add_commutativity() -> RewriteRule:
     """Rule 7: Add Commutativity — (add ?x ?y) -> (add ?y ?x)
 
     Category: Commutativity
@@ -167,7 +167,7 @@ fn rule_add_commutativity() -> RewriteRule:
     return RewriteRule("add_commutativity", 2, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_mul_commutativity() -> RewriteRule:
+def rule_mul_commutativity() -> RewriteRule:
     """Rule 8: Mul Commutativity — (mul ?x ?y) -> (mul ?y ?x)
 
     Category: Commutativity
@@ -185,7 +185,7 @@ fn rule_mul_commutativity() -> RewriteRule:
     return RewriteRule("mul_commutativity", 2, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_add_associativity() -> RewriteRule:
+def rule_add_associativity() -> RewriteRule:
     """Rule 9: Add Associativity — (add (add ?x ?y) ?z) -> (add ?x (add ?y ?z))
 
     Category: Associativity
@@ -214,7 +214,7 @@ fn rule_add_associativity() -> RewriteRule:
     return RewriteRule("add_associativity", 2, RulePriority.Medium, lhs^, rhs^)
 
 
-fn rule_mul_associativity() -> RewriteRule:
+def rule_mul_associativity() -> RewriteRule:
     """Rule 10: Mul Associativity — (mul (mul ?x ?y) ?z) -> (mul ?x (mul ?y ?z))
 
     Category: Associativity
@@ -246,7 +246,7 @@ fn rule_mul_associativity() -> RewriteRule:
 # Fusion Rule Constructors — Transform patterns into fused operations
 # ===----------------------------------------------------------------------=== #
 
-fn rule_rmsnorm_matmul_fusion() -> RewriteRule:
+def rule_rmsnorm_matmul_fusion() -> RewriteRule:
     """Fusion: (matmul ?w (rmsnorm ?x ?gamma)) -> (fused_rmsnorm_linear ?x ?gamma ?w)
 
     Fuses RMSNorm + linear projection into a single pass.
@@ -272,7 +272,7 @@ fn rule_rmsnorm_matmul_fusion() -> RewriteRule:
     return RewriteRule("rmsnorm_matmul_fusion", 1, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_linear_residual_add_fusion() -> RewriteRule:
+def rule_linear_residual_add_fusion() -> RewriteRule:
     """Fusion: (add ?residual (matmul ?w ?x)) -> (fused_linear_res_add ?residual ?w ?x)
 
     Fuses linear projection + residual addition into a single pass.
@@ -298,7 +298,7 @@ fn rule_linear_residual_add_fusion() -> RewriteRule:
     return RewriteRule("linear_residual_add_fusion", 1, RulePriority.High, lhs^, rhs^)
 
 
-fn rule_swiglu_fusion() -> RewriteRule:
+def rule_swiglu_fusion() -> RewriteRule:
     """Fusion: (mul (silu ?gate) ?up) -> (swiglu ?gate ?up)
 
     Fuses SiLU activation + element-wise multiply into a single pass.
@@ -329,18 +329,18 @@ struct RuleSet(Movable):
     """Collection of rewrite rules for equality saturation."""
     var rules: List[RewriteRule]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.rules = List[RewriteRule]()
 
-    fn add_rule(mut self, var rule: RewriteRule):
+    def add_rule(mut self, var rule: RewriteRule):
         """Add a rewrite rule to the set."""
         self.rules.append(rule^)
 
-    fn num_rules(self) -> Int:
+    def num_rules(self) -> Int:
         """Return the number of rules in the set."""
         return len(self.rules)
 
-    fn get_phase1_rules(self) -> List[RewriteRule]:
+    def get_phase1_rules(self) -> List[RewriteRule]:
         """Get all Phase 1 (simplification) rules."""
         var phase1 = List[RewriteRule]()
         for i in range(len(self.rules)):
@@ -348,7 +348,7 @@ struct RuleSet(Movable):
                 phase1.append(self.rules[i].copy())
         return phase1^
 
-    fn get_phase2_rules(self) -> List[RewriteRule]:
+    def get_phase2_rules(self) -> List[RewriteRule]:
         """Get all Phase 2 (equality saturation) rules."""
         var phase2 = List[RewriteRule]()
         for i in range(len(self.rules)):
@@ -357,7 +357,7 @@ struct RuleSet(Movable):
         return phase2^
 
 
-fn create_default_ruleset() -> RuleSet:
+def create_default_ruleset() -> RuleSet:
     """Create the default rule set with high-priority algebraic rules.
 
     Implements the highest-priority rules from egraph_rules.md:

@@ -8,7 +8,7 @@ Tests cross-module interactions between sliding window attention,
 MoE, LoRA, and speculative decoding with earlier sprint components.
 """
 
-from math import abs, exp
+from std.math import abs, exp
 from neutron_mojo.nn.sliding_window import (
     SlidingWindowKVCache,
     sliding_window_attention_head,
@@ -45,19 +45,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_sw_cache_with_fused_attention() raises:
+def test_sw_cache_with_fused_attention() raises:
     """Test sliding window cache produces same results as standard cache for short sequences."""
     var head_dim = 4
     var window = 8
@@ -95,7 +95,7 @@ fn test_sw_cache_with_fused_attention() raises:
     print("  sw_cache_with_fused_attention: PASS")
 
 
-fn test_moe_with_lora_expert() raises:
+def test_moe_with_lora_expert() raises:
     """Test concept: MoE expert output combined with LoRA adapter."""
     var hidden_dim = 4
     var expert_dim = 4
@@ -153,7 +153,7 @@ fn test_moe_with_lora_expert() raises:
     print("  moe_with_lora_expert: PASS")
 
 
-fn test_lora_merge_unmerge_roundtrip_with_linear() raises:
+def test_lora_merge_unmerge_roundtrip_with_linear() raises:
     """Test that merge→linear→unmerge produces same as separate LoRA linear."""
     var in_f = 3
     var out_f = 2
@@ -214,7 +214,7 @@ fn test_lora_merge_unmerge_roundtrip_with_linear() raises:
     print("  lora_merge_unmerge_roundtrip_with_linear: PASS")
 
 
-fn test_speculative_with_sampler() raises:
+def test_speculative_with_sampler() raises:
     """Test speculative decoding feeding results to sampler."""
     var vocab_size = 6
     var k = 3
@@ -277,7 +277,7 @@ fn test_speculative_with_sampler() raises:
     print("  speculative_with_sampler: PASS")
 
 
-fn test_sliding_window_long_sequence() raises:
+def test_sliding_window_long_sequence() raises:
     """Test sliding window handles long sequences with bounded memory."""
     var window = 4
     var head_dim = 2
@@ -310,7 +310,7 @@ fn test_sliding_window_long_sequence() raises:
     print("  sliding_window_long_sequence: PASS")
 
 
-fn test_moe_load_balance_feedback() raises:
+def test_moe_load_balance_feedback() raises:
     """Test MoE routing tracks load and loss decreases with balance."""
     var hidden_dim = 4
     var num_experts = 4
@@ -341,7 +341,7 @@ fn test_moe_load_balance_feedback() raises:
     print("  moe_load_balance_feedback: PASS")
 
 
-fn test_speculative_acceptance_rate_tracking() raises:
+def test_speculative_acceptance_rate_tracking() raises:
     """Test end-to-end speculative decoding with acceptance tracking."""
     var vocab_size = 4
     var k = 2
@@ -387,7 +387,7 @@ fn test_speculative_acceptance_rate_tracking() raises:
     print("  speculative_acceptance_rate_tracking: PASS")
 
 
-fn test_rep_penalty_with_speculative() raises:
+def test_rep_penalty_with_speculative() raises:
     """Test repetition penalty applied to speculative decoding logits."""
     var vocab_size = 5
 
@@ -419,7 +419,7 @@ fn test_rep_penalty_with_speculative() raises:
     print("  rep_penalty_with_speculative: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sprint6_integration:")
 
     test_sw_cache_with_fused_attention()

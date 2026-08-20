@@ -17,18 +17,18 @@ from neutron_mojo.nn.bench import ModelInfo, MemoryEstimate, model_info, estimat
 from neutron_mojo.nn.model import ModelParams
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn contains(haystack: String, needle: String) -> Bool:
+def contains(haystack: String, needle: String) -> Bool:
     """Check if haystack contains needle."""
-    if len(needle) > len(haystack):
+    if needle.byte_length() > haystack.byte_length():
         return False
-    for i in range(len(haystack) - len(needle) + 1):
+    for i in range(haystack.byte_length() - needle.byte_length() + 1):
         var found = True
-        for j in range(len(needle)):
+        for j in range(needle.byte_length()):
             if ord(haystack[byte=i + j]) != ord(needle[byte=j]):
                 found = False
                 break
@@ -37,7 +37,7 @@ fn contains(haystack: String, needle: String) -> Bool:
     return False
 
 
-fn test_known_commands() raises:
+def test_known_commands() raises:
     """is_known_command recognizes valid commands."""
     assert_true(is_known_command("run"), "run is known")
     assert_true(is_known_command("serve"), "serve is known")
@@ -50,7 +50,7 @@ fn test_known_commands() raises:
     print("  known_commands: PASS")
 
 
-fn test_parse_run_basic() raises:
+def test_parse_run_basic() raises:
     """Parse basic 'run' command."""
     var args = List[String]()
     args.append("neutron")
@@ -68,7 +68,7 @@ fn test_parse_run_basic() raises:
     print("  parse_run_basic: PASS")
 
 
-fn test_parse_run_with_options() raises:
+def test_parse_run_with_options() raises:
     """Parse 'run' with all options."""
     var args = List[String]()
     args.append("neutron")
@@ -95,7 +95,7 @@ fn test_parse_run_with_options() raises:
     print("  parse_run_with_options: PASS")
 
 
-fn test_parse_serve() raises:
+def test_parse_serve() raises:
     """Parse 'serve' command with port."""
     var args = List[String]()
     args.append("neutron")
@@ -110,7 +110,7 @@ fn test_parse_serve() raises:
     print("  parse_serve: PASS")
 
 
-fn test_parse_info() raises:
+def test_parse_info() raises:
     """Parse 'info' command."""
     var args = List[String]()
     args.append("neutron")
@@ -122,7 +122,7 @@ fn test_parse_info() raises:
     print("  parse_info: PASS")
 
 
-fn test_parse_convert() raises:
+def test_parse_convert() raises:
     """Parse 'convert' command with output flag."""
     var args = List[String]()
     args.append("neutron")
@@ -137,7 +137,7 @@ fn test_parse_convert() raises:
     print("  parse_convert: PASS")
 
 
-fn test_parse_convert_missing_output() raises:
+def test_parse_convert_missing_output() raises:
     """Convert without -o should raise."""
     var args = List[String]()
     args.append("neutron")
@@ -152,7 +152,7 @@ fn test_parse_convert_missing_output() raises:
     print("  parse_convert_missing_output: PASS")
 
 
-fn test_parse_models() raises:
+def test_parse_models() raises:
     """Parse 'models' command with optional directory."""
     var args = List[String]()
     args.append("neutron")
@@ -168,11 +168,11 @@ fn test_parse_models() raises:
     args2.append("models")
     var parsed2 = parse_cli_args(args2)
     assert_true(parsed2.command == "models", "Command models")
-    assert_true(len(parsed2.model_path) == 0, "No directory specified")
+    assert_true(parsed2.model_path.byte_length() == 0, "No directory specified")
     print("  parse_models: PASS")
 
 
-fn test_unknown_command_raises() raises:
+def test_unknown_command_raises() raises:
     """Unknown command should raise error."""
     var args = List[String]()
     args.append("neutron")
@@ -186,7 +186,7 @@ fn test_unknown_command_raises() raises:
     print("  unknown_command_raises: PASS")
 
 
-fn test_format_info_output() raises:
+def test_format_info_output() raises:
     """Format model info output contains key fields."""
     var p = ModelParams()
     p.num_layers = 4
@@ -209,7 +209,7 @@ fn test_format_info_output() raises:
     print("  format_info_output: PASS")
 
 
-fn test_format_bench_output() raises:
+def test_format_bench_output() raises:
     """Format benchmark output contains key metrics."""
     var header = format_bench_header("FP32", "slurp")
     assert_true(contains(header, "Benchmark"), "Has title")
@@ -224,7 +224,7 @@ fn test_format_bench_output() raises:
     print("  format_bench_output: PASS")
 
 
-fn test_list_model_files() raises:
+def test_list_model_files() raises:
     """Filter filenames to model files only."""
     var files = List[String]()
     files.append("model.gguf")
@@ -241,7 +241,7 @@ fn test_list_model_files() raises:
     print("  list_model_files: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_cli")
     test_known_commands()
     test_parse_run_basic()

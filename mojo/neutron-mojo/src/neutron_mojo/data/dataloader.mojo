@@ -16,18 +16,18 @@ struct BatchResult(Movable):
     var batch_size: Int
     var seq_len: Int
 
-    fn __init__(out self, var inputs: Tensor[DType.float32], var targets: List[Int],
+    def __init__(out self, var inputs: Tensor[DType.float32], var targets: List[Int],
                 batch_size: Int, seq_len: Int):
         self.inputs = inputs^
         self.targets = targets^
         self.batch_size = batch_size
         self.seq_len = seq_len
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.inputs = other.inputs^
-        self.targets = other.targets^
-        self.batch_size = other.batch_size
-        self.seq_len = other.seq_len
+    def __init__(out self, *, deinit move: Self):
+        self.inputs = move.inputs^
+        self.targets = move.targets^
+        self.batch_size = move.batch_size^
+        self.seq_len = move.seq_len^
 
 
 struct DataLoader(Movable):
@@ -39,7 +39,7 @@ struct DataLoader(Movable):
     var order: List[Int]
     var _seed: Int
 
-    fn __init__(out self, var dataset: Dataset, batch_size: Int = 4, shuffle: Bool = True):
+    def __init__(out self, var dataset: Dataset, batch_size: Int = 4, shuffle: Bool = True):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.current_idx = 0
@@ -52,20 +52,20 @@ struct DataLoader(Movable):
         if shuffle:
             self._shuffle_order()
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.dataset = other.dataset^
-        self.batch_size = other.batch_size
-        self.shuffle = other.shuffle
-        self.current_idx = other.current_idx
-        self.order = other.order^
-        self._seed = other._seed
+    def __init__(out self, *, deinit move: Self):
+        self.dataset = move.dataset^
+        self.batch_size = move.batch_size^
+        self.shuffle = move.shuffle^
+        self.current_idx = move.current_idx^
+        self.order = move.order^
+        self._seed = move._seed^
 
-    fn _lcg_next(mut self) -> Int:
+    def _lcg_next(mut self) -> Int:
         """Simple LCG random number generator."""
         self._seed = (self._seed * 1103515245 + 12345) & 0x7FFFFFFF
         return self._seed
 
-    fn _shuffle_order(mut self):
+    def _shuffle_order(mut self):
         """Fisher-Yates shuffle."""
         var n = len(self.order)
         var i = n - 1
@@ -76,16 +76,16 @@ struct DataLoader(Movable):
             self.order[j] = tmp
             i -= 1
 
-    fn reset(mut self):
+    def reset(mut self):
         """Reset to beginning of dataset."""
         self.current_idx = 0
         if self.shuffle:
             self._shuffle_order()
 
-    fn has_next(self) -> Bool:
+    def has_next(self) -> Bool:
         return self.current_idx < self.dataset.size()
 
-    fn next_batch(mut self) -> BatchResult:
+    def next_batch(mut self) -> BatchResult:
         """Get the next batch of data."""
         var n = self.dataset.size()
         var actual_batch = min(self.batch_size, n - self.current_idx)
@@ -109,7 +109,7 @@ struct DataLoader(Movable):
         self.current_idx += actual_batch
         return BatchResult(inputs^, targets^, actual_batch, seq_len)
 
-    fn num_batches(self) -> Int:
+    def num_batches(self) -> Int:
         """Return the number of batches per epoch."""
         var n = self.dataset.size()
         return (n + self.batch_size - 1) // self.batch_size

@@ -7,7 +7,7 @@ repetition penalty + sampler, stop tokens in generation,
 beam search, quantized KV cache in model pipeline, fused attention.
 """
 
-from math import abs
+from std.math import abs
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.generation import (
@@ -32,19 +32,19 @@ from neutron_mojo.nn.rope import RoPETable
 from neutron_mojo.nn.attention import attention_single_head
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn _inv_sqrt(d: Int) -> Float32:
+def _inv_sqrt(d: Int) -> Float32:
     var df = Float32(d)
     var x: Float32 = 0.5
     for _ in range(10):
@@ -52,7 +52,7 @@ fn _inv_sqrt(d: Int) -> Float32:
     return x
 
 
-fn test_rep_penalty_improves_diversity() raises:
+def test_rep_penalty_improves_diversity() raises:
     """Test: repetition penalty prevents degenerate repetition in generation."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -96,7 +96,7 @@ fn test_rep_penalty_improves_diversity() raises:
     print("  rep_penalty_improves_diversity: PASS")
 
 
-fn test_stop_token_halts_generation() raises:
+def test_stop_token_halts_generation() raises:
     """Test: stop tokens properly detected during generation loop."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -134,7 +134,7 @@ fn test_stop_token_halts_generation() raises:
     print("  stop_token_halts_generation: PASS")
 
 
-fn test_beam_search_finds_best_sequence() raises:
+def test_beam_search_finds_best_sequence() raises:
     """Test: beam search explores multiple candidates."""
     # Create logits favoring different tokens
     var logits = Tensor[DType.float32](Shape(4))
@@ -167,7 +167,7 @@ fn test_beam_search_finds_best_sequence() raises:
     print("  beam_search_finds_best_sequence: PASS")
 
 
-fn test_q8_cache_in_model_pipeline() raises:
+def test_q8_cache_in_model_pipeline() raises:
     """Test: quantized KV cache used in a model-like forward pass."""
     var head_dim = 4
 
@@ -211,7 +211,7 @@ fn test_q8_cache_in_model_pipeline() raises:
     print("  q8_cache_in_model_pipeline: PASS")
 
 
-fn test_fused_attention_in_generation() raises:
+def test_fused_attention_in_generation() raises:
     """Test: fused attention produces same result as reference across positions."""
     var head_dim = 4
     var cache = KVCache(max_seq_len=16, num_kv_heads=1, head_dim=4)
@@ -244,7 +244,7 @@ fn test_fused_attention_in_generation() raises:
     print("  fused_attention_in_generation: PASS")
 
 
-fn test_combined_penalties_with_sampling() raises:
+def test_combined_penalties_with_sampling() raises:
     """Test: frequency + presence + repetition penalties together."""
     var logits = Tensor[DType.float32](Shape(5))
     logits.set(0, 5.0)
@@ -280,7 +280,7 @@ fn test_combined_penalties_with_sampling() raises:
     print("  combined_penalties_with_sampling: PASS")
 
 
-fn test_generation_config_driven_loop() raises:
+def test_generation_config_driven_loop() raises:
     """Test: full generation loop driven by GenerationConfig."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -327,7 +327,7 @@ fn test_generation_config_driven_loop() raises:
     print("  generation_config_driven_loop: PASS")
 
 
-fn test_q8_gqa_vs_fused_q8_gqa() raises:
+def test_q8_gqa_vs_fused_q8_gqa() raises:
     """Test: q8_gqa_attention matches fused_q8_gqa for consistency."""
     var q8_cache = Q8KVCache(max_seq_len=8, num_kv_heads=2, head_dim=2)
 
@@ -361,7 +361,7 @@ fn test_q8_gqa_vs_fused_q8_gqa() raises:
     print("  q8_gqa_vs_fused_q8_gqa: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_sprint5_integration:")
 
     test_rep_penalty_improves_diversity()

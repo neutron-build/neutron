@@ -22,15 +22,15 @@ from neutron_mojo.model.populate import model_from_config
 from neutron_mojo.model.weight_reader import load_safetensors_from_buffer
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
-from memory import UnsafePointer, alloc
+from std.memory import UnsafePointer, alloc
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     var diff = a - b
     if diff < 0:
         diff = -diff
@@ -41,7 +41,7 @@ fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
         )
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -53,7 +53,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _f32_to_bytes(val: Float32) -> List[UInt8]:
+def _f32_to_bytes(val: Float32) -> List[UInt8]:
     """Convert a Float32 to 4 little-endian bytes."""
     var p = alloc[Float32](1)
     p.store(val)
@@ -67,7 +67,7 @@ fn _f32_to_bytes(val: Float32) -> List[UInt8]:
     return result^
 
 
-fn _tiny_config() -> ModelConfig:
+def _tiny_config() -> ModelConfig:
     """Create a tiny model config for testing: vocab=4, hidden=2, 1 layer."""
     var cfg = ModelConfig()
     cfg.vocab_size = 4
@@ -81,7 +81,7 @@ fn _tiny_config() -> ModelConfig:
     return cfg^
 
 
-fn _build_tiny_safetensors() -> List[UInt8]:
+def _build_tiny_safetensors() -> List[UInt8]:
     """Build a minimal SafeTensors file with embed + norm + lm_head + 1 layer.
 
     Tensor layout:
@@ -129,7 +129,7 @@ fn _build_tiny_safetensors() -> List[UInt8]:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_parse_weight_map() raises:
+def test_parse_weight_map() raises:
     """Parse a weight_map JSON."""
     var json = String(
         '{"metadata":{"total_size":12345},'
@@ -158,7 +158,7 @@ fn test_parse_weight_map() raises:
     print("  parse_weight_map: PASS")
 
 
-fn test_parse_config_json() raises:
+def test_parse_config_json() raises:
     """Parse a minimal config.json."""
     var json = String(
         '{"vocab_size":32000,"hidden_size":4096,"num_hidden_layers":32,'
@@ -178,7 +178,7 @@ fn test_parse_config_json() raises:
     print("  parse_config_json: PASS")
 
 
-fn test_safetensors_index_from_string() raises:
+def test_safetensors_index_from_string() raises:
     """Build SafeTensorsIndex from JSON string."""
     var json = String(
         '{"weight_map":{'
@@ -206,7 +206,7 @@ fn test_safetensors_index_from_string() raises:
     print("  safetensors_index_from_string: PASS")
 
 
-fn test_dtype_element_size() raises:
+def test_dtype_element_size() raises:
     """Element sizes for SafeTensors dtypes."""
     assert_eq(dtype_element_size("F32"), 4, "F32 = 4 bytes")
     assert_eq(dtype_element_size("F16"), 2, "F16 = 2 bytes")
@@ -219,7 +219,7 @@ fn test_dtype_element_size() raises:
     print("  dtype_element_size: PASS")
 
 
-fn test_build_safetensors_from_parts() raises:
+def test_build_safetensors_from_parts() raises:
     """Build SafeTensors binary from JSON header + data."""
     var json = String('{"test":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}')
     var data = List[UInt8]()
@@ -236,7 +236,7 @@ fn test_build_safetensors_from_parts() raises:
     # First 8 bytes = header size (u64 LE)
     var reader = BinaryReader(buf^)
     var header_size = reader.read_u64_le()
-    assert_eq(header_size, len(json), "header size matches JSON length")
+    assert_eq(header_size, json.byte_length(), "header size matches JSON length")
 
     # Read back JSON
     var json_back = String("")
@@ -254,7 +254,7 @@ fn test_build_safetensors_from_parts() raises:
     print("  build_safetensors_from_parts: PASS")
 
 
-fn test_load_safetensors_from_buffer() raises:
+def test_load_safetensors_from_buffer() raises:
     """Load a tiny SafeTensors model from buffer."""
     var config = _tiny_config()
     var buf = _build_tiny_safetensors()
@@ -278,7 +278,7 @@ fn test_load_safetensors_from_buffer() raises:
     print("  load_safetensors_from_buffer: PASS")
 
 
-fn test_safetensors_model_forward() raises:
+def test_safetensors_model_forward() raises:
     """Loaded SafeTensors model can run forward pass."""
     var config = _tiny_config()
     var buf = _build_tiny_safetensors()
@@ -307,7 +307,7 @@ fn test_safetensors_model_forward() raises:
     print("  safetensors_model_forward: PASS")
 
 
-fn test_safetensors_sharded_index_multi_shard() raises:
+def test_safetensors_sharded_index_multi_shard() raises:
     """Index correctly routes tensors to different shards."""
     var json = String(
         '{"weight_map":{'
@@ -345,7 +345,7 @@ fn test_safetensors_sharded_index_multi_shard() raises:
     print("  safetensors_sharded_index_multi_shard: PASS")
 
 
-fn test_weight_map_empty() raises:
+def test_weight_map_empty() raises:
     """Handle empty weight map gracefully."""
     var json = String('{"weight_map":{}}')
     var wm = parse_weight_map(json)
@@ -356,7 +356,7 @@ fn test_weight_map_empty() raises:
     print("  weight_map_empty: PASS")
 
 
-fn test_config_json_with_strings() raises:
+def test_config_json_with_strings() raises:
     """Config JSON parser skips string/array/object values correctly."""
     var json = String(
         '{"model_type":"llama","vocab_size":32000,'
@@ -378,7 +378,7 @@ fn test_config_json_with_strings() raises:
     print("  config_json_with_strings: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_safetensors_sharded:")
 
     test_parse_weight_map()

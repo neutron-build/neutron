@@ -4,8 +4,8 @@
 
 """Tests for RMSNorm/LayerNorm backward and requires_grad gating."""
 
-from math import abs, sqrt
-from testing import assert_true
+from std.math import abs, sqrt
+from std.testing import assert_true
 
 from neutron_mojo.autograd.tape import Tape
 from neutron_mojo.autograd.backward import run_backward
@@ -13,7 +13,7 @@ from neutron_mojo.train.modules import RMSNormModule, LayerNormModule, Linear
 from neutron_mojo.train.losses import mse_loss
 
 
-fn _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) -> Int:
     var dims = List[Int]()
     dims.append(len(vals))
     var idx = tape.add_variable(dims^, requires_grad=requires_grad)
@@ -22,7 +22,7 @@ fn _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) ->
     return idx
 
 
-fn test_rmsnorm_gamma_gets_grad() raises:
+def test_rmsnorm_gamma_gets_grad() raises:
     """RMSNorm gamma should receive non-zero gradients."""
     var tape = Tape(4096)
     var norm = RMSNormModule(4)
@@ -53,7 +53,7 @@ fn test_rmsnorm_gamma_gets_grad() raises:
     print("PASS: test_rmsnorm_gamma_gets_grad")
 
 
-fn test_rmsnorm_x_gets_grad() raises:
+def test_rmsnorm_x_gets_grad() raises:
     """RMSNorm input x should receive proper gradients."""
     var tape = Tape(4096)
     var norm = RMSNormModule(4)
@@ -83,7 +83,7 @@ fn test_rmsnorm_x_gets_grad() raises:
     print("PASS: test_rmsnorm_x_gets_grad")
 
 
-fn test_rmsnorm_finite_diff() raises:
+def test_rmsnorm_finite_diff() raises:
     """RMSNorm backward matches finite differences for x."""
     var eps = Float64(1e-3)
     var x_vals = List[Float32]()
@@ -135,7 +135,7 @@ fn test_rmsnorm_finite_diff() raises:
     print("PASS: test_rmsnorm_finite_diff")
 
 
-fn test_layernorm_gamma_gets_grad() raises:
+def test_layernorm_gamma_gets_grad() raises:
     """LayerNorm gamma should receive non-zero gradients."""
     var tape = Tape(4096)
     var norm = LayerNormModule(4)
@@ -165,7 +165,7 @@ fn test_layernorm_gamma_gets_grad() raises:
     print("PASS: test_layernorm_gamma_gets_grad")
 
 
-fn test_layernorm_beta_gets_grad() raises:
+def test_layernorm_beta_gets_grad() raises:
     """LayerNorm beta should receive non-zero gradients."""
     var tape = Tape(4096)
     var norm = LayerNormModule(4)
@@ -195,7 +195,7 @@ fn test_layernorm_beta_gets_grad() raises:
     print("PASS: test_layernorm_beta_gets_grad")
 
 
-fn test_layernorm_x_gets_grad() raises:
+def test_layernorm_x_gets_grad() raises:
     """LayerNorm x should receive proper gradients."""
     var tape = Tape(4096)
     var norm = LayerNormModule(3)
@@ -225,7 +225,7 @@ fn test_layernorm_x_gets_grad() raises:
     print("PASS: test_layernorm_x_gets_grad")
 
 
-fn test_requires_grad_false_no_gradient() raises:
+def test_requires_grad_false_no_gradient() raises:
     """Variables with requires_grad=False should not accumulate gradients."""
     var tape = Tape(4096)
 
@@ -265,7 +265,7 @@ fn test_requires_grad_false_no_gradient() raises:
     print("PASS: test_requires_grad_false_no_gradient")
 
 
-fn test_requires_grad_mul() raises:
+def test_requires_grad_mul() raises:
     """requires_grad gate works through multiplication."""
     var tape = Tape(4096)
     var a_vals = List[Float32]()
@@ -286,7 +286,7 @@ fn test_requires_grad_mul() raises:
     print("PASS: test_requires_grad_mul")
 
 
-fn test_requires_grad_matmul() raises:
+def test_requires_grad_matmul() raises:
     """requires_grad gate works through matmul."""
     var tape = Tape(4096)
 
@@ -319,7 +319,7 @@ fn test_requires_grad_matmul() raises:
     print("PASS: test_requires_grad_matmul")
 
 
-fn test_rmsnorm_gamma_frozen() raises:
+def test_rmsnorm_gamma_frozen() raises:
     """RMSNorm gamma with requires_grad=False gets no gradient."""
     var tape = Tape(4096)
     var norm = RMSNormModule(3)
@@ -349,7 +349,7 @@ fn test_rmsnorm_gamma_frozen() raises:
     print("PASS: test_rmsnorm_gamma_frozen")
 
 
-fn test_layernorm_finite_diff() raises:
+def test_layernorm_finite_diff() raises:
     """LayerNorm backward matches finite differences for x."""
     var eps = Float64(1e-3)
     var x_vals = List[Float32]()
@@ -401,7 +401,7 @@ fn test_layernorm_finite_diff() raises:
     print("PASS: test_layernorm_finite_diff")
 
 
-fn test_requires_grad_linear_frozen_weight() raises:
+def test_requires_grad_linear_frozen_weight() raises:
     """Linear layer with frozen weights: only bias gets gradients."""
     var tape = Tape(4096)
     var lin = Linear(3, 2, has_bias=True)
@@ -435,7 +435,7 @@ fn test_requires_grad_linear_frozen_weight() raises:
     print("PASS: test_requires_grad_linear_frozen_weight")
 
 
-fn test_multiple_frozen_in_chain() raises:
+def test_multiple_frozen_in_chain() raises:
     """Multiple frozen variables in a computation chain."""
     var tape = Tape(4096)
     var a_vals = List[Float32]()
@@ -467,7 +467,7 @@ fn test_multiple_frozen_in_chain() raises:
     print("PASS: test_multiple_frozen_in_chain")
 
 
-fn main() raises:
+def main() raises:
     print("=== Sprint 62: Norm Backward + requires_grad Tests ===")
     test_rmsnorm_gamma_gets_grad()
     test_rmsnorm_x_gets_grad()

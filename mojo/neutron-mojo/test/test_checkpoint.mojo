@@ -18,7 +18,7 @@ from neutron_mojo.autograd.checkpoint import (
 )
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e-5) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
@@ -28,12 +28,12 @@ fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-4, atol: Float64 = 1e
         )
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn assert_true(val: Bool, msg: String = "Expected true") raises:
+def assert_true(val: Bool, msg: String = "Expected true") raises:
     if not val:
         raise Error(msg)
 
@@ -42,7 +42,7 @@ fn assert_true(val: Bool, msg: String = "Expected true") raises:
 # Helper: build a tape with chain a*b+c -> relu -> sum
 # ===----------------------------------------------------------------------=== #
 
-fn _build_chain_tape() -> Tape:
+def _build_chain_tape() -> Tape:
     """Build a tape with: loss = sum(relu(a*b + c))."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -71,7 +71,7 @@ fn _build_chain_tape() -> Tape:
     return tape^
 
 
-fn _build_chain_tape_copy() -> Tape:
+def _build_chain_tape_copy() -> Tape:
     """Build an identical tape for comparison."""
     return _build_chain_tape()
 
@@ -81,7 +81,7 @@ fn _build_chain_tape_copy() -> Tape:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_checkpoint_segment_basic() raises:
+def test_checkpoint_segment_basic() raises:
     """CheckpointSegment stores start/end and can be copied."""
     var seg = CheckpointSegment(0, 5)
     assert_eq(seg.start_entry, 0)
@@ -94,7 +94,7 @@ fn test_checkpoint_segment_basic() raises:
     print("  checkpoint_segment_basic: PASS")
 
 
-fn test_mark_checkpoint() raises:
+def test_mark_checkpoint() raises:
     """mark_checkpoint returns current tape entry count."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -116,7 +116,7 @@ fn test_mark_checkpoint() raises:
     print("  mark_checkpoint: PASS")
 
 
-fn test_auto_segments_even_split() raises:
+def test_auto_segments_even_split() raises:
     """auto_checkpoint_segments divides tape evenly."""
     var tape = _build_chain_tape()
     # Tape has 4 entries: mul, add, relu, sum
@@ -130,7 +130,7 @@ fn test_auto_segments_even_split() raises:
     print("  auto_segments_even_split: PASS")
 
 
-fn test_auto_segments_more_than_entries() raises:
+def test_auto_segments_more_than_entries() raises:
     """More segments than entries: clamped to entries."""
     var tape = _build_chain_tape()
     var segs = auto_checkpoint_segments(tape, 10)
@@ -141,7 +141,7 @@ fn test_auto_segments_more_than_entries() raises:
     print("  auto_segments_more_than_entries: PASS")
 
 
-fn test_auto_segments_single() raises:
+def test_auto_segments_single() raises:
     """Single segment covers entire tape."""
     var tape = _build_chain_tape()
     var segs = auto_checkpoint_segments(tape, 1)
@@ -151,7 +151,7 @@ fn test_auto_segments_single() raises:
     print("  auto_segments_single: PASS")
 
 
-fn test_checkpointed_matches_regular_simple() raises:
+def test_checkpointed_matches_regular_simple() raises:
     """Checkpointed backward matches regular for simple add."""
     # Regular
     var tape1 = Tape(4096)
@@ -190,7 +190,7 @@ fn test_checkpointed_matches_regular_simple() raises:
     print("  checkpointed_matches_regular_simple: PASS")
 
 
-fn test_checkpointed_matches_chain() raises:
+def test_checkpointed_matches_chain() raises:
     """Checkpointed backward matches regular for mul->add->relu->sum chain."""
     var tape1 = _build_chain_tape()
     var loss1 = tape1.num_variables() - 1
@@ -208,7 +208,7 @@ fn test_checkpointed_matches_chain() raises:
     print("  checkpointed_matches_chain: PASS")
 
 
-fn test_checkpointed_matches_4_segments() raises:
+def test_checkpointed_matches_4_segments() raises:
     """Checkpointed with 4 segments (1 per entry) matches regular."""
     var tape1 = _build_chain_tape()
     var loss1 = tape1.num_variables() - 1
@@ -225,7 +225,7 @@ fn test_checkpointed_matches_4_segments() raises:
     print("  checkpointed_matches_4_segments: PASS")
 
 
-fn test_checkpointed_matmul() raises:
+def test_checkpointed_matmul() raises:
     """Checkpointed backward matches for matmul chain."""
     # Build matmul + sum tape
     var d_a = List[Int]()
@@ -281,7 +281,7 @@ fn test_checkpointed_matmul() raises:
     print("  checkpointed_matmul: PASS")
 
 
-fn test_empty_segments() raises:
+def test_empty_segments() raises:
     """Empty segment list falls back to regular backward."""
     var tape1 = Tape(4096)
     var d = List[Int]()
@@ -317,7 +317,7 @@ fn test_empty_segments() raises:
     print("  empty_segments: PASS")
 
 
-fn test_saved_var_indices() raises:
+def test_saved_var_indices() raises:
     """auto_checkpoint_segments populates saved_var_indices correctly."""
     var tape = _build_chain_tape()
     var segs = auto_checkpoint_segments(tape, 2)
@@ -331,7 +331,7 @@ fn test_saved_var_indices() raises:
     print("  saved_var_indices: PASS")
 
 
-fn test_checkpointed_deep_chain() raises:
+def test_checkpointed_deep_chain() raises:
     """Checkpointed backward matches for deeper chain (5 ops)."""
     var d = List[Int]()
     d.append(4)
@@ -342,7 +342,7 @@ fn test_checkpointed_deep_chain() raises:
     var w1 = tape1.add_variable(d.copy())
     for i in range(4):
         tape1.set_data(x1, i, Float32(i + 1))
-        tape1.set_data(w1, i, Float32(0.5 * (i + 1)))
+        tape1.set_data(w1, i, Float32(0.5 * Float64(i + 1)))
     var m1 = tracked_mul(tape1, x1, w1)
     var a1 = tracked_relu(tape1, m1)
     var s1 = tracked_scalar_mul(tape1, a1, 2.0)
@@ -356,7 +356,7 @@ fn test_checkpointed_deep_chain() raises:
     var w2 = tape2.add_variable(d.copy())
     for i in range(4):
         tape2.set_data(x2, i, Float32(i + 1))
-        tape2.set_data(w2, i, Float32(0.5 * (i + 1)))
+        tape2.set_data(w2, i, Float32(0.5 * Float64(i + 1)))
     var m2 = tracked_mul(tape2, x2, w2)
     var a2 = tracked_relu(tape2, m2)
     var s2 = tracked_scalar_mul(tape2, a2, 2.0)
@@ -370,7 +370,7 @@ fn test_checkpointed_deep_chain() raises:
     print("  checkpointed_deep_chain: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_checkpoint:")
     test_checkpoint_segment_basic()
     test_mark_checkpoint()

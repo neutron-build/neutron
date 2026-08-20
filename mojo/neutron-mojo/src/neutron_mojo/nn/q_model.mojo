@@ -11,6 +11,7 @@ matrix-vector multiplies via simd_q8_matvec.
 """
 
 from neutron_mojo.tensor.tensor import Tensor
+from std.math import exp, tanh, sqrt
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.simd_math import (
     simd_q8_matvec,
@@ -31,7 +32,7 @@ from neutron_mojo.nn.model import Model, ModelParams, LayerWeightOffsets
 # Scale Offsets
 # ===----------------------------------------------------------------------=== #
 
-struct LayerScaleOffsets(Copyable, Movable):
+struct LayerScaleOffsets(Copyable, Movable, ImplicitlyCopyable):
     """Scale tensor offsets for one layer's quantized projections."""
     var wq: Int
     var wk: Int
@@ -41,7 +42,7 @@ struct LayerScaleOffsets(Copyable, Movable):
     var w_up: Int
     var w_down: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.wq = 0
         self.wk = 0
         self.wv = 0
@@ -50,30 +51,30 @@ struct LayerScaleOffsets(Copyable, Movable):
         self.w_up = 0
         self.w_down = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.wq = existing.wq
-        self.wk = existing.wk
-        self.wv = existing.wv
-        self.wo = existing.wo
-        self.w_gate = existing.w_gate
-        self.w_up = existing.w_up
-        self.w_down = existing.w_down
+    def __init__(out self, *, copy: Self):
+        self.wq = copy.wq
+        self.wk = copy.wk
+        self.wv = copy.wv
+        self.wo = copy.wo
+        self.w_gate = copy.w_gate
+        self.w_up = copy.w_up
+        self.w_down = copy.w_down
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.wq = other.wq
-        self.wk = other.wk
-        self.wv = other.wv
-        self.wo = other.wo
-        self.w_gate = other.w_gate
-        self.w_up = other.w_up
-        self.w_down = other.w_down
+    def __init__(out self, *, deinit move: Self):
+        self.wq = move.wq^
+        self.wk = move.wk^
+        self.wv = move.wv^
+        self.wo = move.wo^
+        self.w_gate = move.w_gate^
+        self.w_up = move.w_up^
+        self.w_down = move.w_down^
 
 
-fn _num_blocks(in_features: Int, block_size: Int) -> Int:
+def _num_blocks(in_features: Int, block_size: Int) -> Int:
     return (in_features + block_size - 1) // block_size
 
 
-fn _scales_count(out_features: Int, in_features: Int, block_size: Int) -> Int:
+def _scales_count(out_features: Int, in_features: Int, block_size: Int) -> Int:
     return out_features * _num_blocks(in_features, block_size)
 
 
@@ -97,7 +98,7 @@ struct QuantizedModel(Movable):
     var block_size: Int
     var scales_per_layer: Int
 
-    fn __init__(out self, params: ModelParams, block_size: Int = 32):
+    def __init__(out self, params: ModelParams, block_size: Int = 32):
         self.params = params.copy()
         self.layer_size = params.layer_weight_count()
         self.block_size = block_size
@@ -135,18 +136,18 @@ struct QuantizedModel(Movable):
                 self.layer_weights.set(offsets.attn_norm + i, 1.0)
                 self.layer_weights.set(offsets.ffn_norm + i, 1.0)
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.params = other.params.copy()
-        self.embed = other.embed^
-        self.final_norm = other.final_norm^
-        self.lm_head = other.lm_head^
-        self.layer_weights = other.layer_weights^
-        self.layer_scales = other.layer_scales^
-        self.layer_size = other.layer_size
-        self.block_size = other.block_size
-        self.scales_per_layer = other.scales_per_layer
+    def __init__(out self, *, deinit move: Self):
+        self.params = move.params.copy()
+        self.embed = move.embed^
+        self.final_norm = move.final_norm^
+        self.lm_head = move.lm_head^
+        self.layer_weights = move.layer_weights^
+        self.layer_scales = move.layer_scales^
+        self.layer_size = move.layer_size^
+        self.block_size = move.block_size^
+        self.scales_per_layer = move.scales_per_layer^
 
-    fn _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
+    def _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
         """Compute data offsets (same layout as Model)."""
         var base = layer * self.layer_size
         var p = self.params.copy()
@@ -176,7 +177,7 @@ struct QuantizedModel(Movable):
         off.w_down = cursor
         return off^
 
-    fn _layer_scale_offsets(self, layer: Int) -> LayerScaleOffsets:
+    def _layer_scale_offsets(self, layer: Int) -> LayerScaleOffsets:
         """Compute scale offsets for a layer's projections."""
         var base = layer * self.scales_per_layer
         var p = self.params.copy()
@@ -203,7 +204,7 @@ struct QuantizedModel(Movable):
         soff.w_down = cursor
         return soff^
 
-    fn _q8_linear_from_flat(
+    def _q8_linear_from_flat(
         self,
         x: Tensor[DType.float32],
         data_offset: Int,
@@ -220,7 +221,7 @@ struct QuantizedModel(Movable):
         )
         return result^
 
-    fn forward_layer(
+    def forward_layer(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -302,7 +303,6 @@ struct QuantizedModel(Movable):
         # Activation dispatch based on architecture
         var ffn_out = Tensor[DType.float32](Shape(p.ffn_dim))
         if p.arch.use_gelu:
-            from math import exp, tanh, sqrt
             for i in range(p.ffn_dim):
                 var xi = gate.get(i)
                 var x64 = Float64(xi)
@@ -322,7 +322,7 @@ struct QuantizedModel(Movable):
 
         return output^
 
-    fn forward(
+    def forward(
         self,
         token_id: Int,
         mut cache: MultiLayerKVCache,
@@ -347,7 +347,7 @@ struct QuantizedModel(Movable):
         )
         return logits^
 
-    fn forward_layer_q8cache(
+    def forward_layer_q8cache(
         self,
         x: Tensor[DType.float32],
         layer: Int,
@@ -426,7 +426,7 @@ struct QuantizedModel(Movable):
 
         return output^
 
-    fn forward_q8cache(
+    def forward_q8cache(
         self,
         token_id: Int,
         mut cache: MultiLayerQ8KVCache,
@@ -455,7 +455,7 @@ struct QuantizedModel(Movable):
 # Quantization
 # ===----------------------------------------------------------------------=== #
 
-fn _quantize_projection(
+def _quantize_projection(
     src: Tensor[DType.float32],
     src_offset: Int,
     mut dst: Tensor[DType.float32],
@@ -506,7 +506,7 @@ fn _quantize_projection(
                 dst.set(dst_offset + row * in_features + j, q)
 
 
-fn quantize_from_model(model: Model, block_size: Int = 32) -> QuantizedModel:
+def quantize_from_model(model: Model, block_size: Int = 32) -> QuantizedModel:
     """Convert FP32 Model to Q8 QuantizedModel.
 
     Quantizes all 7 projection weight matrices per layer.
@@ -596,7 +596,7 @@ fn quantize_from_model(model: Model, block_size: Int = 32) -> QuantizedModel:
 # Generation
 # ===----------------------------------------------------------------------=== #
 
-fn q_generate(
+def q_generate(
     model: QuantizedModel,
     prompt_tokens: List[Int],
     max_new_tokens: Int,

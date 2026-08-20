@@ -17,7 +17,7 @@ Tests:
 10. StreamingGenerator get_text accumulates
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams, tiny_test_params
@@ -30,17 +30,17 @@ from neutron_mojo.nn.streaming import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error("FAIL: " + msg + " expected=" + String(b) + " got=" + String(a))
 
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -58,7 +58,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     var tok = BPETokenizer()
     _ = tok.add_token("<s>")     # 0
     _ = tok.add_token("</s>")   # 1
@@ -78,7 +78,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_token_event_defaults() raises:
+def test_token_event_defaults() raises:
     """TokenEvent default constructor works."""
     var event = TokenEvent()
     assert_eq(event.token_id, -1, "default token_id")
@@ -88,7 +88,7 @@ fn test_token_event_defaults() raises:
     print("  token_event_defaults: PASS")
 
 
-fn test_token_event_tps() raises:
+def test_token_event_tps() raises:
     """TokenEvent tokens_per_sec calculation."""
     var event = TokenEvent(String("hi"), 5, 10, False, UInt(1_000_000_000))
     var tps = event.tokens_per_sec()
@@ -99,7 +99,7 @@ fn test_token_event_tps() raises:
     print("  token_event_tps: PASS")
 
 
-fn test_streaming_produces_tokens() raises:
+def test_streaming_produces_tokens() raises:
     """StreamingGenerator produces at least one token."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -111,11 +111,11 @@ fn test_streaming_produces_tokens() raises:
 
     var event = gen.next_token()
     assert_true(event.token_id >= 0, "first token has valid ID")
-    assert_true(len(event.text) > 0, "first token has text")
+    assert_true(event.text.byte_length() > 0, "first token has text")
     print("  streaming_produces_tokens: PASS")
 
 
-fn test_streaming_finishes_at_max() raises:
+def test_streaming_finishes_at_max() raises:
     """StreamingGenerator stops at max_new_tokens."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -134,7 +134,7 @@ fn test_streaming_finishes_at_max() raises:
     print("  streaming_finishes_at_max: PASS")
 
 
-fn test_streaming_eos_stop() raises:
+def test_streaming_eos_stop() raises:
     """StreamingGenerator stops when EOS is generated."""
     # With tiny model, EOS may or may not be generated naturally.
     # Just verify the is_eos flag mechanism works.
@@ -158,7 +158,7 @@ fn test_streaming_eos_stop() raises:
     print("  streaming_eos_stop: PASS")
 
 
-fn test_streaming_collect() raises:
+def test_streaming_collect() raises:
     """streaming_collect returns all events."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -171,7 +171,7 @@ fn test_streaming_collect() raises:
     print("  streaming_collect: PASS")
 
 
-fn test_streaming_matches_pipeline() raises:
+def test_streaming_matches_pipeline() raises:
     """Streaming output matches non-streaming pipeline output."""
     # Build two identical models
     var model1 = _build_tiny_model()
@@ -196,7 +196,7 @@ fn test_streaming_matches_pipeline() raises:
     print("  streaming_matches_pipeline: PASS")
 
 
-fn test_position_tracking() raises:
+def test_position_tracking() raises:
     """TokenEvent position increments correctly."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -213,7 +213,7 @@ fn test_position_tracking() raises:
     print("  position_tracking: PASS")
 
 
-fn test_timing_info() raises:
+def test_timing_info() raises:
     """TokenEvent contains non-zero timing after generation."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -228,7 +228,7 @@ fn test_timing_info() raises:
     print("  timing_info: PASS")
 
 
-fn test_get_text_accumulates() raises:
+def test_get_text_accumulates() raises:
     """StreamingGenerator.get_text() accumulates generated text."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -238,21 +238,21 @@ fn test_get_text_accumulates() raises:
     var gen = StreamingGenerator(model^, tok^, "abc", cfg)
 
     # Before generating
-    assert_true(len(gen.get_text()) == 0, "empty before generation")
+    assert_true(gen.get_text().byte_length() == 0, "empty before generation")
 
     # Generate some tokens
     _ = gen.next_token()
     var text1 = gen.get_text()
-    assert_true(len(text1) > 0, "text after first token")
+    assert_true(text1.byte_length() > 0, "text after first token")
 
     _ = gen.next_token()
     var text2 = gen.get_text()
-    assert_true(len(text2) >= len(text1), "text grows with tokens")
+    assert_true(text2.byte_length() >= text1.byte_length(), "text grows with tokens")
 
     print("  get_text_accumulates: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_streaming:")
 
     test_token_event_defaults()

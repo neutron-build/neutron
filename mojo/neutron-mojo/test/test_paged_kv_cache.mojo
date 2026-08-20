@@ -20,8 +20,8 @@ Tests:
 13. Benchmark: paged vs contiguous decode
 """
 
-from math import abs, sqrt
-from time import perf_counter_ns
+from std.math import abs, sqrt
+from std.time import perf_counter_ns
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.paged_kv_cache import PageAllocator, PageTable, PagedKVCache
@@ -33,12 +33,12 @@ from neutron_mojo.nn.attention import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error("FAIL: " + msg + " a=" + String(a) + " b=" + String(b))
 
@@ -47,7 +47,7 @@ fn assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # PageAllocator Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_page_allocator_basic() raises:
+def test_page_allocator_basic() raises:
     """PageAllocator allocates and tracks pages."""
     var alloc = PageAllocator(max_pages=8, page_size=4, kv_dim=6)
     assert_true(alloc.num_free() == 8, "8 free pages initially")
@@ -68,7 +68,7 @@ fn test_page_allocator_basic() raises:
     print("  page_allocator_basic: PASS")
 
 
-fn test_page_allocator_exhaustion() raises:
+def test_page_allocator_exhaustion() raises:
     """PageAllocator raises on exhaustion."""
     var alloc = PageAllocator(max_pages=2, page_size=4, kv_dim=4)
     _ = alloc.allocate()
@@ -84,7 +84,7 @@ fn test_page_allocator_exhaustion() raises:
     print("  page_allocator_exhaustion: PASS")
 
 
-fn test_page_allocator_reuse() raises:
+def test_page_allocator_reuse() raises:
     """Deallocated pages can be reused."""
     var alloc = PageAllocator(max_pages=2, page_size=4, kv_dim=4)
     var p0 = alloc.allocate()
@@ -104,7 +104,7 @@ fn test_page_allocator_reuse() raises:
 # PageTable Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_page_table_resolution() raises:
+def test_page_table_resolution() raises:
     """PageTable maps logical positions to page indices and slots."""
     var pt = PageTable(page_size=4)
 
@@ -127,7 +127,7 @@ fn test_page_table_resolution() raises:
 # PagedKVCache Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_paged_cache_append() raises:
+def test_paged_cache_append() raises:
     """PagedKVCache allocates pages on demand during append."""
     var num_kv = 1
     var hd = 2
@@ -165,7 +165,7 @@ fn test_paged_cache_append() raises:
     print("  paged_cache_append: PASS")
 
 
-fn test_paged_cache_read_write() raises:
+def test_paged_cache_read_write() raises:
     """PagedKVCache reads match written data."""
     var num_kv = 2
     var hd = 3
@@ -199,7 +199,7 @@ fn test_paged_cache_read_write() raises:
     print("  paged_cache_read_write: PASS")
 
 
-fn test_paged_cache_multi_page() raises:
+def test_paged_cache_multi_page() raises:
     """PagedKVCache handles sequences spanning multiple pages."""
     var num_kv = 1
     var hd = 2
@@ -233,7 +233,7 @@ fn test_paged_cache_multi_page() raises:
     print("  paged_cache_multi_page: PASS")
 
 
-fn test_paged_cache_multi_layer() raises:
+def test_paged_cache_multi_layer() raises:
     """Each layer allocates pages independently."""
     var num_kv = 1
     var hd = 2
@@ -278,7 +278,7 @@ fn test_paged_cache_multi_layer() raises:
 # Paged Attention Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_paged_attention_matches_direct() raises:
+def test_paged_attention_matches_direct() raises:
     """Paged attention produces same results as direct contiguous attention."""
     var num_q = 2
     var num_kv = 1
@@ -328,7 +328,7 @@ fn test_paged_attention_matches_direct() raises:
     print("  paged_attention_matches_direct: PASS")
 
 
-fn test_paged_cache_free() raises:
+def test_paged_cache_free() raises:
     """Freeing pages reclaims memory."""
     var cache = PagedKVCache(
         max_pages=8, page_size=4,
@@ -359,7 +359,7 @@ fn test_paged_cache_free() raises:
     print("  paged_cache_free: PASS")
 
 
-fn test_paged_cache_can_fit() raises:
+def test_paged_cache_can_fit() raises:
     """Can_fit checks available capacity."""
     var cache = PagedKVCache(
         max_pages=4, page_size=4,
@@ -376,7 +376,7 @@ fn test_paged_cache_can_fit() raises:
     print("  paged_cache_can_fit: PASS")
 
 
-fn test_memory_savings() raises:
+def test_memory_savings() raises:
     """Paged cache uses less memory than contiguous for short sequences."""
     var num_layers = 2
     var num_kv = 4
@@ -402,7 +402,7 @@ fn test_memory_savings() raises:
           String(paged_bytes // 1024) + " KB paged): PASS")
 
 
-fn test_benchmark_paged_decode() raises:
+def test_benchmark_paged_decode() raises:
     """Benchmark paged vs contiguous attention performance."""
     var num_q = 4
     var num_kv = 2
@@ -467,7 +467,7 @@ fn test_benchmark_paged_decode() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_paged_kv_cache:")
 
     # PageAllocator

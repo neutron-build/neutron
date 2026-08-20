@@ -12,19 +12,19 @@ from neutron_mojo.train.lora_train import TrainableLoRA, LoRATrainableLM
 from neutron_mojo.train.losses import cross_entropy_loss, sequence_cross_entropy_loss
 
 
-fn assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
+def assert_close(a: Float32, b: Float32, rtol: Float64 = 1e-3, atol: Float64 = 1e-3) raises:
     var diff = abs(Float64(a) - Float64(b))
     var threshold = atol + rtol * abs(Float64(b))
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_lora_init() raises:
+def test_lora_init() raises:
     """TrainableLoRA initializes with correct fields."""
     var lora = TrainableLoRA(in_features=8, out_features=8, rank=2)
     assert_eq(lora.in_features, 8)
@@ -37,7 +37,7 @@ fn test_lora_init() raises:
     print("  lora_init: PASS")
 
 
-fn test_lora_register() raises:
+def test_lora_register() raises:
     """TrainableLoRA registers A and B on tape."""
     var tape = Tape(65536)
     var lora = TrainableLoRA(in_features=4, out_features=4, rank=2)
@@ -57,7 +57,7 @@ fn test_lora_register() raises:
     print("  lora_register: PASS")
 
 
-fn test_lora_b_zero_init() raises:
+def test_lora_b_zero_init() raises:
     """LoRA B matrix starts at zero (so delta = 0 initially)."""
     var tape = Tape(65536)
     var lora = TrainableLoRA(in_features=4, out_features=4, rank=2)
@@ -69,7 +69,7 @@ fn test_lora_b_zero_init() raises:
     print("  lora_b_zero_init: PASS")
 
 
-fn test_lora_forward_zero_delta() raises:
+def test_lora_forward_zero_delta() raises:
     """LoRA forward with zero B produces zero output."""
     var tape = Tape(65536)
     var lora = TrainableLoRA(in_features=4, out_features=4, rank=2)
@@ -90,7 +90,7 @@ fn test_lora_forward_zero_delta() raises:
     print("  lora_forward_zero_delta: PASS")
 
 
-fn test_lora_forward_shape() raises:
+def test_lora_forward_shape() raises:
     """LoRA forward produces correct output shape."""
     var tape = Tape(65536)
     var lora = TrainableLoRA(in_features=4, out_features=6, rank=2)
@@ -108,7 +108,7 @@ fn test_lora_forward_shape() raises:
     print("  lora_forward_shape: PASS")
 
 
-fn test_lora_copy() raises:
+def test_lora_copy() raises:
     """TrainableLoRA is Copyable."""
     var lora1 = TrainableLoRA(in_features=4, out_features=4, rank=2)
     var lora2 = lora1
@@ -117,7 +117,7 @@ fn test_lora_copy() raises:
     print("  lora_copy: PASS")
 
 
-fn test_lora_backward() raises:
+def test_lora_backward() raises:
     """LoRA backward produces gradients for A and B."""
     var tape = Tape(65536)
     var lora = TrainableLoRA(in_features=4, out_features=4, rank=2)
@@ -160,7 +160,7 @@ fn test_lora_backward() raises:
     print("  lora_backward: PASS")
 
 
-fn test_lora_lm_init() raises:
+def test_lora_lm_init() raises:
     """LoRATrainableLM initializes with correct structure."""
     var lora_lm = LoRATrainableLM(vocab_size=8, hidden_dim=4, num_layers=2, rank=2, ffn_dim=8)
     assert_eq(len(lora_lm.lora_q), 2)
@@ -169,7 +169,7 @@ fn test_lora_lm_init() raises:
     print("  lora_lm_init: PASS")
 
 
-fn test_lora_lm_register() raises:
+def test_lora_lm_register() raises:
     """LoRATrainableLM registers all parameters."""
     var tape = Tape(524288)
     var lora_lm = LoRATrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, rank=2, ffn_dim=8)
@@ -183,7 +183,7 @@ fn test_lora_lm_register() raises:
     print("  lora_lm_register: PASS")
 
 
-fn test_lora_lm_forward() raises:
+def test_lora_lm_forward() raises:
     """LoRATrainableLM forward produces logits."""
     var tape = Tape(524288)
     var lora_lm = LoRATrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, rank=2, ffn_dim=8)
@@ -194,7 +194,7 @@ fn test_lora_lm_forward() raises:
     print("  lora_lm_forward: PASS")
 
 
-fn test_lora_lm_freeze_base() raises:
+def test_lora_lm_freeze_base() raises:
     """freeze_base disables gradients for base model params."""
     var tape = Tape(524288)
     var lora_lm = LoRATrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, rank=2, ffn_dim=8)
@@ -215,7 +215,7 @@ fn test_lora_lm_freeze_base() raises:
     print("  lora_lm_freeze_base: PASS")
 
 
-fn test_lora_param_count() raises:
+def test_lora_param_count() raises:
     """Total LoRA params is much smaller than base."""
     var tape = Tape(524288)
     var lora_lm = LoRATrainableLM(vocab_size=8, hidden_dim=4, num_layers=2, rank=2, ffn_dim=8)
@@ -232,7 +232,7 @@ fn test_lora_param_count() raises:
     print("  lora_param_count: PASS (lora=" + String(lora_total) + " base=" + String(base_total) + ")")
 
 
-fn test_seq_cross_entropy_basic() raises:
+def test_seq_cross_entropy_basic() raises:
     """sequence_cross_entropy_loss computes average loss."""
     var tape = Tape(65536)
 
@@ -243,7 +243,7 @@ fn test_seq_cross_entropy_basic() raises:
         dims.append(4)
         var l_idx = tape.add_variable(dims^)
         for i in range(4):
-            tape.set_data(l_idx, i, Float32(0.25 * (i + 1) + t * 0.1))
+            tape.set_data(l_idx, i, Float32(0.25 * Float64(i + 1) + Float64(t) * 0.1))
         logits_list.append(l_idx)
 
     var targets = List[Int]()
@@ -259,7 +259,7 @@ fn test_seq_cross_entropy_basic() raises:
     print("  seq_cross_entropy_basic: PASS (loss=" + String(loss_val) + ")")
 
 
-fn test_seq_cross_entropy_backward() raises:
+def test_seq_cross_entropy_backward() raises:
     """sequence_cross_entropy_loss backward produces gradients."""
     var tape = Tape(65536)
 
@@ -269,7 +269,7 @@ fn test_seq_cross_entropy_backward() raises:
         dims.append(4)
         var l_idx = tape.add_variable(dims^)
         for i in range(4):
-            tape.set_data(l_idx, i, Float32(0.5 * (i + 1)))
+            tape.set_data(l_idx, i, Float32(0.5 * Float64(i + 1)))
         logits_list.append(l_idx)
 
     var targets = List[Int]()
@@ -291,7 +291,7 @@ fn test_seq_cross_entropy_backward() raises:
     print("  seq_cross_entropy_backward: PASS")
 
 
-fn test_lora_lm_backward_frozen() raises:
+def test_lora_lm_backward_frozen() raises:
     """LoRA backward with frozen base: only LoRA params get gradients."""
     var tape = Tape(524288)
     var lora_lm = LoRATrainableLM(vocab_size=8, hidden_dim=4, num_layers=1, rank=2, ffn_dim=8)
@@ -320,7 +320,7 @@ fn test_lora_lm_backward_frozen() raises:
     print("  lora_lm_backward_frozen: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_lora_training:")
     test_lora_init()
     test_lora_register()

@@ -12,12 +12,12 @@ from neutron_mojo.nn.tokenizer import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_eq(a: Int, b: Int, msg: String) raises:
+def assert_eq(a: Int, b: Int, msg: String) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + msg
@@ -25,7 +25,7 @@ fn assert_eq(a: Int, b: Int, msg: String) raises:
         )
 
 
-fn test_parse_merge_rule() raises:
+def test_parse_merge_rule() raises:
     """Test parsing merge rule strings."""
     var p1 = _parse_merge_rule("hello world")
     assert_true(p1.left == "hello", "left should be 'hello'")
@@ -47,7 +47,7 @@ fn test_parse_merge_rule() raises:
     print("  parse_merge_rule: PASS")
 
 
-fn test_load_gguf_tokenizer_basic() raises:
+def test_load_gguf_tokenizer_basic() raises:
     """Test creating a tokenizer from GGUF-style vocab data."""
     var vocab = List[String]()
     vocab.append("<bos>")   # 0
@@ -83,7 +83,7 @@ fn test_load_gguf_tokenizer_basic() raises:
     print("  load_gguf_tokenizer_basic: PASS")
 
 
-fn test_special_token_ids() raises:
+def test_special_token_ids() raises:
     """Test BOS/EOS token ID extraction."""
     var vocab = List[String]()
     vocab.append("a")       # 0
@@ -104,7 +104,7 @@ fn test_special_token_ids() raises:
     print("  special_token_ids: PASS")
 
 
-fn test_empty_merges() raises:
+def test_empty_merges() raises:
     """Test tokenizer with vocab only, no merges."""
     var vocab = List[String]()
     vocab.append("a")
@@ -131,7 +131,7 @@ fn test_empty_merges() raises:
     print("  empty_merges: PASS")
 
 
-fn test_encode_decode_roundtrip() raises:
+def test_encode_decode_roundtrip() raises:
     """Test full encode-decode roundtrip with merges."""
     var vocab = List[String]()
     vocab.append("t")       # 0
@@ -160,7 +160,7 @@ fn test_encode_decode_roundtrip() raises:
     print("  encode_decode_roundtrip: PASS")
 
 
-fn test_byte_level_token_handling() raises:
+def test_byte_level_token_handling() raises:
     """Test that byte-level tokens (non-ASCII) are handled."""
     var vocab = List[String]()
     vocab.append("a")
@@ -184,7 +184,7 @@ fn test_byte_level_token_handling() raises:
     print("  byte_level_token_handling: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_tokenizer_loading:")
 
     test_parse_merge_rule()

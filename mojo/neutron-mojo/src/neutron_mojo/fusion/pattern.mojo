@@ -9,7 +9,7 @@ Matching extracts variable bindings from e-graph nodes. This enables
 declarative rewrite rules for equality saturation.
 """
 
-from collections import List, Dict, Optional
+from std.collections import List, Dict, Optional
 from .graph import OpKind
 from .eclass import ClassId
 from .egraph import EGraph, CanonicalNode
@@ -32,16 +32,16 @@ struct PatternKind(Writable, TrivialRegisterPassable):
     comptime Op = PatternKind(2)
 
     @implicit
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self._value = value
 
-    fn __eq__(self, other: PatternKind) -> Bool:
+    def __eq__(self, other: PatternKind) -> Bool:
         return self._value == other._value
 
-    fn __ne__(self, other: PatternKind) -> Bool:
+    def __ne__(self, other: PatternKind) -> Bool:
         return self._value != other._value
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         if self._value == 0:
             writer.write("Var")
         elif self._value == 1:
@@ -56,7 +56,7 @@ struct PatternKind(Writable, TrivialRegisterPassable):
 # Pattern — Pattern node with optional operation and sub-patterns
 # ===----------------------------------------------------------------------=== #
 
-struct Pattern(Copyable, Movable):
+struct Pattern(Copyable, Movable, ImplicitlyCopyable):
     """A pattern node for matching against e-graph nodes.
 
     Patterns can be:
@@ -70,7 +70,7 @@ struct Pattern(Copyable, Movable):
     var op: OpKind  # For Op: the operation kind
     var children: List[Pattern]  # For Op: sub-patterns
 
-    fn __init__(out self, kind: PatternKind):
+    def __init__(out self, kind: PatternKind):
         """Create a pattern node."""
         self.kind = kind
         self.var_id = -1
@@ -78,16 +78,22 @@ struct Pattern(Copyable, Movable):
         self.op = OpKind(0)
         self.children = List[Pattern]()
 
-    fn __copyinit__(out self, existing: Self):
-        self.kind = existing.kind
-        self.var_id = existing.var_id
-        self.class_id = existing.class_id
-        self.op = existing.op
-        self.children = List[Pattern]()
-        for i in range(len(existing.children)):
-            self.children.append(existing.children[i].copy())
+    def __deinit__(deinit self):
+        # List[Pattern] is not Deinitable (recursive type): free this level's
+        # storage via deinit_with; nested children storage is not recursively
+        # destroyed (small pattern trees, process-lifetime in practice).
+        self.children^ .deinit_with(_destroy_pattern)
 
-    fn copy(self) -> Pattern:
+    def __init__(out self, *, copy: Self):
+        self.kind = copy.kind
+        self.var_id = copy.var_id
+        self.class_id = copy.class_id
+        self.op = copy.op
+        self.children = List[Pattern]()
+        for i in range(len(copy.children)):
+            self.children.append(copy.children[i].copy())
+
+    def copy(self) -> Pattern:
         """Return a deep copy of this pattern."""
         var p = Pattern(self.kind)
         p.var_id = self.var_id
@@ -98,27 +104,27 @@ struct Pattern(Copyable, Movable):
         return p^
 
     @staticmethod
-    fn variable(var_id: Int) -> Pattern:
+    def variable(var_id: Int) -> Pattern:
         """Create a variable pattern (e.g., `?x`)."""
         var p = Pattern(PatternKind.Var)
         p.var_id = var_id
         return p^
 
     @staticmethod
-    fn constant(class_id: ClassId) -> Pattern:
+    def constant(class_id: ClassId) -> Pattern:
         """Create a constant pattern matching a specific e-class."""
         var p = Pattern(PatternKind.Const)
         p.class_id = class_id.id()
         return p^
 
     @staticmethod
-    fn operation(op: OpKind) -> Pattern:
+    def operation(op: OpKind) -> Pattern:
         """Create an operation pattern (e.g., `(add ?x ?y)`)."""
         var p = Pattern(PatternKind.Op)
         p.op = op
         return p^
 
-    fn add_child(mut self, var child: Pattern):
+    def add_child(mut self, var child: Pattern):
         """Add a sub-pattern to this operation pattern."""
         self.children.append(child^)
 
@@ -127,7 +133,7 @@ struct Pattern(Copyable, Movable):
 # Bindings — Variable bindings from pattern matching
 # ===----------------------------------------------------------------------=== #
 
-struct Bindings(Copyable, Movable):
+struct Bindings(Copyable, Movable, ImplicitlyCopyable):
     """Variable bindings from pattern matching.
 
     Maps variable indices to ClassIds. For example, if pattern `(add ?x ?y)`
@@ -135,16 +141,16 @@ struct Bindings(Copyable, Movable):
     """
     var _bindings: List[Int]  # var_id -> ClassId.id(), -1 if unbound
 
-    fn __init__(out self, num_vars: Int):
+    def __init__(out self, num_vars: Int):
         """Create bindings for num_vars variables, all initially unbound."""
         self._bindings = List[Int]()
         for _ in range(num_vars):
             self._bindings.append(-1)
 
-    fn __copyinit__(out self, existing: Self):
-        self._bindings = existing._bindings.copy()
+    def __init__(out self, *, copy: Self):
+        self._bindings = copy._bindings.copy()
 
-    fn bind(mut self, var_id: Int, class_id: ClassId) raises:
+    def bind(mut self, var_id: Int, class_id: ClassId) raises:
         """Bind a variable to an e-class.
 
         Raises error if variable is already bound to a different class.
@@ -161,7 +167,7 @@ struct Bindings(Copyable, Movable):
             raise Error("Variable already bound to different class")
         # else: already bound to same class, OK
 
-    fn get(self, var_id: Int) raises -> ClassId:
+    def get(self, var_id: Int) raises -> ClassId:
         """Get the ClassId bound to a variable.
 
         Raises error if variable is not bound.
@@ -173,7 +179,7 @@ struct Bindings(Copyable, Movable):
             raise Error("Variable not bound")
         return ClassId(cid)
 
-    fn is_bound(self, var_id: Int) -> Bool:
+    def is_bound(self, var_id: Int) -> Bool:
         """Check if a variable is bound."""
         if var_id < 0 or var_id >= len(self._bindings):
             return False
@@ -184,7 +190,7 @@ struct Bindings(Copyable, Movable):
 # Helper Functions — Pattern matching
 # ===----------------------------------------------------------------------=== #
 
-fn match_pattern(
+def match_pattern(
     pattern: Pattern,
     class_id: ClassId,
     mut bindings: Bindings,
@@ -215,7 +221,7 @@ fn match_pattern(
     return False
 
 
-fn match_pattern_egraph(
+def match_pattern_egraph(
     pattern: Pattern,
     class_id: ClassId,
     mut bindings: Bindings,
@@ -282,3 +288,8 @@ fn match_pattern_egraph(
                 return True
 
     return False
+
+
+def _destroy_pattern(var p: Pattern):
+    """deinit_with callback for List[Pattern] (see Pattern.__deinit__)."""
+    pass

@@ -18,7 +18,7 @@ dequantized to F32 on load. Direct Q8 loading preserves quantized data.
 
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
-from neutron_mojo.io.binary_reader import BinaryReader, _fp16_to_fp32, mmap_reader
+from neutron_mojo.io.binary_reader import BinaryReader, _fp16_to_fp32, mmap_reader, _u32_to_f32
 from neutron_mojo.io.gguf import (
     GGUFFile,
     GGUFTensorInfo,
@@ -34,14 +34,14 @@ from neutron_mojo.io.gguf import (
 from neutron_mojo.model.config import ModelConfig
 from neutron_mojo.model.populate import model_from_config, load_named_weight, normalize_weight_name
 from neutron_mojo.nn.model import Model, ModelParams
-from neutron_mojo.nn.q_model import QuantizedModel, quantize_from_model, _num_blocks
+from neutron_mojo.nn.q_model import QuantizedModel, quantize_from_model, _num_blocks, _quantize_projection
 
 
 # ===----------------------------------------------------------------------=== #
 # Tensor Reading — F32 / F16
 # ===----------------------------------------------------------------------=== #
 
-fn read_tensor_f32(
+def read_tensor_f32(
     mut reader: BinaryReader, offset: Int, numel: Int
 ) raises -> Tensor[DType.float32]:
     """Read F32 tensor data from binary reader.
@@ -58,7 +58,7 @@ fn read_tensor_f32(
     return reader.read_f32_array(numel)
 
 
-fn read_tensor_f16_as_f32(
+def read_tensor_f16_as_f32(
     mut reader: BinaryReader, offset: Int, numel: Int
 ) raises -> Tensor[DType.float32]:
     """Read FP16 tensor data, converting to F32.
@@ -79,7 +79,7 @@ fn read_tensor_f16_as_f32(
 # Tensor Reading — Q8_0 / Q4_0 (dequant to F32)
 # ===----------------------------------------------------------------------=== #
 
-fn read_tensor_q8_0_as_f32(
+def read_tensor_q8_0_as_f32(
     mut reader: BinaryReader, offset: Int, numel: Int
 ) raises -> Tensor[DType.float32]:
     """Read Q8_0 tensor data and dequantize to F32.
@@ -134,7 +134,7 @@ fn read_tensor_q8_0_as_f32(
     return result^
 
 
-fn read_tensor_q4_0_as_f32(
+def read_tensor_q4_0_as_f32(
     mut reader: BinaryReader, offset: Int, numel: Int
 ) raises -> Tensor[DType.float32]:
     """Read Q4_0 tensor data and dequantize to F32.
@@ -194,7 +194,7 @@ fn read_tensor_q4_0_as_f32(
 # GGUF -> Model
 # ===----------------------------------------------------------------------=== #
 
-fn load_gguf_model(path: String) raises -> Model:
+def load_gguf_model(path: String) raises -> Model:
     """Load a GGUF model file into a Model struct.
 
     Steps:
@@ -230,7 +230,7 @@ fn load_gguf_model(path: String) raises -> Model:
     return model^
 
 
-fn _load_known_weights(
+def _load_known_weights(
     mut model: Model, gguf: GGUFFile, mut reader: BinaryReader
 ) raises:
     """Load known weight tensors from GGUF into model.
@@ -270,7 +270,7 @@ fn _load_known_weights(
         _try_load_tensor_multi(model, gguf, reader, gp + "ffn_down.weight", hp + "mlp.down_proj.weight")
 
 
-fn _try_load_tensor_multi(
+def _try_load_tensor_multi(
     mut model: Model,
     gguf: GGUFFile,
     mut reader: BinaryReader,
@@ -316,7 +316,7 @@ fn _try_load_tensor_multi(
     load_named_weight(model, hf_name, data, numel)
 
 
-fn load_gguf_model_from_buffer(var buf: List[UInt8]) raises -> Model:
+def load_gguf_model_from_buffer(var buf: List[UInt8]) raises -> Model:
     """Load a GGUF model from an in-memory buffer (for testing).
 
     Args:
@@ -338,7 +338,7 @@ fn load_gguf_model_from_buffer(var buf: List[UInt8]) raises -> Model:
     return model^
 
 
-fn load_gguf_quantized(path: String, block_size: Int = 32) raises -> QuantizedModel:
+def load_gguf_quantized(path: String, block_size: Int = 32) raises -> QuantizedModel:
     """Load GGUF as FP32 model, then quantize to Q8.
 
     Args:
@@ -361,20 +361,20 @@ struct QuantizedTensorData(Movable):
     var data: Tensor[DType.float32]
     var scales: Tensor[DType.float32]
 
-    fn __init__(out self, var data: Tensor[DType.float32], var scales: Tensor[DType.float32]):
+    def __init__(out self, var data: Tensor[DType.float32], var scales: Tensor[DType.float32]):
         self.data = data^
         self.scales = scales^
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.data = other.data^
-        self.scales = other.scales^
+    def __init__(out self, *, deinit move: Self):
+        self.data = move.data^
+        self.scales = move.scales^
 
 
 # ===----------------------------------------------------------------------=== #
 # Direct Q8 Reading
 # ===----------------------------------------------------------------------=== #
 
-fn read_tensor_q8_0_as_quantized(
+def read_tensor_q8_0_as_quantized(
     mut reader: BinaryReader, offset: Int, numel: Int, block_size: Int
 ) raises -> QuantizedTensorData:
     """Read Q8_0 tensor data directly into quantized format.
@@ -437,7 +437,7 @@ fn read_tensor_q8_0_as_quantized(
 # Direct Q8 GGUF Loading
 # ===----------------------------------------------------------------------=== #
 
-fn _load_q8_projection(
+def _load_q8_projection(
     mut model: QuantizedModel,
     mut reader: BinaryReader,
     abs_offset: Int,
@@ -477,7 +477,7 @@ fn _load_q8_projection(
         model.layer_scales.set(scale_offset + i, qtd.scales.get(i))
 
 
-fn _load_q8_known_weights(
+def _load_q8_known_weights(
     mut model: QuantizedModel, gguf: GGUFFile, mut reader: BinaryReader
 ) raises:
     """Load known weight tensors from GGUF into QuantizedModel.
@@ -523,7 +523,7 @@ fn _load_q8_known_weights(
         _try_load_q8_projection(model, gguf, reader, gp + "ffn_down.weight", hp + "mlp.down_proj.weight", off.w_down, soff.w_down, p.hidden_dim, p.ffn_dim)
 
 
-fn _try_load_q8_tensor_f32(
+def _try_load_q8_tensor_f32(
     mut model: QuantizedModel,
     gguf: GGUFFile,
     mut reader: BinaryReader,
@@ -576,7 +576,7 @@ fn _try_load_q8_tensor_f32(
             model.lm_head.set(i, data.get(i))
 
 
-fn _try_load_q8_tensor_norm(
+def _try_load_q8_tensor_norm(
     mut model: QuantizedModel,
     gguf: GGUFFile,
     mut reader: BinaryReader,
@@ -618,7 +618,7 @@ fn _try_load_q8_tensor_norm(
         model.layer_weights.set(weight_offset + i, data.get(i))
 
 
-fn _try_load_q8_projection(
+def _try_load_q8_projection(
     mut model: QuantizedModel,
     gguf: GGUFFile,
     mut reader: BinaryReader,
@@ -677,7 +677,6 @@ fn _try_load_q8_projection(
             raise Error("Unsupported tensor type for " + found_name)
 
         # Quantize the F32 data into the model's Q8 storage
-        from neutron_mojo.nn.q_model import _quantize_projection
         _quantize_projection(
             data, 0,
             model.layer_weights, weight_offset,
@@ -686,7 +685,7 @@ fn _try_load_q8_projection(
         )
 
 
-fn load_gguf_quantized_direct(path: String, block_size: Int = 32) raises -> QuantizedModel:
+def load_gguf_quantized_direct(path: String, block_size: Int = 32) raises -> QuantizedModel:
     """Load GGUF directly into QuantizedModel without Q8->F32->Q8 roundtrip.
 
     For Q8_0 tensors, reads quantized data directly into QuantizedModel storage.
@@ -721,7 +720,7 @@ fn load_gguf_quantized_direct(path: String, block_size: Int = 32) raises -> Quan
     return model^
 
 
-fn load_gguf_quantized_direct_from_buffer(var buf: List[UInt8], block_size: Int = 32) raises -> QuantizedModel:
+def load_gguf_quantized_direct_from_buffer(var buf: List[UInt8], block_size: Int = 32) raises -> QuantizedModel:
     """Load GGUF directly into QuantizedModel from an in-memory buffer.
 
     For Q8_0 tensors, reads quantized data directly into QuantizedModel storage.
@@ -761,7 +760,7 @@ fn load_gguf_quantized_direct_from_buffer(var buf: List[UInt8], block_size: Int 
 # SafeTensors Loading (Sprint 14)
 # ===----------------------------------------------------------------------=== #
 
-fn _read_safetensors_tensor(
+def _read_safetensors_tensor(
     mut reader: BinaryReader,
     data_base_offset: Int,
     info_start: Int,
@@ -800,14 +799,13 @@ fn _read_safetensors_tensor(
             var b0 = Int(reader.read_u8())
             var b1 = Int(reader.read_u8())
             var f32_bits = UInt32((b0 | (b1 << 8)) << 16)
-            from neutron_mojo.io.binary_reader import _u32_to_f32
             result.set(i, _u32_to_f32(f32_bits))
         return result^
     else:
         raise Error("Unsupported SafeTensors dtype: " + dtype)
 
 
-fn load_safetensors_model(
+def load_safetensors_model(
     path: String, config: ModelConfig
 ) raises -> Model:
     """Load a single SafeTensors file into a Model.
@@ -835,7 +833,7 @@ fn load_safetensors_model(
     return model^
 
 
-fn _load_safetensors_weights(
+def _load_safetensors_weights(
     mut model: Model,
     st: SafeTensorsFile,
     mut reader: BinaryReader,
@@ -872,7 +870,7 @@ fn _load_safetensors_weights(
         _try_load_st_tensor(model, st, reader, lp + "mlp.down_proj.weight")
 
 
-fn _try_load_st_tensor(
+def _try_load_st_tensor(
     mut model: Model,
     st: SafeTensorsFile,
     mut reader: BinaryReader,
@@ -899,7 +897,7 @@ fn _try_load_st_tensor(
     load_named_weight(model, name, data, numel)
 
 
-fn load_safetensors_sharded(
+def load_safetensors_sharded(
     index_path: String, config: ModelConfig
 ) raises -> Model:
     """Load a sharded SafeTensors model from an index file.
@@ -964,7 +962,7 @@ fn load_safetensors_sharded(
     return model^
 
 
-fn load_safetensors_from_buffer(
+def load_safetensors_from_buffer(
     var buf: List[UInt8], config: ModelConfig
 ) raises -> Model:
     """Load a SafeTensors model from an in-memory buffer (for testing).
@@ -1034,7 +1032,7 @@ fn load_safetensors_from_buffer(
 # Memory-Mapped Loading (Sprint 13)
 # ===----------------------------------------------------------------------=== #
 
-fn load_gguf_model_mmap(path: String) raises -> Model:
+def load_gguf_model_mmap(path: String) raises -> Model:
     """Load a GGUF model file using memory-mapped I/O.
 
     Same as load_gguf_model() but uses mmap instead of slurping the
@@ -1065,7 +1063,7 @@ fn load_gguf_model_mmap(path: String) raises -> Model:
     return model^
 
 
-fn load_gguf_quantized_mmap(path: String, block_size: Int = 32) raises -> QuantizedModel:
+def load_gguf_quantized_mmap(path: String, block_size: Int = 32) raises -> QuantizedModel:
     """Load GGUF as FP32 model via mmap, then quantize to Q8.
 
     Args:
@@ -1079,7 +1077,7 @@ fn load_gguf_quantized_mmap(path: String, block_size: Int = 32) raises -> Quanti
     return quantize_from_model(model, block_size)
 
 
-fn load_gguf_quantized_direct_mmap(path: String, block_size: Int = 32) raises -> QuantizedModel:
+def load_gguf_quantized_direct_mmap(path: String, block_size: Int = 32) raises -> QuantizedModel:
     """Load GGUF directly into QuantizedModel via mmap, no Q8->F32->Q8 roundtrip.
 
     Same as load_gguf_quantized_direct() but using memory-mapped I/O.

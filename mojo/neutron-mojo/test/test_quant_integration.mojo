@@ -11,7 +11,7 @@ Validates that all Sprint 2c components work together:
 - Weight loading interface
 """
 
-from math import abs
+from std.math import abs
 
 # Quantization
 from neutron_mojo.quant.nf4 import (
@@ -68,7 +68,7 @@ from neutron_mojo.model.loader import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
@@ -77,7 +77,7 @@ fn assert_true(cond: Bool, msg: String) raises:
 # Integration Test 1: Full NF4 quantization pipeline
 # ===----------------------------------------------------------------------=== #
 
-fn test_nf4_full_pipeline() raises:
+def test_nf4_full_pipeline() raises:
     """Test NF4 quantize → pack → unpack → dequantize pipeline."""
     # Simulate weight block (8 FP32 values)
     var weights = List[Float32]()
@@ -125,7 +125,7 @@ fn test_nf4_full_pipeline() raises:
 # Integration Test 2: Q8_0 quantization with model dimensions
 # ===----------------------------------------------------------------------=== #
 
-fn test_q8_0_model_weight_simulation() raises:
+def test_q8_0_model_weight_simulation() raises:
     """Simulate quantizing a Llama-3 weight block with Q8_0."""
     var config = llama3_8b_config()
 
@@ -170,7 +170,7 @@ fn test_q8_0_model_weight_simulation() raises:
 # Integration Test 3: Q4_K quantization pipeline
 # ===----------------------------------------------------------------------=== #
 
-fn test_q4_k_pipeline() raises:
+def test_q4_k_pipeline() raises:
     """Test Q4_K asymmetric quantization pipeline."""
     var data = List[Float32]()
     for i in range(64):
@@ -206,7 +206,7 @@ fn test_q4_k_pipeline() raises:
 # Integration Test 4: SafeTensors + model config + weight loading
 # ===----------------------------------------------------------------------=== #
 
-fn test_safetensors_model_loading() raises:
+def test_safetensors_model_loading() raises:
     """Simulate loading a SafeTensors model file."""
     var config = llama3_8b_config()
 
@@ -266,7 +266,7 @@ fn test_safetensors_model_loading() raises:
 # Integration Test 5: GGUF + quantized weights + model config
 # ===----------------------------------------------------------------------=== #
 
-fn test_gguf_quantized_model_loading() raises:
+def test_gguf_quantized_model_loading() raises:
     """Simulate loading a GGUF quantized model."""
     var config = llama3_8b_config()
 
@@ -328,7 +328,7 @@ fn test_gguf_quantized_model_loading() raises:
 # Integration Test 6: Multi-format weight size comparison
 # ===----------------------------------------------------------------------=== #
 
-fn test_weight_size_comparison() raises:
+def test_weight_size_comparison() raises:
     """Compare weight sizes across quantization formats for same tensor."""
     var config = llama3_8b_config()
     var numel = config.hidden_size * config.hidden_size  # 4096 * 4096
@@ -367,7 +367,7 @@ fn test_weight_size_comparison() raises:
 # Integration Test 7: Model config → weight count estimation
 # ===----------------------------------------------------------------------=== #
 
-fn test_model_weight_inventory() raises:
+def test_model_weight_inventory() raises:
     """Verify expected weight count for a model architecture."""
     var config = llama3_8b_config()
 
@@ -400,7 +400,7 @@ fn test_model_weight_inventory() raises:
 # Integration Test 8: Quantization config integration
 # ===----------------------------------------------------------------------=== #
 
-fn test_quant_config_integration() raises:
+def test_quant_config_integration() raises:
     """Test QuantConfig works with model dimensions."""
     var nf4_cfg = nf4_config()
     var q8_cfg = q8_0_config()
@@ -428,7 +428,7 @@ fn test_quant_config_integration() raises:
 # Integration Test 9: GQA dimensions validation
 # ===----------------------------------------------------------------------=== #
 
-fn test_gqa_weight_dimensions() raises:
+def test_gqa_weight_dimensions() raises:
     """Verify GQA weight dimensions are consistent."""
     var config = llama3_8b_config()
 
@@ -455,7 +455,7 @@ fn test_gqa_weight_dimensions() raises:
 # Integration Test 10: 70B vs 8B config comparison
 # ===----------------------------------------------------------------------=== #
 
-fn test_model_scale_comparison() raises:
+def test_model_scale_comparison() raises:
     """Compare 8B and 70B model configs."""
     var cfg_8b = llama3_8b_config()
     var cfg_70b = llama3_70b_config()
@@ -488,7 +488,7 @@ fn test_model_scale_comparison() raises:
     print("  model_scale_comparison: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_quant_integration:")
 
     test_nf4_full_pipeline()

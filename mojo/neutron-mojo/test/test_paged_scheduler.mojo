@@ -26,7 +26,7 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("FAIL: " + msg)
 
@@ -35,7 +35,7 @@ fn assert_true(cond: Bool, msg: String) raises:
 # Helper builders
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny model for testing (2 layers, vocab=32, dim=16)."""
     var params = tiny_test_params()
     var model = Model(params)
@@ -53,7 +53,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build tokenizer for tiny model (vocab=32)."""
     var tok = BPETokenizer()
     _ = tok.add_special_token("<bos>", "bos")
@@ -65,14 +65,14 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
     return tok^
 
 
-fn _make_request(prompt: String, max_tokens: Int) -> InferenceRequest:
+def _make_request(prompt: String, max_tokens: Int) -> InferenceRequest:
     """Create an InferenceRequest."""
     var req = InferenceRequest(prompt)
     req.max_tokens = max_tokens
     return req^
 
 
-fn _make_request_with_id(prompt: String, max_tokens: Int, request_id: String) -> InferenceRequest:
+def _make_request_with_id(prompt: String, max_tokens: Int, request_id: String) -> InferenceRequest:
     """Create an InferenceRequest with a specific ID."""
     var req = InferenceRequest(prompt)
     req.max_tokens = max_tokens
@@ -84,7 +84,7 @@ fn _make_request_with_id(prompt: String, max_tokens: Int, request_id: String) ->
 # PagedBatchScheduler Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_paged_scheduler_creation() raises:
+def test_paged_scheduler_creation() raises:
     """Test PagedBatchScheduler initialization."""
     var params = tiny_test_params()
     var sched = PagedBatchScheduler(
@@ -102,7 +102,7 @@ fn test_paged_scheduler_creation() raises:
     print("  paged_scheduler_creation: PASS")
 
 
-fn test_paged_scheduler_enqueue() raises:
+def test_paged_scheduler_enqueue() raises:
     """Test enqueueing requests."""
     var params = tiny_test_params()
     var sched = PagedBatchScheduler(params, max_batch_size=2)
@@ -117,7 +117,7 @@ fn test_paged_scheduler_enqueue() raises:
     print("  paged_scheduler_enqueue: PASS")
 
 
-fn test_paged_scheduler_admit() raises:
+def test_paged_scheduler_admit() raises:
     """Test admitting requests from queue to active batch."""
     var params = tiny_test_params()
     var sched = PagedBatchScheduler(params, max_batch_size=2, max_seq_len=64)
@@ -135,7 +135,7 @@ fn test_paged_scheduler_admit() raises:
     print("  paged_scheduler_admit: PASS")
 
 
-fn test_paged_scheduler_single_request() raises:
+def test_paged_scheduler_single_request() raises:
     """Test processing a single request to completion."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -160,7 +160,7 @@ fn test_paged_scheduler_single_request() raises:
     print("  paged_scheduler_single_request: PASS")
 
 
-fn test_paged_scheduler_multiple_requests() raises:
+def test_paged_scheduler_multiple_requests() raises:
     """Test processing multiple requests."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -188,7 +188,7 @@ fn test_paged_scheduler_multiple_requests() raises:
     print("  paged_scheduler_multiple_requests: PASS")
 
 
-fn test_paged_scheduler_batch_overflow() raises:
+def test_paged_scheduler_batch_overflow() raises:
     """Test that requests beyond batch size wait in queue."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -214,7 +214,7 @@ fn test_paged_scheduler_batch_overflow() raises:
     print("  paged_scheduler_batch_overflow: PASS")
 
 
-fn test_paged_scheduler_stats() raises:
+def test_paged_scheduler_stats() raises:
     """Test that statistics are tracked correctly."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -241,7 +241,7 @@ fn test_paged_scheduler_stats() raises:
     print("  paged_scheduler_stats: PASS")
 
 
-fn test_paged_scheduler_queue_drop() raises:
+def test_paged_scheduler_queue_drop() raises:
     """Test that queue drops are tracked."""
     var params = tiny_test_params()
     var sched = PagedBatchScheduler(
@@ -259,7 +259,7 @@ fn test_paged_scheduler_queue_drop() raises:
     print("  paged_scheduler_queue_drop: PASS")
 
 
-fn test_paged_scheduler_pages_used() raises:
+def test_paged_scheduler_pages_used() raises:
     """Test page usage tracking during processing."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -291,7 +291,7 @@ fn test_paged_scheduler_pages_used() raises:
     print("  paged_scheduler_pages_used: PASS")
 
 
-fn test_paged_scheduler_memory_savings() raises:
+def test_paged_scheduler_memory_savings() raises:
     """Compare memory usage: paged vs contiguous scheduler."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -325,7 +325,7 @@ fn test_paged_scheduler_memory_savings() raises:
     print("  paged_scheduler_memory_savings: PASS")
 
 
-fn test_paged_vs_contiguous_output() raises:
+def test_paged_vs_contiguous_output() raises:
     """Verify paged scheduler produces same tokens as contiguous scheduler."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -363,7 +363,7 @@ fn test_paged_vs_contiguous_output() raises:
     print("  paged_vs_contiguous_output: PASS")
 
 
-fn test_paged_scheduler_peak_batch() raises:
+def test_paged_scheduler_peak_batch() raises:
     """Test peak batch size tracking."""
     var params = tiny_test_params()
     var tok = _build_tiny_tokenizer()
@@ -388,7 +388,7 @@ fn test_paged_scheduler_peak_batch() raises:
 # Main
 # ===----------------------------------------------------------------------=== #
 
-fn main() raises:
+def main() raises:
     print("test_paged_scheduler:")
 
     test_paged_scheduler_creation()

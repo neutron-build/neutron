@@ -14,15 +14,15 @@ from neutron_mojo.quant.fp8 import (
     convert_fp32_to_fp8_e5m2,
     convert_fp8_e5m2_to_fp32,
 )
-from math import abs, isnan
+from std.math import abs, isnan
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
+def assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
     if abs(a - b) > tol:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
@@ -31,7 +31,7 @@ fn assert_close(a: Float32, b: Float32, tol: Float32 = 1e-5) raises:
 # FP8 E4M3 Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_fp8_e4m3_zero() raises:
+def test_fp8_e4m3_zero() raises:
     """Test FP8 E4M3 zero encoding."""
     var q = quantize_fp8_e4m3(Float32(0.0))
     var dq = dequantize_fp8_e4m3(q)
@@ -42,7 +42,7 @@ fn test_fp8_e4m3_zero() raises:
     print("  fp8_e4m3_zero: PASS")
 
 
-fn test_fp8_e4m3_positive() raises:
+def test_fp8_e4m3_positive() raises:
     """Test FP8 E4M3 positive values."""
     var q1 = quantize_fp8_e4m3(Float32(1.0))
     var q10 = quantize_fp8_e4m3(Float32(10.0))
@@ -60,7 +60,7 @@ fn test_fp8_e4m3_positive() raises:
     print("  fp8_e4m3_positive: PASS")
 
 
-fn test_fp8_e4m3_negative() raises:
+def test_fp8_e4m3_negative() raises:
     """Test FP8 E4M3 negative values."""
     var q_neg1 = quantize_fp8_e4m3(Float32(-1.0))
     var q_neg10 = quantize_fp8_e4m3(Float32(-10.0))
@@ -75,7 +75,7 @@ fn test_fp8_e4m3_negative() raises:
     print("  fp8_e4m3_negative: PASS")
 
 
-fn test_fp8_e4m3_small_values() raises:
+def test_fp8_e4m3_small_values() raises:
     """Test FP8 E4M3 small values near zero."""
     var q_small = quantize_fp8_e4m3(Float32(0.1))
     var dq_small = dequantize_fp8_e4m3(q_small)
@@ -87,7 +87,7 @@ fn test_fp8_e4m3_small_values() raises:
     print("  fp8_e4m3_small_values: PASS")
 
 
-fn test_fp8_e4m3_clamping() raises:
+def test_fp8_e4m3_clamping() raises:
     """Test FP8 E4M3 clamping at range limits."""
     # E4M3 max is ~448 - test a value in range
     var q_in_range = quantize_fp8_e4m3(Float32(400.0))
@@ -100,7 +100,7 @@ fn test_fp8_e4m3_clamping() raises:
     print("  fp8_e4m3_clamping: PASS")
 
 
-fn test_fp8_e4m3_roundtrip() raises:
+def test_fp8_e4m3_roundtrip() raises:
     """Test FP8 E4M3 roundtrip for various values."""
     var test_values = List[Float32]()
     test_values.append(Float32(50.0))
@@ -124,7 +124,7 @@ fn test_fp8_e4m3_roundtrip() raises:
 # FP8 E5M2 Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_fp8_e5m2_zero() raises:
+def test_fp8_e5m2_zero() raises:
     """Test FP8 E5M2 zero encoding."""
     var q = quantize_fp8_e5m2(Float32(0.0))
     var dq = dequantize_fp8_e5m2(q)
@@ -135,7 +135,7 @@ fn test_fp8_e5m2_zero() raises:
     print("  fp8_e5m2_zero: PASS")
 
 
-fn test_fp8_e5m2_positive() raises:
+def test_fp8_e5m2_positive() raises:
     """Test FP8 E5M2 positive values."""
     var q1 = quantize_fp8_e5m2(Float32(1.0))
     var q100 = quantize_fp8_e5m2(Float32(100.0))
@@ -153,7 +153,7 @@ fn test_fp8_e5m2_positive() raises:
     print("  fp8_e5m2_positive: PASS")
 
 
-fn test_fp8_e5m2_negative() raises:
+def test_fp8_e5m2_negative() raises:
     """Test FP8 E5M2 negative values."""
     var q_neg1 = quantize_fp8_e5m2(Float32(-1.0))
     var q_neg100 = quantize_fp8_e5m2(Float32(-100.0))
@@ -168,7 +168,7 @@ fn test_fp8_e5m2_negative() raises:
     print("  fp8_e5m2_negative: PASS")
 
 
-fn test_fp8_e5m2_range() raises:
+def test_fp8_e5m2_range() raises:
     """Test FP8 E5M2 has wider range than E4M3."""
     # E5M2 max is ~57344, much larger than E4M3's ~448
     var q_large = quantize_fp8_e5m2(Float32(10000.0))
@@ -180,7 +180,7 @@ fn test_fp8_e5m2_range() raises:
     print("  fp8_e5m2_range: PASS")
 
 
-fn test_fp8_e5m2_roundtrip() raises:
+def test_fp8_e5m2_roundtrip() raises:
     """Test FP8 E5M2 roundtrip for various values."""
     var test_values = List[Float32]()
     test_values.append(Float32(1000.0))
@@ -204,7 +204,7 @@ fn test_fp8_e5m2_roundtrip() raises:
 # Batch Conversion Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_batch_fp8_e4m3_conversion() raises:
+def test_batch_fp8_e4m3_conversion() raises:
     """Test batch FP32 to FP8 E4M3 conversion."""
     # Create input data
     var input_list = List[Float32]()
@@ -233,7 +233,7 @@ fn test_batch_fp8_e4m3_conversion() raises:
     print("  batch_fp8_e4m3_conversion: PASS")
 
 
-fn test_batch_fp8_e5m2_conversion() raises:
+def test_batch_fp8_e5m2_conversion() raises:
     """Test batch FP32 to FP8 E5M2 conversion."""
     # Create input data
     var input_list = List[Float32]()
@@ -262,7 +262,7 @@ fn test_batch_fp8_e5m2_conversion() raises:
     print("  batch_fp8_e5m2_conversion: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_fp8:")
 
     test_fp8_e4m3_zero()

@@ -4,25 +4,25 @@
 
 """Tests for TrainingConfig, TrainingState, TrainingMetrics."""
 
-from math import exp
+from std.math import exp
 from neutron_mojo.train.loop import (
     TrainingConfig, TrainingState, TrainingMetrics, estimate_training_memory,
 )
 
 
-fn assert_close(a: Float64, b: Float64, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
+def assert_close(a: Float64, b: Float64, rtol: Float64 = 1e-3, atol: Float64 = 1e-4) raises:
     var diff = abs(a - b)
     var threshold = atol + rtol * abs(b)
     if diff > threshold:
         raise Error("Values not close: " + String(a) + " vs " + String(b))
 
 
-fn assert_eq(a: Int, b: Int) raises:
+def assert_eq(a: Int, b: Int) raises:
     if a != b:
         raise Error("Not equal: " + String(a) + " vs " + String(b))
 
 
-fn test_config_defaults() raises:
+def test_config_defaults() raises:
     var c = TrainingConfig()
     assert_eq(c.epochs, 10)
     assert_eq(c.batch_size, 4)
@@ -30,7 +30,7 @@ fn test_config_defaults() raises:
     print("  config_defaults: PASS")
 
 
-fn test_config_copy() raises:
+def test_config_copy() raises:
     var c = TrainingConfig()
     c.lr = 0.01
     var c2 = c.copy()
@@ -38,7 +38,7 @@ fn test_config_copy() raises:
     print("  config_copy: PASS")
 
 
-fn test_state_avg_loss() raises:
+def test_state_avg_loss() raises:
     var s = TrainingState()
     s.record_loss(1.0)
     s.record_loss(3.0)
@@ -47,7 +47,7 @@ fn test_state_avg_loss() raises:
     print("  state_avg_loss: PASS")
 
 
-fn test_state_reset() raises:
+def test_state_reset() raises:
     var s = TrainingState()
     s.record_loss(5.0)
     s.reset_running_loss()
@@ -56,7 +56,7 @@ fn test_state_reset() raises:
     print("  state_reset: PASS")
 
 
-fn test_metrics_record() raises:
+def test_metrics_record() raises:
     var m = TrainingMetrics()
     m.record(2.5, 0.001)
     m.record(1.5, 0.0005)
@@ -65,7 +65,7 @@ fn test_metrics_record() raises:
     print("  metrics_record: PASS")
 
 
-fn test_metrics_perplexity() raises:
+def test_metrics_perplexity() raises:
     var m = TrainingMetrics()
     m.record(1.0, 0.001)
     var ppl = m.perplexity()
@@ -73,7 +73,7 @@ fn test_metrics_perplexity() raises:
     print("  metrics_perplexity: PASS")
 
 
-fn test_metrics_perplexity_high() raises:
+def test_metrics_perplexity_high() raises:
     var m = TrainingMetrics()
     m.record(100.0, 0.001)
     var ppl = m.perplexity()
@@ -81,7 +81,7 @@ fn test_metrics_perplexity_high() raises:
     print("  metrics_perplexity_high: PASS")
 
 
-fn test_estimate_memory_sgd() raises:
+def test_estimate_memory_sgd() raises:
     var c = TrainingConfig()
     c.use_adam = False
     var mem = estimate_training_memory(1000000, c)
@@ -90,7 +90,7 @@ fn test_estimate_memory_sgd() raises:
     print("  estimate_memory_sgd: PASS")
 
 
-fn test_estimate_memory_adam() raises:
+def test_estimate_memory_adam() raises:
     var c = TrainingConfig()
     c.use_adam = True
     var mem = estimate_training_memory(1000000, c)
@@ -99,7 +99,7 @@ fn test_estimate_memory_adam() raises:
     print("  estimate_memory_adam: PASS")
 
 
-fn test_state_best_eval() raises:
+def test_state_best_eval() raises:
     var s = TrainingState()
     assert_close(s.best_eval_loss, 1e10)
     s.best_eval_loss = 2.0
@@ -107,7 +107,7 @@ fn test_state_best_eval() raises:
     print("  state_best_eval: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_training_loop:")
     test_config_defaults()
     test_config_copy()

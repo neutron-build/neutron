@@ -8,7 +8,7 @@ Provides a common interface regardless of the underlying file format,
 abstracting away format-specific details.
 """
 
-from collections import Dict
+from std.collections import Dict
 from neutron_mojo.io.safetensors import TensorInfo, SafeTensorsFile, parse_dtype_string
 from neutron_mojo.io.gguf import (
     GGUFTensorType,
@@ -28,35 +28,35 @@ from neutron_mojo.model.config import ModelConfig
 # File Format
 # ===----------------------------------------------------------------------=== #
 
-struct FileFormat(Copyable):
+struct FileFormat(Copyable, ImplicitlyCopyable):
     """Model file format."""
     var _value: Int
 
     @implicit
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self._value = value
 
-    fn __copyinit__(out self, existing: Self):
-        self._value = existing._value
+    def __init__(out self, *, copy: Self):
+        self._value = copy._value
 
-    fn __eq__(self, other: FileFormat) -> Bool:
+    def __eq__(self, other: FileFormat) -> Bool:
         return self._value == other._value
 
-    fn __ne__(self, other: FileFormat) -> Bool:
+    def __ne__(self, other: FileFormat) -> Bool:
         return self._value != other._value
 
 
-fn FMT_SAFETENSORS() -> FileFormat:
+def FMT_SAFETENSORS() -> FileFormat:
     return FileFormat(0)
 
-fn FMT_GGUF() -> FileFormat:
+def FMT_GGUF() -> FileFormat:
     return FileFormat(1)
 
-fn FMT_UNKNOWN() -> FileFormat:
+def FMT_UNKNOWN() -> FileFormat:
     return FileFormat(99)
 
 
-fn detect_format(file_path: String) -> FileFormat:
+def detect_format(file_path: String) -> FileFormat:
     """Detect file format from extension.
 
     Args:
@@ -77,7 +77,7 @@ fn detect_format(file_path: String) -> FileFormat:
 # Weight Descriptor
 # ===----------------------------------------------------------------------=== #
 
-struct WeightDescriptor(Copyable):
+struct WeightDescriptor(Copyable, ImplicitlyCopyable):
     """Unified descriptor for a model weight tensor.
 
     Abstracts over SafeTensors and GGUF tensor metadata.
@@ -90,7 +90,7 @@ struct WeightDescriptor(Copyable):
     var is_quantized: Bool
     var quant_type: String  # "none", "q4_0", "q8_0", "nf4", etc.
 
-    fn __init__(out self):
+    def __init__(out self):
         self.name = String("")
         self.dtype = DType.float32
         self.shape = List[Int]()
@@ -99,23 +99,23 @@ struct WeightDescriptor(Copyable):
         self.is_quantized = False
         self.quant_type = String("none")
 
-    fn __copyinit__(out self, existing: Self):
-        self.name = existing.name
-        self.dtype = existing.dtype
-        self.shape = existing.shape.copy()
-        self.size_bytes = existing.size_bytes
-        self.file_offset = existing.file_offset
-        self.is_quantized = existing.is_quantized
-        self.quant_type = existing.quant_type
+    def __init__(out self, *, copy: Self):
+        self.name = copy.name
+        self.dtype = copy.dtype
+        self.shape = copy.shape.copy()
+        self.size_bytes = copy.size_bytes
+        self.file_offset = copy.file_offset
+        self.is_quantized = copy.is_quantized
+        self.quant_type = copy.quant_type
 
-    fn numel(self) -> Int:
+    def numel(self) -> Int:
         """Total number of elements."""
         var total = 1
         for i in range(len(self.shape)):
             total *= self.shape[i]
         return total
 
-    fn ndim(self) -> Int:
+    def ndim(self) -> Int:
         """Number of dimensions."""
         return len(self.shape)
 
@@ -135,21 +135,21 @@ struct WeightIndex(Movable):
     var weight_names: List[String]  # Ordered list of weight names
     var total_size_bytes: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.format = FMT_UNKNOWN()
         self.file_path = String("")
         self.weights = Dict[String, WeightDescriptor]()
         self.weight_names = List[String]()
         self.total_size_bytes = 0
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.format = other.format.copy()
-        self.file_path = other.file_path^
-        self.weights = other.weights^
-        self.weight_names = other.weight_names^
-        self.total_size_bytes = other.total_size_bytes
+    def __init__(out self, *, deinit move: Self):
+        self.format = move.format.copy()
+        self.file_path = move.file_path^
+        self.weights = move.weights^
+        self.weight_names = move.weight_names^
+        self.total_size_bytes = move.total_size_bytes^
 
-    fn add_weight(mut self, desc: WeightDescriptor):
+    def add_weight(mut self, desc: WeightDescriptor):
         """Add a weight descriptor to the index.
 
         Args:
@@ -159,7 +159,7 @@ struct WeightIndex(Movable):
         self.total_size_bytes += desc.size_bytes
         self.weights[desc.name] = desc.copy()
 
-    fn has_weight(self, name: String) -> Bool:
+    def has_weight(self, name: String) -> Bool:
         """Check if a weight exists.
 
         Args:
@@ -170,7 +170,7 @@ struct WeightIndex(Movable):
         """
         return name in self.weights
 
-    fn get_weight(self, name: String) raises -> WeightDescriptor:
+    def get_weight(self, name: String) raises -> WeightDescriptor:
         """Get weight descriptor by name.
 
         Args:
@@ -183,11 +183,11 @@ struct WeightIndex(Movable):
             raise Error("Weight not found: " + name)
         return self.weights[name].copy()
 
-    fn num_weights(self) -> Int:
+    def num_weights(self) -> Int:
         """Get total number of weights."""
         return len(self.weight_names)
 
-    fn total_size_mb(self) -> Float64:
+    def total_size_mb(self) -> Float64:
         """Get total size in megabytes."""
         return Float64(self.total_size_bytes) / (1024.0 * 1024.0)
 
@@ -196,7 +196,7 @@ struct WeightIndex(Movable):
 # Weight Index Builder — from SafeTensors
 # ===----------------------------------------------------------------------=== #
 
-fn build_index_from_safetensors(st: SafeTensorsFile) -> WeightIndex:
+def build_index_from_safetensors(st: SafeTensorsFile) -> WeightIndex:
     """Build a WeightIndex from a SafeTensorsFile.
 
     Args:
@@ -214,7 +214,7 @@ fn build_index_from_safetensors(st: SafeTensorsFile) -> WeightIndex:
     return index^
 
 
-fn register_safetensors_weight(
+def register_safetensors_weight(
     mut index: WeightIndex,
     name: String,
     info: TensorInfo,
@@ -243,7 +243,7 @@ fn register_safetensors_weight(
 # Weight Index Builder — from GGUF
 # ===----------------------------------------------------------------------=== #
 
-fn register_gguf_weight(
+def register_gguf_weight(
     mut index: WeightIndex,
     name: String,
     info: GGUFTensorInfo,
@@ -288,7 +288,7 @@ fn register_gguf_weight(
 # Weight Validation
 # ===----------------------------------------------------------------------=== #
 
-fn validate_weights_for_model(
+def validate_weights_for_model(
     index: WeightIndex, config: ModelConfig
 ) raises -> Bool:
     """Validate that a weight index has the expected weights for a model config.

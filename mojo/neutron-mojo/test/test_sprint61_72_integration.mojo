@@ -4,8 +4,8 @@
 
 """End-to-end integration tests across all sprint features."""
 
-from math import abs, sqrt, exp, log
-from testing import assert_true
+from std.math import abs, sqrt, exp, log
+from std.testing import assert_true
 
 from neutron_mojo.autograd.tape import Tape, TapeEntry, OP_L1, OP_BCE, OP_KL_DIV
 from neutron_mojo.autograd.backward import run_backward
@@ -25,7 +25,7 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) -> Int:
     var dims = List[Int]()
     dims.append(len(vals))
     var idx = tape.add_variable(dims^, requires_grad=requires_grad)
@@ -34,7 +34,7 @@ fn _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) ->
     return idx
 
 
-fn test_1_fp32_training_e2e() raises:
+def test_1_fp32_training_e2e() raises:
     """E2E: create model, forward, backward, optimizer step, loss decreases."""
     var tape = Tape(65536)
     var model = TrainableLM(8, 4, 1)
@@ -59,7 +59,7 @@ fn test_1_fp32_training_e2e() raises:
     print("PASS: test_1_fp32_training_e2e")
 
 
-fn test_2_lora_concept() raises:
+def test_2_lora_concept() raises:
     """Concept: freeze base weights, train only adapters."""
     var tape = Tape(8192)
 
@@ -103,7 +103,7 @@ fn test_2_lora_concept() raises:
     print("PASS: test_2_lora_concept")
 
 
-fn test_3_weight_transfer_concept() raises:
+def test_3_weight_transfer_concept() raises:
     """Concept: copy weights from external source into tape, train, copy back."""
     var tape = Tape(4096)
     var lin = Linear(3, 2, has_bias=False)
@@ -137,7 +137,7 @@ fn test_3_weight_transfer_concept() raises:
     print("PASS: test_3_weight_transfer_concept")
 
 
-fn test_4_loss_gradient_correctness() raises:
+def test_4_loss_gradient_correctness() raises:
     """All loss functions produce correct op codes and non-zero gradients."""
     # L1
     var tape1 = Tape(2048)
@@ -179,7 +179,7 @@ fn test_4_loss_gradient_correctness() raises:
     print("PASS: test_4_loss_gradient_correctness")
 
 
-fn test_5_norm_backward_correctness() raises:
+def test_5_norm_backward_correctness() raises:
     """RMSNorm gamma receives non-zero gradients after backward."""
     var tape = Tape(4096)
     var norm = RMSNormModule(4)
@@ -207,7 +207,7 @@ fn test_5_norm_backward_correctness() raises:
     print("PASS: test_5_norm_backward_correctness")
 
 
-fn test_6_requires_grad_gating() raises:
+def test_6_requires_grad_gating() raises:
     """Frozen variables get zero gradients."""
     var tape = Tape(4096)
     var frozen_vals = List[Float32]()
@@ -229,7 +229,7 @@ fn test_6_requires_grad_gating() raises:
     print("PASS: test_6_requires_grad_gating")
 
 
-fn test_7_sequence_training_concept() raises:
+def test_7_sequence_training_concept() raises:
     """Multi-token sequence: forward multiple tokens, compute losses."""
     var tape = Tape(65536)
     var model = TrainableLM(8, 4, 1)
@@ -254,7 +254,7 @@ fn test_7_sequence_training_concept() raises:
     print("PASS: test_7_sequence_training_concept")
 
 
-fn test_8_attention_q_k_used() raises:
+def test_8_attention_q_k_used() raises:
     """Q and K projections participate in forward (weights change loss)."""
     var tape = Tape(65536)
     var model = TrainableLM(8, 4, 1)
@@ -286,7 +286,7 @@ fn test_8_attention_q_k_used() raises:
     print("PASS: test_8_attention_q_k_used")
 
 
-fn test_9_checkpoint_concept() raises:
+def test_9_checkpoint_concept() raises:
     """Gradient checkpointing concept: backward produces same grads as regular."""
     # For now, just verify regular backward works correctly
     var tape = Tape(4096)
@@ -307,7 +307,7 @@ fn test_9_checkpoint_concept() raises:
     print("PASS: test_9_checkpoint_concept")
 
 
-fn test_10_simd_autograd_concept() raises:
+def test_10_simd_autograd_concept() raises:
     """SIMD autograd: verify add/mul produce correct results for varied sizes."""
     for size in range(1, 17):
         var tape = Tape(4096)
@@ -326,7 +326,7 @@ fn test_10_simd_autograd_concept() raises:
     print("PASS: test_10_simd_autograd_concept")
 
 
-fn test_11_optimizer_step_changes_params() raises:
+def test_11_optimizer_step_changes_params() raises:
     """Optimizer step modifies parameters after backward."""
     var tape = Tape(4096)
     var w_vals = List[Float32]()
@@ -353,7 +353,7 @@ fn test_11_optimizer_step_changes_params() raises:
     print("PASS: test_11_optimizer_step_changes_params")
 
 
-fn test_12_matmul_backward() raises:
+def test_12_matmul_backward() raises:
     """Matmul backward produces correct gradient shapes."""
     var tape = Tape(4096)
     var a_vals = List[Float32]()
@@ -387,7 +387,7 @@ fn test_12_matmul_backward() raises:
     print("PASS: test_12_matmul_backward")
 
 
-fn test_13_layernorm_backward() raises:
+def test_13_layernorm_backward() raises:
     """LayerNorm backward: gamma and beta receive gradients."""
     var tape = Tape(4096)
     var ln = LayerNormModule(4)
@@ -415,7 +415,7 @@ fn test_13_layernorm_backward() raises:
     print("PASS: test_13_layernorm_backward")
 
 
-fn test_14_cli_arg_parsing() raises:
+def test_14_cli_arg_parsing() raises:
     """CLI arg parsing integration."""
     var args = List[String]()
     args.append("neutron")
@@ -431,7 +431,7 @@ fn test_14_cli_arg_parsing() raises:
     print("PASS: test_14_cli_arg_parsing")
 
 
-fn test_15_multi_loss_comparison() raises:
+def test_15_multi_loss_comparison() raises:
     """Multiple loss functions produce different gradients for same inputs."""
     # MSE
     var tape_mse = Tape(4096)
@@ -468,7 +468,7 @@ fn test_15_multi_loss_comparison() raises:
     print("PASS: test_15_multi_loss_comparison")
 
 
-fn main() raises:
+def main() raises:
     print("=== Sprint 72: Integration Tests (Sprints 61-72) ===")
     test_1_fp32_training_e2e()
     test_2_lora_concept()

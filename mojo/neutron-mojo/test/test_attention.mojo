@@ -4,7 +4,7 @@
 
 """Tests for GQA multi-head attention."""
 
-from math import abs, sqrt, exp
+from std.math import abs, sqrt, exp
 from neutron_mojo.nn.attention import (
     gqa_attention,
     mha_attention,
@@ -18,19 +18,19 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_dot_product() raises:
+def test_dot_product() raises:
     """Test dot product helper."""
     var a = Tensor[DType.float32](Shape(4))
     var b = Tensor[DType.float32](Shape(4))
@@ -55,7 +55,7 @@ fn test_dot_product() raises:
     print("  dot_product: PASS")
 
 
-fn test_softmax_inplace() raises:
+def test_softmax_inplace() raises:
     """Test softmax computation."""
     var s = Tensor[DType.float32](Shape(3))
     s.set(0, 1.0)
@@ -81,7 +81,7 @@ fn test_softmax_inplace() raises:
     print("  softmax_inplace: PASS")
 
 
-fn test_softmax_numerical_stability() raises:
+def test_softmax_numerical_stability() raises:
     """Test softmax with large values (numerical stability)."""
     var s = Tensor[DType.float32](Shape(3))
     s.set(0, 1000.0)
@@ -98,7 +98,7 @@ fn test_softmax_numerical_stability() raises:
     print("  softmax_numerical_stability: PASS")
 
 
-fn test_causal_mask() raises:
+def test_causal_mask() raises:
     """Test causal masking."""
     var s = Tensor[DType.float32](Shape(5))
     for i in range(5):
@@ -117,7 +117,7 @@ fn test_causal_mask() raises:
     print("  causal_mask: PASS")
 
 
-fn test_single_head_uniform_values() raises:
+def test_single_head_uniform_values() raises:
     """Test attention with uniform cached values returns the value."""
     var head_dim = 4
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=head_dim)
@@ -155,7 +155,7 @@ fn test_single_head_uniform_values() raises:
     print("  single_head_uniform_values: PASS")
 
 
-fn test_single_head_peaked_attention() raises:
+def test_single_head_peaked_attention() raises:
     """Test attention with one key matching query strongly."""
     var head_dim = 2
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=head_dim)
@@ -193,7 +193,7 @@ fn test_single_head_peaked_attention() raises:
     print("  single_head_peaked_attention: PASS")
 
 
-fn test_mha_basic() raises:
+def test_mha_basic() raises:
     """Test standard MHA with 2 heads."""
     var head_dim = 2
     var num_heads = 2
@@ -232,7 +232,7 @@ fn test_mha_basic() raises:
     print("  mha_basic: PASS")
 
 
-fn test_gqa_head_mapping() raises:
+def test_gqa_head_mapping() raises:
     """Test GQA where 4 Q heads share 2 KV heads."""
     var head_dim = 2
     var num_q_heads = 4
@@ -276,7 +276,7 @@ fn test_gqa_head_mapping() raises:
     print("  gqa_head_mapping: PASS")
 
 
-fn test_gqa_output_shape() raises:
+def test_gqa_output_shape() raises:
     """Test that GQA output has correct shape."""
     var head_dim = 4
     var num_q_heads = 8
@@ -302,7 +302,7 @@ fn test_gqa_output_shape() raises:
     print("  gqa_output_shape: PASS")
 
 
-fn test_attention_weights_sum_to_one() raises:
+def test_attention_weights_sum_to_one() raises:
     """Test that attention weights sum to 1 (verified via output)."""
     var head_dim = 2
     var cache = KVCache(max_seq_len=8, num_kv_heads=1, head_dim=head_dim)
@@ -332,7 +332,7 @@ fn test_attention_weights_sum_to_one() raises:
     print("  attention_weights_sum_to_one: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_attention:")
 
     test_dot_product()

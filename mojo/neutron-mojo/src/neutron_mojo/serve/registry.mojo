@@ -16,7 +16,7 @@ Usage:
     var response = registry.infer("llama-7b", request)
 """
 
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 from neutron_mojo.nn.model import Model, ModelParams
 from neutron_mojo.nn.q_model import QuantizedModel
 from neutron_mojo.nn.tokenizer import BPETokenizer
@@ -37,7 +37,7 @@ from neutron_mojo.tensor.shape import Shape
 # Deep Copy Helpers (Tensor/Model/QuantizedModel/BPETokenizer are Movable-only)
 # ===----------------------------------------------------------------------=== #
 
-fn _copy_tensor(src: Tensor[DType.float32]) -> Tensor[DType.float32]:
+def _copy_tensor(src: Tensor[DType.float32]) -> Tensor[DType.float32]:
     """Deep-copy a tensor by creating a new one and copying all elements."""
     var dst = Tensor[DType.float32](src.shape)
     for i in range(src.numel()):
@@ -45,7 +45,7 @@ fn _copy_tensor(src: Tensor[DType.float32]) -> Tensor[DType.float32]:
     return dst^
 
 
-fn _copy_model(src: Model) -> Model:
+def _copy_model(src: Model) -> Model:
     """Deep-copy a Model by copying all tensor data."""
     var m = Model(src.params.copy())
     for i in range(src.embed.numel()):
@@ -59,7 +59,7 @@ fn _copy_model(src: Model) -> Model:
     return m^
 
 
-fn _copy_q_model(src: QuantizedModel) -> QuantizedModel:
+def _copy_q_model(src: QuantizedModel) -> QuantizedModel:
     """Deep-copy a QuantizedModel by copying all tensor data."""
     var m = QuantizedModel(src.params.copy(), src.block_size)
     for i in range(src.embed.numel()):
@@ -75,7 +75,7 @@ fn _copy_q_model(src: QuantizedModel) -> QuantizedModel:
     return m^
 
 
-fn _copy_tokenizer(src: BPETokenizer) -> BPETokenizer:
+def _copy_tokenizer(src: BPETokenizer) -> BPETokenizer:
     """Deep-copy a BPETokenizer."""
     var tok = BPETokenizer()
     for i in range(src.vocab_size):
@@ -94,7 +94,7 @@ fn _copy_tokenizer(src: BPETokenizer) -> BPETokenizer:
 # Model Entry — Wraps a loaded model with its tokenizer and metadata
 # ===----------------------------------------------------------------------=== #
 
-struct ModelEntry(Copyable, Movable):
+struct ModelEntry(Copyable, Movable, ImplicitlyCopyable):
     """A registered model with its tokenizer and metadata.
 
     Supports either FP32 or Q8 model (indicated by is_quantized flag).
@@ -110,7 +110,7 @@ struct ModelEntry(Copyable, Movable):
     var total_requests: Int
     var total_tokens_generated: Int
 
-    fn __init__(out self, name: String, var model: Model, var tokenizer: BPETokenizer):
+    def __init__(out self, name: String, var model: Model, var tokenizer: BPETokenizer):
         """Create an FP32 model entry."""
         self.name = name
         self.is_quantized = False
@@ -131,7 +131,7 @@ struct ModelEntry(Copyable, Movable):
         self.total_requests = 0
         self.total_tokens_generated = 0
 
-    fn __init__(out self, name: String, var q_model: QuantizedModel,
+    def __init__(out self, name: String, var q_model: QuantizedModel,
                 var tokenizer: BPETokenizer, params: ModelParams):
         """Create a Q8 model entry."""
         self.name = name
@@ -153,34 +153,34 @@ struct ModelEntry(Copyable, Movable):
         self.total_requests = 0
         self.total_tokens_generated = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.name = existing.name
-        self.is_quantized = existing.is_quantized
-        self.fp32_model = _copy_model(existing.fp32_model)
-        self.q8_model = _copy_q_model(existing.q8_model)
-        self.tokenizer = _copy_tokenizer(existing.tokenizer)
-        self.info = existing.info.copy()
-        self.memory = existing.memory.copy()
-        self.total_requests = existing.total_requests
-        self.total_tokens_generated = existing.total_tokens_generated
+    def __init__(out self, *, copy: Self):
+        self.name = copy.name
+        self.is_quantized = copy.is_quantized
+        self.fp32_model = _copy_model(copy.fp32_model)
+        self.q8_model = _copy_q_model(copy.q8_model)
+        self.tokenizer = _copy_tokenizer(copy.tokenizer)
+        self.info = copy.info.copy()
+        self.memory = copy.memory.copy()
+        self.total_requests = copy.total_requests
+        self.total_tokens_generated = copy.total_tokens_generated
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.name = other.name^
-        self.is_quantized = other.is_quantized
-        self.fp32_model = other.fp32_model^
-        self.q8_model = other.q8_model^
-        self.tokenizer = other.tokenizer^
-        self.info = other.info.copy()
-        self.memory = other.memory.copy()
-        self.total_requests = other.total_requests
-        self.total_tokens_generated = other.total_tokens_generated
+    def __init__(out self, *, deinit move: Self):
+        self.name = move.name^
+        self.is_quantized = move.is_quantized^
+        self.fp32_model = move.fp32_model^
+        self.q8_model = move.q8_model^
+        self.tokenizer = move.tokenizer^
+        self.info = move.info.copy()
+        self.memory = move.memory.copy()
+        self.total_requests = move.total_requests^
+        self.total_tokens_generated = move.total_tokens_generated^
 
 
 # ===----------------------------------------------------------------------=== #
 # Registry Entry Info (lightweight, copyable metadata)
 # ===----------------------------------------------------------------------=== #
 
-struct RegistryEntryInfo(Copyable, Movable):
+struct RegistryEntryInfo(Copyable, Movable, ImplicitlyCopyable):
     """Lightweight info about a registered model (for listing)."""
     var name: String
     var is_quantized: Bool
@@ -188,7 +188,7 @@ struct RegistryEntryInfo(Copyable, Movable):
     var model_memory_mb: Float64
     var total_requests: Int
 
-    fn __init__(out self, name: String, is_quantized: Bool,
+    def __init__(out self, name: String, is_quantized: Bool,
                 total_params_millions: Float64, model_memory_mb: Float64,
                 total_requests: Int):
         self.name = name
@@ -197,21 +197,21 @@ struct RegistryEntryInfo(Copyable, Movable):
         self.model_memory_mb = model_memory_mb
         self.total_requests = total_requests
 
-    fn __copyinit__(out self, existing: Self):
-        self.name = existing.name
-        self.is_quantized = existing.is_quantized
-        self.total_params_millions = existing.total_params_millions
-        self.model_memory_mb = existing.model_memory_mb
-        self.total_requests = existing.total_requests
+    def __init__(out self, *, copy: Self):
+        self.name = copy.name
+        self.is_quantized = copy.is_quantized
+        self.total_params_millions = copy.total_params_millions
+        self.model_memory_mb = copy.model_memory_mb
+        self.total_requests = copy.total_requests
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.name = other.name^
-        self.is_quantized = other.is_quantized
-        self.total_params_millions = other.total_params_millions
-        self.model_memory_mb = other.model_memory_mb
-        self.total_requests = other.total_requests
+    def __init__(out self, *, deinit move: Self):
+        self.name = move.name^
+        self.is_quantized = move.is_quantized^
+        self.total_params_millions = move.total_params_millions^
+        self.model_memory_mb = move.model_memory_mb^
+        self.total_requests = move.total_requests^
 
-    fn summary(self) -> String:
+    def summary(self) -> String:
         var kind = String("FP32")
         if self.is_quantized:
             kind = String("Q8")
@@ -231,15 +231,15 @@ struct ModelRegistry(Movable):
     var entries: List[ModelEntry]
     var default_model: String     # Name of default model for unnamed requests
 
-    fn __init__(out self):
+    def __init__(out self):
         self.entries = List[ModelEntry]()
         self.default_model = String("")
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.entries = other.entries^
-        self.default_model = other.default_model^
+    def __init__(out self, *, deinit move: Self):
+        self.entries = move.entries^
+        self.default_model = move.default_model^
 
-    fn register_fp32(mut self, name: String, var model: Model,
+    def register_fp32(mut self, name: String, var model: Model,
                      var tokenizer: BPETokenizer):
         """Register an FP32 model.
 
@@ -255,7 +255,7 @@ struct ModelRegistry(Movable):
         if len(self.entries) == 1:
             self.default_model = name
 
-    fn register_q8(mut self, name: String, var q_model: QuantizedModel,
+    def register_q8(mut self, name: String, var q_model: QuantizedModel,
                    var tokenizer: BPETokenizer, params: ModelParams):
         """Register a Q8 quantized model.
 
@@ -271,7 +271,7 @@ struct ModelRegistry(Movable):
         if len(self.entries) == 1:
             self.default_model = name
 
-    fn set_default(mut self, name: String):
+    def set_default(mut self, name: String):
         """Set the default model for unnamed requests.
 
         Args:
@@ -279,25 +279,25 @@ struct ModelRegistry(Movable):
         """
         self.default_model = name
 
-    fn count(self) -> Int:
+    def count(self) -> Int:
         """Number of registered models."""
         return len(self.entries)
 
-    fn has_model(self, name: String) -> Bool:
+    def has_model(self, name: String) -> Bool:
         """Check if a model with given name is registered."""
         for i in range(len(self.entries)):
             if self.entries[i].name == name:
                 return True
         return False
 
-    fn _find_index(self, name: String) -> Int:
+    def _find_index(self, name: String) -> Int:
         """Find index of model by name. Returns -1 if not found."""
         for i in range(len(self.entries)):
             if self.entries[i].name == name:
                 return i
         return -1
 
-    fn list_models(self) -> List[RegistryEntryInfo]:
+    def list_models(self) -> List[RegistryEntryInfo]:
         """List all registered models with metadata.
 
         Returns:
@@ -314,7 +314,7 @@ struct ModelRegistry(Movable):
             ))
         return result^
 
-    fn infer(mut self, model_name: String,
+    def infer(mut self, model_name: String,
              request: InferenceRequest) raises -> InferenceResponse:
         """Route an inference request to the named model.
 
@@ -326,7 +326,7 @@ struct ModelRegistry(Movable):
             InferenceResponse with generated text or error.
         """
         var name = model_name
-        if len(name) == 0:
+        if name.byte_length() == 0:
             name = self.default_model
 
         var idx = self._find_index(name)
@@ -374,7 +374,7 @@ struct ModelRegistry(Movable):
             prompt_token_count, elapsed_ms, tps,
         )
 
-    fn get_model_info(self, name: String) -> ModelInfo:
+    def get_model_info(self, name: String) -> ModelInfo:
         """Get architecture info for a named model.
 
         Args:
@@ -388,7 +388,7 @@ struct ModelRegistry(Movable):
             return self.entries[idx].info.copy()
         return ModelInfo()
 
-    fn get_memory_estimate(self, name: String) -> MemoryEstimate:
+    def get_memory_estimate(self, name: String) -> MemoryEstimate:
         """Get memory estimate for a named model.
 
         Args:

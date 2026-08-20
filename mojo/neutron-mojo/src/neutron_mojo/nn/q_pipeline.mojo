@@ -28,7 +28,7 @@ from neutron_mojo.nn.pipeline import PipelineConfig
 # Chat Template (duplicated from pipeline.mojo to avoid coupling)
 # ===----------------------------------------------------------------------=== #
 
-fn _apply_template(prompt: String, config: PipelineConfig) -> String:
+def _apply_template(prompt: String, config: PipelineConfig) -> String:
     """Apply chat template based on config.
 
     Args:
@@ -45,15 +45,15 @@ fn _apply_template(prompt: String, config: PipelineConfig) -> String:
     return prompt
 
 
-fn _format_llama(prompt: String, system_prompt: String) -> String:
-    if len(system_prompt) > 0:
+def _format_llama(prompt: String, system_prompt: String) -> String:
+    if system_prompt.byte_length() > 0:
         return "<<SYS>>\n" + system_prompt + "\n<</SYS>>\n\n[INST] " + prompt + " [/INST]"
     return "[INST] " + prompt + " [/INST]"
 
 
-fn _format_chatml(prompt: String, system_prompt: String) -> String:
+def _format_chatml(prompt: String, system_prompt: String) -> String:
     var result = String("")
-    if len(system_prompt) > 0:
+    if system_prompt.byte_length() > 0:
         result += "<|im_start|>system\n" + system_prompt + "<|im_end|>\n"
     result += "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
     return result^
@@ -63,7 +63,7 @@ fn _format_chatml(prompt: String, system_prompt: String) -> String:
 # Quantized Pipeline Generate
 # ===----------------------------------------------------------------------=== #
 
-fn q_pipeline_generate(
+def q_pipeline_generate(
     model: QuantizedModel,
     tokenizer: BPETokenizer,
     prompt: String,

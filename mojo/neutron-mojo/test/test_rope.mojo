@@ -4,25 +4,25 @@
 
 """Tests for Rotary Position Embeddings."""
 
-from math import sin, cos, abs
+from std.math import sin, cos, abs
 from neutron_mojo.nn.rope import RoPETable, apply_rope, apply_rope_single_head
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
+def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
     if abs(a - b) > tol:
         raise Error(
             "Assertion failed: " + msg + " got " + String(a) + " vs " + String(b)
         )
 
 
-fn test_rope_table_creation() raises:
+def test_rope_table_creation() raises:
     """Test RoPE table creation with correct dimensions."""
     var table = RoPETable(head_dim=64, max_seq_len=128)
 
@@ -36,7 +36,7 @@ fn test_rope_table_creation() raises:
     print("  rope_table_creation: PASS")
 
 
-fn test_rope_table_values_pos0() raises:
+def test_rope_table_values_pos0() raises:
     """Test that position 0 has cos=1, sin=0 for all frequencies."""
     var table = RoPETable(head_dim=8, max_seq_len=4)
 
@@ -50,7 +50,7 @@ fn test_rope_table_values_pos0() raises:
     print("  rope_table_values_pos0: PASS")
 
 
-fn test_rope_table_values_known() raises:
+def test_rope_table_values_known() raises:
     """Test RoPE table against hand-computed values."""
     var table = RoPETable(head_dim=4, max_seq_len=4, theta=10000.0)
 
@@ -74,7 +74,7 @@ fn test_rope_table_values_known() raises:
     print("  rope_table_values_known: PASS")
 
 
-fn test_rope_table_custom_theta() raises:
+def test_rope_table_custom_theta() raises:
     """Test RoPE table with Llama-3 theta=500000."""
     var table = RoPETable(head_dim=4, max_seq_len=2, theta=500000.0)
 
@@ -92,7 +92,7 @@ fn test_rope_table_custom_theta() raises:
     print("  rope_table_custom_theta: PASS")
 
 
-fn test_apply_rope_identity_at_pos0() raises:
+def test_apply_rope_identity_at_pos0() raises:
     """Test that RoPE at position 0 is identity (cos=1, sin=0)."""
     var table = RoPETable(head_dim=4, max_seq_len=8)
     var head_dim = 4
@@ -119,7 +119,7 @@ fn test_apply_rope_identity_at_pos0() raises:
     print("  apply_rope_identity_at_pos0: PASS")
 
 
-fn test_apply_rope_rotation() raises:
+def test_apply_rope_rotation() raises:
     """Test that RoPE actually rotates values at non-zero positions."""
     var table = RoPETable(head_dim=4, max_seq_len=8)
     var head_dim = 4
@@ -143,7 +143,7 @@ fn test_apply_rope_rotation() raises:
     print("  apply_rope_rotation: PASS")
 
 
-fn test_apply_rope_rotation_formula() raises:
+def test_apply_rope_rotation_formula() raises:
     """Test the full rotation formula with non-trivial input."""
     var table = RoPETable(head_dim=4, max_seq_len=8)
 
@@ -166,7 +166,7 @@ fn test_apply_rope_rotation_formula() raises:
     print("  apply_rope_rotation_formula: PASS")
 
 
-fn test_apply_rope_multi_head() raises:
+def test_apply_rope_multi_head() raises:
     """Test RoPE with multiple heads."""
     var table = RoPETable(head_dim=4, max_seq_len=8)
     var num_heads = 2
@@ -198,7 +198,7 @@ fn test_apply_rope_multi_head() raises:
     print("  apply_rope_multi_head: PASS")
 
 
-fn test_apply_rope_multi_seq() raises:
+def test_apply_rope_multi_seq() raises:
     """Test RoPE with multiple sequence positions."""
     var table = RoPETable(head_dim=4, max_seq_len=8)
 
@@ -228,7 +228,7 @@ fn test_apply_rope_multi_seq() raises:
     print("  apply_rope_multi_seq: PASS")
 
 
-fn test_apply_rope_single_head_fn() raises:
+def test_apply_rope_single_head_fn() raises:
     """Test apply_rope_single_head convenience function."""
     var table = RoPETable(head_dim=4, max_seq_len=8)
 
@@ -246,7 +246,7 @@ fn test_apply_rope_single_head_fn() raises:
     print("  apply_rope_single_head_fn: PASS")
 
 
-fn test_rope_relative_position() raises:
+def test_rope_relative_position() raises:
     """Test that RoPE preserves relative position information.
 
     The dot product of two RoPE-rotated vectors at positions m and n
@@ -297,7 +297,7 @@ fn test_rope_relative_position() raises:
     print("  rope_relative_position: PASS")
 
 
-fn test_rope_start_pos_offset() raises:
+def test_rope_start_pos_offset() raises:
     """Test start_pos for KV cache continuation."""
     var table = RoPETable(head_dim=4, max_seq_len=8)
 
@@ -323,7 +323,7 @@ fn test_rope_start_pos_offset() raises:
     print("  rope_start_pos_offset: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_rope:")
 
     test_rope_table_creation()

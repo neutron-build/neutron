@@ -11,7 +11,7 @@ Two FP8 formats are supported:
 Reference: "FP8 Formats for Deep Learning" (Micikevicius et al., 2022)
 """
 
-from math import abs, sqrt, isnan, isinf
+from std.math import abs, sqrt, isnan, isinf
 
 # ===----------------------------------------------------------------------=== #
 # FP8 E4M3 Format
@@ -22,7 +22,7 @@ comptime FP8_E4M3_MIN_NORMAL = 0.015625  # 2^-6
 comptime FP8_E4M3_EXPONENT_BIAS = 7
 
 
-fn quantize_fp8_e4m3(value: Float32) -> UInt8:
+def quantize_fp8_e4m3(value: Float32) -> UInt8:
     """Quantize FP32 to FP8 E4M3 format (simplified linear mapping).
 
     E4M3: 1 sign bit, 4 exponent bits, 3 mantissa bits
@@ -57,7 +57,7 @@ fn quantize_fp8_e4m3(value: Float32) -> UInt8:
     return UInt8(quantized)
 
 
-fn dequantize_fp8_e4m3(value: UInt8) -> Float32:
+def dequantize_fp8_e4m3(value: UInt8) -> Float32:
     """Dequantize FP8 E4M3 to FP32 (simplified linear mapping).
 
     Args:
@@ -80,7 +80,7 @@ comptime FP8_E5M2_MIN_NORMAL = 0.00006103515625  # 2^-14
 comptime FP8_E5M2_EXPONENT_BIAS = 15
 
 
-fn quantize_fp8_e5m2(value: Float32) -> UInt8:
+def quantize_fp8_e5m2(value: Float32) -> UInt8:
     """Quantize FP32 to FP8 E5M2 format (simplified linear mapping).
 
     E5M2: 1 sign bit, 5 exponent bits, 2 mantissa bits
@@ -115,7 +115,7 @@ fn quantize_fp8_e5m2(value: Float32) -> UInt8:
     return UInt8(quantized)
 
 
-fn dequantize_fp8_e5m2(value: UInt8) -> Float32:
+def dequantize_fp8_e5m2(value: UInt8) -> Float32:
     """Dequantize FP8 E5M2 to FP32 (simplified linear mapping).
 
     Args:
@@ -133,11 +133,9 @@ fn dequantize_fp8_e5m2(value: UInt8) -> Float32:
 # Batch Conversion
 # ===----------------------------------------------------------------------=== #
 
-fn convert_fp32_to_fp8_e4m3[
-    input_origin: Origin, output_origin: Origin where output_origin.mut
-](
-    input: UnsafePointer[Float32, input_origin],
-    output: UnsafePointer[UInt8, output_origin],
+def convert_fp32_to_fp8_e4m3(
+    input: Pointer[Float32, ...],
+    output: Pointer[mut=True, UInt8, ...],
     count: Int,
 ):
     """Convert an array of FP32 values to FP8 E4M3.
@@ -148,14 +146,12 @@ fn convert_fp32_to_fp8_e4m3[
         count: Number of elements to convert.
     """
     for i in range(count):
-        output.store(i, quantize_fp8_e4m3(input.load(i)))
+        output.unsafe_store(i, quantize_fp8_e4m3(input.load(i)))
 
 
-fn convert_fp8_e4m3_to_fp32[
-    input_origin: Origin, output_origin: Origin where output_origin.mut
-](
-    input: UnsafePointer[UInt8, input_origin],
-    output: UnsafePointer[Float32, output_origin],
+def convert_fp8_e4m3_to_fp32(
+    input: Pointer[UInt8, ...],
+    output: Pointer[mut=True, Float32, ...],
     count: Int,
 ):
     """Convert an array of FP8 E4M3 values to FP32.
@@ -166,14 +162,12 @@ fn convert_fp8_e4m3_to_fp32[
         count: Number of elements to convert.
     """
     for i in range(count):
-        output.store(i, dequantize_fp8_e4m3(input.load(i)))
+        output.unsafe_store(i, dequantize_fp8_e4m3(input.load(i)))
 
 
-fn convert_fp32_to_fp8_e5m2[
-    input_origin: Origin, output_origin: Origin where output_origin.mut
-](
-    input: UnsafePointer[Float32, input_origin],
-    output: UnsafePointer[UInt8, output_origin],
+def convert_fp32_to_fp8_e5m2(
+    input: Pointer[Float32, ...],
+    output: Pointer[mut=True, UInt8, ...],
     count: Int,
 ):
     """Convert an array of FP32 values to FP8 E5M2.
@@ -184,14 +178,12 @@ fn convert_fp32_to_fp8_e5m2[
         count: Number of elements to convert.
     """
     for i in range(count):
-        output.store(i, quantize_fp8_e5m2(input.load(i)))
+        output.unsafe_store(i, quantize_fp8_e5m2(input.load(i)))
 
 
-fn convert_fp8_e5m2_to_fp32[
-    input_origin: Origin, output_origin: Origin where output_origin.mut
-](
-    input: UnsafePointer[UInt8, input_origin],
-    output: UnsafePointer[Float32, output_origin],
+def convert_fp8_e5m2_to_fp32(
+    input: Pointer[UInt8, ...],
+    output: Pointer[mut=True, Float32, ...],
     count: Int,
 ):
     """Convert an array of FP8 E5M2 values to FP32.
@@ -202,4 +194,4 @@ fn convert_fp8_e5m2_to_fp32[
         count: Number of elements to convert.
     """
     for i in range(count):
-        output.store(i, dequantize_fp8_e5m2(input.load(i)))
+        output.unsafe_store(i, dequantize_fp8_e5m2(input.load(i)))

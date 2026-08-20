@@ -12,12 +12,12 @@ from neutron_mojo.nn.tokenizer import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_empty_tokenizer() raises:
+def test_empty_tokenizer() raises:
     """Test empty tokenizer creation."""
     var tok = BPETokenizer()
     assert_true(tok.vocab_size == 0, "starts empty")
@@ -27,7 +27,7 @@ fn test_empty_tokenizer() raises:
     print("  empty_tokenizer: PASS")
 
 
-fn test_add_tokens() raises:
+def test_add_tokens() raises:
     """Test adding tokens to vocabulary."""
     var tok = BPETokenizer()
     var id0 = tok.add_token("hello")
@@ -42,7 +42,7 @@ fn test_add_tokens() raises:
     print("  add_tokens: PASS")
 
 
-fn test_special_tokens() raises:
+def test_special_tokens() raises:
     """Test special token assignment."""
     var tok = BPETokenizer()
     var bos = tok.add_special_token("<s>", "bos")
@@ -56,7 +56,7 @@ fn test_special_tokens() raises:
     print("  special_tokens: PASS")
 
 
-fn test_add_merges() raises:
+def test_add_merges() raises:
     """Test merge rule addition and lookup."""
     var tok = BPETokenizer()
     tok.add_merge("a", "b")
@@ -69,7 +69,7 @@ fn test_add_merges() raises:
     print("  add_merges: PASS")
 
 
-fn test_encode_single_chars() raises:
+def test_encode_single_chars() raises:
     """Test encoding text that stays as single characters."""
     var tok = build_test_tokenizer()
 
@@ -84,7 +84,7 @@ fn test_encode_single_chars() raises:
     print("  encode_single_chars: PASS")
 
 
-fn test_encode_with_merge() raises:
+def test_encode_with_merge() raises:
     """Test encoding text that triggers BPE merges."""
     var tok = build_test_tokenizer()
 
@@ -98,7 +98,7 @@ fn test_encode_with_merge() raises:
     print("  encode_with_merge: PASS")
 
 
-fn test_encode_partial_merge() raises:
+def test_encode_partial_merge() raises:
     """Test encoding where only some pairs merge."""
     var tok = build_test_tokenizer()
 
@@ -112,7 +112,7 @@ fn test_encode_partial_merge() raises:
     print("  encode_partial_merge: PASS")
 
 
-fn test_encode_with_spaces() raises:
+def test_encode_with_spaces() raises:
     """Test encoding text with spaces."""
     var tok = build_test_tokenizer()
 
@@ -126,7 +126,7 @@ fn test_encode_with_spaces() raises:
     print("  encode_with_spaces: PASS")
 
 
-fn test_encode_unknown() raises:
+def test_encode_unknown() raises:
     """Test encoding with unknown characters falls back to UNK."""
     var tok = build_test_tokenizer()
 
@@ -138,7 +138,7 @@ fn test_encode_unknown() raises:
     print("  encode_unknown: PASS")
 
 
-fn test_encode_empty() raises:
+def test_encode_empty() raises:
     """Test encoding empty string."""
     var tok = build_test_tokenizer()
     var ids = tok.encode("")
@@ -147,7 +147,7 @@ fn test_encode_empty() raises:
     print("  encode_empty: PASS")
 
 
-fn test_encode_with_bos() raises:
+def test_encode_with_bos() raises:
     """Test encoding with BOS token prepended."""
     var tok = build_test_tokenizer()
 
@@ -160,7 +160,7 @@ fn test_encode_with_bos() raises:
     print("  encode_with_bos: PASS")
 
 
-fn test_decode_basic() raises:
+def test_decode_basic() raises:
     """Test basic decoding."""
     var tok = build_test_tokenizer()
 
@@ -175,7 +175,7 @@ fn test_decode_basic() raises:
     print("  decode_basic: PASS")
 
 
-fn test_decode_merged_tokens() raises:
+def test_decode_merged_tokens() raises:
     """Test decoding merged tokens."""
     var tok = build_test_tokenizer()
 
@@ -190,7 +190,7 @@ fn test_decode_merged_tokens() raises:
     print("  decode_merged_tokens: PASS")
 
 
-fn test_decode_skips_special() raises:
+def test_decode_skips_special() raises:
     """Test that decode skips BOS/EOS tokens."""
     var tok = build_test_tokenizer()
 
@@ -206,7 +206,7 @@ fn test_decode_skips_special() raises:
     print("  decode_skips_special: PASS")
 
 
-fn test_decode_single() raises:
+def test_decode_single() raises:
     """Test single-token decode."""
     var tok = build_test_tokenizer()
 
@@ -216,7 +216,7 @@ fn test_decode_single() raises:
     print("  decode_single: PASS")
 
 
-fn test_roundtrip() raises:
+def test_roundtrip() raises:
     """Test encode → decode roundtrip."""
     var tok = build_test_tokenizer()
 
@@ -235,7 +235,7 @@ fn test_roundtrip() raises:
     print("  roundtrip: PASS")
 
 
-fn test_merge_rule_struct() raises:
+def test_merge_rule_struct() raises:
     """Test MergeRule struct."""
     var rule = MergeRule("ab", "cd", 5)
     assert_true(rule.left == "ab", "left")
@@ -246,7 +246,7 @@ fn test_merge_rule_struct() raises:
     print("  merge_rule_struct: PASS")
 
 
-fn test_byte_level_vocab() raises:
+def test_byte_level_vocab() raises:
     """Test byte-level vocab builder."""
     var tok = BPETokenizer()
     build_byte_level_vocab(tok)
@@ -260,7 +260,7 @@ fn test_byte_level_vocab() raises:
     print("  byte_level_vocab: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_tokenizer:")
 
     test_empty_tokenizer()

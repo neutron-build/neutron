@@ -4,7 +4,7 @@
 
 """Tests: broadcast, reshape, strides, numel, negative indexing."""
 
-from testing import assert_true, assert_false, assert_equal
+from std.testing import assert_true, assert_false, assert_equal
 
 from neutron_mojo.tensor.shape import Shape
 
@@ -12,19 +12,19 @@ from neutron_mojo.tensor.shape import Shape
 # --- Basic properties ---
 
 
-fn test_ndim() raises:
+def test_ndim() raises:
     var s = Shape(2, 3, 4)
     assert_equal(s.ndim(), 3)
     print("  ndim: PASS")
 
 
-fn test_numel() raises:
+def test_numel() raises:
     var s = Shape(2, 3, 4)
     assert_equal(s.numel(), 24)
     print("  numel: PASS")
 
 
-fn test_numel_scalar() raises:
+def test_numel_scalar() raises:
     var s = Shape(1)
     assert_equal(s.numel(), 1)
     print("  numel_scalar: PASS")
@@ -33,7 +33,7 @@ fn test_numel_scalar() raises:
 # --- Indexing ---
 
 
-fn test_getitem_positive() raises:
+def test_getitem_positive() raises:
     var s = Shape(2, 3, 4)
     assert_equal(s[0], 2)
     assert_equal(s[1], 3)
@@ -41,7 +41,7 @@ fn test_getitem_positive() raises:
     print("  getitem_positive: PASS")
 
 
-fn test_getitem_negative() raises:
+def test_getitem_negative() raises:
     var s = Shape(2, 3, 4)
     assert_equal(s[-1], 4)
     assert_equal(s[-2], 3)
@@ -52,7 +52,7 @@ fn test_getitem_negative() raises:
 # --- Strides ---
 
 
-fn test_strides_2d() raises:
+def test_strides_2d() raises:
     var s = Shape(3, 4)
     var strides = s.strides()
     assert_equal(strides[0], 4)  # skip 4 elements per row
@@ -60,7 +60,7 @@ fn test_strides_2d() raises:
     print("  strides_2d: PASS")
 
 
-fn test_strides_3d() raises:
+def test_strides_3d() raises:
     var s = Shape(2, 3, 4)
     var strides = s.strides()
     assert_equal(strides[0], 12)  # 3 * 4
@@ -69,7 +69,7 @@ fn test_strides_3d() raises:
     print("  strides_3d: PASS")
 
 
-fn test_strides_1d() raises:
+def test_strides_1d() raises:
     var s = Shape(5)
     var strides = s.strides()
     assert_equal(strides[0], 1)
@@ -79,7 +79,7 @@ fn test_strides_1d() raises:
 # --- Broadcasting ---
 
 
-fn test_broadcast_same_shape() raises:
+def test_broadcast_same_shape() raises:
     var a = Shape(3, 4, 5)
     var b = Shape(3, 4, 5)
     var c = a.broadcast_with(b)
@@ -87,7 +87,7 @@ fn test_broadcast_same_shape() raises:
     print("  broadcast_same_shape: PASS")
 
 
-fn test_broadcast_classic() raises:
+def test_broadcast_classic() raises:
     """(3, 1, 5) broadcast with (1, 4, 5) = (3, 4, 5)."""
     var a = Shape(3, 1, 5)
     var b = Shape(1, 4, 5)
@@ -96,7 +96,7 @@ fn test_broadcast_classic() raises:
     print("  broadcast_classic: PASS")
 
 
-fn test_broadcast_different_ndim() raises:
+def test_broadcast_different_ndim() raises:
     """(5,) broadcast with (3, 5) = (3, 5)."""
     var a = Shape(5)
     var b = Shape(3, 5)
@@ -105,7 +105,7 @@ fn test_broadcast_different_ndim() raises:
     print("  broadcast_different_ndim: PASS")
 
 
-fn test_broadcast_scalar() raises:
+def test_broadcast_scalar() raises:
     """(1,) broadcast with (4, 5) = (4, 5)."""
     var a = Shape(1)
     var b = Shape(4, 5)
@@ -114,7 +114,7 @@ fn test_broadcast_scalar() raises:
     print("  broadcast_scalar: PASS")
 
 
-fn test_broadcast_incompatible() raises:
+def test_broadcast_incompatible() raises:
     """(3, 4) broadcast with (3, 5) should raise."""
     var a = Shape(3, 4)
     var b = Shape(3, 5)
@@ -130,14 +130,14 @@ fn test_broadcast_incompatible() raises:
 # --- Reshape ---
 
 
-fn test_reshape_valid() raises:
+def test_reshape_valid() raises:
     var a = Shape(2, 3, 4)
     var b = Shape(6, 4)
     assert_true(a.reshape_valid(b))
     print("  reshape_valid: PASS")
 
 
-fn test_reshape_invalid() raises:
+def test_reshape_invalid() raises:
     var a = Shape(2, 3, 4)
     var b = Shape(5, 5)  # 25 != 24
     assert_false(a.reshape_valid(b))
@@ -147,7 +147,7 @@ fn test_reshape_invalid() raises:
 # --- Equality ---
 
 
-fn test_equality() raises:
+def test_equality() raises:
     assert_true(Shape(2, 3) == Shape(2, 3))
     assert_false(Shape(2, 3) == Shape(3, 2))
     assert_false(Shape(2, 3) == Shape(2, 3, 1))
@@ -157,7 +157,7 @@ fn test_equality() raises:
 # --- Writable ---
 
 
-fn test_writable() raises:
+def test_writable() raises:
     var s = String(Shape(2, 3, 4))
     assert_true("2" in s)
     assert_true("3" in s)
@@ -168,7 +168,7 @@ fn test_writable() raises:
 # --- Main ---
 
 
-fn main() raises:
+def main() raises:
     print("test_shape:")
     test_ndim()
     test_numel()

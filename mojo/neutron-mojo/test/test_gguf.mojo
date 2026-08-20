@@ -21,12 +21,12 @@ from neutron_mojo.io.gguf import (
 )
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
 
-fn test_gguf_tensor_type() raises:
+def test_gguf_tensor_type() raises:
     """Test GGUF tensor type enum."""
     var t_f32 = GGUF_F32()
     var t_f16 = GGUF_F16()
@@ -40,7 +40,7 @@ fn test_gguf_tensor_type() raises:
     print("  gguf_tensor_type: PASS")
 
 
-fn test_gguf_tensor_info_creation() raises:
+def test_gguf_tensor_info_creation() raises:
     """Test GGUFTensorInfo struct creation."""
     var info = GGUFTensorInfo()
     info.name = String("embedding.weight")
@@ -57,7 +57,7 @@ fn test_gguf_tensor_info_creation() raises:
     print("  gguf_tensor_info_creation: PASS")
 
 
-fn test_gguf_file_creation() raises:
+def test_gguf_file_creation() raises:
     """Test GGUFFile struct creation."""
     var gguf = GGUFFile()
 
@@ -68,7 +68,7 @@ fn test_gguf_file_creation() raises:
     print("  gguf_file_creation: PASS")
 
 
-fn test_gguf_magic_validation() raises:
+def test_gguf_magic_validation() raises:
     """Test GGUF magic number validation."""
     var gguf = GGUFFile()
 
@@ -81,7 +81,7 @@ fn test_gguf_magic_validation() raises:
     print("  gguf_magic_validation: PASS")
 
 
-fn test_gguf_register_tensor() raises:
+def test_gguf_register_tensor() raises:
     """Test manual tensor registration."""
     var gguf = GGUFFile()
 
@@ -97,7 +97,7 @@ fn test_gguf_register_tensor() raises:
     print("  gguf_register_tensor: PASS")
 
 
-fn test_gguf_get_tensor_info() raises:
+def test_gguf_get_tensor_info() raises:
     """Test getting tensor metadata."""
     var gguf = GGUFFile()
 
@@ -119,7 +119,7 @@ fn test_gguf_get_tensor_info() raises:
     print("  gguf_get_tensor_info: PASS")
 
 
-fn test_gguf_tensor_offset() raises:
+def test_gguf_tensor_offset() raises:
     """Test calculating absolute tensor offset."""
     var gguf = GGUFFile()
     gguf.data_offset = 5000  # Simulate header size
@@ -135,7 +135,7 @@ fn test_gguf_tensor_offset() raises:
     print("  gguf_tensor_offset: PASS")
 
 
-fn test_gguf_type_to_dtype() raises:
+def test_gguf_type_to_dtype() raises:
     """Test converting GGUF types to DType."""
     var dt_f32 = gguf_type_to_dtype(GGUF_F32())
     var dt_f16 = gguf_type_to_dtype(GGUF_F16())
@@ -150,7 +150,7 @@ fn test_gguf_type_to_dtype() raises:
     print("  gguf_type_to_dtype: PASS")
 
 
-fn test_dtype_to_gguf_type() raises:
+def test_dtype_to_gguf_type() raises:
     """Test converting DType to GGUF types."""
     var t_f32 = dtype_to_gguf_type(DType.float32)
     var t_f16 = dtype_to_gguf_type(DType.float16)
@@ -161,7 +161,7 @@ fn test_dtype_to_gguf_type() raises:
     print("  dtype_to_gguf_type: PASS")
 
 
-fn test_calculate_tensor_size_f32() raises:
+def test_calculate_tensor_size_f32() raises:
     """Test calculating F32 tensor size."""
     var shape = List[Int]()
     shape.append(100)
@@ -174,7 +174,7 @@ fn test_calculate_tensor_size_f32() raises:
     print("  calculate_tensor_size_f32: PASS")
 
 
-fn test_calculate_tensor_size_f16() raises:
+def test_calculate_tensor_size_f16() raises:
     """Test calculating F16 tensor size."""
     var shape = List[Int]()
     shape.append(512)
@@ -187,7 +187,7 @@ fn test_calculate_tensor_size_f16() raises:
     print("  calculate_tensor_size_f16: PASS")
 
 
-fn test_calculate_tensor_size_q4_0() raises:
+def test_calculate_tensor_size_q4_0() raises:
     """Test calculating Q4_0 tensor size."""
     var shape = List[Int]()
     shape.append(1024)  # 32 blocks * 18 bytes = 576 bytes
@@ -198,7 +198,7 @@ fn test_calculate_tensor_size_q4_0() raises:
     print("  calculate_tensor_size_q4_0: PASS")
 
 
-fn test_calculate_tensor_size_q8_0() raises:
+def test_calculate_tensor_size_q8_0() raises:
     """Test calculating Q8_0 tensor size."""
     var shape = List[Int]()
     shape.append(1024)  # 32 blocks * 34 bytes = 1088 bytes
@@ -209,7 +209,7 @@ fn test_calculate_tensor_size_q8_0() raises:
     print("  calculate_tensor_size_q8_0: PASS")
 
 
-fn test_multiple_gguf_tensors() raises:
+def test_multiple_gguf_tensors() raises:
     """Test registering multiple tensors."""
     var gguf = GGUFFile()
     gguf.tensor_count = 3
@@ -244,7 +244,7 @@ fn test_multiple_gguf_tensors() raises:
     print("  multiple_gguf_tensors: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_gguf:")
 
     test_gguf_tensor_type()

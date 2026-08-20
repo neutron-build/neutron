@@ -4,7 +4,7 @@
 
 """Tests: struct sizes, dtype round-trips, field access, flags."""
 
-from testing import assert_true, assert_false, assert_equal
+from std.testing import assert_true, assert_false, assert_equal
 
 from neutron_mojo.dlpack.dlpack import (
     DLDataType,
@@ -34,7 +34,7 @@ from neutron_mojo.dlpack.dlpack import (
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_dl_datatype_float32() raises:
+def test_dl_datatype_float32() raises:
     var dt = DLDataType(kDLFloat, 32, 1)
     assert_equal(dt.code, kDLFloat)
     assert_equal(dt.bits, UInt8(32))
@@ -42,7 +42,7 @@ fn test_dl_datatype_float32() raises:
     print("  dl_datatype_float32: PASS")
 
 
-fn test_dl_datatype_equality() raises:
+def test_dl_datatype_equality() raises:
     var a = DLDataType(kDLFloat, 32, 1)
     var b = DLDataType(kDLFloat, 32, 1)
     var c = DLDataType(kDLFloat, 16, 1)
@@ -51,7 +51,7 @@ fn test_dl_datatype_equality() raises:
     print("  dl_datatype_equality: PASS")
 
 
-fn test_dl_datatype_writable() raises:
+def test_dl_datatype_writable() raises:
     var dt = DLDataType(kDLInt, 8, 1)
     var s = String(dt)
     assert_true("DLDataType" in s)
@@ -63,21 +63,21 @@ fn test_dl_datatype_writable() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_dl_device_cpu() raises:
+def test_dl_device_cpu() raises:
     var dev = DLDevice(kDLCPU, 0)
     assert_equal(dev.device_type, kDLCPU)
     assert_equal(dev.device_id, Int32(0))
     print("  dl_device_cpu: PASS")
 
 
-fn test_dl_device_cuda() raises:
+def test_dl_device_cuda() raises:
     var dev = DLDevice(kDLCUDA, 1)
     assert_equal(dev.device_type, kDLCUDA)
     assert_equal(dev.device_id, Int32(1))
     print("  dl_device_cuda: PASS")
 
 
-fn test_dl_device_equality() raises:
+def test_dl_device_equality() raises:
     var a = DLDevice(kDLCPU, 0)
     var b = DLDevice(kDLCPU, 0)
     var c = DLDevice(kDLCUDA, 0)
@@ -91,7 +91,7 @@ fn test_dl_device_equality() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_dl_version() raises:
+def test_dl_version() raises:
     assert_equal(DLPACK_VERSION.major, UInt32(1))
     assert_equal(DLPACK_VERSION.minor, UInt32(0))
     var s = String(DLPACK_VERSION)
@@ -99,7 +99,7 @@ fn test_dl_version() raises:
     print("  dl_version: PASS")
 
 
-fn test_dl_version_equality() raises:
+def test_dl_version_equality() raises:
     var a = DLPackVersion(1, 0)
     var b = DLPackVersion(1, 0)
     var c = DLPackVersion(2, 0)
@@ -113,7 +113,7 @@ fn test_dl_version_equality() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_dl_tensor_default() raises:
+def test_dl_tensor_default() raises:
     var t = DLTensor()
     assert_equal(t.ndim, Int32(0))
     assert_equal(t.byte_offset, UInt64(0))
@@ -128,7 +128,7 @@ fn test_dl_tensor_default() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_dl_managed_default() raises:
+def test_dl_managed_default() raises:
     var mt = DLManagedTensorVersioned()
     assert_equal(mt.version.major, UInt32(1))
     assert_equal(mt.version.minor, UInt32(0))
@@ -138,7 +138,7 @@ fn test_dl_managed_default() raises:
     print("  dl_managed_default: PASS")
 
 
-fn test_dl_managed_flags() raises:
+def test_dl_managed_flags() raises:
     var mt = DLManagedTensorVersioned()
     mt.flags = DLPACK_FLAG_BITMASK_READ_ONLY
     assert_true(mt.is_read_only())
@@ -159,7 +159,7 @@ fn test_dl_managed_flags() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_mojo_to_dl_float32() raises:
+def test_mojo_to_dl_float32() raises:
     var dl = mojo_dtype_to_dl(DType.float32)
     assert_equal(dl.code, kDLFloat)
     assert_equal(dl.bits, UInt8(32))
@@ -167,21 +167,21 @@ fn test_mojo_to_dl_float32() raises:
     print("  mojo_to_dl_float32: PASS")
 
 
-fn test_mojo_to_dl_bfloat16() raises:
+def test_mojo_to_dl_bfloat16() raises:
     var dl = mojo_dtype_to_dl(DType.bfloat16)
     assert_equal(dl.code, kDLBfloat)
     assert_equal(dl.bits, UInt8(16))
     print("  mojo_to_dl_bfloat16: PASS")
 
 
-fn test_mojo_to_dl_bool() raises:
+def test_mojo_to_dl_bool() raises:
     var dl = mojo_dtype_to_dl(DType.bool)
     assert_equal(dl.code, kDLBool)
     assert_equal(dl.bits, UInt8(8))
     print("  mojo_to_dl_bool: PASS")
 
 
-fn test_dl_to_mojo_round_trip() raises:
+def test_dl_to_mojo_round_trip() raises:
     """Round-trip: Mojo DType -> DLDataType -> Mojo DType."""
     var types = List[DType]()
     types.append(DType.float16)
@@ -207,18 +207,22 @@ fn test_dl_to_mojo_round_trip() raises:
     print("  dl_to_mojo_round_trip: PASS")
 
 
-fn test_dl_to_mojo_unknown() raises:
-    """Unknown DLDataType should map to DType.invalid."""
+def test_dl_to_mojo_unknown() raises:
+    """Unknown DLDataType should raise an error."""
     var dl = DLDataType(99, 99, 1)
-    var result = dl_to_mojo_dtype(dl)
-    assert_true(result == DType.invalid)
+    var raised = False
+    try:
+        _ = dl_to_mojo_dtype(dl)
+    except:
+        raised = True
+    assert_true(raised)
     print("  dl_to_mojo_unknown: PASS")
 
 
 # --- Main ---
 
 
-fn main() raises:
+def main() raises:
     print("test_dlpack:")
 
     # DLDataType

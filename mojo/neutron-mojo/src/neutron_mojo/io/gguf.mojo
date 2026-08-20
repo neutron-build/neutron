@@ -16,7 +16,7 @@ GGUF (GPT-Generated Unified Format) is used by llama.cpp:
 Reference: https://github.com/ggerganov/llama.cpp/blob/master/gguf-py/gguf/constants.py
 """
 
-from collections import Dict
+from std.collections import Dict
 from neutron_mojo.io.binary_reader import BinaryReader
 from neutron_mojo.model.config import ModelConfig, RoPEConfig, ACT_SILU
 from neutron_mojo.model.architecture import ArchitectureConfig, detect_architecture
@@ -50,24 +50,24 @@ comptime GGUF_TYPE_FLOAT64 = 12
 # GGUF Tensor Type Enum
 # ===----------------------------------------------------------------------=== #
 
-struct GGUFTensorType(Writable, Copyable, Movable):
+struct GGUFTensorType(Writable, Copyable, Movable, ImplicitlyCopyable):
     """GGUF tensor type enumeration."""
     var _value: Int
 
     @implicit
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self._value = value
 
-    fn __copyinit__(out self, existing: Self):
-        self._value = existing._value
+    def __init__(out self, *, copy: Self):
+        self._value = copy._value
 
-    fn __eq__(self, other: GGUFTensorType) -> Bool:
+    def __eq__(self, other: GGUFTensorType) -> Bool:
         return self._value == other._value
 
-    fn __ne__(self, other: GGUFTensorType) -> Bool:
+    def __ne__(self, other: GGUFTensorType) -> Bool:
         return self._value != other._value
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         if self._value == 0:
             writer.write("F32")
         elif self._value == 1:
@@ -85,22 +85,22 @@ struct GGUFTensorType(Writable, Copyable, Movable):
 
 
 # Tensor type constants (factory functions)
-fn GGUF_F32() -> GGUFTensorType:
+def GGUF_F32() -> GGUFTensorType:
     return GGUFTensorType(0)
 
-fn GGUF_F16() -> GGUFTensorType:
+def GGUF_F16() -> GGUFTensorType:
     return GGUFTensorType(1)
 
-fn GGUF_Q4_0() -> GGUFTensorType:
+def GGUF_Q4_0() -> GGUFTensorType:
     return GGUFTensorType(2)
 
-fn GGUF_Q4_1() -> GGUFTensorType:
+def GGUF_Q4_1() -> GGUFTensorType:
     return GGUFTensorType(3)
 
-fn GGUF_Q8_0() -> GGUFTensorType:
+def GGUF_Q8_0() -> GGUFTensorType:
     return GGUFTensorType(8)
 
-fn GGUF_Q4_K() -> GGUFTensorType:
+def GGUF_Q4_K() -> GGUFTensorType:
     return GGUFTensorType(12)
 
 
@@ -108,7 +108,7 @@ fn GGUF_Q4_K() -> GGUFTensorType:
 # GGUF Tensor Info
 # ===----------------------------------------------------------------------=== #
 
-struct GGUFTensorInfo(Copyable):
+struct GGUFTensorInfo(Copyable, ImplicitlyCopyable):
     """Metadata for a single tensor in GGUF file."""
     var name: String
     var n_dims: Int
@@ -116,21 +116,21 @@ struct GGUFTensorInfo(Copyable):
     var tensor_type: GGUFTensorType
     var offset: Int  # Offset in data section
 
-    fn __init__(out self):
+    def __init__(out self):
         self.name = String("")
         self.n_dims = 0
         self.shape = List[Int]()
         self.tensor_type = GGUFTensorType(0)  # Default to F32
         self.offset = 0
 
-    fn __copyinit__(out self, existing: Self):
-        self.name = existing.name
-        self.n_dims = existing.n_dims
-        self.shape = existing.shape.copy()
-        self.tensor_type = existing.tensor_type.copy()
-        self.offset = existing.offset
+    def __init__(out self, *, copy: Self):
+        self.name = copy.name
+        self.n_dims = copy.n_dims
+        self.shape = copy.shape.copy()
+        self.tensor_type = copy.tensor_type.copy()
+        self.offset = copy.offset
 
-    fn numel(self) -> Int:
+    def numel(self) -> Int:
         """Calculate total number of elements."""
         var total = 1
         for i in range(len(self.shape)):
@@ -166,7 +166,7 @@ struct GGUFFile(Movable):
     var token_scores: List[Float64]
     var token_merges: List[String]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.magic = 0
         self.version = 0
         self.tensor_count = 0
@@ -181,22 +181,22 @@ struct GGUFFile(Movable):
         self.token_scores = List[Float64]()
         self.token_merges = List[String]()
 
-    fn __moveinit__(out self, deinit other: Self):
-        self.magic = other.magic
-        self.version = other.version
-        self.tensor_count = other.tensor_count
-        self.metadata_count = other.metadata_count
-        self.alignment = other.alignment
-        self.data_offset = other.data_offset
-        self.tensors = other.tensors^
-        self.metadata_str = other.metadata_str^
-        self.metadata_int = other.metadata_int^
-        self.metadata_float = other.metadata_float^
-        self.token_vocab = other.token_vocab^
-        self.token_scores = other.token_scores^
-        self.token_merges = other.token_merges^
+    def __init__(out self, *, deinit move: Self):
+        self.magic = move.magic^
+        self.version = move.version^
+        self.tensor_count = move.tensor_count^
+        self.metadata_count = move.metadata_count^
+        self.alignment = move.alignment^
+        self.data_offset = move.data_offset^
+        self.tensors = move.tensors^
+        self.metadata_str = move.metadata_str^
+        self.metadata_int = move.metadata_int^
+        self.metadata_float = move.metadata_float^
+        self.token_vocab = move.token_vocab^
+        self.token_scores = move.token_scores^
+        self.token_merges = move.token_merges^
 
-    fn is_valid(self) -> Bool:
+    def is_valid(self) -> Bool:
         """Check if file has valid GGUF magic number.
 
         Returns:
@@ -204,7 +204,7 @@ struct GGUFFile(Movable):
         """
         return self.magic == GGUF_MAGIC
 
-    fn register_tensor(
+    def register_tensor(
         mut self,
         name: String,
         shape: List[Int],
@@ -227,7 +227,7 @@ struct GGUFFile(Movable):
         info.offset = offset
         self.tensors[name] = info^
 
-    fn has_tensor(self, name: String) -> Bool:
+    def has_tensor(self, name: String) -> Bool:
         """Check if a tensor exists in the file.
 
         Args:
@@ -238,7 +238,7 @@ struct GGUFFile(Movable):
         """
         return name in self.tensors
 
-    fn get_tensor_info(self, name: String) raises -> GGUFTensorInfo:
+    def get_tensor_info(self, name: String) raises -> GGUFTensorInfo:
         """Get metadata for a tensor.
 
         Args:
@@ -251,7 +251,7 @@ struct GGUFFile(Movable):
             raise Error("Tensor not found: " + name)
         return self.tensors[name].copy()
 
-    fn get_tensor_offset(self, name: String) raises -> Int:
+    def get_tensor_offset(self, name: String) raises -> Int:
         """Get absolute file offset for tensor data.
 
         Args:
@@ -263,7 +263,7 @@ struct GGUFFile(Movable):
         var info = self.get_tensor_info(name)
         return self.data_offset + info.offset
 
-    fn tensor_count_total(self) -> Int:
+    def tensor_count_total(self) -> Int:
         """Get total number of tensors in file.
 
         Returns:
@@ -271,7 +271,7 @@ struct GGUFFile(Movable):
         """
         return self.tensor_count
 
-    fn get_str(self, key: String, default: String) -> String:
+    def get_str(self, key: String, default: String) -> String:
         """Get a string metadata value."""
         if key in self.metadata_str:
             try:
@@ -280,7 +280,7 @@ struct GGUFFile(Movable):
                 return default
         return default
 
-    fn get_int(self, key: String, default: Int) -> Int:
+    def get_int(self, key: String, default: Int) -> Int:
         """Get an integer metadata value."""
         if key in self.metadata_int:
             try:
@@ -289,7 +289,7 @@ struct GGUFFile(Movable):
                 return default
         return default
 
-    fn get_float(self, key: String, default: Float64) -> Float64:
+    def get_float(self, key: String, default: Float64) -> Float64:
         """Get a float metadata value."""
         if key in self.metadata_float:
             try:
@@ -303,7 +303,7 @@ struct GGUFFile(Movable):
 # Utility Functions
 # ===----------------------------------------------------------------------=== #
 
-fn gguf_type_to_dtype(tensor_type: GGUFTensorType) -> DType:
+def gguf_type_to_dtype(tensor_type: GGUFTensorType) -> DType:
     """Convert GGUF tensor type to Mojo DType.
 
     Args:
@@ -321,7 +321,7 @@ fn gguf_type_to_dtype(tensor_type: GGUFTensorType) -> DType:
         return DType.uint8
 
 
-fn dtype_to_gguf_type(dtype: DType) -> GGUFTensorType:
+def dtype_to_gguf_type(dtype: DType) -> GGUFTensorType:
     """Convert Mojo DType to GGUF tensor type.
 
     Args:
@@ -338,7 +338,7 @@ fn dtype_to_gguf_type(dtype: DType) -> GGUFTensorType:
         return GGUFTensorType(0)  # Default to F32
 
 
-fn calculate_tensor_size(shape: List[Int], tensor_type: GGUFTensorType) -> Int:
+def calculate_tensor_size(shape: List[Int], tensor_type: GGUFTensorType) -> Int:
     """Calculate tensor size in bytes based on shape and type.
 
     Args:
@@ -373,7 +373,7 @@ fn calculate_tensor_size(shape: List[Int], tensor_type: GGUFTensorType) -> Int:
 # Alignment
 # ===----------------------------------------------------------------------=== #
 
-fn _align_offset(offset: Int, alignment: Int) -> Int:
+def _align_offset(offset: Int, alignment: Int) -> Int:
     """Round offset up to the next alignment boundary.
 
     Args:
@@ -393,7 +393,7 @@ fn _align_offset(offset: Int, alignment: Int) -> Int:
 # GGUF Binary Parser
 # ===----------------------------------------------------------------------=== #
 
-fn _skip_gguf_value(mut reader: BinaryReader, value_type: Int) raises:
+def _skip_gguf_value(mut reader: BinaryReader, value_type: Int) raises:
     """Skip a metadata value based on its type.
 
     Args:
@@ -420,7 +420,7 @@ fn _skip_gguf_value(mut reader: BinaryReader, value_type: Int) raises:
         raise Error("Unknown GGUF value type: " + String(value_type))
 
 
-fn parse_gguf_file(path: String) raises -> GGUFFile:
+def parse_gguf_file(path: String) raises -> GGUFFile:
     """Parse a GGUF file from disk.
 
     Reads the header, metadata key-value pairs, and tensor info sections.
@@ -435,7 +435,7 @@ fn parse_gguf_file(path: String) raises -> GGUFFile:
     return _parse_gguf_from_reader(reader)
 
 
-fn parse_gguf_from_buffer(var buf: List[UInt8]) raises -> GGUFFile:
+def parse_gguf_from_buffer(var buf: List[UInt8]) raises -> GGUFFile:
     """Parse a GGUF from an in-memory buffer (for testing).
 
     Args:
@@ -448,7 +448,7 @@ fn parse_gguf_from_buffer(var buf: List[UInt8]) raises -> GGUFFile:
     return _parse_gguf_from_reader(reader)
 
 
-fn _parse_gguf_from_reader(mut reader: BinaryReader) raises -> GGUFFile:
+def _parse_gguf_from_reader(mut reader: BinaryReader) raises -> GGUFFile:
     """Parse GGUF from a BinaryReader.
 
     Args:
@@ -580,7 +580,7 @@ fn _parse_gguf_from_reader(mut reader: BinaryReader) raises -> GGUFFile:
 # Config Extraction
 # ===----------------------------------------------------------------------=== #
 
-fn gguf_to_model_config(gguf: GGUFFile) -> ModelConfig:
+def gguf_to_model_config(gguf: GGUFFile) -> ModelConfig:
     """Extract model configuration from GGUF metadata.
 
     Maps GGUF metadata keys to ModelConfig fields:
@@ -630,7 +630,7 @@ fn gguf_to_model_config(gguf: GGUFFile) -> ModelConfig:
     return cfg^
 
 
-fn detect_arch_from_gguf(gguf: GGUFFile) -> ArchitectureConfig:
+def detect_arch_from_gguf(gguf: GGUFFile) -> ArchitectureConfig:
     """Auto-detect architecture from GGUF metadata.
 
     Reads general.architecture and architecture-specific metadata keys
@@ -659,7 +659,7 @@ fn detect_arch_from_gguf(gguf: GGUFFile) -> ArchitectureConfig:
 # GGUF Writer (for tests)
 # ===----------------------------------------------------------------------=== #
 
-fn _write_u32_le(mut buf: List[UInt8], val: Int):
+def _write_u32_le(mut buf: List[UInt8], val: Int):
     """Append a u32 little-endian to buffer."""
     buf.append(UInt8(val & 0xFF))
     buf.append(UInt8((val >> 8) & 0xFF))
@@ -667,13 +667,13 @@ fn _write_u32_le(mut buf: List[UInt8], val: Int):
     buf.append(UInt8((val >> 24) & 0xFF))
 
 
-fn _write_u64_le(mut buf: List[UInt8], val: Int):
+def _write_u64_le(mut buf: List[UInt8], val: Int):
     """Append a u64 little-endian to buffer."""
     for i in range(8):
         buf.append(UInt8((val >> (i * 8)) & 0xFF))
 
 
-fn _write_string_gguf(mut buf: List[UInt8], s: String):
+def _write_string_gguf(mut buf: List[UInt8], s: String):
     """Write a GGUF string (u64 len + bytes)."""
     var bytes = s.as_bytes()
     _write_u64_le(buf, len(bytes))
@@ -681,9 +681,9 @@ fn _write_string_gguf(mut buf: List[UInt8], s: String):
         buf.append(bytes[i])
 
 
-fn _write_f32_le(mut buf: List[UInt8], val: Float32):
+def _write_f32_le(mut buf: List[UInt8], val: Float32):
     """Write a float32 as little-endian bytes."""
-    from memory import alloc
+    from std.memory import alloc
     var p = alloc[Float32](1)
     p.store(val)
     var bp = p.bitcast[UInt8]()
@@ -692,7 +692,7 @@ fn _write_f32_le(mut buf: List[UInt8], val: Float32):
     p.free()
 
 
-fn build_test_gguf(
+def build_test_gguf(
     str_keys: List[String],
     str_vals: List[String],
     int_keys: List[String],

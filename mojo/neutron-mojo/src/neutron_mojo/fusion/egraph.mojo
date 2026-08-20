@@ -13,7 +13,7 @@ An e-graph efficiently represents equivalence classes of expressions. It combine
 This is the core data structure for the rewrite engine.
 """
 
-from collections import List, Dict, Optional
+from std.collections import List, Dict, Optional
 from .graph import OpKind, ValueId, ENode
 from .eclass import ClassId, UnionFind, EClass
 
@@ -21,7 +21,7 @@ from .eclass import ClassId, UnionFind, EClass
 # CanonicalNode — Canonicalized e-node with ClassId inputs
 # ===----------------------------------------------------------------------=== #
 
-struct CanonicalNode(Writable, Copyable, Movable):
+struct CanonicalNode(Writable, Copyable, Movable, ImplicitlyCopyable):
     """E-node with inputs canonicalized to e-class IDs.
 
     Before adding a node to the e-graph, we canonicalize its inputs by
@@ -32,32 +32,32 @@ struct CanonicalNode(Writable, Copyable, Movable):
     var op: OpKind
     var inputs: List[ClassId]
 
-    fn __init__(out self, op: OpKind):
+    def __init__(out self, op: OpKind):
         self.op = op
         self.inputs = List[ClassId]()
 
-    fn __init__(out self, op: OpKind, input0: ClassId):
+    def __init__(out self, op: OpKind, input0: ClassId):
         self.op = op
         self.inputs = List[ClassId]()
         self.inputs.append(input0)
 
-    fn __init__(out self, op: OpKind, input0: ClassId, input1: ClassId):
+    def __init__(out self, op: OpKind, input0: ClassId, input1: ClassId):
         self.op = op
         self.inputs = List[ClassId]()
         self.inputs.append(input0)
         self.inputs.append(input1)
 
-    fn __copyinit__(out self, existing: Self):
-        self.op = existing.op
-        self.inputs = existing.inputs.copy()
+    def __init__(out self, *, copy: Self):
+        self.op = copy.op
+        self.inputs = copy.inputs.copy()
 
-    fn copy(self) -> CanonicalNode:
+    def copy(self) -> CanonicalNode:
         """Return a deep copy of this canonical node."""
         var cn = CanonicalNode(self.op)
         cn.inputs = self.inputs.copy()
         return cn^
 
-    fn hash(self) -> Int:
+    def hash(self) -> Int:
         """Compute hash for hash-consing.
 
         Simple hash combining op value and input class IDs.
@@ -67,7 +67,7 @@ struct CanonicalNode(Writable, Copyable, Movable):
             h = h * 31 + self.inputs[i].id()
         return h
 
-    fn __eq__(self, other: CanonicalNode) -> Bool:
+    def __eq__(self, other: CanonicalNode) -> Bool:
         """Check structural equality for hash-consing."""
         if self.op != other.op:
             return False
@@ -78,7 +78,7 @@ struct CanonicalNode(Writable, Copyable, Movable):
                 return False
         return True
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write(String(self.op))
         writer.write("(")
         for i in range(len(self.inputs)):
@@ -109,7 +109,7 @@ struct EGraph:
     var _hash_buckets: List[List[Int]]  # hash % 256 -> list of node indices
     var _num_buckets: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.nodes = List[CanonicalNode]()
         self.classes = List[EClass]()
         self.unionfind = UnionFind()
@@ -118,7 +118,7 @@ struct EGraph:
         for _ in range(256):
             self._hash_buckets.append(List[Int]())
 
-    fn add(mut self, var node: CanonicalNode) -> ClassId:
+    def add(mut self, var node: CanonicalNode) -> ClassId:
         """Add a canonical node to the e-graph.
 
         Hash-consing: if a structurally identical node already exists,
@@ -156,7 +156,7 @@ struct EGraph:
 
         return class_id
 
-    fn merge(mut self, id1: ClassId, id2: ClassId) -> ClassId:
+    def merge(mut self, id1: ClassId, id2: ClassId) -> ClassId:
         """Merge two e-classes.
 
         After merging, all nodes in both classes are equivalent.
@@ -170,7 +170,7 @@ struct EGraph:
         """
         return self.unionfind.merge(id1, id2)
 
-    fn find(mut self, id: ClassId) -> ClassId:
+    def find(mut self, id: ClassId) -> ClassId:
         """Find the canonical representative of an e-class.
 
         Args:
@@ -181,7 +181,7 @@ struct EGraph:
         """
         return self.unionfind.find(id)
 
-    fn canonicalize(mut self, var node: CanonicalNode) -> CanonicalNode:
+    def canonicalize(mut self, var node: CanonicalNode) -> CanonicalNode:
         """Canonicalize a node by replacing input classes with their canonical representatives.
 
         This is essential after merging: input references may point to stale
@@ -199,10 +199,10 @@ struct EGraph:
             canonical.inputs.append(canonical_input)
         return canonical^
 
-    fn num_classes(self) -> Int:
+    def num_classes(self) -> Int:
         """Return the total number of e-classes (including merged ones)."""
         return self.unionfind.size()
 
-    fn num_nodes(self) -> Int:
+    def num_nodes(self) -> Int:
         """Return the total number of e-nodes in the graph."""
         return len(self.nodes)

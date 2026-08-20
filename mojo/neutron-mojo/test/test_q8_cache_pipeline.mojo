@@ -16,7 +16,7 @@ from neutron_mojo.nn.kv_cache import MultiLayerKVCache
 from neutron_mojo.nn.rope import RoPETable
 
 
-fn assert_true(cond: Bool, msg: String) raises:
+def assert_true(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("Assertion failed: " + msg)
 
@@ -25,7 +25,7 @@ fn assert_true(cond: Bool, msg: String) raises:
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-fn _build_tiny_tokenizer() -> BPETokenizer:
+def _build_tiny_tokenizer() -> BPETokenizer:
     """Build a minimal tokenizer for testing (8 tokens, IDs 0-7)."""
     var tok = BPETokenizer()
     _ = tok.add_token("<s>")     # 0
@@ -42,7 +42,7 @@ fn _build_tiny_tokenizer() -> BPETokenizer:
     return tok^
 
 
-fn _build_tiny_model() -> Model:
+def _build_tiny_model() -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -64,7 +64,7 @@ fn _build_tiny_model() -> Model:
     return model^
 
 
-fn _build_tiny_q_model() -> QuantizedModel:
+def _build_tiny_q_model() -> QuantizedModel:
     """Build a tiny QuantizedModel from FP32 model."""
     var model = _build_tiny_model()
     return quantize_from_model(model, block_size=2)
@@ -74,7 +74,7 @@ fn _build_tiny_q_model() -> QuantizedModel:
 # Tests
 # ===----------------------------------------------------------------------=== #
 
-fn test_q8_cache_fp32_model_pipeline() raises:
+def test_q8_cache_fp32_model_pipeline() raises:
     """FP32 Model pipeline with use_q8_cache=True generates text."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -84,12 +84,12 @@ fn test_q8_cache_fp32_model_pipeline() raises:
     cfg.use_q8_cache = True
 
     var result = pipeline_generate(model, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "fp32 model + q8 cache produces output")
+    assert_true(result.byte_length() >= 0, "fp32 model + q8 cache produces output")
 
     print("  q8_cache_fp32_model_pipeline: PASS")
 
 
-fn test_q8_cache_quantized_model_pipeline() raises:
+def test_q8_cache_quantized_model_pipeline() raises:
     """QuantizedModel pipeline with use_q8_cache=True generates text."""
     var qm = _build_tiny_q_model()
     var tok = _build_tiny_tokenizer()
@@ -99,12 +99,12 @@ fn test_q8_cache_quantized_model_pipeline() raises:
     cfg.use_q8_cache = True
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "q8 model + q8 cache produces output")
+    assert_true(result.byte_length() >= 0, "q8 model + q8 cache produces output")
 
     print("  q8_cache_quantized_model_pipeline: PASS")
 
 
-fn test_fp32_vs_q8_cache_comparison() raises:
+def test_fp32_vs_q8_cache_comparison() raises:
     """Both FP32 and Q8 cache paths produce valid output from same model."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -120,13 +120,13 @@ fn test_fp32_vs_q8_cache_comparison() raises:
     var result_fp32 = pipeline_generate(model, tok, "ab", cfg_fp32)
     var result_q8 = pipeline_generate(model, tok, "ab", cfg_q8)
 
-    assert_true(len(result_fp32) >= 0, "fp32 cache output valid")
-    assert_true(len(result_q8) >= 0, "q8 cache output valid")
+    assert_true(result_fp32.byte_length() >= 0, "fp32 cache output valid")
+    assert_true(result_q8.byte_length() >= 0, "q8 cache output valid")
 
     print("  fp32_vs_q8_cache_comparison: PASS")
 
 
-fn test_q8_cache_memory_reduction() raises:
+def test_q8_cache_memory_reduction() raises:
     """Q8 cache uses less memory than FP32 cache."""
     var p = tiny_test_params()
     var max_seq = 32
@@ -162,7 +162,7 @@ fn test_q8_cache_memory_reduction() raises:
     print("  q8_cache_memory_reduction: PASS (q8=" + String(q8_bytes) + " fp32=" + String(fp32_bytes) + ")")
 
 
-fn test_q8_cache_with_penalties() raises:
+def test_q8_cache_with_penalties() raises:
     """Q8 cache pipeline with repetition+frequency penalties works."""
     var qm = _build_tiny_q_model()
     var tok = _build_tiny_tokenizer()
@@ -175,12 +175,12 @@ fn test_q8_cache_with_penalties() raises:
     cfg.presence_penalty = 0.2
 
     var result = q_pipeline_generate(qm, tok, "ab", cfg)
-    assert_true(len(result) >= 0, "q8 cache + penalties works")
+    assert_true(result.byte_length() >= 0, "q8 cache + penalties works")
 
     print("  q8_cache_with_penalties: PASS")
 
 
-fn test_q8_cache_with_chat_template() raises:
+def test_q8_cache_with_chat_template() raises:
     """Q8 cache pipeline with chat template works."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
@@ -191,12 +191,12 @@ fn test_q8_cache_with_chat_template() raises:
     cfg.chat_template = String("chatml")
 
     var result = pipeline_generate(model, tok, "hello", cfg)
-    assert_true(len(result) >= 0, "q8 cache + chat template works")
+    assert_true(result.byte_length() >= 0, "q8 cache + chat template works")
 
     print("  q8_cache_with_chat_template: PASS")
 
 
-fn test_config_default_backward_compat() raises:
+def test_config_default_backward_compat() raises:
     """Default PipelineConfig has use_q8_cache=False for backward compatibility."""
     var cfg = PipelineConfig()
     assert_true(cfg.use_q8_cache == False, "default use_q8_cache is False")
@@ -207,7 +207,7 @@ fn test_config_default_backward_compat() raises:
     print("  config_default_backward_compat: PASS")
 
 
-fn main() raises:
+def main() raises:
     print("test_q8_cache_pipeline:")
 
     test_q8_cache_fp32_model_pipeline()

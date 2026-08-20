@@ -9,8 +9,8 @@ factory methods (zeros, ones, full, rand), element access, SIMD
 load/store, and view operations (transpose, reshape).
 """
 
-from memory import memcpy
-from random import random_float64
+from std.memory import memcpy
+from std.random import random_float64
 
 from .shape import Shape
 from .storage import Storage, DeviceKind
@@ -33,13 +33,13 @@ struct Tensor[dtype: DType](Writable, Movable):
 
     # --- Constructors ---
 
-    fn __init__(out self, shape: Shape):
+    def __init__(out self, shape: Shape):
         """Create a zero-initialized tensor with the given shape."""
         var numel = shape.numel()
         self._storage = Storage[Self.dtype](numel)
         self._view = TensorView[Self.dtype](self._storage.unsafe_ptr(), shape)
 
-    fn __init__(out self, *dims: Int):
+    def __init__(out self, *dims: Int):
         """Create a zero-initialized tensor from variadic dimension sizes."""
         var dim_list = List[Int]()
         for i in range(len(dims)):
@@ -49,7 +49,7 @@ struct Tensor[dtype: DType](Writable, Movable):
         self._storage = Storage[Self.dtype](numel)
         self._view = TensorView[Self.dtype](self._storage.unsafe_ptr(), shape)
 
-    fn __init__(out self, view: TensorView[Self.dtype]):
+    def __init__(out self, view: TensorView[Self.dtype]):
         """Create an owned tensor by copying data from a (possibly non-contiguous) view.
 
         Use this to materialize a safe owned copy from a transposed, sliced,
@@ -73,39 +73,34 @@ struct Tensor[dtype: DType](Writable, Movable):
                 offset += coord * src_strides[d]
             dst.store(i, view._ptr.load(offset))
 
-    fn __moveinit__(out self, deinit other: Self):
+    def __init__(out self, *, deinit move: Self):
         """Move constructor."""
-        self._storage = other._storage^
-        self._view = TensorView[Self.dtype](
-            self._storage.unsafe_ptr(),
-            other._view.shape,
-            other._view.strides(),
-            other._view.offset(),
-        )
+        self._storage = move._storage^
+        self._view = move._view^
 
     # --- Factory methods ---
 
     @staticmethod
-    fn zeros(shape: Shape) -> Tensor[Self.dtype]:
+    def zeros(shape: Shape) -> Tensor[Self.dtype]:
         """Create a tensor filled with zeros."""
         return Tensor[Self.dtype](shape)
 
     @staticmethod
-    fn ones(shape: Shape) -> Tensor[Self.dtype]:
+    def ones(shape: Shape) -> Tensor[Self.dtype]:
         """Create a tensor filled with ones."""
         var t = Tensor[Self.dtype](shape)
         t._storage.fill(Scalar[Self.dtype](1))
         return t^
 
     @staticmethod
-    fn full(shape: Shape, value: Scalar[Self.dtype]) -> Tensor[Self.dtype]:
+    def full(shape: Shape, value: Scalar[Self.dtype]) -> Tensor[Self.dtype]:
         """Create a tensor filled with a constant value."""
         var t = Tensor[Self.dtype](shape)
         t._storage.fill(value)
         return t^
 
     @staticmethod
-    fn rand(shape: Shape) -> Tensor[Self.dtype]:
+    def rand(shape: Shape) -> Tensor[Self.dtype]:
         """Create a tensor filled with uniform random values in [0, 1)."""
         var t = Tensor[Self.dtype](shape)
         for i in range(shape.numel()):
@@ -113,12 +108,12 @@ struct Tensor[dtype: DType](Writable, Movable):
         return t^
 
     @staticmethod
-    fn randn(shape: Shape) -> Tensor[Self.dtype]:
+    def randn(shape: Shape) -> Tensor[Self.dtype]:
         """Create a tensor with approximate standard normal values.
 
         Uses Box-Muller transform on pairs of uniform samples.
         """
-        from math import sqrt, log, cos
+        from std.math import sqrt, log, cos
 
         comptime TWO_PI = 6.283185307179586
 
@@ -149,35 +144,31 @@ struct Tensor[dtype: DType](Writable, Movable):
 
     # --- Element access ---
 
-    fn get(self, *indices: Int) -> Scalar[Self.dtype]:
+    def get(self, *indices: Int) -> Scalar[Self.dtype]:
         """Get a single element by indices."""
-        var offset = 0
-        var strides = self._view.strides()
+        var offset = self._view.offset()
         for i in range(len(indices)):
-            offset += indices[i] * strides[i]
-        offset += self._view.offset()
+            offset += indices[i] * self._view._strides[i]
         return self._storage.load(offset)
 
-    fn set(mut self, indices: List[Int], value: Scalar[Self.dtype]):
+    def set(mut self, indices: List[Int], value: Scalar[Self.dtype]):
         """Set a single element by index list."""
-        var offset = 0
-        var strides = self._view.strides()
+        var offset = self._view.offset()
         for i in range(len(indices)):
-            offset += indices[i] * strides[i]
-        offset += self._view.offset()
+            offset += indices[i] * self._view._strides[i]
         self._storage.store(offset, value)
 
-    fn set(mut self, flat_index: Int, value: Scalar[Self.dtype]):
+    def set(mut self, flat_index: Int, value: Scalar[Self.dtype]):
         """Set a single element by flat index (for 1D tensors or raw offset)."""
         self._storage.store(flat_index + self._view.offset(), value)
 
     # --- SIMD access ---
 
-    fn load_simd[width: Int](self, flat_offset: Int) -> SIMD[Self.dtype, width]:
+    def load_simd[width: Int](self, flat_offset: Int) -> SIMD[Self.dtype, width]:
         """Load a SIMD vector of `width` contiguous elements from flat offset."""
         return self._storage.load_simd[width](flat_offset + self._view.offset())
 
-    fn store_simd[width: Int](
+    def store_simd[width: Int](
         mut self, flat_offset: Int, value: SIMD[Self.dtype, width]
     ):
         """Store a SIMD vector of `width` contiguous elements at flat offset."""
@@ -185,7 +176,7 @@ struct Tensor[dtype: DType](Writable, Movable):
 
     # --- View operations ---
 
-    fn view(self) -> TensorView[Self.dtype]:
+    def view(self) -> TensorView[Self.dtype]:
         """Returns the current view of this tensor."""
         return TensorView[Self.dtype](
             self._storage.unsafe_ptr(),
@@ -194,7 +185,7 @@ struct Tensor[dtype: DType](Writable, Movable):
             self._view.offset(),
         )
 
-    fn transpose(self, dim0: Int, dim1: Int) -> TensorView[Self.dtype]:
+    def transpose(self, dim0: Int, dim1: Int) -> TensorView[Self.dtype]:
         """Returns a transposed view (no data copy).
 
         The returned view borrows this tensor's memory. Ensure this tensor
@@ -202,7 +193,7 @@ struct Tensor[dtype: DType](Writable, Movable):
         """
         return self._view.transpose(dim0, dim1)
 
-    fn reshape(self, new_shape: Shape) raises -> TensorView[Self.dtype]:
+    def reshape(self, new_shape: Shape) raises -> TensorView[Self.dtype]:
         """Returns a reshaped view (must be contiguous).
 
         The returned view borrows this tensor's memory. Ensure this tensor
@@ -210,48 +201,48 @@ struct Tensor[dtype: DType](Writable, Movable):
         """
         return self._view.reshape(new_shape)
 
-    fn clone(self) -> Tensor[Self.dtype]:
+    def clone(self) -> Tensor[Self.dtype]:
         """Returns a deep copy of this tensor with independent storage."""
         var t = Tensor[Self.dtype](self.shape())
         t._storage.copy_from(self._storage)
         return t^
 
-    fn is_contiguous(self) -> Bool:
+    def is_contiguous(self) -> Bool:
         """Returns True if the tensor's view is contiguous."""
         return self._view.is_contiguous()
 
     # --- Properties ---
 
     @always_inline
-    fn shape(self) -> Shape:
+    def shape(self) -> Shape:
         """Returns the runtime shape."""
         return self._view.shape.copy()
 
     @always_inline
-    fn ndim(self) -> Int:
+    def ndim(self) -> Int:
         """Returns the number of dimensions."""
         return self._view.ndim()
 
     @always_inline
-    fn numel(self) -> Int:
+    def numel(self) -> Int:
         """Returns the total number of elements."""
         return self._view.numel()
 
-    fn dtype_val(self) -> DType:
+    def dtype_val(self) -> DType:
         """Returns the element data type."""
         return Self.dtype
 
-    fn device(self) -> DeviceKind:
+    def device(self) -> DeviceKind:
         """Returns the device this tensor resides on."""
         return self._storage.device()
 
-    fn data_ptr(self) -> UnsafePointer[Scalar[Self.dtype], MutExternalOrigin]:
+    def data_ptr(self) -> Pointer[Scalar[Self.dtype], MutUntrackedOrigin]:
         """Returns a raw pointer to the tensor's data."""
         return self._storage.unsafe_ptr()
 
     # --- Writable ---
 
-    fn write_to[W: Writer](self, mut writer: W):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write("Tensor[", Self.dtype, "](")
         self._view.shape.write_to(writer)
         if self.numel() <= 20:

@@ -8,18 +8,18 @@ Reference implementations: reference/rmsnorm.py, reference/layernorm.py
 Tolerance: FP32 1e-6, FP16 1e-3
 """
 
-from math import sqrt
+from std.math import sqrt
 from neutron_mojo.tensor import Tensor, rmsnorm, layernorm
 
 
-fn assert_equal[dtype: DType](a: Scalar[dtype], b: Scalar[dtype]) raises:
+def assert_equal[dtype: DType](a: Scalar[dtype], b: Scalar[dtype]) raises:
     if a != b:
         raise Error(
             "Assertion failed: " + String(a) + " != " + String(b)
         )
 
 
-fn assert_close[dtype: DType](
+def assert_close[dtype: DType](
     a: Scalar[dtype], b: Scalar[dtype], rtol: Float64 = 1e-5, atol: Float64 = 1e-8
 ) raises:
     var diff = abs(Float64(a) - Float64(b))
@@ -30,7 +30,7 @@ fn assert_close[dtype: DType](
         )
 
 
-fn assert_true(cond: Bool) raises:
+def assert_true(cond: Bool) raises:
     if not cond:
         raise Error("Assertion failed: condition is False")
 
@@ -40,7 +40,7 @@ fn assert_true(cond: Bool) raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_rmsnorm_basic() raises:
+def test_rmsnorm_basic() raises:
     """Basic RMSNorm correctness: [1, 2, 3, 4] with gamma=1."""
     var x = Tensor[DType.float32](4)
     x.data_ptr().store(0, Float32(1.0))
@@ -70,7 +70,7 @@ fn test_rmsnorm_basic() raises:
     print("  rmsnorm_basic: PASS")
 
 
-fn test_rmsnorm_scale() raises:
+def test_rmsnorm_scale() raises:
     """RMSNorm with gamma scaling: all-ones input should output gamma."""
     var x = Tensor[DType.float32](2, 4)
     for i in range(8):
@@ -99,7 +99,7 @@ fn test_rmsnorm_scale() raises:
     print("  rmsnorm_scale: PASS")
 
 
-fn test_rmsnorm_2d() raises:
+def test_rmsnorm_2d() raises:
     """2D RMSNorm: (2, 4) tensor normalized row-wise."""
     var x = Tensor[DType.float32](2, 4)
     # Row 0: [1, 2, 3, 4]
@@ -136,7 +136,7 @@ fn test_rmsnorm_2d() raises:
     print("  rmsnorm_2d: PASS")
 
 
-fn test_rmsnorm_stability() raises:
+def test_rmsnorm_stability() raises:
     """RMSNorm numerical stability with large values."""
     var x = Tensor[DType.float32](4)
     x.data_ptr().store(0, Float32(1000.0))
@@ -171,7 +171,7 @@ fn test_rmsnorm_stability() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn test_layernorm_basic() raises:
+def test_layernorm_basic() raises:
     """Basic LayerNorm correctness: [1, 2, 3, 4] with gamma=1, beta=0."""
     var x = Tensor[DType.float32](4)
     x.data_ptr().store(0, Float32(1.0))
@@ -205,7 +205,7 @@ fn test_layernorm_basic() raises:
     print("  layernorm_basic: PASS")
 
 
-fn test_layernorm_zero_mean_unit_var() raises:
+def test_layernorm_zero_mean_unit_var() raises:
     """LayerNorm output should have mean≈0 and var≈1 when gamma=1, beta=0."""
     var x = Tensor[DType.float32](8)
     x.data_ptr().store(0, Float32(1.0))
@@ -243,7 +243,7 @@ fn test_layernorm_zero_mean_unit_var() raises:
     print("  layernorm_zero_mean_unit_var: PASS")
 
 
-fn test_layernorm_affine() raises:
+def test_layernorm_affine() raises:
     """LayerNorm with gamma and beta scaling/shifting."""
     var x = Tensor[DType.float32](4)
     x.data_ptr().store(0, Float32(0.0))
@@ -270,7 +270,7 @@ fn test_layernorm_affine() raises:
     print("  layernorm_affine: PASS")
 
 
-fn test_layernorm_2d() raises:
+def test_layernorm_2d() raises:
     """2D LayerNorm: (2, 4) tensor normalized row-wise."""
     var x = Tensor[DType.float32](2, 4)
     # Row 0: [1, 2, 3, 4]
@@ -313,7 +313,7 @@ fn test_layernorm_2d() raises:
 # ===----------------------------------------------------------------------=== #
 
 
-fn main() raises:
+def main() raises:
     print("test_norms:")
 
     # RMSNorm
