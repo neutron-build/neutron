@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -184,6 +185,33 @@ pub struct CollectionWal {
     writer: Mutex<BufWriter<File>>,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: crate::storage::wal_util::WalSync,
+    /// Records appended but whose effect the caller has not applied yet.
+    ///
+    /// Every collection op logs BEFORE it takes its shard lock, so between the
+    /// two the log holds a record the in-memory collections do not. A
+    /// checkpoint that serialized memory in that window wrote a snapshot
+    /// missing the record and then replaced the whole log with it — the write
+    /// was acknowledged, gone from disk, and alive only in the memory of the
+    /// process that had not applied it yet. `checkpoint` now waits for this to
+    /// reach zero while holding the writer lock, which no new append can pass.
+    in_flight: AtomicU64,
+}
+
+/// Outstanding-append guard: alive from the moment a record reaches the log
+/// until the caller has applied its effect to the collections.
+///
+/// A checkpoint may not snapshot memory while any of these exist, because
+/// memory is behind the log by exactly those records.
+#[must_use = "hold this until the record's effect has been applied, or a \
+              checkpoint can snapshot memory that is missing it"]
+pub struct InFlight<'a> {
+    wal: &'a CollectionWal,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.wal.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl CollectionWal {
@@ -221,24 +249,34 @@ impl CollectionWal {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
+                in_flight: AtomicU64::new(0),
             },
             collections,
         ))
     }
 
     /// Append a WAL entry: op(u8) + key_len(u32) + key + data_len(u32) + data.
-    fn append(&self, op: u8, key: &str, data: &[u8]) -> io::Result<()> {
+    fn append(&self, op: u8, key: &str, data: &[u8]) -> io::Result<InFlight<'_>> {
         let mut buf = Vec::new();
         buf.push(op);
         write_string(key, &mut buf);
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(data);
 
+        // The lock comes FIRST and the count is taken under it. Counting
+        // before the lock deadlocks: a writer blocked on the lock would already
+        // have incremented, and `checkpoint` holds that lock while waiting for
+        // the count to reach zero. Under the lock, a writer that has not yet
+        // entered cannot have incremented, so the count can always drain.
         let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let write = w.write_all(&buf).and_then(|()| w.flush());
+        if let Err(e) = write {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return Err(e);
+        }
         self.syncer.on_append();
-        Ok(())
+        Ok(InFlight { wal: self })
     }
 
     /// Flush + `fsync` the log, capturing (under the writer lock) the highest
@@ -264,36 +302,36 @@ impl CollectionWal {
 
     // ── List ops ────────────────────────────────────────────────────────────
 
-    pub fn log_lpush(&self, key: &str, value: &Value) -> io::Result<()> {
+    pub fn log_lpush(&self, key: &str, value: &Value) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         encode_value(value, &mut data);
         self.append(OP_LPUSH, key, &data)
     }
 
-    pub fn log_rpush(&self, key: &str, value: &Value) -> io::Result<()> {
+    pub fn log_rpush(&self, key: &str, value: &Value) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         encode_value(value, &mut data);
         self.append(OP_RPUSH, key, &data)
     }
 
-    pub fn log_lpop(&self, key: &str) -> io::Result<()> {
+    pub fn log_lpop(&self, key: &str) -> io::Result<InFlight<'_>> {
         self.append(OP_LPOP, key, &[])
     }
 
-    pub fn log_rpop(&self, key: &str) -> io::Result<()> {
+    pub fn log_rpop(&self, key: &str) -> io::Result<InFlight<'_>> {
         self.append(OP_RPOP, key, &[])
     }
 
     // ── Hash ops ────────────────────────────────────────────────────────────
 
-    pub fn log_hset(&self, key: &str, field: &str, value: &Value) -> io::Result<()> {
+    pub fn log_hset(&self, key: &str, field: &str, value: &Value) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(field, &mut data);
         encode_value(value, &mut data);
         self.append(OP_HSET, key, &data)
     }
 
-    pub fn log_hdel(&self, key: &str, field: &str) -> io::Result<()> {
+    pub fn log_hdel(&self, key: &str, field: &str) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(field, &mut data);
         self.append(OP_HDEL, key, &data)
@@ -301,13 +339,13 @@ impl CollectionWal {
 
     // ── Set ops ─────────────────────────────────────────────────────────────
 
-    pub fn log_sadd(&self, key: &str, member: &str) -> io::Result<()> {
+    pub fn log_sadd(&self, key: &str, member: &str) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(member, &mut data);
         self.append(OP_SADD, key, &data)
     }
 
-    pub fn log_srem(&self, key: &str, member: &str) -> io::Result<()> {
+    pub fn log_srem(&self, key: &str, member: &str) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(member, &mut data);
         self.append(OP_SREM, key, &data)
@@ -315,20 +353,20 @@ impl CollectionWal {
 
     // ── Sorted Set ops ──────────────────────────────────────────────────────
 
-    pub fn log_zadd(&self, key: &str, member: &str, score: f64) -> io::Result<()> {
+    pub fn log_zadd(&self, key: &str, member: &str, score: f64) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(member, &mut data);
         data.extend_from_slice(&score.to_le_bytes());
         self.append(OP_ZADD, key, &data)
     }
 
-    pub fn log_zrem(&self, key: &str, member: &str) -> io::Result<()> {
+    pub fn log_zrem(&self, key: &str, member: &str) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(member, &mut data);
         self.append(OP_ZREM, key, &data)
     }
 
-    pub fn log_zincrby(&self, key: &str, member: &str, increment: f64) -> io::Result<()> {
+    pub fn log_zincrby(&self, key: &str, member: &str, increment: f64) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(member, &mut data);
         data.extend_from_slice(&increment.to_le_bytes());
@@ -337,13 +375,17 @@ impl CollectionWal {
 
     // ── HyperLogLog ops ─────────────────────────────────────────────────────
 
-    pub fn log_pfadd(&self, key: &str, element: &str) -> io::Result<()> {
+    pub fn log_pfadd(&self, key: &str, element: &str) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         write_string(element, &mut data);
         self.append(OP_PFADD, key, &data)
     }
 
-    pub fn log_pfmerge(&self, dest_key: &str, source_registers: &[Vec<u8>]) -> io::Result<()> {
+    pub fn log_pfmerge(
+        &self,
+        dest_key: &str,
+        source_registers: &[Vec<u8>],
+    ) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         data.extend_from_slice(&(source_registers.len() as u32).to_le_bytes());
         for regs in source_registers {
@@ -360,7 +402,7 @@ impl CollectionWal {
         key: &str,
         id: &StreamId,
         fields: &[(String, String)],
-    ) -> io::Result<()> {
+    ) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         data.extend_from_slice(&id.ms.to_le_bytes());
         data.extend_from_slice(&id.seq.to_le_bytes());
@@ -372,7 +414,7 @@ impl CollectionWal {
         self.append(OP_XADD, key, &data)
     }
 
-    pub fn log_xdel(&self, key: &str, ids: &[StreamId]) -> io::Result<()> {
+    pub fn log_xdel(&self, key: &str, ids: &[StreamId]) -> io::Result<InFlight<'_>> {
         let mut data = Vec::new();
         data.extend_from_slice(&(ids.len() as u32).to_le_bytes());
         for id in ids {
@@ -384,12 +426,42 @@ impl CollectionWal {
 
     // ── Housekeeping ────────────────────────────────────────────────────────
 
-    pub fn log_del(&self, key: &str) -> io::Result<()> {
+    pub fn log_del(&self, key: &str) -> io::Result<InFlight<'_>> {
         self.append(OP_DEL, key, &[])
     }
 
     /// Write a full snapshot of all collections and truncate the WAL.
     pub fn checkpoint(&self, collections: &ShardedCollections) -> io::Result<()> {
+        // The writer lock comes FIRST, and the snapshot is taken under it.
+        //
+        // It used to be the other way round: `serialize_snapshot` read all 64
+        // shards, and only then was the lock taken and the whole log replaced
+        // by that snapshot. Anything appended in between was in neither — and
+        // the `mark_synced` below then told the syncer every outstanding append
+        // was durable, so nothing would ever rewrite it. An acknowledged write,
+        // gone from disk, alive only in memory.
+        let mut w = self.writer.lock();
+        w.flush()?;
+
+        // Then wait for the log to stop being ahead of memory. Every collection
+        // op logs BEFORE it takes its shard lock, so a record can be on disk
+        // with its effect not yet applied; snapshotting memory in that window
+        // writes a snapshot that is missing it. No new append can start here —
+        // `append` needs this same writer lock — so this drains rather than
+        // chases.
+        let mut spins = 0u32;
+        while self.in_flight.load(Ordering::Acquire) > 0 {
+            std::hint::spin_loop();
+            spins += 1;
+            // The apply that follows an append is a shard-lock acquisition and
+            // a small mutation. If it has not happened after this many spins
+            // the thread is descheduled, not deadlocked — yield rather than
+            // burn the core.
+            if spins.is_multiple_of(1024) {
+                std::thread::yield_now();
+            }
+        }
+
         let snapshot_data = serialize_snapshot(collections);
 
         // Serialize the complete new log body (SNAPSHOT tag + empty key + snapshot).
@@ -399,12 +471,9 @@ impl CollectionWal {
         contents.extend_from_slice(&(snapshot_data.len() as u32).to_le_bytes());
         contents.extend_from_slice(&snapshot_data);
 
-        // Hold the writer lock across the whole checkpoint so no append can interleave
-        // between the flush and the reopen. Replace atomically — temp file + fsync +
-        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
-        // never an empty file.
-        let mut w = self.writer.lock();
-        w.flush()?;
+        // Replace atomically — temp file + fsync + rename — so a crash
+        // mid-checkpoint leaves the old log or the new snapshot, never an empty
+        // file.
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
         *w = BufWriter::new(file);
@@ -871,7 +940,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _colls) = CollectionWal::open(dir.path()).unwrap();
         assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
-        wal.log_lpush("l", &Value::Text("a".into())).unwrap();
+        drop(wal.log_lpush("l", &Value::Text("a".into())).unwrap());
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
@@ -892,12 +961,12 @@ mod tests {
 
         for k in ["alpha", "beta", "gamma"] {
             colls.lpush(k, Value::Text("v".into())).unwrap();
-            wal.log_lpush(k, &Value::Text("v".into())).unwrap();
+            drop(wal.log_lpush(k, &Value::Text("v".into())).unwrap());
         }
         wal.checkpoint(&colls).unwrap();
 
         colls.lpush("delta", Value::Text("v".into())).unwrap();
-        wal.log_lpush("delta", &Value::Text("v".into())).unwrap();
+        drop(wal.log_lpush("delta", &Value::Text("v".into())).unwrap());
         wal.group_sync().unwrap();
         drop(wal);
 
@@ -939,7 +1008,7 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
         for k in ["alpha", "beta"] {
             colls.lpush(k, Value::Text("v".into())).unwrap();
-            wal.log_lpush(k, &Value::Text("v".into())).unwrap();
+            drop(wal.log_lpush(k, &Value::Text("v".into())).unwrap());
         }
         wal.group_sync().unwrap();
         drop(wal);
@@ -962,7 +1031,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
         colls.lpush("alpha", Value::Text("v".into())).unwrap();
-        wal.log_lpush("alpha", &Value::Text("v".into())).unwrap();
+        drop(wal.log_lpush("alpha", &Value::Text("v".into())).unwrap());
         wal.group_sync().unwrap();
         drop(wal);
 
@@ -1002,13 +1071,13 @@ mod tests {
         assert_eq!(colls.llen("mylist").unwrap(), 0);
 
         colls.lpush("mylist", Value::Text("a".into())).unwrap();
-        wal.log_lpush("mylist", &Value::Text("a".into())).unwrap();
+        drop(wal.log_lpush("mylist", &Value::Text("a".into())).unwrap());
 
         colls.rpush("mylist", Value::Text("b".into())).unwrap();
-        wal.log_rpush("mylist", &Value::Text("b".into())).unwrap();
+        drop(wal.log_rpush("mylist", &Value::Text("b".into())).unwrap());
 
         colls.lpush("mylist", Value::Text("c".into())).unwrap();
-        wal.log_lpush("mylist", &Value::Text("c".into())).unwrap();
+        drop(wal.log_lpush("mylist", &Value::Text("c".into())).unwrap());
 
         drop(wal);
 
@@ -1032,13 +1101,13 @@ mod tests {
 
         for v in ["a", "b", "c", "d"] {
             colls.rpush("q", Value::Text(v.into())).unwrap();
-            wal.log_rpush("q", &Value::Text(v.into())).unwrap();
+            drop(wal.log_rpush("q", &Value::Text(v.into())).unwrap());
         }
 
         colls.lpop("q").unwrap();
-        wal.log_lpop("q").unwrap();
+        drop(wal.log_lpop("q").unwrap());
         colls.rpop("q").unwrap();
-        wal.log_rpop("q").unwrap();
+        drop(wal.log_rpop("q").unwrap());
 
         drop(wal);
 
@@ -1058,14 +1127,16 @@ mod tests {
         colls
             .hset("user", "name", Value::Text("Alice".into()))
             .unwrap();
-        wal.log_hset("user", "name", &Value::Text("Alice".into()))
-            .unwrap();
+        drop(
+            wal.log_hset("user", "name", &Value::Text("Alice".into()))
+                .unwrap(),
+        );
 
         colls.hset("user", "age", Value::Int32(30)).unwrap();
-        wal.log_hset("user", "age", &Value::Int32(30)).unwrap();
+        drop(wal.log_hset("user", "age", &Value::Int32(30)).unwrap());
 
         colls.hdel("user", "age").unwrap();
-        wal.log_hdel("user", "age").unwrap();
+        drop(wal.log_hdel("user", "age").unwrap());
 
         drop(wal);
 
@@ -1084,14 +1155,14 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
         colls.sadd("tags", "rust").unwrap();
-        wal.log_sadd("tags", "rust").unwrap();
+        drop(wal.log_sadd("tags", "rust").unwrap());
         colls.sadd("tags", "mojo").unwrap();
-        wal.log_sadd("tags", "mojo").unwrap();
+        drop(wal.log_sadd("tags", "mojo").unwrap());
         colls.sadd("tags", "python").unwrap();
-        wal.log_sadd("tags", "python").unwrap();
+        drop(wal.log_sadd("tags", "python").unwrap());
 
         colls.srem("tags", "python").unwrap();
-        wal.log_srem("tags", "python").unwrap();
+        drop(wal.log_srem("tags", "python").unwrap());
 
         drop(wal);
 
@@ -1106,14 +1177,14 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
         colls.zadd("lb", "alice", 100.0).unwrap();
-        wal.log_zadd("lb", "alice", 100.0).unwrap();
+        drop(wal.log_zadd("lb", "alice", 100.0).unwrap());
         colls.zadd("lb", "bob", 200.0).unwrap();
-        wal.log_zadd("lb", "bob", 200.0).unwrap();
+        drop(wal.log_zadd("lb", "bob", 200.0).unwrap());
         colls.zadd("lb", "charlie", 150.0).unwrap();
-        wal.log_zadd("lb", "charlie", 150.0).unwrap();
+        drop(wal.log_zadd("lb", "charlie", 150.0).unwrap());
 
         colls.zrem("lb", "bob").unwrap();
-        wal.log_zrem("lb", "bob").unwrap();
+        drop(wal.log_zrem("lb", "bob").unwrap());
 
         drop(wal);
 
@@ -1130,9 +1201,9 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
         colls.zadd("z", "m", 10.0).unwrap();
-        wal.log_zadd("z", "m", 10.0).unwrap();
+        drop(wal.log_zadd("z", "m", 10.0).unwrap());
         colls.zincrby("z", "m", 5.0).unwrap();
-        wal.log_zincrby("z", "m", 5.0).unwrap();
+        drop(wal.log_zincrby("z", "m", 5.0).unwrap());
 
         drop(wal);
 
@@ -1149,7 +1220,7 @@ mod tests {
         for i in 0..50 {
             let elem = format!("user{i}");
             colls.pfadd("visitors", &elem).unwrap();
-            wal.log_pfadd("visitors", &elem).unwrap();
+            drop(wal.log_pfadd("visitors", &elem).unwrap());
         }
 
         drop(wal);
@@ -1166,17 +1237,17 @@ mod tests {
 
         for i in 0..30 {
             colls.pfadd("hll1", &format!("a{i}")).unwrap();
-            wal.log_pfadd("hll1", &format!("a{i}")).unwrap();
+            drop(wal.log_pfadd("hll1", &format!("a{i}")).unwrap());
         }
         for i in 0..30 {
             colls.pfadd("hll2", &format!("b{i}")).unwrap();
-            wal.log_pfadd("hll2", &format!("b{i}")).unwrap();
+            drop(wal.log_pfadd("hll2", &format!("b{i}")).unwrap());
         }
 
         // Capture source registers for WAL logging
         let src_regs = colls.get_hll_registers(&["hll1", "hll2"]);
         colls.pfmerge("merged", &["hll1", "hll2"]).unwrap();
-        wal.log_pfmerge("merged", &src_regs).unwrap();
+        drop(wal.log_pfmerge("merged", &src_regs).unwrap());
 
         drop(wal);
 
@@ -1191,12 +1262,12 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
         colls.rpush("mylist", Value::Int32(1)).unwrap();
-        wal.log_rpush("mylist", &Value::Int32(1)).unwrap();
+        drop(wal.log_rpush("mylist", &Value::Int32(1)).unwrap());
         colls.sadd("myset", "a").unwrap();
-        wal.log_sadd("myset", "a").unwrap();
+        drop(wal.log_sadd("myset", "a").unwrap());
 
         colls.del("mylist");
-        wal.log_del("mylist").unwrap();
+        drop(wal.log_del("mylist").unwrap());
 
         drop(wal);
 
@@ -1212,20 +1283,20 @@ mod tests {
 
         // Initial data
         colls.rpush("list", Value::Int32(1)).unwrap();
-        wal.log_rpush("list", &Value::Int32(1)).unwrap();
+        drop(wal.log_rpush("list", &Value::Int32(1)).unwrap());
         colls.rpush("list", Value::Int32(2)).unwrap();
-        wal.log_rpush("list", &Value::Int32(2)).unwrap();
+        drop(wal.log_rpush("list", &Value::Int32(2)).unwrap());
         colls.sadd("set", "x").unwrap();
-        wal.log_sadd("set", "x").unwrap();
+        drop(wal.log_sadd("set", "x").unwrap());
 
         // Checkpoint
         wal.checkpoint(&colls).unwrap();
 
         // More mutations after checkpoint
         colls.rpush("list", Value::Int32(3)).unwrap();
-        wal.log_rpush("list", &Value::Int32(3)).unwrap();
+        drop(wal.log_rpush("list", &Value::Int32(3)).unwrap());
         colls.sadd("set", "y").unwrap();
-        wal.log_sadd("set", "y").unwrap();
+        drop(wal.log_sadd("set", "y").unwrap());
 
         drop(wal);
 
@@ -1247,7 +1318,7 @@ mod tests {
         // Write many entries
         for i in 0..100 {
             colls.rpush("big", Value::Int64(i)).unwrap();
-            wal.log_rpush("big", &Value::Int64(i)).unwrap();
+            drop(wal.log_rpush("big", &Value::Int64(i)).unwrap());
         }
         let size_before = std::fs::metadata(dir.path().join("collections.wal"))
             .unwrap()
@@ -1270,7 +1341,7 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
         colls.sadd("good", "value").unwrap();
-        wal.log_sadd("good", "value").unwrap();
+        drop(wal.log_sadd("good", "value").unwrap());
         drop(wal);
 
         // Append garbage bytes
@@ -1302,24 +1373,26 @@ mod tests {
 
         // List
         colls.rpush("mylist", Value::Text("hello".into())).unwrap();
-        wal.log_rpush("mylist", &Value::Text("hello".into()))
-            .unwrap();
+        drop(
+            wal.log_rpush("mylist", &Value::Text("hello".into()))
+                .unwrap(),
+        );
 
         // Hash
         colls.hset("myhash", "field1", Value::Int64(42)).unwrap();
-        wal.log_hset("myhash", "field1", &Value::Int64(42)).unwrap();
+        drop(wal.log_hset("myhash", "field1", &Value::Int64(42)).unwrap());
 
         // Set
         colls.sadd("myset", "member1").unwrap();
-        wal.log_sadd("myset", "member1").unwrap();
+        drop(wal.log_sadd("myset", "member1").unwrap());
 
         // Sorted Set
         colls.zadd("myzset", "player1", 99.5).unwrap();
-        wal.log_zadd("myzset", "player1", 99.5).unwrap();
+        drop(wal.log_zadd("myzset", "player1", 99.5).unwrap());
 
         // HyperLogLog
         colls.pfadd("myhll", "item1").unwrap();
-        wal.log_pfadd("myhll", "item1").unwrap();
+        drop(wal.log_pfadd("myhll", "item1").unwrap());
 
         drop(wal);
 
@@ -1351,31 +1424,31 @@ mod tests {
 
         // Interleave different collection types
         colls.rpush("list", Value::Int32(1)).unwrap();
-        wal.log_rpush("list", &Value::Int32(1)).unwrap();
+        drop(wal.log_rpush("list", &Value::Int32(1)).unwrap());
 
         colls.sadd("set", "a").unwrap();
-        wal.log_sadd("set", "a").unwrap();
+        drop(wal.log_sadd("set", "a").unwrap());
 
         colls.rpush("list", Value::Int32(2)).unwrap();
-        wal.log_rpush("list", &Value::Int32(2)).unwrap();
+        drop(wal.log_rpush("list", &Value::Int32(2)).unwrap());
 
         colls.hset("hash", "k", Value::Text("v".into())).unwrap();
-        wal.log_hset("hash", "k", &Value::Text("v".into())).unwrap();
+        drop(wal.log_hset("hash", "k", &Value::Text("v".into())).unwrap());
 
         colls.zadd("zset", "m1", 1.0).unwrap();
-        wal.log_zadd("zset", "m1", 1.0).unwrap();
+        drop(wal.log_zadd("zset", "m1", 1.0).unwrap());
 
         colls.sadd("set", "b").unwrap();
-        wal.log_sadd("set", "b").unwrap();
+        drop(wal.log_sadd("set", "b").unwrap());
 
         colls.pfadd("hll", "x").unwrap();
-        wal.log_pfadd("hll", "x").unwrap();
+        drop(wal.log_pfadd("hll", "x").unwrap());
 
         colls.rpush("list", Value::Int32(3)).unwrap();
-        wal.log_rpush("list", &Value::Int32(3)).unwrap();
+        drop(wal.log_rpush("list", &Value::Int32(3)).unwrap());
 
         colls.zadd("zset", "m2", 2.0).unwrap();
-        wal.log_zadd("zset", "m2", 2.0).unwrap();
+        drop(wal.log_zadd("zset", "m2", 2.0).unwrap());
 
         drop(wal);
 
@@ -1417,11 +1490,11 @@ mod tests {
 
         // Incremental ops after checkpoint
         colls.rpush("list", Value::Int32(20)).unwrap();
-        wal.log_rpush("list", &Value::Int32(20)).unwrap();
+        drop(wal.log_rpush("list", &Value::Int32(20)).unwrap());
         colls.del("set");
-        wal.log_del("set").unwrap();
+        drop(wal.log_del("set").unwrap());
         colls.zadd("zset", "bob", 60.0).unwrap();
-        wal.log_zadd("zset", "bob", 60.0).unwrap();
+        drop(wal.log_zadd("zset", "bob", 60.0).unwrap());
 
         drop(wal);
 
@@ -1449,9 +1522,9 @@ mod tests {
 
         for (i, val) in values.iter().enumerate() {
             colls.rpush("vals", val.clone()).unwrap();
-            wal.log_rpush("vals", val).unwrap();
+            drop(wal.log_rpush("vals", val).unwrap());
             colls.hset("hvals", &format!("f{i}"), val.clone()).unwrap();
-            wal.log_hset("hvals", &format!("f{i}"), val).unwrap();
+            drop(wal.log_hset("hvals", &format!("f{i}"), val).unwrap());
         }
 
         drop(wal);
@@ -1517,11 +1590,11 @@ mod tests {
         wal.checkpoint(&colls).unwrap();
 
         colls.sadd("s", "b").unwrap();
-        wal.log_sadd("s", "b").unwrap();
+        drop(wal.log_sadd("s", "b").unwrap());
         wal.checkpoint(&colls).unwrap();
 
         colls.sadd("s", "c").unwrap();
-        wal.log_sadd("s", "c").unwrap();
+        drop(wal.log_sadd("s", "c").unwrap());
 
         drop(wal);
 
@@ -1545,15 +1618,17 @@ mod tests {
                 ],
             )
             .unwrap();
-        wal.log_xadd(
-            "mystream",
-            &id1,
-            &[
-                ("name".into(), "Alice".into()),
-                ("action".into(), "login".into()),
-            ],
-        )
-        .unwrap();
+        drop(
+            wal.log_xadd(
+                "mystream",
+                &id1,
+                &[
+                    ("name".into(), "Alice".into()),
+                    ("action".into(), "login".into()),
+                ],
+            )
+            .unwrap(),
+        );
 
         let id2 = colls
             .xadd(
@@ -1565,21 +1640,25 @@ mod tests {
                 ],
             )
             .unwrap();
-        wal.log_xadd(
-            "mystream",
-            &id2,
-            &[
-                ("name".into(), "Bob".into()),
-                ("action".into(), "purchase".into()),
-            ],
-        )
-        .unwrap();
+        drop(
+            wal.log_xadd(
+                "mystream",
+                &id2,
+                &[
+                    ("name".into(), "Bob".into()),
+                    ("action".into(), "purchase".into()),
+                ],
+            )
+            .unwrap(),
+        );
 
         let id3 = colls
             .xadd("mystream", "3-0", vec![("name".into(), "Charlie".into())])
             .unwrap();
-        wal.log_xadd("mystream", &id3, &[("name".into(), "Charlie".into())])
-            .unwrap();
+        drop(
+            wal.log_xadd("mystream", &id3, &[("name".into(), "Charlie".into())])
+                .unwrap(),
+        );
 
         drop(wal);
 
@@ -1607,21 +1686,27 @@ mod tests {
         let id1 = colls
             .xadd("s", "1-0", vec![("a".into(), "1".into())])
             .unwrap();
-        wal.log_xadd("s", &id1, &[("a".into(), "1".into())])
-            .unwrap();
+        drop(
+            wal.log_xadd("s", &id1, &[("a".into(), "1".into())])
+                .unwrap(),
+        );
         let id2 = colls
             .xadd("s", "2-0", vec![("a".into(), "2".into())])
             .unwrap();
-        wal.log_xadd("s", &id2, &[("a".into(), "2".into())])
-            .unwrap();
+        drop(
+            wal.log_xadd("s", &id2, &[("a".into(), "2".into())])
+                .unwrap(),
+        );
         let id3 = colls
             .xadd("s", "3-0", vec![("a".into(), "3".into())])
             .unwrap();
-        wal.log_xadd("s", &id3, &[("a".into(), "3".into())])
-            .unwrap();
+        drop(
+            wal.log_xadd("s", &id3, &[("a".into(), "3".into())])
+                .unwrap(),
+        );
 
         colls.xdel("s", &[StreamId::new(2, 0)]).unwrap();
-        wal.log_xdel("s", &[StreamId::new(2, 0)]).unwrap();
+        drop(wal.log_xdel("s", &[StreamId::new(2, 0)]).unwrap());
 
         drop(wal);
 
@@ -1724,8 +1809,10 @@ mod tests {
         let id3 = colls
             .xadd("log", "3-0", vec![("msg".into(), "third".into())])
             .unwrap();
-        wal.log_xadd("log", &id3, &[("msg".into(), "third".into())])
-            .unwrap();
+        drop(
+            wal.log_xadd("log", &id3, &[("msg".into(), "third".into())])
+                .unwrap(),
+        );
 
         drop(wal);
 
@@ -1744,7 +1831,7 @@ mod tests {
 
         // Stream entry with no fields
         let id = colls.xadd("empty", "1-0", vec![]).unwrap();
-        wal.log_xadd("empty", &id, &[]).unwrap();
+        drop(wal.log_xadd("empty", &id, &[]).unwrap());
 
         drop(wal);
 
@@ -1763,16 +1850,18 @@ mod tests {
         let id = colls
             .xadd("stream", "1-0", vec![("k".into(), "v".into())])
             .unwrap();
-        wal.log_xadd("stream", &id, &[("k".into(), "v".into())])
-            .unwrap();
+        drop(
+            wal.log_xadd("stream", &id, &[("k".into(), "v".into())])
+                .unwrap(),
+        );
 
         // List
         colls.rpush("list", Value::Text("hello".into())).unwrap();
-        wal.log_rpush("list", &Value::Text("hello".into())).unwrap();
+        drop(wal.log_rpush("list", &Value::Text("hello".into())).unwrap());
 
         // Set
         colls.sadd("set", "member").unwrap();
-        wal.log_sadd("set", "member").unwrap();
+        drop(wal.log_sadd("set", "member").unwrap());
 
         drop(wal);
 

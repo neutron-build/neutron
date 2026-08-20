@@ -314,6 +314,35 @@ impl ShardedCollections {
         hasher.finish() as usize % NUM_SHARDS
     }
 
+    /// Log a mutation and keep it counted as in-flight until the returned
+    /// guard drops — which is when the caller has applied its effect.
+    ///
+    /// Every op here logs BEFORE taking its shard lock, so between the two the
+    /// log is ahead of memory. A checkpoint that snapshotted memory in that
+    /// window produced a snapshot missing the record and then replaced the
+    /// whole log with it: an acknowledged write, gone from disk, alive only in
+    /// the memory of the process that had not applied it yet.
+    /// `CollectionWal::checkpoint` now waits for the in-flight count to reach
+    /// zero, and this is what makes the count mean "applied".
+    ///
+    /// A WAL failure is logged and the op proceeds, unchanged from before.
+    #[cfg(feature = "server")]
+    fn log_write<'a, F>(&'a self, f: F) -> Option<crate::kv::collections_wal::InFlight<'a>>
+    where
+        F: FnOnce(
+            &'a crate::kv::collections_wal::CollectionWal,
+        ) -> std::io::Result<crate::kv::collections_wal::InFlight<'a>>,
+    {
+        let wal = self.wal.as_ref()?;
+        match f(wal) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Get a reference to the shard for a given key.
     fn shard(&self, key: &str) -> &CollectionShard {
         &self.shards[Self::shard_index(key)]
@@ -326,12 +355,11 @@ impl ShardedCollections {
     /// LPUSH -- push a value to the front of the list at `key`.
     /// Creates the list if it does not exist. Returns the new length.
     pub fn lpush(&self, key: &str, value: Value) -> Result<usize, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_lpush(key, &value)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_lpush(key, &value));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -352,12 +380,11 @@ impl ShardedCollections {
     /// RPUSH -- push a value to the back of the list at `key`.
     /// Creates the list if it does not exist. Returns the new length.
     pub fn rpush(&self, key: &str, value: Value) -> Result<usize, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_rpush(key, &value)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_rpush(key, &value));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -377,12 +404,11 @@ impl ShardedCollections {
 
     /// LPOP -- remove and return the first element of the list at `key`.
     pub fn lpop(&self, key: &str) -> Result<Option<Value>, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_lpop(key)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_lpop(key));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -403,12 +429,11 @@ impl ShardedCollections {
 
     /// RPOP -- remove and return the last element of the list at `key`.
     pub fn rpop(&self, key: &str) -> Result<Option<Value>, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_rpop(key)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_rpop(key));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -499,12 +524,11 @@ impl ShardedCollections {
 
     /// HSET -- set a field in the hash at `key`. Returns true if the field is new.
     pub fn hset(&self, key: &str, field: &str, value: Value) -> Result<bool, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_hset(key, field, &value)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_hset(key, field, &value));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -539,12 +563,11 @@ impl ShardedCollections {
 
     /// HDEL -- delete a field from the hash at `key`. Returns true if it existed.
     pub fn hdel(&self, key: &str, field: &str) -> Result<bool, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_hdel(key, field)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_hdel(key, field));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -652,12 +675,11 @@ impl ShardedCollections {
 
     /// SADD -- add a member to the set at `key`. Returns true if the member is new.
     pub fn sadd(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_sadd(key, member)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_sadd(key, member));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -674,12 +696,11 @@ impl ShardedCollections {
 
     /// SREM -- remove a member from the set at `key`. Returns true if it existed.
     pub fn srem(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_srem(key, member)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_srem(key, member));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -871,12 +892,11 @@ impl ShardedCollections {
     /// ZADD -- add a member with a score to the sorted set at `key`.
     /// Returns true if the member is new.
     pub fn zadd(&self, key: &str, member: &str, score: f64) -> Result<bool, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_zadd(key, member, score)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_zadd(key, member, score));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -894,12 +914,11 @@ impl ShardedCollections {
     /// ZREM -- remove a member from the sorted set at `key`.
     /// Returns true if the member existed.
     pub fn zrem(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_zrem(key, member)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_zrem(key, member));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -993,12 +1012,11 @@ impl ShardedCollections {
     /// Creates the member with `increment` as the score if it does not exist.
     /// Returns the new score.
     pub fn zincrby(&self, key: &str, member: &str, increment: f64) -> Result<f64, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_zincrby(key, member, increment)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_zincrby(key, member, increment));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -1048,12 +1066,11 @@ impl ShardedCollections {
     /// PFADD -- add an element to the HyperLogLog at `key`.
     /// Returns true if the internal registers changed (cardinality may have changed).
     pub fn pfadd(&self, key: &str, element: &str) -> Result<bool, WrongTypeError> {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_pfadd(key, element)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_pfadd(key, element));
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -1112,12 +1129,11 @@ impl ShardedCollections {
         }
 
         // Log the merge to WAL with the register snapshots
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_pfmerge(dest_key, &source_registers)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_pfmerge(dest_key, &source_registers));
 
         // Now write-lock the destination and merge.
         let dest_shard = self.shard(dest_key);
@@ -1147,12 +1163,11 @@ impl ShardedCollections {
 
     /// Remove a key regardless of its collection type. Returns true if the key existed.
     pub fn del(&self, key: &str) -> bool {
+        // The guard lives until this function returns, which is after the
+        // mutation below. A checkpoint may not snapshot memory while it is
+        // alive — see `CollectionWal::checkpoint`.
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_del(key)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-        }
+        let _in_flight = self.log_write(|wal| wal.log_del(key));
         let shard = self.shard(key);
         shard.data.write().remove(key).is_some()
     }
