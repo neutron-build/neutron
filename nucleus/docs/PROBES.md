@@ -475,6 +475,7 @@ Benchmarks answer "how fast", never "is it correct". Read
 | `benchmark` | `bench-tools` | Standalone in-process report across every model. |
 | `compete` | `bench-tools` | Nucleus vs PostgreSQL, SQLite, SurrealDB, CockroachDB, TiDB, MongoDB. |
 | `compete_vector` | `bench-tools` | Nucleus HNSW vs **pgvector**, apples to apples. |
+| `compete_fts` | `bench-tools` | Nucleus FTS vs **Tantivy** (in-process library), apples to apples: shared exact-BM25 ground truth, tie-blind overlap@k next to every latency, tokenizer parity asserted before timing. |
 | `bench_paired` | `server` | Correctness-paired latency for vector, FTS, graph. |
 | `pg_compare` | `server` | Head-to-head vs PostgreSQL 17 over pgwire. |
 | `stress` | `server` | Load generation. |
