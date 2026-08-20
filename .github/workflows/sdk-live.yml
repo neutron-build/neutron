@@ -81,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk: [python, go, typescript, elixir, rust, julia]
+        sdk: [python, go, typescript, elixir, rust, julia, zig]
         # elixir joined 2026-08-15, once it could connect at all. Its executor
         # existed since S17 and reported 42/42 failing, because Postgrex's type
         # bootstrap died on `ARRAY (SELECT ...)`; with that fixed it runs
@@ -101,19 +101,14 @@ jobs:
         # defect), execute! raised on any DDL or transaction control, and
         # zrange re-joined member:score.
         #
-        # zig was added on 2026-08-19 and taken back out the same day. The
-        # toolchain wall that blocked it is gone (0.15.2 pinned everywhere, the
-        # executor ported off the defunct 0.16-proposal APIs and registered),
-        # and the first live run is what that bought: the executor BOOTS and
-        # then fails 19 of 42 cases, because it was ported to compile rather
-        # than to answer correctly. queryScalar returns null or an integer where
-        # a string is expected, timeseries/vector/blob mappings are missing
-        # entirely, streams.xack takes the wrong argument type. Those are
-        # executor defects, not SDK defects, and none of them is hidden by this
-        # line: the drift job below prints `absent` for zig and says what that
-        # means. It goes back in the matrix when it passes locally against a
-        # live engine — a red lane nobody can fix today teaches people to
-        # ignore the lane. An
+        # zig joined 2026-08-19, on its third attempt the same day. The
+        # toolchain wall that blocked it is gone, and the first live scoring
+        # found 19 of 42 failing — which is what adding it was for. Those were
+        # NOT executor defects as first assumed: the pgwire client read a
+        # response with one read() and left the tail in the socket whenever the
+        # server split it, so the next query decoded stale bytes. 110 of 200
+        # iterations desynced; 0 of 200 after. It is in the matrix because it
+        # passes 42/42 against a live engine, not because it compiles. An
         # SDK absent from this list is UNPROVEN, and the drift job below says so
         # out loud rather than counting it as agreement.
     steps:
