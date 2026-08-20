@@ -1,6 +1,6 @@
 # Neutron Desktop
 
-Cross-platform desktop apps using Tauri 2.0 + Preact + Neutron Rust. ~10MB bundles, ~30MB idle memory, full Nucleus database embedded in-process.
+Cross-platform desktop apps using Tauri 2.0 + Preact + Neutron Rust. Full Nucleus database embedded in-process. Bundle size (~10MB) and idle memory (~30MB) are **design targets, not measured results** — no build-size measurement exists in the repo yet.
 
 ## Philosophy
 
@@ -18,7 +18,10 @@ Light core, modular OS integrations. The core shell is Tauri 2.0 (window managem
 
 ## vs Electron
 
-| | Neutron Desktop | Electron |
+The size and memory rows are the design targets above, not measurements;
+Electron's figures are its commonly cited ballpark.
+
+| | Neutron Desktop (target) | Electron (typical) |
 |-|----------------|---------|
 | Bundle size | ~10MB | ~150MB |
 | Idle memory | ~30-40MB | ~150-300MB |
@@ -95,22 +98,22 @@ pub fn run() {
 
 ## Module System
 
-Core is minimal. OS integrations are opt-in:
+Core is minimal. OS integrations are opt-in (12 plugin crates; one shared TypeScript package, `@neutron/desktop`):
 
-| Crate | JS Package | Provides |
-|-------|-----------|---------|
-| `neutron-desktop` | `@neutron/desktop` | Core: window, bridge, Nucleus |
-| `neutron-desktop-fs` | `@neutron/desktop-fs` | File system, drag-and-drop, watch |
-| `neutron-desktop-notifications` | `@neutron/desktop-notifications` | OS notifications |
-| `neutron-desktop-tray` | `@neutron/desktop-tray` | System tray icon + menu |
-| `neutron-desktop-updater` | `@neutron/desktop-updater` | Auto-update with signature verification |
-| `neutron-desktop-shell` | `@neutron/desktop-shell` | Open files/URLs with OS default app |
-| `neutron-desktop-clipboard` | `@neutron/desktop-clipboard` | Clipboard read/write |
-| `neutron-desktop-global-hotkeys` | `@neutron/desktop-global-hotkeys` | System-wide keyboard shortcuts |
-| `neutron-desktop-autostart` | `@neutron/desktop-autostart` | Launch at OS startup |
-| `neutron-desktop-window-state` | `@neutron/desktop-window-state` | Persist window size/position |
-| `neutron-desktop-deeplink` | `@neutron/desktop-deeplink` | Custom URI scheme deep links |
-| `neutron-desktop-biometrics` | `@neutron/desktop-biometrics` | TouchID / Windows Hello |
+| Crate | Provides |
+|-------|----------|
+| `neutron-desktop` | Core: window, `neutron://` bridge, dev server, embedded Nucleus |
+| `neutron-desktop-fs` | File system |
+| `neutron-desktop-notifications` | OS notifications |
+| `neutron-desktop-tray` | System tray icon + menu |
+| `neutron-desktop-updater` | Auto-update with signature verification |
+| `neutron-desktop-shell` | Open files/URLs with OS default app |
+| `neutron-desktop-clipboard` | Clipboard read/write |
+| `neutron-desktop-global-hotkeys` | System-wide keyboard shortcuts |
+| `neutron-desktop-autostart` | Launch at OS startup |
+| `neutron-desktop-window-state` | Persist window size/position |
+| `neutron-desktop-deeplink` | Custom URI scheme deep links |
+| `neutron-desktop-biometrics` | TouchID / Windows Hello |
 
 ## Auto-Update
 
@@ -136,28 +139,16 @@ neutron desktop release  # tag, build, sign, upload, update manifest
 
 ```
 desktop/
-├── apps/example/               # Reference app
+├── examples/starter/           # Reference app
 │   ├── src/                    # Preact frontend
-│   │   ├── routes/             # File-based routes (same format as Neutron TS)
-│   │   ├── platform/desktop.ts # PlatformContext desktop implementation
-│   │   └── main.tsx
 │   └── src-tauri/
-│       ├── src/
-│       │   ├── lib.rs          # NeutronDesktopBuilder setup
-│       │   ├── bridge.rs       # neutron:// protocol bridge
-│       │   ├── nucleus_state.rs
-│       │   ├── migrations.rs
-│       │   └── commands/       # Native OS commands only
-│       ├── migrations/
-│       └── tauri.conf.json
 ├── crates/
-│   ├── neutron-desktop/        # Core crate
+│   ├── neutron-desktop/        # Core crate (window, bridge, dev server, Nucleus state)
 │   ├── neutron-desktop-fs/
 │   ├── neutron-desktop-tray/
-│   └── ...                     # One crate per module
-├── packages/
-│   ├── neutron-shared/         # Shared Preact components (web + desktop)
-│   └── @neutron/desktop*/      # TypeScript bindings per module
+│   └── ...                     # One crate per module (12 plugins)
+├── packages/desktop/           # @neutron/desktop — TypeScript package
+├── scripts/                    # icon generation, macOS/Windows signing
 └── Cargo.toml
 ```
 
@@ -172,4 +163,7 @@ desktop/
 
 ## Status
 
-Planned — not yet implemented.
+Implemented and tested in-tree: `desktop.yml` runs `cargo test --workspace`
+(including an embedded-Nucleus lifecycle test) and the TypeScript package's
+tests; `desktop-release.yml` owns the signed release path. Platform surface
+still evolving — see the note on size targets above.

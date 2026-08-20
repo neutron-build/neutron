@@ -26,7 +26,7 @@
 ## Projects
 
 ### nucleus/ — Nucleus Database Engine
-Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vector, Graph, TimeSeries, Document, Full-Text Search, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub. PostgreSQL wire protocol compatible. MVCC isolation, WAL crash recovery, production-grade persistence.
+Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vector, Graph, TimeSeries, Document, Full-Text Search, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub. PostgreSQL wire protocol compatible. MVCC isolation, WAL crash recovery. Developer preview — durability differs sharply by model (see nucleus/DURABILITY.md and nucleus/docs/MODEL_SEMANTICS.md; Datalog has no durable store, and distributed/Raft mode is incomplete and unsupported).
 - Entry: `nucleus/src/`
 - Tests: `cargo test --lib` in `nucleus/`
 - Key SQL functions: `kv_get/set`, `ts_insert/range`, `doc_insert/query`, `columnar_insert`, `VECTOR_DISTANCE()`
@@ -34,14 +34,14 @@ Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vec
 - Port: 5432 (pgwire)
 
 ### rust/ — Neutron Rust (Web Framework)
-High-performance HTTP/1.1, HTTP/2, HTTP/3 web framework in Rust. Hyper 1.x + tokio, middleware pipeline, file-based routing, WebSockets, SSE, multipart, TLS, gRPC, GraphQL. 19 crates including OAuth, WebAuthn, Stripe, SMTP, Redis, OpenTelemetry.
+High-performance HTTP/1.1, HTTP/2 web framework in Rust (HTTP/3 behind the `http3` feature). Hyper 1.x + tokio, middleware pipeline, file-based routing, WebSockets, SSE, multipart, TLS, gRPC, GraphQL. 19 crates including OAuth, WebAuthn, Stripe, SMTP, Redis, OpenTelemetry.
 - Entry: `rust/crates/neutron/src/lib.rs`
 - Tests: `cargo test` in `rust/`
 - Key types: `App`, `Router`, `Request`, `Response`, `Middleware`, `Handler`
 
 ### typescript/ — Neutron TypeScript (UI Framework)
 SSR-first TypeScript UI framework on Preact: file-based routing, per-route loaders/actions, static + server (`app`) render modes, islands, signals, streaming. Published as `@neutron-build/core`. Monorepo: pnpm + Turbo. Packages include auth, data, nucleus, otel, security; scaffolding via `create-neutron`.
-- Entry: `typescript/packages/neutron/src/` (package name: `@neutron-build/core`, v0.1.4)
+- Entry: `typescript/packages/neutron/src/` (package name: `@neutron-build/core`, v0.2.0)
 - Tests: `pnpm test` in `typescript/`
 - App authoring: routes in `src/routes/` (`index.tsx`→`/`, `[id].tsx`→dynamic, `_layout.tsx`→layout, `api/*`→API); per-route `export const config = { mode: "static" | "app", cache? }`; `export async function loader({ params, request }: LoaderArgs)` → `props.data`; `export async function action({ request }: ActionArgs)` → `props.actionData`. Client entry (`src/main.tsx`) is fixed glue: `registerRoutes(routes)` + `init()` from `@neutron-build/core/client` with `virtual:neutron/routes`. Preact, not React; no `App.tsx`.
 - Key exports: `@neutron-build/core` → `defineConfig`, `cache`, `revalidateTag`, `signal`/`computed`/`effect`, `Island`, `LoaderArgs`/`ActionArgs`, `useLoaderData`, `Link`, `Form`, `useNavigate`, `useParams`; `@neutron-build/core/client` → `init`, `registerRoutes`; `@neutron-build/core/vite` → `neutronPlugin`. See AGENTS.md in any scaffolded app for full authoring rules.
@@ -53,7 +53,7 @@ Full backend framework built on `net/http`. Generic typed handlers, composable m
 - Key packages: `neutron`, `nucleus`, `neutronauth`, `neutroncache`, `neutronjobs`, `neutronrealtime`
 
 ### python/ — Neutron Python (AI Framework)
-AI application framework: agents, RAG pipelines, MCP integration, structured output. Built on Starlette + Pydantic v2 + asyncpg. 22 modules covering middleware, CSRF, graceful shutdown (30s drain), OpenAPI 3.1.
+AI application framework: agents, RAG pipelines, MCP integration, structured output. Built on Starlette + Pydantic v2 + asyncpg. Modules covering middleware, CSRF, graceful shutdown (30s drain), OpenAPI 3.1.
 - Entry: `python/`
 - Tests: `pytest` in `python/`
 - Key modules: `agents`, `rag`, `mcp`, `structured_output`, `middleware`, `nucleus_client`
@@ -65,7 +65,7 @@ OTP-based backend framework using Plug + Bandit. Fault-tolerant supervisors, all
 - Key modules: `Neutron.Router`, `Neutron.Nucleus`, `Neutron.Channels`, `Neutron.Presence`
 
 ### mojo/ — Neutron Mojo (ML Library)
-Tensor operations, quantization (Q8/Q4/NF4/FP8), inference pipeline, training stack in Mojo. CPU-first with SIMD kernels. Preview — tracks the Mojo nightly toolchain, awaiting Mojo 1.0.
+Tensor operations, quantization (Q8/Q4/NF4/FP8), inference pipeline, training stack in Mojo. CPU-first with SIMD kernels. Preview — migrated to Mojo 1.0 (2026-08); APIs still expected to move.
 - Entry: `mojo/neutron-mojo/src/`
 - Tests: `pixi run mojo build -I src test/test_*.mojo`
 - Key types: `Tensor`, `Model`, `QuantizedModel`, `pipeline_generate`
@@ -77,9 +77,9 @@ ML and scientific computing library. Typed Nucleus client for all 14 models. Ext
 - Key types: `NeutronJulia.connect`, `sql()`, `kv()`, `vector()`, `timeseries()`
 
 ### zig/ — Neutron Zig (Systems Library)
-4-layer systems library (wire -> HAL -> protocols -> app). Nucleus client for all 14 models. JWT auth, compression, SSE, cache. Zero heap allocations, comptime SQL validation. Targets ARM, RISC-V, AVR, ESP32.
+4-layer systems library (wire -> HAL -> protocols -> app). Nucleus client for all 14 models. JWT auth, compression, SSE, cache. Comptime-typed row decoding, fixed-capacity connection pool (heap-backed). Layer 0 is zero-allocation. Requires Zig 0.15.2.
 - Entry: `zig/`
-- Tests: `zig build test` in `zig/` (295 tests)
+- Tests: `zig build test` in `zig/` (309 tests, verified on 0.15.2)
 
 ### modelica/ — Neutron Modelica (Physics Simulation)
 Physics simulation framework. FMI 2.0/3.0 model exchange, Kirchhoff's law solver (MNA), Julia bridge via DifferentialEquations.jl. Python-based tooling.
@@ -92,17 +92,17 @@ React Native Fabric (iOS/Android) + Preact (web). Expo Go for on-device preview.
 - Key APIs: Components, `NeutronRouter`, `useDevice`, `NeutronWind`
 
 ### desktop/ — Neutron Desktop
-Cross-platform desktop apps using Tauri 2.0 + Preact + Neutron Rust backend. 12 Rust plugins, `neutron://` protocol bridge, Nucleus embedded mode. Dev mode TCP server for hot reload. ~10MB bundles vs Electron's 100MB+.
+Cross-platform desktop apps using Tauri 2.0 + Preact + Neutron Rust backend. 12 Rust plugins, `neutron://` protocol bridge, Nucleus embedded mode. Dev mode TCP server for hot reload. Bundle-size and memory targets (~10MB) not yet measured.
 - Entry: `desktop/`
 - CLI: `neutron desktop dev/build/preview`
 
 ### studio/ — Nucleus Studio
-Visual database management GUI. Browse all 14 data models in one UI with toggles. Schema designer, code generator, database browser, MCP server with 17 tools.
+Visual database management GUI. Browse all 14 data models in one UI with toggles. Schema designer, code generator, database browser.
 - Stack: Preact SPA + Go embedded server
 - Backend: `cli/internal/studio/`, Frontend: `studio/src/`
 
 ### cli/ — Neutron CLI
-Universal CLI in Go + Cobra. Commands include `dev`, `build`, `run`, `generate`, `db`, `studio`, `desktop`, `native`, `migrate`, and `mcp` (MCP server). ~21MB binary.
+Universal CLI in Go + Cobra. Commands include `new`, `init`, `dev`, `generate`, `db`, `studio`, `desktop`, `native`, `migrate`, `doctor`, and `mcp` (MCP server). Single self-contained binary.
 - Build: `go build` in `cli/`
 
 ## Transport Layer
@@ -130,15 +130,15 @@ Single schema covers SQL tables, KV stores, vector collections, timeseries metri
 
 Formal verification across three tools:
 
-- **Lean4** (`lean4/`): 26 files, 70 theorems, 0 `sorry` — machine-checked proofs of hand-written Lean *models* of the core algorithms (MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU), modulo explicit axioms. Proves the algorithm designs, not the production Rust binary.
-- **Quint** (`quint/`): 27 protocol specification files, 12 test files, nucleus + framework + realtime specs
-- **Verus** (`verus/`): 12 files, Rust verification for nucleus (MVCC, page, buffer) and framework (JWT, session, rate limit)
+- **Lean4** (`lean4/`): 26 files, 92 theorems, 0 `sorry` — machine-checked proofs of hand-written Lean *models* of the core algorithms (MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU), modulo explicit axioms. Proves the algorithm designs, not the production Rust binary. Gates run in CI (`.github/workflows/lean4.yml`, incl. an axiom audit).
+- **Quint** (`quint/`): 15 protocol specification files, 14 test files, nucleus + framework + realtime specs
+- **Verus** (`verus/`): 12 files of Rust verification specs/annotations for nucleus (MVCC, page, buffer) and framework (JWT, session, rate limit) — annotations written, verification not yet run in CI (see `verus/VERIFIED.md`)
 
 ## Key Design Decisions
 
 - Neutron TS uses Preact (3KB) not React (42KB)
 - Nucleus uses PostgreSQL wire protocol — works with any Postgres client
-- Nucleus MVCC + WAL crash recovery — production-grade persistence
+- Nucleus MVCC + WAL crash recovery — developer preview; per-model durability varies, see nucleus/DURABILITY.md
 - Neutron Rust uses hyper 1.x + tokio, no framework overhead
 - Mojo uses SIMD kernels for tensor ops
 - Elixir uses OTP supervisors for fault tolerance

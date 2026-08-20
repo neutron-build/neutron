@@ -110,7 +110,7 @@ export default function Home() {
 
 ## Performance
 
-Benchmarked against Next.js, Remix 2, Remix 3 (React Router 7), and Astro on Node.js with 80 concurrent connections using [autocannon](https://github.com/mcollina/autocannon). All frameworks running production builds.
+Benchmarks run against Next.js, Remix 2, Remix 3 (React Router 7), and Astro on Node.js with 80 concurrent connections using [autocannon](https://github.com/mcollina/autocannon). All frameworks running production builds.
 
 | Scenario | Neutron | Next.js | Remix 2 | Remix 3 | Astro |
 |---|---|---|---|---|---|
@@ -120,9 +120,9 @@ Benchmarked against Next.js, Remix 2, Remix 3 (React Router 7), and Astro on Nod
 | Big payload `GET /big` | **1,854 req/s** | 240 | 331 | 76 | 274 |
 | Login page `GET /login` | **7,784 req/s** | 2,499 | 613 | 349 | 442 |
 | Auth protected `GET /protected` | **1,102 req/s** | 187 | 284 | 172 | 165 |
-| Mutation `POST /api/mutate` | **776 req/s** | 293 | 314 | 270 | 838 |
+| Mutation `POST /api/mutate` | 776 req/s | 293 | 314 | 270 | **838** |
 
-Full benchmark suite with conformance matrix, publish-grade CI, and regression gates in [`benchmarks/`](./benchmarks/).
+These seven rows are a single 5-second run (2026-02-13, `benchmarks/results/run-2026-02-13T16-57-49-705Z.json`) — the harness reports one measured run per scenario, and absolute numbers swing several-fold across machines and days (see `benchmarks/bench-gate-thresholds.json`, which documents ±40% variation between CI runners of the same nominal class). Across every recorded full run, Neutron beat Next.js on all scenarios and Astro on most — but not all; Astro wins the big-payload scenario in most runs. Run the harness yourself before quoting numbers. The eighth scenario, `session-refresh`, and the full matrix live in [`benchmarks/`](./benchmarks/).
 
 ## Streaming SSR
 
@@ -204,15 +204,15 @@ export async function loader({ request }) {
 
 | Package | Description |
 |---|---|
-| `neutron` | Core framework |
-| `neutron-cli` | Dev server, build, preview |
+| `@neutron-build/core` | Core framework (directory: `packages/neutron`) |
+| `@neutron-build/cli` | Dev server, build, preview (directory: `packages/neutron-cli`) |
 | `create-neutron` | Project scaffolding |
-| `neutron-data` | Database, cache, sessions, queues, storage |
-| `@neutron/auth` | Auth middleware and adapters |
-| `@neutron/security` | CSP, CSRF, rate limiting |
-| `@neutron/cache-redis` | Distributed Redis/Dragonfly cache |
-| `@neutron/ops` | Health checks, request tracing, logging |
-| `@neutron/otel` | OpenTelemetry integration |
+| `@neutron-build/data` | Database, cache, sessions, queues, storage |
+| `@neutron-build/auth` | Auth middleware and adapters |
+| `@neutron-build/security` | CSP, CSRF, rate limiting |
+| `@neutron-build/cache-redis` | Distributed Redis/Dragonfly cache |
+| `@neutron-build/ops` | Health checks, request tracing, logging |
+| `@neutron-build/otel` | OpenTelemetry integration |
 
 ## Documentation
 

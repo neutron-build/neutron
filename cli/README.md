@@ -131,10 +131,10 @@ compatibility: `POST /mcp` (JSON-RPC 2.0), `GET /openai/tools`,
 | `cypher_query` | Graph | Run a Cypher query over a graph store |
 | `doc_find` | Document | Query a document collection with a JSON filter |
 | `ts_range` | TimeSeries | Range query with optional bucketing and aggregation |
-| `geo_radius` | Geo | Find points within a radius of a lat/lon |
+| `geo_distance` | Geo | Haversine distance (metres) between two lat/lon points |
 | `blob_list` | Blob | List blobs with size, content type, and hash |
 | `stream_range` | Streams | Read entries from an append-only stream between two IDs |
-| `datalog_eval` | Datalog | Evaluate a Datalog program with facts, rules, and a query |
+| `datalog_query` | Datalog | Evaluate a Datalog query against asserted facts and rules |
 | `cdc_changes` | CDC | Read recent change events from the WAL, filtered by table/operation |
 | `pubsub_list` | PubSub | List active pub/sub channels |
 

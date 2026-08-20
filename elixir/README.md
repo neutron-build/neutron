@@ -200,7 +200,7 @@ mix deps.get
 mix test
 ```
 
-The suite ships 481 tests across the framework, Nucleus client, all 14 model modules, real-time channels/presence/socket, auth, jobs, cache, middleware, and validation.
+The suite ships 496 tests across the framework, Nucleus client, all 14 model modules, real-time channels/presence/socket, auth, jobs, cache, middleware, and validation.
 
 ## License
 

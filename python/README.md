@@ -97,7 +97,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-533 tests. The live-database cases skip unless `NEUTRON_TEST_DATABASE_URL`
+565 tests. The live-database cases skip unless `NEUTRON_TEST_DATABASE_URL`
 points at a running Nucleus; CI runs them against one it builds in-job.
 
 ---

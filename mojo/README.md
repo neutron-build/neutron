@@ -5,12 +5,13 @@ This repository is the Neutron Mojo implementation within the broader Neutron ec
 A Mojo AI/ML compute library: typed tensors with SIMD kernels, GGUF/SafeTensors
 model loading, block quantization, transformer inference, and training utilities.
 
-## Status — preview, awaiting Mojo 1.0
+## Status — preview, on Mojo 1.0
 
-**This is the one Neutron package that is explicitly gated on a future toolchain.**
-Mojo has not reached 1.0, its standard library and language surface are still
-changing, and this library tracks the `max` nightly channel (`max >= 25.1`). Treat
-everything here as a **preview**, not a production dependency:
+**Mojo 1.0 shipped 2026-08-11 and the SDK was migrated to it** (2026-08-19;
+the pinned nightly toolchain no longer compiles). `mojoproject.toml` requires
+`mojo >= 1.0`, `max >= 26.5`; the last recorded validation run
+(`reports/core-validation-latest.md`, 2026-08-20) is **125 pass / 0 fail on
+Mojo 1.0.0**. Treat it as a **preview**, not a production dependency:
 
 - The runtime is **CPU-first SIMD**. There is no dedicated Mojo GPU kernel path
   in-tree yet, despite the ecosystem's eventual GPU ambitions.
@@ -18,11 +19,11 @@ everything here as a **preview**, not a production dependency:
   primitives, not a production HTTP server runtime.
 - The package split (`neutron-mojo-infer`, `neutron-mojo-python`) is **deferred**;
   those directories are scaffolding stubs. All working code lives in `neutron-mojo`.
-- APIs will move with the language. Pin nothing; expect churn until Mojo 1.0.
+- The 1.0 migration left open gaps with evidence in
+  [`MIGRATION_GAPS.md`](MIGRATION_GAPS.md) (12 gaps, 4 residuals, ~6.8k
+  deprecation warnings). APIs will keep moving; pin nothing.
 
-Current workspace state: **112 source `.mojo` files, 125 test files.** The last
-recorded validation run (`reports/core-validation-latest.md`, 2026-02-20) passed
-125/125 on a `max` nightly toolchain.
+Current workspace state: **112 source `.mojo` files, 125 test files.**
 
 ## What it is
 
@@ -94,7 +95,7 @@ FP32, Q8, Q4, and mixed-precision paths.
 
 ## Build and test
 
-This is a [pixi](https://pixi.sh)/`mojoproject.toml` workspace (`max >= 25.1`). A
+This is a [pixi](https://pixi.sh)/`mojoproject.toml` workspace (`mojo >= 1.0`, `max >= 26.5`). A
 working Mojo toolchain is required to build or run anything.
 
 ```bash

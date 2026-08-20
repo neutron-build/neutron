@@ -3,22 +3,22 @@ title: Verification Overview
 description: Formal verification tools for Neutron Rust — prove your code is correct, not just tested.
 ---
 
-Neutron Rust includes built-in support for formal verification — tools that mathematically prove your code is correct, not just test it with sample inputs.
+Neutron Rust code can be verified with formal tools — tools that mathematically prove your code is correct, not just test it with sample inputs. These are third-party Rust tools that work on Neutron code; the in-repo verification suite (Lean 4 model proofs, Quint protocol specs, Verus annotations) is covered on its own pages.
 
 ## Why Verification?
 
-Testing checks a few inputs and hopes for the best. Verification proves correctness for **all possible inputs**.
+Testing checks a few inputs and hopes for the best. Verification proves correctness for a defined class of inputs.
 
 | | Testing | Verification |
 |---|---|---|
-| Coverage | Sample inputs | All possible inputs |
-| Guarantee | "No bugs found" | "No bugs can exist" |
-| Edge cases | Must think of them | Proven for all cases |
-| Confidence | Probabilistic | Mathematical certainty |
+| Coverage | Sample inputs | All inputs within the tool's scope (bounded for Kani, unbounded for Verus) |
+| Guarantee | "No bugs found" | "No bugs can exist" within that scope |
+| Edge cases | Must think of them | Covered by the proof's scope |
+| Confidence | Probabilistic | Mathematical, modulo the tool's assumptions |
 
 ## Tools
 
-Neutron ships with two verification tools as cargo dependencies — zero extra runtimes, zero extra toolchains.
+Kani and Shuttle are external tools you add to your own project — the Neutron repo does not currently ship proof harnesses or cargo dependencies for either.
 
 ### [Kani](/docs/verification/kani) — Logic Verification
 

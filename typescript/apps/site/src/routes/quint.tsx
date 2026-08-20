@@ -6,7 +6,7 @@ import CodeBlock from "../components/CodeBlock";
 export function head() {
   return {
     title: "Quint Protocol Verification - Neutron",
-    description: "27 Quint specs for Neutron protocols: Multi-Raft, resharding, distributed transactions, real-time presence. TLA+ under the hood with modern syntax.",
+    description: "15 Quint specs for Neutron protocols: Multi-Raft, resharding, distributed transactions, real-time presence. TLA+ under the hood with modern syntax.",
   };
 }
 
@@ -14,15 +14,15 @@ export default function QuintPage() {
   return (
     <ProductPage
       title="Quint Verification"
-      description="27 Quint specs covering Nucleus, framework, and realtime protocols. Multi-Raft consensus, resharding, distributed transactions, presence CRDTs &mdash; modeled and explored before the implementation."
+      description="15 Quint specs covering Nucleus, framework, and realtime protocols. Multi-Raft consensus, resharding, distributed transactions, presence CRDTs &mdash; modeled and explored before the implementation."
       category="tool"
       status="available"
       accent="var(--accent-quint)"
       heroAccentRgb="245, 158, 11"
       heroTagline="Break the design before the design breaks production."
       stats={[
-        { value: '27', label: 'Spec Files' },
-        { value: '12', label: 'Invariant Tests' },
+        { value: '15', label: 'Spec Files' },
+        { value: '14', label: 'Test Files' },
         { value: 'TLA+', label: 'Model Checker' },
         { value: 'TS-like', label: 'Syntax' },
       ]}

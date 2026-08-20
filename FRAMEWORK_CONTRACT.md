@@ -1,6 +1,6 @@
 # Neutron Framework Contract
 
-> Shared behavioral specification for all Neutron frameworks (Go, Python, Zig, TypeScript, Rust). Every framework MUST conform to this contract so they feel like one ecosystem. This document defines the wire-level details — each framework's developer-facing API is idiomatic to its language and defined in its own PLAN.md.
+> Shared behavioral specification for all Neutron frameworks (Go, Python, Zig, TypeScript, Rust, Elixir). Every framework MUST conform to this contract so they feel like one ecosystem. This document defines the wire-level details — each framework's developer-facing API is idiomatic to its language and defined in its own PLAN.md.
 
 ## 1. Feature Detection
 

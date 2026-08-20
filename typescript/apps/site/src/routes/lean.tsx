@@ -95,7 +95,7 @@ end Nucleus.MVCC`}</code></pre>
 
       <section>
         <h3>Where this shows up in Neutron</h3>
-        <p>Every algorithm modeled here is one Nucleus runs. The B-tree is the SQL index. The WAL is every durable write. Raft runs replication. HMAC signs every JWT. The proofs don't certify the compiled binary &mdash; they pin down the designs it's built on, so the parts that are hardest to get right are specified and machine-checked instead of improvised.</p>
+        <p>Most algorithms modeled here are ones Nucleus runs. The B-tree is the SQL index. The WAL is every durable write. HMAC signs every JWT. Raft is modeled because it is the replication design Nucleus is building toward &mdash; the distributed/Raft mode in the shipping engine is incomplete and unsupported today. The proofs don't certify the compiled binary &mdash; they pin down the designs it's built on, so the parts that are hardest to get right are specified and machine-checked instead of improvised.</p>
 
         <h3>What about my application code?</h3>
         <p>You don't need to write Lean to use Nucleus &mdash; the proofs are ours to maintain. For your own code, <a href="/docs/verification/overview">Neutron's verification overview</a> covers Kani (bounded model checking for Rust), Shuttle (concurrency testing), Verus (SMT verification), and Quint (protocol modeling). Different tools for different problems.</p>

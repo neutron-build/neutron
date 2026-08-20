@@ -17,7 +17,7 @@ export default function NucleusPage() {
     facts={[
       { label: "Protocol", value: "PostgreSQL wire protocol for standard clients and Neutron SDKs" },
       { label: "Models", value: "SQL, KV, Vector, Document, Graph, FTS, TimeSeries, Columnar, Blob, Datalog, Streams, Geo, CDC, and PubSub" },
-      { label: "Engine", value: "Rust server with MVCC, WAL, indexing, security, and replication modules" },
+      { label: "Engine", value: "Rust server with MVCC, WAL, indexing, and security modules (distributed/replication modules exist but are incomplete and unsupported)" },
       { label: "License", value: "Business Source License 1.1 with an Additional Use Grant and MIT change license" },
     ]}
     note="Model maturity varies. Consult the model-specific documentation and repository tests before selecting a feature for production use."

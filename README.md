@@ -58,9 +58,9 @@ Full guide: **[neutron.build/docs](https://neutron.build/docs)**.
 ### Platforms & tooling
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| [`native/`](./native) | TypeScript | Mobile — Preact components rendering to native iOS/Android views |
+| [`native/`](./native) | TypeScript | Mobile — React-compatible components to native iOS/Android views (RN Fabric); Preact on web via compat alias |
 | [`desktop/`](./desktop) | Rust + TS | Desktop apps — Tauri 2.0 + Preact, 12 plugin crates, Nucleus embedded mode (bundle-size targets, not yet measured) |
-| [`cli/`](./cli) | Go | Universal CLI — `neutron new/dev/build/studio`, plus `neutron mcp` |
+| [`cli/`](./cli) | Go | Universal CLI — `neutron new/dev/studio/generate/migrate`, plus `neutron mcp` |
 
 ### Verification
 | Directory | Language | Description |

@@ -1,274 +1,89 @@
 # Neutron Go
 
-Go language SDK for the Neutron ecosystem — Nucleus database client (all 9 data models) and Neutron HTTP server bindings.
+Go SDK for the Neutron ecosystem — an HTTP application framework and a Nucleus
+database client covering all 14 data models, in one Go module:
+`github.com/neutron-dev/neutron-go` (Go 1.24+).
 
-## Philosophy
-
-Light core, modular data models. Import only what you use. No codegen, no magic zero-values, no god objects. SQL stays visible. The `Querier` interface makes everything testable without mocks.
-
-## Modules
-
-```
-github.com/neutron-build/nucleus-go          — core SQL client (always imported)
-github.com/neutron-build/nucleus-go/kv       — Key-Value (optional)
-github.com/neutron-build/nucleus-go/vector   — Vector search (optional)
-github.com/neutron-build/nucleus-go/graph    — Graph traversal (optional)
-github.com/neutron-build/nucleus-go/ts       — Timeseries (optional)
-github.com/neutron-build/nucleus-go/doc      — Document store (optional)
-github.com/neutron-build/nucleus-go/fts      — Full-text search (optional)
-github.com/neutron-build/nucleus-go/geo      — Geo queries (optional)
-github.com/neutron-build/nucleus-go/pubsub   — Pub/Sub (optional)
-github.com/neutron-build/neutron-go          — HTTP server bindings
+```bash
+go get github.com/neutron-dev/neutron-go
 ```
 
-A pure-SQL service imports only `nucleus-go`. Vector, graph, and timeseries contribute zero binary size to services that don't need them.
+## Packages
 
-## Struct Tag ORM
+| Package | What it is |
+|---|---|
+| `nucleus` | Nucleus client — feature detection, transactions, all 14 data models |
+| `neutron` | HTTP app: router, composable middleware, OpenAPI 3.1, RFC 7807 errors |
+| `neutronauth` | JWT, OAuth, WebAuthn, sessions, RBAC, API keys |
+| `neutroncache` | Tiered / LRU / HTTP-response caching |
+| `neutronjobs` | Background job queue and cron |
+| `neutronrealtime` | WebSocket hub, SSE, Nucleus stream subscriptions |
+| `neutronmcp` | MCP client/server building blocks |
+| `neutrontest` | Test helpers |
+| `neutroncli` | The `neutron-go` entrypoint (scaffolding) |
 
-Two tags, clearly separated:
+## Nucleus client
 
-- `db:"column_name"` — column mapping for query scanning (inherited from pgx/sqlx — already what Go developers expect)
-- `nucleus:"column_name,pk,notnull,unique,index,default:now()"` — DDL metadata for schema reflection
+`nucleus.Connect` opens a pgx pool and detects Nucleus capabilities via
+`SELECT VERSION()`. Every data model is a typed handle on the client:
 
 ```go
-type User struct {
-    ID        int64     `db:"id"        nucleus:"id,pk"`
-    Name      string    `db:"name"      nucleus:"name,notnull"`
-    Email     string    `db:"email"     nucleus:"email,notnull,unique"`
-    CreatedAt time.Time `db:"created_at" nucleus:"created_at,default:now()"`
-}
-```
+client, err := nucleus.Connect(ctx, "postgres://localhost:5432/mydb")
 
-**No magic zero-value treatment.** A zero `bool` stores as false. A zero `int64` stores as 0. `Update` requires explicit column names — no "update non-zero fields only" surprises.
+client.SQL()        // relational queries
+client.KV()         // kv := client.KV(); kv.Set(ctx, key, val, nucleus.WithTTL(time.Hour))
+client.Vector()     // Insert, Search
+client.TimeSeries() // Insert, Last, RangeAvg
+// also Document(), Graph(), FTS(), Geo(), Blob(), Streams(),
+// Columnar(), Datalog(), CDC(), PubSub()
 
-## The Querier Interface
-
-The single most important design decision. Both `*Client` (pool) and `Tx` (transaction) implement it:
-
-```go
-type Querier interface {
-    Exec(ctx context.Context, sql string, args ...any) (Result, error)
-    Query(ctx context.Context, sql string, args ...any) (Rows, error)
-    QueryRow(ctx context.Context, sql string, args ...any) Row
-}
-```
-
-Repository functions accept `Querier`. In tests, pass a `Tx` that rolls back after each test — zero mocking, fully isolated, parallel-safe tests with no cleanup logic.
-
-## SQL Client
-
-```go
-cfg := nucleus.ParseConfig("postgres://localhost:5432/mydb")
-client, err := nucleus.New(ctx, cfg)
-
-// Type-safe struct scanning
-users, err := nucleus.CollectRows[User](
-    client.Query(ctx, "SELECT * FROM users WHERE active = $1", true),
-)
-
-// Named args
-user, err := nucleus.CollectOneRow[User](
-    client.Query(ctx, "SELECT * FROM users WHERE id = @id", nucleus.NamedArgs{"id": 42}),
-)
-```
-
-## Transactions
-
-`WithTx` commits on nil return, rolls back on error or panic. Transactions are always explicit parameters — never stored in `context.Context`.
-
-```go
-err := nucleus.WithTx(ctx, client, func(tx nucleus.Tx) error {
-    _, err := tx.Exec(ctx, "INSERT INTO users (name) VALUES ($1)", "Alice")
-    return err
+err = client.WithTx(ctx, nil, func(tx *nucleus.Tx) error {
+    // retries serialization failures (40001/25P02) with full-jitter
+    // backoff; lock timeouts (55P03) are surfaced, never retried
+    return nil
 })
 ```
 
-## KV Client
+`WithTx` is the contract's reference retry helper
+(`FRAMEWORK_CONTRACT.md` §3.14); its test asserts a `55P03` is attempted
+exactly once.
 
-Each method mirrors the Nucleus KV SQL function exactly:
+## HTTP framework
 
-```go
-kv := kv.New(client)
-
-kv.Set(ctx, "session:abc", data, kv.TTL(3600))
-val, err := kv.Get(ctx, "session:abc")
-kv.Del(ctx, "session:abc")
-n, err := kv.Incr(ctx, "counter:views")
-```
-
-## Vector Client
+Generic typed handlers — input and output types flow into OpenAPI generation
+automatically:
 
 ```go
-vec := vector.New(client)
+app := neutron.New(neutron.WithOpenAPIInfo("My API", "1.0.0"))
+r := app.Router()
 
-vec.Insert(ctx, "embeddings", id, embedding)
-results, err := vec.Search(ctx, "embeddings", queryVec, vector.K(10))
-```
-
-## Timeseries Client
-
-```go
-ts := ts.New(client)
-
-ts.Insert(ctx, "events", value, ts.Tags{"host": "web-1"})
-count, err := ts.Count(ctx, "events", ts.Since("-1h"))
-avg, err := ts.RangeAvg(ctx, "events", ts.Since("-24h"))
-```
-
-## HTTP Server Bindings
-
-Neutron Rust's routing model in Go. Handler returns an error — centralises error formatting in one place:
-
-```go
-type Handler func(c *RequestCtx) error
-type Middleware func(next Handler) Handler
-
-router := neutron.NewRouter()
-router.Use(middleware.Logger())
-router.Use(middleware.Recover())
-
-router.GET("/api/users", func(c *neutron.RequestCtx) error {
-    users, err := userRepo.List(c.Context())
-    if err != nil {
-        return err  // → 500
-    }
-    return c.JSON(200, users)
+neutron.Get[neutron.Empty, User](r, "/api/users/:id", func(ctx context.Context, in neutron.Empty) (User, error) {
+    return User{ID: 1, Name: "Alice"}, nil
 })
 
-router.POST("/api/users", createUser)
+_ = app.Run(":8080")
 ```
 
-## Config as Plain Struct
+`GET /health`, `GET /openapi.json`, and `GET /docs` are mounted by default;
+errors render as RFC 7807 `application/problem+json`; middleware
+(`Logger`, `Recover`, rate limiting, and the rest of the contract stack) is
+composed with `app.Router().Group(prefix, mw...)` or `WithMiddleware`.
 
-No functional-options chains. A plain struct is assignable, comparable, and loggable:
+## Testing
 
-```go
-cfg := nucleus.ParseConfig("postgres://localhost:5432/mydb")
-cfg.MinConns             = 4                    // always-warm connections
-cfg.MaxConns             = 20                   // (cores × 4) for SSD workloads
-cfg.HealthCheckPeriod    = 30 * time.Second     // aggressive enough to catch dead connections
-cfg.MaxConnIdleTime      = 5 * time.Minute      // reclaim idle connections
-cfg.MaxConnLifetime      = 1 * time.Hour        // recycle before TLS cert expiry
-client, err := nucleus.New(ctx, cfg)
+```bash
+go test ./...
 ```
 
-## Batch Operations
+447 test functions across 9 packages. CI: `.github/workflows/go.yml` builds,
+vets, and tests the whole module on every change to `go/**`.
 
-Use `SendBatch` when issuing 5+ queries per request — it collapses multiple round-trips into one:
+---
 
-```go
-batch := &pgx.Batch{}
-batch.Queue("SELECT value FROM kv WHERE key = $1", "session:abc")
-batch.Queue("SELECT value FROM kv WHERE key = $1", "session:xyz")
-batch.Queue("SELECT id, name FROM users WHERE id = $1", userID)
-
-results := client.SendBatch(ctx, batch)
-defer results.Close()
-
-val1, _ := results.QueryRow().Scan(&v1)
-val2, _ := results.QueryRow().Scan(&v2)
-user, _ := pgx.CollectOneRow(results.Query(), pgx.RowToStructByName[User])
-```
-
-For bulk inserts (thousands of rows), use `COPY` — it's 10–50× faster than batched `INSERT`:
-
-```go
-_, err = client.CopyFrom(ctx,
-    pgx.Identifier{"vectors"},
-    []string{"id", "embedding", "metadata"},
-    pgx.CopyFromRows(rows),
-)
-```
-
-## Error Handling
-
-Nucleus propagates PostgreSQL error codes. Use `errors.As` to detect them:
-
-```go
-import "github.com/jackc/pgconn"
-
-var pgErr *pgconn.PgError
-if errors.As(err, &pgErr) {
-    switch pgErr.SQLState() {
-    case "40001": // serialization_failure — safe to retry
-        return retryWithBackoff(ctx, fn)
-    case "23505": // unique_violation — caller decides
-        return ErrAlreadyExists
-    }
-}
-```
-
-Nucleus also defines data-model-specific codes (vector dimension mismatch, KV key conflict) that follow the same pattern.
-
-## Observability
-
-Wrap the Querier at the client layer — one place, covers all data models:
-
-```go
-func (c *instrumentedClient) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-    ctx, span := tracer.Start(ctx, "nucleus.query",
-        trace.WithAttributes(
-            attribute.String("db.system", "nucleus"),
-            attribute.String("db.statement", sql),
-        ),
-    )
-    defer span.End()
-    return c.inner.Query(ctx, sql, args...)
-}
-```
-
-## What We Took From Each Library
-
-| Library | What we adopted |
-|---------|----------------|
-| pgx v5 | Wire protocol driver, `CollectRows`, `NamedArgs`, modular sub-packages |
-| sqlx | `db` struct tag convention (already the Go standard) |
-| bun | SQL-first query builder style — SQL stays visible |
-| go-redis | Command-mirroring API for KV client |
-| chi | Radix tree routing, 100% `net/http` compatible middleware |
-| Echo | `func(*Ctx) error` handler signature |
-
-## What We Avoided
-
-| Library | What we avoided |
-|---------|----------------|
-| GORM | Silent zero-value semantics, invisible callbacks, `Save()` ambiguity, N+1 by default |
-| ent | Codegen complexity, hundreds of generated files, teaches ent not Go |
-| Fiber | No HTTP/2/3, incompatible with `net/http` ecosystem, `*Ctx` reuse data races |
-| mongo-go-driver | Driver primitive types leaking into application structs |
-
-## File Structure
-
-```
-go/
-├── nucleus/                    # Core SQL client
-│   ├── client.go
-│   ├── config.go
-│   ├── querier.go              # Querier interface
-│   ├── rows.go                 # CollectRows, CollectOneRow
-│   ├── tx.go                   # WithTx, Begin
-│   ├── schema.go               # Struct tag reflection, DDL generation
-│   └── go.mod
-├── kv/                         # KV client module
-├── vector/                     # Vector client module
-├── ts/                         # Timeseries client module
-├── doc/                        # Document client module
-├── graph/                      # Graph client module
-├── fts/                        # Full-text search module
-├── geo/                        # Geo module
-├── pubsub/                     # Pub/Sub module
-├── neutron/                    # HTTP server bindings
-│   ├── router.go
-│   ├── context.go
-│   ├── middleware/
-│   │   ├── logger.go
-│   │   ├── recover.go
-│   │   ├── auth.go
-│   │   └── ratelimit.go
-│   └── go.mod
-└── go.work                     # Go workspace linking all modules
-```
-
-## Status
-
-Planned — not yet implemented.
+*This file replaced a pre-implementation design document (2026-08-19). That
+document described a multi-module layout (`nucleus-go/kv`, `nucleus-go/vector`,
+...), an API that was never built (`ParseConfig`, `kv.New`, `CollectRows`), "9
+data models", and ended with "Status: Planned — not yet implemented" — for an
+SDK that now ships 447 tests and a CI workflow. Found by the S97 claims audit.
+The real module path is `github.com/neutron-dev/neutron-go`; the design doc
+used `github.com/neutron-build/nucleus-go`.*

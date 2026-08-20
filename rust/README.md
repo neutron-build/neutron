@@ -217,23 +217,12 @@ async fn test_api() {
 }
 ```
 
-## io_uring (Linux)
-
-On Linux, enabling the `io_uring` feature switches the runtime from Tokio to [Monoio](https://github.com/bytedance/monoio), ByteDance's thread-per-core runtime. Monoio avoids work-stealing overhead and uses io_uring for all I/O — benchmarks show ~20% higher throughput than Tokio on Linux for I/O-bound workloads.
-
-```toml
-# Cargo.toml — Linux-only, deployment target only
-neutron = { version = "0.1", features = ["io_uring"] }
-```
-
-Tradeoffs: Linux-only (no macOS/Windows), thread-per-core model (no `tokio::spawn` across threads), and Monoio's API is not drop-in compatible with Tokio. Use Tokio (the default) for development and cross-platform deployments; switch to io_uring on Linux production if profiling confirms I/O bottleneck.
-
 ## HTTP/3 (QUIC)
 
-The `h3` feature enables HTTP/3 via [Quinn](https://github.com/quinn-rs/quinn) (pure Rust QUIC). HTTP/3 reduces TTFB by 50–100ms on high-packet-loss networks (mobile, geo-distributed) through connection migration and 0-RTT resumption. On typical datacenter deployments the difference is <10ms — stick with HTTP/2 unless you're targeting high-loss networks.
+The `http3` feature enables HTTP/3 via [Quinn](https://github.com/quinn-rs/quinn) (pure Rust QUIC). HTTP/3 reduces TTFB by 50–100ms on high-packet-loss networks (mobile, geo-distributed) through connection migration and 0-RTT resumption. On typical datacenter deployments the difference is <10ms — stick with HTTP/2 unless you're targeting high-loss networks.
 
 ```toml
-neutron = { version = "0.1", features = ["h3"] }
+neutron = { version = "0.1", features = ["http3"] }
 ```
 
 ## Performance
@@ -276,8 +265,7 @@ Neutron uses feature flags to keep the dependency tree minimal. The `full` featu
 | `jwt` | JWT authentication |
 | `cookie` | Cookie, signed/private cookies, sessions, CSRF |
 | `openapi` | OpenAPI spec generation + Swagger UI |
-| `io_uring` | Monoio runtime on Linux (~20% more throughput, thread-per-core) |
-| `h3` | HTTP/3 via Quinn QUIC (useful for high-loss networks) |
+| `http3` | HTTP/3 via Quinn QUIC (useful for high-loss networks) |
 
 ```toml
 # Use only what you need

@@ -19,7 +19,7 @@ export default function GoPage() {
       { label: "HTTP", value: "Go 1.22+ net/http ServeMux with composable route groups" },
       { label: "Data", value: "SQL in the core client; other Nucleus models are optional packages" },
       { label: "Contract", value: "RFC 7807 errors, standard middleware order, health checks, and graceful shutdown" },
-      { label: "Module", value: "github.com/neutron-build/neutron-go" },
+      { label: "Module", value: "github.com/neutron-dev/neutron-go" },
     ]}
   />;
 }
