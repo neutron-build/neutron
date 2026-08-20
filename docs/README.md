@@ -20,7 +20,8 @@ and carries a banner saying so. Read the banner before believing a checklist.
 | What does an SDK have to implement? | [`FRAMEWORK_CONTRACT.md`](../FRAMEWORK_CONTRACT.md) |
 | What is the engine's completion state? | [`nucleus/DATABASE_COMPLETION.md`](../nucleus/DATABASE_COMPLETION.md) |
 | What numbers may I cite? | `_internal/GROUND_TRUTH.md` (private), machine-checked by `sh nucleus/scripts/metrics.sh --check` |
-| What is being worked on next? | `_internal/ORCHESTRATION.md` (private) |
+| What is being worked on next? | `_internal/HANDOFF.md` (private) — the entry point; `ORCHESTRATION.md` beside it is the ordered plan |
+| What is NOT hardened? | [`RESIDUAL_RISKS.md`](RESIDUAL_RISKS.md) — public, and deliberately separate from the release notes |
 | What bugs are known? | [`nucleus/AUDIT_FINDINGS.md`](../nucleus/AUDIT_FINDINGS.md), [`nucleus/docs/PROBES.md`](../nucleus/docs/PROBES.md) |
 
 Files under `_internal/` are private planning material and are not part of any
@@ -30,6 +31,20 @@ checkout of the public repo.
 
 Maintained, and safe to read as describing the project today.
 
+- [`RESIDUAL_RISKS.md`](RESIDUAL_RISKS.md) — the standing register of what is
+  **not** hardened: cross-model transactions, two index paths that read the whole
+  table, what "formally verified" does and does not mean here, and the whole
+  categories of performance nobody has measured. Twelve entries, each naming the
+  test or measurement behind it, several of them naming a *characterization*
+  test that passes today by asserting the current bad behaviour and fails the
+  moment it improves. Kept separate from release notes on purpose, so reading
+  only the good news is not possible. Written 2026-08-20.
+- [`CLAIM_RECONCILIATION.md`](CLAIM_RECONCILIATION.md) — 93 public claims traced
+  to their three evidence legs (the source that implements it, the test that
+  exercises it, the workflow that runs that test): 44 supported, 10 true only
+  with a missing constraint, 38 unsupported. Includes the ones that held,
+  because a list of only the hits is not an audit. Written 2026-08-19; re-run it
+  before any release that makes new claims.
 - [`ADOPTION_FINDINGS.md`](ADOPTION_FINDINGS.md) — the single `A-###` log of
   problems found by **building real products on Neutron**, rather than by reading
   its docs or tests. Add to it whenever building on Neutron makes you work around
