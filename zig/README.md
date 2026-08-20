@@ -2,6 +2,22 @@
 
 Nucleus embedded database client for IoT, real-time systems, and resource-constrained environments. 12KB binary, zero heap allocations, comptime SQL validation, cross-compiles to any target Zig supports.
 
+## Toolchain
+
+Zig **0.15.2** — the exact version CI pins, `build.zig.zon` requires, and the
+suite is verified on (309/309 tests, all layer combinations).
+
+```bash
+brew install zig@0.15   # keg-only: /opt/homebrew/opt/zig@0.15/bin/zig
+```
+
+Plain `brew install zig` gives 0.16, which does **not** build this SDK: 0.16
+removed `std.io`, `std.net`, `std.Thread.Mutex`, `std.time.nanoTimestamp` and
+`std.crypto.random`, all used throughout layers 1-3. Porting onto the
+allocator-backed `std.Io` model is an open design decision, not a version
+bump. On macOS 26/Xcode 26, the official ziglang.org 0.15.2 tarball also fails
+to link (arm64e-only SDK stubs); brew's `zig@0.15` bottle works.
+
 ## Philosophy
 
 Light core, nothing hidden. The Rust client is ~400KB+ — too large for most firmware. The Go client requires a garbage collector. Zig gives you stack-only queries, comptime SQL validation, and a binary size budget measured in kilobytes.

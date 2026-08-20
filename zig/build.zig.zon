@@ -2,15 +2,18 @@
     .name = .neutron_zig,
     .version = "0.1.0",
     .fingerprint = 0xc573b9d0bd7b4cab,
-    // 0.15.x. NOT 0.14 (this manifest's format, `b.addLibrary` and
-    // `.root_module` in build.zig are all 0.15+, and 0.14.1 additionally fails
-    // to link libSystem on current macOS), and NOT 0.16: that release removed
-    // `std.io`, `std.net`, `std.Thread.Mutex`, `std.time.nanoTimestamp` and
-    // `std.crypto.random`, which this source uses throughout. Building with
-    // 0.16 produces ~28 errors that look like our bugs and are not — they are
-    // Zig's pre-1.0 stdlib churn. Pinned here so the next person does not spend
-    // the afternoon rediscovering that.
-    .minimum_zig_version = "0.15.0",
+    // 0.15.2 — the one version CI, local toolchains and this manifest agree
+    // on. Verified: `zig build test` → 309/309 plus all three layer
+    // combinations (brew `zig@0.15`). NOT 0.14.x: below this floor, and its
+    // builds also fail to link libSystem on current macOS. NOT 0.16: that
+    // release removed `std.io`, `std.net`, `std.Thread.Mutex`,
+    // `std.time.nanoTimestamp`/`timestamp` and `std.crypto.random`, which the
+    // source uses throughout (~27 errors). Building on 0.16 means porting
+    // layers 1-2 onto the allocator-backed `std.Io` model — a design
+    // decision, not a version bump. macOS 26/Xcode 26 note: official
+    // ziglang.org tarballs of 0.15.2 cannot link against the arm64e-only SDK
+    // stubs; brew's `zig@0.15` bottle works.
+    .minimum_zig_version = "0.15.2",
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -55,8 +55,9 @@ pub fn structFields(comptime T: type) []const []const u8 {
             // This was a plain `var` with `return &names`, which Zig 0.14
             // accepted and 0.16 rejects as "returning address of expired local
             // variable" — correctly, since the array lived on a stack frame
-            // that was already gone. CI pins 0.14, so the whole SDK stopped
-            // compiling on current Zig without anything saying so.
+            // that was already gone. When CI was pinned to 0.14 the SDK
+            // silently stopped compiling on current Zig; the comptime block
+            // is the portable shape.
             const names = comptime blk: {
                 var acc: [s.fields.len][]const u8 = undefined;
                 for (s.fields, 0..) |field, i| {
