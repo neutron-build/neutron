@@ -120,31 +120,31 @@ pub const DocumentModel = struct {
     pub fn docInsert(self: DocumentModel, json: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try insertSql(json, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn get(self: DocumentModel, id: u64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try getSql(id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn update(self: DocumentModel, id: u64, json: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try updateSql(id, json, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn delete(self: DocumentModel, id: u64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try deleteSql(id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn docQuery(self: DocumentModel, json_query: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try querySql(json_query, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     // ── Collection-scoped execution ──────────────────────────────
@@ -152,43 +152,43 @@ pub const DocumentModel = struct {
     pub fn docInsertIn(self: DocumentModel, collection: []const u8, json: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try insertInSql(collection, json, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn getIn(self: DocumentModel, collection: []const u8, id: u64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try getInSql(collection, id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn updateIn(self: DocumentModel, collection: []const u8, id: u64, json: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try updateInSql(collection, id, json, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn deleteIn(self: DocumentModel, collection: []const u8, id: u64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try deleteInSql(collection, id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn docQueryIn(self: DocumentModel, collection: []const u8, json_query: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try queryInSql(collection, json_query, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn path(self: DocumentModel, id: u64, keys: []const []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try pathSql(id, keys, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn count(self: DocumentModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try countSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

@@ -46,37 +46,37 @@ pub const DatalogModel = struct {
     pub fn assertFact(self: DatalogModel, fact: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try assertSql(fact, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn retract(self: DatalogModel, fact: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try retractSql(fact, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn rule(self: DatalogModel, head: []const u8, body: []const u8) !?[]const u8 {
         var buf: [2048]u8 = undefined;
         const sql = try ruleSql(head, body, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn datalogQuery(self: DatalogModel, query_str: []const u8) !?[]const u8 {
         var buf: [2048]u8 = undefined;
         const sql = try querySql(query_str, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn clear(self: DatalogModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try clearSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn importGraph(self: DatalogModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try importGraphSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

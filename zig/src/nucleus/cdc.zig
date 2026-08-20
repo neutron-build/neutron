@@ -30,19 +30,19 @@ pub const CdcModel = struct {
     pub fn cdcRead(self: CdcModel, offset: i64) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try readSql(offset, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn count(self: CdcModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try countSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn tableRead(self: CdcModel, table: []const u8, offset: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try tableReadSql(table, offset, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

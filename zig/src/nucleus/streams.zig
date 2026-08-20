@@ -51,43 +51,43 @@ pub const StreamsModel = struct {
     pub fn xadd(self: StreamsModel, stream: []const u8, field: []const u8, value: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try xaddSql(stream, field, value, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn xlen(self: StreamsModel, stream: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try xlenSql(stream, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn xrange(self: StreamsModel, stream: []const u8, start_ms: i64, end_ms: i64, count: u32) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try xrangeSql(stream, start_ms, end_ms, count, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn xread(self: StreamsModel, stream: []const u8, last_id_ms: i64, count: u32) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try xreadSql(stream, last_id_ms, count, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn xgroupCreate(self: StreamsModel, stream: []const u8, group: []const u8, start_id: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try xgroupCreateSql(stream, group, start_id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn xreadgroup(self: StreamsModel, stream: []const u8, group: []const u8, consumer: []const u8, count: u32) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try xreadgroupSql(stream, group, consumer, count, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn xack(self: StreamsModel, stream: []const u8, group: []const u8, id_ms: i64, id_seq: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try xackSql(stream, group, id_ms, id_seq, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

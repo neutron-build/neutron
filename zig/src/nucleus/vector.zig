@@ -44,43 +44,43 @@ pub const VectorModel = struct {
     pub fn search(self: VectorModel, collection: []const u8, query_vec: []const u8, k: u32, metric: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try searchSql(collection, query_vec, k, metric, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn insert(self: VectorModel, collection: []const u8, id: []const u8, vector_data: []const u8, metadata: []const u8) ![]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try insertSql(collection, id, vector_data, metadata, &buf);
-        return try self.client.exec(sql);
+        return try self.client.execModel(sql);
     }
 
     pub fn delete(self: VectorModel, collection: []const u8, id: []const u8) ![]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try deleteSql(collection, id, &buf);
-        return try self.client.exec(sql);
+        return try self.client.execModel(sql);
     }
 
     pub fn distance(self: VectorModel, v1: []const u8, v2: []const u8, metric: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try distanceSql(v1, v2, metric, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn cosineDistance(self: VectorModel, v1: []const u8, v2: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try cosineDistanceSql(v1, v2, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn innerProduct(self: VectorModel, v1: []const u8, v2: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try innerProductSql(v1, v2, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn dims(self: VectorModel, v: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try dimsSql(v, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

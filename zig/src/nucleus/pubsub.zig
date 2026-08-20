@@ -30,19 +30,19 @@ pub const PubSubModel = struct {
     pub fn publish(self: PubSubModel, channel: []const u8, message: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try publishSql(channel, message, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn channels(self: PubSubModel, pattern: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try channelsSql(pattern, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn subscribers(self: PubSubModel, channel: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try subscribersSql(channel, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

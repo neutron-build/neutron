@@ -7,7 +7,7 @@ pgwire.
 ## Toolchain
 
 Zig **0.15.2** — the exact version CI pins, `build.zig.zon` requires, and the
-suite is verified on (309/309 tests, all layer combinations).
+suite is verified on (320/320 tests, all layer combinations).
 
 ```bash
 brew install zig@0.15   # keg-only: /opt/homebrew/opt/zig@0.15/bin/zig
@@ -55,9 +55,9 @@ connection pool, default capacity 25).
 zig build test
 ```
 
-309 tests across the layers (codec round-trips, RFC 7807 serialization, JWT,
-router, per-model request encoding) — verified 309/309 on 0.15.2, all layer
-combinations. CI: `.github/workflows/zig.yml`.
+320 tests across the layers (codec round-trips, RFC 7807 serialization, JWT,
+router, per-model request encoding, middleware order, signal handling) —
+verified 320/320 on 0.15.2, all layer combinations. CI: `.github/workflows/zig.yml`.
 
 ---
 
@@ -67,5 +67,5 @@ document described a different layout (`client.zig`, `comptime/`, `api/`,
 API that was never built, "zero heap allocations", cross-compilation targets
 (ARM/RISC-V/AVR/ESP32) with no cross-build evidence, an STM32 benchmark table
 with no measurement artifact, and ended with "Status: Planned — not yet
-implemented" — for a library that now ships 309 verified tests and a CI
+implemented" — for a library that now ships 320 verified tests and a CI
 workflow. Found by the S97 claims audit.*

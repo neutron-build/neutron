@@ -52,15 +52,17 @@ const EXECUTORS = [
     entry: "executors/elixir/run_live.exs",
     cmd: () => ({ command: "elixir", args: ["run_live.exs"], cwd: path.join(ROOT, "executors/elixir") }),
   },
-  // zig is deliberately NOT registered. Its executor is written and lives in
-  // executors/zig, but it cannot be built: see executors/zig/BLOCKED.md. The SDK
-  // targets Zig 0.14, Zig 0.16 redesigned the standard library around explicit
-  // Io parameters (std.Io.net, std.Io.Mutex, clocks via Io.now — std.net,
-  // std.Thread.Mutex and std.time.nanoTimestamp are gone), and Zig 0.14 cannot
-  // link against current macOS. Registering it would make this suite red for a
-  // toolchain reason rather than a conformance one, and a suite that is red for
-  // an unrelated reason is one nobody reads. Zig is UNPROVEN, and the warning
-  // below says so by name.
+  // zig is registered via run.sh, which resolves a Zig 0.15 toolchain: the SDK
+  // pins 0.15.2 (zig/build.zig.zon) and plain `zig` on PATH may be 0.16, which
+  // does not compile the SDK. See executors/zig/BLOCKED.md for the history —
+  // the executor was once unregistrable because no toolchain could both link
+  // (0.14 on current macOS) and compile the SDK (0.16 std redesign); the SDK
+  // landing on 0.15.2 removed the blocker.
+  {
+    sdk: "zig",
+    entry: "executors/zig/run.sh",
+    cmd: () => ({ command: "sh", args: [path.join(ROOT, "executors/zig/run.sh")], cwd: path.join(ROOT, "executors/zig") }),
+  },
   {
     sdk: "julia",
     entry: "executors/julia/run_live.jl",

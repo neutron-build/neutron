@@ -255,6 +255,7 @@ pub fn jwtMiddleware(comptime config: JwtConfig) fn (comptime HandlerFn) Handler
         fn wrapper(comptime next: HandlerFn) HandlerFn {
             return &struct {
                 fn handle(ctx: *RequestContext) anyerror!void {
+                    ctx.traceMiddleware("auth");
                     // Extract Authorization header
                     const auth_header = ctx.request.getHeader("authorization") orelse {
                         return respondUnauthorized(ctx, "Missing Authorization header");

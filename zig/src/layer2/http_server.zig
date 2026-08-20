@@ -22,6 +22,48 @@ pub const RequestContext = struct {
     path: []const u8,
     method: Method,
 
+    // Middleware execution trace (FRAMEWORK_CONTRACT §5 observability).
+    // Each middleware records its name on entry; the joined sequence is
+    // readable via middlewareTrace(). Fixed-size, zero allocation.
+    middleware_trace_buf: [192]u8 = undefined,
+    middleware_trace_len: usize = 0,
+
+    // W3C trace id propagated (or synthesized) by the OpenTelemetry
+    // middleware. Empty when the trace middleware did not run.
+    trace_id_buf: [32]u8 = undefined,
+    trace_id_len: usize = 0,
+
+    /// Record a middleware layer name in execution order.
+    pub fn traceMiddleware(self: *RequestContext, name: []const u8) void {
+        if (self.middleware_trace_len >= self.middleware_trace_buf.len) return;
+        if (self.middleware_trace_len > 0) {
+            self.middleware_trace_buf[self.middleware_trace_len] = ',';
+            self.middleware_trace_len += 1;
+        }
+        const n = @min(name.len, self.middleware_trace_buf.len - self.middleware_trace_len);
+        @memcpy(self.middleware_trace_buf[self.middleware_trace_len..][0..n], name[0..n]);
+        self.middleware_trace_len += n;
+    }
+
+    /// The middleware execution sequence as "name,name,..." — observation
+    /// point for pinning the FRAMEWORK_CONTRACT §5 order.
+    pub fn middlewareTrace(self: *const RequestContext) []const u8 {
+        return self.middleware_trace_buf[0..self.middleware_trace_len];
+    }
+
+    /// The W3C trace id for this request (32 lowercase hex chars), or an
+    /// empty slice if the OpenTelemetry middleware did not run.
+    pub fn traceId(self: *const RequestContext) []const u8 {
+        return self.trace_id_buf[0..self.trace_id_len];
+    }
+
+    /// Set the trace id (clamped to the fixed buffer; longer ids truncated).
+    pub fn setTraceId(self: *RequestContext, id: []const u8) void {
+        const n = @min(id.len, self.trace_id_buf.len);
+        @memcpy(self.trace_id_buf[0..n], id[0..n]);
+        self.trace_id_len = n;
+    }
+
     pub fn respondJson(self: *RequestContext, status: u16, body: []const u8) !void {
         const headers = [_]Header{
             .{ .name = "Content-Type", .value = "application/json" },
@@ -154,10 +196,21 @@ pub const HttpServer = struct {
     }
 
     /// Start serving in a loop — calls handler for each request.
-    /// Runs until the shutdown flag is set.
+    /// Runs until the shutdown flag is set. The accept is guarded by a
+    /// short poll so a shutdown request (e.g. a SIGTERM handler calling
+    /// shutdown()) is observed while idle — std's accept auto-retries on
+    /// EINTR, so the flag alone would never wake a blocked accept.
     pub fn serve(self: *HttpServer, comptime handler: fn (*RequestContext) anyerror!void) !void {
         self.running = true;
         while (self.running) {
+            var poll_fds = [_]std.posix.pollfd{.{
+                .fd = self.listener.server.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&poll_fds, 250) catch break;
+            if (ready == 0) continue;
+
             var conn = self.listener.accept() catch |err| {
                 if (!self.running) break;
                 return err;

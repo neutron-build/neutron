@@ -104,10 +104,8 @@ fn argFloat(args: []const std.json.Value, i: usize) !f64 {
 /// fragments as strings, so a document or filter argument crosses as JSON text.
 fn argJson(alloc: std.mem.Allocator, args: []const std.json.Value, i: usize) ![]const u8 {
     if (i >= args.len) return failWith("arg {d} is missing", .{i});
-    var out: std.ArrayList(u8) = .empty;
-    std.json.Stringify.value(args[i], .{}, out.writer(alloc)) catch
-        return failWith("arg {d} could not be re-encoded", .{i});
-    return out.items;
+    return std.json.Stringify.valueAlloc(alloc, args[i], .{}) catch
+        failWith("arg {d} could not be re-encoded", .{i});
 }
 
 /// The spec passes vectors as JSON arrays of numbers; the client takes the
@@ -509,18 +507,44 @@ fn call(
         return opt(try streams.xgroupCreate(try argStr(args, 0), try argStr(args, 1), 0));
     if (eq(u8, op, "streams.xreadgroup"))
         return opt(try streams.xreadgroup(try argStr(args, 0), try argStr(args, 1), try argStr(args, 2), 100));
-    if (eq(u8, op, "streams.xack"))
-        return opt(try streams.xack(try argStr(args, 0), try argStr(args, 1), try argStr(args, 2)));
+    if (eq(u8, op, "streams.xack")) {
+        // The client takes the id as (ms, seq); the spec passes "<ms>-<seq>".
+        const id = try argStr(args, 2);
+        const dash = std.mem.indexOfScalar(u8, id, '-') orelse
+            return failWith("streams.xack id is not <ms>-<seq>: {s}", .{id});
+        const ms = std.fmt.parseInt(i64, id[0..dash], 10) catch
+            return failWith("streams.xack id ms is not an integer: {s}", .{id});
+        const seq = std.fmt.parseInt(i64, id[dash + 1 ..], 10) catch
+            return failWith("streams.xack id seq is not an integer: {s}", .{id});
+        return opt(try streams.xack(try argStr(args, 0), try argStr(args, 1), ms, seq));
+    }
 
     // ── datalog ──
     var dl = client.datalog();
     if (eq(u8, op, "datalog.assertFact")) return opt(try dl.assertFact(try argStr(args, 0)));
     if (eq(u8, op, "datalog.query")) return opt(try dl.datalogQuery(try argStr(args, 0)));
-    if (eq(u8, op, "datalog.clear")) return opt(try dl.clear(try argStr(args, 0)));
+    if (eq(u8, op, "datalog.clear")) {
+        // The Zig client's clear() is global — it takes no predicate. The
+        // spec's predicate argument is consumed but unused; if the engine
+        // scopes clear per-predicate, this executor will disagree with the
+        // other SDKs and the drift matrix will say so.
+        _ = try argStr(args, 0);
+        return opt(try dl.clear());
+    }
 
     // ── cdc ──
     var cdc = client.cdc();
-    if (eq(u8, op, "cdc.read")) return opt(try cdc.cdcRead(try argInt(args, 0), try argInt(args, 1)));
+    if (eq(u8, op, "cdc.read")) {
+        // The Zig client takes only the offset — no limit. The spec's limit
+        // argument is consumed but unused; drift against other SDKs will
+        // surface if the engine respects the limit.
+        const after = try argInt(args, 0);
+        if (args.len > 1) {
+            const lim = try argInt(args, 1);
+            if (lim <= 0) return failWith("cdc.read limit must be positive", .{});
+        }
+        return opt(try cdc.cdcRead(after));
+    }
     if (eq(u8, op, "cdc.count")) return opt(try cdc.count());
 
     // ── blob ──
@@ -612,9 +636,8 @@ fn interpolate(
                     .bool => |b| try out.appendSlice(alloc, if (b) "true" else "false"),
                     .null => try out.appendSlice(alloc, "NULL"),
                     else => {
-                        var enc: std.ArrayList(u8) = .empty;
-                        try std.json.Stringify.value(params[idx - 1], .{}, enc.writer(alloc));
-                        try out.print(alloc, "'{s}'", .{enc.items});
+                        const enc = try std.json.Stringify.valueAlloc(alloc, params[idx - 1], .{});
+                        try out.print(alloc, "'{s}'", .{enc});
                     },
                 }
                 i = e;
@@ -629,19 +652,21 @@ fn interpolate(
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-pub fn main(init: std.process.Init) !void {
-    // Zig 0.16 hands the process its environment and an Io implementation
-    // through `Init` rather than exposing globals: `std.os.environ`,
-    // `std.posix.getenv` and `std.fs.cwd()` are all gone. Taking `Init` is the
-    // supported way to get both, and it is why this file targets 0.16 rather
-    // than the 0.14 the SDK's own CI pins — 0.14 cannot link against this
-    // machine's macOS SDK at all (undefined __availability_version_check).
-    const alloc = init.arena.allocator();
-    const io = init.io;
+pub fn main() !void {
+    // Targets Zig 0.15.2 — the version the SDK itself pins (see zig/README.md
+    // and zig/build.zig.zon). Earlier history: this executor was first
+    // written against the 0.16 std.process.Init proposal, then BLOCKED.md
+    // recorded that neither 0.14 (could not link on this macOS) nor 0.16
+    // (SDK did not compile) could run it. The SDK has since landed on
+    // 0.15.2, so the executor now uses the 0.15 APIs: std.fs.cwd(),
+    // std.posix.getenv, plain main().
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     gpa_alloc = alloc;
     fail_detail = .empty;
 
-    const url = init.environ_map.get("NEUTRON_TEST_DATABASE_URL") orelse "";
+    const url = std.posix.getenv("NEUTRON_TEST_DATABASE_URL") orelse "";
     reconnect_url = url;
     if (url.len == 0) {
         std.debug.print(
@@ -654,14 +679,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const spec_path = "../../spec.json";
-    const spec_bytes = std.Io.Dir.cwd().readFileAlloc(io, spec_path, alloc, .limited(8 << 20)) catch |e| {
+    const spec_bytes = std.fs.cwd().readFileAlloc(alloc, spec_path, 8 << 20) catch |e| {
         std.debug.print("::error::cannot read {s}: {s}\n", .{ spec_path, @errorName(e) });
         std.process.exit(1);
     };
     const spec = try std.json.parseFromSlice(std.json.Value, alloc, spec_bytes, .{});
 
     var unsupported = std.StringHashMap([]const u8).init(alloc);
-    if (std.Io.Dir.cwd().readFileAlloc(io, "unsupported.json", alloc, .limited(1 << 20))) |ub| {
+    if (std.fs.cwd().readFileAlloc(alloc, "unsupported.json", 1 << 20)) |ub| {
         const u = try std.json.parseFromSlice(std.json.Value, alloc, ub, .{});
         if (u.value.object.get("cases")) |c| {
             var it = c.object.iterator();
@@ -727,8 +752,9 @@ pub fn main(init: std.process.Init) !void {
         if (ci > 0) try w.writeAll(",\n");
         try w.print("    {{\"id\": \"{s}\", \"model\": \"{s}\", \"status\": \"{s}\"", .{ id, model, status.str() });
         if (detail.len > 0) {
+            const esc = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = detail }, .{});
             try w.writeAll(", \"detail\": ");
-            try std.json.Stringify.value(std.json.Value{ .string = detail }, .{}, w);
+            try w.writeAll(esc);
         }
         try w.writeAll("}");
     }

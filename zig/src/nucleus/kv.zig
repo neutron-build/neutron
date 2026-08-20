@@ -184,85 +184,85 @@ pub const KVModel = struct {
     pub fn get(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try getSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn set(self: KVModel, key: []const u8, value: []const u8, ttl_seconds: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try setSql(key, value, ttl_seconds, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn setnx(self: KVModel, key: []const u8, value: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try setnxSql(key, value, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn del(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try delSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn exists(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try existsSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn incr(self: KVModel, key: []const u8, amount: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try incrSql(key, amount, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn ttl(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try ttlSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn expire(self: KVModel, key: []const u8, ttl_seconds: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try expireSql(key, ttl_seconds, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn dbsize(self: KVModel) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try dbsizeSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn flushdb(self: KVModel) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try flushdbSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn lpush(self: KVModel, key: []const u8, value: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try lpushSql(key, value, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn rpush(self: KVModel, key: []const u8, value: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try rpushSql(key, value, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn lpop(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try lpopSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn rpop(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try rpopSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     /// Returns a JSON array of strings, e.g. ["a","b"].
@@ -270,25 +270,25 @@ pub const KVModel = struct {
     pub fn lrange(self: KVModel, key: []const u8, start: i64, stop: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try lrangeSql(key, start, stop, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn llen(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try llenSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn lindex(self: KVModel, key: []const u8, index: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try lindexSql(key, index, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn hset(self: KVModel, key: []const u8, field: []const u8, value: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try hsetSql(key, field, value, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     // Runtime wrappers for builders that had none. Every *Sql generator below
@@ -298,74 +298,74 @@ pub const KVModel = struct {
     pub fn hdel(self: KVModel, key: []const u8, field: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try hdelSql(key, field, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn hexists(self: KVModel, key: []const u8, field: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try hexistsSql(key, field, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn hlen(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try hlenSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn hgetall(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try hgetallSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn sadd(self: KVModel, key: []const u8, member: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try saddSql(key, member, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn srem(self: KVModel, key: []const u8, member: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try sremSql(key, member, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn smembers(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try smembersSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn zadd(self: KVModel, key: []const u8, score: f64, member: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try zaddSql(key, score, member, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     /// Signed indices: -1 is the last element, as in Redis.
     pub fn zrange(self: KVModel, key: []const u8, start: i64, stop: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try zrangeSql(key, start, stop, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn hget(self: KVModel, key: []const u8, field: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try hgetSql(key, field, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn pfadd(self: KVModel, key: []const u8, element: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try pfaddSql(key, element, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn pfcount(self: KVModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try pfcountSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

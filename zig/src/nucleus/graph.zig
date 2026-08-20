@@ -53,55 +53,55 @@ pub const GraphModel = struct {
     pub fn addNode(self: GraphModel, label: []const u8, props_json: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try addNodeSql(label, props_json, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn addEdge(self: GraphModel, from_id: []const u8, to_id: []const u8, edge_type: []const u8, props_json: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try addEdgeSql(from_id, to_id, edge_type, props_json, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn deleteNode(self: GraphModel, id: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try deleteNodeSql(id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn deleteEdge(self: GraphModel, id: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try deleteEdgeSql(id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn graphQuery(self: GraphModel, cypher: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try graphQuerySql(cypher, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn neighbors(self: GraphModel, id: []const u8, direction: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try neighborsSql(id, direction, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn shortestPath(self: GraphModel, from_id: []const u8, to_id: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try shortestPathSql(from_id, to_id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn nodeCount(self: GraphModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try nodeCountSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn edgeCount(self: GraphModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try edgeCountSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

@@ -20,13 +20,49 @@ const PgPool = pool_mod.ConnectionPool(PgClient, MAX_POOL_SIZE);
 
 pub const Features = struct {
     is_nucleus: bool = false,
+    /// Full server version string as returned by SELECT VERSION().
     version: [64]u8 = undefined,
     version_len: usize = 0,
+    /// Nucleus version ("X.Y.Z") extracted from the VERSION() string —
+    /// the segment following "Nucleus" up to the next space.
+    nucleus_version: [32]u8 = undefined,
+    nucleus_version_len: usize = 0,
 
     pub fn versionStr(self: *const Features) []const u8 {
         return self.version[0..self.version_len];
     }
+
+    pub fn nucleusVersionStr(self: *const Features) []const u8 {
+        return self.nucleus_version[0..self.nucleus_version_len];
+    }
 };
+
+/// Detect Nucleus vs plain PostgreSQL from a SELECT VERSION() result —
+/// FRAMEWORK_CONTRACT.md §1. Nucleus identifies itself in the version
+/// string ("PostgreSQL 16.0 (Nucleus 0.4.2 — ...)"); plain PostgreSQL
+/// does not contain "Nucleus". Zero-allocation.
+pub fn detectFeatures(version_str: []const u8, out: *Features) void {
+    out.is_nucleus = false;
+    out.version_len = 0;
+    out.nucleus_version_len = 0;
+
+    const vlen = @min(version_str.len, out.version.len);
+    @memcpy(out.version[0..vlen], version_str[0..vlen]);
+    out.version_len = vlen;
+
+    const marker = std.mem.indexOf(u8, version_str, "Nucleus") orelse return;
+    out.is_nucleus = true;
+
+    // Extract the version token after "Nucleus": skip spaces, then take
+    // chars until a space (covers "Nucleus 0.4.2 —" and "Nucleus 0.4.2)").
+    var i = marker + "Nucleus".len;
+    while (i < version_str.len and version_str[i] == ' ') i += 1;
+    const start = i;
+    while (i < version_str.len and version_str[i] != ' ' and version_str[i] != ')') i += 1;
+    const nlen = @min(i - start, out.nucleus_version.len);
+    @memcpy(out.nucleus_version[0..nlen], version_str[start .. start + nlen]);
+    out.nucleus_version_len = nlen;
+}
 
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
@@ -147,12 +183,14 @@ pub const NucleusClient = struct {
                 .database = self.config.database,
             });
 
-            // Detect Nucleus features from the first connection
-            if (i == 0 and client.is_nucleus) {
-                self.features.is_nucleus = true;
-                const ver_len = @min(client.server_version_len, self.features.version.len);
-                @memcpy(self.features.version[0..ver_len], client.server_version[0..ver_len]);
-                self.features.version_len = ver_len;
+            // Detect Nucleus features on the first connection from
+            // SELECT VERSION() — FRAMEWORK_CONTRACT.md §1. The contract
+            // defines the VERSION() string as the detection signal; the
+            // startup ParameterStatus is only a hint (PgClient.is_nucleus).
+            if (i == 0) {
+                const vr = try client.query("SELECT VERSION()");
+                const version_str = vr.scalar() orelse "";
+                detectFeatures(version_str, &self.features);
             }
 
             // Place connection directly into the pool slot
@@ -283,6 +321,27 @@ pub const NucleusClient = struct {
         return self.features.is_nucleus;
     }
 
+    /// Guard for Nucleus-specific model APIs (KV, Vector, …) —
+    /// FRAMEWORK_CONTRACT.md §1: they must return a clear error when
+    /// called against plain PostgreSQL.
+    pub fn requireNucleus(self: *const NucleusClient) !void {
+        if (!self.connected) return error.NotConnected;
+        if (!self.features.is_nucleus) return error.NotNucleusServer;
+    }
+
+    /// Guarded execution path for Nucleus-specific models: refuses with
+    /// error.NotNucleusServer unless the connected server is Nucleus.
+    pub fn executeModel(self: *NucleusClient, sql_str: []const u8) !?[]const u8 {
+        try self.requireNucleus();
+        return self.execute(sql_str);
+    }
+
+    /// Guarded exec path for Nucleus-specific models (statements).
+    pub fn execModel(self: *NucleusClient, sql_str: []const u8) ![]const u8 {
+        try self.requireNucleus();
+        return self.exec(sql_str);
+    }
+
     /// Close all connections in the pool and release resources.
     pub fn close(self: *NucleusClient) void {
         self.closePoolConnections(self.active_pool_size);
@@ -382,6 +441,39 @@ pub const NucleusClient = struct {
 };
 
 // ── Tests ─────────────────────────────────────────────────────
+
+// FRAMEWORK_CONTRACT.md §1: detect Nucleus vs plain PostgreSQL from the
+// SELECT VERSION() string; Nucleus returns
+// "PostgreSQL 16.0 (Nucleus X.Y.Z — The Definitive Database)".
+test "detectFeatures: Nucleus VERSION() string (FRAMEWORK_CONTRACT §1)" {
+    var f = Features{};
+    detectFeatures("PostgreSQL 16.0 (Nucleus 0.4.2 — The Definitive Database)", &f);
+    try std.testing.expect(f.is_nucleus);
+    try std.testing.expectEqualStrings("0.4.2", f.nucleusVersionStr());
+    try std.testing.expectEqualStrings(
+        "PostgreSQL 16.0 (Nucleus 0.4.2 — The Definitive Database)",
+        f.versionStr(),
+    );
+}
+
+test "detectFeatures: plain PostgreSQL VERSION() string" {
+    var f = Features{};
+    detectFeatures("PostgreSQL 16.9 (Homebrew, x86_64-apple-darwin23.6.0, 16.9)", &f);
+    try std.testing.expect(!f.is_nucleus);
+    try std.testing.expectEqual(@as(usize, 0), f.nucleus_version_len);
+}
+
+// §1: "All Nucleus-specific APIs (KV, Vector, etc.) should return clear
+// errors if called against plain PostgreSQL."
+test "Nucleus model calls against plain PostgreSQL return clear error (§1)" {
+    var client = NucleusClient.init(std.testing.allocator, .{});
+    // Simulate a live connection to a plain PostgreSQL server.
+    client.connected = true;
+    client.features.is_nucleus = false;
+    try std.testing.expectError(error.NotNucleusServer, client.kv().get("some-key"));
+    try std.testing.expectError(error.NotNucleusServer, client.vector().insert("c", "1", "[1.0]", "{}"));
+    try std.testing.expectError(error.NotNucleusServer, client.document().count());
+}
 
 test "parseUrl: full url" {
     const cfg = try parseUrl("postgres://admin:secret@db.example.com:5433/mydb");

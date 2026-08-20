@@ -6,10 +6,12 @@
 
 const std = @import("std");
 
-/// Individual field validation error.
+/// Individual field validation error. `value` (the offending input) is
+/// optional per FRAMEWORK_CONTRACT.md §2 and is omitted when null.
 pub const FieldError = struct {
     field: []const u8,
     message: []const u8,
+    value: ?[]const u8 = null,
 };
 
 pub const AppError = struct {
@@ -49,6 +51,10 @@ pub const AppError = struct {
                 writer.writeAll(fe.field) catch return error.BufferTooShort;
                 writer.writeAll("\",\"message\":\"") catch return error.BufferTooShort;
                 writer.writeAll(fe.message) catch return error.BufferTooShort;
+                if (fe.value) |val| {
+                    writer.writeAll("\",\"value\":\"") catch return error.BufferTooShort;
+                    writer.writeAll(val) catch return error.BufferTooShort;
+                }
                 writer.writeAll("\"}") catch return error.BufferTooShort;
             }
             writer.writeAll("]") catch return error.BufferTooShort;
@@ -129,6 +135,22 @@ test "RFC 7807: validation with errors array" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"email\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"name\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "must be a valid email address") != null);
+}
+
+// FRAMEWORK_CONTRACT.md §2: validation errors[] entries are
+// { "field", "message" [, "value"] } — `value` is optional and carries the
+// offending input so the client can echo it back.
+test "RFC 7807: validation error entries include optional value (FRAMEWORK_CONTRACT §2)" {
+    var buf: [1024]u8 = undefined;
+    const field_errors = [_]FieldError{
+        .{ .field = "email", .message = "must be a valid email address", .value = "not-an-email" },
+        .{ .field = "name", .message = "is required" },
+    };
+    const err = validationWithErrors("Request body failed validation", &field_errors);
+    const json = try err.toJson(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"email\",\"message\":\"must be a valid email address\",\"value\":\"not-an-email\"") != null);
+    // Entry without a value must omit the member, not emit null.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"name\",\"message\":\"is required\"}") != null);
 }
 
 test "all error constructors" {

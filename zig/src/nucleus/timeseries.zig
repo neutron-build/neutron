@@ -49,49 +49,49 @@ pub const TimeSeriesModel = struct {
     pub fn tsInsert(self: TimeSeriesModel, series: []const u8, timestamp_ms: i64, value: f64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try insertSql(series, timestamp_ms, value, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn last(self: TimeSeriesModel, series: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try lastSql(series, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn count(self: TimeSeriesModel, series: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try countSql(series, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn rangeCount(self: TimeSeriesModel, series: []const u8, start_ms: i64, end_ms: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try rangeCountSql(series, start_ms, end_ms, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn rangeAvg(self: TimeSeriesModel, series: []const u8, start_ms: i64, end_ms: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try rangeAvgSql(series, start_ms, end_ms, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn retention(self: TimeSeriesModel, series: []const u8, days: u32) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try retentionSql(series, days, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn match(self: TimeSeriesModel, series: []const u8, pattern: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try matchSql(series, pattern, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn timeBucket(self: TimeSeriesModel, interval: []const u8, timestamp_ms: i64) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try timeBucketSql(interval, timestamp_ms, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

@@ -62,7 +62,7 @@ pub fn generateSpec(
     }
 
     // Close paths, add components
-    pos += copy(buf[pos..], "},\"components\":{\"schemas\":{\"ProblemDetail\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"status\":{\"type\":\"integer\"},\"detail\":{\"type\":\"string\"},\"instance\":{\"type\":\"string\"},\"errors\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"field\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}}}}},\"required\":[\"type\",\"title\",\"status\",\"detail\"]}}}}");
+    pos += copy(buf[pos..], "},\"components\":{\"schemas\":{\"ProblemDetail\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"status\":{\"type\":\"integer\"},\"detail\":{\"type\":\"string\"},\"instance\":{\"type\":\"string\"},\"errors\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"field\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}}}}},\"required\":[\"type\",\"title\",\"status\",\"detail\"]}}}}");
 
     return buf[0..pos];
 }

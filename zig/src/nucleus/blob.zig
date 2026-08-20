@@ -48,49 +48,49 @@ pub const BlobModel = struct {
     pub fn store(self: BlobModel, key: []const u8, data_hex: []const u8, content_type: []const u8) !?[]const u8 {
         var buf: [8192]u8 = undefined;
         const sql = try storeSql(key, data_hex, content_type, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn get(self: BlobModel, key: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try getSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn delete(self: BlobModel, key: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try deleteSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn meta(self: BlobModel, key: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try metaSql(key, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn tag(self: BlobModel, key: []const u8, tag_key: []const u8, tag_value: []const u8) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try tagSql(key, tag_key, tag_value, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn list(self: BlobModel, prefix: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try listSql(prefix, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn count(self: BlobModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try countSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn dedupRatio(self: BlobModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try dedupRatioSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

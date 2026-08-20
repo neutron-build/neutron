@@ -47,43 +47,43 @@ pub const GeoModel = struct {
     pub fn geoDistance(self: GeoModel, lat1: f64, lon1: f64, lat2: f64, lon2: f64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try distanceSql(lat1, lon1, lat2, lon2, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn geoDistanceEuclidean(self: GeoModel, x1: f64, y1: f64, x2: f64, y2: f64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try distanceEuclideanSql(x1, y1, x2, y2, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn geoWithin(self: GeoModel, lat1: f64, lon1: f64, lat2: f64, lon2: f64, radius: f64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try withinSql(lat1, lon1, lat2, lon2, radius, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn area(self: GeoModel, coords: []const u8) !?[]const u8 {
         var buf: [1024]u8 = undefined;
         const sql = try areaSql(coords, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn makePoint(self: GeoModel, lon: f64, lat: f64) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try makePointSql(lon, lat, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn stX(self: GeoModel, point_expr: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try stXSql(point_expr, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn stY(self: GeoModel, point_expr: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try stYSql(point_expr, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

@@ -181,6 +181,7 @@ pub fn compression(comptime config: CompressConfig) fn (comptime HandlerFn) Hand
         fn wrapper(comptime next: HandlerFn) HandlerFn {
             return &struct {
                 fn handle(ctx: *RequestContext) anyerror!void {
+                    ctx.traceMiddleware("compression");
                     // Check if client accepts gzip
                     const accept_enc = ctx.request.getHeader("accept-encoding") orelse {
                         return next(ctx);

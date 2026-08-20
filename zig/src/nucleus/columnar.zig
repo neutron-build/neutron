@@ -46,37 +46,37 @@ pub const ColumnarModel = struct {
     pub fn colInsert(self: ColumnarModel, table: []const u8, values_json: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try insertSql(table, values_json, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn count(self: ColumnarModel, table: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try countSql(table, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn sum(self: ColumnarModel, table: []const u8, column: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try sumSql(table, column, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn avg(self: ColumnarModel, table: []const u8, column: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try avgSql(table, column, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn min(self: ColumnarModel, table: []const u8, column: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try minSql(table, column, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn max(self: ColumnarModel, table: []const u8, column: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try maxSql(table, column, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

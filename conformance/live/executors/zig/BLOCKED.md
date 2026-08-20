@@ -1,51 +1,55 @@
-# The Zig executor is written but cannot be built
+# The Zig executor is built and registered
 
 `src/main.zig` implements the full spec vocabulary against the in-repo Zig
-client. It is not registered in `runner/run.mjs` because it does not compile,
-and the reason is a toolchain migration rather than anything about conformance.
+client. It is registered in `runner/run.mjs` via `run.sh`, which resolves a
+Zig 0.15 toolchain. This file records why it was once unregistrable, because
+the toolchain constraint is the kind of thing that comes back.
 
-## What blocks it
+## History: the blocker (2026-08-16 — 2026-08-19)
 
-The Zig SDK targets **Zig 0.14** — that is what `.github/workflows/zig.yml`
-pins. **Zig 0.16 redesigned the standard library** around an explicit `Io`
-parameter:
+The executor was first written while the SDK targeted Zig 0.14 and Zig 0.16
+was redesigning the standard library around an explicit `Io` parameter
+(`std.net` → `std.Io.net`, `std.io` → `std.Io`, `std.crypto.random` moved,
+`std.os.environ`/`std.posix.getenv` → `std.process.Init.environ_map`):
 
-| 0.14 | 0.16 |
+- Zig 0.14 could not link on this machine at all (`undefined symbol:
+  __availability_version_check` against the macOS 26 / Xcode 26 SDK).
+- Zig 0.16 could not compile the SDK (layers 1–3 used 0.14 spellings
+  throughout).
+- The executor itself had been written against the 0.16 `std.process.Init`
+  proposal, so it built on neither.
+
+So no toolchain could run it, and it was deliberately not registered.
+
+## What unblocked it
+
+The SDK landed on **Zig 0.15.2** (brew keg-only `zig@0.15` — see
+`zig/README.md` and `zig/build.zig.zon`): 0.14-era APIs still present
+(`std.net`, `std.time.nanoTimestamp`), but builds and links on current macOS.
+On 2026-08-19 the executor was ported from the 0.16 proposal APIs to 0.15:
+
+| 0.16 proposal (old) | 0.15 (now) |
 |---|---|
-| `std.net` | `std.Io.net` |
-| `std.Thread.Mutex` | `std.Io.Mutex` |
-| `std.time.nanoTimestamp` | `Io.now(Clock)` |
-| `std.io` | `std.Io` |
-| `std.fs.cwd()` | `std.Io.Dir.cwd()`, needs an `Io` |
-| `std.os.environ`, `std.posix.getenv` | `std.process.Init.environ_map` |
-| `std.crypto.random` | moved |
+| `pub fn main(init: std.process.Init)` | `pub fn main()` + arena |
+| `init.environ_map.get(...)` | `std.posix.getenv(...)` |
+| `std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(n))` | `std.fs.cwd().readFileAlloc(alloc, path, n)` |
+| `std.json.Stringify.value(v, opts, arrayListWriter)` | `std.json.Stringify.valueAlloc(alloc, v, opts)` |
 
-`zig/src/layer1` (TCP, pool, timer) and `layer3` (cache, middleware, jwt) use the
-0.14 spellings throughout, and the Nucleus client reaches them through
-`layer2/pg_client`. So the executor cannot link on 0.16.
+Three client-surface drifts were also reconciled (the executor predated
+them): `streams.xack` now takes `(stream, group, id_ms, id_seq)` and the
+executor splits the spec's `"<ms>-<seq>"` id; `datalog.clear()` is global in
+the Zig client (no predicate argument — see the comment in `main.zig`;
+cross-SDK drift on scoped clears will surface in the matrix); `cdc.cdcRead`
+takes only the offset (no limit — same drift-matrix story).
 
-**And Zig 0.14 cannot build on this machine at all**: linking fails with
-`undefined symbol: __availability_version_check` against the current macOS SDK.
+## Running
 
-So there is no toolchain on which the executor can currently be run: 0.14 cannot
-link, 0.16 cannot compile the SDK.
+```sh
+NEUTRON_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/postgres \
+    sh run.sh
+```
 
-## What was fixed along the way
-
-`zig/src/nucleus/sql.zig` had a real bug that 0.14 merely failed to catch —
-`structFields` returned `&names` where `names` was a stack local, which 0.16
-correctly rejects as "returning address of expired local variable". Fixed; the
-library now builds on 0.16 even though the layers below it do not.
-
-Nine KV runtime wrappers were also added (`hdel`, `hexists`, `hlen`, `hgetall`,
-`sadd`, `srem`, `smembers`, `zadd`, `zrange`). Every one already had its `*Sql`
-builder; only the runtime wrapper was missing, so hashes, sets and sorted sets
-were unreachable without hand-writing the call.
-
-## What finishing it needs
-
-Porting `zig/src` layers 0–3 from 0.14 to 0.16, which means threading an `Io`
-value through every function that opens a socket, takes a lock or reads a clock.
-That is an architectural change to the SDK, not a set of renames, and it should
-be its own piece of work with `zig build test` green on 0.16 and the CI matrix
-moved off 0.14 in the same change.
+Exit codes: 0 all cases behaved as the spec says, 1 otherwise. Refuses to
+run (exit 1, no report) when `NEUTRON_TEST_DATABASE_URL` is unset. Without a
+live engine the executor cannot be scored locally; `runner/run.mjs` in CI is
+where the zig column is produced.

@@ -51,7 +51,7 @@ pub fn App(comptime Routes: type, comptime middlewareFn: ?fn (comptime router_mo
             // Run OnStart hooks
             self.lifecycle.runStartHooks();
 
-            // Install signal handlers for graceful shutdown
+            // Install signal handlers for graceful shutdown (§8)
             installSignalHandlers(self);
 
             // Log startup
@@ -74,15 +74,44 @@ pub fn App(comptime Routes: type, comptime middlewareFn: ?fn (comptime router_mo
             self.server = null;
         }
 
-        fn installSignalHandlers(self: *Self) void {
-            // Store a reference to the lifecycle for the signal handler.
-            // In a real implementation, this would use a global atomic or
-            // thread-local storage. For now, we mark shutdown_requested.
-            _ = self;
-            // Signal handling is platform-specific and requires careful
-            // implementation. For the initial version, shutdown is triggered
-            // by calling lifecycle.requestShutdown() externally or by
-            // server.shutdown().
+        /// The app instance the signal handler acts on. One per App type —
+        /// the SDK serves one app per process.
+        var active_instance: ?*Self = null;
+
+        /// FRAMEWORK_CONTRACT §8: catch SIGTERM/SIGINT. Async-signal-safe:
+        /// only plain writes — the serve loop observes the flags within its
+        /// poll interval and drains.
+        fn handleSignal(_: c_int) callconv(.c) void {
+            if (active_instance) |app| {
+                app.lifecycle.requestShutdown();
+                if (app.server) |*srv| srv.shutdown();
+            }
+        }
+
+        /// Install SIGTERM/SIGINT handlers that request graceful shutdown:
+        /// stop accepting new connections, finish in-flight requests, run
+        /// OnStop hooks in reverse, close the listener.
+        pub fn installSignalHandlers(self: *Self) void {
+            active_instance = self;
+            const act = std.posix.Sigaction{
+                .handler = .{ .handler = &handleSignal },
+                .mask = std.mem.zeroes(std.posix.sigset_t),
+                .flags = 0,
+            };
+            std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+            std.posix.sigaction(std.posix.SIG.INT, &act, null);
+        }
+
+        /// Restore default SIGTERM/SIGINT dispositions (used by tests).
+        pub fn restoreDefaultSignalHandlers() void {
+            const act = std.posix.Sigaction{
+                .handler = .{ .handler = std.posix.SIG.DFL },
+                .mask = std.mem.zeroes(std.posix.sigset_t),
+                .flags = 0,
+            };
+            std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+            std.posix.sigaction(std.posix.SIG.INT, &act, null);
+            active_instance = null;
         }
 
         /// Get the dispatch function (with middleware applied if configured).
@@ -115,12 +144,35 @@ pub fn App(comptime Routes: type, comptime middlewareFn: ?fn (comptime router_mo
     };
 }
 
-/// Health check response JSON.
-pub fn healthJson(is_nucleus: bool, version: []const u8, buf: []u8) ![]const u8 {
+/// Health of the nucleus dependency — FRAMEWORK_CONTRACT.md §7.
+/// `nucleus` in the /health payload is this tri-state, serialized as a
+/// string. It is NOT a boolean: "unconfigured" (no DB configured) is a
+/// different state from "disconnected" (configured but unreachable).
+pub const NucleusHealth = enum {
+    connected,
+    disconnected,
+    unconfigured,
+
+    pub fn toString(self: NucleusHealth) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Health check response JSON — FRAMEWORK_CONTRACT.md §7 line 432:
+/// GET /health → { "status": "ok", "nucleus": "connected"|"disconnected"|
+/// "unconfigured", "version": "X.Y.Z" }
+/// `status` is "degraded" when nucleus is configured but unreachable.
+pub fn healthJson(health: NucleusHealth, version: []const u8, buf: []u8) ![]const u8 {
+    const status: []const u8 = switch (health) {
+        .connected => "ok",
+        .disconnected => "degraded",
+        .unconfigured => "ok",
+    };
     return std.fmt.bufPrint(buf,
-        \\{{"status":"ok","nucleus":{s},"version":"{s}"}}
+        \\{{"status":"{s}","nucleus":"{s}","version":"{s}"}}
     , .{
-        if (is_nucleus) "true" else "false",
+        status,
+        health.toString(),
         version,
     }) catch return error.BufferTooShort;
 }
@@ -169,18 +221,79 @@ test "App: lifecycle hooks" {
     app.lifecycle.runStopHooks();
 }
 
+// FRAMEWORK_CONTRACT §8: the framework MUST catch SIGTERM/SIGINT and begin
+// graceful shutdown (stop accepting, drain, OnStop hooks in reverse, close).
+test "SIGTERM/SIGINT request graceful shutdown (FRAMEWORK_CONTRACT §8)" {
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/", .handler = &dummyHandler },
+    };
+    const R = router_mod.Router(&routes);
+    const MyApp = App(R, null);
+    var app = MyApp.init(std.testing.allocator, .{});
+
+    const server = try HttpServer.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
+    app.server = server;
+    app.server.?.running = true;
+    app.installSignalHandlers();
+    defer MyApp.restoreDefaultSignalHandlers();
+    defer if (app.server) |*s| s.deinit();
+
+    try std.testing.expect(!app.lifecycle.isShutdownRequested());
+    try std.posix.raise(std.posix.SIG.TERM);
+    try std.testing.expect(app.lifecycle.isShutdownRequested());
+    try std.testing.expect(!app.server.?.running);
+
+    // SIGINT takes the same path.
+    app.lifecycle.requestShutdown();
+    app.lifecycle.shutdown_requested = false;
+    app.server.?.running = true;
+    try std.posix.raise(std.posix.SIG.INT);
+    try std.testing.expect(app.lifecycle.isShutdownRequested());
+    try std.testing.expect(!app.server.?.running);
+}
+
+// FRAMEWORK_CONTRACT.md §7 (line 432): GET /health returns
+// { "status": "ok", "nucleus": "connected"|"disconnected"|"unconfigured",
+//   "version": "X.Y.Z" } — `nucleus` is a tri-state STRING, and
+// `status` becomes "degraded" when the dependency is configured but
+// unreachable.
+test "healthJson: contract tri-state nucleus field (FRAMEWORK_CONTRACT §7)" {
+    var buf: [128]u8 = undefined;
+
+    const conn = try healthJson(.connected, "0.1.0", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, conn, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conn, "\"nucleus\":\"connected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conn, "\"version\":\"0.1.0\"") != null);
+
+    var dis_buf: [128]u8 = undefined;
+    const dis = try healthJson(.disconnected, "0.1.0", &dis_buf);
+    try std.testing.expect(std.mem.indexOf(u8, dis, "\"status\":\"degraded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dis, "\"nucleus\":\"disconnected\"") != null);
+
+    var unc_buf: [128]u8 = undefined;
+    const unc = try healthJson(.unconfigured, "0.1.0", &unc_buf);
+    try std.testing.expect(std.mem.indexOf(u8, unc, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unc, "\"nucleus\":\"unconfigured\"") != null);
+    // A boolean would serialize as bare true/false — assert it is a string.
+    try std.testing.expect(std.mem.indexOf(u8, unc, "\"nucleus\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unc, "\"nucleus\":false") == null);
+}
+
 test "healthJson" {
     var buf: [128]u8 = undefined;
-    const json = try healthJson(true, "0.1.0", &buf);
+    const json = try healthJson(.connected, "0.1.0", &buf);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"ok\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"nucleus\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nucleus\":\"connected\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"version\":\"0.1.0\"") != null);
 }
 
-test "healthJson: plain postgres" {
+test "healthJson: plain postgres is still connected-health" {
+    // Feature detection (§1: is the server Nucleus vs plain PG) is separate
+    // from dependency health (§7). A plain PostgreSQL server that answers is
+    // a *connected* dependency.
     var buf: [128]u8 = undefined;
-    const json = try healthJson(false, "16.0", &buf);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"nucleus\":false") != null);
+    const json = try healthJson(.connected, "16.0", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nucleus\":\"connected\"") != null);
 }
 
 fn dummyHandler(_: *http_server_mod.RequestContext) anyerror!void {}

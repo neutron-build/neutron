@@ -40,37 +40,37 @@ pub const FTSModel = struct {
     pub fn ftsIndex(self: FTSModel, doc_id: []const u8, text: []const u8) !?[]const u8 {
         var buf: [4096]u8 = undefined;
         const sql = try indexSql(doc_id, text, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn search(self: FTSModel, query_str: []const u8, limit: u32) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try searchSql(query_str, limit, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn fuzzySearch(self: FTSModel, query_str: []const u8, max_distance: u32, limit: u32) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try fuzzySearchSql(query_str, max_distance, limit, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn remove(self: FTSModel, doc_id: []const u8) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try removeSql(doc_id, &buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn docCount(self: FTSModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try docCountSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 
     pub fn termCount(self: FTSModel) !?[]const u8 {
         var buf: [256]u8 = undefined;
         const sql = try termCountSql(&buf);
-        return try self.client.execute(sql);
+        return try self.client.executeModel(sql);
     }
 };
 

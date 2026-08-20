@@ -20,6 +20,16 @@ pub const LogLevel = enum {
     }
 };
 
+pub const LogFormat = enum {
+    json,
+    text,
+
+    pub fn fromString(s: []const u8) LogFormat {
+        if (std.mem.eql(u8, s, "text")) return .text;
+        return .json;
+    }
+};
+
 pub const Config = struct {
     host: []const u8 = "0.0.0.0",
     port: u16 = 8080,
@@ -32,6 +42,7 @@ pub const Config = struct {
     db_pool_size: u16 = 25,
 
     log_level: LogLevel = .info,
+    log_format: LogFormat = .json,
 
     /// Load configuration from environment variables with given prefix.
     /// e.g., prefix = "NEUTRON" reads NEUTRON_HOST, NEUTRON_PORT, etc.
@@ -45,6 +56,7 @@ pub const Config = struct {
             if (getEnvValue(kv, prefix ++ "_PORT")) |v| cfg.port = std.fmt.parseInt(u16, v, 10) catch 8080;
             if (getEnvValue(kv, prefix ++ "_DATABASE_URL")) |v| cfg.database_url = v;
             if (getEnvValue(kv, prefix ++ "_LOG_LEVEL")) |v| cfg.log_level = LogLevel.fromString(v);
+            if (getEnvValue(kv, prefix ++ "_LOG_FORMAT")) |v| cfg.log_format = LogFormat.fromString(v);
             if (getEnvValue(kv, prefix ++ "_MAX_CONNECTIONS")) |v| cfg.max_connections = std.fmt.parseInt(u16, v, 10) catch 1024;
             if (getEnvValue(kv, prefix ++ "_SHUTDOWN_TIMEOUT")) |v| cfg.shutdown_timeout_ms = std.fmt.parseInt(u64, v, 10) catch 30000;
             if (getEnvValue(kv, prefix ++ "_DB_POOL_SIZE")) |v| cfg.db_pool_size = std.fmt.parseInt(u16, v, 10) catch 25;
@@ -77,6 +89,16 @@ test "LogLevel fromString" {
     try std.testing.expectEqual(LogLevel.warn, LogLevel.fromString("warning"));
     try std.testing.expectEqual(LogLevel.err, LogLevel.fromString("error"));
     try std.testing.expectEqual(LogLevel.info, LogLevel.fromString("unknown"));
+}
+
+// FRAMEWORK_CONTRACT.md §6: {PREFIX}_LOG_FORMAT (json or text, default json)
+// is one of the five standard env vars every SDK MUST support.
+test "LogFormat: default is json, parses json/text, rejects unknown (FRAMEWORK_CONTRACT §6)" {
+    const cfg = Config{};
+    try std.testing.expectEqual(LogFormat.json, cfg.log_format);
+    try std.testing.expectEqual(LogFormat.json, LogFormat.fromString("json"));
+    try std.testing.expectEqual(LogFormat.text, LogFormat.fromString("text"));
+    try std.testing.expectEqual(LogFormat.json, LogFormat.fromString("yaml"));
 }
 
 test "getEnvValue" {
