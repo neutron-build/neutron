@@ -739,3 +739,50 @@ async fn test_geo_updates_do_not_grow_the_index() {
         "the member answered from a position it has left: {near_first:?}"
     );
 }
+
+/// JSONB, ARRAY and VECTOR have no `Ord` arm — every pair compares Equal.
+/// This asks whether SQL can see it: does DISTINCT collapse distinct values?
+#[tokio::test]
+async fn test_distinct_does_not_collapse_composite_values() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE j (id INT, doc JSONB)").await;
+    exec(&ex, "INSERT INTO j VALUES (1, '{\"a\":1}')").await;
+    exec(&ex, "INSERT INTO j VALUES (2, '{\"b\":2}')").await;
+    exec(&ex, "INSERT INTO j VALUES (3, '{\"a\":1}')").await;
+
+    let r = exec(&ex, "SELECT DISTINCT doc FROM j").await;
+    let rows = match &r[0] {
+        crate::executor::ExecResult::Select { rows, .. } => rows.len(),
+        other => panic!("expected a select, got {other:?}"),
+    };
+    assert_eq!(
+        rows, 2,
+        "DISTINCT over JSONB returned {rows} rows, expected 2"
+    );
+
+    let r = exec(&ex, "SELECT doc, COUNT(*) FROM j GROUP BY doc").await;
+    let groups = match &r[0] {
+        crate::executor::ExecResult::Select { rows, .. } => rows.len(),
+        other => panic!("expected a select, got {other:?}"),
+    };
+    assert_eq!(
+        groups, 2,
+        "GROUP BY over JSONB made {groups} groups, expected 2"
+    );
+
+    // ORDER BY is the arm that DOES read `Value::cmp`, so this records what it
+    // actually does rather than asserting a total order the type does not have.
+    let r = exec(&ex, "SELECT id FROM j ORDER BY doc, id").await;
+    let ids = match &r[0] {
+        crate::executor::ExecResult::Select { rows, .. } => rows
+            .iter()
+            .filter_map(|r| match r.first() {
+                Some(Value::Int32(i)) => Some(i64::from(*i)),
+                Some(Value::Int64(i)) => Some(*i),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected a select, got {other:?}"),
+    };
+    assert_eq!(ids.len(), 3, "ORDER BY over JSONB dropped rows: {ids:?}");
+}

@@ -1,0 +1,198 @@
+# Residual risks
+
+What Nucleus and the Neutron SDKs do **not** yet do well, stated plainly and
+kept separate from the release notes on purpose. Release notes describe what
+changed; this file describes what has not been hardened, so that reading only
+the good news is not possible.
+
+Every entry names how it was established. Where a limit is enforced by a test,
+that test is named — several of these are *characterization* tests, which pass
+today by asserting the current bad behaviour and fail the moment it improves.
+That is deliberate: an unfixed limitation with a test attached cannot quietly
+become folklore.
+
+Last verified: 2026-08-20, against a tree with 43 of 43 probe harnesses passing
+and 28 of 28 CI workflows green.
+
+---
+
+## 1. A transaction spanning SQL and a specialty model is not atomic
+
+**Status: known, designed, not implemented.**
+
+Nucleus has fourteen data models. SQL writes go through the page WAL with a
+commit record. The other thirteen — KV, document, FTS, vector, graph, streams,
+geo, columnar, datalog, CDC and the rest — each own an append log with no
+notion of the transaction that produced a record.
+
+So a transaction that writes a row and a document, and then crashes between the
+two fsyncs, can leave one without the other. Rolling back a transaction does not
+retract what its specialty writes already appended.
+
+The mechanism to fix it is chosen and written down: tag every specialty record
+with the coordinating transaction id, fsync the specialty logs before the SQL
+commit record rather than after, and have recovery discard records whose id
+never committed. Absence of a commit record means discard, always, so there is
+no in-doubt state needing an operator. What is missing is the implementation
+across twelve log formats.
+
+**If this matters to you:** keep cross-model writes idempotent, or confine a
+transaction to SQL.
+
+## 2. Two index paths read the whole table and then narrow the answer
+
+**Status: correct answers, wrong cost. Pinned by characterization tests.**
+
+- **Vector similarity (HNSW).** A top-k similarity query still reads every row
+  in the table; the index reorders a completed scan. Pinned by
+  `test_similarity_search_still_reads_every_row`, whose message says to
+  delete it and assert the real bound once the path is fixed.
+- **JSONB containment (GIN).** Same shape: the index filters positions out of a
+  full scan rather than replacing it. Pinned by
+  `test_gin_containment_still_reads_every_row`.
+
+Range scans, point lookups, ordered scans and FTS lookups do reach their
+indexes, and each is asserted by scan count rather than by rows returned —
+because a query that loses its index gets slower and never wrong, so no
+row-level assertion can catch it.
+
+**If this matters to you:** vector and JSONB-containment query time grows with
+the table, not with the result.
+
+## 3. JSONB, ARRAY and VECTOR values have no ordering
+
+`Value::cmp` has no arm for these three, so any two JSONB documents — or two
+arrays, or two vectors — compare as equal to each other regardless of contents.
+
+Reachability was measured rather than assumed, and it is narrower than it
+sounds: `SELECT DISTINCT` and `GROUP BY` over a JSONB column return the right
+number of groups, because those paths do not use this comparison.
+`ORDER BY` does use it, and returns every row while placing them in no
+meaningful order. Pinned by
+`test_distinct_does_not_collapse_composite_values`.
+
+**If this matters to you:** do not `ORDER BY` a JSONB, ARRAY or VECTOR column
+and expect a stable or meaningful sequence.
+
+## 4. Startup rebuilds every B-tree index, and the cost is linear
+
+Index structures are not persisted; they are rebuilt from the table at startup.
+Measured on a development machine: **0.44s at 10,000 rows and 4.91s at
+100,000** — roughly 49 microseconds per row, so a one-million-row table with
+three indexes is about two and a half minutes before the database is ready.
+
+The O(1) alternative — persist each index's root page id and reopen — is not
+done because a root page **moves** when the root splits, so a naively persisted
+id can name a page that is no longer a root, and reopening there returns wrong
+answers rather than slow ones. Rebuilding is the option that cannot be subtly
+wrong.
+
+**If this matters to you:** budget startup time proportional to your largest
+indexed table.
+
+## 5. Cluster membership authenticates the host, not the node
+
+Node-to-node links are mutually authenticated with TLS: a peer without a
+CA-signed certificate cannot complete the handshake in either direction.
+
+That establishes **admission** — this host belongs to the cluster. It does not
+establish **identity**: the node id in an envelope and in a join request is
+self-asserted, so any admitted peer can speak as any node id, and vote as it.
+
+Binding a claimed node id to its certificate needs a per-node certificate
+subject, and the configuration currently expresses a single cluster-wide server
+name. That is a configuration design decision, not a code change.
+
+**If this matters to you:** every host you admit to a Nucleus cluster is trusted
+as every node in it.
+
+## 6. `RETENTION_SET` accepts a policy that nothing enforces
+
+The function parses, validates and registers a retention policy, and no
+component ever acts on it. It now emits a warning saying so, and it is
+documented here rather than removed, because removing it would break callers
+who — correctly — read the absence of an error as acceptance.
+
+**If this matters to you:** retention is not implemented. Delete old data
+yourself.
+
+## 7. The benchmark numbers in `docs/benchmarks/` are not trustworthy
+
+They were measured against the in-memory MVCC engine rather than the storage
+engine the server runs, and failed operations were timed as successes — an
+engine returning errors quickly can look like a fast engine. They also
+contradict `BENCH_VS_POSTGRES.md` by roughly 49x on INSERT.
+
+They are kept for the methodology, not the figures. Do not quote a number from
+that directory.
+
+## 8. Whole categories of performance are unmeasured against competitors
+
+There is no published comparison of:
+
+- **graph** traversal against Neo4j
+- **full-text search** against Elasticsearch
+- **OLAP** aggregation against ClickHouse (blocked locally on an operator-level
+  Gatekeeper quarantine of the installed binary, not on the code)
+- **vector** search against Qdrant (no Homebrew formula; the local container
+  runtime cannot mount new images)
+
+Vector search *has* been measured against pgvector, and SQL against PostgreSQL,
+SQLite, SurrealDB, CockroachDB, TiDB, MongoDB and Redis.
+
+**If this matters to you:** treat any specialist-workload comparison as unproven
+until one of these exists.
+
+## 9. Scale beyond a development machine has never been run
+
+The 1M-to-100M row, sustained-concurrency, p50/p95/p99 workload has harnesses
+and has never been executed on hardware that could produce a defensible number.
+A laptop cannot: there is no `tc`/netem, no cgroups v2, no `dm-flakey`, and the
+soak probe's memory gate is a silent no-op on macOS.
+
+Relatedly, the Python framework benchmark was run here three times and the
+result was **negative and is published as such**: on this machine class the
+worst single-repeat throughput deviation on a green run is 95.4%, and one repeat
+recorded zero requests per second with zero errors. A 10x regression is a 90%
+drop, so no threshold can both survive a green run and catch a real regression.
+No performance gate is wired, and no Python competitive figures are published.
+
+## 10. "Formally verified" means less than it sounds like
+
+The Lean 4 development has **92 theorems, 3 axioms and zero `sorry`s**, and it
+proves properties of **hand-written simplified models** of MVCC, the B-tree, the
+WAL and Raft. Those models are not the shipping engine, and no extraction or
+refinement connects them to it.
+
+Three axioms that earlier versions carried turned out to be **false**, not
+merely unproven, and were discharged by fixing the statements.
+
+**If this matters to you:** the proofs are evidence that the designs are
+coherent. They are not evidence that the binary implements them.
+
+## 11. An SDK that compiles and passes its own tests may still be broken
+
+Until 2026-08-20 the Zig SDK had 320 passing unit tests and had never spoken to
+a live engine. Its first live scoring found its pgwire client desyncing on
+**110 of 200 queries**: it read a response with a single read and left the tail
+in the socket whenever the server split a message, so the next query decoded the
+previous one's bytes.
+
+All seven SDKs are now scored against a live engine on every change, and the
+cross-SDK diff refuses to count a missing SDK as agreement. The lesson is kept
+here because it applies to any client library, including ones not in this repo:
+a green unit suite over a mocked transport proves the mock.
+
+## 12. `mobile-preview/` is an experiment
+
+It has no tests and no CI workflow. It is not a supported pillar, and nothing
+public claims it is.
+
+---
+
+## How to read the absence of an entry
+
+This register covers the areas that have been audited. It is not a proof that
+everything else is hardened. The durable statement is narrower and more useful:
+every item above is either enforced by a test that fails when the behaviour
+changes, or measured with the measurement recorded.
