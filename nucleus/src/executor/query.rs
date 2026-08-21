@@ -6938,6 +6938,29 @@ impl Executor {
                 FastAgg::Avg(i) | FastAgg::Sum(i) => Some(*i),
                 _ => None,
             });
+            // `fast_group_by` returns (key, count, avg-of-ONE column). This branch
+            // used to answer anyway, three different ways wrong:
+            //   - MIN/MAX were returned as NULL for every group, though the values
+            //     exist and nothing declined;
+            //   - only the FIRST Sum/Avg column reaches `fast_group_by`, and every
+            //     Sum/Avg arm then read that single scalar, so
+            //     `SELECT k, SUM(a), SUM(b) FROM t GROUP BY k` reported SUM(a) twice
+            //     under SUM(b)'s name;
+            //   - SUM was reconstructed as avg*count in f64, which over-counts when
+            //     the column contains NULLs (count is the whole group, avg excludes
+            //     them) and returns Float64 where the general path returns Int64.
+            // The sibling fast path in `execute_plan_node` already guards exactly
+            // this way, and its comment says why; this copy never did. An optimized
+            // path must decline what it cannot compute, not answer a different
+            // question silently.
+            let answerable = items.iter().all(|(_, t)| match t {
+                FastAgg::GroupKey | FastAgg::Count => true,
+                FastAgg::Avg(i) => Some(*i) == val_col,
+                FastAgg::Sum(_) | FastAgg::Min(_) | FastAgg::Max(_) => false,
+            });
+            if !answerable {
+                return Ok(None);
+            }
             let groups = match tbl_storage.fast_group_by(&table_name, key_col, val_col) {
                 Some(g) => g,
                 None => return Ok(None),
@@ -6983,6 +7006,11 @@ impl Executor {
                                 .map(|a| Value::Float64(a * count as f64))
                                 .unwrap_or(Value::Null),
                             FastAgg::Avg(_) => avg.map(Value::Float64).unwrap_or(Value::Null),
+                            // Unreachable: the `answerable` guard above declines
+                            // the whole branch when any of these is present. Left
+                            // returning NULL rather than panicking, because a
+                            // wrong answer from a database is bad and a panic in
+                            // the query path is worse.
                             FastAgg::Min(_) | FastAgg::Max(_) => Value::Null,
                         })
                         .collect()
