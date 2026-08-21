@@ -498,6 +498,7 @@ impl Database {
     pub fn streams(&self) -> StreamsHandle<'_> {
         StreamsHandle {
             streams: self.executor.streams(),
+            wal: self.executor.streams_wal(),
         }
     }
 
@@ -1183,15 +1184,38 @@ impl PubSubHandle<'_> {
 /// Direct streams access — Redis-style append-only logs without SQL.
 pub struct StreamsHandle<'a> {
     streams: &'a parking_lot::RwLock<HashMap<String, crate::pubsub::Stream>>,
+    /// The durable log, when this database has one. `None` for the in-memory
+    /// modes, where there is nothing to be durable to.
+    wal: Option<&'a crate::pubsub::streams_wal::StreamsWal>,
 }
 
 impl StreamsHandle<'_> {
     /// Add an entry to a stream. Creates the stream if it doesn't exist.
     /// Returns the auto-generated entry ID.
     pub fn xadd(&self, stream: &str, fields: Vec<(String, String)>) -> StreamEntryId {
-        let mut map = self.streams.write();
-        let s = map.entry(stream.to_string()).or_default();
-        s.xadd(fields)
+        let id = {
+            let mut map = self.streams.write();
+            let s = map.entry(stream.to_string()).or_default();
+            s.xadd(fields.clone())
+        };
+        // Log it, exactly as the SQL `STREAM_XADD` path does. This handle used to
+        // mutate the map and stop there, so an embedded caller's stream writes
+        // were pure RAM and vanished on reopen while the identical SQL call
+        // survived -- the same entry-point asymmetry as the `meta.json` load.
+        //
+        // The lock is released before logging: `log_xadd` performs file I/O, and
+        // holding the streams write lock across it would serialise every reader
+        // behind a disk write.
+        if let Some(wal) = self.wal
+            && let Err(e) = wal.log_xadd(stream, &id, &fields)
+        {
+            tracing::error!(
+                stream = %stream,
+                "embedded stream append could not be written to the WAL: {e}. \
+                 The entry is in memory and will NOT survive a reopen."
+            );
+        }
+        id
     }
 
     /// Query entries in a stream by ID range.
@@ -2013,6 +2037,35 @@ mod tests {
     /// state back over the `meta.json` it never read (NU-163's write-back,
     /// live through the embedded API). `main.rs` loads meta at startup;
     /// `HarnessDb::open` mirrors it. Only the embedded builder was missing.
+    /// S31-12: an embedded stream append must survive a reopen.
+    ///
+    /// `StreamsHandle::xadd` mutated the in-memory map and stopped there, so an
+    /// embedded caller's stream writes were pure RAM and vanished on reopen,
+    /// while the identical `STREAM_XADD` over SQL was durable. The assertion
+    /// goes through a REOPEN, because an in-memory-only check passes against
+    /// the bug -- which is how it survived.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn embedded_stream_append_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            db.streams()
+                .xadd("orders", vec![("item".into(), "widget".into())]);
+            let live = db.query("SELECT STREAM_XLEN('orders')").await.unwrap();
+            assert_eq!(live.len(), 1, "the append must be visible before reopen");
+        }
+
+        let db = Database::durable_mvcc(dir.path()).unwrap();
+        let rows = db.query("SELECT STREAM_XLEN('orders')").await.unwrap();
+        let recovered = rows.first().and_then(|r| r.first()).cloned();
+        assert_eq!(
+            recovered,
+            Some(Value::Int64(1)),
+            "an embedded stream append must survive a reopen; got {recovered:?}"
+        );
+    }
+
     #[cfg(feature = "server")]
     #[tokio::test]
     async fn durable_mvcc_reloads_roles_views_policies_sequences() {

@@ -4452,6 +4452,17 @@ impl Executor {
     }
 
     /// Get a reference to the streams map.
+    /// The streams write-ahead log, when this executor is durable.
+    ///
+    /// Exposed so the embedded `StreamsHandle` can log what it writes. Without
+    /// it, an embedded `xadd` mutated the in-memory map and nothing else, so
+    /// embedded stream writes were pure RAM while the identical SQL call was
+    /// durable -- the same asymmetry between entry points as the `meta.json`
+    /// load in F2.
+    pub(crate) fn streams_wal(&self) -> Option<&crate::pubsub::streams_wal::StreamsWal> {
+        self.streams_wal.as_ref()
+    }
+
     pub fn streams(&self) -> &parking_lot::RwLock<HashMap<String, crate::pubsub::Stream>> {
         &self.streams
     }
