@@ -557,8 +557,13 @@ impl Executor {
         &self,
         query: &ast::Query,
     ) -> Result<Option<ExecResult>, ExecError> {
-        // RLS queries stay on the fail-closed materialized path.
-        if self.any_rls_active() {
+        // RLS, column masking AND the SELECT grant all gate a read, and every
+        // one of them is enforced on the materialized path. This producer runs
+        // BEFORE that path, so it must decline whenever any of them applies.
+        // It previously checked RLS alone: `SET stream_results = on` then
+        // returned masked columns in the clear, and skipped the grant check
+        // that the materialized route performs.
+        if !self.read_fast_paths_permitted() {
             return Ok(None);
         }
         // Opt-in only.
@@ -839,7 +844,7 @@ impl Executor {
         &self,
         query: &ast::Query,
     ) -> Result<Option<ExecResult>, ExecError> {
-        if self.any_rls_active() || !self.stream_results_enabled() {
+        if !self.read_fast_paths_permitted() || !self.stream_results_enabled() {
             return Ok(None);
         }
         let budget = self.query_memory_limit();
@@ -1024,7 +1029,7 @@ impl Executor {
         &self,
         query: &ast::Query,
     ) -> Result<Option<ExecResult>, ExecError> {
-        if self.any_rls_active() || !self.stream_results_enabled() {
+        if !self.read_fast_paths_permitted() || !self.stream_results_enabled() {
             return Ok(None);
         }
         let budget = self.query_memory_limit();

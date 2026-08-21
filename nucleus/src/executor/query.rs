@@ -1510,8 +1510,13 @@ impl Executor {
         &self,
         query: &ast::Query,
     ) -> Result<Option<ExecResult>, ExecError> {
-        // RLS queries stay on the fail-closed materialized path.
-        if self.any_rls_active() {
+        // RLS, column masking AND the SELECT grant all gate a read, and every
+        // one of them is enforced on the materialized path. This producer runs
+        // BEFORE that path, so it must decline whenever any of them applies.
+        // It previously checked RLS alone: `SET stream_results = on` then
+        // returned masked columns in the clear, and skipped the grant check
+        // that the materialized route performs.
+        if !self.read_fast_paths_permitted() {
             return Ok(None);
         }
         // Opt-in only — default OFF keeps every existing session materialized.
@@ -2531,7 +2536,9 @@ impl Executor {
         cte_tables: &CteTableMap,
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
     ) -> Result<Option<(Vec<ColMeta>, Vec<Row>)>, ExecError> {
-        if self.any_rls_active() {
+        // Returns rows, so it is a read route and gates like one -- see the
+        // streaming producers above.
+        if !self.read_fast_paths_permitted() {
             return Ok(None);
         }
         let (condition, join_type) = match &join.join_operator {
