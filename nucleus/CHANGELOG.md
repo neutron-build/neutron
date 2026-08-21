@@ -5,7 +5,80 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
-### Fixed
+## [0.1.7] - 2026-08-21
+
+The first release in seventeen days, and a large one: **99 fixes, features and
+performance changes** landed on main after v0.1.6 without a tag to carry them.
+Two of them were being waited on specifically — see *Why this release exists*
+at the end.
+
+The two entries below were already written up in full and are the headline
+items. The rest are grouped, because a per-commit account of 99 changes is not
+a changelog anyone reads; `git log nucleus/v0.1.6..nucleus/v0.1.7 -- nucleus/`
+is the complete record.
+
+### Durability
+
+Most of this release. The recurring shape is an acknowledged write that no
+fsync covered, or a subsystem whose WAL was opened and replayed but never
+written to:
+
+- Six models acked writes no fsync covered (NU-006); PITR restored six models
+  to the wrong point silently (NU-030).
+- The Datalog WAL was opened, replayed and never written (NU-013). FTS kept two
+  durable copies while its WAL stopped receiving writes (NU-014). Vector WAL
+  failures were printed rather than returned (NU-048).
+- KV-collection stream writes were never logged (S30-3); a checkpoint discarded
+  acknowledged writes (S30-1); a RESP write was acked before fsync; a KV write
+  the log refused was reported as success.
+- Every restart lost the B-tree indexes and reads fell back to full scans.
+  Consumer groups were lost on every restart, geo on every crash. Columnar
+  column names did not survive a restart.
+- The collections WAL had no checksum, so corruption read as truncation. A
+  short read was treated as EOF and the rest of the page zeroed. Segmented WAL
+  recovery failed open. A torn tail amputated `streams.wal`.
+- Writes a ROLLBACK could not undo were accepted anyway (S63). Stream rollback
+  was memory-only.
+
+### Correctness
+
+- **Three confirmed CRITICALs**: wrong join results and two read-authorization
+  holes.
+- The columnar grouped fast path answered a different query than the one asked.
+  `SELECT` clauses that were parsed and then silently dropped are now refused.
+- `Value`'s `Eq`, `Ord` and `Hash` disagreed, so hash-keyed and order-keyed
+  routes grouped differently. SUM pushdown advertised the wrong column type and
+  summed integers in `f64`. Top-K scan fusion ignored an explicit
+  `NULLS FIRST/LAST`.
+- A repeated `CREATE TABLE` emptied the table (NU-251). A sequence value could
+  be handed out twice (NU-165). AFTER triggers fired for rows the statement
+  never wrote (NU-246). A geo member that moved left its old point in the index
+  forever. Cypher variable-length patterns did not parse.
+
+### Security
+
+- Column masking and the `SELECT` grant were bypassed by **every streaming
+  route**, and separately by the wire OLTP fast path.
+- Cluster TLS was not mutual in either direction (N17). `VALID UNTIL` parsed,
+  succeeded and was thrown away (N16). Masking was enforced but undeclarable
+  (N13). `ALTER POLICY` added, because `DROP` + `CREATE` leaves a window (N14).
+- Durable, bounded security audit events (N18). Two remote resource attacks
+  closed.
+
+### Performance
+
+- `UPDATE`/`DELETE` by primary key no longer read the whole table (S65).
+- The graph property index is wired, and shortest path is bidirectional.
+
+### Operations
+
+- The WAL archive grew without bound because nothing pruned it (S55). An
+  offline backup could not tell that its source was encrypted, and a backup can
+  now name the key it needs. `LISTEN`/`NOTIFY` never delivered. Retention said
+  OK to a policy nothing enforced. The memory ceiling could not see the
+  collections it bounds.
+
+### The two headline fixes, in full
 
 - **An upgrade from a pre-v0.1.2 container image crash-looped instead of
   saying why.** The image has run as uid 10001 since v0.1.2 (the M12 hardening
@@ -67,6 +140,29 @@ Notable changes to the Nucleus engine. Format follows
   otherwise a crash before that transaction committed would undo a write the
   other connection was told succeeded. An unknown session attributes rather
   than skipping, because a missing undo record is the worse failure.
+
+### Why this release exists
+
+Two fixes were sitting on main with **no tag containing them**, and Teploy was
+waiting on a release that carried them rather than upgrading twice:
+
+- `bbe88e3` — concurrent updates left duplicate primary-key index entries, so
+  `WHERE key = ?` returned a row twice and `count(*)` doubled. Reproduced 5/5.
+- `0ed737d` — the root-era-image UID crash-loop, documented in full below.
+
+A third reason emerged on 2026-08-20: **v0.1.5 cannot bootstrap a fresh
+Observe schema at all.** Its migration 28 fails with `events_pre028 not found
+in storage`; the same migration succeeds on 0.1.6. Deployed instances are
+unaffected — they migrated long ago — but a new install, or a restore that
+replays the schema, cannot come up on v0.1.5. Anyone still pinned there should
+move.
+
+### Upgrading from v0.1.5
+
+v0.1.6's breaking change applies: `SKIP LOCKED`, `NOWAIT` and partial
+`CREATE INDEX ... WHERE` now **error** instead of being silently ignored. If a
+query used one and relied on it being a no-op, it now fails loudly.
+
 
 ## [0.1.6] - 2026-08-04
 
