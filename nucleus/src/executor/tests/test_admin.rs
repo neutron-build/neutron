@@ -793,11 +793,12 @@ async fn test_privilege_checking_superuser() {
     // Create a table
     exec(&ex, "CREATE TABLE priv_test (id INT, name TEXT)").await;
 
-    // Create a superuser role
-    exec(&ex, "CREATE ROLE superuser WITH SUPERUSER").await;
+    // A role with the SUPERUSER ATTRIBUTE. Deliberately not named "superuser":
+    // that name is now reserved, because a role merely called that used to
+    // confer full bypass on every member regardless of its attributes.
+    exec(&ex, "CREATE ROLE admin_role WITH SUPERUSER").await;
 
-    // Set session authorization to superuser
-    exec(&ex, "SET SESSION AUTHORIZATION superuser").await;
+    exec(&ex, "SET SESSION AUTHORIZATION admin_role").await;
 
     // Superuser should be able to do everything without explicit grants
     exec(&ex, "INSERT INTO priv_test VALUES (1, 'test')").await;

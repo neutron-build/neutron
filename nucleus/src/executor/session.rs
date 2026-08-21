@@ -329,7 +329,14 @@ impl Session {
             // engages once a session assumes a non-superuser identity via
             // SET session_authorization / SET ROLE (T2.2).
             session_context: parking_lot::RwLock::new(
-                crate::security::SessionContext::new("nucleus").with_role("superuser"),
+                // The bootstrap identity carries the bypass ATTRIBUTE, not just the
+                // role name. Enforcement now reads the attribute only (SEC-4), and
+                // the role catalog entry this mirrors has always had both -- without
+                // this line, flipping the enforcement sites would strip the default
+                // session's authority and break single-user mode.
+                crate::security::SessionContext::new("nucleus")
+                    .with_role("superuser")
+                    .with_bypass_rls(true),
             ),
             last_activity_ms: AtomicU64::new(now_millis()),
             executing: AtomicBool::new(false),

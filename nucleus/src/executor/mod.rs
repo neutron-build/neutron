@@ -3352,13 +3352,13 @@ impl Executor {
     pub fn session_read_fast_paths_permitted(&self, session_id: u64) -> bool {
         let session = self.get_session(session_id);
         let ctx = session.session_context.read();
-        ctx.bypass_rls || ctx.has_role("superuser")
+        ctx.bypass_rls
     }
 
     pub fn session_has_active_rls(&self, session_id: u64) -> bool {
         let session = self.get_session(session_id);
         let ctx = session.session_context.read();
-        if ctx.bypass_rls || ctx.has_role("superuser") {
+        if ctx.bypass_rls {
             return false;
         }
         // Blocking, for the same reason as `session_in_transaction`: under
@@ -3644,12 +3644,8 @@ impl Executor {
     /// FAIL-CLOSED gate every fast/bypass read path checks — when true, that
     /// path must defer to the general materialize-and-filter path.
     pub(super) fn rls_active(&self, table: &str) -> bool {
-        if self
-            .current_session()
-            .session_context
-            .read()
-            .has_role("superuser")
-        {
+        // SEC-4: the attribute, not the name.
+        if self.current_session().session_context.read().bypass_rls {
             return false;
         }
         self.with_visible_security(|security| security.rls.is_enabled(table))
@@ -3659,12 +3655,8 @@ impl Executor {
     ///
     /// Superusers see unmasked data, matching the RLS rule directly above.
     pub(super) fn masking_active(&self, table: &str) -> bool {
-        if self
-            .current_session()
-            .session_context
-            .read()
-            .has_role("superuser")
-        {
+        // SEC-4: the attribute, not the name.
+        if self.current_session().session_context.read().bypass_rls {
             return false;
         }
         self.with_visible_security(|security| security.masking.covers_table(table))
@@ -3740,17 +3732,13 @@ impl Executor {
     pub(super) fn privileges_enforced_for_session(&self) -> bool {
         let session = self.current_session();
         let ctx = session.session_context.read();
-        !(ctx.bypass_rls || ctx.has_role("superuser"))
+        !(ctx.bypass_rls)
     }
 
     /// Whether any masking policy exists for this session.
     pub(super) fn any_masking_active(&self) -> bool {
-        if self
-            .current_session()
-            .session_context
-            .read()
-            .has_role("superuser")
-        {
+        // SEC-4: the attribute, not the name.
+        if self.current_session().session_context.read().bypass_rls {
             return false;
         }
         self.with_visible_security(|security| security.masking.any_policies())
@@ -3811,12 +3799,8 @@ impl Executor {
     /// disable the SQL-text-keyed result cache path wholesale when policies are
     /// live (cheap: only true for non-superuser sessions with ≥1 enabled table).
     pub(super) fn any_rls_active(&self) -> bool {
-        if self
-            .current_session()
-            .session_context
-            .read()
-            .has_role("superuser")
-        {
+        // SEC-4: the attribute, not the name.
+        if self.current_session().session_context.read().bypass_rls {
             return false;
         }
         self.with_visible_security(|security| security.rls.any_enabled())
@@ -6489,7 +6473,7 @@ impl Executor {
     /// - No role is found and user is the default "nucleus" superuser
     async fn check_privilege(&self, table_name: &str, privilege: &str) -> bool {
         let ctx = self.current_session().session_context.read().clone();
-        if ctx.bypass_rls || ctx.has_role("superuser") {
+        if ctx.bypass_rls {
             return true;
         }
 

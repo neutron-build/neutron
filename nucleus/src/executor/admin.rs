@@ -929,6 +929,18 @@ impl Executor {
         let mut roles = self.roles.write().await;
         for name in &create_role.names {
             let role_name = name.to_string();
+            // SEC-4, defence in depth. Authority is the bypass_rls attribute now,
+            // so a role of this name confers nothing -- but policy TO-clauses
+            // still address roles BY NAME, and a role called "superuser" is an
+            // ambush: it reads as authority to every human looking at a catalog
+            // dump. Reserve it so the ambiguity cannot be created in the first
+            // place.
+            if role_name.eq_ignore_ascii_case("superuser") {
+                return Err(ExecError::PermissionDenied(
+                    "role name 'superuser' is reserved; grant the SUPERUSER attribute instead"
+                        .into(),
+                ));
+            }
             let mut role = RoleDef {
                 name: role_name.clone(),
                 password_hash: None,

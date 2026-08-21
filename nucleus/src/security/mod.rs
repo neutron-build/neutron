@@ -580,7 +580,7 @@ impl RlsEngine {
         ctx: &SessionContext,
     ) -> bool {
         // Superuser bypasses RLS
-        if ctx.bypass_rls || ctx.has_role("superuser") {
+        if ctx.bypass_rls {
             return true;
         }
 
@@ -636,7 +636,7 @@ impl RlsEngine {
         row: &HashMap<String, String>,
         ctx: &SessionContext,
     ) -> bool {
-        if ctx.bypass_rls || ctx.has_role("superuser") {
+        if ctx.bypass_rls {
             return true;
         }
         if !self.is_enabled(table) {
@@ -1427,10 +1427,24 @@ mod tests {
             permissive: true,
         });
 
-        let ctx = SessionContext::new("admin").with_role("superuser");
         let row = make_row(&[("id", "1")]);
-        // Superuser bypasses RLS
-        assert!(engine.check_row("orders", PolicyCommand::Select, &row, &ctx));
+
+        // The bypass comes from the ATTRIBUTE.
+        let privileged = SessionContext::new("admin")
+            .with_role("superuser")
+            .with_bypass_rls(true);
+        assert!(engine.check_row("orders", PolicyCommand::Select, &row, &privileged));
+
+        // The NAME alone must confer nothing. This assertion is the point of the
+        // test: it used to pass with only `.with_role("superuser")`, which meant
+        // any role a security admin happened to call "superuser" -- or any role
+        // reaching that name through GRANT membership -- silently bypassed RLS,
+        // masking and privilege checks while `pg_roles.rolsuper` reported false.
+        let named_only = SessionContext::new("mallory").with_role("superuser");
+        assert!(
+            !engine.check_row("orders", PolicyCommand::Select, &row, &named_only),
+            "a role NAMED superuser must not bypass RLS without the attribute"
+        );
     }
 
     #[test]
