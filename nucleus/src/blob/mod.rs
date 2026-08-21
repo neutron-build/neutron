@@ -831,7 +831,17 @@ impl BlobStore {
     /// Read an entire blob.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let meta = self.blobs.get(key)?;
-        let mut data = Vec::with_capacity(meta.size as usize);
+        // `meta.size` is a raw `u64` recovered from the blob WAL. Handing it to
+        // `with_capacity` ABORTS the process on Linux when it is corrupt (a
+        // Rust allocation failure is not an `Err` — SIGABRT, no unwind, no log)
+        // and silently succeeds on an overcommitting macOS. The per-chunk index
+        // is the real upper bound on what the loop below can append; cap the
+        // reservation at both that and a sane ceiling and let the Vec grow,
+        // which costs a few reallocations on a very large honest blob and
+        // nothing at all on a normal one.
+        const MAX_GET_PREALLOC: u64 = 64 * 1024 * 1024;
+        let cap = meta.size.min(meta.index.total_size()).min(MAX_GET_PREALLOC) as usize;
+        let mut data = Vec::with_capacity(cap);
         for hash in &meta.chunk_hashes {
             if !self.chunks.read_into(hash, &mut data) {
                 eprintln!("blob store: blob '{key}' has an unreadable chunk");

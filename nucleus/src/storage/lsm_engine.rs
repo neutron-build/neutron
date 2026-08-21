@@ -218,7 +218,11 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
 fn decode_row(data: &[u8]) -> Option<Row> {
     let mut pos = 0;
     let col_count = read_u32(data, &mut pos)? as usize;
-    let mut row = Vec::with_capacity(col_count);
+    // `col_count` comes out of an SST value on disk. An unbounded
+    // `with_capacity` ABORTS the process on Linux (allocation failure is not an
+    // `Err`) and silently succeeds on an overcommitting macOS. Every value
+    // costs at least its 1-byte tag, so the bytes remaining are an exact bound.
+    let mut row = Vec::with_capacity(col_count.min(data.len().saturating_sub(pos)));
     for _ in 0..col_count {
         row.push(decode_value(data, &mut pos)?);
     }
@@ -269,7 +273,8 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         }
         13 => {
             let count = read_u32(data, pos)? as usize;
-            let mut arr = Vec::with_capacity(count);
+            // Off-disk count; each element costs at least its 1-byte tag.
+            let mut arr = Vec::with_capacity(count.min(data.len().saturating_sub(*pos)));
             for _ in 0..count {
                 arr.push(decode_value(data, pos)?);
             }
@@ -277,7 +282,8 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         }
         14 => {
             let count = read_u32(data, pos)? as usize;
-            let mut floats = Vec::with_capacity(count);
+            // Off-disk count; each f32 element is exactly 4 bytes.
+            let mut floats = Vec::with_capacity(count.min(data.len().saturating_sub(*pos) / 4));
             for _ in 0..count {
                 if *pos + 4 > data.len() {
                     return None;

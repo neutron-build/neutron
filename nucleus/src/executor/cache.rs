@@ -259,7 +259,7 @@ impl Executor {
     /// Entries expire after `QUERY_CACHE_TTL_SECS` seconds (default 30).
     pub fn query_cache_get(&self, sql: &str) -> Option<ExecResult> {
         let current_gen = self.cache_write_gen.load(Ordering::Acquire);
-        let key = Self::query_cache_key(sql);
+        let key = self.query_cache_key(sql);
         let cache = self.query_cache.read();
         let entry = cache.get(&key)?;
         // Stale generation: a DML ran after this entry was inserted.
@@ -300,7 +300,7 @@ impl Executor {
         if current_gen != gen_at_miss {
             return;
         }
-        let key = Self::query_cache_key(sql);
+        let key = self.query_cache_key(sql);
         let mut cache = self.query_cache.write();
         // Re-check after acquiring the write lock — a DML may have just cleared
         // the cache and bumped the generation between our Acquire load above and
@@ -353,11 +353,43 @@ impl Executor {
     /// the whole statement collapses distinct queries onto one key and returns a
     /// stale result for the other. Keywords being case-insensitive only means
     /// `SELECT`/`select` get separate (correct) cache entries — a harmless miss.
-    fn query_cache_key(sql: &str) -> String {
+    /// Key a cached result on everything the result depends on, not just the
+    /// text that asked for it.
+    ///
+    /// Keying on the SQL text alone made this cache a cross-principal
+    /// disclosure channel: two sessions issuing byte-identical SQL shared one
+    /// entry, so one principal was served another's rows -- rows the engine
+    /// REFUSED to serve when the query actually executed -- and even
+    /// `SELECT current_user` returned the other session's answer. It also made
+    /// `SET plan_execution = off` return the on-path's cached result, which
+    /// silently defeats the standard way of cross-checking the two paths.
+    ///
+    /// So the identity (authenticated principal, effective role, tenant claim),
+    /// the session settings, and the policy generation all enter the key. The
+    /// settings map is small and hashed in sorted order so the key is stable.
+    fn query_cache_key(&self, sql: &str) -> String {
         let normalized = sql.trim();
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         normalized.hash(&mut hasher);
+
+        let session = self.current_session();
+        (*session.authenticated_user.read()).hash(&mut hasher);
+        (*session.current_role.read()).hash(&mut hasher);
+        (*session.trusted_tenant_id.read()).hash(&mut hasher);
+        {
+            let settings = session.settings.read();
+            let mut entries: Vec<(&String, &String)> = settings.iter().collect();
+            entries.sort_unstable();
+            for (name, value) in entries {
+                name.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+        }
+        // Makes `bump_policy_gen`'s doc comment true: it said the policy
+        // generation was folded into this key, and it was not.
+        self.policy_gen.load(Ordering::Acquire).hash(&mut hasher);
+
         format!("qc:{:016x}", hasher.finish())
     }
 

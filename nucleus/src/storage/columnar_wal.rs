@@ -533,7 +533,10 @@ fn decode_snapshot_into(
 
 fn decode_row(data: &[u8], pos: &mut usize) -> Option<Row> {
     let col_count = read_u32(data, pos)? as usize;
-    let mut row = Vec::with_capacity(col_count);
+    // `col_count` comes off disk, like the three counts already wrapped above.
+    // Every value costs at least its 1-byte tag, so the bytes remaining bound
+    // how many can really follow; an unbounded reservation ABORTS on Linux.
+    let mut row = Vec::with_capacity(col_count.min(data.len().saturating_sub(*pos)));
     for _ in 0..col_count {
         row.push(decode_value(data, pos)?);
     }

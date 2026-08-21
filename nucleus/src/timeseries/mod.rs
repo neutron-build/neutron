@@ -1255,14 +1255,22 @@ impl TsWal {
             let (n_points, new_pos) = Self::read_u32(data, pos)?;
             pos = new_pos;
             let n = n_points as usize;
+            // `n_points` comes off disk on the recovery path. An unbounded
+            // `with_capacity` ABORTS the process on Linux (allocation failure
+            // is not an `Err`) and silently succeeds on an overcommitting
+            // macOS, so a corrupt count is a boot crash-loop with no log. Each
+            // timestamp and each value is 8 bytes, so the bytes remaining bound
+            // how many can really follow; the reads below still return `None`
+            // on truncation. Matches `read_insert_batch`, already clamped.
+            let n_cap_8 = n.min(data.len().saturating_sub(pos) / 8);
 
-            let mut timestamps = Vec::with_capacity(n);
+            let mut timestamps = Vec::with_capacity(n_cap_8);
             for _ in 0..n {
                 let (ts, new_pos) = Self::read_u64(data, pos)?;
                 timestamps.push(ts);
                 pos = new_pos;
             }
-            let mut values = Vec::with_capacity(n);
+            let mut values = Vec::with_capacity(n.min(data.len().saturating_sub(pos) / 8));
             for _ in 0..n {
                 let (val, new_pos) = Self::read_f64(data, pos)?;
                 values.push(val);
@@ -1275,7 +1283,8 @@ impl TsWal {
             for _ in 0..n_tag_keys {
                 let (key, new_pos) = Self::read_string(data, pos)?;
                 pos = new_pos;
-                let mut col = Vec::with_capacity(n);
+                // Each tag slot costs at least its 1-byte presence flag.
+                let mut col = Vec::with_capacity(n.min(data.len().saturating_sub(pos)));
                 for _ in 0..n {
                     if pos >= data.len() {
                         return None;

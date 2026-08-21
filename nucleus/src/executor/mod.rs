@@ -3504,6 +3504,46 @@ impl Executor {
         self.any_rls_active() || self.any_masking_active()
     }
 
+    /// Whether the fast read routes may answer this session.
+    ///
+    /// They may only do so when nothing that gates a read is in play: RLS,
+    /// column masking, or a GRANT check this session must pass. Kept separate
+    /// from `any_table_secured` deliberately -- that predicate also gates the
+    /// query result cache, and the cache is safe for a non-superuser now that
+    /// its key carries the principal, so folding the grant gate into it would
+    /// disable caching for every non-superuser session for no benefit.
+    pub(super) fn read_fast_paths_permitted(&self) -> bool {
+        !self.any_table_secured() && !self.privileges_enforced_for_session()
+    }
+
+    /// True when this session's reads have to pass the GRANT gate.
+    ///
+    /// `check_privilege` short-circuits for a superuser and for `bypass_rls`;
+    /// every other principal needs an explicit grant. But the SELECT gate has
+    /// exactly ONE read-path call site, inside `load_table_factor_with_ctes`,
+    /// and it sits AFTER the fast paths have already returned rows. A role
+    /// holding no grant at all could therefore read a table through `count(*)`,
+    /// a primary-key point lookup or a filtered scan while
+    /// `has_table_privilege` answered false for that same table in the same
+    /// session -- one authorization question, two answers, selected by which
+    /// execution route the planner happened to take.
+    ///
+    /// Duplicating the gate onto each route is how it came to be missing from
+    /// five of six in the first place. Instead the PLAN PATH is declined for
+    /// any session that has to be checked, so the query falls to the AST path
+    /// where the single existing gate lives -- exactly as `rls_guarded`
+    /// already does at the same call site. A superuser session, which is the
+    /// default single-user case, is unaffected.
+    ///
+    /// This costs a granted non-superuser the plan path: the read still
+    /// succeeds, by the checked route. Serving the right answer slowly beats
+    /// serving an unauthorized one quickly.
+    pub(super) fn privileges_enforced_for_session(&self) -> bool {
+        let session = self.current_session();
+        let ctx = session.session_context.read();
+        !(ctx.bypass_rls || ctx.has_role("superuser"))
+    }
+
     /// Whether any masking policy exists for this session.
     pub(super) fn any_masking_active(&self) -> bool {
         if self

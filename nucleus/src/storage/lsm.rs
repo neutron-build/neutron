@@ -678,7 +678,27 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
     pos += 4;
     let n = u32::from_le_bytes(four) as usize;
 
-    let mut index: Vec<(Vec<u8>, ValueLoc)> = Vec::with_capacity(n);
+    // `n` is a header field: it is whatever the file says. Handing it straight
+    // to `with_capacity` / `vec![false; n * 10]` ABORTS the process on Linux
+    // when it is corrupt (a Rust allocation failure is not an `Err` — SIGABRT,
+    // no unwind, no log) and silently succeeds on an overcommitting macOS, so
+    // this is a boot crash-loop that a local run cannot reproduce. Every entry
+    // costs at least key_len(4) + kind(1) bytes, so the file's own size is a
+    // hard bound: reject a count larger than it can possibly hold.
+    let file_len = r.get_ref().metadata()?.len();
+    const MIN_ENTRY_BYTES: u64 = 5;
+    if n as u64 > file_len.saturating_sub(pos) / MIN_ENTRY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SSTable entry count {n} exceeds what a {file_len}-byte file can hold"),
+        ));
+    }
+
+    // Bounded reservation: the index grows as entries are read, which costs a
+    // few reallocations on the honest path and removes the abort on the corrupt
+    // one. The bloom filter cannot grow, but `n` is gated above.
+    let mut index: Vec<(Vec<u8>, ValueLoc)> =
+        Vec::with_capacity(crate::storage::wal_util::bounded_capacity(n));
     let mut bloom = BloomFilter::new(n.max(1), 10);
     let mut size_bytes = 0usize;
 
@@ -686,6 +706,13 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
         r.read_exact(&mut four)?;
         pos += 4;
         let key_len = u32::from_le_bytes(four) as usize;
+        // Same class: a corrupt key length must not size the allocation.
+        if key_len as u64 > file_len.saturating_sub(pos) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("SSTable key length {key_len} runs past the end of the file"),
+            ));
+        }
         let mut key = vec![0u8; key_len];
         r.read_exact(&mut key)?;
         pos += key_len as u64;

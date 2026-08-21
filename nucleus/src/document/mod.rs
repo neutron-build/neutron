@@ -305,7 +305,13 @@ fn decode_from(data: &[u8], cursor: &mut usize) -> Option<JsonValue> {
 
         TAG_ARRAY => {
             let count = read_u32(data, cursor)? as usize;
-            let mut arr = Vec::with_capacity(count);
+            // `count` comes out of stored/WAL bytes. An unbounded
+            // `with_capacity` ABORTS the process on Linux (allocation failure
+            // is not an `Err`) and silently succeeds on an overcommitting
+            // macOS. Every element costs at least its 1-byte tag, so the bytes
+            // remaining are an exact bound; the loop still returns `None` on
+            // truncation.
+            let mut arr = Vec::with_capacity(count.min(data.len().saturating_sub(*cursor)));
             for _ in 0..count {
                 arr.push(decode_from(data, cursor)?);
             }

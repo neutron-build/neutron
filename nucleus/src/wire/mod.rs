@@ -3195,9 +3195,18 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
     if ndim != 1 || bytes.len() < 20 {
         return None;
     }
-    let count = i32::from_be_bytes(bytes[12..16].try_into().ok()?);
+    let count = i32::from_be_bytes(bytes[12..16].try_into().ok()?).max(0) as usize;
     let mut off = 20;
-    let mut parts: Vec<String> = Vec::with_capacity(count.max(0) as usize);
+    // `count` is client-supplied over pgwire. `max(0)` only stops negatives: a
+    // positive ~2.1e9 asks `with_capacity` for ~51 GB of `String`, and a Rust
+    // allocation failure ABORTS the process (SIGABRT, no unwind, no `Err`) on
+    // Linux while succeeding on an overcommitting macOS. Every element carries
+    // at least a 4-byte length prefix, so a count larger than the bytes present
+    // is a lie — reject it instead of reserving for it.
+    if count > (bytes.len() - off) / 4 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(count);
     for _ in 0..count {
         if bytes.len() < off + 4 {
             return None;
@@ -4945,6 +4954,72 @@ mod tests {
     use super::*;
 
     // ── Binary-parameter typed decoding (corruption-class regression) ──
+
+    // ── Unbounded-preallocation class (NU-385) ──
+    //
+    // A count read out of a message and handed to `Vec::with_capacity` reserves
+    // that much; a Rust allocation failure ABORTS the process (SIGABRT, no
+    // unwind, no `Err`, no log) on Linux, and silently succeeds on this
+    // overcommitting macOS. So a round-trip of honest data proves nothing here:
+    // these tests hand the decoder a count that the bytes cannot back and
+    // require a refusal.
+
+    /// Build a one-dimensional binary array header with a DECLARED element
+    /// count and no elements behind it.
+    fn binary_array_header(ndim: i32, elem_oid: u32, declared_count: i32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&ndim.to_be_bytes());
+        b.extend_from_slice(&0i32.to_be_bytes()); // dataoffset
+        b.extend_from_slice(&elem_oid.to_be_bytes());
+        b.extend_from_slice(&declared_count.to_be_bytes());
+        b.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+        b
+    }
+
+    #[test]
+    fn binary_array_absurd_element_count_is_refused() {
+        // ~2.1e9 elements of `String` is ~51 GB of reservation, and this param
+        // is client-supplied over pgwire — remotely reachable by any client.
+        let bytes = binary_array_header(1, 23, 2_100_000_000);
+        assert_eq!(bytes.len(), 20, "header only, zero elements behind it");
+        assert!(
+            decode_binary_array(&bytes).is_none(),
+            "a declared count the bytes cannot back must be refused, not reserved"
+        );
+    }
+
+    #[test]
+    fn binary_array_count_just_past_the_bytes_is_refused() {
+        // Exactly one element present (4-byte len + 4-byte payload) but two
+        // declared: the off-by-one boundary of the bound.
+        let mut bytes = binary_array_header(1, 23, 2);
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&7i32.to_be_bytes());
+        assert!(
+            decode_binary_array(&bytes).is_none(),
+            "two declared elements with one present must fail"
+        );
+    }
+
+    #[test]
+    fn binary_array_honest_payload_still_decodes() {
+        // Positive control: the bound must not reject well-formed input.
+        let mut bytes = binary_array_header(1, 23, 2);
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&7i32.to_be_bytes());
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&9i32.to_be_bytes());
+        assert_eq!(decode_binary_array(&bytes), Some("{7,9}".to_string()));
+        // NULL elements (len = -1) carry no payload and must still pass.
+        let mut with_null = binary_array_header(1, 23, 2);
+        with_null.extend_from_slice(&(-1i32).to_be_bytes());
+        with_null.extend_from_slice(&4i32.to_be_bytes());
+        with_null.extend_from_slice(&5i32.to_be_bytes());
+        assert_eq!(
+            decode_binary_array(&with_null),
+            Some("{NULL,5}".to_string())
+        );
+    }
 
     #[test]
     fn binary_param_timestamp_decodes_to_literal() {

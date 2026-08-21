@@ -407,7 +407,11 @@ fn replay_store_legacy(data: &[u8], pos: &mut usize) -> Option<(String, BlobWalE
     };
     let total_size = read_u64(data, pos)?;
     let n_chunks = read_u32(data, pos)? as usize;
-    let mut chunks = Vec::with_capacity(n_chunks);
+    // Off-disk count: an unbounded `with_capacity` here ABORTS the process on
+    // Linux (allocation failure is not an `Err`) and silently succeeds on an
+    // overcommitting macOS. A chunk record is at least hash(32) + len(4) bytes,
+    // so the bytes remaining are an exact bound on how many can really follow.
+    let mut chunks = Vec::with_capacity(bounded_by_remaining(data, *pos, n_chunks, 36));
     for _ in 0..n_chunks {
         let hash = read_hash(data, pos)?;
         let chunk_len = read_u32(data, pos)? as usize;
@@ -445,7 +449,11 @@ fn replay_store_meta(data: &[u8], pos: &mut usize) -> Option<(String, BlobWalEnt
     };
     let total_size = read_u64(data, pos)?;
     let n_chunks = read_u32(data, pos)? as usize;
-    let mut chunks = Vec::with_capacity(n_chunks);
+    // Off-disk count: an unbounded `with_capacity` here ABORTS the process on
+    // Linux (allocation failure is not an `Err`) and silently succeeds on an
+    // overcommitting macOS. A chunk record is at least hash(32) + len(4) bytes,
+    // so the bytes remaining are an exact bound on how many can really follow.
+    let mut chunks = Vec::with_capacity(bounded_by_remaining(data, *pos, n_chunks, 36));
     for _ in 0..n_chunks {
         let hash = read_hash(data, pos)?;
         let len = read_u32(data, pos)?;
@@ -516,7 +524,9 @@ fn replay_snapshot_legacy(
         let Some(n_chunks) = read_u32(data, pos) else {
             return false;
         };
-        let mut chunks = Vec::with_capacity(n_chunks as usize);
+        // Off-disk count — bound by the bytes present, not by the claim.
+        let mut chunks =
+            Vec::with_capacity(bounded_by_remaining(data, *pos, n_chunks as usize, 36));
         for _ in 0..n_chunks as usize {
             let Some(hash) = read_hash(data, pos) else {
                 return false;
@@ -576,6 +586,17 @@ fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
     Some(u64::from_le_bytes([
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
     ]))
+}
+
+/// Bound a declared element count by the bytes actually left in `data`.
+///
+/// `min_elem_bytes` is the smallest size one element can occupy, so
+/// `remaining / min_elem_bytes` is a hard upper bound on how many elements the
+/// buffer can really hold. Reserving that never over-reserves, and the caller's
+/// loop still returns `None` the moment a read runs off the end — so a corrupt
+/// count fails cleanly instead of aborting the process.
+fn bounded_by_remaining(data: &[u8], pos: usize, declared: usize, min_elem_bytes: usize) -> usize {
+    declared.min(data.len().saturating_sub(pos) / min_elem_bytes)
 }
 
 fn read_hash(data: &[u8], pos: &mut usize) -> Option<[u8; 32]> {

@@ -234,7 +234,14 @@ fn replay(data: &[u8]) -> StreamsWalState {
                 let Some(n_fields) = read_u32(data, &mut pos) else {
                     break;
                 };
-                let mut fields = Vec::with_capacity(n_fields as usize);
+                // `n_fields` comes off disk and this WAL carries NO checksum, so
+                // nothing rejects a corrupt length before it reaches here. An
+                // unbounded `with_capacity` ABORTS the process on Linux (an
+                // allocation failure is not an `Err`) and silently succeeds on an
+                // overcommitting macOS. Each field costs at least two 4-byte
+                // length prefixes, so the bytes remaining are an exact bound.
+                let mut fields =
+                    Vec::with_capacity(bounded_by_remaining(data, pos, n_fields as usize, 8));
                 let mut ok = true;
                 for _ in 0..n_fields {
                     let Some(k) = read_string(data, &mut pos) else {
@@ -286,7 +293,10 @@ fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bo
         let Some(n_entries) = read_u32(data, pos) else {
             return false;
         };
-        let mut entries = Vec::with_capacity(n_entries as usize);
+        // Off-disk count, unchecksummed file: bound it by the bytes actually
+        // present. An entry costs at least ms(8) + seq(8) + n_fields(4).
+        let mut entries =
+            Vec::with_capacity(bounded_by_remaining(data, *pos, n_entries as usize, 20));
         for _ in 0..n_entries as usize {
             let Some(ms) = read_u64(data, pos) else {
                 return false;
@@ -297,7 +307,9 @@ fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bo
             let Some(n_fields) = read_u32(data, pos) else {
                 return false;
             };
-            let mut fields = Vec::with_capacity(n_fields as usize);
+            // Same: each field costs at least two 4-byte length prefixes.
+            let mut fields =
+                Vec::with_capacity(bounded_by_remaining(data, *pos, n_fields as usize, 8));
             for _ in 0..n_fields as usize {
                 let Some(k) = read_string(data, pos) else {
                     return false;
@@ -315,6 +327,18 @@ fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bo
 }
 
 // ---- Primitive readers ------------------------------------------------------
+
+/// Bound a declared element count by the bytes actually left in `data`.
+///
+/// `min_elem_bytes` is the smallest number of bytes one element can possibly
+/// occupy, so `remaining / min_elem_bytes` is a hard upper bound on how many
+/// elements this buffer can really contain. Reserving that instead of the
+/// declared count cannot over-reserve at all, and the caller's loop still stops
+/// (and fails) the moment a read runs off the end — so a corrupt count yields a
+/// clean failure rather than a `handle_alloc_error` abort.
+fn bounded_by_remaining(data: &[u8], pos: usize, declared: usize, min_elem_bytes: usize) -> usize {
+    declared.min(data.len().saturating_sub(pos) / min_elem_bytes)
+}
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
     let b = data.get(*pos..*pos + 4)?;
@@ -347,6 +371,107 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Unbounded-preallocation class (NU-385) ──
+    //
+    // These counts are `u32`s read straight out of the WAL, and this file
+    // carries NO checksum, so nothing rejects a bad length before the decoder
+    // sees it. Handing one to `Vec::with_capacity` reserves it, and a Rust
+    // allocation failure ABORTS the process (SIGABRT, no unwind, no `Err`, no
+    // log) on Linux while silently succeeding on an overcommitting macOS — a
+    // boot crash-loop from one corrupt file. An instrumented allocator recorded
+    // peak single reservations of 206.2 GB / 171.8 GB / 206.2 GB here for
+    // `u32::MAX` counts. Round-tripping honest data does NOT cover this, which
+    // is why the class survived: each test below hands the replayer a count the
+    // bytes cannot back and requires a refusal.
+
+    fn push_str_field(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// The bound itself: a `u32::MAX` count against a near-empty buffer must
+    /// collapse to a handful of elements, never to the declared count.
+    #[test]
+    fn declared_count_is_bounded_by_bytes_present() {
+        let data = [0u8; 16];
+        assert_eq!(bounded_by_remaining(&data, 0, u32::MAX as usize, 8), 2);
+        assert_eq!(bounded_by_remaining(&data, 0, u32::MAX as usize, 20), 0);
+        // Past the end must saturate, not underflow.
+        assert_eq!(bounded_by_remaining(&data, 999, u32::MAX as usize, 8), 0);
+        // An honest count under the bound is passed through untouched.
+        assert_eq!(bounded_by_remaining(&data, 0, 1, 8), 1);
+    }
+
+    /// XADD arm of `replay`: `n_fields` = `u32::MAX` with no fields behind it.
+    #[test]
+    fn xadd_absurd_field_count_is_refused_not_reserved() {
+        let mut buf = vec![ENTRY_XADD];
+        push_str_field(&mut buf, "events");
+        buf.extend_from_slice(&1000u64.to_le_bytes()); // ms
+        buf.extend_from_slice(&0u64.to_le_bytes()); // seq
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_fields, a lie
+        let state = replay(&buf);
+        assert!(
+            state.streams.is_empty(),
+            "a field count the bytes cannot back must abandon the entry"
+        );
+    }
+
+    /// `replay_snapshot`: `n_entries` = `u32::MAX` with no entries behind it.
+    #[test]
+    fn snapshot_absurd_entry_count_is_refused_not_reserved() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // n_streams
+        push_str_field(&mut buf, "events");
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_entries, a lie
+        let mut pos = 0usize;
+        let mut map = StreamsMap::new();
+        assert!(
+            !replay_snapshot(&buf, &mut pos, &mut map),
+            "an entry count the bytes cannot back must fail the snapshot"
+        );
+        assert!(map.is_empty());
+    }
+
+    /// `replay_snapshot`, per-entry: `n_fields` = `u32::MAX` inside an
+    /// otherwise well-formed entry.
+    #[test]
+    fn snapshot_absurd_per_entry_field_count_is_refused_not_reserved() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // n_streams
+        push_str_field(&mut buf, "events");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // n_entries, honest
+        buf.extend_from_slice(&1000u64.to_le_bytes()); // ms
+        buf.extend_from_slice(&0u64.to_le_bytes()); // seq
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_fields, a lie
+        let mut pos = 0usize;
+        let mut map = StreamsMap::new();
+        assert!(
+            !replay_snapshot(&buf, &mut pos, &mut map),
+            "a per-entry field count the bytes cannot back must fail the snapshot"
+        );
+        assert!(map.is_empty());
+    }
+
+    /// A whole snapshot entry reached through `replay`, so the corrupt count
+    /// must not wipe state already recovered from the entries before it.
+    #[test]
+    fn corrupt_snapshot_count_does_not_discard_recovered_state() {
+        let mut buf = vec![ENTRY_XADD];
+        push_str_field(&mut buf, "events");
+        buf.extend_from_slice(&1000u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        push_str_field(&mut buf, "k");
+        push_str_field(&mut buf, "v");
+        // Now a snapshot whose stream count is a lie.
+        buf.push(ENTRY_SNAPSHOT);
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        let state = replay(&buf);
+        assert_eq!(state.streams.len(), 1);
+        assert_eq!(state.streams["events"].len(), 1);
+    }
 
     #[test]
     fn group_sync_marks_clean() {

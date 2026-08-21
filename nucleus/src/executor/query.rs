@@ -1901,6 +1901,22 @@ impl Executor {
                     | ast::JoinOperator::RightOuter(_)
                     | ast::JoinOperator::Right(_)
                     | ast::JoinOperator::FullOuter(_) => return false,
+                    // USING and NATURAL carry a join condition the plan path
+                    // cannot express. `plan_query` keeps only
+                    // `JoinConstraint::On` and maps every other constraint to
+                    // `None`, which builds an UNCONDITIONED nested-loop join --
+                    // so `r1 JOIN r2 USING (id)` over two five-row tables
+                    // returned all 25 combined rows instead of 5, silently and
+                    // with no error. The AST path expands both correctly, so
+                    // decline to plan them exactly as the outer joins above do.
+                    //
+                    // A bare `JOIN` with no constraint is declined by the same
+                    // test; it is a cross join and the AST path handles it.
+                    ast::JoinOperator::Inner(c) | ast::JoinOperator::Join(c)
+                        if !matches!(c, ast::JoinConstraint::On(_)) =>
+                    {
+                        return false;
+                    }
                     _ => {}
                 }
             }
@@ -5480,6 +5496,7 @@ impl Executor {
             // GROUP BY, HAVING, DISTINCT), bypass plan cache and plan executor entirely.
             // Directly calls index_lookup → saves 2 plan clones + 2 write lock acqs.
             if !rls_guarded
+                && !self.privileges_enforced_for_session()
                 && let SetExpr::Select(ref select) = *query.body
                 && select.from.len() == 1
                 && select.from[0].joins.is_empty()
@@ -5558,6 +5575,7 @@ impl Executor {
                 let planned_query = normalized.as_ref().unwrap_or(&query);
                 if use_plan
                     && !rls_guarded
+                    && !self.privileges_enforced_for_session()
                     && let SetExpr::Select(ref select) = *planned_query.body
                     && Self::query_eligible_for_plan(select, planned_query)
                 {
@@ -6611,6 +6629,12 @@ impl Executor {
         cte_tables: &CteTableMap,
     ) -> Result<Option<ExecResult>, ExecError> {
         if self.any_rls_active() {
+            return Ok(None);
+        }
+        // Guard 0: the SELECT grant is checked on the AST read route only, so a
+        // session that has to pass that gate must not be answered from here --
+        // a role with no grant at all was reading a table through COUNT(*).
+        if self.privileges_enforced_for_session() {
             return Ok(None);
         }
         // Guard 1: single FROM table, no JOINs
@@ -8318,7 +8342,7 @@ impl Executor {
         // Columnar fast-aggregate (before any row scan)
         // Intercepts COUNT(*) / SUM / AVG / GROUP BY on ColumnarStorageEngine tables.
         // Returns None if the engine doesn't support it or the pattern is unsupported.
-        if !self.any_table_secured()
+        if self.read_fast_paths_permitted()
             && let Some(fast) = self.try_columnar_fast_aggregate(select, cte_tables)?
         {
             return Ok(SelectResult::Projected(fast));
@@ -8328,7 +8352,7 @@ impl Executor {
         // (SELECT list + WHERE) are covered by a single B-tree index, return
         // results directly from the index without any heap/table access.
         // This achieves 1.5-2x speedup for covering index queries.
-        if !self.any_table_secured()
+        if self.read_fast_paths_permitted()
             && select.from.len() == 1
             && select.from[0].joins.is_empty()
             && let TableFactor::Table {
@@ -8353,7 +8377,7 @@ impl Executor {
         // Index-aware optimization (fully synchronous)
         // For simple single-table queries with WHERE equality predicates,
         // try to use a B-tree index instead of a full table scan.
-        let index_result: IndexScanResult = if !self.any_table_secured()
+        let index_result: IndexScanResult = if self.read_fast_paths_permitted()
             && select.from.len() == 1
             && select.from[0].joins.is_empty()
         {
@@ -8413,7 +8437,7 @@ impl Executor {
                     rows
                 };
                 (col_meta, filtered, sorted_by)
-            } else if !self.any_table_secured()
+            } else if self.read_fast_paths_permitted()
                 && let Some((col_meta, rows)) = self.try_columnar_filtered_scan(select, cte_tables)
             {
                 // Columnar filter pushdown: engine filtered non-matching rows before
@@ -8560,7 +8584,7 @@ impl Executor {
         // When FROM t1, t2 WHERE t1.pk = t2.fk AND t2.filter, defer loading t1
         // until we know the join strategy. If t2 is small and t1's join key is
         // indexed, use batch index lookups instead of scanning all of t1.
-        if !self.any_table_secured()
+        if self.read_fast_paths_permitted()
             && from.len() == 2
             && from[0].joins.is_empty()
             && from[1].joins.is_empty()
@@ -8767,7 +8791,7 @@ impl Executor {
                 // Index nested-loop optimization: when one side is small and the
                 // join key on the other side is indexed, replace the full table
                 // with batch index lookups — avoids scanning the large table.
-                let effective_left = if !self.any_table_secured()
+                let effective_left = if self.read_fast_paths_permitted()
                     && filtered_right.len() < 1000
                     && left_keys.len() == 1
                 {

@@ -202,9 +202,17 @@ fn serialize_column(col: &ColumnData) -> Vec<u8> {
 /// Deserialize a column from raw bytes.
 fn deserialize_column(data: &[u8], col_type: u8, row_count: usize) -> io::Result<ColumnData> {
     let mut pos = 0;
+    // `row_count` is a segment-header field. A whole-payload CRC32C is verified
+    // in `from_bytes` before this runs, so ordinary bit-rot is already caught —
+    // but a CRC-consistent crafted header still reaches here, and an unbounded
+    // `with_capacity` ABORTS the process on Linux (allocation failure is not an
+    // `Err`) while silently succeeding on an overcommitting macOS. Every arm
+    // below consumes at least one byte per row, so this column's own byte
+    // length is a hard bound; the reads still return EOF on truncation.
+    let cap = row_count.min(data.len());
     match col_type {
         COL_TYPE_BOOL => {
-            let mut vals = Vec::with_capacity(row_count);
+            let mut vals = Vec::with_capacity(cap);
             for _ in 0..row_count {
                 let b = *data.get(pos).ok_or_else(eof)?;
                 pos += 1;
@@ -217,7 +225,7 @@ fn deserialize_column(data: &[u8], col_type: u8, row_count: usize) -> io::Result
             Ok(ColumnData::Bool(vals))
         }
         COL_TYPE_INT32 => {
-            let mut vals = Vec::with_capacity(row_count);
+            let mut vals = Vec::with_capacity(cap);
             for _ in 0..row_count {
                 let flag = *data.get(pos).ok_or_else(eof)?;
                 pos += 1;
@@ -231,7 +239,7 @@ fn deserialize_column(data: &[u8], col_type: u8, row_count: usize) -> io::Result
             Ok(ColumnData::Int32(vals))
         }
         COL_TYPE_INT64 => {
-            let mut vals = Vec::with_capacity(row_count);
+            let mut vals = Vec::with_capacity(cap);
             for _ in 0..row_count {
                 let flag = *data.get(pos).ok_or_else(eof)?;
                 pos += 1;
@@ -245,7 +253,7 @@ fn deserialize_column(data: &[u8], col_type: u8, row_count: usize) -> io::Result
             Ok(ColumnData::Int64(vals))
         }
         COL_TYPE_FLOAT64 => {
-            let mut vals = Vec::with_capacity(row_count);
+            let mut vals = Vec::with_capacity(cap);
             for _ in 0..row_count {
                 let flag = *data.get(pos).ok_or_else(eof)?;
                 pos += 1;
@@ -259,7 +267,7 @@ fn deserialize_column(data: &[u8], col_type: u8, row_count: usize) -> io::Result
             Ok(ColumnData::Float64(vals))
         }
         COL_TYPE_TEXT => {
-            let mut vals = Vec::with_capacity(row_count);
+            let mut vals = Vec::with_capacity(cap);
             for _ in 0..row_count {
                 let flag = *data.get(pos).ok_or_else(eof)?;
                 pos += 1;
@@ -582,7 +590,11 @@ impl SegmentReader {
         pos += 2; // reserved
 
         // Parse column metadata
-        let mut col_metas = Vec::with_capacity(col_count as usize);
+        // Header field again: a column meta costs at least name_len(2) +
+        // type(1) + compressed(4) + uncompressed(4) = 11 bytes, so the bytes
+        // remaining bound how many can really follow.
+        let mut col_metas =
+            Vec::with_capacity((col_count as usize).min(data.len().saturating_sub(pos) / 11));
         for _ in 0..col_count {
             let name_len = read_u16_le(&data, &mut pos)? as usize;
             if pos + name_len > data.len() {
