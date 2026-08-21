@@ -3630,7 +3630,7 @@ impl Executor {
                     {
                         // Parse single sort key
                         let key_str = &keys[0];
-                        let (base, _nulls) =
+                        let (base, explicit_nulls_first) =
                             if key_str.to_uppercase().strip_suffix("NULLS FIRST").is_some() {
                                 (
                                     key_str[..key_str.len() - "NULLS FIRST".len()].trim(),
@@ -3683,7 +3683,20 @@ impl Executor {
                                 None
                             };
 
+                        // `fast_scan_where_eq_topk` takes only `desc` as its ordering
+                        // input and orders by raw `Value::cmp`, which fixes NULL at
+                        // the high end. That coincides with the SQL DEFAULTS --
+                        // ASC/NULLS LAST and DESC/NULLS FIRST -- and therefore
+                        // disagrees with every explicit override. The NULLS clause
+                        // was parsed here and thrown away, so
+                        // `ORDER BY ts ASC NULLS FIRST LIMIT 5` returned the five
+                        // smallest non-NULL timestamps where SQL requires five NULLs,
+                        // while the unfused paths honoured it via `cmp_sort_key`.
+                        //
+                        // Decline the fusion when the explicit clause contradicts what
+                        // the fused ordering can express; the default cases keep it.
                         if let Some((table, key_expr)) = scan_table_and_expr
+                            && explicit_nulls_first.is_none_or(|first| first == sort_desc)
                             && let Some((col_name, _)) = planner::is_equality_predicate(&key_expr)
                             && let Some(filter_val) = Self::extract_equality_value(&key_expr)
                             && let Ok(table_def) = self.get_table(&table).await
