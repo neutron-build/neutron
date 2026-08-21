@@ -658,6 +658,64 @@ fn normalize_fetch_in_table_factor(factor: &mut ast::TableFactor) -> Result<(), 
     }
 }
 
+/// Refuse SELECT clauses that are parsed and then never read.
+///
+/// `sqlparser` populates these fields and no execution path consumes any of
+/// them, so each was accepted and silently discarded. The worst is
+/// `SELECT ... INTO`: `SELECT * INTO backup FROM users` returned the rows of
+/// `users` and never created `backup`, so an operator who ran it got a backup
+/// that does not exist and no indication of it. `QUALIFY` is a filter, so
+/// dropping it returns rows that should have been excluded. `SORT BY`,
+/// `CLUSTER BY` and `DISTRIBUTE BY` are ordering and distribution requests that
+/// silently did nothing.
+///
+/// Refusing is the established answer here -- the same one
+/// `reject_unsupported_row_locks` gives `FOR UPDATE SKIP LOCKED` -- because a
+/// clause that carries a guarantee must not be accepted unless it is honoured.
+fn reject_ignored_select_clauses(query: &ast::Query) -> Result<(), ExecError> {
+    fn check(body: &ast::SetExpr) -> Result<(), ExecError> {
+        match body {
+            ast::SetExpr::Query(inner) => check(&inner.body),
+            ast::SetExpr::SetOperation { left, right, .. } => {
+                check(left)?;
+                check(right)
+            }
+            ast::SetExpr::Select(select) => {
+                if select.into.is_some() {
+                    return Err(ExecError::Unsupported(
+                        "SELECT ... INTO is not implemented. It was previously accepted and \
+                         silently returned the rows WITHOUT creating the target table. Use \
+                         CREATE TABLE ... AS SELECT instead."
+                            .into(),
+                    ));
+                }
+                if select.qualify.is_some() {
+                    return Err(ExecError::Unsupported(
+                        "QUALIFY is not implemented. Filtering on a window function result \
+                         must be written as a subquery with a WHERE on the outer query."
+                            .into(),
+                    ));
+                }
+                for (clause, empty) in [
+                    ("SORT BY", select.sort_by.is_empty()),
+                    ("CLUSTER BY", select.cluster_by.is_empty()),
+                    ("DISTRIBUTE BY", select.distribute_by.is_empty()),
+                ] {
+                    if !empty {
+                        return Err(ExecError::Unsupported(format!(
+                            "{clause} is not implemented and was previously accepted and \
+                             ignored. Use ORDER BY."
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    check(&query.body)
+}
+
 fn normalize_fetch_into_limit(query: &mut ast::Query) -> Result<(), ExecError> {
     // A FETCH can sit on any nested query -- a CTE body, a set-operation arm, a
     // derived table in FROM -- and each is executed as its own query, so each
@@ -5873,6 +5931,9 @@ impl Executor {
 
                 // FETCH FIRST/NEXT is parsed into a field no execution path
                 // reads; fold it into the LIMIT that every path does read.
+                // Clauses sqlparser fills in that no execution path reads.
+                reject_ignored_select_clauses(&query)?;
+
                 let mut query = query;
                 normalize_fetch_into_limit(&mut query)?;
 
