@@ -6,31 +6,70 @@
 //!
 //! ## Log entry binary format
 //! ```text
-//! XADD:     [0x01] [stream_name_len: u32 LE] [stream_name: bytes]
-//!           [ms: u64 LE] [seq: u64 LE]
-//!           [n_fields: u32 LE] [per field: key_len(u32) + key + val_len(u32) + val]
-//! SNAPSHOT: [0x02] [n_streams: u32 LE]
-//!           [per stream: name_len(u32) + name + n_entries(u32)
-//!            + per entry: ms(u64) + seq(u64) + n_fields(u32)
-//!            + per field: key_len(u32) + key + val_len(u32) + val]
+//! XADD:      [0x01] [stream_name_len: u32 LE] [stream_name: bytes]
+//!            [ms: u64 LE] [seq: u64 LE]
+//!            [n_fields: u32 LE] [per field: key_len(u32) + key + val_len(u32) + val]
+//! SNAPSHOT:  [0x02] [n_streams: u32 LE]
+//!            [per stream: name_len(u32) + name + n_entries(u32)
+//!             + per entry: ms(u64) + seq(u64) + n_fields(u32)
+//!             + per field: key_len(u32) + key + val_len(u32) + val]
+//! SNAPSHOT2: [0x03] [n_streams: u32 LE]
+//!            [per stream: name_len(u32) + name
+//!             + has_max_len(u8) + max_len(u64)
+//!             + n_entries(u32) + entries (as SNAPSHOT)
+//!             + n_groups(u32) + per group:
+//!                 name_len(u32) + name
+//!                 + last_delivered_ms(u64) + last_delivered_seq(u64)
+//!                 + n_consumers(u32) + per consumer: len(u32) + name
+//!                 + n_pending_consumers(u32) + per: len(u32) + name
+//!                     + n_ids(u32) + per id: ms(u64) + seq(u64)]
+//! XGROUP:    [0x04] [stream_name] [group_name] [start_ms: u64] [start_seq: u64]
+//! XREADGROUP:[0x05] [stream_name] [group_name] [consumer]
+//!            [last_delivered_ms: u64] [last_delivered_seq: u64]
+//!            [n_ids: u32] [per id: ms(u64) + seq(u64)]
+//! XACK:      [0x06] [stream_name] [group_name]
+//!            [n_ids: u32] [per id: ms(u64) + seq(u64)]
 //! ```
 //!
-//! A SNAPSHOT resets all state. After `checkpoint()` the file is truncated to
-//! a single SNAPSHOT entry so the log stays small.
+//! A SNAPSHOT (either version) resets all state. After `checkpoint()` the file
+//! is truncated to a single SNAPSHOT2 entry so the log stays small.
+//!
+//! ## Format evolution (S31-05)
+//!
+//! Opcodes `0x03`-`0x06` were added after `0x01`/`0x02` shipped, so consumer
+//! groups, cursors, pending lists and acks — the one part of stream state a
+//! client cannot reconstruct — survive a restart. Compatibility is by
+//! **addition only**: `0x01` and `0x02` keep their exact byte layouts, so a
+//! log written before groups existed still replays (a `0x02` snapshot simply
+//! recovers no groups, which is what that file actually recorded). Nothing
+//! reads a version header, because there is none and adding one would break
+//! exactly those old files.
+//!
+//! The truncation contract in `replay` is preserved too: every new arm either
+//! applies whole or abandons the record at `entry_start`, so a torn tail is
+//! still truncated to the last valid boundary rather than half-applied. This
+//! log carries no checksum, so replay stopping remains the only detection
+//! there is — which is also why every count read off disk is bounded by
+//! `bounded_by_remaining` before it reaches `Vec::with_capacity`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
-use super::{Stream, StreamEntryId};
+use super::{ConsumerGroup, Stream, StreamEntryId};
 
 // ---- Entry type tags --------------------------------------------------------
 
 const ENTRY_XADD: u8 = 0x01;
 const ENTRY_SNAPSHOT: u8 = 0x02;
+/// Snapshot carrying consumer groups and `max_len` as well as entries.
+const ENTRY_SNAPSHOT_V2: u8 = 0x03;
+const ENTRY_XGROUP_CREATE: u8 = 0x04;
+const ENTRY_XREADGROUP: u8 = 0x05;
+const ENTRY_XACK: u8 = 0x06;
 
 // ---- Public types -----------------------------------------------------------
 
@@ -40,10 +79,21 @@ pub type StreamEntry = (StreamEntryId, Vec<(String, String)>);
 /// Per-stream recovered entries, keyed by stream name.
 pub type StreamsMap = HashMap<String, Vec<StreamEntry>>;
 
+/// Per-stream recovered consumer groups: `stream_name -> group_name -> group`.
+pub type StreamGroupsMap = HashMap<String, HashMap<String, ConsumerGroup>>;
+
 /// Recovered streams state from WAL replay.
+#[derive(Default)]
 pub struct StreamsWalState {
     /// `stream_name -> Vec<(entry_id, fields)>` in order.
     pub streams: StreamsMap,
+    /// `stream_name -> group_name -> group` (cursor, consumers, pending list).
+    ///
+    /// A stream can appear here and not in `streams` (a group created on a
+    /// stream that has no entries yet) and vice versa.
+    pub groups: StreamGroupsMap,
+    /// `stream_name -> max_len` for streams that carry a cap.
+    pub max_len: HashMap<String, usize>,
 }
 
 /// Append-only Streams WAL.
@@ -80,9 +130,7 @@ impl StreamsWal {
             }
             state
         } else {
-            StreamsWalState {
-                streams: HashMap::new(),
-            }
+            StreamsWalState::default()
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
@@ -119,8 +167,73 @@ impl StreamsWal {
             write_str(&mut buf, v);
         }
 
+        self.append(&buf)
+    }
+
+    /// Log the creation (or idempotent re-creation) of a consumer group.
+    ///
+    /// Group state is the one part of a stream a client cannot rebuild for
+    /// itself: entries are re-readable, a cursor is not. Before this existed
+    /// (S31-05) a restart dropped every group, and `STREAM_XREADGROUP` against
+    /// the vanished group returned an empty result — indistinguishable from
+    /// "caught up", so a consumer silently skipped everything it had not yet
+    /// processed instead of failing.
+    pub fn log_xgroup_create(
+        &self,
+        stream_name: &str,
+        group: &str,
+        start_id: &StreamEntryId,
+    ) -> io::Result<()> {
+        let mut buf = vec![ENTRY_XGROUP_CREATE];
+        write_str(&mut buf, stream_name);
+        write_str(&mut buf, group);
+        buf.extend_from_slice(&start_id.ms.to_le_bytes());
+        buf.extend_from_slice(&start_id.seq.to_le_bytes());
+        self.append(&buf)
+    }
+
+    /// Log a group delivery: the advanced cursor, the consumer that claimed the
+    /// entries, and the ids added to that consumer's pending list (the PEL).
+    pub fn log_xreadgroup(
+        &self,
+        stream_name: &str,
+        group: &str,
+        consumer: &str,
+        last_delivered: &StreamEntryId,
+        delivered: &[StreamEntryId],
+    ) -> io::Result<()> {
+        let mut buf = vec![ENTRY_XREADGROUP];
+        write_str(&mut buf, stream_name);
+        write_str(&mut buf, group);
+        write_str(&mut buf, consumer);
+        buf.extend_from_slice(&last_delivered.ms.to_le_bytes());
+        buf.extend_from_slice(&last_delivered.seq.to_le_bytes());
+        write_ids(&mut buf, delivered);
+        self.append(&buf)
+    }
+
+    /// Log an acknowledgement: the ids leave the group's pending list.
+    pub fn log_xack(
+        &self,
+        stream_name: &str,
+        group: &str,
+        ids: &[StreamEntryId],
+    ) -> io::Result<()> {
+        let mut buf = vec![ENTRY_XACK];
+        write_str(&mut buf, stream_name);
+        write_str(&mut buf, group);
+        write_ids(&mut buf, ids);
+        self.append(&buf)
+    }
+
+    /// Append one complete, self-contained record.
+    ///
+    /// Records are built in full in memory first so a single `write_all` puts
+    /// the whole record in the page cache: a partial record can only ever be a
+    /// torn *tail*, which `open` truncates, never a hole in the middle.
+    fn append(&self, buf: &[u8]) -> io::Result<()> {
         let mut w = self.writer.lock();
-        w.write_all(&buf)?;
+        w.write_all(buf)?;
         w.flush()?;
         self.syncer.on_append();
         Ok(())
@@ -149,16 +262,38 @@ impl StreamsWal {
 
     /// Write a full snapshot and truncate the log to just that snapshot.
     ///
-    /// `streams` maps stream name to its current entries.
+    /// `streams` maps stream name to its current state — entries, consumer
+    /// groups and `max_len`. Everything the in-memory `Stream` holds is written,
+    /// so the snapshot is a complete replacement for the log it replaces; a
+    /// checkpoint that dropped group state would silently un-persist the very
+    /// records `log_xgroup_create`/`log_xreadgroup`/`log_xack` just wrote.
+    ///
+    /// Written with the `SNAPSHOT2` opcode. Iteration is sorted throughout so
+    /// checkpointing unchanged state produces identical bytes.
     pub fn checkpoint(&self, streams: &HashMap<String, Stream>) -> io::Result<()> {
         let mut payload = Vec::new();
 
         // n_streams
         payload.extend_from_slice(&(streams.len() as u32).to_le_bytes());
 
-        for (name, stream) in streams {
+        let mut names: Vec<&String> = streams.keys().collect();
+        names.sort();
+        for name in names {
+            let stream = &streams[name];
             // stream name
             write_str(&mut payload, name);
+
+            // max_len (flagged, so `Some(0)` and `None` stay distinct)
+            match stream.max_len {
+                Some(n) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(n as u64).to_le_bytes());
+                }
+                None => {
+                    payload.push(0);
+                    payload.extend_from_slice(&0u64.to_le_bytes());
+                }
+            }
 
             // n_entries
             payload.extend_from_slice(&(stream.entries.len() as u32).to_le_bytes());
@@ -175,11 +310,37 @@ impl StreamsWal {
                     write_str(&mut payload, v);
                 }
             }
+
+            // consumer groups
+            payload.extend_from_slice(&(stream.groups.len() as u32).to_le_bytes());
+            let mut group_names: Vec<&String> = stream.groups.keys().collect();
+            group_names.sort();
+            for gname in group_names {
+                let g = &stream.groups[gname];
+                write_str(&mut payload, &g.name);
+                payload.extend_from_slice(&g.last_delivered_id.ms.to_le_bytes());
+                payload.extend_from_slice(&g.last_delivered_id.seq.to_le_bytes());
+
+                let mut consumers: Vec<&String> = g.consumers.iter().collect();
+                consumers.sort();
+                payload.extend_from_slice(&(consumers.len() as u32).to_le_bytes());
+                for c in consumers {
+                    write_str(&mut payload, c);
+                }
+
+                let mut pending: Vec<(&String, &Vec<StreamEntryId>)> = g.pending.iter().collect();
+                pending.sort_by(|a, b| a.0.cmp(b.0));
+                payload.extend_from_slice(&(pending.len() as u32).to_le_bytes());
+                for (consumer, ids) in pending {
+                    write_str(&mut payload, consumer);
+                    write_ids(&mut payload, ids);
+                }
+            }
         }
 
-        // Serialize the complete new log body (SNAPSHOT tag + payload).
+        // Serialize the complete new log body (SNAPSHOT2 tag + payload).
         let mut contents = Vec::with_capacity(payload.len() + 1);
-        contents.push(ENTRY_SNAPSHOT);
+        contents.push(ENTRY_SNAPSHOT_V2);
         contents.extend_from_slice(&payload);
 
         // Hold the writer lock across the whole checkpoint so no append can interleave
@@ -202,13 +363,27 @@ impl StreamsWal {
 ///
 /// Call this after `StreamsWal::open()` to rebuild the `HashMap<String, Stream>`.
 pub fn rebuild_streams(state: &StreamsWalState) -> HashMap<String, Stream> {
-    let mut result = HashMap::new();
+    let mut result: HashMap<String, Stream> = HashMap::new();
     for (name, entries) in &state.streams {
         let mut stream = Stream::new();
+        // Set the cap before replaying, so the recovered stream trims exactly
+        // where the live one did rather than exceeding its own max_len.
+        stream.max_len = state.max_len.get(name).copied();
         for (id, fields) in entries {
             stream.xadd_with_id(id.clone(), fields.clone());
         }
         result.insert(name.clone(), stream);
+    }
+    // A group can exist on a stream with no entries (created, never written to,
+    // or drained by a trim), so groups drive their own pass rather than riding
+    // along with entries.
+    for (name, groups) in &state.groups {
+        let stream = result.entry(name.clone()).or_insert_with(|| {
+            let mut s = Stream::new();
+            s.max_len = state.max_len.get(name).copied();
+            s
+        });
+        stream.groups = groups.clone();
     }
     result
 }
@@ -219,6 +394,14 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
     buf.extend_from_slice(b);
+}
+
+fn write_ids(buf: &mut Vec<u8>, ids: &[StreamEntryId]) {
+    buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
+        buf.extend_from_slice(&id.ms.to_le_bytes());
+        buf.extend_from_slice(&id.seq.to_le_bytes());
+    }
 }
 
 // ---- Replay -----------------------------------------------------------------
@@ -232,13 +415,22 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
 /// of the clean prefix, and `entry_start` is the truncation point.
 fn replay(data: &[u8]) -> (StreamsWalState, usize) {
     let mut streams: StreamsMap = HashMap::new();
+    let mut groups: StreamGroupsMap = HashMap::new();
+    let mut max_len: HashMap<String, usize> = HashMap::new();
     let mut pos = 0usize;
 
     while pos < data.len() {
         let entry_start = pos;
         macro_rules! torn {
             () => {{
-                return (StreamsWalState { streams }, entry_start);
+                return (
+                    StreamsWalState {
+                        streams,
+                        groups,
+                        max_len,
+                    },
+                    entry_start,
+                );
             }};
         }
 
@@ -289,15 +481,99 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                     .or_default()
                     .push((StreamEntryId::new(ms, seq), fields));
             }
-            ENTRY_SNAPSHOT => {
+            ENTRY_SNAPSHOT | ENTRY_SNAPSHOT_V2 => {
                 // Parse into a temporary map and only swap it in once the snapshot
                 // parses completely. Clearing first meant a corrupt/truncated
                 // snapshot wiped all already-recovered state before failing.
-                let mut snapshot = StreamsMap::new();
-                if replay_snapshot(data, &mut pos, &mut snapshot) {
-                    streams = snapshot;
+                //
+                // `ENTRY_SNAPSHOT` (0x02) is the pre-groups layout and is still
+                // accepted verbatim: a log written before S31-05 must replay.
+                // It recovers no groups and no max_len, which is exactly what
+                // that file recorded — and a snapshot resets ALL state, so the
+                // group maps are replaced (emptied), not merged into.
+                let with_groups = entry_type == ENTRY_SNAPSHOT_V2;
+                let mut snapshot = StreamsWalState::default();
+                if replay_snapshot(data, &mut pos, &mut snapshot, with_groups) {
+                    streams = snapshot.streams;
+                    groups = snapshot.groups;
+                    max_len = snapshot.max_len;
                 } else {
                     torn!();
+                }
+            }
+            ENTRY_XGROUP_CREATE => {
+                let Some(stream_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(group_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(ms) = read_u64(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(seq) = read_u64(data, &mut pos) else {
+                    torn!();
+                };
+                // Idempotent-overwrite, matching `Stream::xgroup_create`: a
+                // re-create resets the cursor and drops the pending list.
+                groups.entry(stream_name).or_default().insert(
+                    group_name.clone(),
+                    ConsumerGroup {
+                        name: group_name,
+                        last_delivered_id: StreamEntryId::new(ms, seq),
+                        pending: HashMap::new(),
+                        consumers: HashSet::new(),
+                    },
+                );
+            }
+            ENTRY_XREADGROUP => {
+                let Some(stream_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(group_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(consumer) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(ms) = read_u64(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(seq) = read_u64(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(ids) = read_ids(data, &mut pos) else {
+                    torn!();
+                };
+                // A delivery against a group the log never created cannot be
+                // applied to anything; skip it rather than inventing a group
+                // with a cursor nobody chose.
+                if let Some(g) = groups
+                    .get_mut(&stream_name)
+                    .and_then(|m| m.get_mut(&group_name))
+                {
+                    g.last_delivered_id = StreamEntryId::new(ms, seq);
+                    g.consumers.insert(consumer.clone());
+                    g.pending.entry(consumer).or_default().extend(ids);
+                }
+            }
+            ENTRY_XACK => {
+                let Some(stream_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(group_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(ids) = read_ids(data, &mut pos) else {
+                    torn!();
+                };
+                if let Some(g) = groups
+                    .get_mut(&stream_name)
+                    .and_then(|m| m.get_mut(&group_name))
+                {
+                    for pending in g.pending.values_mut() {
+                        pending.retain(|id| !ids.contains(id));
+                    }
                 }
             }
             _ => {
@@ -307,10 +583,28 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
         }
     }
 
-    (StreamsWalState { streams }, pos)
+    (
+        StreamsWalState {
+            streams,
+            groups,
+            max_len,
+        },
+        pos,
+    )
 }
 
-fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bool {
+/// Parse a snapshot body into `out`.
+///
+/// `with_groups` selects the layout: `false` is the original `ENTRY_SNAPSHOT`
+/// (0x02) body, `true` the `ENTRY_SNAPSHOT_V2` (0x03) body that additionally
+/// carries `max_len` and consumer groups per stream. The two differ only by
+/// added fields, so the old parse is the new one with those reads skipped.
+fn replay_snapshot(
+    data: &[u8],
+    pos: &mut usize,
+    out: &mut StreamsWalState,
+    with_groups: bool,
+) -> bool {
     let Some(n_streams) = read_u32(data, pos) else {
         return false;
     };
@@ -318,6 +612,18 @@ fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bo
         let Some(name) = read_string(data, pos) else {
             return false;
         };
+        if with_groups {
+            let Some(&flag) = data.get(*pos) else {
+                return false;
+            };
+            *pos += 1;
+            let Some(cap) = read_u64(data, pos) else {
+                return false;
+            };
+            if flag == 1 {
+                out.max_len.insert(name.clone(), cap as usize);
+            }
+        }
         let Some(n_entries) = read_u32(data, pos) else {
             return false;
         };
@@ -349,7 +655,59 @@ fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bo
             }
             entries.push((StreamEntryId::new(ms, seq), fields));
         }
-        streams.insert(name, entries);
+        if with_groups {
+            let Some(n_groups) = read_u32(data, pos) else {
+                return false;
+            };
+            let mut stream_groups: HashMap<String, ConsumerGroup> = HashMap::new();
+            for _ in 0..n_groups as usize {
+                let Some(gname) = read_string(data, pos) else {
+                    return false;
+                };
+                let Some(last_ms) = read_u64(data, pos) else {
+                    return false;
+                };
+                let Some(last_seq) = read_u64(data, pos) else {
+                    return false;
+                };
+                let Some(n_consumers) = read_u32(data, pos) else {
+                    return false;
+                };
+                let mut consumers = HashSet::new();
+                for _ in 0..n_consumers as usize {
+                    let Some(c) = read_string(data, pos) else {
+                        return false;
+                    };
+                    consumers.insert(c);
+                }
+                let Some(n_pending) = read_u32(data, pos) else {
+                    return false;
+                };
+                let mut pending: HashMap<String, Vec<StreamEntryId>> = HashMap::new();
+                for _ in 0..n_pending as usize {
+                    let Some(c) = read_string(data, pos) else {
+                        return false;
+                    };
+                    let Some(ids) = read_ids(data, pos) else {
+                        return false;
+                    };
+                    pending.insert(c, ids);
+                }
+                stream_groups.insert(
+                    gname.clone(),
+                    ConsumerGroup {
+                        name: gname,
+                        last_delivered_id: StreamEntryId::new(last_ms, last_seq),
+                        pending,
+                        consumers,
+                    },
+                );
+            }
+            if !stream_groups.is_empty() {
+                out.groups.insert(name.clone(), stream_groups);
+            }
+        }
+        out.streams.insert(name, entries);
     }
     true
 }
@@ -366,6 +724,22 @@ fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bo
 /// clean failure rather than a `handle_alloc_error` abort.
 fn bounded_by_remaining(data: &[u8], pos: usize, declared: usize, min_elem_bytes: usize) -> usize {
     declared.min(data.len().saturating_sub(pos) / min_elem_bytes)
+}
+
+/// Read a length-prefixed run of entry ids.
+///
+/// The count is off-disk and this log has no checksum, so it goes through
+/// `bounded_by_remaining` before `with_capacity` — an id costs 16 bytes
+/// (ms + seq), which is an exact bound on how many the buffer can hold.
+fn read_ids(data: &[u8], pos: &mut usize) -> Option<Vec<StreamEntryId>> {
+    let n = read_u32(data, pos)?;
+    let mut ids = Vec::with_capacity(bounded_by_remaining(data, *pos, n as usize, 16));
+    for _ in 0..n as usize {
+        let ms = read_u64(data, pos)?;
+        let seq = read_u64(data, pos)?;
+        ids.push(StreamEntryId::new(ms, seq));
+    }
+    Some(ids)
 }
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
@@ -454,12 +828,12 @@ mod tests {
         push_str_field(&mut buf, "events");
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_entries, a lie
         let mut pos = 0usize;
-        let mut map = StreamsMap::new();
+        let mut out = StreamsWalState::default();
         assert!(
-            !replay_snapshot(&buf, &mut pos, &mut map),
+            !replay_snapshot(&buf, &mut pos, &mut out, false),
             "an entry count the bytes cannot back must fail the snapshot"
         );
-        assert!(map.is_empty());
+        assert!(out.streams.is_empty());
     }
 
     /// `replay_snapshot`, per-entry: `n_fields` = `u32::MAX` inside an
@@ -474,12 +848,12 @@ mod tests {
         buf.extend_from_slice(&0u64.to_le_bytes()); // seq
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_fields, a lie
         let mut pos = 0usize;
-        let mut map = StreamsMap::new();
+        let mut out = StreamsWalState::default();
         assert!(
-            !replay_snapshot(&buf, &mut pos, &mut map),
+            !replay_snapshot(&buf, &mut pos, &mut out, false),
             "a per-entry field count the bytes cannot back must fail the snapshot"
         );
-        assert!(map.is_empty());
+        assert!(out.streams.is_empty());
     }
 
     /// A whole snapshot entry reached through `replay`, so the corrupt count
@@ -731,5 +1105,338 @@ mod tests {
             let name = format!("stream_{}", i);
             assert_eq!(state.streams[&name].len(), 3);
         }
+    }
+
+    // ── Consumer-group durability (S31-05) ──
+    //
+    // Group state — the cursor, the consumer set and the pending list — was
+    // never logged and never checkpointed, so every restart dropped it. Each
+    // test here CROSSES A REOPEN: the in-memory path was always correct, which
+    // is exactly why the gap survived.
+
+    /// Cursor, consumers and PEL rebuilt from the record tail (no checkpoint).
+    #[test]
+    fn group_state_survives_reopen_from_the_log_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let id1 = StreamEntryId::new(10, 0);
+        let id2 = StreamEntryId::new(20, 0);
+        {
+            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+            wal.log_xadd("s", &id1, &[("k".into(), "a".into())])
+                .unwrap();
+            wal.log_xadd("s", &id2, &[("k".into(), "b".into())])
+                .unwrap();
+            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+                .unwrap();
+            wal.log_xreadgroup("s", "g", "c1", &id2, &[id1.clone(), id2.clone()])
+                .unwrap();
+            wal.log_xack("s", "g", std::slice::from_ref(&id1)).unwrap();
+            wal.group_sync().unwrap();
+        }
+
+        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let rebuilt = rebuild_streams(&state);
+        let stream = &rebuilt["s"];
+        assert_eq!(stream.xlen(), 2);
+        let g = &stream.groups["g"];
+        assert_eq!(
+            g.last_delivered_id, id2,
+            "the cursor must resume where the group left off, not at the start — \
+             a lost cursor redelivers the whole backlog"
+        );
+        assert!(g.consumers.contains("c1"));
+        assert_eq!(
+            g.pending["c1"],
+            vec![id2],
+            "the acknowledged id must be gone from the PEL and the unacknowledged one must stay"
+        );
+    }
+
+    /// A checkpoint rewrites the log from live memory, so a snapshot that
+    /// dropped group state would silently un-persist every record above.
+    #[test]
+    fn checkpoint_round_trips_groups_and_max_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+
+        let mut s = Stream::with_max_len(4);
+        let a = s.xadd_with_id(StreamEntryId::new(1, 0), vec![("k".into(), "a".into())]);
+        let b = s.xadd_with_id(StreamEntryId::new(2, 0), vec![("k".into(), "b".into())]);
+        s.xgroup_create("g", StreamEntryId::new(0, 0));
+        let _ = s.xreadgroup("g", "c1", 10);
+        s.xack("g", std::slice::from_ref(&a));
+        // A group with no deliveries at all must round-trip too.
+        s.xgroup_create("idle", StreamEntryId::new(7, 3));
+
+        let mut live = HashMap::new();
+        live.insert("s".to_string(), s);
+        wal.checkpoint(&live).unwrap();
+        drop(wal);
+
+        let (_wal2, state) = StreamsWal::open(dir.path()).unwrap();
+        let rebuilt = rebuild_streams(&state);
+        let got = &rebuilt["s"];
+        assert_eq!(got.xlen(), 2);
+        assert_eq!(got.max_len, Some(4), "the cap must survive the snapshot");
+        assert_eq!(got.groups["g"].last_delivered_id, b);
+        assert_eq!(got.groups["g"].pending["c1"], vec![b]);
+        assert!(got.groups["g"].consumers.contains("c1"));
+        assert_eq!(
+            got.groups["idle"].last_delivered_id,
+            StreamEntryId::new(7, 3)
+        );
+        assert!(got.groups["idle"].pending.is_empty());
+    }
+
+    /// Checkpointing unchanged state must produce identical bytes — sorted
+    /// iteration, so a hash-order shuffle cannot masquerade as a real change.
+    #[test]
+    fn checkpoint_is_byte_stable() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        let mut live = HashMap::new();
+        for name in ["z", "a", "m"] {
+            let mut s = Stream::new();
+            s.xadd_with_id(StreamEntryId::new(1, 0), vec![("k".into(), name.into())]);
+            for g in ["g2", "g1"] {
+                s.xgroup_create(g, StreamEntryId::new(0, 0));
+                let _ = s.xreadgroup(g, "c2", 10);
+                let _ = s.xreadgroup(g, "c1", 10);
+            }
+            live.insert(name.to_string(), s);
+        }
+
+        let (wal_a, _) = StreamsWal::open(dir_a.path()).unwrap();
+        wal_a.checkpoint(&live).unwrap();
+        let (wal_b, _) = StreamsWal::open(dir_b.path()).unwrap();
+        wal_b.checkpoint(&live).unwrap();
+        assert_eq!(
+            std::fs::read(dir_a.path().join("streams.wal")).unwrap(),
+            std::fs::read(dir_b.path().join("streams.wal")).unwrap(),
+        );
+    }
+
+    /// A group created on a stream with no entries is still a group.
+    #[test]
+    fn group_on_an_entryless_stream_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+            wal.log_xgroup_create("empty", "g", &StreamEntryId::new(0, 0))
+                .unwrap();
+        }
+        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let rebuilt = rebuild_streams(&state);
+        assert!(
+            rebuilt["empty"].groups.contains_key("g"),
+            "a group must not need entries to exist"
+        );
+        assert_eq!(rebuilt["empty"].xlen(), 0);
+    }
+
+    /// Re-creating a group resets its cursor and drops its pending list, both
+    /// live and on replay (`Stream::xgroup_create` is idempotent-overwrite).
+    #[test]
+    fn replayed_group_recreate_resets_cursor_and_pel() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = StreamEntryId::new(5, 0);
+        {
+            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+            wal.log_xadd("s", &id, &[("k".into(), "v".into())]).unwrap();
+            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+                .unwrap();
+            wal.log_xreadgroup("s", "g", "c", &id, std::slice::from_ref(&id))
+                .unwrap();
+            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+                .unwrap();
+        }
+        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let g = &rebuild_streams(&state)["s"].groups["g"];
+        assert_eq!(g.last_delivered_id, StreamEntryId::new(0, 0));
+        assert!(g.pending.is_empty());
+        assert!(g.consumers.is_empty());
+    }
+
+    // ── Backward compatibility with a pre-groups log ──
+
+    /// A log written before opcodes 0x03-0x06 existed must still replay. The
+    /// compatibility rule is addition-only: 0x01 and 0x02 keep their exact byte
+    /// layouts, and there is no version header to consult (adding one would
+    /// break precisely these files).
+    #[test]
+    fn a_log_written_before_groups_existed_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streams.wal");
+
+        // Hand-build the OLD format by hand rather than by calling the current
+        // writer, so this test keeps failing if the old layout is ever changed.
+        let mut old = Vec::new();
+        // A v1 SNAPSHOT: one stream, one entry, one field.
+        old.push(0x02u8);
+        old.extend_from_slice(&1u32.to_le_bytes()); // n_streams
+        push_str_field(&mut old, "events");
+        old.extend_from_slice(&1u32.to_le_bytes()); // n_entries
+        old.extend_from_slice(&1000u64.to_le_bytes()); // ms
+        old.extend_from_slice(&0u64.to_le_bytes()); // seq
+        old.extend_from_slice(&1u32.to_le_bytes()); // n_fields
+        push_str_field(&mut old, "user");
+        push_str_field(&mut old, "alice");
+        // A v1 XADD behind it, the shape a running server leaves.
+        old.push(0x01u8);
+        push_str_field(&mut old, "events");
+        old.extend_from_slice(&1001u64.to_le_bytes());
+        old.extend_from_slice(&0u64.to_le_bytes());
+        old.extend_from_slice(&1u32.to_le_bytes());
+        push_str_field(&mut old, "user");
+        push_str_field(&mut old, "bob");
+        let old_len = old.len();
+        std::fs::write(&path, &old).unwrap();
+
+        let (wal, state) = StreamsWal::open(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            old_len,
+            "an old log is fully valid and must NOT be truncated as a torn tail"
+        );
+        assert_eq!(state.streams["events"].len(), 2);
+        assert!(
+            state.groups.is_empty() && state.max_len.is_empty(),
+            "a pre-groups log recorded no groups, which is what it must recover"
+        );
+
+        // And the upgraded server can keep writing group records into it.
+        wal.log_xgroup_create("events", "g", &StreamEntryId::new(0, 0))
+            .unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+        let (_wal2, state2) = StreamsWal::open(dir.path()).unwrap();
+        assert_eq!(state2.streams["events"].len(), 2);
+        assert!(state2.groups["events"].contains_key("g"));
+    }
+
+    /// A v1 SNAPSHOT still resets state, including group state recovered from
+    /// records before it — a snapshot means "this is everything".
+    #[test]
+    fn a_v1_snapshot_still_resets_group_state() {
+        let mut buf = Vec::new();
+        buf.push(ENTRY_XGROUP_CREATE);
+        push_str_field(&mut buf, "s");
+        push_str_field(&mut buf, "g");
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // Then an old-format snapshot declaring zero streams.
+        buf.push(ENTRY_SNAPSHOT);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let (state, end) = replay(&buf);
+        assert_eq!(end, buf.len());
+        assert!(state.streams.is_empty());
+        assert!(state.groups.is_empty(), "a snapshot resets ALL state");
+    }
+
+    // ── Torn tails and hostile counts on the new opcodes ──
+
+    /// The new records must obey the same truncation contract as XADD: a torn
+    /// one is abandoned at its own start, so `open` truncates to the last valid
+    /// boundary and later appends are still replayable.
+    #[test]
+    fn a_torn_group_record_is_truncated_and_later_appends_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streams.wal");
+        {
+            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+                .unwrap();
+            wal.group_sync().unwrap();
+        }
+        let clean_len = std::fs::metadata(&path).unwrap().len();
+
+        // A half-written XREADGROUP: tag, stream, group, then nothing.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            let mut torn = vec![ENTRY_XREADGROUP];
+            push_str_field(&mut torn, "s");
+            push_str_field(&mut torn, "g");
+            f.write_all(&torn).unwrap();
+            f.flush().unwrap();
+        }
+
+        {
+            let (wal, state) = StreamsWal::open(dir.path()).unwrap();
+            assert!(state.groups["s"].contains_key("g"));
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                clean_len,
+                "the torn record must be truncated away on open"
+            );
+            wal.log_xreadgroup(
+                "s",
+                "g",
+                "c",
+                &StreamEntryId::new(9, 0),
+                &[StreamEntryId::new(9, 0)],
+            )
+            .unwrap();
+            wal.group_sync().unwrap();
+        }
+
+        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let g = &state.groups["s"]["g"];
+        assert_eq!(g.last_delivered_id, StreamEntryId::new(9, 0));
+        assert_eq!(g.pending["c"], vec![StreamEntryId::new(9, 0)]);
+    }
+
+    /// `read_ids`: an id count the bytes cannot back must be refused, not
+    /// reserved. 4.29e9 x 16 bytes is 68 GB, which aborts the process on Linux
+    /// rather than returning an error (NU-385 class).
+    #[test]
+    fn absurd_pending_id_count_is_refused_not_reserved() {
+        let mut buf = vec![ENTRY_XACK];
+        push_str_field(&mut buf, "s");
+        push_str_field(&mut buf, "g");
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_ids, a lie
+        let (state, end) = replay(&buf);
+        assert_eq!(end, 0, "the record must be abandoned at its own start");
+        assert!(state.groups.is_empty());
+
+        // Same inside a SNAPSHOT2 body, where the failure must fail the whole
+        // snapshot rather than half-apply it.
+        let mut snap = vec![ENTRY_SNAPSHOT_V2];
+        snap.extend_from_slice(&1u32.to_le_bytes()); // n_streams
+        push_str_field(&mut snap, "s");
+        snap.push(0); // has_max_len
+        snap.extend_from_slice(&0u64.to_le_bytes());
+        snap.extend_from_slice(&0u32.to_le_bytes()); // n_entries
+        snap.extend_from_slice(&1u32.to_le_bytes()); // n_groups
+        push_str_field(&mut snap, "g");
+        snap.extend_from_slice(&0u64.to_le_bytes()); // last_ms
+        snap.extend_from_slice(&0u64.to_le_bytes()); // last_seq
+        snap.extend_from_slice(&0u32.to_le_bytes()); // n_consumers
+        snap.extend_from_slice(&1u32.to_le_bytes()); // n_pending
+        push_str_field(&mut snap, "c");
+        snap.extend_from_slice(&u32::MAX.to_le_bytes()); // n_ids, a lie
+        let (state, end) = replay(&snap);
+        assert_eq!(end, 0);
+        assert!(state.streams.is_empty() && state.groups.is_empty());
+    }
+
+    /// A hostile consumer count inside a SNAPSHOT2 group must fail the parse
+    /// rather than loop 4.29e9 times building strings.
+    #[test]
+    fn absurd_consumer_count_fails_the_snapshot() {
+        let mut snap = vec![ENTRY_SNAPSHOT_V2];
+        snap.extend_from_slice(&1u32.to_le_bytes());
+        push_str_field(&mut snap, "s");
+        snap.push(0);
+        snap.extend_from_slice(&0u64.to_le_bytes());
+        snap.extend_from_slice(&0u32.to_le_bytes()); // n_entries
+        snap.extend_from_slice(&1u32.to_le_bytes()); // n_groups
+        push_str_field(&mut snap, "g");
+        snap.extend_from_slice(&0u64.to_le_bytes());
+        snap.extend_from_slice(&0u64.to_le_bytes());
+        snap.extend_from_slice(&u32::MAX.to_le_bytes()); // n_consumers, a lie
+        let (state, end) = replay(&snap);
+        assert_eq!(end, 0);
+        assert!(state.streams.is_empty() && state.groups.is_empty());
     }
 }

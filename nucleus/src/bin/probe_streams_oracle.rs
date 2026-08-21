@@ -300,6 +300,13 @@ impl RefStream {
         );
     }
 
+    fn has_group(&self, group: &str) -> bool {
+        self.groups.contains_key(group)
+    }
+
+    /// Callers must check `has_group` first: a read against a group that does
+    /// not exist is a NOGROUP error, not an empty batch (S31-05). Returning
+    /// empty made a vanished group indistinguishable from "caught up".
     fn xreadgroup(&mut self, group: &str, consumer: &str, count: usize) -> Vec<(Id, Fields)> {
         let Some(g) = self.groups.get(group) else {
             return Vec::new();
@@ -579,6 +586,28 @@ fn section_streams(ex: &Executor, rng: &mut Rng, ops: usize, neg: bool, rep: &mu
                     "SELECT STREAM_XREADGROUP('{stream}', '{group}', '{consumer}', {count})"
                 );
                 log.push(sql.clone());
+                // A read against a group that was never created must FAIL with
+                // NOGROUP, not read as an empty batch — empty is what "caught
+                // up" looks like, so the old behaviour let a consumer skip its
+                // whole backlog silently (S31-05).
+                if !models[stream].has_group(group) {
+                    match scalar_text(ex, &sql) {
+                        Ok(t) => rep.push(
+                            "streams",
+                            "XREADGROUP on a missing group errors instead of reading empty",
+                            format!("expected a NOGROUP error, got {t:?}"),
+                            &log,
+                        ),
+                        Err(e) if e.contains("NOGROUP") => {}
+                        Err(e) => rep.push(
+                            "streams",
+                            "XREADGROUP on a missing group reports NOGROUP",
+                            format!("expected NOGROUP, got {e}"),
+                            &log,
+                        ),
+                    }
+                    continue;
+                }
                 let expected = models
                     .get_mut(stream)
                     .unwrap()

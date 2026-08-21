@@ -251,6 +251,14 @@ Direction: `'out'` (default), `'in'`, `'both'`
 Reads on a nonexistent stream return an empty string (`''`), not `'[]'` — clients must treat
 empty text as an empty result before JSON-parsing.
 
+**`STREAM_XREADGROUP` is the exception: it raises instead of reading empty.** A call naming a
+stream or a consumer group that does not exist fails with `NOGROUP No such consumer group
+'<group>' for stream '<stream>'` (2026-08-20, S31-05). It has to: an empty batch is exactly
+what "caught up" looks like, so a consumer whose group had vanished concluded it had nothing
+to do and silently skipped everything it had not yet processed. Redis answers `NOGROUP` here
+and so does this engine's RESP surface. An existing group with nothing new still returns `'[]'`
+normally, so the error means "this group is not there", never "no new entries".
+
 **Positions take either form, and they are not equivalent.** A BIGINT is a bare millisecond;
 a TEXT `'<ms>-<seq>'` is the id `STREAM_XADD` returned. Ids carry a sequence, so several
 entries can share a millisecond, and a millisecond therefore cannot address one: `XREAD` from

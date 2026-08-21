@@ -415,6 +415,34 @@ impl Executor {
                     }
                 }
             }
+            // Compensate the WAL, or the rollback is in-memory only (S31-04).
+            //
+            // `STREAM_XADD` appends its record inside the transaction and
+            // `log_xadd` ends in `write_all` + `flush`, so the record is in the
+            // kernel before ROLLBACK is even parsed. Reverting only `self.streams`
+            // left that record in the log: the aborted entry read back as absent
+            // and then came BACK on the next restart, because replay re-applied
+            // it. A graceful restart was enough — nothing on the shutdown path
+            // checkpoints this log, only the 300 s timer does — so the
+            // resurrection window closed only by luck. Publishing an event that
+            // never happened is worse than losing a write, because consumers may
+            // already have acted on it.
+            //
+            // Checkpointing rewrites the log from the just-restored live state,
+            // which is the approach datalog and FTS take above: cheaper than
+            // inverse records and correct by construction, since the log after a
+            // rollback IS the state. The snapshot carries consumer groups too, so
+            // a rolled-back XREADGROUP cursor advance is compensated with it.
+            // Rollbacks that touch a stream are rare; stream writes are not.
+            if let Some(ref wal) = self.streams_wal
+                && let Err(e) = wal.checkpoint(&live)
+            {
+                tracing::error!(
+                    target: "nucleus::streams",
+                    "streams rollback could not compensate the WAL ({e}); a restart before the \
+                     next checkpoint could resurrect the rolled-back stream entries on replay"
+                );
+            }
         }
         if !fts_ops.is_empty() {
             self.fts_index

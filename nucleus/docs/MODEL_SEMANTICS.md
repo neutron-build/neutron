@@ -46,7 +46,7 @@ power failure loses up to `wal.checkpoint_interval_secs` (default **300 s**,
 | Columnar *store* (`COLUMNAR_*`) | fsync (**2026-08-18**, NU-006) | yes | **refused inside a transaction** (2026-08-19) | **no** | yes |
 | Columnar *engine* (`engine='columnar'`) | **fsync** | yes | **yes** | yes | via table policies |
 | Datalog | fsync | yes (**fixed 2026-08-17**, NU-013) | yes (in-memory) | **no** | yes |
-| Streams (SQL `STREAM_*`) | fsync (entries only) | entries yes; **groups/acks no** | yes, **session-scoped** (`9820d85a`) | **no** | yes |
+| Streams (SQL `STREAM_*`) | fsync | entries yes; groups/cursors/PEL/acks yes (**2026-08-20**, S31-05) | yes, **session-scoped** (`9820d85a`), WAL-compensated (**2026-08-20**, S31-04) | **no** | yes |
 | Streams (RESP `XADD`) | **none** | **NO** | **no** | **no** | **no** |
 | CDC | fsync (**2026-08-18**, NU-006) | yes | **no** | **no** — emitted pre-commit (NU-107 open) | yes (metadata only) |
 | Blob / large objects | fsync for manifests (**2026-08-18**, NU-006) | manifests yes; payload racy | yes, **session-scoped** | **no** | yes |
@@ -948,13 +948,23 @@ There are **two disjoint stream implementations that do not interoperate**.
 error discarded via `let _ =`). `group_sync` (`src/pubsub/streams_wal.rs:128`) is
 called from `src/executor/mod.rs:3107`. Checkpointed from `src/main.rs:1450`.
 
-**Consumer groups, delivery cursors, acks, and trims are never persisted.** The
-WAL format encodes only `XADD` and `SNAPSHOT`, and the snapshot body serialises
-only name/entries/fields. **On restart every consumer group vanishes** while the
-entries replay; `XREADGROUP` on a pre-existing group returns empty until someone
-re-runs `XGROUP_CREATE`, which then redelivers from the chosen start id — mass
-duplicate delivery. `XTRIM` and `max_len` trimming are not logged either, so a
-restart before the next checkpoint resurrects trimmed entries. **[code]**
+**Consumer groups, delivery cursors, acks and `max_len` are persisted
+(2026-08-20, S31-05).** The WAL gained opcodes `0x03` `SNAPSHOT2` (carries groups
+and `max_len` alongside entries), `0x04` `XGROUP_CREATE`, `0x05` `XREADGROUP`
+(cursor advance + PEL additions) and `0x06` `XACK`; `0x01`/`0x02` keep their exact
+byte layouts, so a log written before the change still replays. Until then the
+format encoded only `XADD` and `SNAPSHOT`, **every consumer group vanished on
+restart** while the entries replayed, and — the dangerous half — `XREADGROUP` on
+the vanished group returned an **empty batch**, indistinguishable from "caught
+up", so a consumer silently skipped its whole backlog instead of erroring. That
+read is now an error: `NOGROUP No such consumer group '<g>' for stream '<s>'`,
+matching Redis and the RESP surface (`src/kv/streams.rs`). **[code]**
+
+**Still not logged:** an explicit `Stream::xtrim` (no SQL surface reaches it) and
+the embedded `StreamsHandle` (`src/embedded.rs`), which writes to the same map
+without touching the WAL at all. `max_len` trimming *is* covered — the cap is
+restored before replay, so the recovered stream trims exactly where the live one
+did. **[code]**
 
 **Delivery semantics.** Ordering within a stream is guaranteed by
 `xadd_with_id` (`src/pubsub/mod.rs:476-502`). Delivery is **at-most-once in
@@ -965,15 +975,26 @@ observable via `xpending` but not redeliverable. Across a restart the semantics
 degrade to at-least-once with unbounded duplication. Exactly-once is not
 attempted. **[code]**
 
-**Transactions — none.** Streams are not in `CrossModelSnapshots`. A
-`STREAM_XADD` inside an aborted transaction leaves both the in-memory entry and a
-**durable** WAL record. **[code]**
+**Transactions — session-scoped rollback, WAL-compensated.** `9820d85a` gave
+streams a per-stream before-image in `CrossModelLevel`, so `ROLLBACK` reverts the
+entries this session appended and leaves other sessions' alone. That fix was
+in-memory only, and the WAL record `STREAM_XADD` had already flushed **survived
+the rollback and resurrected the aborted entry on the next restart** — a graceful
+one was enough, since nothing on the shutdown path checkpoints this log. Since
+2026-08-20 (S31-04) `cross_model_revert` rewrites the streams log from the
+restored live state, the way datalog and FTS do: the log after a rollback IS the
+state. **[code]**
 
 **Policy.** `STREAM_` prefix — **[verified]** `STREAM_XLEN` denied.
 
-**Consistency.** No CRC, and unlike blob the **torn tail is not truncated** on
-open — it stays on disk behind valid data, so every later append lands after
-garbage and is lost to all future replays. **[code]**
+**Consistency.** Still **no CRC**, so replay stopping is the only corruption
+detection there is. The torn tail **is** truncated on open now (S31-03, same
+treatment as `blob/wal.rs`), so appends made after a torn write land on a valid
+boundary instead of sitting behind garbage and being lost to every future replay.
+Every count read off the file is bounded by the bytes actually present before it
+reaches `Vec::with_capacity`, on the new opcodes as well as the old — an
+unbounded reservation aborts the process on Linux rather than returning an error
+(NU-385 class). **[code]**
 
 ### RESP streams — `XADD` over port 6379
 

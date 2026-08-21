@@ -3967,9 +3967,16 @@ impl Executor {
                 };
                 let start_ms = val_to_u64(&args[2], "STREAM_XGROUP_CREATE start_id")?;
                 self.cross_model_touch_stream(&stream_name);
+                let start_id = crate::pubsub::StreamEntryId::new(start_ms, 0);
                 let mut streams = self.streams.write();
-                let stream = streams.entry(stream_name).or_default();
-                stream.xgroup_create(&group, crate::pubsub::StreamEntryId::new(start_ms, 0));
+                let stream = streams.entry(stream_name.clone()).or_default();
+                stream.xgroup_create(&group, start_id.clone());
+                // Group state does not survive a restart unless it is logged
+                // (S31-05): entries replay from the log, a cursor cannot be
+                // reconstructed from anything.
+                if let Some(ref wal) = self.streams_wal {
+                    let _ = wal.log_xgroup_create(&stream_name, &group, &start_id);
+                }
                 // Contract (§3.9): BOOLEAN. Creation is idempotent-overwrite.
                 Ok(Value::Bool(true))
             }
@@ -3993,13 +4000,42 @@ impl Executor {
                 // entry is a write as far as rollback is concerned.
                 self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
-                match streams.get_mut(&stream_name) {
-                    Some(stream) => {
-                        let entries = stream.xreadgroup(&group, &consumer, count);
-                        Ok(Value::Text(stream_entries_to_json(&entries)))
-                    }
-                    None => Ok(Value::Text(String::new())),
+                // A read against a group that does not exist must NOT read as
+                // an empty batch (S31-05). Empty is what "caught up" looks
+                // like, so a consumer whose group vanished — dropped by a
+                // restart before group state was logged, or never created —
+                // concluded it had nothing to do and silently skipped every
+                // entry it had not yet processed, forever. Redis answers
+                // NOGROUP here and so does the RESP surface of this engine
+                // (`kv/streams.rs`); the SQL surface now agrees.
+                let group_exists = streams
+                    .get(&stream_name)
+                    .is_some_and(|s| s.groups.contains_key(&group));
+                if !group_exists {
+                    return Err(ExecError::Runtime(format!(
+                        "NOGROUP No such consumer group '{group}' for stream '{stream_name}'"
+                    )));
                 }
+                let stream = streams
+                    .get_mut(&stream_name)
+                    .expect("stream presence checked above");
+                let was_known = stream.groups[&group].consumers.contains(&consumer);
+                let entries = stream.xreadgroup(&group, &consumer, count);
+                let delivered: Vec<crate::pubsub::StreamEntryId> =
+                    entries.iter().map(|e| e.id.clone()).collect();
+                let json = stream_entries_to_json(&entries);
+                // Log the cursor advance and the pending-list additions. An
+                // idle poll that delivers nothing and registers no new consumer
+                // changes no state, so it is not logged — otherwise a polling
+                // consumer would grow the log without bound.
+                if !delivered.is_empty() || !was_known {
+                    let last = stream.groups[&group].last_delivered_id.clone();
+                    if let Some(ref wal) = self.streams_wal {
+                        let _ =
+                            wal.log_xreadgroup(&stream_name, &group, &consumer, &last, &delivered);
+                    }
+                }
+                Ok(Value::Text(json))
             }
             "STREAM_XACK" => {
                 // stream_xack(stream, group, id_ms, id_seq) → count acknowledged
@@ -4060,11 +4096,21 @@ impl Executor {
                     }
                 };
                 self.cross_model_touch_stream(&stream_name);
+                let id = crate::pubsub::StreamEntryId::new(id_ms, id_seq);
                 let mut streams = self.streams.write();
                 match streams.get_mut(&stream_name) {
                     Some(stream) => {
-                        let acked = stream
-                            .xack(&group, &[crate::pubsub::StreamEntryId::new(id_ms, id_seq)]);
+                        let acked = stream.xack(&group, std::slice::from_ref(&id));
+                        // Only a removal changes the pending list; an ack of an
+                        // id that was not pending is a no-op and stays out of
+                        // the log. Without this record a restart would restore
+                        // an entry to the PEL that a consumer had already
+                        // acknowledged.
+                        if acked > 0
+                            && let Some(ref wal) = self.streams_wal
+                        {
+                            let _ = wal.log_xack(&stream_name, &group, std::slice::from_ref(&id));
+                        }
                         Ok(Value::Int64(acked as i64))
                     }
                     None => Ok(Value::Int64(0)),

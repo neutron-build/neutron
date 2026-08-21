@@ -82,6 +82,7 @@ mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN 
 mod test_streaming_lazy; // Lazy per-partition/pair output emitters for the Grace operators
 mod test_streaming_metamorphic; // streaming ≡ materialized over random queries (transitive SQLite oracle)
 mod test_streaming_scan; // Phase 1.1: opt-in streaming scan (SET stream_results = on)
+mod test_streams_persistence; // S31-04/S31-05: stream rollback compensation + consumer-group durability across a restart
 mod test_table_engine_checkpoint; // R4: per-table engine WAL compaction is reachable, not just implemented
 mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_temporal_range_cost; // S66: TIMESTAMP/DATE range predicates must prune // S65: UPDATE/DELETE by PK must not scan the table
