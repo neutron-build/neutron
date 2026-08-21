@@ -4227,31 +4227,51 @@ impl Executor {
                                                 "SUM" => {
                                                     match tbl_storage.fast_sum_f64(table, col_idx) {
                                                         Some((sum, cnt)) => {
+                                                            let is_int = ci
+                                                                .get(col_idx)
+                                                                .is_some_and(|(_, dt)| {
+                                                                    matches!(
+                                                                        dt,
+                                                                        DataType::Int32
+                                                                            | DataType::Int64
+                                                                    )
+                                                                });
+                                                            // An f64 mantissa holds integers
+                                                            // exactly only to 2^53. Past that
+                                                            // the pushdown cannot produce the
+                                                            // exact integer SUM it claims to,
+                                                            // so decline and let the row scan
+                                                            // compute it.
+                                                            if is_int
+                                                                && sum.abs()
+                                                                    >= 9_007_199_254_740_992.0
+                                                            {
+                                                                all_handled = false;
+                                                                break;
+                                                            }
                                                             let v = if cnt == 0 {
                                                                 Value::Null
+                                                            } else if is_int {
+                                                                Value::Int64(sum as i64)
                                                             } else {
-                                                                let is_int = ci
-                                                                    .get(col_idx)
-                                                                    .is_some_and(|(_, dt)| {
-                                                                        matches!(
-                                                                            dt,
-                                                                            DataType::Int32
-                                                                                | DataType::Int64
-                                                                        )
-                                                                    });
-                                                                if is_int {
-                                                                    Value::Int64(sum as i64)
-                                                                } else {
-                                                                    Value::Float64(sum)
-                                                                }
+                                                                Value::Float64(sum)
                                                             };
                                                             result_meta.push(ColMeta {
                                                                 table: None,
                                                                 name: agg_str.clone(),
-                                                                dtype: if cnt == 0 {
-                                                                    DataType::Float64
-                                                                } else {
+                                                                // Follow the COLUMN's type, not
+                                                                // the row count. Testing `cnt == 0`
+                                                                // meant a DOUBLE PRECISION sum over
+                                                                // a non-empty table pushed
+                                                                // Value::Float64 and advertised
+                                                                // Int64 -- and pgwire builds its
+                                                                // RowDescription from this metadata,
+                                                                // so the client was told INT8 and
+                                                                // handed a float.
+                                                                dtype: if is_int {
                                                                     DataType::Int64
+                                                                } else {
+                                                                    DataType::Float64
                                                                 },
                                                             });
                                                             result_values.push(v);
@@ -7085,6 +7105,12 @@ impl Executor {
                             let is_int = col_info.get(*ci).is_some_and(|(_, dt)| {
                                 matches!(dt, DataType::Int32 | DataType::Int64)
                             });
+                            // An f64 mantissa holds integers exactly only to 2^53,
+                            // so past that this cannot produce the exact integer SUM
+                            // it reports. Decline and let the exact path answer.
+                            if is_int && sum.abs() >= 9_007_199_254_740_992.0 {
+                                return Ok(None);
+                            }
                             if is_int {
                                 col_defs.push((col_label.clone(), DataType::Int64));
                                 result_row.push(Value::Int64(sum as i64));
