@@ -1714,10 +1714,18 @@ impl SimpleQueryHandler for NucleusHandler {
         }
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
+        // `rls_active` alone was the whole gate, so masking and GRANTs were
+        // enforced nowhere on this route. The session-keyed predicate keeps
+        // unprivileged traffic off the bypass entirely; the enforcement itself
+        // lives inside the scoped call.
         if !in_txn
             && !rls_active
+            && self.executor.session_read_fast_paths_permitted(session_id)
             && let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
-            && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await
+            && let Some(result) = self
+                .executor
+                .execute_sql_fast_path(session_id, &sql_cmd)
+                .await
         {
             self.flush_pending_notifications(client).await?;
             return Ok(vec![Self::build_response(

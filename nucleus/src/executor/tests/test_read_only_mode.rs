@@ -212,7 +212,7 @@ async fn sql_oltp_fast_path_is_gated_too() {
     let insert = try_parse_sql_fast_path("INSERT INTO fp VALUES (7, 'g')")
         .expect("fast path should recognise a simple INSERT");
     assert!(
-        ex.execute_sql_fast_path(&insert)
+        ex.execute_sql_fast_path(0, &insert)
             .await
             .expect("healthy server should take the fast path")
             .is_ok(),
@@ -221,7 +221,7 @@ async fn sql_oltp_fast_path_is_gated_too() {
 
     service.enter_read_only(DegradeReason::DiskWatermark, "low disk");
     let err = ex
-        .execute_sql_fast_path(&insert)
+        .execute_sql_fast_path(0, &insert)
         .await
         .expect("fast path should still handle the statement")
         .expect_err("fast-path INSERT must be refused while degraded");
@@ -231,7 +231,7 @@ async fn sql_oltp_fast_path_is_gated_too() {
     let select = try_parse_sql_fast_path("SELECT * FROM fp WHERE a = 1")
         .expect("fast path should recognise a point SELECT");
     assert!(
-        ex.execute_sql_fast_path(&select)
+        ex.execute_sql_fast_path(0, &select)
             .await
             .expect("point SELECT should still take the fast path")
             .is_ok()

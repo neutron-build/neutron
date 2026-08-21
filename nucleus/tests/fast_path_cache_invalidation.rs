@@ -47,7 +47,7 @@ async fn point_update_invalidates_cached_select() {
         where_col: "id".into(),
         where_val: SqlLiteral::Integer(1),
     };
-    ex.execute_sql_fast_path(&cmd)
+    ex.execute_sql_fast_path(0, &cmd)
         .await
         .expect("fast path should handle this shape")
         .expect("update should succeed");
@@ -75,7 +75,7 @@ async fn point_delete_invalidates_cached_select() {
         where_col: "id".into(),
         where_val: SqlLiteral::Integer(1),
     };
-    ex.execute_sql_fast_path(&cmd)
+    ex.execute_sql_fast_path(0, &cmd)
         .await
         .expect("fast path should handle this shape")
         .expect("delete should succeed");
@@ -101,7 +101,7 @@ async fn simple_insert_invalidates_cached_select() {
         table: "fp_ins".into(),
         values: vec![SqlLiteral::Integer(2), SqlLiteral::Text("b".into())],
     };
-    ex.execute_sql_fast_path(&cmd)
+    ex.execute_sql_fast_path(0, &cmd)
         .await
         .expect("fast path should handle this shape")
         .expect("insert should succeed");

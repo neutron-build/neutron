@@ -3341,6 +3341,20 @@ impl Executor {
 
     /// Whether a wire session must avoid every transport-level bypass path.
     #[cfg(feature = "server")]
+    /// Session-keyed twin of `read_fast_paths_permitted`, for the wire gate,
+    /// which has a session id but no session scope yet.
+    ///
+    /// It collapses to "is this session privileged", because the policy half is
+    /// only ever true for a non-privileged session. Advisory: a fail-closed
+    /// optimisation that keeps unprivileged traffic off the bypass route
+    /// entirely. The enforcement lives inside the scoped call.
+    #[cfg(feature = "server")]
+    pub fn session_read_fast_paths_permitted(&self, session_id: u64) -> bool {
+        let session = self.get_session(session_id);
+        let ctx = session.session_context.read();
+        ctx.bypass_rls || ctx.has_role("superuser")
+    }
+
     pub fn session_has_active_rls(&self, session_id: u64) -> bool {
         let session = self.get_session(session_id);
         let ctx = session.session_context.read();
@@ -3674,6 +3688,19 @@ impl Executor {
     /// session. The whole-query equivalent of [`table_is_secured`].
     pub(super) fn any_table_secured(&self) -> bool {
         self.any_rls_active() || self.any_masking_active()
+    }
+
+    /// Per-table gate for every bypass route: decline when the table carries any
+    /// row or column policy for this session, OR when the session has to pass
+    /// the GRANT gate at all.
+    ///
+    /// The second half is the part that was missing. Only the parsed path checks
+    /// privileges, so a bypass route that consults policies alone serves a role
+    /// with no grant whatsoever. Declining rather than erroring is deliberate:
+    /// the caller falls through to the parsed path, which enforces grants, RLS
+    /// and masking and produces the correct error or the masked result.
+    pub(super) fn fast_path_table_secured(&self, table: &str) -> bool {
+        self.table_is_secured(table) || self.privileges_enforced_for_session()
     }
 
     /// Whether the fast read routes may answer this session.
@@ -4922,7 +4949,38 @@ impl Executor {
     /// table not found, column not found, constraint issues), in which case
     /// the caller should fall through to the normal SQL execution path.
     #[cfg(feature = "server")]
+    /// The wire OLTP fast path, scoped to the calling session.
+    ///
+    /// The session threading is load-bearing, not tidiness. This route never
+    /// enters `execute()`, and the wire used to call it with no session scope at
+    /// all -- so `current_session()` fell through to `default_session`, the
+    /// bootstrap superuser. Every in-path guard that consults the session was
+    /// therefore DEAD on the wire route, and the only live protection was the
+    /// wire's own RLS check. A role holding no privileges could read, UPDATE and
+    /// DELETE arbitrary rows through here, verified against a running server.
+    ///
+    /// It also means a session-based predicate dropped in here without this
+    /// wrapper compiles, passes its tests, and enforces nothing.
+    ///
+    /// The context is recomputed from the live role catalog on entry because a
+    /// REVOKE between statements would otherwise leave the stale context in
+    /// charge on a route that never re-derives it.
     pub async fn execute_sql_fast_path(
+        &self,
+        session_id: u64,
+        cmd: &crate::wire::kv_fast_path::SqlFastPathCommand,
+    ) -> Option<Result<ExecResult, ExecError>> {
+        let session = self.get_session(session_id);
+        self.recompute_session_context(&session);
+        CURRENT_SESSION
+            .scope(
+                session,
+                STORAGE_SESSION_ID.scope(session_id, self.execute_sql_fast_path_inner(cmd)),
+            )
+            .await
+    }
+
+    async fn execute_sql_fast_path_inner(
         &self,
         cmd: &crate::wire::kv_fast_path::SqlFastPathCommand,
     ) -> Option<Result<ExecResult, ExecError>> {
@@ -4947,7 +5005,7 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.rls_active(table) {
+                if self.fast_path_table_secured(table) {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -4993,11 +5051,18 @@ impl Executor {
                     .iter()
                     .map(|c| (c.name.clone(), c.data_type.clone()))
                     .collect();
+                // Defence in depth. The gate above already declines any table
+                // carrying a masking rule for this session, so this should be a
+                // no-op -- but it reads `current_session()`, which is only
+                // correct because the entry point now scopes it, and a masked
+                // column escaping through the fastest route is the failure this
+                // whole change exists to prevent.
+                let rows = self.mask_rows(table, rows);
                 Some(Ok(ExecResult::Select { columns, rows }))
             }
 
             SqlFastPathCommand::SimpleInsert { table, values } => {
-                if self.rls_active(table) {
+                if self.fast_path_table_secured(table) {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -5062,7 +5127,7 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.rls_active(table) {
+                if self.fast_path_table_secured(table) {
                     return None;
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
@@ -5156,7 +5221,7 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
-                if self.rls_active(table) {
+                if self.fast_path_table_secured(table) {
                     return None;
                 }
                 // The fast path deletes without enforcing referential
