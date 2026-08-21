@@ -1068,3 +1068,38 @@ effort, not runtime compatibility.
 
 **Suggested positioning:** *Neutron runs Preact. Most React libraries work —
 here is the tested list. If you need React internals or RSC, use Next.*
+
+## A-025 — ViewTransitions bootstrap script never executes in static SPA deployments (2026-08-21, omni-analyst)
+
+`packages/neutron/src/client/view-transitions.tsx` ships its runtime flag via
+`h("script", { dangerouslySetInnerHTML: BOOTSTRAP })`. That executes only when
+server-rendered inline in the initial document. In a static SPA build
+(`neutron-ts build` with the empty `#app` shell), the component is mounted
+client-side at runtime, and browsers never execute scripts inserted via DOM —
+so `window.__NEUTRON_VIEW_TRANSITIONS__` is never set, `navigate()` skips
+`startViewTransition` entirely, and the component is a silent no-op. Omni
+mounted it (commit 9263039) and only a runtime probe (flag null, zero
+`startViewTransition` calls during navigation) revealed nothing was happening.
+
+Fix direction: set the flag from a `useEffect` in the component itself (and
+inject the CSS the same way), so the component works in both SSR and CSR
+deployments. Omni worked around it app-side (flag in `_layout` mount effect,
+CSS in global.css).
+
+## A-026 — Global SPA click interceptor does not intercept in static production builds (2026-08-21, omni-analyst)
+
+`hydrate.ts`'s init registers a document-level click interceptor that
+preventDefaults same-origin anchors and calls `navigate()`. Verified working
+in dev builds, but against Omni's DEPLOYED static production artifact
+(probed 2026-08-21 with a real session through the production edge): every
+topbar click performed a full document navigation — window markers wiped, no
+`preventDefault`, zero console errors, route table present with modes
+undefined (not "static"), `__NEUTRON_ACTIVE_ROUTE_IDS__` set. The
+interceptor is either not registered or not reached in this build tier. The
+user-visible symptom was "the whole site flashes on every page change."
+
+Omni now ships its own interceptor (same guards, calls the exported
+`navigate()`) in `_layout.tsx`, so SPA navigation no longer depends on this
+path. Fix direction: reproduce with `neutron-ts build` + a static file
+server, and check whether init's listener registration is tree-shaken,
+ordering-dependent, or skipped when there is no SSR document.
