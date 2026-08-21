@@ -58,14 +58,27 @@ impl StreamsWal {
     /// Open or create the WAL file in `dir`.
     ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
-    /// state is empty. Corrupt trailing bytes are silently ignored (best-effort
-    /// recovery).
+    /// state is empty. A torn or corrupt tail ends replay and is truncated
+    /// away, so subsequent appends land on a valid boundary (they would
+    /// otherwise sit behind garbage and be lost to every future replay — this
+    /// log carries no checksum, so replay stopping is the only detection there
+    /// is). Same treatment as `blob/wal.rs::open`.
     pub fn open(dir: &Path) -> io::Result<(Self, StreamsWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("streams.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data)
+            let (state, valid_end) = replay(&data);
+            if valid_end < data.len() {
+                eprintln!(
+                    "streams WAL: truncating {} torn/corrupt trailing bytes",
+                    data.len() - valid_end
+                );
+                let f = OpenOptions::new().write(true).open(&path)?;
+                f.set_len(valid_end as u64)?;
+                f.sync_all()?;
+            }
+            state
         } else {
             StreamsWalState {
                 streams: HashMap::new(),
@@ -210,29 +223,43 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
 
 // ---- Replay -----------------------------------------------------------------
 
-fn replay(data: &[u8]) -> StreamsWalState {
+/// Replay all entries in `data`. Returns the recovered state and the byte
+/// offset of the first torn/corrupt entry (== `data.len()` when fully valid).
+///
+/// No arm here half-applies: the XADD arm pushes only after every field parses,
+/// and the SNAPSHOT arm builds a temporary map and swaps it in only on success.
+/// So the state accumulated when an entry is abandoned already equals a replay
+/// of the clean prefix, and `entry_start` is the truncation point.
+fn replay(data: &[u8]) -> (StreamsWalState, usize) {
     let mut streams: StreamsMap = HashMap::new();
     let mut pos = 0usize;
 
     while pos < data.len() {
+        let entry_start = pos;
+        macro_rules! torn {
+            () => {{
+                return (StreamsWalState { streams }, entry_start);
+            }};
+        }
+
         let Some(&entry_type) = data.get(pos) else {
-            break;
+            torn!();
         };
         pos += 1;
 
         match entry_type {
             ENTRY_XADD => {
                 let Some(stream_name) = read_string(data, &mut pos) else {
-                    break;
+                    torn!();
                 };
                 let Some(ms) = read_u64(data, &mut pos) else {
-                    break;
+                    torn!();
                 };
                 let Some(seq) = read_u64(data, &mut pos) else {
-                    break;
+                    torn!();
                 };
                 let Some(n_fields) = read_u32(data, &mut pos) else {
-                    break;
+                    torn!();
                 };
                 // `n_fields` comes off disk and this WAL carries NO checksum, so
                 // nothing rejects a corrupt length before it reaches here. An
@@ -255,7 +282,7 @@ fn replay(data: &[u8]) -> StreamsWalState {
                     fields.push((k, v));
                 }
                 if !ok {
-                    break;
+                    torn!();
                 }
                 streams
                     .entry(stream_name)
@@ -270,16 +297,17 @@ fn replay(data: &[u8]) -> StreamsWalState {
                 if replay_snapshot(data, &mut pos, &mut snapshot) {
                     streams = snapshot;
                 } else {
-                    break;
+                    torn!();
                 }
             }
             _ => {
-                break;
+                // Unknown entry type -- corrupt data; keep the clean prefix.
+                torn!();
             }
         }
     }
 
-    StreamsWalState { streams }
+    (StreamsWalState { streams }, pos)
 }
 
 fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bool {
@@ -411,7 +439,7 @@ mod tests {
         buf.extend_from_slice(&1000u64.to_le_bytes()); // ms
         buf.extend_from_slice(&0u64.to_le_bytes()); // seq
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_fields, a lie
-        let state = replay(&buf);
+        let (state, _) = replay(&buf);
         assert!(
             state.streams.is_empty(),
             "a field count the bytes cannot back must abandon the entry"
@@ -468,7 +496,7 @@ mod tests {
         // Now a snapshot whose stream count is a lie.
         buf.push(ENTRY_SNAPSHOT);
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
-        let state = replay(&buf);
+        let (state, _) = replay(&buf);
         assert_eq!(state.streams.len(), 1);
         assert_eq!(state.streams["events"].len(), 1);
     }
@@ -621,6 +649,62 @@ mod tests {
         assert_eq!(state.streams.len(), 1);
         assert!(state.streams.contains_key("good_stream"));
         assert_eq!(state.streams["good_stream"].len(), 1);
+    }
+
+    /// S31-03: a torn tail must be truncated on open, so that everything
+    /// appended afterwards is replayable. Before the fix `open()` reopened in
+    /// append mode without truncating, so every later record sat behind the
+    /// garbage and was silently lost by every future replay — while `log_xadd`
+    /// returned Ok and `group_sync` reported it durable.
+    #[test]
+    fn torn_tail_is_truncated_and_later_appends_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("streams.wal");
+
+        {
+            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+            wal.log_xadd("s", &StreamEntryId::new(1, 0), &[("k".into(), "a".into())])
+                .unwrap();
+            wal.group_sync().unwrap();
+        }
+        let clean_len = std::fs::metadata(&wal_path).unwrap().len();
+
+        // Hand-build a torn tail: an XADD tag plus a truncated stream name.
+        {
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            let mut torn = vec![ENTRY_XADD];
+            torn.extend_from_slice(&64u32.to_le_bytes()); // name_len, unbacked
+            torn.extend_from_slice(b"tor");
+            f.write_all(&torn).unwrap();
+            f.flush().unwrap();
+        }
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > clean_len);
+
+        // Reopen: the torn bytes must be gone, and the good prefix intact.
+        {
+            let (wal, state) = StreamsWal::open(dir.path()).unwrap();
+            assert_eq!(state.streams["s"].len(), 1);
+            assert_eq!(
+                std::fs::metadata(&wal_path).unwrap().len(),
+                clean_len,
+                "the torn tail must be truncated away on open"
+            );
+            // Append a good record behind where the garbage used to be.
+            wal.log_xadd("s", &StreamEntryId::new(2, 0), &[("k".into(), "b".into())])
+                .unwrap();
+            wal.group_sync().unwrap();
+        }
+
+        // The record written after the torn tail must survive a reopen.
+        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let entries = &state.streams["s"];
+        assert_eq!(
+            entries.len(),
+            2,
+            "a record appended after a torn tail must be recovered"
+        );
+        assert_eq!(entries[1].0, StreamEntryId::new(2, 0));
+        assert_eq!(entries[1].1, vec![("k".to_string(), "b".to_string())]);
     }
 
     #[test]

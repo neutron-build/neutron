@@ -13,7 +13,7 @@ pub mod error_codec;
 pub mod kv_fast_path;
 pub mod overload;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -287,11 +287,17 @@ pub struct PendingNotification {
 
 /// Per-connection notification state: tracks which channels this connection
 /// listens on and receives pending notifications from those channels.
+///
+/// `broadcast::Receiver`s cannot be merged, so there is one per LISTENed
+/// channel and `flush_pending_notifications` drains them all. The receiver must
+/// be the one created at LISTEN time: `subscribe()` positions a receiver at the
+/// channel tail, so a receiver made at flush time can never observe a
+/// notification sent before it — which is exactly why this used to store a
+/// single receiver it never read and deliver nothing (S31-02).
 struct ConnectionNotifyState {
-    /// Channels this connection has subscribed to via LISTEN.
-    channels: HashSet<String>,
-    /// Receiver end for notifications destined for this connection.
-    rx: broadcast::Receiver<PendingNotification>,
+    /// Channels this connection has subscribed to via LISTEN, each with the
+    /// receiver subscribed at the moment the LISTEN was issued.
+    receivers: HashMap<String, broadcast::Receiver<PendingNotification>>,
 }
 
 /// Shared notification registry — routes NOTIFY messages to all connections
@@ -2352,7 +2358,10 @@ impl NucleusHandler {
         }
         // Clean up notification state (channels are GC'd lazily).
         if let Some(state) = self.notify_state.lock().remove(peer_addr) {
-            for ch in &state.channels {
+            // Drop every receiver first, so `receiver_count()` reflects this
+            // connection's departure before the channels are GC'd.
+            let channels: Vec<String> = state.receivers.into_keys().collect();
+            for ch in &channels {
                 self.notification_registry.remove_channel_if_empty(ch);
             }
         }
@@ -2383,26 +2392,20 @@ impl NucleusHandler {
 
     /// Register a LISTEN on `channel` for the connection identified by `peer_addr`.
     fn handle_listen(&self, peer_addr: &str, channel: &str) {
-        let rx = self.notification_registry.listen(channel);
         let mut map = self.notify_state.lock();
-        let state = map.entry(peer_addr.to_string()).or_insert_with(|| {
-            // First LISTEN for this connection — create the per-connection state.
-            // We use a single broadcast channel per-connection to aggregate all
-            // channel notifications. But since broadcast::Receiver cannot be
-            // merged, we store one receiver per channel and drain them all in
-            // flush_pending_notifications.
-            ConnectionNotifyState {
-                channels: HashSet::new(),
-                rx,
-            }
-        });
-        if !state.channels.contains(channel) {
-            state.channels.insert(channel.to_string());
-            // Replace the receiver with one for the new channel. In practice
-            // we store the latest one here — the flush loop drains from the
-            // registry directly using try_recv for each channel.
-            state.rx = self.notification_registry.listen(channel);
-        }
+        let state = map
+            .entry(peer_addr.to_string())
+            .or_insert_with(|| ConnectionNotifyState {
+                receivers: HashMap::new(),
+            });
+        // Subscribe once, at LISTEN time, and keep that receiver: it is the
+        // only one that will observe notifications sent from now on. A repeated
+        // LISTEN on the same channel must NOT re-subscribe — that would discard
+        // anything already queued for this connection.
+        state
+            .receivers
+            .entry(channel.to_string())
+            .or_insert_with(|| self.notification_registry.listen(channel));
     }
 
     /// Unregister a LISTEN on `channel` (or all channels with `*`).
@@ -2410,12 +2413,13 @@ impl NucleusHandler {
         let mut map = self.notify_state.lock();
         if let Some(state) = map.get_mut(peer_addr) {
             if channel == "*" {
-                for ch in state.channels.drain() {
+                for (ch, rx) in state.receivers.drain() {
+                    drop(rx);
                     self.notification_registry.unlisten(&ch);
                     self.notification_registry.remove_channel_if_empty(&ch);
                 }
             } else {
-                state.channels.remove(channel);
+                drop(state.receivers.remove(channel));
                 self.notification_registry.unlisten(channel);
                 self.notification_registry.remove_channel_if_empty(channel);
             }
@@ -2442,43 +2446,54 @@ impl NucleusHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let peer_addr = client.socket_addr().to_string();
-        let channels: Vec<String> = {
-            let map = self.notify_state.lock();
-            match map.get(&peer_addr) {
-                Some(state) => state.channels.iter().cloned().collect(),
-                None => return Ok(()),
+
+        // Drain the receivers subscribed at LISTEN time — those are the only
+        // ones holding this connection's queued notifications. Collect under
+        // the lock (it is a sync `parking_lot::Mutex`, never held across the
+        // `.await` below), then send.
+        let pending: Vec<PendingNotification> = {
+            let mut map = self.notify_state.lock();
+            let Some(state) = map.get_mut(&peer_addr) else {
+                return Ok(());
+            };
+            if state.receivers.is_empty() {
+                return Ok(());
             }
-        };
-
-        if channels.is_empty() {
-            return Ok(());
-        }
-
-        // For each channel this connection listens on, drain pending notifications.
-        // We re-subscribe briefly to collect any pending messages.
-        for channel in &channels {
-            // Get a fresh receiver and try_recv in a loop.
-            let mut rx = self.notification_registry.listen(channel);
-            loop {
-                match rx.try_recv() {
-                    Ok(notif) => {
-                        let msg = NotificationResponse::new(
-                            notif.pid,
-                            notif.channel.clone(),
-                            notif.payload.clone(),
-                        );
-                        client
-                            .send(PgWireBackendMessage::NotificationResponse(msg))
-                            .await?;
-                    }
-                    Err(broadcast::error::TryRecvError::Empty)
-                    | Err(broadcast::error::TryRecvError::Closed) => break,
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                        // Missed some messages due to buffer overflow — skip.
-                        continue;
+            let mut pending = Vec::new();
+            for (channel, rx) in state.receivers.iter_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(notif) => pending.push(notif),
+                        Err(broadcast::error::TryRecvError::Empty)
+                        | Err(broadcast::error::TryRecvError::Closed) => break,
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            // The connection fell behind the per-channel
+                            // broadcast buffer and those notifications are
+                            // gone for good. PostgreSQL never drops silently,
+                            // so at minimum say so — and keep draining: the
+                            // receiver has been repositioned at the oldest
+                            // message still held, so the rest are recoverable
+                            // and the connection stays usable.
+                            tracing::warn!(
+                                channel = %channel,
+                                peer = %peer_addr,
+                                skipped,
+                                "LISTEN/NOTIFY: listener fell behind; {skipped} \
+                                 notification(s) on channel '{channel}' were dropped"
+                            );
+                            continue;
+                        }
                     }
                 }
             }
+            pending
+        };
+
+        for notif in pending {
+            let msg = NotificationResponse::new(notif.pid, notif.channel, notif.payload);
+            client
+                .send(PgWireBackendMessage::NotificationResponse(msg))
+                .await?;
         }
 
         Ok(())
@@ -6235,7 +6250,7 @@ mod security_tests {
         handler.handle_listen("peer1", "my_channel");
         let state = handler.notify_state.lock();
         let conn = state.get("peer1").unwrap();
-        assert!(conn.channels.contains("my_channel"));
+        assert!(conn.receivers.contains_key("my_channel"));
     }
 
     #[test]
@@ -6246,8 +6261,8 @@ mod security_tests {
         handler.handle_unlisten("peer1", "ch1");
         let state = handler.notify_state.lock();
         let conn = state.get("peer1").unwrap();
-        assert!(!conn.channels.contains("ch1"));
-        assert!(conn.channels.contains("ch2"));
+        assert!(!conn.receivers.contains_key("ch1"));
+        assert!(conn.receivers.contains_key("ch2"));
     }
 
     #[test]
@@ -6259,7 +6274,7 @@ mod security_tests {
         handler.handle_unlisten("peer1", "*");
         let state = handler.notify_state.lock();
         let conn = state.get("peer1").unwrap();
-        assert!(conn.channels.is_empty());
+        assert!(conn.receivers.is_empty());
     }
 
     #[test]
@@ -6270,6 +6285,83 @@ mod security_tests {
         let count = handler.handle_notify("peer1", "events", "test");
         // At least 2 listeners registered (our 2 handle_listen calls).
         assert!(count >= 2);
+    }
+
+    /// S31-02: the receiver stored at LISTEN time is the one that must carry
+    /// the notification. The old code stored a receiver it never read and made
+    /// a *fresh* one at flush time — `subscribe()` starts at the channel tail,
+    /// so that receiver was always Empty and nothing was ever delivered.
+    #[test]
+    fn handler_stored_receiver_sees_notification_sent_after_listen() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("peer1", "events");
+        // Sent by a different connection, after the LISTEN.
+        assert!(handler.handle_notify("peer2", "events", "hello") >= 1);
+
+        let mut state = handler.notify_state.lock();
+        let conn = state.get_mut("peer1").unwrap();
+        let rx = conn.receivers.get_mut("events").unwrap();
+        let notif = rx
+            .try_recv()
+            .expect("the LISTEN-time receiver must hold the notification");
+        assert_eq!(notif.channel, "events");
+        assert_eq!(notif.payload, "hello");
+        // Exactly one, and no duplicate delivery.
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A repeated LISTEN on an already-listened channel must not re-subscribe:
+    /// that would drop everything already queued for the connection.
+    #[test]
+    fn handler_repeat_listen_does_not_discard_queued_notifications() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("peer1", "events");
+        handler.handle_notify("peer2", "events", "first");
+        handler.handle_listen("peer1", "events");
+
+        let mut state = handler.notify_state.lock();
+        let conn = state.get_mut("peer1").unwrap();
+        let rx = conn.receivers.get_mut("events").unwrap();
+        assert_eq!(rx.try_recv().unwrap().payload, "first");
+    }
+
+    /// A notification sent before LISTEN must not be delivered — the receiver
+    /// starts at the tail, matching PostgreSQL, which only delivers what is
+    /// sent after the LISTEN commits.
+    #[test]
+    fn handler_notification_sent_before_listen_is_not_delivered() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("other", "events");
+        handler.handle_notify("peer2", "events", "too_early");
+        handler.handle_listen("peer1", "events");
+
+        let mut state = handler.notify_state.lock();
+        let conn = state.get_mut("peer1").unwrap();
+        let rx = conn.receivers.get_mut("events").unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A listener that overruns the per-channel broadcast buffer must resume
+    /// from the oldest message still held rather than losing the channel.
+    #[test]
+    fn handler_lagged_listener_keeps_draining() {
+        let registry = NotificationRegistry::new(4);
+        let mut rx = registry.listen("events");
+        for i in 0..8 {
+            registry.notify(1, "events", &format!("m{i}"));
+        }
+        // First try_recv reports the overrun...
+        let skipped = match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Lagged(n)) => n,
+            other => panic!("expected Lagged, got {other:?}"),
+        };
+        assert_eq!(skipped, 4);
+        // ...and the receiver still yields the messages that survived.
+        let mut got = Vec::new();
+        while let Ok(n) = rx.try_recv() {
+            got.push(n.payload);
+        }
+        assert_eq!(got, vec!["m4", "m5", "m6", "m7"]);
     }
 
     #[test]
