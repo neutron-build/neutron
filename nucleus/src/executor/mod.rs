@@ -3691,6 +3691,9 @@ impl Executor {
     /// with no grant whatsoever. Declining rather than erroring is deliberate:
     /// the caller falls through to the parsed path, which enforces grants, RLS
     /// and masking and produces the correct error or the masked result.
+    // Only reachable from server-gated code, same as `table_is_fk_referenced`
+    // above; without this the core-only clippy gate fails on dead_code.
+    #[cfg(feature = "server")]
     pub(super) fn fast_path_table_secured(&self, table: &str) -> bool {
         self.table_is_secured(table) || self.privileges_enforced_for_session()
     }
@@ -4964,6 +4967,13 @@ impl Executor {
             .await
     }
 
+    // Gated for the same reason its only caller is: the body names
+    // `crate::wire`, which does not exist without the server feature, and it
+    // calls two helpers that are themselves server-gated. The caller above was
+    // gated when it was written and this was not, so `--no-default-features`
+    // stopped compiling — a configuration nothing builds locally and only the
+    // release job checks.
+    #[cfg(feature = "server")]
     async fn execute_sql_fast_path_inner(
         &self,
         cmd: &crate::wire::kv_fast_path::SqlFastPathCommand,
