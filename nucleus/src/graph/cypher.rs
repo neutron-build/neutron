@@ -226,6 +226,34 @@ fn is_keyword(word: &str) -> bool {
     KEYWORDS.contains(&upper.as_str())
 }
 
+/// Scan a numeric literal starting at `start`, returning the index just past it.
+///
+/// Stops before a `..` range operator. `[:KNOWS*1..2]` is Cypher's
+/// variable-length pattern, and consuming both dots as part of the number made
+/// the lexer emit `1..2` and reject it as an invalid float -- so the parser's
+/// perfectly correct `*min..max` branch was unreachable and the whole pattern
+/// failed to parse.
+///
+/// Also stops at a SECOND `.`, so `1.2.3` no longer scans as one token only to
+/// die in `parse::<f64>`.
+fn scan_number(chars: &[char], start: usize) -> usize {
+    let len = chars.len();
+    let mut i = start;
+    let mut seen_dot = false;
+    while i < len {
+        let c = chars[i];
+        if c.is_ascii_digit() {
+            i += 1;
+        } else if c == '.' && !seen_dot && !(i + 1 < len && chars[i + 1] == '.') {
+            seen_dot = true;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
 fn tokenize(input: &str) -> Result<Vec<Token>, CypherError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
@@ -330,9 +358,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CypherError> {
                 // Parse negative number
                 let start = i;
                 i += 1; // skip '-'
-                while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                    i += 1;
-                }
+                i = scan_number(&chars, i);
                 let num_str: String = chars[start..i].iter().collect();
                 if num_str.contains('.') {
                     let val: f64 = num_str.parse().map_err(|_| {
@@ -375,9 +401,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CypherError> {
         // Numbers
         if ch.is_ascii_digit() {
             let start = i;
-            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                i += 1;
-            }
+            i = scan_number(&chars, i);
             let num_str: String = chars[start..i].iter().collect();
             if num_str.contains('.') {
                 let val: f64 = num_str
@@ -1149,6 +1173,40 @@ pub fn parse_cypher(input: &str) -> Result<CypherStatement, CypherError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The lexer used to scan a number with `while digit || '.'`, so the `1..2`
+    /// in a variable-length pattern was swallowed whole and rejected as an
+    /// invalid float -- before the parser's correct `*min..max` branch could see
+    /// it. The pattern is ordinary Cypher and simply did not parse.
+    #[test]
+    fn variable_length_pattern_range_lexes_as_two_integers() {
+        let toks = tokenize("[:KNOWS*1..2]").expect("a variable-length range must tokenize");
+        let ints: Vec<i64> = toks
+            .iter()
+            .filter_map(|t| match t {
+                Token::IntLit(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ints, vec![1, 2], "got tokens: {toks:?}");
+    }
+
+    /// The range fix must not cost ordinary float literals.
+    #[test]
+    fn float_literals_still_lex() {
+        let toks = tokenize("1.5").expect("a float literal must tokenize");
+        assert!(
+            matches!(toks.first(), Some(Token::FloatLit(v)) if (*v - 1.5).abs() < f64::EPSILON),
+            "got tokens: {toks:?}"
+        );
+    }
+
+    /// A second dot ends the literal rather than producing a token that only
+    /// fails later inside `parse::<f64>`.
+    #[test]
+    fn a_second_dot_ends_the_number() {
+        assert!(tokenize("1.2.3").is_ok(), "1.2.3 should lex, not error");
+    }
     use super::*;
 
     #[test]
