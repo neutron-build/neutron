@@ -29,6 +29,14 @@ losses: Nucleus resolves a node by property 14x slower than Neo4j because its
 Cypher subset has no property index, and its shortest path is 1.9x slower
 because it is a unidirectional BFS where Neo4j's is bidirectional.**
 
+> **Both losses were fixed on 2026-08-20; see "What was done about the two
+> losses" at the end. Everything above that section describes the engine as it
+> was measured on 2026-08-20 BEFORE the fix, and the table below is kept
+> unchanged because it is the baseline the fix is measured against. No
+> Nucleus-vs-Neo4j ratio in this document has been re-measured on a clean
+> machine since — read the new section for exactly which numbers are new and
+> which are not.**
+
 ## Dataset, parameters, iteration count
 
 | | |
@@ -170,6 +178,10 @@ is simply not wired into `cypher_executor::candidate_node_ids`, which is the sam
 "declared surface, no execution path" shape catalogued in
 `_internal/ENGINE_PERFORMANCE_PROGRAM.md` §2.
 
+**FIXED 2026-08-20** — and wiring the lookup was the small part; the feature is
+the maintenance, the persistence and the creation surface. See the last section
+of this file.
+
 ### 2. Shortest path is unidirectional where Neo4j's is bidirectional
 
 Net of transport, Neo4j finds a shortest path in 341 µs against Nucleus's 637 µs
@@ -185,6 +197,9 @@ fix is well understood and self-contained.
 Note what this row does *not* say: Nucleus's answers were right every time,
 including path validity edge-for-edge. It finds the same shortest path, by a
 more expensive route.
+
+**FIXED 2026-08-20** — 14–15x on the engine call, measured in-process against
+the old implementation kept as an oracle. See the last section of this file.
 
 ## The write comparison is NOT VALID in this environment
 
@@ -315,3 +330,137 @@ here is quoted to better than one decimal place.
   and the anchor finding predicts the gap grows with scale — untested.
 - **Node deletion and edge deletion.** Only inserts and reads were timed.
 - **Undirected and typed-edge traversal.** One edge type, `Outgoing` only.
+
+## What was done about the two losses — 2026-08-20, after the table above
+
+Both were implemented. The re-measurement is reported carefully because **every
+re-measurement run failed this document's own control test**: on all four runs
+the Nucleus transport floor read 127–246 µs against the clean run's 39 µs and
+the Neo4j floor 1,754–3,850 µs against 537 µs, with an unrelated `rustc` at
+200–400% CPU and a load average of 17–26 throughout. By the rule stated above,
+all four are discarded for cross-engine purposes. **No new Nucleus-vs-Neo4j
+ratio is claimed here.** What is claimed is measured one of two ways that
+contention cannot fake into existence:
+
+- **In-process**, calling the two implementations alternately on the same graph
+  in the same process, so both arms carry the same machine noise; and
+- **Nucleus against Nucleus over pgwire**, each run reported net of *its own*
+  transport floor, from two independent before/after pairs.
+
+### 1. The anchor: a node property index
+
+`GraphStore` now carries explicit node property indexes, created through
+Cypher DDL that the existing `GRAPH_QUERY` / `CYPHER` SQL functions already
+reach:
+
+```sql
+SELECT GRAPH_QUERY('CREATE INDEX ON :N(k)');           -- Neo4j 3.x spelling
+SELECT GRAPH_QUERY('CREATE INDEX n_k IF NOT EXISTS FOR (n:N) ON (n.k)');
+SELECT GRAPH_QUERY('SHOW INDEXES');
+SELECT GRAPH_QUERY('DROP INDEX ON :N(k)');
+```
+
+Explicit, not automatic: indexing every property of every node costs memory
+proportional to the whole graph and slows every write, which is an operator's
+decision. The definition is durable in the graph WAL (a record per
+create/drop, plus a section in the checkpoint snapshot); the *contents* are
+never written and are rebuilt from the recovered nodes on open, so a definition
+can never come back without its data.
+
+**In-process, 400 random anchors, release build** (`cargo test --release
+--features server --lib anchor_resolution_scan_vs_index_timing -- --ignored
+--nocapture`):
+
+| nodes | label scan p50 | index p50 |
+|---:|---:|---:|
+| 10,000 | 472 µs | **0.83 µs** |
+| 100,000 | 16,510 µs | **1.75 µs** |
+
+This is the prediction above tested: the scan's cost grew 35x for 10x the nodes
+(worse than linear — `nodes_by_label` materialises a `Vec` of every matching
+node before any comparison), and the index moved by 0.9 µs.
+
+**Over pgwire, Nucleus against Nucleus**, `--no-index` against the default, two
+pairs, each net of its own run's transport floor:
+
+| workload, net of own floor | before | before | after | after |
+|---|---:|---:|---:|---:|
+| anchor | 2,965 | 1,152 | **24** | **5** |
+| 2-hop set, `GRAPH_QUERY` | 1,993 | 1,140 | **65** | **118** |
+| 3-hop set, `GRAPH_QUERY` | 2,185 | 2,073 | **482** | **207** |
+| pattern: 1-hop filtered on `b.grp` | 2,417 | 2,812 | **115** | **-48** |
+
+All µs. The `before` columns are inflated against the clean run's 319 µs anchor
+by the same contention the controls show; the `after` columns are not, because
+they are near zero and cannot be. The −48 is the pattern arm landing inside the
+noise of its own floor. For scale, the clean run measured Neo4j's indexed
+anchor at 23 µs net.
+
+**What an index costs a write** — which `compete_graph` cannot answer, because
+it creates the index after its load, so its load rate says nothing about
+maintenance. In-process, 200,000 nodes, release:
+
+| | ns per node |
+|---|---:|
+| `create_node`, no index | 418 |
+| `create_node`, 1 index | 636 |
+| `create_node`, 3 indexes | 962 |
+| `delete_node`, no index | 405 |
+| `delete_node`, 1 index | 579 |
+
+About 220 ns per index on create and 175 ns on delete. Against the 3,900 µs
+`F_FULLFSYNC` barrier a durable graph write pays on this filesystem that is
+0.006% of a commit; it is only visible in an in-memory bulk build.
+
+### 2. Shortest path: bidirectional
+
+`GraphStore::shortest_path` now expands both ends and meets in the middle. The
+single-source version is kept as `shortest_path_unidirectional`, because it is
+the oracle the new one is tested against — a property test compares them for
+every pair of 90 random graphs across three directions and two edge-type
+filters, on exact path length and on reachability, and separately checks that
+every returned path is a real walk of the graph with no repeated node.
+
+**In-process, 400 random pairs on the same 10,000-node / 40,000-edge
+small-world graph this document uses, calls alternated, three runs**
+(`shortest_path_bidirectional_vs_unidirectional_timing -- --ignored`):
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| unidirectional p50 | 1,485 µs | 1,450 µs | 1,483 µs |
+| bidirectional p50 | 106 µs | 96 µs | 102 µs |
+| **speedup** | **14.0x** | **15.1x** | **14.5x** |
+
+Three runs agreeing within 8% on a machine this noisy is the reason to believe
+the ratio; the absolute figures are inflated by the same contention as
+everything else and should not be compared with the table above. A fourth,
+visibly contended run read 20.7x and is excluded — it is the outlier, not the
+best result.
+
+Note what this does *not* say. The `compete_graph` shortest-path arm cannot
+produce a before/after at all: `--no-index` changes only the anchor, so both of
+its configurations call the same new method. That is why the measurement is
+in-process.
+
+### Correctness, which is the part that matters
+
+- 4 runs x 400 timed operations per arm, every one graded against the
+  in-process BFS oracle before its latency was kept: **all arms N/N, zero
+  divergences**, on both engines, in all four runs.
+- `probe_graph`: 90,000 operations against an adjacency-map oracle through
+  pgwire, **0 divergences, 0 panics**.
+- `probe_graph_algo`: 64,000 operations, **0 divergences, 0 panics**.
+- The lib suite: `cargo test --features server --lib graph::` — 147 passed.
+
+### What is still not measured
+
+- **Any new Nucleus-vs-Neo4j ratio.** The machine was contended for every run
+  after the fix. Re-run the command at the top of this file on a quiet machine
+  to produce one.
+- **The index at 100,000 nodes over pgwire.** The 100,000-node point above is
+  in-process; loading 100,000 nodes and 400,000 edges through the harness at
+  ~250 op/s takes over half an hour.
+- **Range predicates.** `PropertyIndex::range` exists and `node_index_range`
+  exposes it, but Nucleus's Cypher subset parses only property *equality* in a
+  node pattern, so no query can reach it yet.
+- **Edge property indexes.** Nodes only.

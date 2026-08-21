@@ -279,7 +279,6 @@ impl GraphStore {
         Ok(store)
     }
 
-
     // ========================================================================
     // Node property indexes
     // ========================================================================
@@ -1229,17 +1228,27 @@ impl GraphStore {
     ///
     /// Exactness is the whole difficulty. The rule used here is:
     ///
-    /// 1. expand whichever frontier is smaller by one *complete* level;
+    /// 1. expand whichever frontier is smaller by one **complete** level;
     /// 2. only then test the newly reached nodes against the other side's
     ///    visited set;
     /// 3. if any are shared, return `min(dist_f(m) + dist_b(m))` over them.
     ///
-    /// Stopping at the first shared node found *inside* a level, which is the
-    /// classic off-by-one, can return a path one hop too long. Step 3 is exact
-    /// because a non-empty intersection after two complete levels implies
-    /// `df + db >= L`, and `df + db >= L` implies some node of a true shortest
-    /// path is in both visited sets (take the node at position `min(df, L)`),
-    /// so the minimum over the intersection is `L` itself.
+    /// Why that is exact, with `L` the true distance and `df`/`db` the depths
+    /// explored: the visited sets intersect **iff** `df + db >= L` (forwards,
+    /// a shared node gives a walk of length `df(m)+db(m) >= L` with
+    /// `df(m)<=df`, `db(m)<=db`; backwards, take the node at position
+    /// `min(df, L)` of a shortest path). So at the first level where the
+    /// intersection is non-empty, `df + db >= L`, and the level before it gave
+    /// `df - 1 + db < L`, hence `df + db == L` exactly. Every shared node found
+    /// in that level therefore already measures `L`; the `min` in step 3 is
+    /// belt-and-braces, not load-bearing.
+    ///
+    /// What *is* load-bearing is "complete level" in step 1. Testing after a
+    /// partial expansion breaks `df - 1 + db < L` and returns paths one hop too
+    /// long — the classic off-by-one. That is checked: mutating this function
+    /// to expand one node of the level before testing makes
+    /// `bidirectional_shortest_path_matches_unidirectional_oracle` fail with a
+    /// 9-node path where the oracle finds 8.
     pub fn shortest_path(
         &self,
         from: NodeId,
@@ -4141,5 +4150,684 @@ mod tests {
         let communities = g.louvain_communities();
         assert_eq!(communities.len(), 1);
         assert!(communities.contains_key(&a));
+    }
+}
+
+#[cfg(test)]
+mod bidirectional_and_index_tests {
+    use super::*;
+    use crate::graph::cypher::parse_cypher;
+    use crate::graph::cypher_executor::execute_cypher;
+
+    /// Deterministic xorshift — no external RNG dependency in the test build.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+
+    fn random_graph(rng: &mut Rng, n: u64, edges: u64, types: usize) -> (GraphStore, Vec<NodeId>) {
+        let mut g = GraphStore::new();
+        let ids: Vec<NodeId> = (0..n)
+            .map(|i| {
+                let mut p = Properties::new();
+                p.insert("k".into(), PropValue::Int(i as i64));
+                g.create_node(vec!["N".into()], p)
+            })
+            .collect();
+        for _ in 0..edges {
+            let a = ids[rng.below(n) as usize];
+            let b = ids[rng.below(n) as usize];
+            let t = format!("T{}", rng.below(types as u64));
+            g.create_edge(a, b, t, Properties::new());
+        }
+        (g, ids)
+    }
+
+    /// A path is only an answer if it is a real walk of the graph, so the
+    /// oracle comparison checks the edges too — comparing lengths alone would
+    /// accept a fabricated path of the right size.
+    fn assert_valid_path(
+        g: &GraphStore,
+        path: &[NodeId],
+        from: NodeId,
+        to: NodeId,
+        dir: Direction,
+        et: Option<&str>,
+    ) {
+        assert_eq!(
+            path.first().copied(),
+            Some(from),
+            "path does not start at from"
+        );
+        assert_eq!(path.last().copied(), Some(to), "path does not end at to");
+        for w in path.windows(2) {
+            let ok = g.neighbors(w[0], dir, et).iter().any(|(nb, _)| *nb == w[1]);
+            assert!(ok, "path uses a non-existent edge {} -> {}", w[0], w[1]);
+        }
+        let mut seen = HashSet::new();
+        for &n in path {
+            assert!(seen.insert(n), "shortest path repeats node {n}");
+        }
+    }
+
+    /// The bidirectional search must agree with the unidirectional oracle on
+    /// EXACT length for every pair of a lot of random graphs, and must agree on
+    /// reachability (disconnected pairs return None on both).
+    #[test]
+    fn bidirectional_shortest_path_matches_unidirectional_oracle() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let mut checked = 0usize;
+        let mut found = 0usize;
+        let mut unreachable = 0usize;
+        for round in 0..90 {
+            // Three shapes, on purpose. Tiny dense graphs make paths 1-2 hops
+            // and never exercise the frontier alternation; only the larger,
+            // sparser rounds produce the long paths where the two frontiers
+            // meet several levels deep, which is where the off-by-one lives.
+            let (n, edges) = match round % 3 {
+                0 => (4 + rng.below(18), rng.below(30)),
+                1 => (30 + rng.below(60), 30 + rng.below(90)),
+                _ => (60 + rng.below(120), 60 + rng.below(90)),
+            };
+            let types = 1 + (round % 3);
+            let (g, ids) = random_graph(&mut rng, n, edges, types);
+            // Sampling on the large rounds — the full n^2 sweep there would be
+            // slow without testing anything the sample misses.
+            let probe: Vec<NodeId> = if ids.len() > 24 {
+                (0..24).map(|_| ids[rng.below(n) as usize]).collect()
+            } else {
+                ids.clone()
+            };
+            for dir in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
+                for et in [None, Some("T0")] {
+                    for &a in &probe {
+                        for &b in &probe {
+                            let got = g.shortest_path(a, b, dir, et);
+                            let want = g.shortest_path_unidirectional(a, b, dir, et);
+                            checked += 1;
+                            match (&got, &want) {
+                                (None, None) => unreachable += 1,
+                                (Some(p), Some(q)) => {
+                                    found += 1;
+                                    assert_eq!(
+                                        p.len(),
+                                        q.len(),
+                                        "length differs for {a} -> {b} dir {dir:?} type {et:?}: \
+                                         {p:?} vs oracle {q:?}"
+                                    );
+                                    if a != b {
+                                        assert_valid_path(&g, p, a, b, dir, et);
+                                    }
+                                }
+                                _ => panic!(
+                                    "reachability differs for {a} -> {b} dir {dir:?} type {et:?}: \
+                                     {got:?} vs oracle {want:?}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A test that never exercised either outcome would pass vacuously.
+        assert!(checked > 50_000, "only {checked} pairs compared");
+        assert!(found > 1_000, "only {found} reachable pairs");
+        assert!(unreachable > 1_000, "only {unreachable} unreachable pairs");
+    }
+
+    /// The classic bidirectional off-by-one yields a path one hop too long on
+    /// an odd-length chain, so pin the exact length on a graph whose answer is
+    /// known by hand.
+    #[test]
+    fn bidirectional_shortest_path_exact_length_on_chain() {
+        for len in 1..24usize {
+            let mut g = GraphStore::new();
+            let ids: Vec<NodeId> = (0..=len)
+                .map(|_| g.create_node(vec!["N".into()], Properties::new()))
+                .collect();
+            for w in ids.windows(2) {
+                g.create_edge(w[0], w[1], "R".into(), Properties::new());
+            }
+            let p = g
+                .shortest_path(ids[0], ids[len], Direction::Outgoing, None)
+                .expect("chain is connected");
+            assert_eq!(p.len(), len + 1, "chain of {len} hops");
+            assert_eq!(p, ids, "chain path is the chain itself");
+        }
+    }
+
+    /// A shortcut must beat the long way round in both parities.
+    #[test]
+    fn bidirectional_shortest_path_prefers_the_shortcut() {
+        let mut g = GraphStore::new();
+        let ids: Vec<NodeId> = (0..10)
+            .map(|_| g.create_node(vec!["N".into()], Properties::new()))
+            .collect();
+        for w in ids.windows(2) {
+            g.create_edge(w[0], w[1], "R".into(), Properties::new());
+        }
+        // 0 -> 4 -> 9 is 2 hops against the ring's 9.
+        g.create_edge(ids[0], ids[4], "R".into(), Properties::new());
+        g.create_edge(ids[4], ids[9], "R".into(), Properties::new());
+        let p = g
+            .shortest_path(ids[0], ids[9], Direction::Outgoing, None)
+            .unwrap();
+        assert_eq!(p, vec![ids[0], ids[4], ids[9]]);
+    }
+
+    #[test]
+    fn shortest_path_self_and_missing_nodes() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec!["N".into()], Properties::new());
+        assert_eq!(
+            g.shortest_path(a, a, Direction::Outgoing, None),
+            Some(vec![a])
+        );
+        assert_eq!(g.shortest_path(a, 999, Direction::Outgoing, None), None);
+        assert_eq!(g.shortest_path(999, a, Direction::Outgoing, None), None);
+    }
+
+    // ---- property index ----
+
+    /// Scan and index must return the same set. This is the cheap corruption
+    /// check: a stale index answers wrongly, not slowly.
+    fn assert_index_agrees_with_scan(g: &GraphStore, label: &str, property: &str) {
+        for node in g.nodes_by_label(label) {
+            if let Some(v) = node.properties.get(property) {
+                let mut want: Vec<NodeId> = g
+                    .nodes_by_label(label)
+                    .iter()
+                    .filter(|n| n.properties.get(property) == Some(v))
+                    .map(|n| n.id)
+                    .collect();
+                let mut got = g
+                    .node_index_lookup(label, property, v)
+                    .expect("index exists");
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(
+                    got, want,
+                    "index disagrees with scan on {label}({property}) = {v:?}"
+                );
+            }
+        }
+        // Nothing indexed may point at a node that no longer matches.
+        let total: usize = g
+            .node_index_defs()
+            .into_iter()
+            .find(|(l, p, _)| l == label && p == property)
+            .map(|(_, _, n)| n)
+            .unwrap();
+        let live = g
+            .nodes_by_label(label)
+            .iter()
+            .filter(|n| n.properties.contains_key(property))
+            .count();
+        assert_eq!(
+            total, live,
+            "index holds {total} entries against {live} live nodes"
+        );
+    }
+
+    #[test]
+    fn index_survives_every_mutation_path() {
+        let mut rng = Rng(0xDEADBEEFCAFEF00D);
+        let mut g = GraphStore::new();
+        assert!(g.create_node_index("N", "k"));
+        assert!(!g.create_node_index("N", "k"), "duplicate create must fail");
+        let mut live: Vec<NodeId> = Vec::new();
+
+        for step in 0..4_000u64 {
+            match rng.below(10) {
+                0..=4 => {
+                    // create_node
+                    let mut p = Properties::new();
+                    p.insert("k".into(), PropValue::Int(rng.below(40) as i64));
+                    // A second label and an unindexed property, so the hooks
+                    // have to discriminate.
+                    p.insert("other".into(), PropValue::Text(format!("v{step}")));
+                    let labels = if step % 3 == 0 {
+                        vec!["N".into(), "M".into()]
+                    } else {
+                        vec!["N".into()]
+                    };
+                    live.push(g.create_node(labels, p));
+                }
+                5 => {
+                    // a node with no indexed property at all
+                    live.push(g.create_node(vec!["N".into()], Properties::new()));
+                }
+                6 => {
+                    // a node under a different label entirely
+                    let mut p = Properties::new();
+                    p.insert("k".into(), PropValue::Int(rng.below(40) as i64));
+                    g.create_node(vec!["Q".into()], p);
+                }
+                7..=8 => {
+                    // set_node_property, including overwriting an absent value
+                    if !live.is_empty() {
+                        let id = live[rng.below(live.len() as u64) as usize];
+                        g.set_node_property(id, "k".into(), PropValue::Int(rng.below(40) as i64));
+                    }
+                }
+                _ => {
+                    // delete_node
+                    if !live.is_empty() {
+                        let i = rng.below(live.len() as u64) as usize;
+                        let id = live.swap_remove(i);
+                        g.delete_node(id);
+                    }
+                }
+            }
+            if step % 250 == 0 {
+                assert_index_agrees_with_scan(&g, "N", "k");
+            }
+        }
+        assert_index_agrees_with_scan(&g, "N", "k");
+        // The other-label nodes must never have leaked into the :N index.
+        assert!(
+            g.nodes_by_label("Q").len() > 50,
+            "the Q arm never ran, so the label discrimination is untested"
+        );
+    }
+
+    #[test]
+    fn index_is_maintained_across_rollback() {
+        let mut g = GraphStore::new();
+        let mut p = Properties::new();
+        p.insert("k".into(), PropValue::Int(1));
+        let keep = g.create_node(vec!["N".into()], p);
+        assert!(g.create_node_index("N", "k"));
+
+        let snap = g.txn_snapshot();
+        g.clear_touched();
+        let mut p2 = Properties::new();
+        p2.insert("k".into(), PropValue::Int(2));
+        let tmp = g.create_node(vec!["N".into()], p2);
+        g.set_node_property(keep, "k".into(), PropValue::Int(9));
+        let touched = g.take_touched();
+        g.txn_restore_scoped(&snap, &touched);
+
+        assert_eq!(
+            g.node_index_lookup("N", "k", &PropValue::Int(2)),
+            Some(vec![])
+        );
+        assert_eq!(
+            g.node_index_lookup("N", "k", &PropValue::Int(9)),
+            Some(vec![])
+        );
+        assert_eq!(
+            g.node_index_lookup("N", "k", &PropValue::Int(1)),
+            Some(vec![keep])
+        );
+        assert!(g.get_node(tmp).is_none());
+        assert_index_agrees_with_scan(&g, "N", "k");
+    }
+
+    /// `GraphTransaction` buffers operations and replays them through the
+    /// store's own methods on commit, so the hooks must cover that route too.
+    #[test]
+    fn index_is_maintained_through_graph_transaction_commit() {
+        let mut g = GraphStore::new();
+        let mut p = Properties::new();
+        p.insert("k".into(), PropValue::Int(1));
+        let a = g.create_node(vec!["N".into()], p);
+        assert!(g.create_node_index("N", "k"));
+
+        let mut mgr = GraphTransactionManager::new();
+        let mut txn = mgr.begin(&g);
+        let mut p2 = Properties::new();
+        p2.insert("k".into(), PropValue::Int(7));
+        txn.create_node(&g, vec!["N".into()], p2);
+        txn.delete_node(&g, a);
+        mgr.commit(txn, &mut g);
+
+        assert!(g.get_node(a).is_none());
+        assert_eq!(
+            g.node_index_lookup("N", "k", &PropValue::Int(1)),
+            Some(vec![])
+        );
+        assert_eq!(
+            g.node_index_lookup("N", "k", &PropValue::Int(7))
+                .map(|v| v.len()),
+            Some(1)
+        );
+        assert_index_agrees_with_scan(&g, "N", "k");
+    }
+
+    #[test]
+    fn index_definition_survives_reopen_and_is_rebuilt() {
+        let dir = std::env::temp_dir().join(format!("nucleus_gidx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ids: Vec<NodeId> = {
+            let mut g = GraphStore::open(&dir).expect("open");
+            assert!(g.create_node_index("N", "k"));
+            (0..50u64)
+                .map(|i| {
+                    let mut p = Properties::new();
+                    p.insert("k".into(), PropValue::Int(i as i64));
+                    g.create_node(vec!["N".into()], p)
+                })
+                .collect()
+        };
+        // Reopen from the WAL tail (no checkpoint).
+        {
+            let g = GraphStore::open(&dir).expect("reopen");
+            assert!(g.has_node_index("N", "k"));
+            assert_eq!(
+                g.node_index_lookup("N", "k", &PropValue::Int(7)),
+                Some(vec![ids[7]])
+            );
+            assert_index_agrees_with_scan(&g, "N", "k");
+            g.checkpoint_wal().expect("checkpoint");
+        }
+        // Reopen from the checkpoint snapshot.
+        {
+            let mut g = GraphStore::open(&dir).expect("reopen after checkpoint");
+            assert!(g.has_node_index("N", "k"));
+            assert_index_agrees_with_scan(&g, "N", "k");
+            assert!(g.drop_node_index("N", "k"));
+        }
+        // A dropped definition must stay dropped.
+        {
+            let g = GraphStore::open(&dir).expect("reopen after drop");
+            assert!(!g.has_node_index("N", "k"));
+            assert!(g.node_index_lookup("N", "k", &PropValue::Int(7)).is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Engine-level before/after for the bidirectional change, with no
+    /// transport in the measurement — `compete_graph`'s shortest-path arm
+    /// cannot produce a "before" number because both of its configurations
+    /// call the same (new) method.
+    ///
+    /// Ignored by default; it is a measurement, not an assertion, and this
+    /// machine is too noisy for a latency assertion to be anything but a
+    /// flaky test.
+    ///
+    ///     cargo test --release --features server --lib \
+    ///         shortest_path_bidirectional_vs_unidirectional_timing \
+    ///         -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+    fn shortest_path_bidirectional_vs_unidirectional_timing() {
+        use std::time::Instant;
+        // The same shape compete_graph generates: a ring plus 3 random
+        // shortcuts per node, so mean distance is ~6.6 hops at out-degree 4.
+        let n: u64 = 10_000;
+        let mut rng = Rng(42);
+        let mut g = GraphStore::new();
+        let ids: Vec<NodeId> = (0..n)
+            .map(|_| g.create_node(vec!["N".into()], Properties::new()))
+            .collect();
+        for i in 0..n as usize {
+            g.create_edge(
+                ids[i],
+                ids[(i + 1) % n as usize],
+                "REL".into(),
+                Properties::new(),
+            );
+            for _ in 0..3 {
+                let t = rng.below(n) as usize;
+                g.create_edge(ids[i], ids[t], "REL".into(), Properties::new());
+            }
+        }
+
+        let pairs: Vec<(NodeId, NodeId)> = (0..400)
+            .map(|_| (ids[rng.below(n) as usize], ids[rng.below(n) as usize]))
+            .collect();
+
+        // Warm both, and prove they agree before either is timed.
+        let mut hops = 0usize;
+        for &(a, b) in &pairs {
+            let x = g.shortest_path(a, b, Direction::Outgoing, None);
+            let y = g.shortest_path_unidirectional(a, b, Direction::Outgoing, None);
+            assert_eq!(
+                x.as_ref().map(|p| p.len()),
+                y.as_ref().map(|p| p.len()),
+                "the two implementations disagree on {a} -> {b}"
+            );
+            hops += x.as_ref().map(|p| p.len()).unwrap_or(0);
+        }
+
+        let mut bi = Vec::new();
+        let mut uni = Vec::new();
+        // Alternate so machine drift lands on both equally.
+        for &(a, b) in &pairs {
+            let t = Instant::now();
+            std::hint::black_box(g.shortest_path(a, b, Direction::Outgoing, None));
+            bi.push(t.elapsed().as_micros() as u64);
+            let t = Instant::now();
+            std::hint::black_box(g.shortest_path_unidirectional(a, b, Direction::Outgoing, None));
+            uni.push(t.elapsed().as_micros() as u64);
+        }
+        bi.sort_unstable();
+        uni.sort_unstable();
+        let q = |v: &[u64], f: f64| v[((v.len() as f64 - 1.0) * f) as usize];
+        println!(
+            "shortest path over {} pairs, {} nodes / {} edges, mean path {:.1} nodes",
+            pairs.len(),
+            g.node_count(),
+            g.edge_count(),
+            hops as f64 / pairs.len() as f64
+        );
+        println!(
+            "  unidirectional  p50 {:>6} us  p90 {:>6} us  p99 {:>6} us",
+            q(&uni, 0.5),
+            q(&uni, 0.9),
+            q(&uni, 0.99)
+        );
+        println!(
+            "  bidirectional   p50 {:>6} us  p90 {:>6} us  p99 {:>6} us",
+            q(&bi, 0.5),
+            q(&bi, 0.9),
+            q(&bi, 0.99)
+        );
+        println!(
+            "  speedup at p50: {:.2}x",
+            q(&uni, 0.5) as f64 / q(&bi, 0.5).max(1) as f64
+        );
+    }
+
+    /// Engine-level anchor resolution, scan against index, at two scales.
+    ///
+    /// `BENCH_VS_NEO4J.md` predicted the scan's cost grows linearly with node
+    /// count while an index stays flat. This measures both points; it does not
+    /// assert, for the same reason as the timing test above.
+    ///
+    ///     cargo test --release --features server --lib \
+    ///         anchor_resolution_scan_vs_index_timing -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+    fn anchor_resolution_scan_vs_index_timing() {
+        use crate::graph::cypher_executor::execute_cypher;
+        use std::time::Instant;
+        for n in [10_000u64, 100_000u64] {
+            let mut g = GraphStore::new();
+            let mut rng = Rng(7);
+            for i in 0..n {
+                let mut p = Properties::new();
+                p.insert("k".into(), PropValue::Int(i as i64));
+                g.create_node(vec!["N".into()], p);
+            }
+            let keys: Vec<i64> = (0..400).map(|_| rng.below(n) as i64).collect();
+            let q: Vec<crate::graph::cypher::CypherStatement> = keys
+                .iter()
+                .map(|k| parse_cypher(&format!("MATCH (a:N {{k: {k}}}) RETURN a.k")).unwrap())
+                .collect();
+
+            let mut scan = Vec::new();
+            for stmt in &q {
+                let t = Instant::now();
+                let r = execute_cypher(&mut g, stmt).unwrap();
+                scan.push(t.elapsed().as_nanos() as u64);
+                assert_eq!(r.rows.len(), 1);
+            }
+            assert!(g.create_node_index("N", "k"));
+            let mut idx = Vec::new();
+            for stmt in &q {
+                let t = Instant::now();
+                let r = execute_cypher(&mut g, stmt).unwrap();
+                idx.push(t.elapsed().as_nanos() as u64);
+                assert_eq!(r.rows.len(), 1);
+            }
+            scan.sort_unstable();
+            idx.sort_unstable();
+            let m = |v: &[u64]| v[v.len() / 2];
+            println!(
+                "anchor at {n:>6} nodes: label scan p50 {:>8.1} us   index p50 {:>6.2} us   {:>8.0}x",
+                m(&scan) as f64 / 1000.0,
+                m(&idx) as f64 / 1000.0,
+                m(&scan) as f64 / m(&idx).max(1) as f64
+            );
+        }
+    }
+
+    /// What an index costs a write. `compete_graph` cannot answer this: it
+    /// creates the index after its load, so its load rate measures nothing
+    /// about maintenance.
+    ///
+    ///     cargo test --release --features server --lib \
+    ///         index_write_maintenance_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+    fn index_write_maintenance_cost() {
+        use std::time::Instant;
+        let n = 200_000u64;
+        let build = |indexes: usize| -> (u128, usize) {
+            let mut g = GraphStore::new();
+            for i in 0..indexes {
+                assert!(g.create_node_index("N", &format!("p{i}")));
+            }
+            let t = Instant::now();
+            for i in 0..n {
+                let mut p = Properties::new();
+                p.insert("p0".into(), PropValue::Int(i as i64));
+                p.insert("p1".into(), PropValue::Int((i % 97) as i64));
+                p.insert("p2".into(), PropValue::Text(format!("v{i}")));
+                g.create_node(vec!["N".into()], p);
+            }
+            (t.elapsed().as_nanos() / n as u128, g.node_count())
+        };
+        // Warm the allocator so the first configuration is not charged for it.
+        let _ = build(0);
+        for indexes in [0usize, 1, 3] {
+            let (ns, count) = build(indexes);
+            assert_eq!(count, n as usize);
+            println!("create_node with {indexes} index(es): {ns} ns/node");
+        }
+        // Deletes have to find and remove the entry, which is the more
+        // expensive half.
+        for indexes in [0usize, 1] {
+            let mut g = GraphStore::new();
+            for i in 0..indexes {
+                assert!(g.create_node_index("N", &format!("p{i}")));
+            }
+            let ids: Vec<NodeId> = (0..n)
+                .map(|i| {
+                    let mut p = Properties::new();
+                    p.insert("p0".into(), PropValue::Int(i as i64));
+                    g.create_node(vec!["N".into()], p)
+                })
+                .collect();
+            let t = Instant::now();
+            for id in &ids {
+                g.delete_node(*id);
+            }
+            println!(
+                "delete_node with {indexes} index(es): {} ns/node",
+                t.elapsed().as_nanos() / n as u128
+            );
+        }
+    }
+
+    // ---- Cypher DDL surface ----
+
+    fn run(g: &mut GraphStore, q: &str) -> crate::graph::cypher_executor::CypherResult {
+        let stmt = parse_cypher(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+        execute_cypher(g, &stmt).unwrap_or_else(|e| panic!("exec {q}: {e}"))
+    }
+
+    #[test]
+    fn cypher_index_ddl_both_spellings() {
+        let mut g = GraphStore::new();
+        for i in 0..20i64 {
+            let mut p = Properties::new();
+            p.insert("k".into(), PropValue::Int(i));
+            g.create_node(vec!["N".into()], p);
+        }
+        run(&mut g, "CREATE INDEX ON :N(k)");
+        assert!(g.has_node_index("N", "k"));
+        // Re-creating without the guard is an error; with the guard it is not.
+        assert!(execute_cypher(&mut g, &parse_cypher("CREATE INDEX ON :N(k)").unwrap()).is_err());
+        run(&mut g, "CREATE INDEX IF NOT EXISTS ON :N(k)");
+
+        let shown = run(&mut g, "SHOW INDEXES");
+        assert_eq!(shown.rows.len(), 1);
+        assert_eq!(shown.rows[0][2], PropValue::Int(20));
+
+        run(&mut g, "DROP INDEX ON :N(k)");
+        assert!(!g.has_node_index("N", "k"));
+
+        // Neo4j 5 spelling, with a name.
+        run(&mut g, "CREATE INDEX n_k IF NOT EXISTS FOR (n:N) ON (n.k)");
+        assert!(g.has_node_index("N", "k"));
+        run(&mut g, "DROP INDEX n_k IF EXISTS FOR (n:N) ON (n.k)");
+        assert!(!g.has_node_index("N", "k"));
+
+        // A variable mismatch is rejected rather than silently indexing something else.
+        assert!(parse_cypher("CREATE INDEX FOR (n:N) ON (m.k)").is_err());
+    }
+
+    /// The point of the whole feature: the same MATCH must return the same rows
+    /// with and without an index, and must stop scanning.
+    #[test]
+    fn indexed_match_returns_the_same_rows_as_the_scan() {
+        let mut g = GraphStore::new();
+        for i in 0..200i64 {
+            let mut p = Properties::new();
+            p.insert("k".into(), PropValue::Int(i));
+            p.insert("grp".into(), PropValue::Int(i % 10));
+            g.create_node(vec!["N".into()], p);
+        }
+        let q = "MATCH (a:N {k: 42}) RETURN a.k";
+        let before = run(&mut g, q);
+        run(&mut g, "CREATE INDEX ON :N(k)");
+        let after = run(&mut g, q);
+        assert_eq!(before, after);
+        assert_eq!(after.rows, vec![vec![PropValue::Int(42)]]);
+
+        // A multi-property pattern where only one property is indexed must
+        // still filter on both.
+        let both = run(&mut g, "MATCH (a:N {k: 42, grp: 2}) RETURN a.k");
+        assert_eq!(both.rows, vec![vec![PropValue::Int(42)]]);
+        let contradiction = run(&mut g, "MATCH (a:N {k: 42, grp: 3}) RETURN a.k");
+        assert!(contradiction.rows.is_empty());
+
+        // A value with no match returns nothing, not everything.
+        assert!(
+            run(&mut g, "MATCH (a:N {k: 9999}) RETURN a.k")
+                .rows
+                .is_empty()
+        );
+
+        // Writes through Cypher keep the index true.
+        run(&mut g, "CREATE (x:N {k: 9999})");
+        assert_eq!(
+            run(&mut g, "MATCH (a:N {k: 9999}) RETURN a.k").rows.len(),
+            1
+        );
+        assert_index_agrees_with_scan(&g, "N", "k");
     }
 }

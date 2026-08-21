@@ -561,7 +561,8 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<CypherStatement, CypherError> {
         // Index DDL, checked before the normal dispatch because `CREATE INDEX`
         // shares its leading keyword with `CREATE (n:Label)`.
-        if matches!(self.peek(), Some(Token::Keyword(k)) if k == "CREATE") && self.ident_at(1, "INDEX")
+        if matches!(self.peek(), Some(Token::Keyword(k)) if k == "CREATE")
+            && self.ident_at(1, "INDEX")
         {
             return self.parse_create_index();
         }

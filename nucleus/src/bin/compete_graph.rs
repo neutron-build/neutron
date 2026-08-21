@@ -63,9 +63,10 @@
 //! 2. **No property reads on the fast surface.** `GRAPH_NEIGHBORS` returns
 //!    neighbour ids, edge ids and edge types, and there is no Nucleus function
 //!    that reads a node's properties. Any property-filtered pattern must go
-//!    through `GRAPH_QUERY`'s Cypher subset, which resolves its anchor with a
-//!    label scan (`nodes_by_label` + a property compare per node) because that
-//!    subset has no property index. Both facts are measured, not hidden.
+//!    through `GRAPH_QUERY`'s Cypher subset. That subset now has a node
+//!    property index (`CREATE INDEX ON :N(k)`), created by default here so
+//!    both engines resolve their anchor through an index; `--no-index` runs
+//!    the label scan it used to do, so the same binary measures both.
 //! 3. **No server-side k-hop on the fast surface.** Multi-hop through
 //!    `GRAPH_NEIGHBORS` costs one round trip per expanded node. That arm is
 //!    reported with its round-trip count so the number is read as the
@@ -142,6 +143,11 @@ struct Cfg {
     /// oracle before anything is timed, so a truncated search can never be
     /// mistaken for "no path".
     sp_bound: usize,
+    /// Create a Nucleus node property index on `:N(k)` before the read arms.
+    /// On by default, to mirror the range index Neo4j is given. `--no-index`
+    /// turns it off so the same binary measures the label-scan anchor this
+    /// document originally reported.
+    nucleus_index: bool,
     data_dir: std::path::PathBuf,
 }
 
@@ -160,6 +166,7 @@ impl Default for Cfg {
             neo4j_pass: "neo4j".into(),
             skip_neo4j: false,
             sp_bound: 30,
+            nucleus_index: true,
             data_dir: std::env::temp_dir()
                 .join(format!("nucleus_compete_graph_{}", std::process::id())),
         }
@@ -182,6 +189,8 @@ Usage: compete_graph [OPTIONS]
   --neo4j-pass P    Bolt password                   (default neo4j)
   --sp-bound N      hop bound for Neo4j shortestPath (default 30)
   --skip-neo4j      run the Nucleus arm only
+  --no-index        do NOT create the Nucleus :N(k) index (measures the old
+                    label-scan anchor; Neo4j keeps its index either way)
   --help            print this text and exit";
 
 fn parse_args() -> Option<Cfg> {
@@ -206,6 +215,7 @@ fn parse_args() -> Option<Cfg> {
             "--neo4j-pass" => cfg.neo4j_pass = next(&mut i),
             "--sp-bound" => cfg.sp_bound = next(&mut i).parse().unwrap_or(cfg.sp_bound),
             "--skip-neo4j" => cfg.skip_neo4j = true,
+            "--no-index" => cfg.nucleus_index = false,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return None;
@@ -1025,6 +1035,34 @@ async fn main() {
         nuc_edge_load.as_secs_f64(),
         truth.edge_count as f64 / nuc_edge_load.as_secs_f64(),
     );
+    // Nucleus's equivalent of the range index Neo4j is given above. Created
+    // AFTER the load so both engines pay the same per-write index maintenance
+    // during it — Neo4j's index also exists throughout its load, so if
+    // anything this is the conservative order for Nucleus's load numbers.
+    if cfg.nucleus_index {
+        let created = nuc_text(&nuc, "SELECT GRAPH_QUERY('CREATE INDEX ON :N(k)')")
+            .await
+            .expect("CREATE INDEX returned NULL");
+        assert!(
+            created.contains("true"),
+            "CREATE INDEX ON :N(k) did not report success: {created}"
+        );
+        let shown = nuc_text(&nuc, "SELECT GRAPH_QUERY('SHOW INDEXES')")
+            .await
+            .expect("SHOW INDEXES returned NULL");
+        // An index that exists but indexed nothing would make every anchor
+        // query return zero rows, which the per-op assertions would catch —
+        // but catching it here names the cause.
+        assert!(
+            shown.contains(&format!("{}", cfg.nodes)),
+            "the :N(k) index does not hold {} entries: {shown}",
+            cfg.nodes
+        );
+        println!("  nucleus ix : CREATE INDEX ON :N(k) — {shown}");
+    } else {
+        println!("  nucleus ix : none (--no-index): the anchor is a label scan");
+    }
+
     if neo.is_some() {
         println!(
             "  neo4j    nodes {:>7.1}s ({:>6.0} op/s)   edges {:>7.1}s ({:>6.0} op/s)",
@@ -1145,7 +1183,11 @@ async fn main() {
         stats: nuc_anchor,
         correct: (ops, ops),
         round_trips: 1.0,
-        note: "GRAPH_QUERY: label scan + property compare, no index",
+        note: if cfg.nucleus_index {
+            "GRAPH_QUERY: node property index on :N(k)"
+        } else {
+            "GRAPH_QUERY: label scan + property compare, no index"
+        },
     });
     if neo.is_some() {
         arms.push(Arm {

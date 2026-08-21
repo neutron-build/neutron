@@ -912,6 +912,7 @@ mod tests {
             edges: snap_edges_refs,
             next_node_id: 151,
             next_edge_id: 150,
+            node_indexes: vec![],
         })
         .unwrap();
         drop(wal);
@@ -987,6 +988,7 @@ mod tests {
             edges: vec![],
             next_node_id: 3,
             next_edge_id: 1,
+            node_indexes: vec![],
         })
         .unwrap();
 
