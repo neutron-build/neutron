@@ -839,10 +839,25 @@ impl PartialEq for Value {
         if let (Some(a), Some(b)) = (self.as_canonical_int(), other.as_canonical_int()) {
             return a == b;
         }
+        // Temporal variants compare by INSTANT, mirroring `Ord`, which has had
+        // these arms all along. Without them a `Timestamp` and a `TimestampTz`
+        // naming the same instant fell to `_ => false` here while `Ord` returned
+        // `Equal` -- `cmp == Equal` with `eq == false` is the direction that
+        // breaks `BTreeMap` and `BinaryHeap` invariants, and it made the
+        // hash-keyed routes (DISTINCT, HashJoin, hash aggregates) disagree with
+        // the order-keyed ones (Sort, top-K heaps, every B-tree lookup) on the
+        // same data. A DATE compares as midnight of that day, as in PostgreSQL.
+        if let (Some(a), Some(b)) = (self.as_temporal_micros(), other.as_temporal_micros()) {
+            return a == b;
+        }
         match (self, other) {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Float64(a), Value::Float64(b)) => a == b,
+            // NaN equals NaN, matching both `Ord` above and PostgreSQL, where
+            // `'NaN'::float8 = 'NaN'::float8` is true. IEEE says otherwise, but
+            // `Eq` is asserted for this type and a non-reflexive value inside a
+            // sorted or hashed container corrupts it.
+            (Value::Float64(a), Value::Float64(b)) => a == b || (a.is_nan() && b.is_nan()),
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
             (Value::Date(a), Value::Date(b)) => a == b,
@@ -879,7 +894,29 @@ impl Eq for Value {}
 /// `PartialEq`-equal) also hash equal, independent of their enum discriminant. Any
 /// constant works — collisions with other variants are harmless; only equal-hashes-
 /// for-equal-values matters.
+/// Fixed tag for temporal values, mirroring [`INT_HASH_TAG`]: `Date`, `Timestamp`
+/// and `TimestampTz` are `PartialEq`-equal when they name the same instant, so
+/// they must hash equal too, independent of their enum discriminant.
+const TEMPORAL_HASH_TAG: u8 = 0xF2;
+
 const INT_HASH_TAG: u8 = 0xF1;
+
+impl Value {
+    /// This value as microseconds since the 2000-01-01 epoch, for the variants
+    /// that compare and hash by INSTANT rather than by type tag.
+    ///
+    /// `Date`, `Timestamp` and `TimestampTz` name points on one timeline, and
+    /// `Ord` has always compared them that way. `PartialEq` and `Hash` now agree,
+    /// which is what keeps the hash-keyed and order-keyed execution routes from
+    /// grouping the same rows differently.
+    fn as_temporal_micros(&self) -> Option<i64> {
+        match self {
+            Value::Date(d) => Some(date_as_micros(*d)),
+            Value::Timestamp(t) | Value::TimestampTz(t) => Some(*t),
+            _ => None,
+        }
+    }
+}
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -891,19 +928,31 @@ impl Hash for Value {
             i.hash(state);
             return;
         }
+        // Same reasoning for temporal values: equal-by-instant means equal-hash,
+        // and the discriminant must not enter the hash for these variants.
+        if let Some(micros) = self.as_temporal_micros() {
+            TEMPORAL_HASH_TAG.hash(state);
+            micros.hash(state);
+            return;
+        }
         core::mem::discriminant(self).hash(state);
         match self {
             Value::Null => {}
             Value::Bool(b) => b.hash(state),
             Value::Int32(_) | Value::Int64(_) => unreachable!("integers handled above"),
+            Value::Date(_) | Value::Timestamp(_) | Value::TimestampTz(_) => {
+                unreachable!("temporal values handled above")
+            }
+            // Every NaN hashes alike. NaN has many bit patterns and they are all
+            // equal to each other under `PartialEq` above, so hashing the raw
+            // bits would put equal values in different buckets.
+            Value::Float64(f) if f.is_nan() => f64::NAN.to_bits().hash(state),
             Value::Float64(f) => f.to_bits().hash(state),
             Value::Text(s) => s.hash(state),
             Value::Numeric(s) => canonical_numeric(s)
                 .unwrap_or_else(|_| s.clone())
                 .hash(state),
             Value::Jsonb(v) => format!("{v}").hash(state),
-            Value::Date(d) => d.hash(state),
-            Value::Timestamp(t) | Value::TimestampTz(t) => t.hash(state),
             Value::Uuid(u) => u.hash(state),
             Value::Bytea(b) => b.hash(state),
             Value::Array(a) => a.hash(state),
