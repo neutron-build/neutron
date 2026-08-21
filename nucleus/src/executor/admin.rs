@@ -260,6 +260,20 @@ impl Executor {
             "DEFAULT_TRANSACTION_ISOLATION" => "read committed".to_string(),
             "LC_COLLATE" => "C".to_string(),
             "LC_CTYPE" => "en_US.UTF-8".to_string(),
+            // Answered from the EFFECTIVE value -- session override over server
+            // default -- not from whether this session happens to hold an
+            // override. `SHOW synchronous_commit` returned "(not set)" on a
+            // server whose default is `on`, so a client could not see the one
+            // setting that decides whether a committed write survives a crash.
+            // That is precisely why a durability report sat untriaged: the
+            // setting "was never checked" because it could not be.
+            "SYNCHRONOUS_COMMIT" => {
+                if self.synchronous_commit_enabled() {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
             _ => "(not set)".to_string(),
         };
 

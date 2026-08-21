@@ -627,7 +627,18 @@ impl DiskEngine {
                 }
             };
             if use_segmented_wal {
-                records.extend(wal::read_wal_dir_records(&wal_dir).unwrap_or_default());
+                // The single-file arm immediately above refuses to open rather
+                // than silently discard unreplayed commits. This arm did the
+                // opposite one line later: a directory or segment that could not
+                // be read replayed NOTHING, the open still succeeded, and the
+                // database came up empty over a data directory that was not.
+                records.extend(wal::read_wal_dir_records(&wal_dir).map_err(|e| {
+                    StorageError::Io(format!(
+                        "WAL recovery could not read the segment directory {}: {e}. \
+                         Refusing to open and silently discard unreplayed commits.",
+                        wal_dir.display()
+                    ))
+                })?);
             }
             // Apply strictly in LSN order so latest-per-page wins across the
             // legacy single file and every segment.

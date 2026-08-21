@@ -1693,9 +1693,24 @@ pub fn read_wal_dir_records(dir: &Path) -> std::io::Result<Vec<WalRecord>> {
     segments.sort_unstable();
     let mut all = Vec::new();
     for seg in segments {
-        if let Ok(mut records) = read_wal_records(&segment_path(dir, seg)) {
-            all.append(&mut records);
-        }
+        // Propagate rather than skip. A torn tail is NOT an error here --
+        // `read_wal_records_with_end` repairs that internally and returns the
+        // records it could parse -- so an Err from this call is a genuine I/O
+        // failure to read a segment that exists. Skipping it silently dropped
+        // every commit in that segment while the open went on to succeed, which
+        // is the failure the single-file arm of the caller explicitly refuses.
+        let path = segment_path(dir, seg);
+        let mut records = read_wal_records(&path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "WAL recovery could not read segment {}: {e}. Refusing to open and \
+                     silently discard its commits.",
+                    path.display()
+                ),
+            )
+        })?;
+        all.append(&mut records);
     }
     Ok(all)
 }
