@@ -474,8 +474,9 @@ Benchmarks answer "how fast", never "is it correct". Read
 |---|---|---|
 | `benchmark` | `bench-tools` | Standalone in-process report across every model. |
 | `compete` | `bench-tools` | Nucleus vs PostgreSQL, SQLite, SurrealDB, CockroachDB, TiDB, MongoDB. |
-| `compete_vector` | `bench-tools` | Nucleus HNSW vs **pgvector**, apples to apples. |
+| `compete_vector` | `bench-tools` | Nucleus HNSW vs **pgvector** and **Qdrant**, apples to apples: one corpus, one brute-force ground truth, one index per engine swept over `ef_search`, each competitor's transport floor measured alongside. Results in `docs/BENCH_VS_QDRANT.md`. **Read the curves at matched RECALL, not matched `ef`.** |
 | `compete_fts` | `bench-tools` | Nucleus FTS vs **Tantivy** (in-process library), apples to apples: shared exact-BM25 ground truth, tie-blind overlap@k next to every latency, tokenizer parity asserted before timing. |
+| `compete_graph` | `bench-tools` | Nucleus GRAPH vs **Neo4j 5** over Bolt, apples to apples: one seeded graph loaded edge-for-edge into both, one in-process BFS ground truth, every neighbourhood set and every returned path checked against it before its sample is kept, both engines warmed (Neo4j is a JVM). Results in `docs/BENCH_VS_NEO4J.md`. **Read every traversal row against the `anchor` row** — Nucleus's `GRAPH_*` functions take node ids, Cypher resolves an anchor by property. |
 | `bench_paired` | `server` | Correctness-paired latency for vector, FTS, graph. |
 | `pg_compare` | `server` | Head-to-head vs PostgreSQL 17 over pgwire. |
 | `stress` | `server` | Load generation. |

@@ -1,4 +1,5 @@
-//! Cross-engine vector benchmark — Nucleus HNSW vs pgvector, apples to apples.
+//! Cross-engine vector benchmark — Nucleus HNSW vs pgvector vs Qdrant, apples
+//! to apples.
 //!
 //! `bench_paired` deliberately measures Nucleus against an inline brute-force
 //! reference and says so: its numbers are Nucleus-only and must not be
@@ -25,17 +26,41 @@
 //!   engine, repeated on each row, and it is a property of `ef_construction`
 //!   rather than of the point.
 //! - **The transport difference is measured, not hidden.** Nucleus runs
-//!   in-process; pgvector answers over a loopback socket. That gap is real and
-//!   it favours Nucleus, so the harness measures the round-trip floor with a
-//!   trivial `SELECT 1` and prints it on every run. Subtract it before claiming
-//!   a latency win.
+//!   in-process; pgvector answers over a loopback socket, and Qdrant over
+//!   loopback HTTP into a Linux VM when podman is the runtime. That gap is real
+//!   and it favours Nucleus, so the harness measures each competitor's
+//!   round-trip floor with a trivial request (`SELECT 1`, `GET /healthz`) and
+//!   prints it on every run. Subtract it before claiming a latency win.
+//! - **Recall is what the operating points are compared AT.** Every engine's
+//!   `ef_search` sweep produces a (recall, latency) curve against the one shared
+//!   ground truth. Read the curves at equal recall. Comparing the ef=64 row of
+//!   one engine with the ef=64 row of another compares parameter values, not
+//!   engines — an engine that returns worse answers faster is not faster.
 //!
 //! Usage:
 //! ```text
 //! cargo run --release --features bench-tools --bin compete_vector -- \
-//!     --n 50000 --dim 128 --k 10 --queries 200 --pg "host=localhost port=5432 dbname=nucleus_bench"
+//!     --n 50000 --dim 128 --k 10 --queries 200 \
+//!     --pg "host=localhost port=5432 dbname=nucleus_bench" \
+//!     --qdrant http://127.0.0.1:56333
 //! ```
-//! Skip pgvector with `--skip-pg` to get the Nucleus column alone.
+//! Skip a competitor with `--skip-pg` / `--skip-qdrant`.
+//!
+//! Qdrant notes, because its defaults are not pgvector's:
+//!
+//! - It shards a collection into several segments, each with its own HNSW graph,
+//!   and merges their answers. `--qdrant-segments` pins that count (default: 1,
+//!   so the comparison is one graph against one graph); `0` leaves Qdrant's
+//!   CPU-derived default.
+//! - Indexing is a background optimizer, not a blocking `CREATE INDEX`. The
+//!   harness uploads with `indexing_threshold = 0` (indexing off), then turns it
+//!   on and polls until `status = green` and every vector is indexed. That
+//!   elapsed time is `build_s`, and it excludes upload.
+//! - `hnsw_config.full_scan_threshold` is set to Qdrant's minimum, 10 KB, so the
+//!   graph is always preferred — the analogue of `SET enable_seqscan = off` on
+//!   the pgvector arm. At its default (10 MB) a segment below that size answers
+//!   EXACTLY, which reads as perfect recall at a latency that is not an HNSW
+//!   latency at all.
 
 use std::time::Instant;
 
@@ -54,6 +79,20 @@ struct Config {
     dist: VectorDist,
     pg_conn: String,
     skip_pg: bool,
+    qdrant_url: String,
+    skip_qdrant: bool,
+    /// Segments per Qdrant collection. `1` gives one HNSW graph, matching the
+    /// other two arms; `0` leaves Qdrant's CPU-derived default.
+    qdrant_segments: usize,
+    /// Qdrant optimizer threads during the index build. `1` matches Nucleus's
+    /// single-threaded build; `0` leaves Qdrant's default (parallel).
+    qdrant_opt_threads: usize,
+    /// How many times the whole query sweep is replayed over the SAME index.
+    /// This laptop has measured 95.4% worst-case deviation on green runs, so a
+    /// single pass of `queries` samples is not enough to separate an engine
+    /// difference from scheduler noise. Recall is deterministic and does not
+    /// change across repeats; only the latency sample count grows.
+    repeats: usize,
 }
 
 impl Default for Config {
@@ -70,8 +109,43 @@ impl Default for Config {
             dist: VectorDist::Clustered,
             pg_conn: "host=localhost port=5432 dbname=nucleus_bench".into(),
             skip_pg: false,
+            qdrant_url: "http://127.0.0.1:56333".into(),
+            skip_qdrant: false,
+            qdrant_segments: 1,
+            qdrant_opt_threads: 1,
+            repeats: 3,
         }
     }
+}
+
+/// Peak resident set size of this process, in bytes.
+///
+/// Used as a build-memory probe: the corpus is allocated before the index is
+/// built and nothing is freed in between, so the delta across the build is the
+/// index's footprint. It is a PEAK, so it is a lower bound on nothing and an
+/// upper bound on nothing — it is the high-water mark, and it is reported as
+/// such rather than as "index size".
+#[cfg(unix)]
+fn peak_rss_bytes() -> u64 {
+    // SAFETY: `getrusage` writes a plain POD struct through the pointer; the
+    // zeroed value is a valid `rusage` and the call cannot fail for RUSAGE_SELF.
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return 0;
+        }
+        // macOS reports ru_maxrss in bytes, Linux in kilobytes.
+        if cfg!(target_os = "macos") {
+            usage.ru_maxrss as u64
+        } else {
+            (usage.ru_maxrss as u64) * 1024
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> u64 {
+    0
 }
 
 /// One engine's result at one `ef_search` operating point.
@@ -198,7 +272,7 @@ fn bench_nucleus(
     corpus: &[Vector],
     queries: &[Vector],
     truth_kth: &[f64],
-) -> Vec<Measurement> {
+) -> (Vec<Measurement>, u64) {
     // ONE index, swept. It used to be rebuilt per operating point, which made
     // the curve uninterpretable: HNSW construction is randomized (layer
     // assignment), so each rebuild is a different graph and recall at ef=64
@@ -216,17 +290,23 @@ fn bench_nucleus(
         metric: DistanceMetric::L2,
     };
     let mut index = HnswIndex::new(index_cfg);
+    let rss_before = peak_rss_bytes();
     let t_build = Instant::now();
     for (id, v) in corpus.iter().enumerate() {
         index.insert(id as u64, v.clone());
     }
     let build_s = t_build.elapsed().as_secs_f64();
+    // The graph stores its own copy of every vector, so this delta covers the
+    // vectors AND the adjacency lists — the same thing Qdrant's segment holds.
+    let rss_delta = peak_rss_bytes().saturating_sub(rss_before);
 
     let mut out = Vec::new();
     for &ef in &cfg.ef_search {
         let mut recalls = Vec::with_capacity(queries.len());
-        let mut latencies = Vec::with_capacity(queries.len());
-        for (qi, q) in queries.iter().enumerate() {
+        let mut latencies = Vec::with_capacity(queries.len() * cfg.repeats);
+        for (pass, (qi, q)) in (0..cfg.repeats)
+            .flat_map(|pass| std::iter::repeat(pass).zip(queries.iter().enumerate()))
+        {
             let t0 = Instant::now();
             // `search_ef`, not `search`: `search` raises the beam to
             // `max(ef_search, min(n/2048, 512))`, so at 50k rows the reported
@@ -235,11 +315,16 @@ fn bench_nucleus(
             let got = index.search_ef(q, cfg.k, ef);
             latencies.push(t0.elapsed().as_nanos() as f64 / 1000.0);
             let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
-            recalls.push(recall_by_distance(&ids, truth_kth[qi], corpus, q, cfg.k));
+            let r = recall_by_distance(&ids, truth_kth[qi], corpus, q, cfg.k);
+            // Recall is deterministic over a fixed graph, so it is recorded once
+            // and the later passes only add latency samples.
+            if pass == 0 {
+                recalls.push(r);
+            }
         }
         out.push(summarize("nucleus", ef, build_s, &recalls, latencies));
     }
-    out
+    (out, rss_delta)
 }
 
 #[cfg(feature = "bench-tools")]
@@ -348,20 +433,289 @@ async fn bench_pgvector(
             .await?;
 
         let mut recalls = Vec::with_capacity(queries.len());
-        let mut latencies = Vec::with_capacity(queries.len());
-        for (qi, q) in queries.iter().enumerate() {
+        let mut latencies = Vec::with_capacity(queries.len() * cfg.repeats);
+        for (pass, (qi, q)) in (0..cfg.repeats)
+            .flat_map(|pass| std::iter::repeat(pass).zip(queries.iter().enumerate()))
+        {
             let literal = vector_literal(q);
             let limit = cfg.k as i64;
             let t0 = Instant::now();
             let rows = client.query(&stmt, &[&literal, &limit]).await?;
             latencies.push(t0.elapsed().as_nanos() as f64 / 1000.0);
             let ids: Vec<u64> = rows.iter().map(|r| r.get::<_, i64>(0) as u64).collect();
-            recalls.push(recall_by_distance(&ids, truth_kth[qi], corpus, q, cfg.k));
+            let r = recall_by_distance(&ids, truth_kth[qi], corpus, q, cfg.k);
+            if pass == 0 {
+                recalls.push(r);
+            }
         }
         out.push(summarize("pgvector", ef, build_s, &recalls, latencies));
     }
 
     Ok((out, rtt_p50))
+}
+
+/// Everything the Qdrant arm reports beyond the per-ef rows.
+#[cfg(feature = "bench-tools")]
+struct QdrantRun {
+    rows: Vec<Measurement>,
+    version: String,
+    /// p50 of a trivial `GET /healthz`, the loopback-HTTP floor under every
+    /// query latency in `rows`.
+    rtt_p50_us: f64,
+    /// Segments the collection actually ended up with, read back rather than
+    /// assumed — the requested count is a hint, not a guarantee.
+    segments: usize,
+    indexed_vectors: u64,
+    upload_s: f64,
+    /// `(ef_search, p50, p95)` of Qdrant's OWN reported handling time, in
+    /// microseconds. Self-reported, so it is evidence about the transport, not
+    /// a substitute for the measured client-side latency.
+    server_us_by_ef: Vec<(usize, f64, f64)>,
+}
+
+/// Nucleus HNSW vs Qdrant over its REST API.
+///
+/// Qdrant is a purpose-built vector database and this arm is written so that it
+/// can win cleanly: same corpus, same queries, same `m`/`ef_construct`, the same
+/// `ef_search` sweep against ONE index, and recall scored by the same external
+/// brute-force truth used for every other engine.
+#[cfg(feature = "bench-tools")]
+async fn bench_qdrant(
+    cfg: &Config,
+    corpus: &[Vector],
+    queries: &[Vector],
+    truth_kth: &[f64],
+) -> Result<QdrantRun, Box<dyn std::error::Error>> {
+    use serde_json::{Value, json};
+
+    let base = cfg.qdrant_url.trim_end_matches('/').to_string();
+    let coll = format!("{base}/collections/bench_vectors");
+    let http = reqwest::Client::builder()
+        // Qdrant's index build on a large corpus can outlast a default timeout,
+        // and a timeout mid-build would be reported as a Qdrant failure rather
+        // than as a harness limit.
+        .timeout(std::time::Duration::from_secs(900))
+        .build()?;
+
+    /// A non-2xx from Qdrant must abort, never be timed as a success. That is
+    /// the exact defect that discredited the numbers under `docs/benchmarks/`.
+    async fn ok_json(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(format!("qdrant {what} failed: HTTP {status}: {body}").into());
+        }
+        Ok(serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
+    let version = ok_json(http.get(&base).send().await?, "GET /")
+        .await?
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Loopback floor. Measured against `/healthz`, which touches no collection,
+    // so it is transport and HTTP framing only. Under podman on macOS this also
+    // includes the hop into the Linux VM, which is exactly why it is printed.
+    let mut rtt = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let t0 = Instant::now();
+        let r = http.get(format!("{base}/healthz")).send().await?;
+        if !r.status().is_success() {
+            return Err(format!("qdrant healthz: HTTP {}", r.status()).into());
+        }
+        let _ = r.bytes().await?;
+        rtt.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+    }
+    rtt.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    let rtt_p50_us = percentile(&rtt, 0.50);
+
+    // Recreate from scratch: a leftover collection would be measured with the
+    // previous run's parameters and nothing in the output would say so.
+    let _ = http.delete(&coll).send().await?;
+
+    let mut optimizers = json!({
+        // 0 disables HNSW construction. Points land unindexed, so upload cost
+        // and build cost are two measurements instead of one blended number.
+        "indexing_threshold": 0,
+    });
+    if cfg.qdrant_segments > 0 {
+        optimizers["default_segment_number"] = json!(cfg.qdrant_segments);
+    }
+    if cfg.qdrant_opt_threads > 0 {
+        optimizers["max_optimization_threads"] = json!(cfg.qdrant_opt_threads);
+    }
+    let create = json!({
+        "vectors": { "size": cfg.dim, "distance": "Euclid", "on_disk": false },
+        "hnsw_config": {
+            "m": cfg.m,
+            "ef_construct": cfg.ef_construction,
+            // 10 KB is Qdrant's minimum accepted value (it rejects smaller with
+            // HTTP 422). Always prefer the graph: the default, 10 MB, answers
+            // any smaller segment exactly, which would score perfect recall at
+            // a latency that is not an HNSW latency.
+            "full_scan_threshold": 10,
+            "on_disk": false,
+        },
+        "optimizers_config": optimizers,
+        "shard_number": 1,
+        "replication_factor": 1,
+    });
+    ok_json(
+        http.put(&coll).json(&create).send().await?,
+        "create collection",
+    )
+    .await?;
+
+    // Upload unindexed. `wait=true` so the harness never races the write path.
+    const CHUNK: usize = 500;
+    let t_upload = Instant::now();
+    let mut loaded = 0usize;
+    while loaded < corpus.len() {
+        let end = (loaded + CHUNK).min(corpus.len());
+        let points: Vec<Value> = corpus[loaded..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, v)| json!({ "id": loaded + offset, "vector": v.data }))
+            .collect();
+        ok_json(
+            http.put(format!("{coll}/points?wait=true"))
+                .json(&json!({ "points": points }))
+                .send()
+                .await?,
+            "upsert points",
+        )
+        .await?;
+        loaded = end;
+    }
+    let upload_s = t_upload.elapsed().as_secs_f64();
+
+    // Turn indexing on and time it to completion. `status = green` alone is not
+    // enough — a collection with zero indexed vectors is also green — so the
+    // loop waits on `indexed_vectors_count` reaching the corpus size.
+    let t_build = Instant::now();
+    ok_json(
+        http.patch(&coll)
+            .json(&json!({ "optimizers_config": { "indexing_threshold": 1 } }))
+            .send()
+            .await?,
+        "enable indexing",
+    )
+    .await?;
+    let (build_s, indexed_vectors, segments) = loop {
+        let info = ok_json(http.get(&coll).send().await?, "collection info").await?;
+        let result = info.get("result").cloned().unwrap_or(Value::Null);
+        let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let indexed = result
+            .get("indexed_vectors_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let segments = result
+            .get("segments_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        if status == "red" {
+            return Err(format!("qdrant collection went red during build: {result}").into());
+        }
+        if status == "green" && indexed >= corpus.len() as u64 {
+            break (t_build.elapsed().as_secs_f64(), indexed, segments);
+        }
+        if t_build.elapsed().as_secs_f64() > 900.0 {
+            return Err(format!(
+                "qdrant index build did not finish in 900s (status={status}, indexed={indexed})"
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    // One index, swept — `hnsw_ef` is a per-request parameter in Qdrant, so no
+    // rebuild is needed and none is done. Queries are sequential and
+    // single-threaded, matching the other two arms.
+    let mut rows = Vec::new();
+    let mut server_us_by_ef = Vec::new();
+    for &ef in &cfg.ef_search {
+        let mut recalls = Vec::with_capacity(queries.len());
+        let mut latencies = Vec::with_capacity(queries.len() * cfg.repeats);
+        // Qdrant reports its own server-side handling time on every response.
+        // It is self-reported and therefore NOT the headline number, but it is
+        // the only way to see past a loopback-into-a-VM transport that is
+        // hundreds of microseconds on its own.
+        let mut server_us: Vec<f64> = Vec::with_capacity(queries.len() * cfg.repeats);
+        for (pass, (qi, q)) in (0..cfg.repeats)
+            .flat_map(|pass| std::iter::repeat(pass).zip(queries.iter().enumerate()))
+        {
+            let body = json!({
+                "vector": q.data,
+                "limit": cfg.k,
+                // `exact: false` is the default, stated so a future Qdrant
+                // default flip cannot silently turn this into a brute-force arm
+                // scoring perfect recall.
+                "params": { "hnsw_ef": ef, "exact": false },
+                "with_payload": false,
+                "with_vector": false,
+            });
+            let t0 = Instant::now();
+            let resp = http
+                .post(format!("{coll}/points/search"))
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            latencies.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+            if !status.is_success() {
+                return Err(format!("qdrant search failed: HTTP {status}: {text}").into());
+            }
+            let parsed: Value = serde_json::from_str(&text)?;
+            let hits = parsed
+                .get("result")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| format!("qdrant search returned no result array: {text}"))?;
+            if hits.len() != cfg.k {
+                return Err(format!(
+                    "qdrant returned {} hits, expected k={} — an under-full answer \
+                     would be scored as low recall at low latency, which is not a \
+                     measurement",
+                    hits.len(),
+                    cfg.k
+                )
+                .into());
+            }
+            let ids: Vec<u64> = hits
+                .iter()
+                .filter_map(|h| h.get("id").and_then(|v| v.as_u64()))
+                .collect();
+            if let Some(t) = parsed.get("time").and_then(|v| v.as_f64()) {
+                server_us.push(t * 1_000_000.0);
+            }
+            let r = recall_by_distance(&ids, truth_kth[qi], corpus, q, cfg.k);
+            if pass == 0 {
+                recalls.push(r);
+            }
+        }
+        server_us.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        server_us_by_ef.push((
+            ef,
+            percentile(&server_us, 0.50),
+            percentile(&server_us, 0.95),
+        ));
+        rows.push(summarize("qdrant", ef, build_s, &recalls, latencies));
+    }
+
+    Ok(QdrantRun {
+        rows,
+        version,
+        rtt_p50_us,
+        segments,
+        indexed_vectors,
+        upload_s,
+        server_us_by_ef,
+    })
 }
 
 fn parse_args() -> Config {
@@ -397,6 +751,15 @@ fn parse_args() -> Config {
             }
             "--pg" => cfg.pg_conn = next(&mut i),
             "--skip-pg" => cfg.skip_pg = true,
+            "--qdrant" => cfg.qdrant_url = next(&mut i),
+            "--skip-qdrant" => cfg.skip_qdrant = true,
+            "--qdrant-segments" => {
+                cfg.qdrant_segments = next(&mut i).parse().unwrap_or(cfg.qdrant_segments)
+            }
+            "--qdrant-opt-threads" => {
+                cfg.qdrant_opt_threads = next(&mut i).parse().unwrap_or(cfg.qdrant_opt_threads)
+            }
+            "--repeats" => cfg.repeats = next(&mut i).parse().unwrap_or(cfg.repeats).max(1),
             _ => {}
         }
         i += 1;
@@ -407,8 +770,8 @@ fn parse_args() -> Config {
 fn main() {
     let cfg = parse_args();
     println!(
-        "corpus n={} dim={} dist={:?} k={} queries={} seed={}",
-        cfg.n, cfg.dim, cfg.dist, cfg.k, cfg.queries, cfg.seed
+        "corpus n={} dim={} dist={:?} k={} queries={} repeats={} seed={}",
+        cfg.n, cfg.dim, cfg.dist, cfg.k, cfg.queries, cfg.repeats, cfg.seed
     );
     println!(
         "matched index params: m={} ef_construction={} ef_search={:?} metric=L2",
@@ -448,19 +811,68 @@ fn main() {
         t_truth.elapsed().as_secs_f64()
     );
 
-    let mut results = bench_nucleus(&cfg, &corpus, &queries, &truth_kth);
-    let mut rtt_note = String::from("pgvector skipped");
+    let (mut results, nucleus_rss) = bench_nucleus(&cfg, &corpus, &queries, &truth_kth);
+    let mut notes: Vec<String> = vec![format!(
+        "nucleus build peak-RSS delta = {:.1} MB ({:.0} bytes/vector over {} vectors, \
+         graph + its own copy of each vector)",
+        nucleus_rss as f64 / (1024.0 * 1024.0),
+        nucleus_rss as f64 / cfg.n.max(1) as f64,
+        cfg.n
+    )];
+    if cfg.skip_pg {
+        notes.push("pgvector skipped".into());
+    }
+    if cfg.skip_qdrant {
+        notes.push("qdrant skipped".into());
+    }
+
+    // One runtime for every networked arm. Errors are recorded and printed, not
+    // swallowed: a competitor that failed must never look like a competitor that
+    // lost.
+    #[cfg(feature = "bench-tools")]
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     #[cfg(feature = "bench-tools")]
     if !cfg.skip_pg {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         match runtime.block_on(bench_pgvector(&cfg, &corpus, &queries, &truth_kth)) {
             Ok((mut pg, rtt_p50)) => {
                 results.append(&mut pg);
-                rtt_note = format!("pgvector loopback SELECT 1 p50 = {rtt_p50:.0} us");
+                notes.push(format!("pgvector loopback SELECT 1 p50 = {rtt_p50:.0} us"));
             }
             Err(e) => {
-                rtt_note = format!("pgvector FAILED: {e}");
+                notes.push(format!("pgvector FAILED: {e}"));
+            }
+        }
+    }
+
+    #[cfg(feature = "bench-tools")]
+    if !cfg.skip_qdrant {
+        match runtime.block_on(bench_qdrant(&cfg, &corpus, &queries, &truth_kth)) {
+            Ok(mut q) => {
+                notes.push(format!(
+                    "qdrant {} at {} — segments={} indexed_vectors={} upload={:.1}s \
+                     (upload is NOT in build_s); loopback GET /healthz p50 = {:.0} us",
+                    q.version,
+                    cfg.qdrant_url,
+                    q.segments,
+                    q.indexed_vectors,
+                    q.upload_s,
+                    q.rtt_p50_us
+                ));
+                notes.push(format!(
+                    "qdrant requested segments={} opt_threads={} repeats={} (0 = qdrant default)",
+                    cfg.qdrant_segments, cfg.qdrant_opt_threads, cfg.repeats
+                ));
+                for (ef, p50, p95) in &q.server_us_by_ef {
+                    notes.push(format!(
+                        "qdrant SELF-REPORTED handling time at ef={ef}: p50 {p50:.0} us, \
+                         p95 {p95:.0} us (excludes transport; not the headline number)"
+                    ));
+                }
+                results.append(&mut q.rows);
+            }
+            Err(e) => {
+                notes.push(format!("qdrant FAILED: {e}"));
             }
         }
     }
@@ -487,10 +899,13 @@ fn main() {
         );
     }
     println!();
-    println!("{rtt_note}");
+    for n in &notes {
+        println!("{n}");
+    }
     println!(
-        "NOTE: Nucleus runs in-process; pgvector answers over a loopback socket. \
-         Subtract the round-trip floor above before reading any latency gap as an \
-         engine difference. Queries are sequential and single-threaded."
+        "NOTE: Nucleus runs in-process; pgvector answers over a loopback socket and \
+         Qdrant over loopback HTTP. Subtract each round-trip floor above before \
+         reading a latency gap as an engine difference. Queries are sequential and \
+         single-threaded. COMPARE AT EQUAL RECALL, not at equal ef_search."
     );
 }
