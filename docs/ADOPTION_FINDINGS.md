@@ -1103,3 +1103,19 @@ Omni now ships its own interceptor (same guards, calls the exported
 path. Fix direction: reproduce with `neutron-ts build` + a static file
 server, and check whether init's listener registration is tree-shaken,
 ordering-dependent, or skipped when there is no SSR document.
+
+**A-026 correction (same day, after full root-cause):** the interceptor was
+never the problem — it intercepts and calls `navigate()` correctly in
+production builds too. The chain: `handleNavigation` fetches route data with
+`Accept: application/json; X-Neutron-Data: true`; a static SPA host's
+fallback answers that with `index.html` (200); `response.json()` throws; the
+catch runs `window.location.reload()` **silently** — so every navigation is
+a full document load with no console trace. Dev works because the dev server
+answers those fetches with JSON. Two real defects: (1) a non-JSON 200 on a
+`X-Neutron-Data` request should be treated as "this host has no route data"
+and render client-side with empty loader data, not reload; (2) the reload
+fallback is silent — at minimum it should warn. Omni fixed it at the edge
+(caddy answers `X-Neutron-Data` with `200 {}`; documented for self-hosters
+in the README) and additionally ships a capture-phase interceptor in
+`_layout.tsx` as defence in depth. Verified on the deployed artifact: all
+topbar navigations are same-document SPA.
