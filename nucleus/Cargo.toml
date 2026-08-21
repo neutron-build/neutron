@@ -70,6 +70,11 @@ ndarray = { version = "0.17", optional = true }
 # Minimal features: the harness uses RamDirectory, the default BM25 scorer and
 # SimpleTokenizer; no mmap, no stemmers, no on-disk index.
 tantivy = { version = "0.26", optional = true, default-features = false }
+# Cross-engine GRAPH benchmark only (`compete_graph`). Bolt is Neo4j's binary
+# wire protocol, so the Neo4j arm pays a loopback round trip of the same shape
+# as the Nucleus arm's pgwire round trip -- the HTTP/JSON endpoint would have
+# charged Neo4j a transport penalty that is not an engine difference.
+neo4rs = { version = "0.8", optional = true }
 # --- Allocators (mutually exclusive at runtime via feature selection) ---
 #   `mimalloc-allocator` (default in `server`) — universal, builds clean on
 #       macOS / Linux / Windows; perf within ~5–10% of jemalloc.
@@ -98,7 +103,7 @@ server = [
     "tokio/full", "tokio/rt-multi-thread",
 ]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "getrandom/js"]
-bench-tools = ["server", "comfy-table", "dep:redis", "dep:reqwest", "rusqlite", "mongodb", "dep:mysql_async", "clickhouse", "dep:tantivy"]
+bench-tools = ["server", "comfy-table", "dep:redis", "dep:reqwest", "rusqlite", "mongodb", "dep:mysql_async", "clickhouse", "dep:tantivy", "dep:neo4rs"]
 rusqlite = ["dep:rusqlite"]
 mongodb = ["dep:mongodb"]
 clickhouse = ["dep:clickhouse", "dep:urlencoding", "dep:reqwest"]
@@ -173,6 +178,11 @@ required-features = ["bench-tools"]
 [[bin]]
 name = "compete_fts"
 path = "src/bin/compete_fts.rs"
+required-features = ["bench-tools"]
+
+[[bin]]
+name = "compete_graph"
+path = "src/bin/compete_graph.rs"
 required-features = ["bench-tools"]
 
 [[bin]]
