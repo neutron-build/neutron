@@ -140,6 +140,14 @@ pub struct GraphStore {
     /// clears this before a mutating call and drains it afterwards, under the
     /// same write guard, so the record is attributed to exactly one session.
     txn_touched: GraphTouched,
+    /// Node property indexes, keyed by `(label, property)`.
+    ///
+    /// Explicitly created (`CREATE INDEX ON :Label(prop)`), never automatic:
+    /// indexing every property would cost memory proportional to the whole
+    /// graph and slow every write, which is a choice the operator makes.
+    /// A `BTreeMap` so iteration order — and therefore which index a query
+    /// picks when several apply — is deterministic.
+    node_prop_indexes: BTreeMap<(String, String), PropertyIndex>,
 }
 
 impl Default for GraphStore {
@@ -164,6 +172,7 @@ impl GraphStore {
             hot_node_ids: HashSet::new(),
             max_hot_nodes: usize::MAX,
             txn_touched: GraphTouched::default(),
+            node_prop_indexes: BTreeMap::new(),
         }
     }
 
@@ -243,6 +252,18 @@ impl GraphStore {
             store.incoming.entry(we.to).or_default().push(*id);
         }
 
+        // Restore index definitions and rebuild their contents from the
+        // recovered nodes. Definitions are durable; contents never are — a
+        // definition that survived without its data would answer queries
+        // wrongly rather than slowly.
+        for (label, property) in &state.node_indexes {
+            store.node_prop_indexes.insert(
+                (label.clone(), property.clone()),
+                PropertyIndex::new(label, property),
+            );
+        }
+        store.rebuild_all_node_indexes();
+
         // Restore ID counters.
         store.next_node_id = if state.next_node_id > 0 {
             state.next_node_id
@@ -256,6 +277,222 @@ impl GraphStore {
         };
 
         Ok(store)
+    }
+
+
+    // ========================================================================
+    // Node property indexes
+    // ========================================================================
+    //
+    // Every path in this file that adds, removes, or rewrites a node — or a
+    // node's properties — calls one of the three `index_*` hooks below. The
+    // list is closed by construction: `nodes`, `label_index` and
+    // `hot_node_ids` are private fields of `GraphStore`, so only this module
+    // and its children can write them, and the only child that touches them is
+    // `tiered.rs`, which owns a *different* type (`TieredGraphStore`).
+    //
+    // The hooked paths are:
+    //   create_node            → index_add_node
+    //   delete_node            → index_remove_node
+    //   set_node_property      → index_replace_property
+    //   detach_node (rollback) → index_remove_node
+    //   reattach_node (rollback) → index_add_node
+    //   txn_restore (whole-store restore) → rebuild_all_node_indexes
+    //   open (WAL replay)      → rebuild_all_node_indexes
+    //   GraphTransaction::commit's SetProperty, which used to write
+    //     `graph.nodes` directly (and so also skipped the WAL) and now goes
+    //     through `set_node_property`.
+    //
+    // `maybe_evict_props` is deliberately NOT hooked: it clears the in-memory
+    // copy of a property that still logically exists, so removing the index
+    // entry would lose a row. It is the reason the rebuild and the
+    // old-value lookup below both fall back to the cold tier.
+    //
+    // There is no relabel path — `GraphStore` exposes no way to change a
+    // node's labels after creation — so no hook is needed for one.
+
+    /// A node's properties as the index must see them, following the cold tier
+    /// when the hot copy has been evicted.
+    fn index_visible_props(&self, id: NodeId, hot: &Properties) -> Option<Properties> {
+        if !hot.is_empty() || self.cold_props.is_none() {
+            return None;
+        }
+        let cold = self.cold_props.as_ref()?;
+        let data = cold.lock().get(&format!("n:{id}").into_bytes())?;
+        tiered::properties_from_bytes(&data)
+    }
+
+    /// Add a node to every index whose `(label, property)` it satisfies.
+    fn index_add_node(&mut self, id: NodeId, labels: &[String], props: &Properties) {
+        if self.node_prop_indexes.is_empty() {
+            return;
+        }
+        let spilled = self.index_visible_props(id, props);
+        let props = spilled.as_ref().unwrap_or(props);
+        for ((label, property), idx) in self.node_prop_indexes.iter_mut() {
+            if labels.iter().any(|l| l == label)
+                && let Some(v) = props.get(property)
+            {
+                idx.insert(id, v);
+            }
+        }
+    }
+
+    /// Remove a node from every index it could be in.
+    fn index_remove_node(&mut self, id: NodeId, labels: &[String], props: &Properties) {
+        if self.node_prop_indexes.is_empty() {
+            return;
+        }
+        let spilled = self.index_visible_props(id, props);
+        let props = spilled.as_ref().unwrap_or(props);
+        for ((label, property), idx) in self.node_prop_indexes.iter_mut() {
+            if labels.iter().any(|l| l == label)
+                && let Some(v) = props.get(property)
+            {
+                idx.remove(id, v);
+            }
+        }
+    }
+
+    /// Move a node between index slots when one of its properties is rewritten.
+    fn index_replace_property(
+        &mut self,
+        id: NodeId,
+        labels: &[String],
+        key: &str,
+        old: Option<&PropValue>,
+        new: &PropValue,
+    ) {
+        if self.node_prop_indexes.is_empty() {
+            return;
+        }
+        for ((label, property), idx) in self.node_prop_indexes.iter_mut() {
+            if property != key || !labels.iter().any(|l| l == label) {
+                continue;
+            }
+            if let Some(old) = old {
+                idx.remove(id, old);
+            }
+            idx.insert(id, new);
+        }
+    }
+
+    /// Rebuild every index from the live node set, following the cold tier.
+    fn rebuild_all_node_indexes(&mut self) {
+        if self.node_prop_indexes.is_empty() {
+            return;
+        }
+        let mut indexes = std::mem::take(&mut self.node_prop_indexes);
+        for ((label, property), idx) in indexes.iter_mut() {
+            idx.tree.clear();
+            let ids: Vec<NodeId> = self
+                .label_index
+                .get(label)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            for id in ids {
+                let Some(node) = self.nodes.get(&id) else {
+                    continue;
+                };
+                let spilled = self.index_visible_props(id, &node.properties);
+                let props = spilled.as_ref().unwrap_or(&node.properties);
+                if let Some(v) = props.get(property) {
+                    idx.insert(id, v);
+                }
+            }
+        }
+        self.node_prop_indexes = indexes;
+    }
+
+    /// Create a node property index on `label(property)`.
+    ///
+    /// Returns `false` if one already exists. The definition is written to the
+    /// graph WAL; the contents are built here and rebuilt on every open.
+    pub fn create_node_index(&mut self, label: &str, property: &str) -> bool {
+        let key = (label.to_string(), property.to_string());
+        if self.node_prop_indexes.contains_key(&key) {
+            return false;
+        }
+        if let Some(ref w) = self.wal {
+            let _ = w.log_add_node_index(label, property);
+        }
+        self.node_prop_indexes
+            .insert(key, PropertyIndex::new(label, property));
+        // Build just the new one, not all of them.
+        let mut idx = self
+            .node_prop_indexes
+            .remove(&(label.to_string(), property.to_string()))
+            .expect("just inserted");
+        let ids: Vec<NodeId> = self
+            .label_index
+            .get(label)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        for id in ids {
+            let Some(node) = self.nodes.get(&id) else {
+                continue;
+            };
+            let spilled = self.index_visible_props(id, &node.properties);
+            let props = spilled.as_ref().unwrap_or(&node.properties);
+            if let Some(v) = props.get(property) {
+                idx.insert(id, v);
+            }
+        }
+        self.node_prop_indexes
+            .insert((label.to_string(), property.to_string()), idx);
+        true
+    }
+
+    /// Drop a node property index. Returns `false` if it did not exist.
+    pub fn drop_node_index(&mut self, label: &str, property: &str) -> bool {
+        let key = (label.to_string(), property.to_string());
+        if self.node_prop_indexes.remove(&key).is_none() {
+            return false;
+        }
+        if let Some(ref w) = self.wal {
+            let _ = w.log_drop_node_index(label, property);
+        }
+        true
+    }
+
+    /// Whether an index exists on `label(property)`.
+    pub fn has_node_index(&self, label: &str, property: &str) -> bool {
+        self.node_prop_indexes
+            .contains_key(&(label.to_string(), property.to_string()))
+    }
+
+    /// Every index definition, with its entry count. Ordered by (label, property).
+    pub fn node_index_defs(&self) -> Vec<(String, String, usize)> {
+        self.node_prop_indexes
+            .iter()
+            .map(|((l, p), idx)| (l.clone(), p.clone(), idx.entry_count()))
+            .collect()
+    }
+
+    /// Exact index lookup. `None` means no index covers `label(property)` —
+    /// which is different from `Some(vec![])`, "indexed, and nothing matches".
+    pub fn node_index_lookup(
+        &self,
+        label: &str,
+        property: &str,
+        value: &PropValue,
+    ) -> Option<Vec<NodeId>> {
+        self.node_prop_indexes
+            .get(&(label.to_string(), property.to_string()))
+            .map(|idx| idx.lookup(value))
+    }
+
+    /// Inclusive range lookup over an index. `None` if no index covers it.
+    pub fn node_index_range(
+        &self,
+        label: &str,
+        property: &str,
+        min: &PropValue,
+        max: &PropValue,
+    ) -> Option<Vec<NodeId>> {
+        self.node_prop_indexes
+            .get(&(label.to_string(), property.to_string()))
+            .map(|idx| idx.range(min, max))
     }
 
     // ---- Node operations ----
@@ -276,6 +513,8 @@ impl GraphStore {
                 .or_default()
                 .insert(id);
         }
+
+        self.index_add_node(id, &labels, &properties);
 
         self.nodes.insert(
             id,
@@ -342,6 +581,7 @@ impl GraphStore {
             None => return false,
         };
         self.txn_touched.nodes.insert(id);
+        self.index_remove_node(id, &node.labels, &node.properties);
 
         // Remove from label index
         for label in &node.labels {
@@ -552,6 +792,19 @@ impl GraphStore {
         if let Some(ref w) = self.wal {
             let _ = w.log_set_prop(0, id, &key, &value);
         }
+        let Some(node) = self.nodes.get(&id) else {
+            return false;
+        };
+        // The old value has to come from wherever it really is: for an evicted
+        // node the hot map is empty and removing nothing would leave a stale
+        // entry pointing at this id under the previous value.
+        let labels = node.labels.clone();
+        let spilled = self.index_visible_props(id, &node.properties);
+        let old = match &spilled {
+            Some(props) => props.get(&key).cloned(),
+            None => node.properties.get(&key).cloned(),
+        };
+        self.index_replace_property(id, &labels, &key, old.as_ref(), &value);
         if let Some(node) = self.nodes.get_mut(&id) {
             node.properties.insert(key, value);
             self.txn_touched.nodes.insert(id);
@@ -590,6 +843,11 @@ impl GraphStore {
                 .collect(),
             next_node_id: self.next_node_id,
             next_edge_id: self.next_edge_id,
+            node_indexes: self
+                .node_prop_indexes
+                .keys()
+                .map(|(l, p)| (l.as_str(), p.as_str()))
+                .collect(),
         }
     }
 
@@ -699,6 +957,7 @@ impl GraphStore {
         let Some(node) = self.nodes.remove(&id) else {
             return;
         };
+        self.index_remove_node(id, &node.labels, &node.properties);
         for label in &node.labels {
             if let Some(set) = self.label_index.get_mut(label) {
                 set.remove(&id);
@@ -726,6 +985,7 @@ impl GraphStore {
         if node.id >= self.next_node_id {
             self.next_node_id = node.id + 1;
         }
+        self.index_add_node(node.id, &node.labels, &node.properties);
         self.nodes.insert(node.id, node);
     }
 
@@ -770,6 +1030,9 @@ impl GraphStore {
         self.type_index = snap.type_index;
         self.next_node_id = snap.next_node_id;
         self.next_edge_id = snap.next_edge_id;
+        // Every node was just replaced wholesale; no incremental hook can
+        // describe that, so the indexes are rebuilt.
+        self.rebuild_all_node_indexes();
     }
 
     // ========================================================================
@@ -955,8 +1218,118 @@ impl GraphStore {
 
     // ---- Shortest path ----
 
-    /// Unweighted shortest path (BFS-based). Returns the path as a list of node IDs, or None.
+    /// Unweighted shortest path, by bidirectional BFS. Returns the path as a
+    /// list of node IDs, or `None` when `to` is unreachable from `from`.
+    ///
+    /// A single-source BFS at mean distance `d` and branching factor `b`
+    /// expands on the order of `b^d` nodes; two frontiers meeting in the
+    /// middle expand `2 * b^(d/2)`. The answer is identical — see
+    /// [`Self::shortest_path_unidirectional`], which is kept as the oracle the
+    /// property test in this module compares against on random graphs.
+    ///
+    /// Exactness is the whole difficulty. The rule used here is:
+    ///
+    /// 1. expand whichever frontier is smaller by one *complete* level;
+    /// 2. only then test the newly reached nodes against the other side's
+    ///    visited set;
+    /// 3. if any are shared, return `min(dist_f(m) + dist_b(m))` over them.
+    ///
+    /// Stopping at the first shared node found *inside* a level, which is the
+    /// classic off-by-one, can return a path one hop too long. Step 3 is exact
+    /// because a non-empty intersection after two complete levels implies
+    /// `df + db >= L`, and `df + db >= L` implies some node of a true shortest
+    /// path is in both visited sets (take the node at position `min(df, L)`),
+    /// so the minimum over the intersection is `L` itself.
     pub fn shortest_path(
+        &self,
+        from: NodeId,
+        to: NodeId,
+        direction: Direction,
+        edge_type: Option<&str>,
+    ) -> Option<Vec<NodeId>> {
+        if from == to {
+            return Some(vec![from]);
+        }
+        if !self.nodes.contains_key(&from) || !self.nodes.contains_key(&to) {
+            return None;
+        }
+
+        let back = match direction {
+            Direction::Outgoing => Direction::Incoming,
+            Direction::Incoming => Direction::Outgoing,
+            Direction::Both => Direction::Both,
+        };
+
+        // Index 0 is the forward search from `from`, index 1 the backward
+        // search from `to`. `parent[0][n]` is n's predecessor on the way from
+        // `from`; `parent[1][n]` is n's successor on the way to `to`.
+        const FWD: usize = 0;
+        const BWD: usize = 1;
+        let mut dist: [HashMap<NodeId, u32>; 2] = [HashMap::new(), HashMap::new()];
+        let mut parent: [HashMap<NodeId, NodeId>; 2] = [HashMap::new(), HashMap::new()];
+        let mut frontier: [Vec<NodeId>; 2] = [vec![from], vec![to]];
+        dist[FWD].insert(from, 0);
+        dist[BWD].insert(to, 0);
+
+        while !frontier[FWD].is_empty() && !frontier[BWD].is_empty() {
+            // Expand the cheaper side, and expand a whole level of it — a
+            // partial level would break the exactness argument above.
+            let (side, other) = if frontier[FWD].len() <= frontier[BWD].len() {
+                (FWD, BWD)
+            } else {
+                (BWD, FWD)
+            };
+            let dir = if side == FWD { direction } else { back };
+
+            let level = std::mem::take(&mut frontier[side]);
+            let mut next = Vec::new();
+            let mut best: Option<(u32, NodeId)> = None;
+            for current in level {
+                let d = dist[side][&current] + 1;
+                for (neighbor, _) in self.neighbors(current, dir, edge_type) {
+                    if dist[side].contains_key(&neighbor) {
+                        continue;
+                    }
+                    dist[side].insert(neighbor, d);
+                    parent[side].insert(neighbor, current);
+                    next.push(neighbor);
+                    // The intersection was empty before this level, so any
+                    // shared node must be one of the nodes just added.
+                    if let Some(&od) = dist[other].get(&neighbor) {
+                        let total = d + od;
+                        if best.is_none_or(|(b, _)| total < b) {
+                            best = Some((total, neighbor));
+                        }
+                    }
+                }
+            }
+            frontier[side] = next;
+
+            if let Some((_, meet)) = best {
+                let mut path = vec![meet];
+                let mut cur = meet;
+                while let Some(&p) = parent[FWD].get(&cur) {
+                    path.push(p);
+                    cur = p;
+                }
+                path.reverse();
+                let mut cur = meet;
+                while let Some(&nx) = parent[BWD].get(&cur) {
+                    path.push(nx);
+                    cur = nx;
+                }
+                return Some(path);
+            }
+        }
+
+        None
+    }
+
+    /// The single-source BFS this store used before [`Self::shortest_path`]
+    /// became bidirectional. Retained deliberately: it is the oracle the
+    /// bidirectional implementation is tested against, and it is simple enough
+    /// to be obviously correct.
+    pub fn shortest_path_unidirectional(
         &self,
         from: NodeId,
         to: NodeId,
@@ -2245,9 +2618,11 @@ impl GraphTransaction {
                     new_value,
                     ..
                 } => {
-                    if let Some(node) = graph.nodes.get_mut(&node_id) {
-                        node.properties.insert(key, new_value);
-                    }
+                    // Was a direct write to `graph.nodes`, which skipped the
+                    // WAL, the touched-set and (once they existed) the property
+                    // indexes. Route it through the one method that maintains
+                    // all three.
+                    graph.set_node_property(node_id, key, new_value);
                 }
             }
         }

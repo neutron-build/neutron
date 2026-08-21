@@ -37,6 +37,21 @@ pub enum CypherStatement {
     Delete {
         variables: Vec<String>,
     },
+    /// `CREATE INDEX ON :Label(prop)` — also accepts the Neo4j 5 spelling
+    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.prop)`.
+    CreateNodeIndex {
+        label: String,
+        property: String,
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX ON :Label(prop)`.
+    DropNodeIndex {
+        label: String,
+        property: String,
+        if_exists: bool,
+    },
+    /// `SHOW INDEXES`.
+    ShowIndexes,
 }
 
 /// A WITH clause that projects intermediate results.
@@ -519,7 +534,45 @@ impl Parser {
 
     // ---- Top-level parse ----
 
+    /// Whether the token at `pos + n` is an identifier equal to `word`,
+    /// ignoring case.
+    ///
+    /// The index DDL is recognised through identifiers rather than by adding
+    /// INDEX / DROP / SHOW / ON / FOR to `KEYWORDS`, on purpose: promoting a
+    /// word to a keyword changes how it lexes *everywhere*, so a label named
+    /// `Index` or a property named `on` would start failing to parse. This
+    /// keeps the tokenizer untouched.
+    fn ident_at(&self, n: usize, word: &str) -> bool {
+        matches!(self.tokens.get(self.pos + n), Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
+    }
+
+    /// Consume an identifier equal to `word`, ignoring case.
+    fn expect_ident(&mut self, word: &str) -> Result<(), CypherError> {
+        let tok = self.advance()?.clone();
+        match &tok {
+            Token::Ident(s) if s.eq_ignore_ascii_case(word) => Ok(()),
+            other => Err(CypherError::UnexpectedToken {
+                expected: word.to_string(),
+                found: other.to_string(),
+            }),
+        }
+    }
+
     fn parse_statement(&mut self) -> Result<CypherStatement, CypherError> {
+        // Index DDL, checked before the normal dispatch because `CREATE INDEX`
+        // shares its leading keyword with `CREATE (n:Label)`.
+        if matches!(self.peek(), Some(Token::Keyword(k)) if k == "CREATE") && self.ident_at(1, "INDEX")
+        {
+            return self.parse_create_index();
+        }
+        if self.ident_at(0, "DROP") && self.ident_at(1, "INDEX") {
+            return self.parse_drop_index();
+        }
+        if self.ident_at(0, "SHOW") && (self.ident_at(1, "INDEXES") || self.ident_at(1, "INDEX")) {
+            self.advance()?;
+            self.advance()?;
+            return Ok(CypherStatement::ShowIndexes);
+        }
         match self.peek() {
             Some(Token::Keyword(k)) if k == "MATCH" || k == "OPTIONAL" => self.parse_match(),
             Some(Token::Keyword(k)) if k == "CREATE" => self.parse_create(),
@@ -584,6 +637,120 @@ impl Parser {
             with_clause,
             with_where,
         })
+    }
+
+    // ---- Index DDL ----
+
+    /// `:Label(prop)` — the Neo4j 3.x index target spelling.
+    fn parse_index_target_short(&mut self) -> Result<(String, String), CypherError> {
+        self.expect_token(&Token::Colon)?;
+        let label = self.parse_name()?;
+        self.expect_token(&Token::LParen)?;
+        let property = self.parse_name()?;
+        self.expect_token(&Token::RParen)?;
+        Ok((label, property))
+    }
+
+    /// `FOR (n:Label) ON (n.prop)` — the Neo4j 5 index target spelling. The
+    /// variable is checked to match on both sides so a typo is an error rather
+    /// than an index on the wrong thing.
+    fn parse_index_target_for(&mut self) -> Result<(String, String), CypherError> {
+        self.expect_ident("FOR")?;
+        self.expect_token(&Token::LParen)?;
+        let var = self.parse_name()?;
+        self.expect_token(&Token::Colon)?;
+        let label = self.parse_name()?;
+        self.expect_token(&Token::RParen)?;
+        self.expect_ident("ON")?;
+        self.expect_token(&Token::LParen)?;
+        let var2 = self.parse_name()?;
+        if !var2.eq_ignore_ascii_case(&var) {
+            return Err(CypherError::InvalidSyntax(format!(
+                "index pattern variable '{var}' does not match '{var2}' in the ON clause"
+            )));
+        }
+        self.expect_token(&Token::Dot)?;
+        let property = self.parse_name()?;
+        self.expect_token(&Token::RParen)?;
+        Ok((label, property))
+    }
+
+    /// Either index target spelling, after any name / existence guard.
+    fn parse_index_target(&mut self) -> Result<(String, String), CypherError> {
+        if self.ident_at(0, "ON") {
+            self.advance()?;
+            self.parse_index_target_short()
+        } else if self.ident_at(0, "FOR") {
+            self.parse_index_target_for()
+        } else {
+            Err(CypherError::InvalidSyntax(
+                "expected ON :Label(prop) or FOR (n:Label) ON (n.prop)".into(),
+            ))
+        }
+    }
+
+    /// Skip an optional index name — any identifier that is not the start of
+    /// the target or of an existence guard.
+    fn skip_optional_index_name(&mut self) -> Result<(), CypherError> {
+        if matches!(self.peek(), Some(Token::Ident(_)))
+            && !self.ident_at(0, "ON")
+            && !self.ident_at(0, "FOR")
+            && !self.ident_at(0, "IF")
+        {
+            self.advance()?;
+        }
+        Ok(())
+    }
+
+    fn parse_create_index(&mut self) -> Result<CypherStatement, CypherError> {
+        self.expect_keyword("CREATE")?;
+        self.expect_ident("INDEX")?;
+        self.skip_optional_index_name()?;
+        let mut if_not_exists = false;
+        if self.ident_at(0, "IF") {
+            self.advance()?;
+            self.expect_keyword("NOT")?;
+            self.expect_ident("EXISTS")?;
+            if_not_exists = true;
+        }
+        let (label, property) = self.parse_index_target()?;
+        Ok(CypherStatement::CreateNodeIndex {
+            label,
+            property,
+            if_not_exists,
+        })
+    }
+
+    fn parse_drop_index(&mut self) -> Result<CypherStatement, CypherError> {
+        self.expect_ident("DROP")?;
+        self.expect_ident("INDEX")?;
+        self.skip_optional_index_name()?;
+        let mut if_exists = false;
+        if self.ident_at(0, "IF") {
+            self.advance()?;
+            self.expect_ident("EXISTS")?;
+            if_exists = true;
+        }
+        let (label, property) = self.parse_index_target()?;
+        Ok(CypherStatement::DropNodeIndex {
+            label,
+            property,
+            if_exists,
+        })
+    }
+
+    /// An identifier, or a keyword used as a name (labels like `Count` are
+    /// legal Cypher and must not be rejected here).
+    fn parse_name(&mut self) -> Result<String, CypherError> {
+        let tok = self.advance()?.clone();
+        match tok {
+            Token::Ident(s) => Ok(s),
+            Token::Keyword(k) => Ok(k),
+            other => Err(CypherError::UnexpectedToken {
+                expected: "a name".to_string(),
+                found: other.to_string(),
+            }),
+        }
     }
 
     // ---- CREATE ----

@@ -943,10 +943,18 @@ There are **two disjoint stream implementations that do not interoperate**.
 (`src/executor/scalar_fns.rs:3601-3746`), over
 `src/pubsub/streams_wal.rs`.
 
-**Durability — entries fsync before ack; everything else is RAM.** Only
-`STREAM_XADD` writes to the WAL (`src/executor/scalar_fns.rs:3630-3632`, with the
-error discarded via `let _ =`). `group_sync` (`src/pubsub/streams_wal.rs:128`) is
-called from `src/executor/mod.rs:3107`. Checkpointed from `src/main.rs:1450`.
+**Durability — entries fsync before ack; everything else is RAM.**
+`group_sync` (`src/pubsub/streams_wal.rs:128`) is called from
+`src/executor/mod.rs:3107`. Checkpointed from `src/main.rs:1450`.
+
+**A WAL append that fails now fails the statement (2026-08-20, S31-13).**
+`STREAM_XADD` and `STREAM_XGROUP_CREATE` used to discard the `io::Result` with
+`let _ =` and not even log it, so on a full disk the client got an entry id back
+for a write whose durable record had failed and the first symptom was missing
+entries after a restart. Both now log at ERROR, undo the in-memory mutation and
+return `53100` (disk full) or a storage error. The failure is testable without a
+full disk: `NUCLEUS_IOFAULT=streams.wal_append` (see
+`src/storage/crashpoint.rs::ALL_IO_POINTS`).
 
 **Consumer groups, delivery cursors, acks and `max_len` are persisted
 (2026-08-20, S31-05).** The WAL gained opcodes `0x03` `SNAPSHOT2` (carries groups

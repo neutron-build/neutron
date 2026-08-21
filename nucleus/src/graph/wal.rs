@@ -15,13 +15,23 @@
 //! DEL_EDGE:   [0x04] [edge_id: u64 LE]
 //! SET_PROP:   [0x05] [node_or_edge: u8 (0=node,1=edge)] [id: u64 LE]
 //!             [key_len: u32 LE] [key: bytes] [val_tag(u8) + val_payload]
-//! SNAPSHOT:   [0x10] [full graph binary dump — all nodes + all edges]
+//! ADD_INDEX:  [0x06] [label_len(u32)+label] [prop_len(u32)+prop]
+//! DEL_INDEX:  [0x07] [label_len(u32)+label] [prop_len(u32)+prop]
+//! SNAPSHOT:   [0x10] [full graph binary dump — all nodes + all edges + index defs]
 //! ```
+//!
+//! ## What is and is not persisted for property indexes
+//!
+//! Only the *definition* `(label, property)` is logged. The index contents are
+//! never written: they are rebuilt from the recovered nodes in
+//! `GraphStore::open`. A definition without its data would be a silent
+//! wrong-answer machine, and rebuilding a BTreeMap over an already in-memory
+//! node set is cheap, so the definition is the only durable part.
 //!
 //! A SNAPSHOT resets all state. After `checkpoint()` the file is truncated to a
 //! single SNAPSHOT entry so the log stays small.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +47,8 @@ const TAG_ADD_EDGE: u8 = 0x02;
 const TAG_DEL_NODE: u8 = 0x03;
 const TAG_DEL_EDGE: u8 = 0x04;
 const TAG_SET_PROP: u8 = 0x05;
+const TAG_ADD_INDEX: u8 = 0x06;
+const TAG_DEL_INDEX: u8 = 0x07;
 const TAG_SNAPSHOT: u8 = 0x10;
 
 // PropValue wire tags
@@ -73,6 +85,9 @@ pub struct GraphWalState {
     pub edges: HashMap<EdgeId, WalEdge>,
     pub next_node_id: NodeId,
     pub next_edge_id: EdgeId,
+    /// Node property index definitions `(label, property)`. Contents are not
+    /// persisted — the store rebuilds each index from the recovered nodes.
+    pub node_indexes: BTreeSet<(String, String)>,
 }
 
 /// A snapshot of the current graph suitable for checkpointing.
@@ -81,6 +96,8 @@ pub struct GraphSnapshot<'a> {
     pub edges: Vec<(&'a EdgeId, &'a NodeId, &'a NodeId, &'a str, &'a Properties)>,
     pub next_node_id: NodeId,
     pub next_edge_id: EdgeId,
+    /// Node property index definitions `(label, property)`.
+    pub node_indexes: Vec<(&'a str, &'a str)>,
 }
 
 /// Append-only WAL for the property graph store.
@@ -186,6 +203,24 @@ impl GraphWal {
         self.append_raw(&buf)
     }
 
+    /// Log the creation of a node property index definition.
+    pub fn log_add_node_index(&self, label: &str, property: &str) -> io::Result<()> {
+        let mut buf = Vec::new();
+        buf.push(TAG_ADD_INDEX);
+        encode_str(label, &mut buf);
+        encode_str(property, &mut buf);
+        self.append_raw(&buf)
+    }
+
+    /// Log the removal of a node property index definition.
+    pub fn log_drop_node_index(&self, label: &str, property: &str) -> io::Result<()> {
+        let mut buf = Vec::new();
+        buf.push(TAG_DEL_INDEX);
+        encode_str(label, &mut buf);
+        encode_str(property, &mut buf);
+        self.append_raw(&buf)
+    }
+
     /// Write the complete current state of the graph as a single SNAPSHOT
     /// entry and truncate the log to just that entry.
     pub fn checkpoint(&self, snap: &GraphSnapshot<'_>) -> io::Result<()> {
@@ -211,6 +246,15 @@ impl GraphWal {
             payload.extend_from_slice(&dst.to_le_bytes());
             encode_str(etype, &mut payload);
             encode_props(props, &mut payload);
+        }
+
+        // Node property index definitions. Appended after the edges so a
+        // snapshot written by an older build (which ends here) still decodes:
+        // `decode_snapshot` treats "no bytes left" as "no indexes".
+        payload.extend_from_slice(&(snap.node_indexes.len() as u32).to_le_bytes());
+        for &(label, property) in &snap.node_indexes {
+            encode_str(label, &mut payload);
+            encode_str(property, &mut payload);
         }
 
         // Serialize the complete new log body (a single snapshot entry).
@@ -414,6 +458,24 @@ fn replay(data: &[u8]) -> GraphWalState {
                     edge.properties.insert(key, val);
                 }
             }
+            TAG_ADD_INDEX => {
+                let Some(label) = decode_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(property) = decode_string(data, &mut pos) else {
+                    break;
+                };
+                state.node_indexes.insert((label, property));
+            }
+            TAG_DEL_INDEX => {
+                let Some(label) = decode_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(property) = decode_string(data, &mut pos) else {
+                    break;
+                };
+                state.node_indexes.remove(&(label, property));
+            }
             TAG_SNAPSHOT => {
                 let Some(payload_len) = read_u32(data, &mut pos) else {
                     break;
@@ -493,11 +555,24 @@ fn decode_snapshot(data: &[u8]) -> Option<GraphWalState> {
         );
     }
 
+    // Index definitions. Snapshots written before property indexes existed end
+    // exactly here, so an exhausted buffer means "no indexes", not corruption.
+    let mut node_indexes = BTreeSet::new();
+    if pos < data.len() {
+        let n_idx = read_u32(data, &mut pos)? as usize;
+        for _ in 0..n_idx {
+            let label = decode_string(data, &mut pos)?;
+            let property = decode_string(data, &mut pos)?;
+            node_indexes.insert((label, property));
+        }
+    }
+
     Some(GraphWalState {
         nodes,
         edges,
         next_node_id,
         next_edge_id,
+        node_indexes,
     })
 }
 

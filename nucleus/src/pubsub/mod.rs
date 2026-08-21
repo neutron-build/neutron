@@ -539,7 +539,41 @@ impl Stream {
         result
     }
 
-    pub fn xgroup_create(&mut self, group_name: &str, start_id: StreamEntryId) {
+    /// Create a consumer group. Fails with `BUSYGROUP` if one already exists,
+    /// which is what Redis does and what the sibling implementation at
+    /// `kv::streams::Stream::xgroup_create` has always done.
+    ///
+    /// This used to be an unconditional `insert`, described in the code as
+    /// "idempotent-overwrite" — but idempotent and overwrite are opposites
+    /// here. An idempotent create is a no-op on an existing group; that one
+    /// reset `last_delivered_id`, dropped the pending list and returned
+    /// success, so a re-run provisioning script silently rewound or fast-
+    /// forwarded a live consumer group (S31-11). Consumer-group state is
+    /// persisted, so it destroyed durable state, not just memory.
+    ///
+    /// Deliberately resetting a group is still possible — see
+    /// [`Self::xgroup_recreate`] — but it is now something a caller has to ask
+    /// for by name.
+    pub fn xgroup_create(
+        &mut self,
+        group_name: &str,
+        start_id: StreamEntryId,
+    ) -> Result<(), String> {
+        if self.groups.contains_key(group_name) {
+            return Err("BUSYGROUP Consumer Group name already exists".to_string());
+        }
+        self.xgroup_recreate(group_name, start_id);
+        Ok(())
+    }
+
+    /// Create a consumer group, discarding any existing group of that name
+    /// along with its cursor and pending list.
+    ///
+    /// The opt-in form of [`Self::xgroup_create`], and the operation WAL replay
+    /// performs: a replayed `XGROUP_CREATE` record was written because the live
+    /// create succeeded, so replay must reproduce it unconditionally (a
+    /// create-after-destroy sequence replays correctly only under last-wins).
+    pub fn xgroup_recreate(&mut self, group_name: &str, start_id: StreamEntryId) {
         self.groups.insert(
             group_name.to_string(),
             ConsumerGroup {
@@ -1032,7 +1066,8 @@ mod tests {
     fn stream_consumer_group_create() {
         let mut s = Stream::new();
         s.xadd_with_id(StreamEntryId::new(1, 0), vec![("k".into(), "v".into())]);
-        s.xgroup_create("mygroup", StreamEntryId::new(0, 0));
+        s.xgroup_create("mygroup", StreamEntryId::new(0, 0))
+            .unwrap();
         assert!(s.groups.contains_key("mygroup"));
         assert_eq!(
             s.groups["mygroup"].last_delivered_id,
@@ -1046,7 +1081,7 @@ mod tests {
         for i in 1..=5 {
             s.xadd_with_id(StreamEntryId::new(i, 0), vec![("i".into(), i.to_string())]);
         }
-        s.xgroup_create("grp", StreamEntryId::new(0, 0));
+        s.xgroup_create("grp", StreamEntryId::new(0, 0)).unwrap();
         let entries = s.xreadgroup("grp", "consumer-1", 3);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].id.ms, 1);
@@ -1063,7 +1098,7 @@ mod tests {
         for i in 1..=3 {
             s.xadd_with_id(StreamEntryId::new(i, 0), vec![("i".into(), i.to_string())]);
         }
-        s.xgroup_create("grp", StreamEntryId::new(0, 0));
+        s.xgroup_create("grp", StreamEntryId::new(0, 0)).unwrap();
         let _ = s.xreadgroup("grp", "c1", 3);
         let pending = s.xpending("grp");
         assert_eq!(pending.len(), 1);
@@ -1080,7 +1115,7 @@ mod tests {
         for i in 1..=6 {
             s.xadd_with_id(StreamEntryId::new(i, 0), vec![("i".into(), i.to_string())]);
         }
-        s.xgroup_create("grp", StreamEntryId::new(0, 0));
+        s.xgroup_create("grp", StreamEntryId::new(0, 0)).unwrap();
         let _ = s.xreadgroup("grp", "alice", 3);
         let _ = s.xreadgroup("grp", "bob", 3);
         let pending = s.xpending("grp");
@@ -1097,8 +1132,8 @@ mod tests {
         for i in 1..=4 {
             s.xadd_with_id(StreamEntryId::new(i, 0), vec![("i".into(), i.to_string())]);
         }
-        s.xgroup_create("g1", StreamEntryId::new(0, 0));
-        s.xgroup_create("g2", StreamEntryId::new(0, 0));
+        s.xgroup_create("g1", StreamEntryId::new(0, 0)).unwrap();
+        s.xgroup_create("g2", StreamEntryId::new(0, 0)).unwrap();
         let _ = s.xreadgroup("g1", "c1", 2);
         let _ = s.xreadgroup("g2", "c2", 4);
         let _ = s.xreadgroup("g2", "c3", 0);
@@ -1119,7 +1154,7 @@ mod tests {
         for i in 1..=9 {
             s.xadd_with_id(StreamEntryId::new(i, 0), vec![("i".into(), i.to_string())]);
         }
-        s.xgroup_create("grp", StreamEntryId::new(0, 0));
+        s.xgroup_create("grp", StreamEntryId::new(0, 0)).unwrap();
         let batch1 = s.xreadgroup("grp", "c1", 3);
         assert_eq!(batch1.len(), 3);
         assert_eq!(batch1[0].id.ms, 1);

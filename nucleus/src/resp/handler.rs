@@ -90,7 +90,7 @@ impl RespHandler {
     /// Returns the RESP-encoded push message, or None if the channel is closed.
     pub async fn recv_pubsub_message(&mut self) -> Option<Vec<u8>> {
         let sub = self.pubsub_sub.as_mut()?;
-        let msg = sub.rx.recv().await?;
+        let msg = sub.recv().await?;
         if msg.is_pattern {
             // Pattern message: *4\r\n $8\r\npmessage\r\n $pattern\r\n $channel\r\n $payload\r\n
             let mut resp = encoder::encode_array_header(4);
@@ -215,6 +215,16 @@ impl RespHandler {
                 let mut responses = Vec::new();
                 for pat_arg in &args[1..] {
                     let pattern = String::from_utf8_lossy(pat_arg).to_string();
+                    // Patterns are matched under the registry's global mutex on
+                    // every PUBLISH, so their length is a per-publish cost paid
+                    // by every other subscriber (S31-09). Cap it.
+                    if pattern.len() > crate::resp::pubsub_registry::MAX_PATTERN_LEN {
+                        responses.push(encoder::encode_error(&format!(
+                            "ERR pattern is too long (max {} bytes)",
+                            crate::resp::pubsub_registry::MAX_PATTERN_LEN
+                        )));
+                        continue;
+                    }
                     let count = self.pubsub.psubscribe(id, &pattern);
                     let mut resp = encoder::encode_array_header(3);
                     resp.extend(encoder::encode_bulk_string(b"psubscribe"));

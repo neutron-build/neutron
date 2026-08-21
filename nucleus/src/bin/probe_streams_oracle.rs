@@ -286,8 +286,13 @@ impl RefStream {
             .collect()
     }
 
-    /// Contract §3.9 and the engine's own note: creation is idempotent-overwrite.
-    fn xgroup_create(&mut self, group: &str, start_ms: u64) {
+    /// Creation is BUSYGROUP on an existing group (S31-11), matching Redis and
+    /// the sibling `kv::streams` implementation. Returns false when the group
+    /// already existed and nothing was changed.
+    fn xgroup_create(&mut self, group: &str, start_ms: u64) -> bool {
+        if self.groups.contains_key(group) {
+            return false;
+        }
         self.groups.insert(
             group.to_string(),
             RefGroup {
@@ -298,6 +303,7 @@ impl RefStream {
                 pending: BTreeMap::new(),
             },
         );
+        true
     }
 
     fn has_group(&self, group: &str) -> bool {
@@ -569,12 +575,34 @@ fn section_streams(ex: &Executor, rng: &mut Rng, ops: usize, neg: bool, rep: &mu
                 let start_ms = if rng.below(2) == 0 { 0 } else { 1 };
                 let sql = format!("SELECT STREAM_XGROUP_CREATE('{stream}', '{group}', {start_ms})");
                 log.push(sql.clone());
+                // Creating a group that already exists must FAIL with
+                // BUSYGROUP, not overwrite it: the overwrite reset the cursor
+                // and dropped the pending list while reporting success, so a
+                // re-run of an idempotent setup script silently redelivered the
+                // whole stream or silently abandoned everything unacked
+                // (S31-11).
+                let existed = models[stream].has_group(group);
                 match exec(ex, &sql) {
-                    Ok(_) => models
-                        .get_mut(stream)
-                        .unwrap()
-                        .xgroup_create(group, start_ms),
-                    Err(e) => rep.push("streams", "XGROUP_CREATE succeeds", e, &log),
+                    Ok(_) => {
+                        if existed {
+                            rep.push(
+                                "streams",
+                                "XGROUP_CREATE on an existing group errors instead of resetting it",
+                                "expected a BUSYGROUP error, got success".to_string(),
+                                &log,
+                            );
+                        } else {
+                            models
+                                .get_mut(stream)
+                                .unwrap()
+                                .xgroup_create(group, start_ms);
+                        }
+                    }
+                    Err(e) => {
+                        if !existed {
+                            rep.push("streams", "XGROUP_CREATE succeeds", e, &log);
+                        }
+                    }
                 }
             }
             // ── XREADGROUP ───────────────────────────────────────────────────

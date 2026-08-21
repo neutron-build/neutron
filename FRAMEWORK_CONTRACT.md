@@ -244,12 +244,18 @@ Direction: `'out'` (default), `'in'`, `'both'`
 | `STREAM_XLEN` | `STREAM_XLEN(stream TEXT)` | BIGINT |
 | `STREAM_XRANGE` | `STREAM_XRANGE(stream TEXT, start BIGINT\|TEXT, end BIGINT\|TEXT, count BIGINT)` | TEXT (JSON) |
 | `STREAM_XREAD` | `STREAM_XREAD(stream TEXT, last_id BIGINT\|TEXT, count BIGINT)` | TEXT (JSON) |
-| `STREAM_XGROUP_CREATE` | `STREAM_XGROUP_CREATE(stream TEXT, group TEXT, start_id BIGINT)` | BOOLEAN |
+| `STREAM_XGROUP_CREATE` | `STREAM_XGROUP_CREATE(stream TEXT, group TEXT, start_id BIGINT [, recreate BOOLEAN])` | BOOLEAN |
 | `STREAM_XREADGROUP` | `STREAM_XREADGROUP(stream TEXT, group TEXT, consumer TEXT, count BIGINT)` | TEXT |
 | `STREAM_XACK` | `STREAM_XACK(stream TEXT, group TEXT, id_ms BIGINT, id_seq BIGINT)` | BIGINT (count acknowledged) |
 
 Reads on a nonexistent stream return an empty string (`''`), not `'[]'` — clients must treat
 empty text as an empty result before JSON-parsing.
+
+**`STREAM_XGROUP_CREATE` raises `BUSYGROUP` on a group that already exists**, matching Redis
+and the RESP `XGROUP CREATE` surface. It used to overwrite the group — resetting its cursor,
+dropping its pending list and returning `true` — so a re-run of idempotent startup code
+silently redelivered the whole stream or silently abandoned everything unacked. Resetting a
+group is still available, as the explicit fourth argument `recreate => true`.
 
 **`STREAM_XREADGROUP` is the exception: it raises instead of reading empty.** A call naming a
 stream or a consumer group that does not exist fails with `NOGROUP No such consumer group

@@ -44,6 +44,56 @@ pub fn execute_cypher(
         ),
         CypherStatement::Create { items } => execute_create(store, items),
         CypherStatement::Delete { variables } => execute_delete(store, variables),
+        CypherStatement::CreateNodeIndex {
+            label,
+            property,
+            if_not_exists,
+        } => {
+            let created = store.create_node_index(label, property);
+            if !created && !*if_not_exists {
+                return Err(CypherError::InvalidSyntax(format!(
+                    "an index on :{label}({property}) already exists"
+                )));
+            }
+            Ok(CypherResult {
+                columns: vec!["created".to_string()],
+                rows: vec![vec![PropValue::Bool(created)]],
+            })
+        }
+        CypherStatement::DropNodeIndex {
+            label,
+            property,
+            if_exists,
+        } => {
+            let dropped = store.drop_node_index(label, property);
+            if !dropped && !*if_exists {
+                return Err(CypherError::InvalidSyntax(format!(
+                    "no index on :{label}({property})"
+                )));
+            }
+            Ok(CypherResult {
+                columns: vec!["dropped".to_string()],
+                rows: vec![vec![PropValue::Bool(dropped)]],
+            })
+        }
+        CypherStatement::ShowIndexes => Ok(CypherResult {
+            columns: vec![
+                "label".to_string(),
+                "property".to_string(),
+                "entries".to_string(),
+            ],
+            rows: store
+                .node_index_defs()
+                .into_iter()
+                .map(|(l, p, n)| {
+                    vec![
+                        PropValue::Text(l),
+                        PropValue::Text(p),
+                        PropValue::Int(n as i64),
+                    ]
+                })
+                .collect(),
+        }),
     }
 }
 
@@ -293,8 +343,23 @@ fn variable_length_expand(
     results
 }
 
+/// Candidate anchor nodes for the first node pattern of a MATCH.
+///
+/// When the pattern carries a label and an inline property equality, and an
+/// index covers that `(label, property)`, the index answers directly instead of
+/// scanning every node with the label. This is a *narrowing* only: the caller
+/// still runs `node_matches_properties` over the full property map, so an index
+/// on one of several properties is safe, and a wrong index could only ever make
+/// the query slow, never wrong.
 fn candidate_node_ids(store: &GraphStore, np: &NodePattern) -> Vec<NodeId> {
     if let Some(label) = np.labels.first() {
+        // `np.properties` is a BTreeMap, so "the first usable index" is a
+        // deterministic choice rather than a hash-order accident.
+        for (key, value) in &np.properties {
+            if let Some(ids) = store.node_index_lookup(label, key, value) {
+                return ids;
+            }
+        }
         store.nodes_by_label(label).iter().map(|n| n.id).collect()
     } else {
         store.all_nodes().iter().map(|n| n.id).collect()

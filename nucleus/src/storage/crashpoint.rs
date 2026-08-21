@@ -139,6 +139,11 @@ pub const ALL_IO_POINTS: &[&str] = &[
     // the log had refused. Failing these must change the reply.
     "kv.wal_append",
     "collections.wal_append",
+    // The streams log. `STREAM_XADD` used to discard this error with `let _ =`
+    // and not even log it (S31-13): the client got an entry id back for a write
+    // whose durable record had failed. Arming this must make the statement
+    // fail, and only what was acknowledged may survive a restart.
+    "streams.wal_append",
 ];
 
 fn io_armed() -> Option<&'static str> {

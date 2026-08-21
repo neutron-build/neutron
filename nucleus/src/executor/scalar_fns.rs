@@ -3890,9 +3890,37 @@ impl Executor {
                 let mut streams = self.streams.write();
                 let stream = streams.entry(stream_name.clone()).or_default();
                 let id = stream.xadd(fields.clone());
-                // Log to WAL after successful append
-                if let Some(ref wal) = self.streams_wal {
-                    let _ = wal.log_xadd(&stream_name, &id, &fields);
+                // Log to WAL after successful append. A failure here used to be
+                // discarded with `let _ =` and not even logged (S31-13): the
+                // client got an entry id back for a write whose durable record
+                // had failed, and the first symptom was missing entries after a
+                // restart, with nothing in the log to correlate. Fail the
+                // statement instead, and undo the in-memory append so the two
+                // agree — an acknowledged write that was never logged is the
+                // defect class this engine keeps finding.
+                if let Some(ref wal) = self.streams_wal
+                    && let Err(e) = wal.log_xadd(&stream_name, &id, &fields)
+                {
+                    // The entry just appended is the last one; `last_id` stays
+                    // advanced (ids may skip, which is legal and harmless).
+                    // Entries this append evicted via MAXLEN are already gone —
+                    // that is unavoidable, and the WAL error means the stream is
+                    // degraded regardless.
+                    stream.entries.retain(|e| e.id != id);
+                    tracing::error!(
+                        stream = %stream_name,
+                        entry = %id,
+                        error = %e,
+                        "STREAM_XADD failed to write its WAL record; rejecting the write"
+                    );
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::StorageFull => ExecError::DiskFull(format!(
+                            "STREAM_XADD could not log entry {id} for stream '{stream_name}': {e}"
+                        )),
+                        _ => ExecError::Storage(crate::storage::StorageError::Io(format!(
+                            "STREAM_XADD could not log entry {id} for stream '{stream_name}': {e}"
+                        ))),
+                    });
                 }
                 Ok(Value::Text(id.to_string()))
             }
@@ -3955,8 +3983,14 @@ impl Executor {
                 }
             }
             "STREAM_XGROUP_CREATE" => {
-                // stream_xgroup_create(stream, group, start_id_ms) → 'OK'
-                require_args(fname, &args, 3)?;
+                // stream_xgroup_create(stream, group, start_id_ms [, recreate])
+                //   → BOOLEAN
+                if args.len() != 3 && args.len() != 4 {
+                    return Err(ExecError::Unsupported(
+                        "STREAM_XGROUP_CREATE requires (stream, group, start_id[, recreate])"
+                            .into(),
+                    ));
+                }
                 let stream_name = match &args[0] {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
@@ -3966,18 +4000,70 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let start_ms = val_to_u64(&args[2], "STREAM_XGROUP_CREATE start_id")?;
+                // Resetting a live group is destructive and now has to be asked
+                // for by name (S31-11). It used to be what a plain create did.
+                let recreate = match args.get(3) {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(other) => {
+                        return Err(ExecError::Unsupported(format!(
+                            "STREAM_XGROUP_CREATE recreate must be BOOLEAN, got {other:?}"
+                        )));
+                    }
+                };
                 self.cross_model_touch_stream(&stream_name);
                 let start_id = crate::pubsub::StreamEntryId::new(start_ms, 0);
                 let mut streams = self.streams.write();
                 let stream = streams.entry(stream_name.clone()).or_default();
-                stream.xgroup_create(&group, start_id.clone());
+                // A plain create against an existing group is BUSYGROUP, which
+                // is what Redis returns and what the sibling implementation in
+                // `kv::streams` has always returned. It used to be an
+                // unconditional overwrite that reset the cursor, dropped the
+                // pending list and answered `true` (S31-11) — so a re-run
+                // provisioning script silently redelivered the whole stream or
+                // silently abandoned everything unacked, and consumer-group
+                // state is persisted, so it destroyed durable state.
+                let prior = stream.groups.get(&group).cloned();
+                if recreate {
+                    stream.xgroup_recreate(&group, start_id.clone());
+                } else if let Err(e) = stream.xgroup_create(&group, start_id.clone()) {
+                    return Err(ExecError::ConstraintViolation(e));
+                }
                 // Group state does not survive a restart unless it is logged
                 // (S31-05): entries replay from the log, a cursor cannot be
-                // reconstructed from anything.
-                if let Some(ref wal) = self.streams_wal {
-                    let _ = wal.log_xgroup_create(&stream_name, &group, &start_id);
+                // reconstructed from anything. A failed append must fail the
+                // statement for the same reason STREAM_XADD's does (S31-13):
+                // otherwise the caller is told a group exists that a restart
+                // will not produce.
+                if let Some(ref wal) = self.streams_wal
+                    && let Err(e) = wal.log_xgroup_create(&stream_name, &group, &start_id)
+                {
+                    match prior {
+                        Some(g) => {
+                            stream.groups.insert(group.clone(), g);
+                        }
+                        None => {
+                            stream.groups.remove(&group);
+                        }
+                    }
+                    tracing::error!(
+                        stream = %stream_name,
+                        group = %group,
+                        error = %e,
+                        "STREAM_XGROUP_CREATE failed to write its WAL record; rejecting the create"
+                    );
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::StorageFull => ExecError::DiskFull(format!(
+                            "STREAM_XGROUP_CREATE could not log group '{group}' on stream \
+                             '{stream_name}': {e}"
+                        )),
+                        _ => ExecError::Storage(crate::storage::StorageError::Io(format!(
+                            "STREAM_XGROUP_CREATE could not log group '{group}' on stream \
+                             '{stream_name}': {e}"
+                        ))),
+                    });
                 }
-                // Contract (§3.9): BOOLEAN. Creation is idempotent-overwrite.
+                // Contract (§3.9): BOOLEAN.
                 Ok(Value::Bool(true))
             }
             "STREAM_XREADGROUP" => {

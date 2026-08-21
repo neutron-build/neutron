@@ -102,6 +102,18 @@ pub struct StreamsWal {
     writer: Mutex<BufWriter<File>>,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: crate::storage::wal_util::WalSync,
+    /// Test-only append fault switch; see `append`.
+    #[cfg(test)]
+    fail_appends: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl StreamsWal {
+    /// Make every subsequent `append` fail with ENOSPC. Test-only.
+    pub fn set_fail_appends(&self, on: bool) {
+        self.fail_appends
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl StreamsWal {
@@ -138,6 +150,8 @@ impl StreamsWal {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
+                #[cfg(test)]
+                fail_appends: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
@@ -232,6 +246,20 @@ impl StreamsWal {
     /// the whole record in the page cache: a partial record can only ever be a
     /// torn *tail*, which `open` truncates, never a hole in the middle.
     fn append(&self, buf: &[u8]) -> io::Result<()> {
+        if let Some(e) = crate::storage::crashpoint::io_fault("streams.wal_append") {
+            return Err(e);
+        }
+        // In-process arming for unit tests. The `NUCLEUS_IOFAULT` machinery
+        // above reads its environment through a `OnceLock` initialised by
+        // whichever call site runs first, so it cannot be armed from inside a
+        // shared test binary — only from a freshly spawned process.
+        #[cfg(test)]
+        if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected streams WAL append failure",
+            ));
+        }
         let mut w = self.writer.lock();
         w.write_all(buf)?;
         w.flush()?;
@@ -514,8 +542,11 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                 let Some(seq) = read_u64(data, &mut pos) else {
                     torn!();
                 };
-                // Idempotent-overwrite, matching `Stream::xgroup_create`: a
-                // re-create resets the cursor and drops the pending list.
+                // Last-wins, matching `Stream::xgroup_recreate`. Replay must
+                // apply this record unconditionally: it exists only because a
+                // live create succeeded, and the only way a second record for
+                // a live group can now be written is an explicit recreate
+                // (S31-11), which did reset the cursor and drop the PEL.
                 groups.entry(stream_name).or_default().insert(
                     group_name.clone(),
                     ConsumerGroup {
@@ -1162,11 +1193,11 @@ mod tests {
         let mut s = Stream::with_max_len(4);
         let a = s.xadd_with_id(StreamEntryId::new(1, 0), vec![("k".into(), "a".into())]);
         let b = s.xadd_with_id(StreamEntryId::new(2, 0), vec![("k".into(), "b".into())]);
-        s.xgroup_create("g", StreamEntryId::new(0, 0));
+        s.xgroup_create("g", StreamEntryId::new(0, 0)).unwrap();
         let _ = s.xreadgroup("g", "c1", 10);
         s.xack("g", std::slice::from_ref(&a));
         // A group with no deliveries at all must round-trip too.
-        s.xgroup_create("idle", StreamEntryId::new(7, 3));
+        s.xgroup_create("idle", StreamEntryId::new(7, 3)).unwrap();
 
         let mut live = HashMap::new();
         live.insert("s".to_string(), s);
@@ -1200,7 +1231,7 @@ mod tests {
             let mut s = Stream::new();
             s.xadd_with_id(StreamEntryId::new(1, 0), vec![("k".into(), name.into())]);
             for g in ["g2", "g1"] {
-                s.xgroup_create(g, StreamEntryId::new(0, 0));
+                s.xgroup_create(g, StreamEntryId::new(0, 0)).unwrap();
                 let _ = s.xreadgroup(g, "c2", 10);
                 let _ = s.xreadgroup(g, "c1", 10);
             }
@@ -1235,8 +1266,11 @@ mod tests {
         assert_eq!(rebuilt["empty"].xlen(), 0);
     }
 
-    /// Re-creating a group resets its cursor and drops its pending list, both
-    /// live and on replay (`Stream::xgroup_create` is idempotent-overwrite).
+    /// Replaying a second XGROUP_CREATE record for a live group resets its
+    /// cursor and drops its pending list — last-wins, matching
+    /// `Stream::xgroup_recreate`. Since S31-11 only an explicit recreate can
+    /// write that second record; a plain create fails with BUSYGROUP and logs
+    /// nothing.
     #[test]
     fn replayed_group_recreate_resets_cursor_and_pel() {
         let dir = tempfile::tempdir().unwrap();

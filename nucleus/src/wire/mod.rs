@@ -4052,7 +4052,9 @@ fn walk_expr_for_params(
                 "CDC_TABLE_READ" => &[Type::TEXT, Type::INT8, Type::INT8],
                 "STREAM_XRANGE" => &[Type::TEXT, Type::INT8, Type::INT8, Type::INT8],
                 "STREAM_XREAD" => &[Type::TEXT, Type::INT8, Type::INT8],
-                "STREAM_XGROUP_CREATE" => &[Type::TEXT, Type::TEXT, Type::INT8],
+                // The fourth argument is the optional `recreate` opt-in added
+                // with S31-11; a 3-argument call simply stops at INT8.
+                "STREAM_XGROUP_CREATE" => &[Type::TEXT, Type::TEXT, Type::INT8, Type::BOOL],
                 "STREAM_XREADGROUP" => &[Type::TEXT, Type::TEXT, Type::TEXT, Type::INT8],
                 "STREAM_XACK" => &[Type::TEXT, Type::TEXT, Type::INT8, Type::INT8],
                 "SPARSE_INSERT" | "SPARSE_REMOVE" => &[Type::INT8],

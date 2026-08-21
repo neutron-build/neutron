@@ -182,9 +182,25 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 // Subscription message to push to client
                 msg = handler.recv_pubsub_message() => {
-                    if let Some(data) = msg {
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                    match msg {
+                        Some(data) => {
+                            writer.write_all(&data).await?;
+                            writer.flush().await?;
+                        }
+                        None => {
+                            // The registry dropped this subscriber's sender.
+                            // The only reason it does that while the connection
+                            // is still in pub/sub mode is the output-buffer
+                            // limit (S31-08): the client was not draining, so
+                            // it is disconnected the way Redis disconnects it.
+                            // Returning here rather than continuing also avoids
+                            // spinning on a closed channel.
+                            tracing::warn!(
+                                "RESP subscriber disconnected: pub/sub output buffer limit exceeded"
+                            );
+                            handler.cleanup_pubsub();
+                            return Ok(());
+                        }
                     }
                 }
             }

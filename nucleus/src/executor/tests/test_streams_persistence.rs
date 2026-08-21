@@ -298,3 +298,185 @@ async fn xreadgroup_on_missing_group_is_an_error_not_an_empty_read() {
     let r = exec(&ex, "SELECT STREAM_XREADGROUP('n', 'g', 'c', 10)").await;
     assert_eq!(scalar(&r[0]), &Value::Text("[]".into()));
 }
+
+// ── S31-11: a create must not destroy a live consumer group ─────────────────
+
+/// `STREAM_XGROUP_CREATE` used to be an unconditional overwrite that reset the
+/// cursor, dropped the pending list, and returned `true`. The sibling
+/// implementation reachable over RESP (`kv::streams::Stream::xgroup_create`)
+/// has always returned `BUSYGROUP`, and so does Redis; the two now agree.
+///
+/// The damage is a re-run of ordinary idempotent startup code — a migration, a
+/// service that creates its group on boot, a replayed provisioning script —
+/// silently redelivering the whole stream (`start_id = 0`) or silently
+/// abandoning everything unacked (`start_id = now`).
+#[tokio::test]
+async fn xgroup_create_on_an_existing_group_is_busygroup_not_a_silent_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    for n in ["1", "2", "3"] {
+        exec(&ex, &format!("SELECT STREAM_XADD('bg', 'n', '{n}')")).await;
+    }
+    exec(&ex, "SELECT STREAM_XGROUP_CREATE('bg', 'g', 0)").await;
+    let first = text(&ex, "SELECT STREAM_XREADGROUP('bg', 'g', 'c', 10)").await;
+    assert!(
+        first.contains("\"1\"") && first.contains("\"3\""),
+        "{first}"
+    );
+
+    let err = ex
+        .execute("SELECT STREAM_XGROUP_CREATE('bg', 'g', 0)")
+        .await
+        .expect_err("re-creating a live consumer group must not succeed");
+    assert!(
+        err.to_string().contains("BUSYGROUP"),
+        "expected BUSYGROUP, got {err}"
+    );
+
+    // The cursor and the pending list are intact: nothing is redelivered.
+    let r = exec(&ex, "SELECT STREAM_XREADGROUP('bg', 'g', 'c', 10)").await;
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Text("[]".into()),
+        "a refused create must not have rewound the group"
+    );
+}
+
+/// Consumer-group state is persisted, so the overwrite destroyed durable state,
+/// not just memory. The refusal has to hold against a group recovered from the
+/// log as well as one created in this process.
+#[tokio::test]
+async fn busygroup_holds_for_a_group_recovered_from_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "SELECT STREAM_XADD('r', 'n', '1')").await;
+        exec(&ex, "SELECT STREAM_XGROUP_CREATE('r', 'g', 0)").await;
+        let _ = text(&ex, "SELECT STREAM_XREADGROUP('r', 'g', 'c', 10)").await;
+        exec(&ex, "SELECT STREAM_XADD('r', 'n', '2')").await;
+    }
+
+    let ex = open_executor(dir.path()).await;
+    let err = ex
+        .execute("SELECT STREAM_XGROUP_CREATE('r', 'g', 0)")
+        .await
+        .expect_err("a group replayed from the log is still a live group");
+    assert!(
+        err.to_string().contains("BUSYGROUP"),
+        "expected BUSYGROUP, got {err}"
+    );
+    let after = text(&ex, "SELECT STREAM_XREADGROUP('r', 'g', 'c', 10)").await;
+    assert!(
+        after.contains("\"2\"") && !after.contains("\"1\""),
+        "the recovered cursor must be unchanged by the refused create: {after}"
+    );
+}
+
+/// Resetting a group is still possible — it just has to be asked for. The
+/// fourth argument is the opt-in; without it the default is the safe one.
+#[tokio::test]
+async fn explicit_recreate_resets_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(&ex, "SELECT STREAM_XADD('rc', 'n', '1')").await;
+    exec(&ex, "SELECT STREAM_XGROUP_CREATE('rc', 'g', 0)").await;
+    let first = text(&ex, "SELECT STREAM_XREADGROUP('rc', 'g', 'c', 10)").await;
+    assert!(first.contains("\"1\""), "{first}");
+
+    exec(&ex, "SELECT STREAM_XGROUP_CREATE('rc', 'g', 0, true)").await;
+    let again = text(&ex, "SELECT STREAM_XREADGROUP('rc', 'g', 'c', 10)").await;
+    assert!(
+        again.contains("\"1\""),
+        "an explicit recreate rewinds the cursor: {again}"
+    );
+
+    // `false` is the default, and is still a refusal.
+    let err = ex
+        .execute("SELECT STREAM_XGROUP_CREATE('rc', 'g', 0, false)")
+        .await
+        .expect_err("recreate=false must behave exactly like a plain create");
+    assert!(
+        err.to_string().contains("BUSYGROUP"),
+        "expected BUSYGROUP, got {err}"
+    );
+}
+
+// ── S31-13: an XADD whose WAL record failed must not be acknowledged ─────────
+
+/// `STREAM_XADD` discarded its WAL error with `let _ =` and not even a log
+/// line: on a full disk it returned an entry id, the client counted the event
+/// as published, and it existed only in memory until the next restart dropped
+/// it — with nothing in the log to correlate afterwards.
+#[tokio::test]
+async fn xadd_fails_the_statement_when_its_wal_record_cannot_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "SELECT STREAM_XADD('d', 'n', 'logged')").await;
+
+        ex.streams_wal()
+            .expect("the executor opened a streams WAL")
+            .set_fail_appends(true);
+
+        let err = ex
+            .execute("SELECT STREAM_XADD('d', 'n', 'unloggable')")
+            .await
+            .expect_err("an XADD whose WAL append failed must not be acknowledged");
+        assert!(
+            err.to_string().contains("STREAM_XADD could not log"),
+            "the error must name the failure, got {err}"
+        );
+
+        // The rejected entry is not visible in memory either: a statement that
+        // failed must not leave its write behind for consumers to read.
+        assert_eq!(
+            xlen(&ex, "d").await,
+            1,
+            "a rejected XADD must not be readable"
+        );
+
+        ex.streams_wal().unwrap().set_fail_appends(false);
+    }
+
+    // And it is not there after a restart, which is where the old behaviour
+    // finally showed itself.
+    let ex = open_executor(dir.path()).await;
+    assert_eq!(
+        xlen(&ex, "d").await,
+        1,
+        "only the acknowledged entry survives the restart"
+    );
+    let all = text(&ex, "SELECT STREAM_XRANGE('d', 0, 9999999999999, 100)").await;
+    assert!(
+        all.contains("logged") && !all.contains("unloggable"),
+        "{all}"
+    );
+}
+
+/// The same rule for the group create two lines below it in the same match arm:
+/// a group whose creation record was never written must not be reported as
+/// created, because a restart will not produce it.
+#[tokio::test]
+async fn xgroup_create_fails_when_its_wal_record_cannot_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(&ex, "SELECT STREAM_XADD('gw', 'n', '1')").await;
+    ex.streams_wal().unwrap().set_fail_appends(true);
+
+    let err = ex
+        .execute("SELECT STREAM_XGROUP_CREATE('gw', 'g', 0)")
+        .await
+        .expect_err("a group create whose WAL append failed must not be acknowledged");
+    assert!(
+        err.to_string()
+            .contains("STREAM_XGROUP_CREATE could not log"),
+        "the error must name the failure, got {err}"
+    );
+
+    ex.streams_wal().unwrap().set_fail_appends(false);
+    // The group was rolled back, so it is neither present nor BUSYGROUP.
+    exec(&ex, "SELECT STREAM_XGROUP_CREATE('gw', 'g', 0)").await;
+    let served = text(&ex, "SELECT STREAM_XREADGROUP('gw', 'g', 'c', 10)").await;
+    assert!(served.contains("\"1\""), "{served}");
+}
