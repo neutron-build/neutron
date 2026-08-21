@@ -1,17 +1,44 @@
 ---
 title: Replication
-description: Primary-replica streaming, multi-Raft consensus, and automatic failover.
+description: Design of the primary-replica, multi-Raft and failover modes. Not shipping — see the status notice.
 ---
 
-Nucleus supports three cluster modes, from single-node to fully distributed.
+> **Status: this page describes a DESIGN, not a shipped feature. Do not deploy
+> it.** Everything below the Cluster Modes table is the intended architecture.
+> In the shipping engine, as of 2026-08-21:
+>
+> - **A replica never applies streamed records to its storage.** The receive
+>   loop appends into an in-memory structure whose own comment says it
+>   "simulates durability". The function that would write into real replica
+>   storage has no callers outside its tests.
+> - **A replica is fully writable and nothing consults replication state.** There
+>   is no read-only gate and no role check, so pointing a client at a "replica"
+>   gives you an empty, writable database while the startup banner says it is
+>   replicating.
+> - **Automatic failover is not wired.** `check_health` and `promote` have no
+>   production callers.
+> - **Synchronous mode does not wait for anything.** The durability it advertises
+>   is not enforced.
+> - **Multi-Raft does not gate writes.** Joining N nodes yields N independent
+>   writable databases running background elections, not one cluster.
+>
+> Single-node Nucleus is unaffected — MVCC, WAL durability and crash recovery are
+> real and tested. If you need high availability today, replicate at the storage
+> or infrastructure layer, not with this.
+>
+> This notice will be removed when there is a `probe_replication` harness proving
+> a replica converges and survives a crash. Until it exists, treat the tables
+> below as a roadmap.
+
+Nucleus defines three cluster modes. Only Standalone is implemented.
 
 ## Cluster Modes
 
-| Mode | Nodes | Consensus | Use Case |
-|------|-------|-----------|----------|
-| **Standalone** | 1 | None | Development, small workloads |
-| **PrimaryReplica** | 2 | WAL streaming | High availability |
-| **MultiRaft** | 3+ | Raft per shard | Horizontal scaling |
+| Mode | Nodes | Consensus | Status |
+|------|-------|-----------|--------|
+| **Standalone** | 1 | None | **Implemented.** The supported way to run Nucleus. |
+| **PrimaryReplica** | 2 | WAL streaming | **Design only.** Streams, never applies. Not HA. |
+| **MultiRaft** | 3+ | Raft per shard | **Design only.** Elections run; writes are not gated. |
 
 ## Primary-Replica
 
@@ -19,10 +46,10 @@ Two-node setup where the primary streams WAL records to a replica.
 
 ### Replication Modes
 
-| Mode | Behavior | Tradeoff |
-|------|----------|----------|
-| **Synchronous** | Primary waits for replica ACK before committing | Stronger durability, higher latency |
-| **Asynchronous** | Primary streams WAL in background | Lower latency, potential data loss on failover |
+| Mode | Intended behavior | Actual behavior today |
+|------|-------------------|-----------------------|
+| **Synchronous** | Primary waits for replica ACK before committing | Does not wait. The advertised durability is not enforced. |
+| **Asynchronous** | Primary streams WAL in background | Streams, but the replica never applies what it receives. |
 
 ### WAL Streaming
 
@@ -67,6 +94,8 @@ Returns:
 
 ## Automatic Failover
 
+> Design only. `check_health` and `promote` have no production callers.
+
 The `FailoverManager` monitors heartbeats and promotes the replica if the primary is unreachable.
 
 ### Failover Timeline
@@ -86,6 +115,8 @@ The `FailoverManager` monitors heartbeats and promotes the replica if the primar
 | `ReplicationResumed` | Streaming resumed after failover |
 
 ## Multi-Raft (3+ Nodes)
+
+> Design only. The DML gate never opens, so joined nodes accept writes independently.
 
 For horizontal scaling, Nucleus uses **one Raft consensus group per shard**. Each shard independently elects a leader and replicates its log.
 
@@ -139,6 +170,8 @@ Noop                       — Leader confirmation
 ```
 
 ## Distributed Transactions
+
+> Design only. Depends on the Raft mode above.
 
 Cross-shard transactions use two-phase commit (2PC) coordinated through Raft:
 

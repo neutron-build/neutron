@@ -732,6 +732,41 @@ async fn cmd_start(cfg: StartConfig) {
         }
     });
 
+    // Replica mode is a DESIGN, not a shipped feature, and starting one silently
+    // is the dangerous case: the node prints "Replicating: from {addr}", accepts
+    // client connections, and serves an EMPTY, WRITABLE database, because the
+    // receive loop never applies streamed records to storage (the function that
+    // would has no callers outside its tests) and nothing consults replication
+    // state to make the node read-only. An operator who points traffic at it
+    // loses writes and does not find out from the banner.
+    //
+    // So it refuses to start unless the operator has said the word, and says
+    // exactly what they are opting into. See docs/nucleus/replication.
+    if replicate_from.is_some() && std::env::var("NUCLEUS_EXPERIMENTAL_REPLICATION").is_err() {
+        eprintln!(
+            "nucleus: refusing to start as a replica.\n\
+             \n\
+             Replication is not implemented. A replica does NOT apply the records\n\
+             it receives, is fully writable, and will serve an EMPTY database\n\
+             while reporting that it is replicating. Automatic failover is not\n\
+             wired, and synchronous mode does not wait for anything.\n\
+             \n\
+             Single-node Nucleus is unaffected: MVCC, WAL durability and crash\n\
+             recovery are real. For high availability today, replicate at the\n\
+             storage or infrastructure layer instead.\n\
+             \n\
+             To run it anyway, for development only, set\n\
+             NUCLEUS_EXPERIMENTAL_REPLICATION=1."
+        );
+        std::process::exit(1);
+    }
+    if replicate_from.is_some() {
+        tracing::warn!(
+            "EXPERIMENTAL replica mode: streamed records are NOT applied to \
+             storage and this node is writable. Do not point clients at it."
+        );
+    }
+
     let cluster_token = std::env::var("NUCLEUS_CLUSTER_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());

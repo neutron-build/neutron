@@ -29,7 +29,7 @@ export default function LeanPage() {
     >
       <section>
         <h2>The algorithms that can't get this wrong.</h2>
-        <p>Nucleus handles your transactions, replicates your data, and signs your tokens &mdash; tests alone aren't enough for that kind of code. Neutron's Lean 4 suite contains machine-checked proofs of the core algorithms: MVCC snapshot isolation, B-tree invariants, write-ahead log durability, Raft safety, HMAC verification, Bloom filter false-positive bounds, LRU eviction correctness, and sliding-window rate limiting. Every proof compiles with zero use of <code>sorry</code> &mdash; against precise Lean models of each algorithm, resting on nothing but Lean&rsquo;s own axioms and three stated assumptions about SHA-256, which no proof can discharge.</p>
+        <p>Nucleus handles your transactions, indexes your data, and signs your tokens &mdash; tests alone aren't enough for that kind of code. Neutron's Lean 4 suite contains machine-checked proofs of the core algorithms: MVCC snapshot isolation, B-tree invariants, write-ahead log durability, Raft safety, HMAC verification, Bloom filter false-positive bounds, LRU eviction correctness, and sliding-window rate limiting. Every proof compiles with zero use of <code>sorry</code> &mdash; against precise Lean models of each algorithm, resting on nothing but Lean&rsquo;s own axioms and three stated assumptions about SHA-256, which no proof can discharge.</p>
       </section>
 
       <CodeBlock filename="proofs/MVCC.lean" annotation="A sample of what's in the suite. The full file proves snapshot isolation.">
