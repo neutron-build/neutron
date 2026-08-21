@@ -209,6 +209,25 @@ impl DatabaseBuilder {
         executor.install_self_ref();
         executor.warm_table_caches_sync();
         executor.load_sequences_sync();
+        // Load the executor metadata -- roles, RLS policies, column masking,
+        // views, triggers and sequence definitions. Without this the embedded
+        // API silently reopened a data directory with an empty policy catalog,
+        // and the first DDL afterwards wrote that empty state back over the
+        // meta.json it had never read. `main.rs` has always failed closed on
+        // this; the embedded path did not, and that asymmetry WAS the bug.
+        //
+        // Fail closed here for the same reason main.rs does: continuing would
+        // hand the caller a database whose row-level security and masking are
+        // off, which is worse than not opening. An ABSENT meta.json is an
+        // ordinary first boot and returns Ok.
+        executor.load_meta_sync().map_err(|e| {
+            DatabaseError::Storage(format!(
+                "{e}\n\nmeta.json holds the row-level-security policies and column-masking \
+                 rules. Opening without it would expose every table with those protections \
+                 off. Restore it from backup, or move it aside to open with an explicitly \
+                 empty policy catalog."
+            ))
+        })?;
         Ok(Database {
             executor,
             _catalog: catalog,
@@ -1983,5 +2002,114 @@ mod tests {
             assert_eq!(rows[0][0], Value::Int32(10));
             assert_eq!(rows[1][0], Value::Int32(20));
         }
+    }
+
+    /// S35 F2: the embedded `Database` builder must load `meta.json`.
+    ///
+    /// `DatabaseBuilder::build` loaded `catalog.json` and sequences but no
+    /// executor metadata, so through the shipped `Database::durable_mvcc`
+    /// roles, RLS policies, views, triggers and sequence DEFINITIONS silently
+    /// vanished on reopen — and the first post-reopen DDL wrote the emptied
+    /// state back over the `meta.json` it never read (NU-163's write-back,
+    /// live through the embedded API). `main.rs` loads meta at startup;
+    /// `HarnessDb::open` mirrors it. Only the embedded builder was missing.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn durable_mvcc_reloads_roles_views_policies_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            db.execute("CREATE TABLE mdocs (id INT, owner TEXT)")
+                .await
+                .unwrap();
+            db.execute("INSERT INTO mdocs VALUES (1, 'me')")
+                .await
+                .unwrap();
+            db.execute("CREATE ROLE embedded_reader LOGIN PASSWORD 'x'")
+                .await
+                .unwrap();
+            db.execute(
+                "CREATE POLICY embedded_pol ON mdocs FOR SELECT USING (owner = CURRENT_USER)",
+            )
+            .await
+            .unwrap();
+            db.execute("ALTER TABLE mdocs ENABLE ROW LEVEL SECURITY")
+                .await
+                .unwrap();
+            db.execute("CREATE VIEW mdocs_view AS SELECT id FROM mdocs")
+                .await
+                .unwrap();
+            db.execute("CREATE SEQUENCE embedded_seq START WITH 10")
+                .await
+                .unwrap();
+            db.execute("SELECT NEXTVAL('embedded_seq')").await.unwrap();
+            db.close();
+        }
+
+        let db = Database::durable_mvcc(dir.path()).unwrap();
+        let roles = db
+            .query("SELECT rolname FROM pg_catalog.pg_roles")
+            .await
+            .unwrap();
+        assert!(
+            roles
+                .iter()
+                .any(|r| matches!(&r[0], Value::Text(s) if s == "embedded_reader")),
+            "role 'embedded_reader' vanished across an embedded reopen — meta.json is not loaded"
+        );
+        let policies = db
+            .query("SELECT policyname FROM pg_catalog.pg_policies")
+            .await
+            .unwrap();
+        assert!(
+            policies
+                .iter()
+                .any(|r| matches!(&r[0], Value::Text(s) if s == "embedded_pol")),
+            "RLS policy 'embedded_pol' vanished across an embedded reopen — security-relevant"
+        );
+        let view_rows = db.query("SELECT * FROM mdocs_view").await.unwrap();
+        assert_eq!(view_rows.len(), 1, "view definition vanished across reopen");
+        let next = db
+            .query_one("SELECT NEXTVAL('embedded_seq')")
+            .await
+            .unwrap();
+        assert_eq!(
+            next,
+            Some(Value::Int64(11)),
+            "sequence definition vanished across reopen (NEXTVAL should resume at 11)"
+        );
+    }
+
+    /// S35 F2, corrupt direction: a `meta.json` that exists but cannot be
+    /// parsed must REFUSE the embedded open and leave the file untouched —
+    /// the same fail-closed contract `main.rs` applies at server startup.
+    /// The old behaviour opened with the policy catalog silently empty, so
+    /// RLS and masking were off, and the next DDL wrote that emptied state
+    /// back over the original file.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn durable_mvcc_refuses_a_corrupt_meta_json() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            db.execute("CREATE ROLE meta_keeper LOGIN PASSWORD 'x'")
+                .await
+                .unwrap();
+            db.close();
+        }
+        let meta_path = dir.path().join("meta.json");
+        let corrupt = b"{ this is not valid json";
+        std::fs::write(&meta_path, corrupt).unwrap();
+
+        let result = Database::durable_mvcc(dir.path());
+        assert!(
+            result.is_err(),
+            "an embedded open must refuse a corrupt meta.json, not serve with RLS/masking off"
+        );
+        let bytes_now = std::fs::read(&meta_path).unwrap();
+        assert_eq!(
+            bytes_now, corrupt,
+            "the refused open must not rewrite the corrupt meta.json"
+        );
     }
 }

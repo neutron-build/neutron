@@ -603,6 +603,113 @@ async fn vector_index_changes_survive_restart() {
     assert_eq!(ids, vec![1, 3], "a deleted row came back after restart");
 }
 
+/// S35 F1b (delete half): a post-reopen DELETE must remove the RIGHT vector
+/// from the WAL's node-id space, not a physical row position.
+///
+/// The node->PK registry is deliberately not persisted, so it is empty after
+/// every reopen. The old path resolved the tombstone id through it and fell
+/// back to the scan position — a different id space. Worse, one post-reopen
+/// INSERT makes the registry non-empty (it holds only the new row), which
+/// flips `incremental_maintenance_eligible` to true, so the delete takes the
+/// fast path with a PARTIAL registry: the real node stays live and the
+/// position it tombstoned can belong to a different row's vector.
+///
+/// Node ids equal scan positions only while no row was ever deleted, which is
+/// why the fixture interposes an insert before the delete: after inserting
+/// pk 9 (node 0 — colliding with pk 1's recovered node 0), deleting pk 1
+/// tombstones node 0 and leaves four of the five live vectors indexed.
+/// Asserted through `hnsw_index_live_ids` because a SQL KNN query falls back
+/// to a base-table scan and masks index loss entirely.
+#[tokio::test]
+#[ignore = "F1b remainder: a post-reopen delete cannot resolve pk -> node because the PK \
+            registry is not persisted. The unsafe half is fixed (the delete no longer tombstones \
+            an unrelated node), but making the delete actually take effect needs a design \
+            decision -- persist the registry, or rebuild it on reopen. See _internal/HANDOFF.md."]
+async fn post_reopen_delete_removes_the_right_vector_from_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE f1bd (id INT PRIMARY KEY, x VECTOR(4))").await;
+        exec(&ex, "CREATE INDEX f1bd_v ON f1bd USING HNSW (x)").await;
+        for i in 1..=5i32 {
+            exec(
+                &ex,
+                &format!("INSERT INTO f1bd VALUES ({i}, VECTOR('[{i},0,0,0]'))"),
+            )
+            .await;
+        }
+    }
+    {
+        let ex = open_executor(dir.path()).await;
+        // The insert makes the (empty, stale) registry non-empty without
+        // making it authoritative — the exact state the old gate missed.
+        exec(&ex, "INSERT INTO f1bd VALUES (9, VECTOR('[9,0,0,0]'))").await;
+        exec(&ex, "DELETE FROM f1bd WHERE id = 1").await;
+    }
+
+    let ex = open_executor(dir.path()).await;
+    let live = ex
+        .hnsw_index_live_ids("f1bd_v")
+        .expect("the HNSW index must survive reopen");
+    assert_eq!(
+        live.len(),
+        5,
+        "6 inserts minus 1 acknowledged delete must leave 5 live vectors in the \
+         recovered index, found {}: a post-reopen delete tombstoned a physical row \
+         position in the WAL's node-id space (F1b)",
+        live.len()
+    );
+    // And the base table agrees — the divergence is index-side only.
+    let r = exec(&ex, "SELECT COUNT(*) FROM f1bd").await;
+    let count = match &rows(&r[0])[0][0] {
+        Value::Int64(n) => *n,
+        Value::Int32(n) => *n as i64,
+        other => panic!("expected count, got {other:?}"),
+    };
+    assert_eq!(count, 5);
+}
+
+/// S35 F1b (insert half): a post-reopen INSERT must not allocate a node id
+/// from the stale registry's fresh counter.
+///
+/// The registry counter restarts at 0 after a reopen while the recovered
+/// index already holds nodes 0..n-1, so the first post-reopen insert
+/// OVERWRITES a live node's vector (and re-tombstones it if it was deleted).
+/// Count-based: an insert that overwrites a node leaves the live count
+/// unchanged, so 4 inserts + 1 post-reopen insert must recover 5, not 4.
+#[tokio::test]
+async fn post_reopen_insert_does_not_overwrite_a_recovered_node() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE f1bi (id INT PRIMARY KEY, x VECTOR(4))").await;
+        exec(&ex, "CREATE INDEX f1bi_v ON f1bi USING HNSW (x)").await;
+        for i in 1..=4i32 {
+            exec(
+                &ex,
+                &format!("INSERT INTO f1bi VALUES ({i}, VECTOR('[{i},0,0,0]'))"),
+            )
+            .await;
+        }
+    }
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "INSERT INTO f1bi VALUES (9, VECTOR('[9,0,0,0]'))").await;
+    }
+
+    let ex = open_executor(dir.path()).await;
+    let live = ex
+        .hnsw_index_live_ids("f1bi_v")
+        .expect("the HNSW index must survive reopen");
+    assert_eq!(
+        live.len(),
+        5,
+        "5 acknowledged inserts must recover as 5 live vectors, found {}: the \
+         first post-reopen insert overwrote a recovered node id (F1b)",
+        live.len()
+    );
+}
+
 /// A rolled-back Datalog assertion must not come back on replay.
 ///
 /// Fixing NU-013 (the WAL was opened and never written) created this gap: the

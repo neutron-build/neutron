@@ -420,6 +420,12 @@ impl Ord for MaxCandidate {
     }
 }
 
+/// Tag introducing the optional tombstone section that follows the HNSW
+/// footer. The on-disk format is positional and carries no version byte, so
+/// the section is appended behind this tag instead: a blob that ends at the
+/// footer predates the section, and anything else trailing is corruption.
+const TOMBSTONE_SECTION_TAG: u32 = 0x5453_4E48; // "HNST"
+
 /// HNSW (Hierarchical Navigable Small World) index.
 #[derive(Clone)]
 pub struct HnswIndex {
@@ -905,6 +911,28 @@ impl HnswIndex {
     }
 
     /// Mark a vector ID as deleted. It will be excluded from search results.
+    /// One past the highest node id this index has ever used, counting
+    /// tombstoned ids.
+    ///
+    /// A reopened index carries node ids but no `PkRegistry` -- the registry is
+    /// deliberately not persisted -- so the registry's allocator has to be told
+    /// where the recovered graph already reaches. Starting it at zero made the
+    /// first post-reopen insert allocate an id the recovered graph was already
+    /// using, and `insert` overwrites in place: one acknowledged vector lost per
+    /// collision, silently, with the row still present in the base table.
+    ///
+    /// Tombstoned ids count. They are persisted now, so handing one back to a
+    /// new vector would file it under a standing tombstone and make it
+    /// invisible to search the moment it was written.
+    pub fn next_free_node_id(&self) -> u64 {
+        self.nodes
+            .keys()
+            .chain(self.deleted.iter())
+            .copied()
+            .max()
+            .map_or(0, |highest| highest + 1)
+    }
+
     pub fn mark_deleted(&mut self, id: u64) {
         self.deleted.insert(id);
     }
@@ -993,6 +1021,22 @@ impl HnswIndex {
         // Footer
         buf.extend_from_slice(&(self.max_layer as u32).to_le_bytes());
         buf.extend_from_slice(&self.entry_point.unwrap_or(u64::MAX).to_le_bytes());
+
+        // Tombstones, appended after the footer behind a tag rather than
+        // versioned into the header, so a blob written before this section
+        // existed still loads: it ends at the footer and yields an empty set,
+        // which is what it meant. Until this was written, every tombstone
+        // standing at checkpoint time was dropped, and a deleted vector became
+        // searchable again after reopen. Sorted, so the encoding is
+        // deterministic for a given set.
+        buf.extend_from_slice(&TOMBSTONE_SECTION_TAG.to_le_bytes());
+        let mut tombstones: Vec<u64> = self.deleted.iter().copied().collect();
+        tombstones.sort_unstable();
+        buf.extend_from_slice(&(tombstones.len() as u32).to_le_bytes());
+        for id in tombstones {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+
         buf
     }
 
@@ -1150,11 +1194,64 @@ impl HnswIndex {
                 .try_into()
                 .map_err(|_| "truncated entry_point")?,
         );
+        // The footer read used to end the function, so it never advanced `pos`.
+        // The tombstone section below is positioned relative to it, so it must.
+        pos += 8;
         let entry_point = if entry_raw == u64::MAX {
             None
         } else {
             Some(entry_raw)
         };
+
+        // Tombstones. Absent from blobs written before this section existed, in
+        // which case `pos` already sits at the end and the set is empty. Any
+        // other trailing bytes are corruption, not an old file: guessing at
+        // them would silently misparse a live index, which is a worse failure
+        // than the resurrection bug this section fixes.
+        let mut deleted = HashSet::new();
+        if pos < data.len() {
+            if data.len() - pos < 8 {
+                return Err(
+                    "trailing bytes after the footer are too short for a tombstone section".into(),
+                );
+            }
+            let tag = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| "truncated tombstone section tag")?,
+            );
+            if tag != TOMBSTONE_SECTION_TAG {
+                return Err(
+                    "trailing bytes after the footer do not carry the tombstone section tag".into(),
+                );
+            }
+            pos += 4;
+            let num_deleted = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| "truncated num_deleted")?,
+            ) as usize;
+            pos += 4;
+            // Bound the count against the bytes actually present, exactly as the
+            // `dim` and `num_layers` reads above already do. A raw u32 taken from
+            // a file and fed to an allocation ABORTS the process on Linux -- no
+            // unwind, no Err, no log, SIGABRT -- while silently succeeding on an
+            // overcommitting host, so this must be checked and not merely sized.
+            if num_deleted > (data.len() - pos) / 8 {
+                return Err("num_deleted exceeds remaining data".into());
+            }
+            for _ in 0..num_deleted {
+                deleted.insert(u64::from_le_bytes(
+                    data[pos..pos + 8]
+                        .try_into()
+                        .map_err(|_| "truncated deleted id")?,
+                ));
+                pos += 8;
+            }
+            if pos != data.len() {
+                return Err("trailing bytes after the tombstone section".into());
+            }
+        }
 
         let ml = 1.0 / (config.m as f64).ln();
         Ok(Self {
@@ -1163,7 +1260,7 @@ impl HnswIndex {
             max_layer,
             entry_point,
             ml,
-            deleted: HashSet::new(),
+            deleted,
         })
     }
 }
@@ -2445,6 +2542,103 @@ mod tests {
             assert_eq!(p.0, s.0, "id mismatch at 5000 vectors");
             assert!((p.1 - s.1).abs() < 1e-5);
         }
+    }
+
+    /// S35 F1a: tombstones must survive a serialize/deserialize round-trip.
+    ///
+    /// `serialize` wrote header, nodes and footer — and never the `deleted`
+    /// set every search path consults. A WAL checkpoint snapshots through it,
+    /// so every tombstone standing at checkpoint time was dropped and the
+    /// deleted vector resurrected on reopen. `len()` counts tombstoned nodes,
+    /// so the assertion goes through `live_ids`, which can see a resurrected
+    /// delete — the same observability rule as the recovery probe.
+    #[test]
+    fn tombstones_survive_serialize_roundtrip() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
+            metric: DistanceMetric::L2,
+        };
+        let mut index = HnswIndex::new(config);
+        for i in 0..24u64 {
+            index.insert(i, Vector::new(vec![i as f32, 0.0, 0.0, 0.0]));
+        }
+        index.mark_deleted(3);
+        index.mark_deleted(17);
+        assert_eq!(index.live_ids().len(), 22, "fixture must hold 22 live ids");
+
+        let round = HnswIndex::deserialize(&index.serialize())
+            .expect("a round-trip of a tombstoned index must parse");
+        assert_eq!(
+            round.live_ids(),
+            index.live_ids(),
+            "tombstones were dropped by the round-trip: deleted vectors resurrect"
+        );
+    }
+
+    /// An index serialized by a build that predates the tombstone section must
+    /// still load — with an empty tombstone set, which is faithful: those
+    /// bytes contain no tombstone information to recover.
+    ///
+    /// The format is versioned by position, not by a version byte, so the
+    /// section is APPENDED after the footer and tagged. A reader that stops
+    /// exactly at the footer read an old file; a reader that finds trailing
+    /// bytes demands the tag match (see the next test). Hand-built here, the
+    /// same way `wal::a_pre_checksum_snapshot_still_opens` exercises its
+    /// legacy record: nothing writes the old layout any more.
+    #[test]
+    fn an_index_without_a_tombstone_section_still_loads() {
+        // [metric u8][m u32][ef_search u32][num_nodes u32]
+        // one node: [id u64][dim u32][f32 * dim][num_layers u32 = 0]
+        // footer: [max_layer u32][entry u64]
+        let mut data = Vec::new();
+        data.push(0u8); // metric = L2
+        data.extend_from_slice(&8u32.to_le_bytes()); // m
+        data.extend_from_slice(&50u32.to_le_bytes()); // ef_search
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_nodes
+        data.extend_from_slice(&7u64.to_le_bytes()); // node id
+        data.extend_from_slice(&2u32.to_le_bytes()); // dim
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // num_layers = 0
+        data.extend_from_slice(&0u32.to_le_bytes()); // max_layer
+        data.extend_from_slice(&7u64.to_le_bytes()); // entry_point
+
+        let index = HnswIndex::deserialize(&data).expect("the old format must still load");
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.live_ids(),
+            [7u64].into_iter().collect(),
+            "an old-format index has no tombstones to recover; its one node is live"
+        );
+    }
+
+    /// Trailing bytes after the footer that do not carry the tombstone
+    /// section tag are corruption, not an old file — guessing here would
+    /// silently misparse an existing index, which is worse than the bug the
+    /// section fixes.
+    #[test]
+    fn unknown_trailing_bytes_after_the_footer_are_refused() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
+            metric: DistanceMetric::L2,
+        };
+        let mut index = HnswIndex::new(config);
+        index.insert(1, Vector::new(vec![1.0, 0.0, 0.0, 0.0]));
+        let mut data = index.serialize();
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+
+        let err = HnswIndex::deserialize(&data)
+            .expect_err("trailing bytes without the section tag must be refused");
+        assert!(
+            err.contains("trailing"),
+            "the error should name the trailing section, got: {err}"
+        );
     }
 
     #[test]

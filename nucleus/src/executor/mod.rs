@@ -933,6 +933,16 @@ impl Executor {
                     let (table_name, column_name, pk_col_name) =
                         meta.get(&index_name).cloned().unwrap_or_default();
                     let pk_column = (!pk_col_name.is_empty()).then_some(pk_col_name);
+                    // The maps are not persisted, so they stay empty until the
+                    // first rebuild after reopen and resolve brute-forces in the
+                    // meantime. The ALLOCATOR is a different matter: it must
+                    // start above every id the recovered graph already holds, or
+                    // the first post-reopen insert silently overwrites a
+                    // recovered node in place.
+                    let registry = PkRegistry {
+                        next_node: recovered.hnsw.next_free_node_id(),
+                        ..PkRegistry::default()
+                    };
                     exec.vector_indexes.write().insert(
                         index_name,
                         VectorIndexEntry {
@@ -940,9 +950,7 @@ impl Executor {
                             column_name,
                             kind: VectorIndexKind::Hnsw(recovered.hnsw),
                             pk_column,
-                            // Not persisted; empty until the first rebuild after
-                            // reopen. Resolve brute-forces while it is empty.
-                            registry: PkRegistry::default(),
+                            registry,
                         },
                     );
                 }
@@ -1317,6 +1325,29 @@ impl Executor {
     /// booted the server with RLS and masking silently switched off. See
     /// `MetaPersistence::load_checked`.
     pub async fn load_meta_checked(&self) -> Result<(), ExecError> {
+        self.load_meta_sync()?;
+        // Diagnostic only, and the sole part of the load that needs a runtime.
+        // The embedded builder deliberately does without it rather than block.
+        self.report_policies_without_grants().await;
+        Ok(())
+    }
+
+    /// The whole of the metadata load except the policy/grant report, callable
+    /// from a synchronous startup path.
+    ///
+    /// This exists because `DatabaseBuilder::build` is synchronous and is itself
+    /// routinely called from inside a tokio runtime, so it can neither `.await`
+    /// nor `block_on`. It is the SAME code the async path runs -- `load_meta_checked`
+    /// delegates here -- because the defect this fixes WAS a second entry point
+    /// quietly doing less than the first, and a parallel copy would grow the same
+    /// gap again.
+    ///
+    /// The tokio write locks are taken with `try_write`. At startup the executor
+    /// has just been constructed and is not yet shared, so nothing can contend;
+    /// contention means this was called on a live database, which is a caller
+    /// error and is reported rather than skipped. Skipping is precisely how the
+    /// original bug emptied the policy catalog.
+    pub fn load_meta_sync(&self) -> Result<(), ExecError> {
         let Some(ref cp) = self.catalog_path else {
             return Ok(());
         };
@@ -1331,27 +1362,43 @@ impl Executor {
             }
         };
 
-        // tokio::sync::RwLock — await the write locks
+        // tokio::sync::RwLock — uncontended at startup, see the doc comment
         if !loaded.views.is_empty() {
-            *self.views.write().await = loaded.views;
+            *self
+                .views
+                .try_write()
+                .map_err(|_| Self::meta_lock_contended("views"))? = loaded.views;
         }
         if !loaded.materialized_views.is_empty() {
             // Rebuild mv_deps from loaded MV definitions.
             {
-                let mut deps = self.mv_deps.write().await;
+                let mut deps = self
+                    .mv_deps
+                    .try_write()
+                    .map_err(|_| Self::meta_lock_contended("mv_deps"))?;
                 for mv in loaded.materialized_views.values() {
                     for src in &mv.source_tables {
                         deps.entry(src.clone()).or_default().push(mv.name.clone());
                     }
                 }
             }
-            *self.materialized_views.write().await = loaded.materialized_views;
+            *self
+                .materialized_views
+                .try_write()
+                .map_err(|_| Self::meta_lock_contended("materialized_views"))? =
+                loaded.materialized_views;
         }
         if !loaded.triggers.is_empty() {
-            *self.triggers.write().await = loaded.triggers;
+            *self
+                .triggers
+                .try_write()
+                .map_err(|_| Self::meta_lock_contended("triggers"))? = loaded.triggers;
         }
         if !loaded.roles.is_empty() {
-            *self.roles.write().await = loaded.roles;
+            *self
+                .roles
+                .try_write()
+                .map_err(|_| Self::meta_lock_contended("roles"))? = loaded.roles;
         }
 
         // parking_lot::RwLock — sync, no async needed
@@ -1374,8 +1421,16 @@ impl Executor {
         // Override sequences with dedicated sequences.json if it exists (more up-to-date).
         self.load_sequences_sync();
 
-        self.report_policies_without_grants().await;
         Ok(())
+    }
+
+    fn meta_lock_contended(what: &str) -> ExecError {
+        ExecError::Runtime(format!(
+            "metadata load could not take the {what} lock. load_meta_sync runs at startup, \
+             before the executor is shared, so contention here means it was called on a live \
+             database; use load_meta_checked instead. Refusing to continue: a partial load \
+             would let the emptied state be written back over meta.json."
+        ))
     }
 
     /// Warn about policies whose target roles hold no GRANT on the table.
@@ -6837,7 +6892,35 @@ impl Executor {
             };
             match &mut entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => {
-                    let id = node.unwrap_or(row_position as u64);
+                    // A PK-keyed index whose registry could not resolve the pk does
+                    // not know which node this row is. Falling back to
+                    // `row_position` used an id from a DIFFERENT space: it
+                    // tombstoned an unrelated vector and logged that delete to the
+                    // WAL, making the corruption durable and survive restart.
+                    //
+                    // Leaving the entry in place is strictly safer. A stale index
+                    // entry is harmless -- the row is gone from the base table, so
+                    // the result is filtered out -- whereas a wrong tombstone
+                    // permanently hides a vector that still exists. It does mean the
+                    // delete does not shrink the index until the next rebuild; see
+                    // the registry-persistence decision in _internal/HANDOFF.md.
+                    let id = if entry.pk_column.is_some() {
+                        match node {
+                            Some(resolved) => resolved,
+                            None => {
+                                tracing::warn!(
+                                    index = %idx_name,
+                                    "vector delete could not resolve the primary key to a node \
+                                     id: the PK registry is empty, as it is after a reopen. \
+                                     Leaving the index entry in place rather than tombstoning an \
+                                     unrelated node; it will clear on the next index rebuild."
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        row_position as u64
+                    };
                     hnsw.mark_deleted(id);
                     wal_deletes.push((idx_name.clone(), id));
                 }

@@ -1001,6 +1001,49 @@ mod tests {
         assert_eq!(results[0].0, 0); // vector 0 should be nearest to itself
     }
 
+    /// S35 F1a: a checkpoint snapshot must carry the tombstone set.
+    ///
+    /// `checkpoint` snapshots through `HnswIndex::serialize`, which never
+    /// wrote `deleted`. An acknowledged DELETE followed by a checkpoint (the
+    /// server's recurring task, or the probe's explicit call) resurrected the
+    /// vector on the next reopen — replay had a snapshot in which the delete
+    /// never happened. Asserted through `live_ids`, not a search: `len()`
+    /// counts tombstoned nodes and cannot see a resurrection.
+    #[test]
+    fn checkpointed_tombstones_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = VectorWal::open(dir.path()).unwrap();
+            let mut idx = make_index(24, 8, DistanceMetric::L2);
+            idx.mark_deleted(5);
+            idx.mark_deleted(11);
+            let mut snaps = HashMap::new();
+            snaps.insert(
+                "v".to_string(),
+                IndexSnapshot {
+                    hnsw: &idx,
+                    dims: 8,
+                    metric: 0,
+                    m: 8,
+                    ef: 50,
+                },
+            );
+            wal.checkpoint(&snaps).unwrap();
+            drop(wal);
+        }
+
+        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        let live = st.indexes["v"].hnsw.live_ids();
+        assert_eq!(
+            live.len(),
+            22,
+            "checkpoint dropped tombstones: {}/24 live, expected 22 — deleted vectors \
+             resurrect across a checkpoint-restart cycle",
+            live.len()
+        );
+        assert!(!live.contains(&5) && !live.contains(&11));
+    }
+
     /// A snapshot written by a build that predates per-blob checksums must
     /// still open.
     ///
