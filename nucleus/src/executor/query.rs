@@ -901,6 +901,67 @@ impl Executor {
     /// index-probe results to the zone map dropped a row that matched, and the
     /// `zm_row_total != rows.len()` net did not catch it — equal counts are not
     /// evidence that these are the same rows.
+    /// Filter `rows` in place by a plan-path predicate, PROPAGATING an
+    /// evaluation error instead of silently dropping the row that caused it.
+    ///
+    /// Every filter on the plan path used `unwrap_or(false)` while the AST
+    /// path's `try_parallel_filter` propagates with `?`. That gave one
+    /// predicate two error policies chosen by route: `WHERE 10/v > 1` over a
+    /// column containing a zero returned the other rows and no error on the
+    /// default path, where the AST path and PostgreSQL both raise 22012. The
+    /// rows that would have errored are exactly the rows a user is hunting,
+    /// and their silent absence looks like a valid answer.
+    ///
+    /// The first error wins and the rest of the scan is abandoned, which
+    /// matches the AST path: an error is an error, not a per-row verdict.
+    pub(super) fn retain_by_plan_predicate(
+        &self,
+        rows: &mut Vec<Row>,
+        expr: &Expr,
+        meta: &[ColMeta],
+    ) -> Result<(), ExecError> {
+        let mut first_err: Option<ExecError> = None;
+        rows.retain(|row| match self.eval_where_plan(expr, row, meta) {
+            Ok(keep) => keep,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                false
+            }
+        });
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The Rayon branch of [`retain_by_plan_predicate`].
+    ///
+    /// This one also carries the CANCEL signal: the parallel branch previously
+    /// mapped a cancelled query to `false` per row, so a cancelled plan-path
+    /// query returned a TRUNCATED result set as a successful answer.
+    #[cfg(feature = "server")]
+    pub(super) fn par_filter_by_plan_predicate(
+        &self,
+        rows: Vec<Row>,
+        expr: &Expr,
+        meta: &[ColMeta],
+    ) -> Result<Vec<Row>, ExecError> {
+        use rayon::prelude::*;
+        let keyed: Vec<(bool, Row)> = rows
+            .into_par_iter()
+            .map(|row| {
+                self.eval_where_plan(expr, &row, meta)
+                    .map(|keep| (keep, row))
+            })
+            .collect::<Result<Vec<_>, ExecError>>()?;
+        Ok(keyed
+            .into_iter()
+            .filter_map(|(keep, row)| keep.then_some(row))
+            .collect())
+    }
+
     fn filter_scanned_rows(
         &self,
         table: &str,
@@ -908,7 +969,7 @@ impl Executor {
         expr: &Expr,
         row_meta: &[ColMeta],
         zone_map_meta: Option<&[ColMeta]>,
-    ) -> Vec<Row> {
+    ) -> Result<Vec<Row>, ExecError> {
         // ── Zone map pruning ────────────────────────────────────────────────
         // Before evaluating the WHERE clause row-by-row, try to skip entire
         // granules whose min/max stats prove no row can match the predicate.
@@ -925,16 +986,12 @@ impl Executor {
         } else if cfg!(feature = "server") && rows.len() > 10_000 {
             #[cfg(feature = "server")]
             {
-                use rayon::prelude::*;
-                rows = rows
-                    .into_par_iter()
-                    .filter(|row| self.eval_where_plan(expr, row, row_meta).unwrap_or(false))
-                    .collect();
+                rows = self.par_filter_by_plan_predicate(rows, expr, row_meta)?;
             }
         } else {
-            rows.retain(|row| self.eval_where_plan(expr, row, row_meta).unwrap_or(false));
+            self.retain_by_plan_predicate(&mut rows, expr, row_meta)?;
         }
-        rows
+        Ok(rows)
     }
 
     /// The `SeqScan` at the base of a projection/filter/aggregation chain.
@@ -3034,9 +3091,7 @@ impl Executor {
                                 .and_then(|s| Self::parse_expr_string(s).ok())
                         });
                         if let Some(expr) = resolved_expr {
-                            result_rows.retain(|row| {
-                                self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
-                            });
+                            self.retain_by_plan_predicate(&mut result_rows, &expr, &meta)?;
                         }
                         return Ok((meta, result_rows));
                     }
@@ -3078,7 +3133,7 @@ impl Executor {
                             .values_scanned
                             .inc_by((examined * meta.len()) as u64);
                         // No zone maps: these rows are index hits, not a scan.
-                        let rows = self.filter_scanned_rows(table, rows, expr, &meta, None);
+                        let rows = self.filter_scanned_rows(table, rows, expr, &meta, None)?;
                         return Ok((meta, rows));
                     }
 
@@ -3184,7 +3239,7 @@ impl Executor {
                                 // the engine already pruned below the scan.
                                 (scan_limit.is_none() && prune.is_none())
                                     .then_some(meta.as_slice()),
-                            );
+                            )?;
                         }
                         return Ok((proj_meta, rows));
                     }
@@ -3215,7 +3270,7 @@ impl Executor {
                             &expr,
                             &meta,
                             scan_limit.is_none().then_some(meta.as_slice()),
-                        );
+                        )?;
                     }
                     Ok((meta, rows))
                 }
@@ -3282,10 +3337,7 @@ impl Executor {
                             && let Some((_, mut rows, _, _)) =
                                 self.try_gin_index_scan(table, table, &predicate).await
                         {
-                            rows.retain(|row| {
-                                self.eval_where_plan(&predicate, row, &meta)
-                                    .unwrap_or(false)
-                            });
+                            self.retain_by_plan_predicate(&mut rows, &predicate, &meta)?;
                             self.metrics.index_scan_served.inc();
                             return Ok((meta, rows));
                         }
@@ -3360,10 +3412,7 @@ impl Executor {
                                         .and_then(|s| Self::parse_expr_string(s).ok())
                                 });
                             if let Some(pred_expr) = rp_resolved {
-                                rows.retain(|row| {
-                                    self.eval_where_plan(&pred_expr, row, &meta)
-                                        .unwrap_or(false)
-                                });
+                                self.retain_by_plan_predicate(&mut rows, &pred_expr, &meta)?;
                             }
                             self.metrics.rows_scanned.inc_by(rows.len() as u64);
                             self.metrics.index_scan_served.inc();
@@ -3498,18 +3547,10 @@ impl Executor {
                             // Parallel filter for large row sets — linear speedup on multi-core
                             #[cfg(feature = "server")]
                             {
-                                use rayon::prelude::*;
-                                rows = rows
-                                    .into_par_iter()
-                                    .filter(|row| {
-                                        self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
-                                    })
-                                    .collect();
+                                rows = self.par_filter_by_plan_predicate(rows, &expr, &meta)?;
                             }
                         } else {
-                            rows.retain(|row| {
-                                self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
-                            });
+                            self.retain_by_plan_predicate(&mut rows, &expr, &meta)?;
                         }
                     }
                     Ok((meta, rows))
@@ -3989,10 +4030,7 @@ impl Executor {
                             let mut combined = lrow.clone();
                             combined.extend(rrow.clone());
                             if let Some(ref expr) = cond_expr {
-                                if self
-                                    .eval_where_plan(expr, &combined, &combined_meta)
-                                    .unwrap_or(false)
-                                {
+                                if self.eval_where_plan(expr, &combined, &combined_meta)? {
                                     result_rows.push(combined);
                                 }
                             } else {

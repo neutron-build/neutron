@@ -599,6 +599,120 @@ pub struct Executor {
 /// Plain `FOR UPDATE`/`FOR SHARE` are allowed through: they are advisory
 /// pessimistic hints, and the isolation the engine already provides is a
 /// stronger guarantee than ignoring them would imply.
+/// Fold `FETCH FIRST/NEXT n ROWS ONLY` into the LIMIT the executor actually reads.
+///
+/// sqlparser populates `Query::fetch` for the PostgreSQL dialect, and nothing on
+/// any execution path ever consumed it -- every LIMIT path reads
+/// `Query::limit_clause`. So `SELECT * FROM t FETCH FIRST 5 ROWS ONLY` returned
+/// the whole table, silently and with no error.
+///
+/// The shape that makes this matter is Hibernate's PostgreSQL pagination,
+/// `OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`: the OFFSET lands in `limit_clause` and
+/// was applied, the FETCH landed here and was dropped. Page one was therefore the
+/// entire table, and the row that should have started page two reappeared on
+/// every page.
+///
+/// Same class as the `FOR UPDATE SKIP LOCKED` case that
+/// `reject_unsupported_row_locks` exists to refuse -- a clause parsed and then
+/// discarded -- which is why this sits beside it and runs at the same point.
+///
+/// `WITH TIES` and `PERCENT` are refused rather than approximated: both change
+/// WHICH rows come back, so quietly substituting a plain LIMIT would be the same
+/// defect this fixes, one layer down.
+/// Walk a query body folding `FETCH` on every nested query. See
+/// [`normalize_fetch_into_limit`].
+fn normalize_fetch_in_set_expr(body: &mut ast::SetExpr) -> Result<(), ExecError> {
+    match body {
+        ast::SetExpr::Query(inner) => normalize_fetch_into_limit(inner),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            normalize_fetch_in_set_expr(left)?;
+            normalize_fetch_in_set_expr(right)
+        }
+        ast::SetExpr::Select(select) => {
+            for twj in &mut select.from {
+                normalize_fetch_in_table_factor(&mut twj.relation)?;
+                for join in &mut twj.joins {
+                    normalize_fetch_in_table_factor(&mut join.relation)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The `FROM`-item half of [`normalize_fetch_in_set_expr`].
+fn normalize_fetch_in_table_factor(factor: &mut ast::TableFactor) -> Result<(), ExecError> {
+    match factor {
+        ast::TableFactor::Derived { subquery, .. } => normalize_fetch_into_limit(subquery),
+        ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            normalize_fetch_in_table_factor(&mut table_with_joins.relation)?;
+            for join in &mut table_with_joins.joins {
+                normalize_fetch_in_table_factor(&mut join.relation)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn normalize_fetch_into_limit(query: &mut ast::Query) -> Result<(), ExecError> {
+    // A FETCH can sit on any nested query -- a CTE body, a set-operation arm, a
+    // derived table in FROM -- and each is executed as its own query, so each
+    // has to be folded. Handling only the top level fixed
+    // `SELECT ... FETCH FIRST 5 ROWS ONLY` while leaving
+    // `SELECT * FROM (SELECT ... FETCH FIRST 5 ROWS ONLY) s` returning
+    // everything, which is the same silent wrong answer one layer down.
+    if let Some(ref mut with) = query.with {
+        for cte in &mut with.cte_tables {
+            normalize_fetch_into_limit(&mut cte.query)?;
+        }
+    }
+    normalize_fetch_in_set_expr(&mut query.body)?;
+
+    let Some(fetch) = query.fetch.take() else {
+        return Ok(());
+    };
+    if fetch.with_ties || fetch.percent {
+        return Err(ExecError::Unsupported(
+            "FETCH ... WITH TIES and FETCH ... PERCENT are not implemented. Rewrite as \
+             LIMIT, which returns a fixed number of rows, or omit the modifier."
+                .into(),
+        ));
+    }
+
+    // `FETCH FIRST ROW ONLY` with no quantity means exactly one row. Parsed
+    // rather than hand-built so the literal matches whatever the AST expects.
+    let quantity = match fetch.quantity {
+        Some(expr) => expr,
+        None => Executor::parse_expr_string("1")?,
+    };
+
+    match query.limit_clause.as_mut() {
+        // `OFFSET n ROWS FETCH NEXT m ROWS ONLY` -- the offset is already here.
+        Some(ast::LimitClause::LimitOffset { limit, .. }) if limit.is_none() => {
+            *limit = Some(quantity);
+        }
+        // Both a LIMIT and a FETCH. PostgreSQL rejects this; so do we, rather
+        // than pick one and silently drop the other.
+        Some(_) => {
+            return Err(ExecError::Unsupported(
+                "a query cannot carry both LIMIT and FETCH; use one of them".into(),
+            ));
+        }
+        None => {
+            query.limit_clause = Some(ast::LimitClause::LimitOffset {
+                limit: Some(quantity),
+                offset: None,
+                limit_by: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn reject_unsupported_row_locks(query: &ast::Query) -> Result<(), ExecError> {
     for lock in &query.locks {
         if let Some(nonblock) = &lock.nonblock {
@@ -5756,6 +5870,11 @@ impl Executor {
                 // queue delivers each job to as many workers as happen to poll
                 // together. Refuse it instead.
                 reject_unsupported_row_locks(&query)?;
+
+                // FETCH FIRST/NEXT is parsed into a field no execution path
+                // reads; fold it into the LIMIT that every path does read.
+                let mut query = query;
+                normalize_fetch_into_limit(&mut query)?;
 
                 // Streaming scan (Phase 1.1, opt-in via SET stream_results = on):
                 // for a bare `SELECT * FROM <base table>` hand back a lazy
