@@ -517,11 +517,11 @@ impl LsmTree {
             .collect();
 
         // Merge all SSTables at this level into one at the next level.
-        let tables_to_merge: Vec<SSTable> = self.levels[level].drain(..).collect();
+        let tables_to_merge: Vec<SSTable> = std::mem::take(&mut self.levels[level]);
         let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
 
         // Also include existing SSTables at the next level.
-        let next_tables: Vec<SSTable> = self.levels[level + 1].drain(..).collect();
+        let next_tables: Vec<SSTable> = std::mem::take(&mut self.levels[level + 1]);
 
         // Merge: newer entries (higher seq) win.
         // Process older tables first so newer ones overwrite.

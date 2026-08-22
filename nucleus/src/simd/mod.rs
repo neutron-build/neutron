@@ -1,3 +1,18 @@
+// clippy 1.98 added `chunks_exact_to_as_chunks`, which fires on every
+// `chunks_exact(N)` with a literal N in this module and suggests `as_chunks::<N>()`.
+//
+// Allowed rather than rewritten, deliberately. These call sites are inside
+// `#[cfg(target_arch = "x86_64")]` SIMD intrinsics, so they do not compile on an
+// aarch64 development machine at all -- the lint is reachable only from CI, and a
+// rewrite could be neither compiled nor tested here. `as_chunks` also returns
+// `(&[[T; N]], &[T])` rather than an iterator plus `.remainder()`, so it is a
+// reshape of the loop, not a substitution. The existing code is correct; this is
+// a style lint that arrived with a toolchain bump and blocked a release.
+//
+// Follow-up for anyone on x86_64: do the rewrite properly, with the SIMD tests
+// actually executing.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! SIMD-accelerated query execution primitives.
 //!
 //! Provides vectorized implementations of common database operations:

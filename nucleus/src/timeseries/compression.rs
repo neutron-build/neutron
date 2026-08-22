@@ -382,27 +382,27 @@ impl<'a> GorillaDecoder<'a> {
         }
 
         // Third and beyond: delta-of-delta
-        let dod;
-        if !self.ts_reader.read_bit() {
+
+        let dod = if !self.ts_reader.read_bit() {
             // 0 → dod = 0
-            dod = 0i64;
+            0i64
         } else if !self.ts_reader.read_bit() {
             // 10 + 7 bits
             let raw = self.ts_reader.read_bits(7) as i64;
-            dod = raw - 63;
+            raw - 63
         } else if !self.ts_reader.read_bit() {
             // 110 + 9 bits
             let raw = self.ts_reader.read_bits(9) as i64;
-            dod = raw - 255;
+            raw - 255
         } else if !self.ts_reader.read_bit() {
             // 1110 + 12 bits
             let raw = self.ts_reader.read_bits(12) as i64;
-            dod = raw - 2047;
+            raw - 2047
         } else {
             // 1111 + 32 bits
             let raw = self.ts_reader.read_bits(32) as u32;
-            dod = raw as i32 as i64;
-        }
+            raw as i32 as i64
+        };
 
         let delta = self.prev_delta + dod;
         let ts = (self.prev_ts as i64 + delta) as u64;

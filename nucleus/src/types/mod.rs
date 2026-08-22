@@ -417,9 +417,7 @@ fn split_zone_suffix(time: &str) -> Result<(&str, Option<i64>), String> {
 
 fn parse_timestamp_with_zone(value: &str) -> Result<(i64, Option<i64>), String> {
     let value = value.trim();
-    let (date, time) = value
-        .split_once([' ', 'T'])
-        .map_or((value, "00:00:00"), |parts| parts);
+    let (date, time) = value.split_once([' ', 'T']).unwrap_or((value, "00:00:00"));
     let (time, zone_offset) = split_zone_suffix(time)?;
     let time = time.trim_end();
     let days = parse_date(date)? as i64;
