@@ -5,6 +5,47 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-21
+
+A security release, cut the same day as 0.1.7 because two authorization fixes
+landed after that tag and neither should wait for the next feature cycle.
+
+### Security
+
+- **The wire OLTP fast path enforced neither GRANTs nor column masking.**
+  Reproduced against a running server: a genuinely authenticated role holding no
+  privileges at all could SELECT, UPDATE and DELETE arbitrary rows, while
+  `has_table_privilege` answered false for the same table in the same session.
+
+  The route also ran outside any session scope, so the executor's
+  `current_session()` returned the bootstrap superuser and every in-path guard
+  that consults the session was dead code. The entry point now carries the
+  session id, recomputes authority from the live role catalog, and declines the
+  bypass for any session that must pass the grant gate. Declining rather than
+  erroring is deliberate: the caller falls through to the parsed path, which
+  produces the correct error or the masked row.
+
+- **A role merely NAMED `superuser` conferred full bypass.** Enforcement read the
+  session's role name set while every administrative and introspection surface
+  read the role attribute, so any role called `superuser` -- created by a
+  security admin, imported from a migrated role catalog, or reached through GRANT
+  membership -- granted RLS, masking and privilege bypass to every member while
+  `pg_roles.rolsuper` reported false and `SHOW IS_SUPERUSER` said off.
+
+  Ten enforcement sites now read the `bypass_rls` attribute only, and the name is
+  reserved at `CREATE ROLE`. Present in every release from 0.1.0 through 0.1.7.
+
+### Changed
+
+- **Replica mode refuses to start without `NUCLEUS_EXPERIMENTAL_REPLICATION=1`.**
+  Streaming replication does not apply received records to replica storage, the
+  replica is fully writable with no read-only gate, and automatic failover is not
+  wired -- so a node would report that it was replicating while serving an empty,
+  writable database. The public replication documentation, which promised high
+  availability, automatic failover and synchronous durability, now states what is
+  actually implemented. Single-node operation is unaffected.
+
+
 ## [0.1.7] - 2026-08-21
 
 The first release in seventeen days, and a large one: **99 fixes, features and
