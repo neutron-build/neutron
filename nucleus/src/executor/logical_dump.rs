@@ -29,8 +29,9 @@
 //!
 //! - The bootstrap `nucleus` superuser is NOT emitted: a restore must not
 //!   overwrite the target's own administrative credential.
-//! - Column **masking** policies have no SQL DDL surface in this engine (they are
-//!   constructed programmatically), so a SQL-text dump cannot express them.
+//! - Column **masking** policies have a SQL DDL surface (`CREATE MASKING
+//!   POLICY`) but this dump does not emit it yet, so a SQL-text dump cannot
+//!   reconstruct them.
 //!   [`Executor::logical_dump_gaps`] reports them so a caller can fail loudly
 //!   rather than restore a database that silently unmasks columns.
 //! - Non-relational model state (KV, graph, streams, blobs, …) lives outside the
@@ -468,8 +469,8 @@ fn render_create_policy(policy: &RlsPolicy) -> String {
 /// creates, which would otherwise reset a customised increment/min/max.
 fn render_create_sequence(name: &str, seq: &SequenceDef) -> String {
     format!(
-        "CREATE SEQUENCE {name} INCREMENT BY {} MINVALUE {} MAXVALUE {};",
-        seq.increment, seq.min_value, seq.max_value
+        "CREATE SEQUENCE {name} INCREMENT BY {} MINVALUE {} MAXVALUE {} START WITH {};",
+        seq.increment, seq.min_value, seq.max_value, seq.start
     )
 }
 
@@ -571,7 +572,8 @@ impl super::Executor {
             gaps.push(DumpGap {
                 kind: "masking_policy",
                 detail: format!(
-                    "column mask on {}.{} for role {} has no SQL DDL surface",
+                    "column mask on {}.{} for role {} is not emitted by the dump \
+                     (CREATE MASKING POLICY exists; dump support pending)",
                     policy.table, policy.column, policy.role
                 ),
             });

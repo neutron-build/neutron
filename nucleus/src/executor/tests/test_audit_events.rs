@@ -37,6 +37,10 @@ async fn authority_changes_are_recorded() {
         "CREATE POLICY tenant_read ON t FOR SELECT TO app_user USING (tenant = 'acme')",
     )
     .await;
+    // The most destructive authority change must leave a record too —
+    // an intruder erasing principals is exactly the case the trail exists for.
+    exec(&ex, "DROP ROLE app_user").await;
+    exec(&ex, "DROP ROLE IF EXISTS ghost_never_existed").await;
 
     let l = lines(dir.path()).await;
     for (kind, principal) in [
@@ -45,6 +49,7 @@ async fn authority_changes_are_recorded() {
         ("privilege_granted", "app_user"),
         ("privilege_revoked", "app_user"),
         ("policy_changed", "tenant_read"),
+        ("role_dropped", "app_user"),
     ] {
         assert!(
             has_kind(&l, kind, principal),
@@ -52,6 +57,12 @@ async fn authority_changes_are_recorded() {
             l.join("\n")
         );
     }
+    assert!(
+        !l.iter()
+            .any(|line| line.contains("role_dropped") && line.contains("ghost_never_existed")),
+        "DROP ROLE IF EXISTS on a missing role must not record a drop; log was:\n{}",
+        l.join("\n")
+    );
 }
 
 /// The audit log must never become the place the password leaks.

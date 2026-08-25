@@ -561,3 +561,35 @@ async fn rls_comparison_in_list_and_null_predicates_enforce() {
     assert_eq!(rows(&result[0]).len(), 1);
     assert_eq!(rows(&result[0])[0][0], Value::Int32(4));
 }
+
+/// Extension-prefix commands (SHOW TABLE STATS, REFRESH MV, masking DDL, ...)
+/// run on raw text before the parsed path's per-statement
+/// `recompute_session_context` — a session whose authority was revoked kept
+/// its stale context indefinitely on those commands. A demoted superuser's
+/// session used `bypass_rls` from before the demotion to read planner stats
+/// of an RLS table.
+#[tokio::test]
+async fn extension_commands_recompute_session_context() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE guarded_stats (id INT, ssn TEXT)").await;
+    exec(&ex, "ALTER TABLE guarded_stats ENABLE ROW LEVEL SECURITY").await;
+    exec(&ex, "CREATE ROLE boss LOGIN PASSWORD 'x' SUPERUSER").await;
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "boss").await.unwrap();
+    // Prime the session context while boss still holds the attribute.
+    exec_session(&ex, sid, "SELECT 1").await.unwrap();
+
+    // Demote from the bootstrap session.
+    exec(&ex, "ALTER ROLE boss NOSUPERUSER").await;
+
+    // The extension-prefix arm must see the REVOKED authority, not the
+    // context snapshotted while boss was a superuser.
+    let res = exec_session(&ex, sid, "SHOW TABLE STATS guarded_stats").await;
+    match res {
+        Err(ExecError::PermissionDenied(msg)) => assert!(msg.contains("RLS-protected")),
+        Err(other) => panic!("expected PermissionDenied, got: {other}"),
+        Ok(v) => {
+            panic!("stale superuser context leaked RLS-table stats via SHOW TABLE STATS: {v:?}")
+        }
+    }
+}

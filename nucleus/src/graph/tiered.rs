@@ -31,7 +31,14 @@ fn prop_value_to_json(v: &PropValue) -> String {
             if f.is_finite() {
                 format!("{{\"__float\":{f}}}")
             } else {
-                "null".to_string()
+                // JSON cannot spell NaN/±inf; the old fallback wrote "null",
+                // which silently turned the value into Null on the cold
+                // round-trip. Self-describing spellings instead.
+                match (f.is_nan(), f.is_sign_positive()) {
+                    (true, _) => "{\"__float\":\"nan\"}".to_string(),
+                    (false, true) => "{\"__float\":\"inf\"}".to_string(),
+                    (false, false) => "{\"__float\":\"-inf\"}".to_string(),
+                }
             }
         }
         PropValue::Text(s) => format!("\"{}\"", escape_json(s)),
@@ -126,10 +133,23 @@ fn parse_tagged_object(s: &str) -> Option<(PropValue, &str)> {
             Some((PropValue::Int(n), rest))
         }
         "__float" => {
-            let (num_str, rest) = take_number(rest)?;
-            let rest = rest.trim().strip_prefix('}')?;
-            let f: f64 = num_str.parse().ok()?;
-            Some((PropValue::Float(f), rest))
+            if rest.starts_with('"') {
+                // NaN / +inf / -inf arrive as strings — JSON has no spelling
+                // for them (see `prop_value_to_json`).
+                let (s, rest) = parse_json_string(rest)?;
+                let rest = rest.trim().strip_prefix('}')?;
+                match s.as_str() {
+                    "nan" => Some((PropValue::Float(f64::NAN), rest)),
+                    "inf" => Some((PropValue::Float(f64::INFINITY), rest)),
+                    "-inf" => Some((PropValue::Float(f64::NEG_INFINITY), rest)),
+                    _ => None,
+                }
+            } else {
+                let (num_str, rest) = take_number(rest)?;
+                let rest = rest.trim().strip_prefix('}')?;
+                let f: f64 = num_str.parse().ok()?;
+                Some((PropValue::Float(f), rest))
+            }
         }
         _ => None,
     }
@@ -548,7 +568,9 @@ impl TieredGraphStore {
         }
         self.hot_node_ids.clear();
         self.hot_edge_ids.clear();
-        cold.force_flush();
+        if let Err(e) = cold.force_flush() {
+            tracing::error!("graph cold tier flush failed: {e}");
+        }
     }
 
     // ---- Internal helpers ----
@@ -615,6 +637,50 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    /// GRP-12: non-finite floats used to encode as `null` on eviction, so a
+    /// NaN/inf property silently became Null on the cold round-trip. The
+    /// tagged `__float` encoding now spells them out.
+    #[test]
+    fn nonfinite_floats_survive_the_cold_round_trip() {
+        let mut props = BTreeMap::new();
+        props.insert("nan".to_string(), PropValue::Float(f64::NAN));
+        props.insert("inf".to_string(), PropValue::Float(f64::INFINITY));
+        props.insert("ninf".to_string(), PropValue::Float(f64::NEG_INFINITY));
+        props.insert("one".to_string(), PropValue::Float(1.0));
+        let bytes = properties_to_bytes(&props);
+        let back = properties_from_bytes(&bytes).expect("round-trip must parse");
+        match (
+            back.get("nan"),
+            back.get("inf"),
+            back.get("ninf"),
+            back.get("one"),
+        ) {
+            (
+                Some(PropValue::Float(nan)),
+                Some(PropValue::Float(inf)),
+                Some(PropValue::Float(ninf)),
+                Some(PropValue::Float(one)),
+            ) => {
+                assert!(nan.is_nan(), "NaN came back as {nan}");
+                assert_eq!(inf, &f64::INFINITY);
+                assert_eq!(ninf, &f64::NEG_INFINITY);
+                assert_eq!(one, &1.0);
+            }
+            other => panic!("non-finite props were lost on the round-trip: {other:?}"),
+        }
+    }
+
+    /// Legacy bytes — finite tagged floats and genuine nulls — must parse
+    /// exactly as before.
+    #[test]
+    fn legacy_cold_bytes_still_parse() {
+        let back = properties_from_bytes(br#"{"a":{"__float":2.5},"b":null,"c":{"__int":7}}"#)
+            .expect("legacy bytes must parse");
+        assert_eq!(back.get("a"), Some(&PropValue::Float(2.5)));
+        assert_eq!(back.get("b"), Some(&PropValue::Null));
+        assert_eq!(back.get("c"), Some(&PropValue::Int(7)));
+    }
 
     fn props(pairs: &[(&str, PropValue)]) -> Properties {
         let mut map = BTreeMap::new();

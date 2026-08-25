@@ -1256,3 +1256,44 @@ async fn test_create_extension_rejects_unsupported() {
     assert!(err.contains("procedural-language"), "got: {err}");
     assert!(ex.execute("CREATE EXTENSION postgres_fdw").await.is_err());
 }
+
+/// CREATE/DROP MODEL are privileged DDL over shared engine state, and the
+/// CREATE path reads a filesystem path — containment is not a role question.
+#[tokio::test]
+async fn model_ddl_is_gated_and_path_contained() {
+    let ex = test_executor();
+    exec(&ex, "CREATE ROLE pleb LOGIN PASSWORD 'x'").await;
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "pleb").await.unwrap();
+
+    match ex.execute_with_session(sid, "DROP MODEL anything").await {
+        Err(e) => assert!(e.to_string().contains("superuser"), "got: {e}"),
+        Ok(_) => panic!("non-superuser must not DROP MODEL"),
+    }
+    match ex
+        .execute_with_session(sid, "CREATE MODEL m FROM '/etc/passwd'")
+        .await
+    {
+        Err(e) => assert!(e.to_string().contains("superuser"), "got: {e}"),
+        Ok(_) => panic!("non-superuser must not CREATE MODEL"),
+    }
+}
+
+/// Even a superuser cannot register a model from outside the data directory
+/// — the old containment canonicalized the path and then grepped the
+/// RESOLVED string for "..", which can never match; every absolute path
+/// passed (an existence oracle for arbitrary paths).
+#[tokio::test]
+async fn create_model_path_containment_holds_even_for_superuser() {
+    let dir = tempfile::tempdir().unwrap();
+    // open_executor (durable, disk-backed) — the default session is the
+    // bootstrap superuser, so ONLY the containment check can refuse.
+    let ex = super::test_meta_persistence::open_executor(dir.path()).await;
+    match ex.execute("CREATE MODEL m FROM '/etc/passwd'").await {
+        Err(e) => assert!(
+            e.to_string().contains("data directory"),
+            "refusal must come from containment, got: {e}"
+        ),
+        Ok(_) => panic!("/etc/passwd must never be registrable as a model path"),
+    }
+}

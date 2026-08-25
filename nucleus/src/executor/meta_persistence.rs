@@ -97,6 +97,14 @@ struct SequenceSer {
     increment: i64,
     min_value: i64,
     max_value: i64,
+    /// Absent in pre-upgrade meta.json files; defaults to 1 (the common
+    /// START), matching what those sequences were created with.
+    #[serde(default = "default_seq_start")]
+    start: i64,
+}
+
+fn default_seq_start() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +175,8 @@ struct MetaSnapshot {
     #[serde(default)]
     extensions: Vec<ExtensionSer>,
     #[serde(default)]
+    schemas: Vec<String>,
+    #[serde(default)]
     rls: crate::security::RlsEngine,
     #[serde(default)]
     masking: crate::security::MaskingEngine,
@@ -233,9 +243,15 @@ impl MetaPersistence {
         roles: &HashMap<String, RoleDef>,
         functions: &HashMap<String, FunctionDef>,
         extensions: &HashMap<String, ExtensionDef>,
+        schemas: &std::collections::HashSet<String>,
         security: &crate::security::SecurityManager,
     ) -> Result<(), String> {
         let snapshot = MetaSnapshot {
+            schemas: {
+                let mut v: Vec<String> = schemas.iter().cloned().collect();
+                v.sort();
+                v
+            },
             views: views
                 .values()
                 .map(|v| ViewSer {
@@ -269,6 +285,7 @@ impl MetaPersistence {
                         increment: seq.increment,
                         min_value: seq.min_value,
                         max_value: seq.max_value,
+                        start: seq.start,
                     }
                 })
                 .collect(),
@@ -426,6 +443,7 @@ impl MetaPersistence {
         let mut meta = LoadedMeta {
             rls: snap.rls,
             masking: snap.masking,
+            schemas: snap.schemas.into_iter().collect(),
             ..LoadedMeta::default()
         };
 
@@ -464,6 +482,7 @@ impl MetaPersistence {
                 increment: s.increment,
                 min_value: s.min_value,
                 max_value: s.max_value,
+                start: s.start,
             };
             meta.sequences.insert(s.name, parking_lot::Mutex::new(seq));
         }
@@ -571,6 +590,7 @@ pub struct LoadedMeta {
     pub roles: HashMap<String, RoleDef>,
     pub functions: HashMap<String, FunctionDef>,
     pub extensions: HashMap<String, ExtensionDef>,
+    pub schemas: std::collections::HashSet<String>,
     pub rls: crate::security::RlsEngine,
     pub masking: crate::security::MaskingEngine,
 }

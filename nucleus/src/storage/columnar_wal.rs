@@ -49,7 +49,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -89,6 +89,15 @@ pub struct ColumnarWal {
     synced: AtomicU64,
     /// Group-commit coordinator so concurrent commit-time syncs share fsyncs.
     committer: GroupCommitter,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no future recovery
+    /// reads while `group_sync`/`is_dirty` report healthy. Set when a
+    /// checkpoint replaced the log but its reopen failed; cleared by the next
+    /// successful reattach (or checkpoint reopen). See `reattach_if_stranded`.
+    stranded: AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint_named`.
+    #[cfg(test)]
+    fail_reopen_once: AtomicBool,
 }
 
 impl ColumnarWal {
@@ -117,6 +126,9 @@ impl ColumnarWal {
                 appends: AtomicU64::new(0),
                 synced: AtomicU64::new(0),
                 committer: GroupCommitter::new(),
+                stranded: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_reopen_once: AtomicBool::new(false),
             },
             state,
         ))
@@ -238,10 +250,37 @@ impl ColumnarWal {
         write_entry(&mut contents, ENTRY_SNAPSHOT_NAMED, "", &payload)?;
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
 
+        // The reopen is the hazardous half: the rename above already unlinked
+        // the inode `writer` holds, so a failure here leaves the writer
+        // pointing at a file no future recovery reads.
+        #[cfg(test)]
+        let injected: Option<io::Error> = self
+            .fail_reopen_once
+            .swap(false, Ordering::AcqRel)
+            .then(|| io::Error::other("injected columnar WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<io::Error> = None;
+        let file = if let Some(e) = injected {
+            Err(e)
+        } else if let Some(e) = crate::storage::crashpoint::io_fault("columnar.wal_reopen") {
+            Err(e)
+        } else {
+            OpenOptions::new().append(true).open(&self.path)
+        };
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                // The rename already happened, so the handle in `writer` is
+                // now an unlinked inode. Mark the writer stranded: appends
+                // must reattach (or fail loudly), never write through it.
+                self.stranded.store(true, Ordering::Release);
+                return Err(e);
+            }
+        };
         // Re-open in append mode for future writes, and count the snapshot
         // as a covered append so coverage marks stay consistent.
-        let file = OpenOptions::new().append(true).open(&self.path)?;
         *writer = BufWriter::new(file);
+        self.stranded.store(false, Ordering::Release);
         let mark = self.appends.fetch_add(1, Ordering::AcqRel) + 1;
         self.synced.fetch_max(mark, Ordering::AcqRel);
         Ok(())
@@ -251,10 +290,42 @@ impl ColumnarWal {
 
     fn append(&self, entry_type: u8, name: &str, payload: &[u8]) -> io::Result<()> {
         let mut w = self.writer.lock();
+        self.reattach_if_stranded(&mut w)?;
         write_entry(&mut *w, entry_type, name, payload)?;
         w.flush()?;
         // Counted under the writer lock so sync_covering's mark is exact.
         self.appends.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly instead of
+    /// letting it acknowledge a write to a dead inode.
+    fn reattach_if_stranded(&self, w: &mut BufWriter<File>) -> io::Result<()> {
+        if !self.stranded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("columnar.wal_reopen") {
+            return Err(e);
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "columnar WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        *w = BufWriter::new(file);
+        self.stranded.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -652,6 +723,34 @@ mod tests {
         assert!(
             !wal.is_dirty(),
             "checkpoint fsyncs the snapshot — nothing left to force"
+        );
+    }
+
+    /// S31-14: a checkpoint whose reopen fails must not leave the writer
+    /// appending into the unlinked inode the rename displaced. Those appends
+    /// report success while no future recovery can ever read them, so an
+    /// acknowledged row silently vanishes at restart. The discriminator is
+    /// durability: the post-failure insert must land in the replaced file.
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
+            wal.log_create_table("t").unwrap();
+            wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
+            wal.fail_reopen_once.store(true, Ordering::SeqCst);
+            wal.checkpoint(&[("t", vec![int_row(1, 1.0)])])
+                .expect_err("the injected reopen failure must fail the checkpoint");
+            wal.log_insert_rows("t", &[int_row(2, 2.0)])
+                .expect("a later append must reattach, not strand");
+        }
+        let (_wal2, state) = ColumnarWal::open(dir.path()).unwrap();
+        let t = state.tables.iter().find(|(n, _)| n == "t").unwrap();
+        assert_eq!(
+            t.1.len(),
+            2,
+            "the post-checkpoint-failure insert went to the unlinked inode: it \
+             returned Ok and no recovery can ever read it"
         );
     }
 

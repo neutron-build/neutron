@@ -29,6 +29,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::Executor;
+use super::enlistment::{EnlistedSet, Model, XACT_AUTOCOMMIT};
 use super::types::VectorIndexEntry;
 use crate::graph::GraphTouched;
 
@@ -64,6 +65,16 @@ pub(super) struct CrossModelLevel {
 
 /// Cross-model state for one session's open transaction.
 pub(super) struct CrossModelTxn {
+    /// This transaction's coordinator id (S63). Minted at BEGIN from the
+    /// executor's `next_xact_id`, written into every specialty record the
+    /// transaction tags, and vouched for by the COMMIT-record body. It is
+    /// NOT the SQL engine's txn id — see `executor::enlistment` for why that
+    /// one cannot serve here.
+    pub xid: u64,
+    /// Which specialty models this transaction has enlisted. Drives the
+    /// COMMIT-record body and the S7 checkpoint gate (a SQL-only transaction
+    /// never blocks a specialty checkpoint).
+    pub enlisted: EnlistedSet,
     /// Before-images and write-set as of `BEGIN`.
     pub base: CrossModelLevel,
     /// Savepoint stack: `(name, level, fts_mark)`.
@@ -74,8 +85,10 @@ pub(super) struct CrossModelTxn {
 }
 
 impl CrossModelTxn {
-    pub fn new() -> Self {
+    pub fn new(xid: u64) -> Self {
         Self {
+            xid,
+            enlisted: EnlistedSet::default(),
             base: CrossModelLevel::default(),
             savepoints: Vec::new(),
             fts_ops: Vec::new(),
@@ -107,25 +120,39 @@ impl Executor {
     // open SQL transaction.
 
     /// Record that this transaction is about to write `key`, capturing the KV
-    /// before-image on first use. Must be called *before* the mutation.
-    pub(super) fn cross_model_touch_kv(&self, key: &str) {
+    /// before-image on first use, and return the coordinating id the WAL
+    /// record for that write must carry (S63): the transaction's `xid`
+    /// inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    /// Folding the enlistment into the touch means one lock acquisition
+    /// covers both, and a write path cannot drift between capturing the
+    /// before-image and tagging its record. Must be called *before* the
+    /// mutation.
+    pub(super) fn cross_model_touch_kv(&self, key: &str) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Kv);
         for_each_level!(cm, lvl, {
             if lvl.kv.is_none() {
                 lvl.kv = Some(self.kv_store.txn_snapshot());
             }
             lvl.kv_touched.insert(key.to_string());
         });
+        cm.xid
     }
 
     /// `FLUSHDB` erases the whole keyspace, so its write-set is every key the
-    /// before-image holds.
+    /// before-image holds. Enlists the KV model for the S7 checkpoint gate;
+    /// the flush's own WAL effect is a snapshot (committed by construction,
+    /// untaggable — see the S63 design's D3), so unlike the keyed touches
+    /// there is no id to hand back.
     pub(super) fn cross_model_touch_kv_all(&self) {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
         let Some(cm) = guard.as_mut() else { return };
+        cm.enlisted.enlist(Model::Kv);
         for_each_level!(cm, lvl, {
             if lvl.kv.is_none() {
                 lvl.kv = Some(self.kv_store.txn_snapshot());
@@ -282,7 +309,12 @@ impl Executor {
 
     // ── Streams ─────────────────────────────────────────────────────────────
 
-    /// Record that this transaction is about to modify stream `name`.
+    /// Record that this transaction is about to modify stream `name`, and
+    /// return the coordinating id the WAL record for that write must carry
+    /// (S63): the transaction's `xid` inside an explicit transaction,
+    /// `XACT_AUTOCOMMIT` outside one. Folding the enlistment into the touch
+    /// means one lock acquisition covers both, and a write path cannot drift
+    /// between capturing the before-image and tagging its record.
     ///
     /// Must be called BEFORE the mutation and while NOT holding the `streams`
     /// write guard — this takes a read guard, and the reverse order would
@@ -292,10 +324,13 @@ impl Executor {
     /// back: `XADD` inside a `BEGIN` stayed in the stream after `ROLLBACK`, so
     /// an aborted transaction still published events that downstream consumers
     /// had already acted on.
-    pub(super) fn cross_model_touch_stream(&self, name: &str) {
+    pub(super) fn cross_model_touch_stream(&self, name: &str) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Streams);
         // Read the before-image once, outside the per-level loop.
         let before = self.streams.read().get(name).cloned();
         for_each_level!(cm, lvl, {
@@ -303,6 +338,7 @@ impl Executor {
                 .entry(name.to_string())
                 .or_insert_with(|| before.clone());
         });
+        cm.xid
     }
 
     // ── FTS (already op-scoped) ─────────────────────────────────────────────

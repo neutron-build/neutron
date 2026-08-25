@@ -1438,7 +1438,20 @@ impl GraphStore {
             }
 
             for (neighbor, edge) in self.neighbors(current, direction, None) {
-                let raw_weight = match edge.properties.get(weight_property) {
+                // An evicted edge's hot properties are empty; when that is
+                // the case and a cold tier exists, resolve the full edge
+                // before reading the weight (GRP-8) — otherwise the missing
+                // weight silently defaulted to 1.0.
+                let cold_edge = if edge.properties.is_empty() && self.cold_props.is_some() {
+                    self.get_edge_full(edge.id)
+                } else {
+                    None
+                };
+                let raw_weight = match cold_edge
+                    .as_ref()
+                    .and_then(|e| e.properties.get(weight_property))
+                    .or_else(|| edge.properties.get(weight_property))
+                {
                     Some(PropValue::Float(w)) => *w,
                     Some(PropValue::Int(w)) => *w as f64,
                     _ => 1.0,

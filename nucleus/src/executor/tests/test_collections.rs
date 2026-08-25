@@ -407,6 +407,24 @@ async fn test_pubsub_subscribers_count() {
 }
 
 #[tokio::test]
+async fn test_pubsub_channels_lists_only_live_channels() {
+    let ex = test_executor();
+    // Seed the sync hub the way the embedded API does: subscribe, then drop
+    // the receiver — a zero-subscriber channel entry (S31-16).
+    {
+        let _rx = ex.pubsub_sync().write().subscribe("ghost");
+    }
+    let r = exec(&ex, "SELECT pubsub_channels()").await;
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Text("".into()),
+        "a channel with no subscribers must not appear in PUBSUB_CHANNELS"
+    );
+    let r = exec(&ex, "SELECT pubsub_subscribers('ghost')").await;
+    assert_eq!(scalar(&r[0]), &Value::Int64(0));
+}
+
+#[tokio::test]
 async fn test_pubsub_channels_empty() {
     let ex = test_executor();
     let r = exec(&ex, "SELECT pubsub_channels()").await;
@@ -709,12 +727,13 @@ async fn test_geo_updates_do_not_grow_the_index() {
     use crate::kv::collections::GeoSet;
 
     let mut geo = GeoSet::new();
-    geo.add(13.361389, 38.115556, "palermo");
+    geo.add(13.361389, 38.115556, "palermo").unwrap();
     assert_eq!(geo.index_len(), 1);
 
     for i in 1..=200 {
         let drift = f64::from(i) * 0.0001;
-        geo.add(13.361389 + drift, 38.115556 + drift, "palermo");
+        geo.add(13.361389 + drift, 38.115556 + drift, "palermo")
+            .unwrap();
     }
     assert_eq!(
         geo.index_len(),
@@ -737,6 +756,40 @@ async fn test_geo_updates_do_not_grow_the_index() {
     assert!(
         near_first.is_empty(),
         "the member answered from a position it has left: {near_first:?}"
+    );
+}
+
+/// GDL-8: unstorable coordinates (NaN/inf/out-of-range) must be rejected at
+/// the collection boundary. A NaN member's bbox never `contains_point`s its
+/// own position, so every later move of that member fails `RTree::remove`
+/// and leaks one index entry per update — invisible to answers, unbounded
+/// in memory.
+#[tokio::test]
+async fn test_geo_rejects_invalid_coordinates() {
+    use crate::kv::collections::GeoSet;
+
+    let mut geo = GeoSet::new();
+    for (lon, lat) in [
+        (f64::NAN, 0.0),
+        (0.0, f64::NAN),
+        (f64::INFINITY, 0.0),
+        (181.0, 0.0),
+        (0.0, 90.1),
+    ] {
+        assert!(
+            geo.add(lon, lat, "bad").is_err(),
+            "({lon}, {lat}) must be rejected"
+        );
+    }
+    assert_eq!(geo.len(), 0, "no member may be stored");
+    assert_eq!(geo.index_len(), 0);
+
+    geo.add(0.0, 0.0, "x").unwrap();
+    assert!(!geo.add(1.0, 1.0, "x").unwrap(), "update of a valid member");
+    assert_eq!(
+        geo.index_len(),
+        1,
+        "a moving member leaves exactly one entry"
     );
 }
 

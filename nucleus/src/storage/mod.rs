@@ -707,9 +707,38 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
+    /// The next LSN this engine's WAL will assign (`0` when it has no LSNs).
+    /// Read once at executor construction for the S7 reclaim horizon.
+    fn current_wal_lsn(&self) -> u64 {
+        0
+    }
     /// Begin an explicit transaction. Engines that support MVCC will take a
     /// snapshot; simple engines do nothing.
     async fn begin_txn(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+    /// Stage the S63 enlistment payload to be written into this session's
+    /// next COMMIT record. Called by the executor's commit path immediately
+    /// before [`StorageEngine::commit_txn`], under the same session scope the
+    /// commit itself runs in; the engine keys the slot by that session so two
+    /// concurrent committers cannot pick up each other's marker. Engines
+    /// without a transactional commit record ignore it.
+    fn set_pending_enlistment(&self, _body: [u8; 10]) {}
+    /// The coordinating transaction ids recovered from this engine's commit
+    /// records (S63) — the set the specialty-WAL recovery filter keys on.
+    /// Engines that cannot recover one (in-memory, or no commit record at
+    /// all) return an empty set, which makes the filter discard every
+    /// id-carrying specialty record; only engines that really do persist
+    /// commit markers should override this.
+    fn committed_xacts(&self) -> std::sync::Arc<std::collections::HashSet<u64>> {
+        std::sync::Arc::new(std::collections::HashSet::new())
+    }
+    /// Durable marker that a coordinating transaction committed, for engines
+    /// where an explicit transaction writes no commit record of its own (the
+    /// non-MVCC disk engine): without it, a BEGIN/COMMIT touching only
+    /// specialty models leaves nothing on the SQL side to vouch for the
+    /// transaction at recovery. Errors fail the COMMIT.
+    fn log_xact_commit(&self, _body: &[u8; 10]) -> Result<(), StorageError> {
         Ok(())
     }
     /// Commit the current transaction.

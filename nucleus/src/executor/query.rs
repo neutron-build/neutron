@@ -1979,6 +1979,16 @@ impl Executor {
                     {
                         return false;
                     }
+                    // SEMI/ANTI: plan_query maps these to an UNCONDITIONED
+                    // Inner nested loop (join type `_` arm + dropped ON) — a
+                    // full cross product. Decline to plan so the AST path's
+                    // explicit refusal (execute_join) surfaces instead.
+                    ast::JoinOperator::Semi(_)
+                    | ast::JoinOperator::LeftSemi(_)
+                    | ast::JoinOperator::RightSemi(_)
+                    | ast::JoinOperator::Anti(_)
+                    | ast::JoinOperator::LeftAnti(_)
+                    | ast::JoinOperator::RightAnti(_) => return false,
                     _ => {}
                 }
             }
@@ -2720,9 +2730,7 @@ impl Executor {
 
             for right_row in probed_rows {
                 if let Some(ref pred) = right_pushdown
-                    && !self
-                        .eval_where(pred, &right_row, &right_meta)
-                        .unwrap_or(false)
+                    && !self.eval_where(pred, &right_row, &right_meta)?
                 {
                     continue;
                 }
@@ -2743,8 +2751,7 @@ impl Executor {
 
                 let combined: Row = left_row.iter().chain(right_row.iter()).cloned().collect();
                 let residual_ok = if let Some(ref residual) = residual_on {
-                    self.eval_where(residual, &combined, &combined_meta)
-                        .unwrap_or(false)
+                    self.eval_where(residual, &combined, &combined_meta)?
                 } else {
                     true
                 };
@@ -4093,6 +4100,7 @@ impl Executor {
                     let mut combined_meta = left_meta.clone();
                     combined_meta.extend(right_meta.clone());
                     // Parse hash key: "left_col = right_col"
+                    let mut key_declined: Option<String> = None;
                     if let Some(key_str) = hash_keys.first() {
                         let parts: Vec<&str> = key_str.split('=').map(|s| s.trim()).collect();
                         if parts.len() == 2 {
@@ -4146,6 +4154,18 @@ impl Executor {
                                 return Ok((combined_meta, result_rows));
                             }
                         }
+                        // The key exists but resolved on neither side (or is
+                        // malformed): falling through to a cross join would
+                        // DROP the join condition and hand back a Cartesian
+                        // product presented as a join. Decline loudly — the
+                        // caller falls back to the AST path, which resolves
+                        // joins by a different and more complete route.
+                        key_declined = Some(key_str.clone());
+                    }
+                    if let Some(key) = key_declined {
+                        return Err(ExecError::Unsupported(format!(
+                            "hash join key could not be resolved: {key}"
+                        )));
                     }
                     // Fallback: cross join
                     let product = left_rows.len().saturating_mul(right_rows.len());
@@ -4285,6 +4305,29 @@ impl Executor {
                                                 "AVG" => {
                                                     match tbl_storage.fast_sum_f64(table, col_idx) {
                                                         Some((sum, cnt)) => {
+                                                            let is_int = ci
+                                                                .get(col_idx)
+                                                                .is_some_and(|(_, dt)| {
+                                                                    matches!(
+                                                                        dt,
+                                                                        DataType::Int32
+                                                                            | DataType::Int64
+                                                                    )
+                                                                });
+                                                            // Same precision guard as the
+                                                            // SUM arm above: an f64 sum of
+                                                            // near-i64::MAX integers rounds
+                                                            // before the divide and reports
+                                                            // a wrong average where the
+                                                            // exact path errors. Decline.
+                                                            if is_int
+                                                                && cnt > 0
+                                                                && sum.abs()
+                                                                    >= 9_007_199_254_740_992.0
+                                                            {
+                                                                all_handled = false;
+                                                                break;
+                                                            }
                                                             let v = if cnt == 0 {
                                                                 Value::Null
                                                             } else {
@@ -4415,9 +4458,12 @@ impl Executor {
                             )?
                         } else {
                             // Try SIMD fast-path for primitive SUM/MIN/MAX.
-                            col_idx
+                            match col_idx
                                 .and_then(|ci| simd_aggregate(&func_name, ci, &meta, &rows))
-                                .unwrap_or_else(|| compute_aggregate(&func_name, col_idx, &rows))
+                            {
+                                Some(v) => v,
+                                None => compute_aggregate(&func_name, col_idx, &rows)?,
+                            }
                         };
                         let static_dt = match func_name.as_str() {
                             "COUNT" => Some(DataType::Int64),
@@ -4682,7 +4728,7 @@ impl Executor {
                                             &group_rows,
                                         )?
                                     } else {
-                                        compute_aggregate_refs(&func_name, col_idx, &group_rows)
+                                        compute_aggregate_refs(&func_name, col_idx, &group_rows)?
                                     };
                                 row_out.push(value);
                             }
@@ -4731,7 +4777,7 @@ impl Executor {
                                     &group_rows,
                                 )?
                             } else {
-                                compute_aggregate_refs(&func_name, col_idx, &group_rows)
+                                compute_aggregate_refs(&func_name, col_idx, &group_rows)?
                             };
                             row_out.push(value);
                         }
@@ -5276,7 +5322,14 @@ impl Executor {
                     let op_val = self.eval_expr_plan(operand_expr, row, meta)?;
                     for cw in conditions.iter() {
                         let cond_val = self.eval_expr_plan(&cw.condition, row, meta)?;
-                        if Self::plan_values_cmp(&op_val, &cond_val) == std::cmp::Ordering::Equal {
+                        // `=` semantics: NULL never matches, not even NULL —
+                        // compare_values maps (Null,Null) to Equal for
+                        // ordering purposes (see the AST-path twin in expr.rs).
+                        if !matches!(op_val, Value::Null)
+                            && !matches!(cond_val, Value::Null)
+                            && Self::plan_values_cmp(&op_val, &cond_val)
+                                == std::cmp::Ordering::Equal
+                        {
                             return self.eval_expr_plan(&cw.result, row, meta);
                         }
                     }
@@ -7127,6 +7180,17 @@ impl Executor {
                         let avg = if cnt == 0 {
                             Value::Null
                         } else {
+                            // Same precision guard as the SUM arm above: an
+                            // f64 mantissa holds integers exactly only to
+                            // 2^53, and near-i64::MAX inputs make this f64
+                            // average silently wrong where the exact path
+                            // errors. Decline and let it answer.
+                            let is_int = col_info.get(*ci).is_some_and(|(_, dt)| {
+                                matches!(dt, DataType::Int32 | DataType::Int64)
+                            });
+                            if is_int && sum.abs() >= 9_007_199_254_740_992.0 {
+                                return Ok(None);
+                            }
                             Value::Float64(sum / cnt as f64)
                         };
                         col_defs.push((col_label.clone(), DataType::Float64));
@@ -7425,7 +7489,9 @@ impl Executor {
         }
 
         // Find column index
-        let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+        let col_idx = col_meta
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
 
         // Determine column type
         let dtype = &col_meta[col_idx].dtype;
@@ -7654,7 +7720,9 @@ impl Executor {
 
         match kind {
             FilterKind::Eq(col_name, filter_val) => {
-                let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 // Coerce text literals to the column's declared type before
                 // pushdown — pgx SimpleProtocol delivers all parameters as
                 // text, so `WHERE bigint_col = '5'` arrives with `filter_val =
@@ -7669,7 +7737,9 @@ impl Executor {
                 Some((col_meta, rows))
             }
             FilterKind::Range(col_name, lo, hi) => {
-                let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 let lo = Self::coerce_literal_to_column_type(lo, &col_meta[col_idx].dtype)?;
                 let hi = Self::coerce_literal_to_column_type(hi, &col_meta[col_idx].dtype)?;
                 let rows = storage.fast_scan_where_range(&table_name, col_idx, &lo, &hi)?;
@@ -7828,7 +7898,9 @@ impl Executor {
                 right,
             } => {
                 let (col_name, filter_val) = self.try_extract_col_eq_literal(left, right)?;
-                let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 let filter_val = Self::coerce_to_column_type(&filter_val, &col_meta[col_idx].dtype);
                 storage.fast_scan_where_eq(table_name, col_idx, &filter_val)
             }
@@ -7839,7 +7911,9 @@ impl Executor {
                 negated,
             } if !*negated => {
                 let (col_name, lo, hi) = self.try_extract_col_between_literals(expr, low, high)?;
-                let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 let dtype = &col_meta[col_idx].dtype;
                 let lo = Self::coerce_to_column_type(&lo, dtype);
                 let hi = Self::coerce_to_column_type(&hi, dtype);
@@ -7859,7 +7933,9 @@ impl Executor {
                 right: _,
             } => {
                 let (col_name, val, is_lower) = self.try_extract_col_bound(where_expr)?;
-                let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 let val = Self::coerce_to_column_type(&val, &col_meta[col_idx].dtype);
                 // The open end must be a sentinel of the SAME type as `val`
                 // (a hard-coded Int64 sentinel makes the storage comparator
@@ -7885,7 +7961,9 @@ impl Executor {
                 right,
             } => {
                 let (col_name, lo, hi) = self.try_extract_range_from_and(left, right)?;
-                let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 let dtype = &col_meta[col_idx].dtype;
                 let lo = Self::coerce_to_column_type(&lo, dtype);
                 let hi = Self::coerce_to_column_type(&hi, dtype);
@@ -8768,6 +8846,19 @@ impl Executor {
                                     left_rows.append(&mut found);
                                 }
                             }
+                            // QPP-3: the probe bypasses the left table's load
+                            // path, so its single-table WHERE predicates were
+                            // never applied. Re-apply the pushdown, exactly as
+                            // apply_pushdown_for_factor does for every loaded
+                            // factor. (Left here is always the single table
+                            // from[0] — the fast path requires from.len()==2
+                            // and from[0].joins.is_empty().)
+                            let left_rows = self.apply_pushdown_for_factor(
+                                &from[0].relation,
+                                left_rows,
+                                &left_meta,
+                                pushdown,
+                            )?;
                             let combined_meta: Vec<ColMeta> =
                                 left_meta.iter().chain(right_meta.iter()).cloned().collect();
                             let join_rows = self.execute_hash_join(
@@ -8849,14 +8940,20 @@ impl Executor {
             rows = new_rows;
         }
 
+        // QPP-2: the index-NL fast path below probes ONE base table, so it is
+        // only valid while the accumulated left side is exactly that single
+        // table. Set at the top of each iteration so the loop's `continue`
+        // statements are safe.
+        let mut first_comma_factor = true;
         for twj in &from[1..] {
+            let left_is_single_table = first_comma_factor;
+            first_comma_factor = false;
             let twj_pushdown = Self::factor_pushdown_expr(&twj.relation, pushdown);
             let (right_meta, right_rows0) = self
                 .load_table_factor_with_ctes(&twj.relation, cte_tables, twj_pushdown.as_ref())
                 .await?;
             let right_rows =
                 self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown)?;
-
             // Optimization: implicit hash join for comma-separated FROM
             // Instead of O(N*M) cross join + filter, try to extract equi-join
             // conditions from the remaining cross-table WHERE predicates and
@@ -8886,14 +8983,16 @@ impl Executor {
                         right_rows.clone()
                     } else {
                         let filter_expr = Self::combine_predicates(right_only).unwrap();
-                        right_rows
-                            .iter()
-                            .filter(|r| {
-                                self.eval_where(&filter_expr, r, &right_meta)
-                                    .unwrap_or(false)
-                            })
-                            .cloned()
-                            .collect()
+                        // Propagate evaluation errors instead of collapsing
+                        // them to "no match" — the same defect QPP-12 fixed in
+                        // execute_hash_join's residual.
+                        let mut kept = Vec::with_capacity(right_rows.len());
+                        for r in &right_rows {
+                            if self.eval_where(&filter_expr, r, &right_meta)? {
+                                kept.push(r.clone());
+                            }
+                        }
+                        kept
                     };
                     (filtered, Self::combine_predicates(cross))
                 } else {
@@ -8903,7 +9002,14 @@ impl Executor {
                 // Index nested-loop optimization: when one side is small and the
                 // join key on the other side is indexed, replace the full table
                 // with batch index lookups — avoids scanning the large table.
+                // QPP-2 guard: only valid while the accumulated left IS one
+                // base table (first comma factor, from[0] a plain table with
+                // no explicit joins) — the probe returns single-table-width
+                // rows while the hash join would run with multi-table metadata.
                 let effective_left = if self.read_fast_paths_permitted()
+                    && left_is_single_table
+                    && from[0].joins.is_empty()
+                    && matches!(&from[0].relation, TableFactor::Table { .. })
                     && filtered_right.len() < 1000
                     && left_keys.len() == 1
                 {
@@ -8934,6 +9040,15 @@ impl Executor {
                                     left_rows.append(&mut found);
                                 }
                             }
+                            // QPP-3: re-apply the left table's pushdown to the
+                            // probed rows (guarded above, col_meta here is
+                            // from[0]'s single-table meta).
+                            let left_rows = self.apply_pushdown_for_factor(
+                                &from[0].relation,
+                                left_rows,
+                                &col_meta,
+                                pushdown,
+                            )?;
                             Some(left_rows)
                         } else {
                             None
@@ -10411,15 +10526,13 @@ impl Executor {
 
             // ── Skip double-quoted identifiers ────────────────────────
             if ch == b'"' {
-                out.push('"');
+                let start = i;
                 i += 1;
                 while i < len {
-                    out.push(bytes[i] as char);
                     if bytes[i] == b'"' {
                         i += 1;
                         // Handle escaped double-quote ("")
                         if i < len && bytes[i] == b'"' {
-                            out.push('"');
                             i += 1;
                             continue;
                         }
@@ -10427,21 +10540,25 @@ impl Executor {
                     }
                     i += 1;
                 }
+                // Slice copy — byte-at-a-time `as char` re-emission
+                // mojibakes multi-byte identifiers (WIR-4 family). Must
+                // stay key-identical to normalize_sql_with_literals.
+                out.push_str(&sql[start..i]);
                 continue;
             }
 
             // ── Skip backtick-quoted identifiers ──────────────────────
             if ch == b'`' {
-                out.push('`');
+                let start = i;
                 i += 1;
                 while i < len {
-                    out.push(bytes[i] as char);
                     if bytes[i] == b'`' {
                         i += 1;
                         break;
                     }
                     i += 1;
                 }
+                out.push_str(&sql[start..i]);
                 continue;
             }
 
@@ -10534,8 +10651,15 @@ impl Executor {
             }
 
             // ── Everything else: copy through ─────────────────────────
-            out.push(ch as char);
-            i += 1;
+            // Copy whole UTF-8 chars, not single bytes (WIR-4 family).
+            if ch < 0x80 {
+                out.push(ch as char);
+                i += 1;
+            } else {
+                let c = sql[i..].chars().next().unwrap_or('\u{fffd}');
+                out.push(c);
+                i += c.len_utf8();
+            }
         }
 
         out
@@ -10560,14 +10684,12 @@ impl Executor {
 
             // ── Skip double-quoted identifiers ────────────────────────
             if ch == b'"' {
-                out.push('"');
+                let start = i;
                 i += 1;
                 while i < len {
-                    out.push(bytes[i] as char);
                     if bytes[i] == b'"' {
                         i += 1;
                         if i < len && bytes[i] == b'"' {
-                            out.push('"');
                             i += 1;
                             continue;
                         }
@@ -10575,44 +10697,53 @@ impl Executor {
                     }
                     i += 1;
                 }
+                // Copied as a slice: re-emitting bytes one at a time as chars
+                // mojibakes multi-byte identifiers into Latin-1 (WIR-4 family).
+                out.push_str(&sql[start..i]);
                 continue;
             }
 
             // ── Skip backtick-quoted identifiers ──────────────────────
             if ch == b'`' {
-                out.push('`');
+                let start = i;
                 i += 1;
                 while i < len {
-                    out.push(bytes[i] as char);
                     if bytes[i] == b'`' {
                         i += 1;
                         break;
                     }
                     i += 1;
                 }
+                out.push_str(&sql[start..i]);
                 continue;
             }
 
             // ── Replace string literals ('...') with $S ───────────────
             if ch == b'\'' {
                 i += 1;
-                let mut value = String::new();
+                let body_start = i;
                 loop {
                     if i >= len {
                         break;
                     }
                     if bytes[i] == b'\'' {
-                        i += 1;
-                        if i < len && bytes[i] == b'\'' {
-                            value.push('\'');
-                            i += 1;
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
                             continue;
                         }
                         break;
                     }
-                    value.push(bytes[i] as char);
                     i += 1;
                 }
+                // The literal body is a UTF-8 substring bounded by ASCII
+                // quotes; byte-at-a-time `as char` accumulation mojibaked
+                // it, and a cache hit substitutes that value into the
+                // cloned AST (wrong answers after the first execution).
+                let body_end = i;
+                if i < len {
+                    i += 1;
+                }
+                let value = sql[body_start..body_end].replace("''", "'");
                 literals.push(CacheLiteral::String(value));
                 out.push_str("$S");
                 continue;
@@ -10679,8 +10810,18 @@ impl Executor {
                 continue;
             }
 
-            out.push(ch as char);
-            i += 1;
+            // ── Everything else: copy through ─────────────────────────
+            // A non-ASCII byte is part of a multi-byte UTF-8 sequence:
+            // pushing it alone as a char mojibakes it into Latin-1
+            // (WIR-4 family). Copy the whole char instead.
+            if ch < 0x80 {
+                out.push(ch as char);
+                i += 1;
+            } else {
+                let c = sql[i..].chars().next().unwrap_or('\u{fffd}');
+                out.push(c);
+                i += c.len_utf8();
+            }
         }
 
         (out, literals)

@@ -152,6 +152,19 @@ pub(super) fn sync_block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+/// Security staging state as of one savepoint. Restoring the PAIR is what
+/// makes ROLLBACK TO SAVEPOINT a no-op for transactions that never touched
+/// policy: re-staging an old snapshot unconditionally would publish it at
+/// COMMIT and erase other sessions' committed policy DDL.
+pub(super) struct SecuritySavepoint {
+    pub name: String,
+    /// Staged catalog at savepoint time. `None` = no policy DDL yet in this
+    /// transaction at the time the savepoint was taken.
+    pub pending: Option<SecurityManager>,
+    /// `policy_dirty` as of the savepoint.
+    pub policy_dirty: bool,
+}
+
 /// Transaction state for the current session.
 pub(super) struct TxnState {
     /// Whether a transaction is currently active.
@@ -182,8 +195,8 @@ pub(super) struct TxnState {
     pub security_snapshot: Option<SecurityManager>,
     /// Session-local security catalog staged by policy DDL until COMMIT.
     pub security_pending: Option<SecurityManager>,
-    /// Security snapshots associated with SQL savepoints.
-    pub security_savepoints: Vec<(String, SecurityManager)>,
+    /// Security staging state as of each SQL savepoint.
+    pub security_savepoints: Vec<SecuritySavepoint>,
     /// Whether this transaction changed security policy metadata.
     pub policy_dirty: bool,
     /// Whether relational DML changed rows that may feed a shared GIN index.

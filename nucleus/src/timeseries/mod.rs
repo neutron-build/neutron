@@ -522,8 +522,47 @@ impl Series {
 
     /// Insert a data point into the columnar storage. Maintains sorted order.
     fn insert(&mut self, ts: u64, value: f64, tags: &[(String, String)], partition_size: u64) {
-        // Find sorted insertion position
-        let pos = self.timestamps.binary_search(&ts).unwrap_or_else(|i| i);
+        // Duplicate timestamps are last-write-wins (Prometheus/Influx
+        // semantics): an OTLP retry must not double-count in aggregates.
+        // The last_values cache already does `>=` LWW; this makes the
+        // columnar store agree with it. WAL replay applies inserts in log
+        // order, so replays converge to the same LWW state.
+        let pos = match self.timestamps.binary_search(&ts) {
+            Ok(pos) => {
+                let old = self.values[pos];
+                self.values[pos] = value;
+                for col in self.tag_columns.values_mut() {
+                    col[pos] = None;
+                }
+                for (key, val) in tags {
+                    let col = self
+                        .tag_columns
+                        .entry(key.clone())
+                        .or_insert_with(|| vec![None; self.timestamps.len()]);
+                    if col.len() < self.timestamps.len() {
+                        col.resize(self.timestamps.len(), None);
+                    }
+                    col[pos] = Some(val.clone());
+                }
+                // Stats consistency: count and min/max_ts unchanged (same
+                // ts, same row count). Sum adjusted for the replacement.
+                // If the OLD value sat at either val bound the stat would go
+                // stale, so recompute exactly in that (rare) case —
+                // fast_aggregate returns stats.min_val/max_val as ANSWERS,
+                // not merely bounds. Widening is only safe when old was
+                // strictly interior.
+                self.stats.sum += value - old;
+                if old <= self.stats.min_val || old >= self.stats.max_val {
+                    self.stats = SeriesStats::recompute(&self.timestamps, &self.values);
+                } else {
+                    self.stats.min_val = self.stats.min_val.min(value);
+                    self.stats.max_val = self.stats.max_val.max(value);
+                }
+                // Partition index untouched: no row was added.
+                return;
+            }
+            Err(pos) => pos,
+        };
 
         let is_append = pos == self.timestamps.len();
 
@@ -899,6 +938,17 @@ struct TsWal {
     dir: std::path::PathBuf,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: crate::storage::wal_util::WalSync,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no future recovery
+    /// reads. Set when a checkpoint replaced the log but its reopen failed;
+    /// cleared by the next successful reattach (or checkpoint reopen). See
+    /// `reattach_if_stranded`. This WAL's appends are best-effort by design
+    /// (logged, never propagated), so a failed reattach is reported the same
+    /// way — loudly in the log, and the point is NOT acknowledged as durable.
+    stranded: std::sync::atomic::AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
+    #[cfg(test)]
+    fail_reopen_once: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for TsWal {
@@ -919,11 +969,50 @@ impl TsWal {
             writer: parking_lot::Mutex::new(Some(std::io::BufWriter::new(file))),
             dir: dir.to_path_buf(),
             syncer: crate::storage::wal_util::WalSync::new(),
+            stranded: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     fn wal_path(&self) -> std::path::PathBuf {
         self.dir.join("ts_wal.bin")
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly (in this WAL's
+    /// best-effort idiom: logged, and the write skipped) instead of letting it
+    /// acknowledge a point no recovery can ever read.
+    fn reattach_if_stranded(
+        &self,
+        guard: &mut Option<std::io::BufWriter<std::fs::File>>,
+    ) -> std::io::Result<()> {
+        if !self.stranded.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("ts.wal_reopen") {
+            return Err(e);
+        }
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.wal_path())
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "timeseries WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.wal_path().display()
+                    ),
+                )
+            })?;
+        *guard = Some(std::io::BufWriter::new(file));
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// Flush + `fsync` the log, capturing (under the writer lock) the highest
@@ -953,6 +1042,10 @@ impl TsWal {
     fn log_create_series(&self, name: &str, partition_size: u64) {
         use std::io::Write;
         let mut guard = self.writer.lock();
+        if let Err(e) = self.reattach_if_stranded(&mut guard) {
+            tracing::error!("timeseries WAL append skipped, writer stranded: {e}");
+            return;
+        }
         if let Some(ref mut w) = *guard {
             let mut buf = vec![WAL_CREATE_SERIES];
             let name_bytes = name.as_bytes();
@@ -970,6 +1063,10 @@ impl TsWal {
     fn log_delete_series(&self, name: &str) {
         use std::io::Write;
         let mut guard = self.writer.lock();
+        if let Err(e) = self.reattach_if_stranded(&mut guard) {
+            tracing::error!("timeseries WAL append skipped, writer stranded: {e}");
+            return;
+        }
         if let Some(ref mut w) = *guard {
             let mut buf = vec![WAL_DELETE_SERIES];
             let name_bytes = name.as_bytes();
@@ -986,6 +1083,10 @@ impl TsWal {
     fn log_insert(&self, name: &str, ts: u64, value: f64, tags: &[(String, String)]) {
         use std::io::Write;
         let mut guard = self.writer.lock();
+        if let Err(e) = self.reattach_if_stranded(&mut guard) {
+            tracing::error!("timeseries WAL append skipped, writer stranded: {e}");
+            return;
+        }
         if let Some(ref mut w) = *guard {
             let mut buf = vec![WAL_INSERT];
             let name_bytes = name.as_bytes();
@@ -1014,6 +1115,10 @@ impl TsWal {
     fn log_insert_batch(&self, name: &str, points: &[(u64, f64, Vec<(String, String)>)]) {
         use std::io::Write;
         let mut guard = self.writer.lock();
+        if let Err(e) = self.reattach_if_stranded(&mut guard) {
+            tracing::error!("timeseries WAL append skipped, writer stranded: {e}");
+            return;
+        }
         if let Some(ref mut w) = *guard {
             let mut buf = vec![WAL_INSERT_BATCH];
             let name_bytes = name.as_bytes();
@@ -1088,9 +1193,37 @@ impl TsWal {
         if let Err(e) = crate::storage::wal_util::atomic_replace_wal(&wal_path, &buf) {
             tracing::error!("timeseries WAL checkpoint failed: {e}");
         }
-        // Reopen in append mode.
-        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&wal_path) {
-            *guard = Some(std::io::BufWriter::new(file));
+        // The reopen is the hazardous half: the rename above already unlinked
+        // the inode the writer holds, so a failure here used to leave appends
+        // going to a file no future recovery reads — silently, because the
+        // old `if let Ok` swallowed the error. Mark the writer stranded
+        // instead: appends reattach (or refuse loudly), never write through
+        // the dead handle.
+        #[cfg(test)]
+        let injected: Option<std::io::Error> = self
+            .fail_reopen_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .then(|| std::io::Error::other("injected timeseries WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<std::io::Error> = None;
+        let file = if let Some(e) = injected {
+            Err(e)
+        } else if let Some(e) = crate::storage::crashpoint::io_fault("ts.wal_reopen") {
+            Err(e)
+        } else {
+            std::fs::OpenOptions::new().append(true).open(&wal_path)
+        };
+        match file {
+            Ok(file) => {
+                *guard = Some(std::io::BufWriter::new(file));
+                self.stranded
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            Err(e) => {
+                tracing::error!("timeseries WAL checkpoint reopen failed: {e}");
+                self.stranded
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
         let mark = self.syncer.on_append();
@@ -2132,17 +2265,13 @@ impl ContinuousAggManager {
             }
         }
 
-        // If no closed buckets, materialize all (batch scenario).
-        if new_watermark == watermark && !buckets.is_empty() {
-            for (bucket_start, agg) in &buckets {
-                let value = def.agg_function.extract(agg);
-                def.materialized.insert(*bucket_start as i64, value);
-                let bucket_end = bucket_start + def.bucket_size.millis();
-                if bucket_end > new_watermark {
-                    new_watermark = bucket_end;
-                }
-            }
-        }
+        // The still-open bucket is deliberately NOT materialized (DKV-5).
+        // The old fallback materialized it from its first N samples and
+        // advanced the watermark past its end, so every later sample in that
+        // bucket fell below the watermark and was invisible forever — a
+        // partial aggregate frozen as if final. Under-materializing is safe:
+        // the next refresh re-reads from the unmoved watermark, and the
+        // bucket materializes once a newer one closes it, from complete data.
 
         def.last_materialized_ts = new_watermark as i64;
     }
@@ -2405,6 +2534,73 @@ mod tests {
         assert_eq!(after_phase1[1], after_phase2[1]);
     }
 
+    /// DKV-5 (interim: fallback deleted): an open bucket must never be
+    /// materialized from partial samples. The deleted fallback froze the
+    /// still-open bucket at whatever had arrived and advanced the watermark
+    /// past its end, so later samples in that same bucket were invisible
+    /// forever — the materialized sum stayed at the first sample's value.
+    #[test]
+    fn continuous_agg_open_bucket_not_frozen() {
+        let mut store = TimeSeriesStore::new(BucketSize::Hour);
+        let mut manager = ContinuousAggManager::new();
+        let base_ts = time_bucket(1_700_000_000_000, BucketSize::Minute);
+
+        manager.create("cpu_1m_sum", "cpu", BucketSize::Minute, AggFunction::Sum);
+
+        store.insert(
+            "cpu",
+            DataPoint {
+                timestamp: base_ts,
+                tags: vec![],
+                value: 1.0,
+            },
+        );
+        manager.refresh("cpu_1m_sum", &store);
+        assert!(
+            manager.query("cpu_1m_sum", 0, i64::MAX).is_empty(),
+            "an open bucket must not be materialized"
+        );
+
+        // A later sample in the SAME bucket.
+        store.insert(
+            "cpu",
+            DataPoint {
+                timestamp: base_ts + 30_000,
+                tags: vec![],
+                value: 2.0,
+            },
+        );
+        manager.refresh("cpu_1m_sum", &store);
+        assert!(
+            manager.query("cpu_1m_sum", 0, i64::MAX).is_empty(),
+            "the open bucket still must not be materialized from partial samples"
+        );
+
+        // A sample in the next minute closes the first bucket; only now may
+        // it materialize — from ALL of its samples.
+        store.insert(
+            "cpu",
+            DataPoint {
+                timestamp: base_ts + 60_000,
+                tags: vec![],
+                value: 4.0,
+            },
+        );
+        manager.refresh("cpu_1m_sum", &store);
+
+        let results = manager.query("cpu_1m_sum", 0, i64::MAX);
+        assert_eq!(
+            results.len(),
+            1,
+            "only the closed first bucket materializes: {results:?}"
+        );
+        assert!(
+            (results[0].1 - 3.0).abs() < 1e-10,
+            "the closed bucket must aggregate every sample (1.0 + 2.0), got {}",
+            results[0].1
+        );
+    }
+
     #[test]
     fn continuous_agg_query_range() {
         let mut store = TimeSeriesStore::new(BucketSize::Hour);
@@ -2566,6 +2762,17 @@ mod tests {
         let base_ts = time_bucket(1_700_000_000_000, BucketSize::Minute);
 
         insert_series(&mut store, "s1", 60, 1_000, base_ts);
+        // One point in the NEXT minute closes the first bucket, so every
+        // aggregate below reads closed-bucket data (the still-open bucket is
+        // no longer materialized — DKV-5).
+        store.insert(
+            "s1",
+            DataPoint {
+                timestamp: base_ts + 60_000,
+                tags: vec![],
+                value: 99.0,
+            },
+        );
 
         for (name, func, expected) in [
             ("sum", AggFunction::Sum, 1830.0),
@@ -3020,6 +3227,53 @@ mod tests {
             assert_eq!(result.count, 60);
             assert!((result.sum - 1830.0).abs() < 1e-10); // 1+2+...+60
         }
+    }
+
+    /// S31-14: a checkpoint whose reopen fails must not leave the writer
+    /// appending into the unlinked inode the rename displaced. Those appends
+    /// report success while no future recovery can ever read them, so an
+    /// acknowledged point silently vanishes at restart. This WAL's appends
+    /// are best-effort by design, so the discriminator is durability: the
+    /// post-failure insert must land in the replaced file.
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().join("ts_wal_stranded");
+        {
+            let mut store = TimeSeriesStore::open(&dir_path, BucketSize::Hour).unwrap();
+            for i in 0..2 {
+                store.insert(
+                    "s",
+                    DataPoint {
+                        timestamp: 1_000_000 + i * 1000,
+                        tags: vec![],
+                        value: i as f64,
+                    },
+                );
+            }
+            store
+                .wal
+                .as_ref()
+                .unwrap()
+                .fail_reopen_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            store.snapshot();
+            store.insert(
+                "s",
+                DataPoint {
+                    timestamp: 2_000_000,
+                    tags: vec![],
+                    value: 9.0,
+                },
+            );
+        }
+        let store = TimeSeriesStore::open(&dir_path, BucketSize::Hour).unwrap();
+        assert_eq!(
+            store.total_points(),
+            3,
+            "the post-checkpoint-failure insert went to the unlinked inode: the \
+             insert reported success and no recovery can ever read it"
+        );
     }
 
     #[test]
@@ -3825,5 +4079,34 @@ mod tests {
         assert!(store.par_range_avg("ghost", 0, u64::MAX).is_none());
         assert!(store.par_range_min("ghost", 0, u64::MAX).is_none());
         assert!(store.par_range_max("ghost", 0, u64::MAX).is_none());
+    }
+
+    /// DKV-9: duplicate timestamps are last-write-wins (Prometheus/Influx
+    /// semantics) — an OTLP retry must not double-count in aggregates. The
+    /// old `binary_search(...).unwrap_or_else(|i| i)` inserted a second row
+    /// at the same ts; the last_values cache already did `>=` LWW, so the
+    /// store was internally inconsistent.
+    #[test]
+    fn duplicate_timestamps_are_last_write_wins() {
+        let mut series = Series::new("s");
+        series.insert(1_000, 10.0, &[], 3600);
+        // Out-of-order insert at a distinct ts.
+        series.insert(500, 5.0, &[], 3600);
+        // Retry at the SAME ts: replaces the value in place.
+        series.insert(1_000, 3.0, &[], 3600);
+
+        assert_eq!(series.timestamps, vec![500, 1_000]);
+        assert_eq!(series.values, vec![5.0, 3.0], "LWW on duplicate ts");
+        assert_eq!(series.stats.count, 2);
+        assert!((series.stats.sum - 8.0).abs() < 1e-9);
+        assert!((series.stats.min_val - 3.0).abs() < 1e-9);
+        assert!((series.stats.max_val - 5.0).abs() < 1e-9);
+
+        // Old value sat at a stat bound -> exact recompute, not stale bounds.
+        series.insert(500, 7.0, &[], 3600);
+        assert_eq!(series.stats.count, 2);
+        assert!((series.stats.sum - 10.0).abs() < 1e-9);
+        assert!((series.stats.min_val - 3.0).abs() < 1e-9);
+        assert!((series.stats.max_val - 7.0).abs() < 1e-9);
     }
 }

@@ -113,6 +113,11 @@ pub enum ProcResult {
     Ok(ProcValue),
     /// Successfully returned multiple rows (for table-returning functions).
     Rows(Vec<Vec<ProcValue>>),
+    /// A SQL procedure's substituted body, to be executed by the host
+    /// executor. Only `ProcedureBody::Sql` produces this; builtin output is
+    /// always data and must never be executed (the host used to sniff output
+    /// text for SQL keywords and run it — second-order injection).
+    SqlBody(String),
     /// Execution failed.
     Error(String),
 }
@@ -338,8 +343,9 @@ impl ProcedureEngine {
                     // For SQL procedures, return the body with parameter substitution.
                     // Text values are escaped to prevent SQL injection:
                     // - NUL bytes stripped
-                    // - Backslashes doubled
-                    // - Single quotes doubled
+                    // - Single quotes doubled (backslashes are LITERAL characters
+                    //   under the standard-conforming PostgreSqlDialect — doubling
+                    //   them corrupted every Windows path / regex argument)
                     let mut positional = Vec::with_capacity(sql_proc.param_names.len());
                     let mut named = HashMap::new();
                     for (i, param) in sql_proc.param_names.iter().enumerate() {
@@ -351,9 +357,12 @@ impl ProcedureEngine {
                             positional.push("NULL".to_string());
                         }
                     }
-                    let body =
-                        substitute_proc_sql_placeholders(&sql_proc.body, &positional, &named);
-                    ProcResult::Ok(ProcValue::Text(body))
+                    let body = crate::sql::substitute_sql_placeholders(
+                        &sql_proc.body,
+                        &positional,
+                        &named,
+                    );
+                    ProcResult::SqlBody(body)
                 }
                 ProcedureBody::Wasm {
                     module_bytes,
@@ -367,7 +376,10 @@ impl ProcedureEngine {
         };
 
         let duration = start.elapsed().as_micros() as u64;
-        let success = matches!(result, ProcResult::Ok(_) | ProcResult::Rows(_));
+        let success = matches!(
+            result,
+            ProcResult::Ok(_) | ProcResult::Rows(_) | ProcResult::SqlBody(_)
+        );
 
         self.executions.push(ExecutionRecord {
             procedure: name.to_string(),
@@ -478,15 +490,15 @@ fn sanitize_proc_sql_text(value: &str) -> String {
         match ch {
             // Strip NUL bytes — they can truncate strings in C-based parsers.
             '\0' => {}
-            // Double backslashes to prevent escape-sequence injection
-            // (e.g., `\'` becoming an unescaped quote in some SQL dialects).
-            '\\' => out.push_str("\\\\"),
-            // Double single quotes (standard SQL escaping).
+            // Backslashes are NOT doubled: PostgreSqlDialect is
+            // standard-conforming, so '\' inside '...' is a literal
+            // character. Doubling corrupted every Windows path / regex
+            // argument. Injection safety comes from quote-doubling alone.
             '\'' => out.push_str("''"),
             // Block Unicode escape sequences that some SQL engines interpret:
             //   \uXXXX  and  U&'...'  style escapes start with these chars
-            //   after a backslash (already doubled above), but raw U+0000
-            //   surrogates or BOM could also be abused.
+            //   after a backslash, but raw U+0000 surrogates or BOM could
+            //   also be abused.
             // Strip Unicode replacement char and BOM.
             '\u{FFFD}' | '\u{FEFF}' | '\u{FFFE}' | '\u{FFFF}' => {}
             // Strip lone surrogates (Rust strings can't contain them, but
@@ -508,139 +520,6 @@ fn proc_sql_replacement(value: &ProcValue) -> String {
         ProcValue::Null => "NULL".to_string(),
         _ => format!("'{}'", sanitize_proc_sql_text(&format!("{value:?}"))),
     }
-}
-
-fn substitute_proc_sql_placeholders(
-    sql: &str,
-    positional: &[String],
-    named: &HashMap<String, String>,
-) -> String {
-    let mut out = String::with_capacity(sql.len() + 32);
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while i < bytes.len() {
-        if in_line_comment {
-            out.push(bytes[i] as char);
-            if bytes[i] == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_block_comment {
-            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                out.push('*');
-                out.push('/');
-                in_block_comment = false;
-                i += 2;
-            } else {
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-            continue;
-        }
-        if in_single {
-            out.push(bytes[i] as char);
-            if bytes[i] == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    out.push('\'');
-                    i += 2;
-                } else {
-                    in_single = false;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if in_double {
-            out.push(bytes[i] as char);
-            if bytes[i] == b'"' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    out.push('"');
-                    i += 2;
-                } else {
-                    in_double = false;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            out.push('-');
-            out.push('-');
-            in_line_comment = true;
-            i += 2;
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            out.push('/');
-            out.push('*');
-            in_block_comment = true;
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'\'' {
-            out.push('\'');
-            in_single = true;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'"' {
-            out.push('"');
-            in_double = true;
-            i += 1;
-            continue;
-        }
-
-        if bytes[i] == b'$' {
-            let start = i;
-            i += 1;
-            if i < bytes.len() && bytes[i].is_ascii_digit() {
-                let mut idx = 0usize;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    idx = idx * 10 + (bytes[i] - b'0') as usize;
-                    i += 1;
-                }
-                if idx > 0 && idx <= positional.len() {
-                    out.push_str(&positional[idx - 1]);
-                } else {
-                    out.push_str(&sql[start..i]);
-                }
-                continue;
-            }
-            if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-                let ident_start = i;
-                i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let ident = &sql[ident_start..i];
-                if let Some(repl) = named.get(ident) {
-                    out.push_str(repl);
-                } else {
-                    out.push_str(&sql[start..i]);
-                }
-                continue;
-            }
-            out.push('$');
-            continue;
-        }
-
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-
-    out
 }
 
 // ============================================================================
@@ -941,7 +820,7 @@ mod tests {
 
         let result = engine.execute("get_user", &[ProcValue::Int(42)]);
         match result {
-            ProcResult::Ok(ProcValue::Text(sql)) => {
+            ProcResult::SqlBody(sql) => {
                 assert_eq!(sql, "SELECT * FROM users WHERE id = 42");
             }
             _ => panic!("expected substituted SQL"),
@@ -1084,7 +963,7 @@ mod tests {
             &[ProcValue::Int(10), ProcValue::Text("active".into())],
         );
         match result {
-            ProcResult::Ok(ProcValue::Text(sql)) => {
+            ProcResult::SqlBody(sql) => {
                 assert!(sql.contains("user_id = 10"));
                 assert!(sql.contains("status = 'active'"));
             }
@@ -1269,15 +1148,51 @@ mod tests {
     // ── SQL injection prevention tests ──────────────────────────────
 
     #[test]
+    fn builtin_output_is_never_a_sql_body() {
+        // The encoding distinction is structural: builtins return data, only
+        // SQL procedures return SqlBody. The host must never have to sniff.
+        let mut engine = ProcedureEngine::new();
+        let result = engine.execute("coalesce", &[ProcValue::Text("DROP TABLE users".into())]);
+        assert!(
+            matches!(result, ProcResult::Ok(ProcValue::Text(_))),
+            "builtin output must be data, not SqlBody: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sql_body_substitution_is_utf8_safe() {
+        // Multi-byte characters in the body AND in substituted arguments must
+        // survive byte-exact (the old scanner re-emitted bytes as Latin-1
+        // chars — the WIR-4 family).
+        let mut engine = ProcedureEngine::new();
+        engine.register_sql(
+            "echo",
+            "echo",
+            vec!["v".into()],
+            "SELECT '你好' AS a, $v AS b -- héllo",
+        );
+        match engine.execute("echo", &[ProcValue::Text("Zoë".into())]) {
+            ProcResult::SqlBody(sql) => {
+                assert!(sql.contains("你好"), "body literal mangled: {sql:?}");
+                assert!(sql.contains("'Zoë'"), "argument mangled: {sql:?}");
+                assert!(sql.contains("héllo"), "comment mangled: {sql:?}");
+            }
+            _ => panic!("expected SqlBody"),
+        }
+    }
+
+    #[test]
     fn sanitize_strips_nul_bytes() {
         let result = sanitize_proc_sql_text("hello\0world");
         assert_eq!(result, "helloworld");
     }
 
     #[test]
-    fn sanitize_doubles_backslashes() {
+    fn sanitize_preserves_backslashes() {
+        // PostgreSqlDialect is standard-conforming: a backslash inside '...'
+        // is a literal character and must NOT be doubled.
         let result = sanitize_proc_sql_text("path\\to\\file");
-        assert_eq!(result, "path\\\\to\\\\file");
+        assert_eq!(result, "path\\to\\file");
     }
 
     #[test]
@@ -1296,10 +1211,11 @@ mod tests {
 
     #[test]
     fn sanitize_combined_attack() {
-        // Attempt: break out of a string literal using backslash + quote
+        // Attempt: break out of a string literal using backslash + quote.
+        // The backslash is a literal character (standard-conforming dialect);
+        // the doubled quote alone prevents the breakout.
         let result = sanitize_proc_sql_text("value\\'; DROP TABLE users; --");
-        assert_eq!(result, "value\\\\''; DROP TABLE users; --");
-        // The doubled backslash and doubled quote prevent breakout
+        assert_eq!(result, "value\\''; DROP TABLE users; --");
     }
 
     #[test]
@@ -1316,7 +1232,7 @@ mod tests {
             &[ProcValue::Text("'; DROP TABLE users; --".into())],
         );
         match result {
-            ProcResult::Ok(ProcValue::Text(sql)) => {
+            ProcResult::SqlBody(sql) => {
                 // The injected single quote must be doubled, preventing
                 // breakout from the string literal.
                 assert!(sql.contains("''"), "single quote must be escaped");

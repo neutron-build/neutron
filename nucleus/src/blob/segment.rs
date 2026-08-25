@@ -16,7 +16,7 @@
 //! A torn tail (partial record, bad CRC) ends the scan of that segment; for the
 //! newest segment the tail is truncated so appends resume from a clean offset.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -65,6 +65,14 @@ pub struct SegmentStore {
     roll_bytes: u64,
     /// Cached read handles per segment (positioned reads, shared across threads).
     readers: Mutex<HashMap<u32, Arc<File>>>,
+    /// Segments with bytes flushed to the OS but not yet fsynced. Drained by
+    /// [`Self::sync`], which the blob commit boundary calls BEFORE the WAL
+    /// group-sync: the log must never vouch for a manifest whose chunk data
+    /// is still only in the page cache.
+    dirty: Mutex<HashSet<u32>>,
+    /// A new segment file was created since the last successful sync — the
+    /// directory entry itself needs an fsync to survive power loss.
+    dir_dirty: Mutex<bool>,
 }
 
 fn segment_path(dir: &Path, seg: u32) -> PathBuf {
@@ -176,6 +184,8 @@ impl SegmentStore {
             write_off,
             roll_bytes: DEFAULT_SEGMENT_ROLL_BYTES,
             readers: Mutex::new(HashMap::new()),
+            dirty: Mutex::new(HashSet::new()),
+            dir_dirty: Mutex::new(false),
         })
     }
 
@@ -226,6 +236,7 @@ impl SegmentStore {
             let s = self.stats.entry(old.segment).or_default();
             s.dead_bytes += old.record_bytes();
         }
+        self.dirty.lock().insert(self.write_seg);
         Ok(())
     }
 
@@ -238,7 +249,54 @@ impl SegmentStore {
             .append(true)
             .open(segment_path(&self.dir, self.write_seg))?;
         self.writer = BufWriter::new(file);
+        self.dirty.lock().insert(self.write_seg);
+        *self.dir_dirty.lock() = true;
         Ok(())
+    }
+
+    /// Fsync every segment written since the last successful call, plus the
+    /// segments directory when new files appeared. `&self` works because every
+    /// write path ends with `flush` — the BufWriter is empty between calls, so
+    /// `get_ref()` reaches all appended bytes.
+    pub fn sync(&self) -> io::Result<()> {
+        let dirty: Vec<u32> = self.dirty.lock().drain().collect();
+        let dir_dirty = std::mem::take(&mut *self.dir_dirty.lock());
+        let mut first_err: Option<io::Error> = None;
+        for &seg in &dirty {
+            let res = if seg == self.write_seg {
+                self.writer.get_ref().sync_all()
+            } else {
+                // Sealed segments have no live handle; a fresh fd on the same
+                // inode flushes the file's dirty pages (POSIX fsync semantics).
+                OpenOptions::new()
+                    .write(true)
+                    .open(segment_path(&self.dir, seg))
+                    .and_then(|f| f.sync_all())
+            };
+            if let Err(e) = res {
+                first_err.get_or_insert(e);
+                self.dirty.lock().insert(seg); // retry at the next commit
+            }
+        }
+        #[cfg(unix)]
+        if dir_dirty
+            && first_err.is_none()
+            && let Err(e) = File::open(&self.dir).and_then(|d| d.sync_all())
+        {
+            *self.dir_dirty.lock() = true;
+            first_err.get_or_insert(e);
+        }
+        #[cfg(not(unix))]
+        let _ = dir_dirty;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether any segment has bytes not yet fsynced.
+    pub fn is_dirty(&self) -> bool {
+        !self.dirty.lock().is_empty() || *self.dir_dirty.lock()
     }
 
     /// Read a chunk's data, verifying its CRC. Returns `Ok(None)` if the hash
@@ -370,11 +428,19 @@ impl SegmentStore {
                 self.index.insert(hash, entry);
             }
             self.writer.flush()?;
+            // Rewritten copies durable before their source file disappears:
+            // power loss between the delete and this sync would otherwise
+            // lose the chunk entirely. A crash before the delete still leaves
+            // duplicates that the open-time scan deduplicates (last copy
+            // wins) — unchanged.
+            self.dirty.lock().insert(self.write_seg);
+            self.sync()?;
 
             // Drop index entries (all remaining ones are dead) and the file.
             self.index.retain(|_, e| e.segment != victim);
             self.stats.remove(&victim);
             self.readers.lock().remove(&victim);
+            self.dirty.lock().remove(&victim);
             let path = segment_path(&self.dir, victim);
             if let Err(e) = std::fs::remove_file(&path) {
                 eprintln!("blob segments: failed to remove compacted {path:?}: {e}");
@@ -598,5 +664,59 @@ mod tests {
         drop(store);
         let store = SegmentStore::open(dir.path()).unwrap();
         assert_eq!(store.read(&h).unwrap().unwrap(), Vec::<u8>::new());
+    }
+
+    /// BLO-1 dirty-state machine: an append leaves the segment dirty until an
+    /// explicit sync fsyncs it, and a sync with nothing pending is clean.
+    #[test]
+    fn append_marks_dirty_sync_cleans() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SegmentStore::open(dir.path()).unwrap();
+        assert!(!store.is_dirty(), "a freshly opened store is clean");
+        put(&mut store, b"some bytes");
+        assert!(
+            store.is_dirty(),
+            "an appended chunk is flushed to the OS but not yet fsynced"
+        );
+        store.sync().unwrap();
+        assert!(!store.is_dirty(), "sync drains the dirty set");
+        // A redundant sync stays clean and errors nowhere.
+        store.sync().unwrap();
+        assert!(!store.is_dirty());
+    }
+
+    /// BLO-1 compaction half: compaction must leave the store clean (the
+    /// rewritten copies are synced BEFORE the victim file is deleted — power
+    /// loss in between loses the chunk entirely) and the survivors readable.
+    #[test]
+    fn compact_syncs_rewrites_and_leaves_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SegmentStore::open(dir.path()).unwrap();
+        store.set_roll_bytes(256);
+
+        let mut hashes = Vec::new();
+        for i in 0..20u8 {
+            hashes.push(put(&mut store, &[i; 100]));
+        }
+        assert!(store.segment_count() > 1);
+        store.sync().unwrap();
+        assert!(!store.is_dirty());
+
+        for h in &hashes[..16] {
+            store.mark_dead(h);
+        }
+        store.compact().unwrap();
+        assert!(
+            !store.is_dirty(),
+            "compaction syncs its rewrites before deleting the victim files"
+        );
+        assert_eq!(store.dead_bytes(), 0);
+        for (i, h) in hashes.iter().enumerate().skip(16) {
+            assert_eq!(
+                store.read(h).unwrap().unwrap(),
+                vec![i as u8; 100],
+                "rewritten survivor must stay readable"
+            );
+        }
     }
 }

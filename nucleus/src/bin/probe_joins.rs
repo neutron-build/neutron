@@ -212,7 +212,7 @@ fn gen_join_query(
     rows_a: usize,
     rows_b: usize,
 ) -> (String, bool) {
-    match rng.below(12) {
+    match rng.below(14) {
         // ── INNER JOIN (2 tables, multi-predicate ON) ──────────────────────
         0 | 1 => {
             let (aa, ba) = ("a", "b");
@@ -460,6 +460,61 @@ fn gen_join_query(
             }
         }
         // ── JOIN + ORDER BY + LIMIT ────────────────────────────────────────
+        11 => {
+            let (aa, ba) = ("a", "b");
+            let jcol = sa.int_join_col();
+            // Comma join + single-table predicates on BOTH sides: exercises
+            // the AST comma fast paths (index-NL probes), where the left
+            // table's pushdown was once dropped (QPP-3). SQLite is a perfect
+            // oracle for comma joins.
+            (
+                format!(
+                    "SELECT {aa}.id, {ba}.id, {aa}.{jc} FROM {ta} {aa}, {tb} {ba} WHERE {aa}.{jc} = {ba}.{jc} AND {p1} AND {p2} {ob}",
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    jc = jcol,
+                    p1 = gen_pred(rng, aa, sa),
+                    p2 = gen_pred(rng, ba, sb),
+                    ob = det_orderby_two(aa, ba)
+                ),
+                true,
+            )
+        }
+        // ── Comma factors mixed with an explicit JOIN (desugar-declining) ──
+        12 | 13 => {
+            let (aa, ba) = ("a", "b");
+            let jcol = sa.int_join_col();
+            if let Some(sc) = sc {
+                // `c JOIN d` makes desugar_comma_joins decline, so the AST
+                // from[1..] loop runs with a MULTI-TABLE accumulated left —
+                // the exact shape whose index-NL probe once read past the
+                // single-table row width (QPP-2).
+                (
+                    format!(
+                        "SELECT {aa}.id, {ba}.id, c.id, d.id FROM {ta} {aa}, {tb} {ba}, {tc} c JOIN {tb} d ON c.{jc} = d.{jc} WHERE {aa}.{jc} = c.{jc} AND {p} ORDER BY {aa}.id ASC, {ba}.id ASC, c.id ASC, d.id ASC",
+                        ta = sa.tname,
+                        tb = sb.tname,
+                        tc = sc.tname,
+                        jc = jcol,
+                        p = gen_pred(rng, aa, sa)
+                    ),
+                    true,
+                )
+            } else {
+                (
+                    format!(
+                        "SELECT {aa}.id, {ba}.id FROM {ta} {aa}, {tb} {ba} WHERE {aa}.{jc} = {ba}.{jc} AND {p} {ob}",
+                        ta = sa.tname,
+                        tb = sb.tname,
+                        jc = jcol,
+                        p = gen_pred(rng, aa, sa),
+                        ob = det_orderby_two(aa, ba)
+                    ),
+                    true,
+                )
+            }
+        }
+        // ── JOIN + ORDER BY + LIMIT (original arm) ─────────────────────────
         _ => {
             let (aa, ba) = ("a", "b");
             let jcol = sa.int_join_col();
@@ -475,8 +530,6 @@ fn gen_join_query(
                     "SELECT {aa}.id, {ba}.id, {aa}.{jc} FROM {ta} {aa} {kind} {tb} {ba} ON {aa}.{jc} = {ba}.{jc}{w} {ob} LIMIT {limit}",
                     ta = sa.tname,
                     tb = sb.tname,
-                    aa = aa,
-                    ba = ba,
                     jc = jcol,
                     ob = det_orderby_two(aa, ba)
                 ),
@@ -700,6 +753,36 @@ fn main_impl() {
         if !ok {
             continue 'outer;
         }
+
+        // Secondary indexes on the join column. The comma-join index-NL
+        // fast paths only engage when the probed column is indexed — without
+        // these, every generated query exercised table scans and the index
+        // paths (QPP-2/QPP-3) were invisible to this probe.
+        let mut index_stmts = vec![
+            format!(
+                "CREATE INDEX ix_ta_j ON {} ({})",
+                sa.tname,
+                sa.int_join_col()
+            ),
+            format!(
+                "CREATE INDEX ix_tb_j ON {} ({})",
+                sb.tname,
+                sb.int_join_col()
+            ),
+        ];
+        if let Some(sc) = &sc_opt {
+            index_stmts.push(format!(
+                "CREATE INDEX ix_tc_j ON {} ({})",
+                sc.tname,
+                sc.int_join_col()
+            ));
+        }
+        for stmt in &index_stmts {
+            if exec_nucleus(&ex, stmt).is_err() || sqlite.execute_batch(stmt).is_err() {
+                continue 'outer;
+            }
+        }
+        let setup_stmts = [setup_stmts, index_stmts].concat();
 
         // ── Query loop ─────────────────────────────────────────────────────
         for _ in 0..queries_per {

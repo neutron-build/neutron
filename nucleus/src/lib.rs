@@ -21,6 +21,7 @@ pub mod fault;
 pub mod fts;
 pub mod geo;
 pub mod graph;
+pub mod import_export;
 pub mod inference;
 pub mod kv;
 pub mod memory;

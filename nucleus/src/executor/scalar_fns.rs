@@ -73,7 +73,7 @@ impl Executor {
         self.kv_store.collections().key_memory_bytes(key)
     }
 
-    /// Drain the write-failure flag from both KV logs.
+    /// Drain the write-failure flag from both KV logs and the cold tier.
     #[cfg(feature = "server")]
     fn kv_write_failed(&self) -> bool {
         let strings = self
@@ -86,7 +86,8 @@ impl Executor {
             .collections_wal()
             .map(|w| w.take_write_error())
             .unwrap_or(false);
-        strings || collections
+        let cold = self.kv_store.take_cold_write_error();
+        strings || collections || cold
     }
 
     fn eval_scalar_fn_inner(
@@ -693,18 +694,23 @@ impl Executor {
                         Ok(Value::Float64((n * factor).round() / factor))
                     }
                     // NUMERIC round is EXACT and half-away-from-zero (PG),
-                    // supporting an optional scale. round(2.5)=3, round(-2.5)=-3.
-                    Value::Numeric(t) => crate::types::parse_numeric(t)
-                        .map(|d| {
-                            Value::Numeric(
-                                d.round_dp_with_strategy(
-                                    decimals.max(0) as u32,
-                                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-                                )
-                                .to_string(),
-                            )
-                        })
-                        .map_err(ExecError::Runtime),
+                    // supporting negative scale.
+                    Value::Numeric(t) => {
+                        let d = crate::types::parse_numeric(t).map_err(ExecError::Runtime)?;
+                        Ok(Value::Numeric(
+                            round_decimal_scaled(d, decimals)?.to_string(),
+                        ))
+                    }
+                    // PG rounds integers by scale too: round(123, -1) = 120.
+                    // Non-negative scale is a no-op — keep the input type.
+                    Value::Int32(n) if decimals < 0 => Ok(Value::Numeric(
+                        round_decimal_scaled(rust_decimal::Decimal::from(*n), decimals)?
+                            .to_string(),
+                    )),
+                    Value::Int64(n) if decimals < 0 => Ok(Value::Numeric(
+                        round_decimal_scaled(rust_decimal::Decimal::from(*n), decimals)?
+                            .to_string(),
+                    )),
                     Value::Int32(_) | Value::Int64(_) => Ok(args[0].clone()),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("ROUND requires numeric".into())),
@@ -1421,7 +1427,15 @@ impl Executor {
             }
             "MAKE_DATE" => {
                 require_args(fname, &args, 3)?;
-                let y = value_to_i64(&args[0])? as i32;
+                // Validate on the i64 BEFORE the i32 cast — the cast used to
+                // truncate silently and ymd_to_days has no year guard.
+                let year = value_to_i64(&args[0])?;
+                if !(crate::types::MIN_DATE_YEAR as i64..=crate::types::MAX_DATE_YEAR as i64)
+                    .contains(&year)
+                {
+                    return Err(ExecError::Runtime("date field value out of range".into()));
+                }
+                let y = year as i32;
                 let m = value_to_i64(&args[1])? as u32;
                 let d = value_to_i64(&args[2])? as u32;
                 Ok(Value::Date(crate::types::ymd_to_days(y, m, d)))
@@ -2100,10 +2114,22 @@ impl Executor {
                 let seqs = self.sequences.read();
                 if let Some(seq_mutex) = seqs.get(&seq_name) {
                     let mut seq = seq_mutex.lock();
-                    seq.current += seq.increment;
-                    if seq.current > seq.max_value {
+                    // checked_add: past i64::MAX the old unchecked `+=` handed
+                    // out i64::MIN (release) or panicked (debug).
+                    let next = seq.current.checked_add(seq.increment).ok_or_else(|| {
+                        ExecError::Unsupported(format!("sequence {seq_name} reached max value"))
+                    })?;
+                    seq.current = next;
+                    if seq.increment > 0 && seq.current > seq.max_value {
                         return Err(ExecError::Unsupported(format!(
                             "sequence {seq_name} reached max value"
+                        )));
+                    }
+                    // Descending sequences burn down to MINVALUE and stop —
+                    // the max check alone let them continue into negatives.
+                    if seq.increment < 0 && seq.current < seq.min_value {
+                        return Err(ExecError::Unsupported(format!(
+                            "sequence {seq_name} reached min value"
                         )));
                     }
                     let val = seq.current;
@@ -3091,8 +3117,8 @@ impl Executor {
                         estimated, key
                     )));
                 }
-                self.cross_model_touch_kv(&key);
-                self.kv_store.set(&key, value, ttl);
+                let xact = self.cross_model_touch_kv(&key);
+                self.kv_store.set_xact(&key, value, ttl, xact);
                 Ok(Value::Text("OK".into()))
             }
             "KV_DEL" => {
@@ -3103,8 +3129,8 @@ impl Executor {
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
                 };
-                self.cross_model_touch_kv(&key);
-                let deleted = self.kv_store.del(&key);
+                let xact = self.cross_model_touch_kv(&key);
+                let deleted = self.kv_store.del_xact(&key, xact);
                 if deleted {
                     self.memory_allocator.lock().release("kv", key.len() + 96);
                 }
@@ -3144,8 +3170,8 @@ impl Executor {
                 } else {
                     1
                 };
-                self.cross_model_touch_kv(&key);
-                match self.kv_store.incr_by(&key, amount) {
+                let xact = self.cross_model_touch_kv(&key);
+                match self.kv_store.incr_by_xact(&key, amount, xact) {
                     Ok(v) => Ok(Value::Int64(v)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
@@ -3167,8 +3193,8 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let ttl = val_to_u64(&args[1], "KV_EXPIRE ttl")?;
-                self.cross_model_touch_kv(&key);
-                Ok(Value::Bool(self.kv_store.expire(&key, ttl)))
+                let xact = self.cross_model_touch_kv(&key);
+                Ok(Value::Bool(self.kv_store.expire_xact(&key, ttl, xact)))
             }
             "KV_SETNX" => {
                 // kv_setnx(key, value) or kv_setnx(key, value, ttl_secs)
@@ -3199,8 +3225,10 @@ impl Executor {
                         estimated
                     )));
                 }
-                self.cross_model_touch_kv(&key);
-                let was_set = self.kv_store.setnx_ttl(&key, args[1].clone(), ttl);
+                let xact = self.cross_model_touch_kv(&key);
+                let was_set = self
+                    .kv_store
+                    .setnx_ttl_xact(&key, args[1].clone(), ttl, xact);
                 if !was_set {
                     // Key already existed, release the reservation
                     self.memory_allocator.lock().release("kv", estimated);
@@ -3216,8 +3244,8 @@ impl Executor {
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
                 };
-                self.cross_model_touch_kv(&key);
-                let deleted = self.kv_store.cdel(&key, &args[1]);
+                let xact = self.cross_model_touch_kv(&key);
+                let deleted = self.kv_store.cdel_xact(&key, &args[1], xact);
                 if deleted {
                     self.memory_allocator.lock().release("kv", key.len() + 96);
                 }
@@ -3234,8 +3262,10 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let ttl = val_to_u64(&args[2], "KV_CEXPIRE ttl")?;
-                self.cross_model_touch_kv(&key);
-                Ok(Value::Bool(self.kv_store.cexpire(&key, &args[1], ttl)))
+                let xact = self.cross_model_touch_kv(&key);
+                Ok(Value::Bool(
+                    self.kv_store.cexpire_xact(&key, &args[1], ttl, xact),
+                ))
             }
             "KV_DBSIZE" => {
                 // kv_dbsize() → count of non-expired keys
@@ -3883,10 +3913,29 @@ impl Executor {
                     fields.push((field, value));
                     i += 2;
                 }
+                // A repeated field name is a client error, not silent
+                // last-wins (S31-15): on read the duplicate collapses and
+                // the first value is unrecoverable, which is data loss
+                // dressed as syntax. The read side still renders duplicates
+                // deterministically, because entries written before this
+                // check can carry them.
+                {
+                    let mut seen = HashSet::new();
+                    for (field, _) in &fields {
+                        if !seen.insert(field.as_str()) {
+                            return Err(ExecError::Unsupported(format!(
+                                "STREAM_XADD field names must be unique: '{field}' given more \
+                                 than once"
+                            )));
+                        }
+                    }
+                }
                 // Record the before-image before taking the write guard —
                 // an aborted transaction must not leave the appended entry
-                // behind for consumers that already read it.
-                self.cross_model_touch_stream(&stream_name);
+                // behind for consumers that already read it. Returns the
+                // coordinating id the WAL record carries (S63): the txn's
+                // xid inside BEGIN/COMMIT, XACT_AUTOCOMMIT outside.
+                let xact = self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
                 let stream = streams.entry(stream_name.clone()).or_default();
                 let id = stream.xadd(fields.clone());
@@ -3899,7 +3948,7 @@ impl Executor {
                 // agree — an acknowledged write that was never logged is the
                 // defect class this engine keeps finding.
                 if let Some(ref wal) = self.streams_wal
-                    && let Err(e) = wal.log_xadd(&stream_name, &id, &fields)
+                    && let Err(e) = wal.log_xadd(Some(xact), &stream_name, &id, &fields)
                 {
                     // The entry just appended is the last one; `last_id` stays
                     // advanced (ids may skip, which is legal and harmless).
@@ -4011,7 +4060,7 @@ impl Executor {
                         )));
                     }
                 };
-                self.cross_model_touch_stream(&stream_name);
+                let xact = self.cross_model_touch_stream(&stream_name);
                 let start_id = crate::pubsub::StreamEntryId::new(start_ms, 0);
                 let mut streams = self.streams.write();
                 let stream = streams.entry(stream_name.clone()).or_default();
@@ -4036,7 +4085,8 @@ impl Executor {
                 // otherwise the caller is told a group exists that a restart
                 // will not produce.
                 if let Some(ref wal) = self.streams_wal
-                    && let Err(e) = wal.log_xgroup_create(&stream_name, &group, &start_id)
+                    && let Err(e) =
+                        wal.log_xgroup_create(Some(xact), &stream_name, &group, &start_id)
                 {
                     match prior {
                         Some(g) => {
@@ -4084,7 +4134,7 @@ impl Executor {
                 let count = val_to_u64(&args[3], "STREAM_XREADGROUP count")? as usize;
                 // A read that advances the group cursor and records a pending
                 // entry is a write as far as rollback is concerned.
-                self.cross_model_touch_stream(&stream_name);
+                let xact = self.cross_model_touch_stream(&stream_name);
                 let mut streams = self.streams.write();
                 // A read against a group that does not exist must NOT read as
                 // an empty batch (S31-05). Empty is what "caught up" looks
@@ -4106,6 +4156,7 @@ impl Executor {
                     .get_mut(&stream_name)
                     .expect("stream presence checked above");
                 let was_known = stream.groups[&group].consumers.contains(&consumer);
+                let prev_last = stream.groups[&group].last_delivered_id.clone();
                 let entries = stream.xreadgroup(&group, &consumer, count);
                 let delivered: Vec<crate::pubsub::StreamEntryId> =
                     entries.iter().map(|e| e.id.clone()).collect();
@@ -4113,12 +4164,53 @@ impl Executor {
                 // Log the cursor advance and the pending-list additions. An
                 // idle poll that delivers nothing and registers no new consumer
                 // changes no state, so it is not logged — otherwise a polling
-                // consumer would grow the log without bound.
+                // consumer would grow the log without bound. A failure to log
+                // fails the statement (S31-13, the one arm that still
+                // discarded it): the client would otherwise be told a cursor
+                // advanced that a restart will not reproduce, which
+                // redelivers — or silently skips — everything after it.
                 if !delivered.is_empty() || !was_known {
                     let last = stream.groups[&group].last_delivered_id.clone();
-                    if let Some(ref wal) = self.streams_wal {
-                        let _ =
-                            wal.log_xreadgroup(&stream_name, &group, &consumer, &last, &delivered);
+                    if let Some(ref wal) = self.streams_wal
+                        && let Err(e) = wal.log_xreadgroup(
+                            Some(xact),
+                            &stream_name,
+                            &group,
+                            &consumer,
+                            &last,
+                            &delivered,
+                        )
+                    {
+                        // Undo the in-memory delivery so the statement's
+                        // effects and its durable record agree.
+                        if let Some(g) = stream.groups.get_mut(&group) {
+                            g.last_delivered_id = prev_last;
+                            if was_known {
+                                if let Some(pel) = g.pending.get_mut(&consumer) {
+                                    pel.retain(|id| !delivered.contains(id));
+                                }
+                            } else {
+                                g.consumers.remove(&consumer);
+                                g.pending.remove(&consumer);
+                            }
+                        }
+                        tracing::error!(
+                            stream = %stream_name,
+                            group = %group,
+                            consumer = %consumer,
+                            error = %e,
+                            "STREAM_XREADGROUP failed to write its WAL record; rejecting the read"
+                        );
+                        return Err(match e.kind() {
+                            std::io::ErrorKind::StorageFull => ExecError::DiskFull(format!(
+                                "STREAM_XREADGROUP could not log the delivery from '{group}' on \
+                                 stream '{stream_name}': {e}"
+                            )),
+                            _ => ExecError::Storage(crate::storage::StorageError::Io(format!(
+                                "STREAM_XREADGROUP could not log the delivery from '{group}' on \
+                                 stream '{stream_name}': {e}"
+                            ))),
+                        });
                     }
                 }
                 Ok(Value::Text(json))
@@ -4181,22 +4273,62 @@ impl Executor {
                         ),
                     }
                 };
-                self.cross_model_touch_stream(&stream_name);
+                let xact = self.cross_model_touch_stream(&stream_name);
                 let id = crate::pubsub::StreamEntryId::new(id_ms, id_seq);
                 let mut streams = self.streams.write();
                 match streams.get_mut(&stream_name) {
                     Some(stream) => {
-                        let acked = stream.xack(&group, std::slice::from_ref(&id));
-                        // Only a removal changes the pending list; an ack of an
-                        // id that was not pending is a no-op and stays out of
-                        // the log. Without this record a restart would restore
-                        // an entry to the PEL that a consumer had already
-                        // acknowledged.
-                        if acked > 0
+                        // Collect the PEL owners BEFORE logging or removing
+                        // (S31-15): the ack record must name whose pending
+                        // lists held the entry, and the removal itself is
+                        // what destroys that fact. Only a removal changes
+                        // the pending list; an ack of an id that is not
+                        // pending is a no-op and stays out of the log —
+                        // without the record a restart would restore to the
+                        // PEL an entry a consumer had already acknowledged.
+                        let owners: Vec<(String, Vec<crate::pubsub::StreamEntryId>)> = stream
+                            .groups
+                            .get(&group)
+                            .map(|g| {
+                                g.pending
+                                    .iter()
+                                    .filter(|(_, pel)| pel.contains(&id))
+                                    .map(|(consumer, _)| {
+                                        (consumer.clone(), std::slice::from_ref(&id).to_vec())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        // Log before removing: on an append failure the
+                        // statement fails and the PEL is untouched, because
+                        // nothing has happened to undo yet. Acknowledging an
+                        // ack no restart will reproduce is the same defect
+                        // class S31-13 fixed for XADD/XGROUP_CREATE/
+                        // XREADGROUP — this was the last arm to swallow it.
+                        if !owners.is_empty()
                             && let Some(ref wal) = self.streams_wal
+                            && let Err(e) =
+                                wal.log_xack_owned(Some(xact), &stream_name, &group, &owners)
                         {
-                            let _ = wal.log_xack(&stream_name, &group, std::slice::from_ref(&id));
+                            tracing::error!(
+                                stream = %stream_name,
+                                group = %group,
+                                id = %id,
+                                error = %e,
+                                "STREAM_XACK failed to write its WAL record; rejecting the ack"
+                            );
+                            return Err(match e.kind() {
+                                std::io::ErrorKind::StorageFull => ExecError::DiskFull(format!(
+                                    "STREAM_XACK could not log the ack of {id} for group \
+                                     '{group}' on stream '{stream_name}': {e}"
+                                )),
+                                _ => ExecError::Storage(crate::storage::StorageError::Io(format!(
+                                    "STREAM_XACK could not log the ack of {id} for group \
+                                     '{group}' on stream '{stream_name}': {e}"
+                                ))),
+                            });
                         }
+                        let acked = stream.xack(&group, std::slice::from_ref(&id));
                         Ok(Value::Int64(acked as i64))
                     }
                     None => Ok(Value::Int64(0)),
@@ -6093,11 +6225,8 @@ impl Executor {
                         "pii_detect requires (column_name, sample...)".into(),
                     ));
                 }
-                let col_name = args[0].to_string().replace('\'', "");
-                let samples: Vec<String> = args[1..]
-                    .iter()
-                    .map(|v| v.to_string().replace('\'', ""))
-                    .collect();
+                let col_name = compliance_text_arg(&args[0]);
+                let samples: Vec<String> = args[1..].iter().map(compliance_text_arg).collect();
                 let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
                 let detector = crate::compliance::PiiDetector::new();
                 let matches = detector.detect(&col_name, &sample_refs);
@@ -6116,8 +6245,8 @@ impl Executor {
                         "pii_detect_category requires (column_name, sample)".into(),
                     ));
                 }
-                let col_name = args[0].to_string().replace('\'', "");
-                let sample = args[1].to_string().replace('\'', "");
+                let col_name = compliance_text_arg(&args[0]);
+                let sample = compliance_text_arg(&args[1]);
                 let detector = crate::compliance::PiiDetector::new();
                 let matches = detector.detect(&col_name, &[sample.as_str()]);
                 let category = matches
@@ -6134,13 +6263,13 @@ impl Executor {
                         "retention_set requires (table, days, ts_col)".into(),
                     ));
                 }
-                let table_name = args[0].to_string().replace('\'', "");
+                let table_name = compliance_text_arg(&args[0]);
                 let days = match &args[1] {
                     Value::Int32(n) => *n as u32,
                     Value::Int64(n) => *n as u32,
                     other => other.to_string().parse::<u32>().unwrap_or(30),
                 };
-                let ts_col = args[2].to_string().replace('\'', "");
+                let ts_col = compliance_text_arg(&args[2]);
                 let now_ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -6193,9 +6322,13 @@ impl Executor {
                         "gdpr_delete_plan requires (table, id_col, id_val)".into(),
                     ));
                 }
-                let table = args[0].to_string().replace('\'', "");
-                let id_col = args[1].to_string().replace('\'', "");
-                let id_val = args[2].to_string().replace('\'', "");
+                // extract_fn_args returns typed Values; Text renders bare, so
+                // the old `.replace('\'', "")` was blind apostrophe-STRIPPING,
+                // not quote-unwrapping — it corrupted any value containing
+                // one, and the plan's automation silently matched nothing.
+                let table = compliance_text_arg(&args[0]);
+                let id_col = compliance_text_arg(&args[1]);
+                let id_val = compliance_text_arg(&args[2]);
                 let cascade = crate::compliance::DeletionCascade::new();
                 let plan = cascade.plan_deletion(&table, &id_col, &id_val);
                 let json = format!(
@@ -6453,6 +6586,10 @@ impl Executor {
                 };
                 if let Some(func_def) = func_def {
                     let args = self.extract_fn_args(func, row, col_meta)?;
+                    // Depth guard: the body is executed as SQL whose
+                    // expressions may invoke this UDF again — unbounded
+                    // recursion used to overflow the stack (PRC-1).
+                    let _depth = self.enter_call()?;
                     let mut positional = Vec::with_capacity(func_def.params.len());
                     let mut named = HashMap::new();
                     // Substitute parameters ($1, $2, ... or named parameters).
@@ -6468,9 +6605,21 @@ impl Executor {
                         }
                     }
                     let body = substitute_sql_placeholders(&func_def.body, &positional, &named);
-                    // Execute the function body as SQL and return the result
-                    let result = sync_block_on(self.execute(&body))?;
-                    match result.first() {
+                    // Execute the function body as SQL and return the result.
+                    // materialize() first: under stream_results=on the body
+                    // yields a SelectStream, which used to fall through to
+                    // NULL (PRC-8).
+                    let result = sync_block_on(async {
+                        let results = self.execute(&body).await?;
+                        let mut first = None;
+                        for r in results {
+                            if first.is_none() {
+                                first = Some(r.materialize().await?);
+                            }
+                        }
+                        Ok::<Option<ExecResult>, ExecError>(first)
+                    })?;
+                    match result {
                         Some(ExecResult::Select { rows, .. }) => {
                             if let Some(first_row) = rows.first() {
                                 Ok(first_row.first().cloned().unwrap_or(Value::Null))
@@ -6592,6 +6741,16 @@ impl Executor {
 ///
 /// `default_seq` is what a bare millisecond means at this call site — the
 /// sequence to fill in when the caller only named a millisecond. `XREAD`'s
+/// Text argument for the compliance functions: the extracted Values are
+/// typed, so a Text is taken verbatim (apostrophes intact) — the old
+/// `.replace('\'', "")` stripped legitimate apostrophes out of every value.
+fn compliance_text_arg(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// cursor and `XRANGE`'s end bound take `u64::MAX` (after / through the whole
 /// millisecond); `XRANGE`'s start bound takes 0 (from its beginning).
 ///
@@ -6627,6 +6786,12 @@ fn stream_entries_to_json(entries: &[&crate::pubsub::StreamEntry]) -> String {
     let items: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
+            // A JSON object cannot carry duplicate keys, so entries whose
+            // XADD repeated a field name collapse DETERMINISTICALLY
+            // last-wins here, while the RESP render (`encode_stream_entries`,
+            // a flat array) preserves both pairs like Redis. The write side
+            // rejects new duplicates (S31-15); this collapse only serves
+            // entries written before that check existed.
             let fields: serde_json::Map<String, serde_json::Value> = e
                 .fields
                 .iter()
@@ -7045,7 +7210,7 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
 /// 1-based character index of `needle` in `haystack`, or 0 if absent — the
 /// POSITION/strpos return contract. Byte `find` then converted to a char
 /// index so multibyte text reports character positions like PostgreSQL.
-fn char_index_of(haystack: &str, needle: &str) -> i32 {
+pub(super) fn char_index_of(haystack: &str, needle: &str) -> i32 {
     if needle.is_empty() {
         return 1;
     }
@@ -7053,4 +7218,39 @@ fn char_index_of(haystack: &str, needle: &str) -> i32 {
         Some(byte_idx) => (haystack[..byte_idx].chars().count() + 1) as i32,
         None => 0,
     }
+}
+
+/// ROUND a Decimal to `dp` decimal places, supporting NEGATIVE scale
+/// (PG: round(123, -1) = 120). `round_dp_with_strategy` takes u32, so
+/// negative scales are computed as divide -> round at 0 dp -> multiply.
+fn round_decimal_scaled(
+    d: rust_decimal::Decimal,
+    dp: i32,
+) -> Result<rust_decimal::Decimal, ExecError> {
+    if dp >= 0 {
+        return Ok(d.round_dp_with_strategy(
+            dp as u32,
+            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+        ));
+    }
+    let exp = -(dp as i64);
+    // 10^28 is the largest power of ten a Decimal mantissa (< 7.9e28) holds;
+    // from 10^29 on, checked_mul would error — but every representable value
+    // rounds to 0 at that scale (PG returns 0), so short-circuit there.
+    if exp > 28 {
+        return Ok(rust_decimal::Decimal::ZERO);
+    }
+    let mut scale = rust_decimal::Decimal::ONE;
+    for _ in 0..exp {
+        scale = scale
+            .checked_mul(rust_decimal::Decimal::from(10u64))
+            .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+    }
+    let scaled = d
+        .checked_div(scale)
+        .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+    scaled
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        .checked_mul(scale)
+        .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))
 }

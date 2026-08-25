@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 #[cfg(feature = "server")]
 use crate::storage::kv_wal::{KvWal, KvWalOp};
 use crate::types::Value;
@@ -149,6 +150,22 @@ fn default_max_hot_bytes() -> usize {
         .saturating_mul(1024 * 1024)
 }
 
+/// Remove every entry of `dir` (files and subdirectories), keeping the
+/// directory itself. Used by FLUSHDB so the cold tier's on-disk state
+/// matches the just-cleared memory.
+fn clear_dir_contents(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 pub struct KvStore {
     data: ShardedMap,
     #[cfg(feature = "server")]
@@ -156,6 +173,18 @@ pub struct KvStore {
     collections: collections::ShardedCollections,
     /// Cold tier: disk-backed LsmTree for overflow entries (disk mode only).
     cold: Option<parking_lot::Mutex<crate::storage::lsm::LsmTree>>,
+    /// Directory of the disk-backed cold tier (disk mode only). FLUSHDB
+    /// needs it to empty and reopen the same directory — swapping in an
+    /// in-memory tree leaves the old SSTables on disk, and `open` reloads
+    /// them on the next restart.
+    cold_dir: Option<std::path::PathBuf>,
+    /// A write to the cold tier failed since the last time anyone asked.
+    ///
+    /// Eviction has no error channel of its own (`evict_to` runs inside
+    /// `set`), so a cold spill whose SSTable write failed latches here and
+    /// is drained through the same `-MISCONF` channel WAL-append failures
+    /// use — the reply must not claim a durability the cold tier lacks.
+    cold_write_error: std::sync::atomic::AtomicBool,
     /// Maximum entries in the hot (in-memory) tier before eviction to cold.
     max_hot_entries: usize,
     /// Maximum bytes in the hot tier before eviction to cold.
@@ -187,6 +216,8 @@ impl KvStore {
             wal: None,
             collections: collections::ShardedCollections::new(),
             cold: None,
+            cold_dir: None,
+            cold_write_error: std::sync::atomic::AtomicBool::new(false),
             max_hot_entries: 100_000,
             max_hot_bytes: default_max_hot_bytes(),
             global_version: std::sync::atomic::AtomicU64::new(0),
@@ -198,9 +229,27 @@ impl KvStore {
     ///
     /// If the WAL files don't exist a fresh store is returned. Corrupt
     /// trailing bytes are silently skipped (best-effort recovery).
+    ///
+    /// Replays with an EMPTY committed set, so every tagged record keeps —
+    /// the pre-S63 contract. The executor opens through
+    /// [`KvStore::open_with_committed`] instead, passing the coordinating
+    /// transaction ids the SQL side durably committed so the S63 replay
+    /// filter can discard the rest.
     #[cfg(feature = "server")]
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        let (wal, state) = KvWal::open(dir)?;
+        Self::open_with_committed(dir, &std::collections::HashSet::new())
+    }
+
+    /// Open a WAL-backed KV store whose `kv.wal` replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
+    #[cfg(feature = "server")]
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &std::collections::HashSet<u64>,
+    ) -> std::io::Result<Self> {
+        let (wal, state) = KvWal::open(dir, committed)?;
         let sharded = ShardedMap::new();
         let now_epoch_ms = epoch_ms_now();
         for (key, value, ttl_abs_ms) in state.items {
@@ -252,6 +301,17 @@ impl KvStore {
         std::fs::create_dir_all(&cold_dir).ok();
         let config = crate::storage::lsm::LsmConfig::default();
         let cold = crate::storage::lsm::LsmTree::open(config, &cold_dir)
+            .map_err(|e| {
+                // A store that opens without its cold tier has silently lost
+                // cold durability: every previously evicted key is gone from
+                // the moment this `.ok()` used to swallow the error.
+                tracing::error!(
+                    "KV: failed to open cold tier at {}: {e} — evicted keys \
+                     are not durable until this is fixed",
+                    cold_dir.display()
+                );
+                e
+            })
             .ok()
             .map(parking_lot::Mutex::new);
 
@@ -260,6 +320,8 @@ impl KvStore {
             wal: Some(Arc::new(wal)),
             collections: col_state,
             cold,
+            cold_dir: Some(cold_dir),
+            cold_write_error: std::sync::atomic::AtomicBool::new(false),
             max_hot_entries: 100_000,
             max_hot_bytes: default_max_hot_bytes(),
             global_version: std::sync::atomic::AtomicU64::new(0),
@@ -334,6 +396,15 @@ impl KvStore {
 
     /// SET — store a value with optional TTL in seconds.
     pub fn set(&self, key: &str, value: Value, ttl_secs: Option<u64>) {
+        self.set_xact(key, value, ttl_secs, XACT_AUTOCOMMIT);
+    }
+
+    /// SET carrying the coordinating transaction id (S63): the WAL record is
+    /// tagged with `xact`, so replay discards it when its transaction never
+    /// committed. `XACT_AUTOCOMMIT` marks a write outside any explicit
+    /// transaction, whose durability point is this log's own fsync.
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    pub fn set_xact(&self, key: &str, value: Value, ttl_secs: Option<u64>, xact: u64) {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             // One record carrying the value AND the expiry decided with it.
@@ -343,7 +414,9 @@ impl KvStore {
             // is equally load-bearing: it clears an expiry the key already had,
             // which is what the in-memory write below does, and what a bare
             // `ENTRY_SET` record would NOT have done on replay.
-            if let Err(e) = wal.log_set_with_expiry(key, &value, ttl_secs.map(abs_expiry_ms)) {
+            if let Err(e) =
+                wal.log_set_with_expiry(Some(xact), key, &value, ttl_secs.map(abs_expiry_ms))
+            {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
         }
@@ -379,9 +452,16 @@ impl KvStore {
 
     /// DEL — remove a key. Returns true if the key existed (in hot or cold tier).
     pub fn del(&self, key: &str) -> bool {
+        self.del_xact(key, XACT_AUTOCOMMIT)
+    }
+
+    /// DEL carrying the coordinating transaction id (S63); see
+    /// [`KvStore::set_xact`].
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    pub fn del_xact(&self, key: &str, xact: u64) -> bool {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_delete(key)
+            && let Err(e) = wal.log_delete(Some(xact), key)
         {
             tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
         }
@@ -422,13 +502,36 @@ impl KvStore {
 
     /// INCRBY — increment an integer value by a given amount.
     pub fn incr_by(&self, key: &str, amount: i64) -> Result<i64, KvError> {
+        self.incr_by_xact(key, amount, XACT_AUTOCOMMIT)
+    }
+
+    /// INCRBY carrying the coordinating transaction id (S63); see
+    /// [`KvStore::set_xact`].
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    pub fn incr_by_xact(&self, key: &str, amount: i64, xact: u64) -> Result<i64, KvError> {
         let shard = self.data.shard(key);
         let mut data = shard.data.write();
         let entry = data.get(key);
 
+        // An expired-but-uncollected key must be treated exactly like an
+        // absent one for BOTH the value and the deadline: Redis deletes it on
+        // touch, so the incremented value is a NEW key with no TTL. Keeping
+        // the old deadline made it born expired (`SET ctr 5 EX 1` -> wait ->
+        // `INCR ctr` answers 1, GET is nil forever, WAL replays to the same
+        // lost state).
+        let expired = entry.is_some_and(|e| e.is_expired());
+        if expired {
+            // Drop the dead key's expiry-index entry; the sweep would
+            // otherwise keep it (its double-check no longer sees an expired
+            // value).
+            if let Some(exp) = entry.and_then(|e| e.expires_at) {
+                shard.remove_expiry(key, exp);
+            }
+        }
+
         let current = match entry {
             None => 0,
-            Some(e) if e.is_expired() => 0,
+            Some(e) if e.is_expired() => 0, // fresh key: inherits nothing
             Some(e) => match e.value.as_ref() {
                 Value::Int32(n) => *n as i64,
                 Value::Int64(n) => *n,
@@ -443,11 +546,20 @@ impl KvStore {
         // checked_add: Redis returns an error rather than wrapping/panicking when
         // an INCR/INCRBY would exceed i64 range.
         let new_val = current.checked_add(amount).ok_or(KvError::Overflow)?;
-        let ttl = entry.and_then(|e| e.expires_at);
+        let ttl = if expired {
+            None
+        } else {
+            entry.and_then(|e| e.expires_at)
+        };
 
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_set(key, &Value::Int64(new_val))
+            && let Err(e) = wal.log_set_with_expiry(
+                Some(xact),
+                key,
+                &Value::Int64(new_val),
+                ttl.map(instant_to_epoch_ms),
+            )
         {
             tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
         }
@@ -466,6 +578,13 @@ impl KvStore {
 
     /// EXPIRE — set a TTL on an existing key. Returns false if key doesn't exist.
     pub fn expire(&self, key: &str, ttl_secs: u64) -> bool {
+        self.expire_xact(key, ttl_secs, XACT_AUTOCOMMIT)
+    }
+
+    /// EXPIRE carrying the coordinating transaction id (S63); see
+    /// [`KvStore::set_xact`].
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    pub fn expire_xact(&self, key: &str, ttl_secs: u64, xact: u64) -> bool {
         let shard = self.data.shard(key);
         let mut data = shard.data.write();
         if let Some(entry) = data.get_mut(key) {
@@ -488,7 +607,7 @@ impl KvStore {
                 // log, or a restart resurrects the expiry this branch dropped.
                 #[cfg(feature = "server")]
                 if let Some(ref wal) = self.wal
-                    && let Err(e) = wal.log_set_with_expiry(key, &entry.value, None)
+                    && let Err(e) = wal.log_set_with_expiry(Some(xact), key, &entry.value, None)
                 {
                     tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
                 }
@@ -498,7 +617,7 @@ impl KvStore {
             };
             #[cfg(feature = "server")]
             if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_expire(key, abs_expiry_ms(ttl_secs))
+                && let Err(e) = wal.log_expire(Some(xact), key, abs_expiry_ms(ttl_secs))
             {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
@@ -533,7 +652,8 @@ impl KvStore {
             // record, so re-log the value with an explicit `None` expiry.
             #[cfg(feature = "server")]
             if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_set_with_expiry(key, &entry.value, None)
+                && let Err(e) =
+                    wal.log_set_with_expiry(Some(XACT_AUTOCOMMIT), key, &entry.value, None)
             {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
@@ -608,10 +728,54 @@ impl KvStore {
             shard.data.write().clear();
             shard.expiry_index.write().clear();
         }
-        // Clear cold tier by replacing with a fresh LsmTree
+        // Clear cold tier by emptying the directory and reopening a
+        // DISK-BACKED tree over it. `LsmTree::new` (disk_dir: None) leaves
+        // every old .sst in place — KvStore::open reloads them on restart
+        // and FLUSHDB'd keys resurrect — and makes later evictions
+        // non-durable. Best-effort, like the WAL checkpoint above: on
+        // failure we still serve an empty (in-memory) tree, loudly.
         if let Some(ref cold) = self.cold {
-            let config = crate::storage::lsm::LsmConfig::default();
-            *cold.lock() = crate::storage::lsm::LsmTree::new(config);
+            let replacement = match self.cold_dir.as_deref() {
+                Some(dir) => match clear_dir_contents(dir) {
+                    Ok(()) => {
+                        // Crash-right-after-FLUSHDB must not resurrect
+                        // unlinked `.sst`s on ext4-style filesystems.
+                        if let Ok(d) = std::fs::File::open(dir) {
+                            let _ = d.sync_all();
+                        }
+                        crate::storage::lsm::LsmTree::open(
+                            crate::storage::lsm::LsmConfig::default(),
+                            dir,
+                        )
+                        .map_err(|e| {
+                            tracing::error!(
+                                target: "nucleus::kv",
+                                "FLUSHDB: cleared but could not reopen cold tier at {}: {e}",
+                                dir.display()
+                            );
+                            e
+                        })
+                        .unwrap_or_else(|_| {
+                            crate::storage::lsm::LsmTree::new(
+                                crate::storage::lsm::LsmConfig::default(),
+                            )
+                        })
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "nucleus::kv",
+                            "FLUSHDB: could not clear cold dir {}: {e} — deleted keys may \
+                             resurrect on restart",
+                            dir.display()
+                        );
+                        crate::storage::lsm::LsmTree::new(crate::storage::lsm::LsmConfig::default())
+                    }
+                },
+                None => {
+                    crate::storage::lsm::LsmTree::new(crate::storage::lsm::LsmConfig::default())
+                }
+            };
+            *cold.lock() = replacement;
         }
         // Collections: clear memory first, then snapshot the (now empty) state
         // so replay cannot resurrect what FLUSHDB just removed.
@@ -705,7 +869,7 @@ impl KvStore {
                 .iter()
                 .map(|(key, value)| (KvWalOp::SetExact, *key, Some(value), None))
                 .collect();
-            if let Err(e) = wal.log_batch(&batch) {
+            if let Err(e) = wal.log_batch(Some(XACT_AUTOCOMMIT), &batch) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
         }
@@ -739,6 +903,19 @@ impl KvStore {
     /// who holds what, and replay then produced a lock with no expiry — held
     /// forever by a process that no longer exists.
     pub fn setnx_ttl(&self, key: &str, value: Value, ttl_secs: Option<u64>) -> bool {
+        self.setnx_ttl_xact(key, value, ttl_secs, XACT_AUTOCOMMIT)
+    }
+
+    /// SETNX with the coordinating transaction id (S63); see
+    /// [`KvStore::set_xact`].
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    pub fn setnx_ttl_xact(
+        &self,
+        key: &str,
+        value: Value,
+        ttl_secs: Option<u64>,
+        xact: u64,
+    ) -> bool {
         let shard = self.data.shard(key);
         let mut data = shard.data.write();
         if let Some(entry) = data.get(key) {
@@ -752,7 +929,8 @@ impl KvStore {
         }
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_set_with_expiry(key, &value, ttl_secs.map(abs_expiry_ms))
+            && let Err(e) =
+                wal.log_set_with_expiry(Some(xact), key, &value, ttl_secs.map(abs_expiry_ms))
         {
             tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
         }
@@ -783,6 +961,13 @@ impl KvStore {
     /// cold tier so a stale copy cannot resurrect. TTL'd keys (locks) never
     /// evict to cold, so lock usage always takes the atomic hot path.
     pub fn cdel(&self, key: &str, expected: &Value) -> bool {
+        self.cdel_xact(key, expected, XACT_AUTOCOMMIT)
+    }
+
+    /// CDEL carrying the coordinating transaction id (S63); see
+    /// [`KvStore::set_xact`].
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    pub fn cdel_xact(&self, key: &str, expected: &Value, xact: u64) -> bool {
         enum Gate {
             Missing,
             Expired(Option<Instant>),
@@ -810,7 +995,7 @@ impl KvStore {
                 Gate::Match(old_exp) => {
                     #[cfg(feature = "server")]
                     if let Some(ref wal) = self.wal
-                        && let Err(e) = wal.log_delete(key)
+                        && let Err(e) = wal.log_delete(Some(xact), key)
                     {
                         tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
                     }
@@ -850,6 +1035,13 @@ impl KvStore {
     /// cannot extend the new holder's lock). Mirrors `expire`'s hot-tier
     /// semantics; TTL'd keys never evict to cold.
     pub fn cexpire(&self, key: &str, expected: &Value, ttl_secs: u64) -> bool {
+        self.cexpire_xact(key, expected, ttl_secs, XACT_AUTOCOMMIT)
+    }
+
+    /// CEXPIRE carrying the coordinating transaction id (S63); see
+    /// [`KvStore::set_xact`].
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    pub fn cexpire_xact(&self, key: &str, expected: &Value, ttl_secs: u64, xact: u64) -> bool {
         let shard = self.data.shard(key);
         let mut data = shard.data.write();
         if let Some(entry) = data.get_mut(key) {
@@ -871,7 +1063,7 @@ impl KvStore {
             let Some(new_exp) = Instant::now().checked_add(Duration::from_secs(ttl_secs)) else {
                 #[cfg(feature = "server")]
                 if let Some(ref wal) = self.wal
-                    && let Err(e) = wal.log_set_with_expiry(key, &entry.value, None)
+                    && let Err(e) = wal.log_set_with_expiry(Some(xact), key, &entry.value, None)
                 {
                     tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
                 }
@@ -881,7 +1073,7 @@ impl KvStore {
             };
             #[cfg(feature = "server")]
             if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_expire(key, abs_expiry_ms(ttl_secs))
+                && let Err(e) = wal.log_expire(Some(xact), key, abs_expiry_ms(ttl_secs))
             {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
@@ -1584,6 +1776,13 @@ impl KvStore {
             freed_bytes = freed_bytes.saturating_add(size);
             evicted += 1;
         }
+        // Surface a RAM-only cold spill through the same -MISCONF channel
+        // WAL-append failures use: a threshold flush inside `cold.put` has
+        // no caller to fail, so it latches on the tree and is drained here.
+        if cold.lock().take_write_error() {
+            self.cold_write_error
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         freed_bytes
     }
 
@@ -1607,6 +1806,14 @@ impl KvStore {
     /// Whether this store has a cold tier (disk mode).
     pub fn has_cold_tier(&self) -> bool {
         self.cold.is_some()
+    }
+
+    /// Take the cold-tier write-failure flag, clearing it. Edge-triggered,
+    /// like the WAL flags: the caller that drains it is the one that must
+    /// report it.
+    pub fn take_cold_write_error(&self) -> bool {
+        self.cold_write_error
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Return the number of non-expired keys in the hot (in-memory) tier only.
@@ -1642,8 +1849,13 @@ impl KvStore {
         // Rare while eviction was keyed on entry count and almost never fired.
         // Making eviction byte-aware made it routine, which is what turned this
         // from theoretical into the ordering that has to hold.
+        //
+        // STO-2: the flush must also SUCCEED before `wal.checkpoint` truncates
+        // — `flush_memtable` fsyncs the SSTable (and rejects a failed write),
+        // so `?` here means the WAL is never truncated past keys whose only
+        // durable copy is still in RAM.
         if let Some(ref cold) = self.cold {
-            cold.lock().flush_memtable();
+            cold.lock().flush_memtable()?;
         }
         let mut items = Vec::new();
         for shard in &self.data.shards {
@@ -1664,6 +1876,18 @@ impl KvStore {
     #[cfg(feature = "server")]
     pub fn wal(&self) -> Option<&Arc<KvWal>> {
         self.wal.as_ref()
+    }
+
+    /// The highest coordinating transaction id this store's `kv.wal`
+    /// recovered (S63) — 0 with no WAL. Seeds the executor's XactId counter
+    /// so a reopened process never mints an id a surviving tagged record
+    /// already carries.
+    pub fn wal_max_xact_id(&self) -> u64 {
+        #[cfg(feature = "server")]
+        if let Some(ref wal) = self.wal {
+            return wal.max_xact_id();
+        }
+        0
     }
 
     /// Access the collections WAL (if any) — the second durable log this store
@@ -1727,11 +1951,26 @@ impl KvStore {
                         // The restored expiry belongs to the restored value:
                         // one record, so a crash mid-rollback cannot resurrect
                         // the pre-transaction value without its TTL.
+                        //
+                        // Tagged XACT_AUTOCOMMIT deliberately (S63): the
+                        // rollback is its own durability point, so its
+                        // compensating records must always keep on replay.
+                        // Double protection by design — the recovery filter
+                        // discards the rolled-back transaction's tagged
+                        // records on its own, so these records only matter
+                        // for a crash between the revert and the next
+                        // checkpoint of a log replayed by an older binary.
+                        // Do not remove until S6 is proven at scale (D4).
                         let abs_ms = entry.expires_at.map(|exp| {
                             let remaining = exp.saturating_duration_since(Instant::now());
                             epoch_ms_now().saturating_add(remaining.as_millis() as u64)
                         });
-                        if let Err(e) = wal.log_set_with_expiry(key, &entry.value, abs_ms) {
+                        if let Err(e) = wal.log_set_with_expiry(
+                            Some(XACT_AUTOCOMMIT),
+                            key,
+                            &entry.value,
+                            abs_ms,
+                        ) {
                             tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
                         }
                     }
@@ -1740,7 +1979,7 @@ impl KvStore {
                 None => {
                     #[cfg(feature = "server")]
                     if let Some(ref wal) = self.wal
-                        && let Err(e) = wal.log_delete(key)
+                        && let Err(e) = wal.log_delete(Some(XACT_AUTOCOMMIT), key)
                     {
                         tracing::error!(target: "nucleus::kv::wal", "rollback WAL write failed: {e}");
                     }
@@ -3532,7 +3771,7 @@ mod tests {
             }
             // Force flush the cold LsmTree to disk
             if let Some(ref cold) = store.cold {
-                cold.lock().force_flush();
+                cold.lock().force_flush().unwrap();
             }
         }
         // Reopen — cold data should survive
@@ -3552,5 +3791,128 @@ mod tests {
             !store.has_cold_tier(),
             "memory mode should have no cold tier"
         );
+    }
+
+    /// STO-2: the WAL must never be truncated past keys whose only durable
+    /// copy is still in RAM. A cold flush that fails (injected here via the
+    /// lsm test fault arm) must fail the checkpoint, leaving the WAL intact;
+    /// once the flush succeeds, the checkpoint may proceed. Witnessed failing
+    /// before the fix (read-only cold dir) with k1 lost on reopen.
+    #[cfg(feature = "server")]
+    #[test]
+    fn checkpoint_refuses_to_truncate_wal_when_cold_flush_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = KvStore::open(dir.path()).unwrap();
+            store.max_hot_entries = 5;
+            for i in 0..20 {
+                store.set(&format!("k{i}"), Value::Int64(i), None);
+            }
+            // The cold tree lives in <dir>/kv_cold — arm that directory,
+            // not the store root.
+            crate::storage::lsm::fail_next_sst_write(&dir.path().join("kv_cold"));
+            store
+                .checkpoint()
+                .expect_err("a failed cold flush must fail the checkpoint");
+            // The WAL was not truncated: replay still yields the evicted keys.
+            let (_, state) = KvWal::open(dir.path(), &std::collections::HashSet::new()).unwrap();
+            for i in 0..20 {
+                assert!(
+                    state.items.iter().any(|(k, _, _)| k == &format!("k{i}")),
+                    "k{i} must still be in the WAL after the refused checkpoint"
+                );
+            }
+        }
+        let store2 = KvStore::open(dir.path()).unwrap();
+        for i in 0..20 {
+            assert!(
+                store2.get(&format!("k{i}")).is_some(),
+                "k{i} lost: checkpoint truncated the WAL while the cold flush failed"
+            );
+        }
+        // The fault is one-shot; the retry converges.
+        store2.checkpoint().unwrap();
+        drop(store2);
+        let store3 = KvStore::open(dir.path()).unwrap();
+        for i in 0..20 {
+            assert!(
+                store3.get(&format!("k{i}")).is_some(),
+                "k{i} lost after the retry"
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_kv_flushdb_clears_cold_tier_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = KvStore::open(dir.path()).unwrap();
+            store.max_hot_entries = 5;
+            for i in 0..20 {
+                store.set(&format!("k{i}"), Value::Int64(i), None);
+            }
+            store.checkpoint().unwrap(); // flushes cold -> .sst files on disk
+            assert!(dir.path().join("kv_cold").read_dir().unwrap().count() > 0);
+            store.flushdb();
+        }
+        let store2 = KvStore::open(dir.path()).unwrap();
+        for i in 0..20 {
+            assert_eq!(
+                store2.get(&format!("k{i}")),
+                None,
+                "k{i} resurrected from cold"
+            );
+        }
+        // Facet 2: post-flush evictions must be durable
+        let mut store2 = store2;
+        store2.max_hot_entries = 5;
+        for i in 0..20 {
+            store2.set(&format!("n{i}"), Value::Int64(i), None);
+        }
+        store2.checkpoint().unwrap();
+        drop(store2);
+        let store3 = KvStore::open(dir.path()).unwrap();
+        assert!(
+            store3.get("n0").is_some(),
+            "post-flush eviction must survive restart"
+        );
+    }
+
+    /// DKV-1: INCR on an expired-but-uncollected key must treat the key as
+    /// ABSENT for both the value and the deadline. Keeping the dead entry's
+    /// expires_at made the incremented value born expired (`SET ctr 5 EX 1`;
+    /// wait; `INCR ctr` -> 1; `GET ctr` -> nil forever), and the WAL record
+    /// carried no expiry, so a live TTL'd counter resurrected as permanent
+    /// after restart.
+    #[test]
+    fn incr_on_expired_key_creates_persistent_key() {
+        let store = KvStore::new();
+        store.set("ctr", Value::Int64(5), Some(0)); // expires immediately
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(store.incr("ctr").unwrap(), 1);
+        assert_eq!(
+            store.get("ctr"),
+            Some(Value::Int64(1)),
+            "value must not be born expired"
+        );
+        assert_eq!(store.ttl("ctr"), -1, "fresh key must have no TTL");
+        assert_eq!(
+            store.sweep_expired_full(),
+            0,
+            "stale expiry_index entry gone"
+        );
+        assert_eq!(store.get("ctr"), Some(Value::Int64(1)));
+    }
+
+    /// DKV-1 companion: INCR on a LIVE TTL'd key keeps its deadline (and the
+    /// WAL record now records it).
+    #[test]
+    fn incr_on_live_ttl_key_keeps_deadline() {
+        let store = KvStore::new();
+        store.set("ctr2", Value::Int64(5), Some(3600));
+        assert_eq!(store.incr("ctr2").unwrap(), 6);
+        assert!(store.ttl("ctr2") > 0, "live TTL must survive the increment");
+        assert_eq!(store.get("ctr2"), Some(Value::Int64(6)));
     }
 }

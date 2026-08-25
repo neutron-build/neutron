@@ -69,6 +69,13 @@ impl RespHandler {
         }
     }
 
+    /// Whether this connection has authenticated (or no password is set).
+    /// The server's SUBSCRIBE/PSUBSCRIBE intercept runs before
+    /// `handle_command`'s NOAUTH gate, so it must consult this directly.
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
+    }
+
     /// Ensure a pub/sub subscriber ID is allocated for this connection.
     fn ensure_pubsub_id(&mut self) {
         if self.pubsub_id.is_none() {
@@ -334,9 +341,9 @@ impl RespHandler {
         response
     }
 
-    /// Drain the write-failure flag from both durable logs.
+    /// Drain the write-failure flag from both durable logs and the cold tier.
     ///
-    /// Both are drained, not short-circuited: a command can dirty either log,
+    /// All are drained, not short-circuited: a command can dirty any of them,
     /// and leaving one set would misattribute the failure to whatever command
     /// came next.
     fn take_write_failure(&self) -> bool {
@@ -346,7 +353,8 @@ impl RespHandler {
             .collections_wal()
             .map(|w| w.take_write_error())
             .unwrap_or(false);
-        kv || collections
+        let cold = self.kv.take_cold_write_error();
+        kv || collections || cold
     }
 
     /// fsync anything this connection just wrote, before its acknowledgement
@@ -525,7 +533,7 @@ impl RespHandler {
                     i += 1;
                 }
 
-                let value = Value::Text(String::from_utf8_lossy(val).to_string());
+                let value = Value::Text(require_text!(val));
                 if nx {
                     // SET key val NX [EX ttl] — atomic set-if-absent; Redis
                     // replies nil when the key already exists.
@@ -611,7 +619,7 @@ impl RespHandler {
             "SETNX" => {
                 let key = require_arg!(args, 1);
                 let val = require_arg_bytes!(args, 2);
-                let value = Value::Text(String::from_utf8_lossy(val).to_string());
+                let value = Value::Text(require_text!(val));
                 let ok = self.kv.setnx(key, value);
                 encoder::encode_integer(if ok { 1 } else { 0 })
             }
@@ -663,7 +671,7 @@ impl RespHandler {
                 let mut i = 1;
                 while i + 1 < args.len() {
                     let key = std::str::from_utf8(&args[i]).unwrap_or("").to_string();
-                    let val_str = String::from_utf8_lossy(&args[i + 1]).to_string();
+                    let val_str = require_text!(&args[i + 1]);
                     pairs.push((key, Value::Text(val_str)));
                     i += 2;
                 }
@@ -678,13 +686,13 @@ impl RespHandler {
                 let new_val = match self.kv.get(key) {
                     Some(Value::Text(existing)) => {
                         let mut s = existing;
-                        s.push_str(&String::from_utf8_lossy(val));
+                        s.push_str(&require_text!(val));
                         s
                     }
                     Some(_) => {
                         return encoder::encode_error("ERR value is not a string");
                     }
-                    None => String::from_utf8_lossy(val).to_string(),
+                    None => require_text!(val),
                 };
                 let len = new_val.len() as i64;
                 self.kv.set(key, Value::Text(new_val), None);
@@ -823,10 +831,27 @@ impl RespHandler {
                 let mut fields = Vec::new();
                 let mut i = 3;
                 while i + 1 < args.len() {
-                    let field = String::from_utf8_lossy(&args[i]).to_string();
-                    let value = String::from_utf8_lossy(&args[i + 1]).to_string();
+                    let field = require_text!(&args[i]);
+                    let value = require_text!(&args[i + 1]);
                     fields.push((field, value));
                     i += 2;
+                }
+                // S31-15: a repeated field name is a client error, not silent
+                // last-wins — the duplicate collapses on read and the first
+                // value is unrecoverable.
+                {
+                    let mut dup: Option<&str> = None;
+                    for (i, (field, _)) in fields.iter().enumerate() {
+                        if fields[..i].iter().any(|(prev, _)| prev == field) {
+                            dup = Some(field);
+                            break;
+                        }
+                    }
+                    if let Some(field) = dup {
+                        return encoder::encode_error(&format!(
+                            "ERR duplicate field name '{field}' in 'xadd' command"
+                        ));
+                    }
                 }
                 match self.kv.xadd(key, id_str, fields) {
                     Ok(id) => encoder::encode_bulk_string(id.to_string().as_bytes()),
@@ -845,11 +870,9 @@ impl RespHandler {
                 let key = require_arg!(args, 1);
                 let start = require_arg!(args, 2);
                 let end = require_arg!(args, 3);
-                let count = if args.len() >= 6 {
-                    let c_str = String::from_utf8_lossy(&args[5]);
-                    c_str.parse::<usize>().ok()
-                } else {
-                    None
+                let count = match parse_stream_count(&args[4..]) {
+                    Ok(c) => c,
+                    Err(reply) => return reply,
                 };
                 match self.kv.xrange(key, start, end, count) {
                     Ok(entries) => encode_stream_entries(&entries),
@@ -860,11 +883,9 @@ impl RespHandler {
                 let key = require_arg!(args, 1);
                 let end = require_arg!(args, 2);
                 let start = require_arg!(args, 3);
-                let count = if args.len() >= 6 {
-                    let c_str = String::from_utf8_lossy(&args[5]);
-                    c_str.parse::<usize>().ok()
-                } else {
-                    None
+                let count = match parse_stream_count(&args[4..]) {
+                    Ok(c) => c,
+                    Err(reply) => return reply,
                 };
                 match self.kv.xrevrange(key, end, start, count) {
                     Ok(entries) => encode_stream_entries(&entries),
@@ -878,11 +899,11 @@ impl RespHandler {
                 let mut idx = 1;
                 if args.len() > idx && String::from_utf8_lossy(&args[idx]).to_uppercase() == "COUNT"
                 {
-                    idx += 1;
-                    if idx < args.len() {
-                        count = String::from_utf8_lossy(&args[idx]).parse::<usize>().ok();
-                        idx += 1;
-                    }
+                    count = match parse_stream_count(&args[idx..]) {
+                        Ok(c) => c,
+                        Err(reply) => return reply,
+                    };
+                    idx += 2;
                 }
                 // Expect STREAMS keyword
                 if idx >= args.len()
@@ -1019,11 +1040,11 @@ impl RespHandler {
                 let mut count: Option<usize> = None;
                 if idx < args.len() && String::from_utf8_lossy(&args[idx]).to_uppercase() == "COUNT"
                 {
-                    idx += 1;
-                    if idx < args.len() {
-                        count = String::from_utf8_lossy(&args[idx]).parse::<usize>().ok();
-                        idx += 1;
-                    }
+                    count = match parse_stream_count(&args[idx..]) {
+                        Ok(c) => c,
+                        Err(reply) => return reply,
+                    };
+                    idx += 2;
                 }
                 if idx >= args.len()
                     || String::from_utf8_lossy(&args[idx]).to_uppercase() != "STREAMS"
@@ -1084,7 +1105,7 @@ impl RespHandler {
                 }
                 let mut new_len = 0;
                 for arg in &args[2..] {
-                    let val = Value::Text(String::from_utf8_lossy(arg).to_string());
+                    let val = Value::Text(require_text!(arg));
                     match self.kv.lpush(key, val) {
                         Ok(len) => new_len = len,
                         Err(e) => return encode_wrongtype(&e),
@@ -1101,7 +1122,7 @@ impl RespHandler {
                 }
                 let mut new_len = 0;
                 for arg in &args[2..] {
-                    let val = Value::Text(String::from_utf8_lossy(arg).to_string());
+                    let val = Value::Text(require_text!(arg));
                     match self.kv.rpush(key, val) {
                         Ok(len) => new_len = len,
                         Err(e) => return encode_wrongtype(&e),
@@ -1171,7 +1192,7 @@ impl RespHandler {
                 let mut i = 2;
                 while i + 1 < args.len() {
                     let field = std::str::from_utf8(&args[i]).unwrap_or("");
-                    let val = Value::Text(String::from_utf8_lossy(&args[i + 1]).to_string());
+                    let val = Value::Text(require_text!(&args[i + 1]));
                     match self.kv.hset(key, field, val) {
                         Ok(is_new) => {
                             if is_new {
@@ -1600,6 +1621,17 @@ impl RespHandler {
                         Ok(v) => v,
                         Err(_) => return encoder::encode_error("ERR value is not a valid float"),
                     };
+                    // "NaN"/"inf" parse Ok but are unstorable: a NaN member is
+                    // GEOPOS-visible yet GEORADIUS-invisible forever, and its
+                    // bbox never contains_point, so updates leak a tree entry
+                    // each. Redis rejects these at the same boundary.
+                    if !lon.is_finite()
+                        || !(-180.0..=180.0).contains(&lon)
+                        || !lat.is_finite()
+                        || !(-90.0..=90.0).contains(&lat)
+                    {
+                        return encoder::encode_error("ERR invalid longitude/latitude");
+                    }
                     let member = std::str::from_utf8(&args[i + 2]).unwrap_or("");
                     match self.kv.geoadd(key, lon, lat, member) {
                         Ok(is_new) => {
@@ -1859,6 +1891,33 @@ fn encode_stream_entries(entries: &[crate::kv::streams::StreamEntry]) -> Vec<u8>
     resp
 }
 
+/// Parse the trailing `[COUNT n]` arguments of a stream command. The caller
+/// passes everything from the COUNT keyword position onward (XRANGE-family)
+/// or from the value position onward (XREAD-family, after the keyword was
+/// already consumed). An unparseable COUNT is an ERROR, never a silent
+/// "no limit" — and for the XRANGE family the keyword itself is checked, so
+/// position no longer substitutes for spelling.
+fn parse_stream_count(rest: &[Vec<u8>]) -> Result<Option<usize>, Vec<u8>> {
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let keyword = String::from_utf8_lossy(&rest[0]).to_uppercase();
+    if keyword != "COUNT" {
+        return Err(encoder::encode_error("ERR syntax error"));
+    }
+    let Some(value) = rest.get(1) else {
+        return Err(encoder::encode_error(
+            "ERR wrong number of arguments for 'xrange' command",
+        ));
+    };
+    match String::from_utf8_lossy(value).parse::<usize>() {
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err(encoder::encode_error(
+            "ERR value is not an integer or out of range",
+        )),
+    }
+}
+
 // ============================================================================
 // Argument extraction macros
 // ============================================================================
@@ -1898,6 +1957,21 @@ macro_rules! require_arg_bytes {
     };
 }
 use require_arg_bytes;
+
+/// Decode a bulk-string argument as UTF-8 text, rejecting non-UTF-8
+/// instead of corrupting it. RESP bulk strings are binary-safe, but the
+/// KV value type is String; `from_utf8_lossy` rewrote invalid bytes as
+/// U+FFFD and silently corrupted the stored value (WIR-7). Keys already
+/// reject non-UTF-8 (`require_arg!`); this makes values consistent.
+macro_rules! require_text {
+    ($bytes:expr) => {
+        match std::str::from_utf8($bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return encoder::encode_error("ERR invalid argument encoding"),
+        }
+    };
+}
+use require_text;
 
 /// Parse an i64 from the argument at the given position.
 macro_rules! require_i64 {
@@ -2038,6 +2112,83 @@ mod tests {
 
         let resp = h.handle_command(args(&["GET", "foo"]));
         assert_eq!(decode_bulk(&resp), Some("bar".to_string()));
+    }
+
+    /// WIR-7: RESP bulk strings are binary-safe, but the KV value type is
+    /// String. `from_utf8_lossy` rewrote invalid bytes as U+FFFD and stored
+    /// the corruption durably. Values must be rejected at the boundary
+    /// exactly like keys already are, and valid multi-byte UTF-8 must
+    /// round-trip byte-exact.
+    #[test]
+    fn test_non_utf8_values_are_rejected_not_corrupted() {
+        let mut h = new_handler();
+        let bad = vec![0xFFu8, 0xFE];
+        let err = b"-ERR invalid argument encoding";
+
+        let resp = h.handle_command(vec![b"SET".to_vec(), b"bin".to_vec(), bad.clone()]);
+        assert!(resp.starts_with(err), "SET: {resp:?}");
+        // Store left empty: the corrupted value was never written.
+        assert_eq!(
+            decode_bulk(&h.handle_command(args(&["GET", "bin"]))),
+            None,
+            "a refused SET must not leave a value behind"
+        );
+
+        let resp = h.handle_command(vec![b"SETNX".to_vec(), b"bin".to_vec(), bad.clone()]);
+        assert!(resp.starts_with(err), "SETNX: {resp:?}");
+
+        let resp = h.handle_command(vec![
+            b"MSET".to_vec(),
+            b"a".to_vec(),
+            b"1".to_vec(),
+            b"b".to_vec(),
+            bad.clone(),
+        ]);
+        assert!(resp.starts_with(err), "MSET: {resp:?}");
+        // Pairs are collected before the write, so nothing is applied.
+        assert_eq!(
+            decode_bulk(&h.handle_command(args(&["GET", "a"]))),
+            None,
+            "a refused MSET must not apply its earlier pairs"
+        );
+
+        let resp = h.handle_command(vec![b"APPEND".to_vec(), b"bin".to_vec(), bad.clone()]);
+        assert!(resp.starts_with(err), "APPEND: {resp:?}");
+
+        let resp = h.handle_command(vec![b"LPUSH".to_vec(), b"lst".to_vec(), bad.clone()]);
+        assert!(resp.starts_with(err), "LPUSH: {resp:?}");
+        let resp = h.handle_command(vec![b"RPUSH".to_vec(), b"lst".to_vec(), bad.clone()]);
+        assert!(resp.starts_with(err), "RPUSH: {resp:?}");
+
+        let resp = h.handle_command(vec![
+            b"HSET".to_vec(),
+            b"hash".to_vec(),
+            b"f".to_vec(),
+            bad.clone(),
+        ]);
+        assert!(resp.starts_with(err), "HSET: {resp:?}");
+
+        let resp = h.handle_command(vec![
+            b"XADD".to_vec(),
+            b"stream".to_vec(),
+            b"0-1".to_vec(),
+            b"f".to_vec(),
+            bad.clone(),
+        ]);
+        assert!(resp.starts_with(err), "XADD: {resp:?}");
+        assert_eq!(
+            decode_int(&h.handle_command(args(&["XLEN", "stream"]))),
+            0,
+            "a refused XADD must not create an entry"
+        );
+
+        // Control: valid multi-byte UTF-8 keeps STRLEN == byte length.
+        let resp = h.handle_command(args(&["SET", "u", "héllo"]));
+        assert_eq!(decode_simple(&resp), "OK");
+        let resp = h.handle_command(args(&["STRLEN", "u"]));
+        assert_eq!(decode_int(&resp), "héllo".len() as i64);
+        let resp = h.handle_command(args(&["APPEND", "u", "wörld"]));
+        assert_eq!(decode_int(&resp), "héllowörld".len() as i64);
     }
 
     #[test]
@@ -2420,6 +2571,32 @@ mod tests {
         }
         let resp = h.handle_command(args(&["GET", "s"]));
         assert_eq!(decode_bulk(&resp), None);
+    }
+
+    /// S31-15: an XADD whose field/value pairs repeat a field name is a
+    /// client error, not silent last-wins — on read the duplicate collapses
+    /// and the first value is unrecoverable, which is data loss dressed as
+    /// syntax.
+    #[test]
+    fn test_xadd_duplicate_field_is_an_error() {
+        let mut h = new_handler();
+        let resp = h.handle_command(args(&["XADD", "dupf", "1-0", "a", "1", "a", "2"]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("-ERR"), "XADD: {s:?}");
+        assert!(
+            s.contains("duplicate"),
+            "the error must name the problem: {s}"
+        );
+        assert_eq!(
+            decode_int(&h.handle_command(args(&["XLEN", "dupf"]))),
+            0,
+            "a refused XADD must not create an entry"
+        );
+
+        // Distinct fields on the same shape still succeed.
+        let resp = h.handle_command(args(&["XADD", "dupf", "1-0", "a", "1", "b", "2"]));
+        assert_eq!(decode_bulk(&resp), Some("1-0".to_string()));
+        assert_eq!(decode_int(&h.handle_command(args(&["XLEN", "dupf"]))), 1);
     }
 
     /// A write the log refused must not be acknowledged as one that succeeded.
@@ -2874,6 +3051,39 @@ mod tests {
             "Palermo",
         ]));
         assert_eq!(decode_int(&resp), 0);
+    }
+
+    /// GDL-8: NaN/inf/out-of-range coordinates must be rejected at the parse
+    /// boundary. A NaN member is GEOPOS-visible but GEORADIUS-invisible
+    /// forever (NaN comparisons fail every bbox test), and updating it later
+    /// leaks one tree entry per update.
+    #[test]
+    fn test_geoadd_rejects_invalid_coordinates() {
+        let mut h = new_handler();
+        for (lon, lat) in [
+            ("NaN", "0"),
+            ("0", "NaN"),
+            ("inf", "0"),
+            ("181", "0"),
+            ("-180.1", "0"),
+            ("0", "90.1"),
+            ("0", "-91"),
+        ] {
+            let resp = h.handle_command(args(&["GEOADD", "places", lon, lat, "m"]));
+            let s = String::from_utf8_lossy(&resp);
+            assert!(
+                is_error(&resp) && s.contains("invalid longitude/latitude"),
+                "({lon}, {lat}) must be rejected: {s}"
+            );
+        }
+        // The rejected adds must not have created the key or any member.
+        let resp = h.handle_command(args(&["GEOPOS", "places", "m"]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.contains("$-1"), "no member may exist: {s}");
+
+        // A valid add still works and reports :1.
+        let resp = h.handle_command(args(&["GEOADD", "places", "13.3", "38.1", "ok"]));
+        assert_eq!(decode_int(&resp), 1);
     }
 
     // ====================================================================

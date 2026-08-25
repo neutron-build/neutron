@@ -11,6 +11,61 @@ use super::{Direction, EdgeId, GraphStore, Node, NodeId, PropValue, Properties};
 enum Binding {
     Node(NodeId),
     Edge(EdgeId),
+    /// A scalar projected by `WITH n.prop AS alias` (GRP-9). Rendering a
+    /// node binding under such an alias used to print the node ID.
+    Scalar(PropValue),
+}
+
+/// Bind `variable` (and the positional internal `__node_{idx}` slot) to `id`.
+///
+/// A repeated variable in a pattern is an EQUALITY constraint, not a
+/// rebinding (GRP-2): a candidate that would bind it to a different node
+/// cannot match, so the caller must skip it — returning false here. The
+/// positional slot lets an ANONYMOUS pattern node anchor the next edge in
+/// the chain (GRP-3); user identifiers starting with `__` are rejected at
+/// parse time so the two spaces cannot collide.
+fn bind_node_if_consistent(
+    nb: &mut HashMap<String, Binding>,
+    variable: Option<&str>,
+    positional_idx: usize,
+    id: NodeId,
+) -> bool {
+    let positional = format!("__node_{positional_idx}");
+    let consistent = |b: &Binding| !matches!(b, Binding::Node(existing) if *existing != id);
+    if let Some(v) = variable
+        && let Some(b) = nb.get(v)
+        && !consistent(b)
+    {
+        return false;
+    }
+    if let Some(b) = nb.get(&positional)
+        && !consistent(b)
+    {
+        return false;
+    }
+    if let Some(v) = variable {
+        nb.insert(v.to_string(), Binding::Node(id));
+    }
+    nb.insert(positional, Binding::Node(id));
+    true
+}
+
+/// Edge-binding twin of [`bind_node_if_consistent`].
+fn bind_edge_if_consistent(
+    nb: &mut HashMap<String, Binding>,
+    variable: Option<&str>,
+    id: EdgeId,
+) -> bool {
+    if let Some(v) = variable
+        && let Some(Binding::Edge(existing)) = nb.get(v)
+        && *existing != id
+    {
+        return false;
+    }
+    if let Some(v) = variable {
+        nb.insert(v.to_string(), Binding::Edge(id));
+    }
+    true
 }
 
 /// The result of executing a Cypher query.
@@ -158,7 +213,7 @@ fn execute_match(
 /// WITH items can rename variables (via AS alias) or project properties.
 /// The result is a new set of bindings with only the projected variables.
 fn apply_with_clause(
-    _store: &GraphStore,
+    store: &GraphStore,
     binding_sets: &[HashMap<String, Binding>],
     with_clause: &WithClause,
 ) -> Vec<HashMap<String, Binding>> {
@@ -183,12 +238,24 @@ fn apply_with_clause(
                         new_bindings.insert(name, b.clone());
                     }
                 }
-                ReturnItem::Property(v, _p) => {
-                    // For property projections, keep the underlying node/edge binding
-                    // under the alias so that the RETURN clause can access properties.
+                ReturnItem::Property(v, p) => {
+                    // GRP-9: resolve the property NOW and bind the SCALAR
+                    // under the alias — the old code stored the node binding
+                    // there, and `RETURN alias` rendered the node ID.
+                    // Cold-aware (GRP-8): the source may be evicted.
+                    let scalar = match bindings.get(v) {
+                        Some(Binding::Node(id)) => store
+                            .get_node_full(*id)
+                            .and_then(|n| n.properties.get(p).cloned()),
+                        Some(Binding::Edge(id)) => store
+                            .get_edge_full(*id)
+                            .and_then(|e| e.properties.get(p).cloned()),
+                        _ => None,
+                    }
+                    .unwrap_or(PropValue::Null);
+                    new_bindings.insert(name, Binding::Scalar(scalar));
+                    // Also keep the original variable for property resolution
                     if let Some(b) = bindings.get(v) {
-                        new_bindings.insert(name.clone(), b.clone());
-                        // Also keep the original variable for property resolution
                         new_bindings.insert(v.clone(), b.clone());
                     }
                 }
@@ -217,58 +284,69 @@ fn find_bindings(
     let candidate_ids = candidate_node_ids(store, first_node);
     let mut binding_sets: Vec<HashMap<String, Binding>> = Vec::new();
     for nid in &candidate_ids {
-        let node = match store.get_node(*nid) {
+        // Cold-aware fetch (GRP-8): an evicted node's hot properties are
+        // empty, so a hot-only read would drop it from every predicate.
+        let node = match store.get_node_full(*nid) {
             Some(n) => n,
             None => continue,
         };
-        if !node_matches_properties(node, &first_node.properties) {
+        // GRP-7: the anchor's FULL label set must be enforced.
+        // `candidate_node_ids` narrows by the first label only, and when the
+        // first label is absent from the pattern the candidate set is every
+        // node — making this check the only label enforcement.
+        if !node_matches_labels(&node, &first_node.labels) {
+            continue;
+        }
+        if !node_matches_properties(&node, &first_node.properties) {
             continue;
         }
         let mut bindings = HashMap::new();
-        if let Some(ref var) = first_node.variable {
-            bindings.insert(var.clone(), Binding::Node(node.id));
-        }
+        bind_node_if_consistent(&mut bindings, first_node.variable.as_deref(), 0, node.id);
         binding_sets.push(bindings);
     }
     for edge_pat in &pattern.edges {
         let target_node_pat = &pattern.nodes[edge_pat.to_idx];
         let mut new_binding_sets = Vec::new();
 
-        let is_variable_length = edge_pat.min_hops.is_some() || edge_pat.max_hops.is_some();
-
         for bindings in &binding_sets {
             let source_node_pat = &pattern.nodes[edge_pat.from_idx];
-            let source_id = match resolve_node_id(bindings, source_node_pat) {
+            let source_id = match resolve_node_id(bindings, source_node_pat, edge_pat.from_idx) {
                 Some(id) => id,
                 None => continue,
             };
 
-            if is_variable_length {
-                // Variable-length path expansion: DFS from source within hop bounds
+            if edge_pat.star {
+                // Variable-length path expansion (GRP-5/GRP-11): layered BFS
+                // over deduped terminals.
                 let min_hops = edge_pat.min_hops.unwrap_or(1);
-                let max_hops = edge_pat.max_hops.unwrap_or(10);
                 let terminal_nodes = variable_length_expand(
                     store,
                     source_id,
                     edge_pat.direction,
                     edge_pat.edge_type.as_deref(),
+                    &edge_pat.properties,
                     min_hops,
-                    max_hops,
+                    edge_pat.max_hops,
                 );
                 for terminal_id in terminal_nodes {
-                    let target_node = match store.get_node(terminal_id) {
+                    let target_node = match store.get_node_full(terminal_id) {
                         Some(n) => n,
                         None => continue,
                     };
-                    if !node_matches_labels(target_node, &target_node_pat.labels) {
+                    if !node_matches_labels(&target_node, &target_node_pat.labels) {
                         continue;
                     }
-                    if !node_matches_properties(target_node, &target_node_pat.properties) {
+                    if !node_matches_properties(&target_node, &target_node_pat.properties) {
                         continue;
                     }
                     let mut nb = bindings.clone();
-                    if let Some(ref var) = target_node_pat.variable {
-                        nb.insert(var.clone(), Binding::Node(target_node.id));
+                    if !bind_node_if_consistent(
+                        &mut nb,
+                        target_node_pat.variable.as_deref(),
+                        edge_pat.to_idx,
+                        target_node.id,
+                    ) {
+                        continue;
                     }
                     new_binding_sets.push(nb);
                 }
@@ -277,22 +355,30 @@ fn find_bindings(
                 let neighbors =
                     store.neighbors(source_id, edge_pat.direction, edge_pat.edge_type.as_deref());
                 for (neighbor_id, edge) in &neighbors {
-                    let target_node = match store.get_node(*neighbor_id) {
+                    if !edge_props_match(store, edge, &edge_pat.properties) {
+                        continue;
+                    }
+                    let target_node = match store.get_node_full(*neighbor_id) {
                         Some(n) => n,
                         None => continue,
                     };
-                    if !node_matches_labels(target_node, &target_node_pat.labels) {
+                    if !node_matches_labels(&target_node, &target_node_pat.labels) {
                         continue;
                     }
-                    if !node_matches_properties(target_node, &target_node_pat.properties) {
+                    if !node_matches_properties(&target_node, &target_node_pat.properties) {
                         continue;
                     }
                     let mut nb = bindings.clone();
-                    if let Some(ref var) = edge_pat.variable {
-                        nb.insert(var.clone(), Binding::Edge(edge.id));
+                    if !bind_edge_if_consistent(&mut nb, edge_pat.variable.as_deref(), edge.id) {
+                        continue;
                     }
-                    if let Some(ref var) = target_node_pat.variable {
-                        nb.insert(var.clone(), Binding::Node(target_node.id));
+                    if !bind_node_if_consistent(
+                        &mut nb,
+                        target_node_pat.variable.as_deref(),
+                        edge_pat.to_idx,
+                        target_node.id,
+                    ) {
+                        continue;
                     }
                     new_binding_sets.push(nb);
                 }
@@ -303,44 +389,86 @@ fn find_bindings(
     Ok(binding_sets)
 }
 
-/// Expand variable-length paths from a source node via DFS.
-/// Returns deduplicated terminal node IDs reachable within `min_hops..=max_hops`.
+/// Whether an edge satisfies an inline relationship property map (GRP-6).
+/// An evicted edge's hot properties are empty; when a filter is required
+/// and a cold tier exists, resolve the full edge before deciding (GRP-8).
+fn edge_props_match(
+    store: &GraphStore,
+    edge: &super::Edge,
+    required: &BTreeMap<String, PropValue>,
+) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let props = if edge.properties.is_empty() && store.has_cold_tier() {
+        match store.get_edge_full(edge.id) {
+            Some(e) => e.properties,
+            None => return false,
+        }
+    } else {
+        edge.properties.clone()
+    };
+    required.iter().all(|(k, v)| props.get(k) == Some(v))
+}
+
+/// Variable-length expansion: terminals are `{v : min <= mindist(source,v) <=
+/// max}` (deduped by minimal BFS distance), plus the source itself when
+/// `min == 0` or a qualifying self-loop puts it back in band at some depth.
+///
+/// Layered BFS with one `seen` set — O(levels·(V+E)) time, O(V) memory. The
+/// previous DFS enumerated every simple path with a cloned visited-set per
+/// push (K25 `*..8` ≈ 1.7e10 paths — hours of CPU from one query) only to
+/// deduplicate the identical terminal set at the end (GRP-11). Longer cycles
+/// back to the source are NOT terminals: that is the standing node-unique vs
+/// relationship-unique deviation, documented and oracle-compensated.
 fn variable_length_expand(
     store: &GraphStore,
     source_id: NodeId,
     direction: Direction,
     edge_type: Option<&str>,
+    edge_props: &BTreeMap<String, PropValue>,
     min_hops: usize,
-    max_hops: usize,
+    max_hops: Option<usize>,
 ) -> Vec<NodeId> {
-    let mut results = Vec::new();
-    let mut seen_terminals = HashSet::new();
-    // Stack: (current_node, depth, visited_set)
-    let mut stack: Vec<(NodeId, usize, HashSet<NodeId>)> = Vec::new();
-    let mut initial_visited = HashSet::new();
-    initial_visited.insert(source_id);
-    stack.push((source_id, 0, initial_visited));
-
-    while let Some((current, depth, visited)) = stack.pop() {
-        if depth >= min_hops
-            && depth <= max_hops
-            && current != source_id
-            && seen_terminals.insert(current)
-        {
-            results.push(current);
-        }
-        if depth >= max_hops {
-            continue;
-        }
-        for (neighbor, _) in store.neighbors(current, direction, edge_type) {
-            if !visited.contains(&neighbor) {
-                let mut new_visited = visited.clone();
-                new_visited.insert(neighbor);
-                stack.push((neighbor, depth + 1, new_visited));
+    let mut terminals = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(source_id);
+    if min_hops == 0 {
+        terminals.push(source_id); // the zero-hop path
+    }
+    let mut frontier = vec![source_id];
+    let mut depth = 0usize;
+    while !frontier.is_empty() && max_hops.is_none_or(|m| depth < m) {
+        depth += 1;
+        let mut next = Vec::new();
+        for cur in &frontier {
+            for (nbr, edge) in store.neighbors(*cur, direction, edge_type) {
+                if !edge_props_match(store, edge, edge_props) {
+                    continue;
+                }
+                if nbr == source_id
+                    && *cur == source_id
+                    && depth >= min_hops
+                    && !terminals.contains(&source_id)
+                {
+                    // A TRUE self-loop (an edge source→source) puts the
+                    // source back in band at one hop. Longer cycles back to
+                    // the source are not terminals — the documented
+                    // node-unique vs relationship-unique deviation.
+                    terminals.push(source_id);
+                }
+                if seen.insert(nbr) {
+                    // First-seen == minimal distance.
+                    if depth >= min_hops {
+                        terminals.push(nbr);
+                    }
+                    next.push(nbr);
+                }
             }
         }
+        frontier = next;
     }
-    results
+    terminals
 }
 
 /// Candidate anchor nodes for the first node pattern of a MATCH.
@@ -380,10 +508,20 @@ fn node_matches_properties(node: &Node, required: &BTreeMap<String, PropValue>) 
     true
 }
 
-fn resolve_node_id(bindings: &HashMap<String, Binding>, np: &NodePattern) -> Option<NodeId> {
+/// Resolve a pattern node to a bound id: by variable first, then by the
+/// positional internal `__node_{idx}` slot — the fallback that lets an
+/// ANONYMOUS node anchor the next edge in a chain (GRP-3).
+fn resolve_node_id(
+    bindings: &HashMap<String, Binding>,
+    np: &NodePattern,
+    idx: usize,
+) -> Option<NodeId> {
     if let Some(ref var) = np.variable
         && let Some(Binding::Node(id)) = bindings.get(var)
     {
+        return Some(*id);
+    }
+    if let Some(Binding::Node(id)) = bindings.get(&format!("__node_{idx}")) {
         return Some(*id);
     }
     None
@@ -411,12 +549,19 @@ fn evaluate_condition(
             value,
         } => match bindings.get(variable) {
             Some(Binding::Node(id)) => store
-                .get_node(*id)
+                .get_node_full(*id)
                 .is_some_and(|n| n.properties.get(property) == Some(value)),
             Some(Binding::Edge(id)) => store
-                .get_edge(*id)
+                .get_edge_full(*id)
                 .is_some_and(|e| e.properties.get(property) == Some(value)),
+            Some(Binding::Scalar(v)) => v == value,
             None => false,
+        },
+        Condition::VariableEquals { variable, value } => match bindings.get(variable) {
+            Some(Binding::Scalar(v)) => v == value,
+            // A node/edge binding has no scalar identity to compare against
+            // a literal; only WITH-projected scalars reach this arm.
+            _ => false,
         },
         Condition::And(left, right) => {
             evaluate_condition(store, bindings, left) && evaluate_condition(store, bindings, right)
@@ -465,19 +610,19 @@ fn project_item(
         ReturnItem::Variable(var) => match bindings.get(var) {
             Some(Binding::Node(id)) => PropValue::Int(*id as i64),
             Some(Binding::Edge(id)) => PropValue::Int(*id as i64),
+            Some(Binding::Scalar(v)) => v.clone(),
             None => PropValue::Null,
         },
         ReturnItem::Property(var, prop) => match bindings.get(var) {
             Some(Binding::Node(id)) => store
-                .get_node(*id)
-                .and_then(|n| n.properties.get(prop))
-                .cloned()
+                .get_node_full(*id)
+                .and_then(|n| n.properties.get(prop).cloned())
                 .unwrap_or(PropValue::Null),
             Some(Binding::Edge(id)) => store
-                .get_edge(*id)
-                .and_then(|e| e.properties.get(prop))
-                .cloned()
+                .get_edge_full(*id)
+                .and_then(|e| e.properties.get(prop).cloned())
                 .unwrap_or(PropValue::Null),
+            Some(Binding::Scalar(_)) => PropValue::Null,
             None => PropValue::Null,
         },
         ReturnItem::Count => PropValue::Null,
@@ -486,15 +631,16 @@ fn project_item(
             for (var, binding) in bindings {
                 match binding {
                     Binding::Node(id) => {
-                        if let Some(node) = store.get_node(*id) {
+                        if let Some(node) = store.get_node_full(*id) {
                             parts.push(format!("{var}=Node({})", node.id));
                         }
                     }
                     Binding::Edge(id) => {
-                        if let Some(edge) = store.get_edge(*id) {
+                        if let Some(edge) = store.get_edge_full(*id) {
                             parts.push(format!("{var}=Edge({})", edge.id));
                         }
                     }
+                    Binding::Scalar(v) => parts.push(format!("{var}={v:?}")),
                 }
             }
             parts.sort();
@@ -902,5 +1048,354 @@ mod tests {
         let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], PropValue::Text("Alice".to_string()));
+    }
+
+    // ====================================================================
+    // GRP cluster — binding, traversal and tiering regressions
+    // ====================================================================
+
+    fn count_of(s: &mut GraphStore, q: &str) -> i64 {
+        let r = execute_cypher(s, &parse_cypher(q).unwrap()).unwrap();
+        match r.rows.first().and_then(|row| row.first()) {
+            Some(PropValue::Int(n)) => *n,
+            other => panic!("expected a COUNT(*) integer, got {other:?}"),
+        }
+    }
+
+    /// GRP-2: a repeated variable in a pattern is an equality constraint,
+    /// not a rebinding. On the 2-cycle 1⇄2 (+ extra 2→3), `(a)->(b)->(a)`
+    /// has exactly two legal assignments — (1,2) and (2,1); the rebinding
+    /// bug also accepted (a=3,b=2), where no 3→2 edge exists at all.
+    #[test]
+    fn repeated_variables_constrain_instead_of_rebinding() {
+        let mut s = GraphStore::new();
+        for _ in 0..3 {
+            s.create_node(vec!["N".into()], Properties::new());
+        }
+        // 2-cycle 1→2→1 plus an extra edge 2→3.
+        s.create_edge(1, 2, "K".into(), Properties::new());
+        s.create_edge(2, 1, "K".into(), Properties::new());
+        s.create_edge(2, 3, "K".into(), Properties::new());
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (a)-[:K]->(b)-[:K]->(a) RETURN a, b").unwrap(),
+        )
+        .unwrap();
+        let mut pairs: Vec<(i64, i64)> = r
+            .rows
+            .iter()
+            .filter_map(|row| match (&row[0], &row[1]) {
+                (PropValue::Int(a), PropValue::Int(b)) => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![(1, 2), (2, 1)],
+            "the closing edge must constrain, not rebind: an assignment with no \
+             backing edge is the rebinding defect"
+        );
+
+        let mut s2 = GraphStore::new();
+        s2.create_node(
+            vec!["P".into()],
+            props(vec![("name", PropValue::Text("x".into()))]),
+        );
+        s2.create_node(
+            vec!["P".into()],
+            props(vec![("name", PropValue::Text("y".into()))]),
+        );
+        s2.create_node(
+            vec!["P".into()],
+            props(vec![("name", PropValue::Text("z".into()))]),
+        );
+        // Self-loop plus two other out-edges.
+        s2.create_edge(1, 1, "K".into(), Properties::new());
+        s2.create_edge(1, 2, "K".into(), Properties::new());
+        s2.create_edge(1, 3, "K".into(), Properties::new());
+        assert_eq!(
+            count_of(
+                &mut s2,
+                r#"MATCH (a:P {name: "x"})-[:K]->(a) RETURN COUNT(*)"#
+            ),
+            1,
+            "a self-loop pattern must count the loop, not the out-degree"
+        );
+    }
+
+    /// GRP-3: an anonymous node pattern as an edge source used to leave no
+    /// binding, so the next edge in the chain resolved nothing and every row
+    /// was dropped.
+    #[test]
+    fn anonymous_source_yields_real_rows() {
+        let mut s = GraphStore::new();
+        s.create_node(
+            vec!["P".into()],
+            props(vec![("name", PropValue::Text("x".into()))]),
+        );
+        s.create_node(
+            vec!["P".into()],
+            props(vec![("name", PropValue::Text("y".into()))]),
+        );
+        s.create_node(
+            vec!["P".into()],
+            props(vec![("name", PropValue::Text("z".into()))]),
+        );
+        s.create_edge(1, 2, "K".into(), Properties::new());
+        s.create_edge(1, 3, "K".into(), Properties::new());
+        assert_eq!(
+            count_of(
+                &mut s,
+                r#"MATCH (:P {name: "x"})-[:K]->(b) RETURN COUNT(*)"#
+            ),
+            2,
+            "an anonymous source must still anchor the edge chain"
+        );
+    }
+
+    /// GRP-5, concretely: same 12-node chain, but each node carries its
+    /// position so terminals are identifiable. Asserts the hop table from
+    /// node 1.
+    #[test]
+    fn variable_length_hop_table_from_node_one() {
+        let mut s = GraphStore::new();
+        for pos in 1..=12i64 {
+            s.create_node(vec!["N".into()], props(vec![("pos", PropValue::Int(pos))]));
+        }
+        for from in 1..=11u64 {
+            s.create_edge(from, from + 1, "T".into(), Properties::new());
+        }
+        let mut terminals = |q: &str| -> Vec<i64> {
+            let r = execute_cypher(&mut s, &parse_cypher(q).unwrap()).unwrap();
+            let mut v: Vec<i64> = r
+                .rows
+                .iter()
+                .filter_map(|row| match row.first() {
+                    Some(PropValue::Int(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        // Fixed *2: exactly the distance-2 node (pos 3).
+        assert_eq!(
+            terminals("MATCH (a:N {pos: 1})-[:T*2]->(b) RETURN b.pos"),
+            vec![3],
+            "*2 must mean exactly two hops"
+        );
+        // Open *1.. : all 11 others.
+        assert_eq!(
+            terminals("MATCH (a:N {pos: 1})-[:T*1..]->(b) RETURN b.pos").len(),
+            11,
+            "*1.. must be unbounded, not capped at 10"
+        );
+        // Bare * means the same 1..inf.
+        assert_eq!(
+            terminals("MATCH (a:N {pos: 1})-[:T*]->(b) RETURN b.pos").len(),
+            11,
+            "bare * must mean 1..inf, not a single hop"
+        );
+        // *.. unbounded with no min spelled: same as bare *.
+        assert_eq!(
+            terminals("MATCH (a:N {pos: 1})-[:T*..]->(b) RETURN b.pos").len(),
+            11,
+            "*.. must mean 1..inf"
+        );
+
+        // Zero-hop *0..1: the source itself plus distance-1.
+        assert_eq!(
+            terminals("MATCH (a:N {pos: 1})-[:T*0..1]->(b) RETURN b.pos"),
+            vec![1, 2],
+            "*0.. must include the zero-hop terminal (the source)"
+        );
+        // Self-loop: *1..1 on a node with a self-loop returns the node.
+        let mut sl = GraphStore::new();
+        sl.create_node(vec!["S".into()], Properties::new());
+        sl.create_node(vec!["S".into()], Properties::new());
+        sl.create_edge(1, 1, "L".into(), Properties::new());
+        sl.create_edge(1, 2, "L".into(), Properties::new());
+        assert_eq!(
+            count_of(&mut sl, "MATCH (a:S)-[:L*1..1]->(a) RETURN COUNT(*)"),
+            1,
+            "a self-loop terminal at 1 hop in band must return the source"
+        );
+    }
+
+    /// GRP-11: path enumeration is exponential; the BFS rewrite answers the
+    /// same deduped terminal set in polynomial time. K25, `*..8` from one
+    /// anchor would need ~1.7e10 simple paths under the old DFS.
+    #[test]
+    fn variable_length_expansion_is_polynomial_on_a_complete_graph() {
+        let n = 25u64;
+        let mut s = GraphStore::new();
+        for pos in 1..=n {
+            s.create_node(
+                vec!["K".into()],
+                props(vec![("pos", PropValue::Int(pos as i64))]),
+            );
+        }
+        for from in 1..=n {
+            for to in 1..=n {
+                if from != to {
+                    s.create_edge(from, to, "T".into(), Properties::new());
+                }
+            }
+        }
+        let start = std::time::Instant::now();
+        let c = count_of(&mut s, "MATCH (a:K {pos: 1})-[:T*..8]->(b) RETURN COUNT(*)");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            c, 24,
+            "from one anchor, every other node is reachable in 1 hop"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "K25 *..8 took {elapsed:?} — path enumeration is still exponential"
+        );
+    }
+
+    /// GRP-6: an inline property map on a relationship pattern was parsed and
+    /// silently discarded, over-counting matches.
+    #[test]
+    fn inline_edge_property_maps_filter() {
+        let mut s = GraphStore::new();
+        s.create_node(vec!["P".into()], Properties::new());
+        s.create_node(vec!["P".into()], Properties::new());
+        s.create_edge(1, 2, "KNOWS".into(), props(vec![("w", PropValue::Int(1))]));
+        s.create_edge(1, 2, "KNOWS".into(), props(vec![("w", PropValue::Int(2))]));
+        assert_eq!(
+            count_of(&mut s, "MATCH (a)-[r:KNOWS {w: 1}]->(b) RETURN COUNT(*)"),
+            1,
+            "the inline property map must filter, not vanish"
+        );
+    }
+
+    /// GRP-7: only the first label of a multi-label anchor was enforced.
+    #[test]
+    fn all_anchor_labels_are_enforced() {
+        let mut s = GraphStore::new();
+        s.create_node(vec!["P".into()], Properties::new());
+        s.create_node(vec!["P".into(), "Admin".into()], Properties::new());
+        assert_eq!(
+            count_of(&mut s, "MATCH (n:P:Admin) RETURN COUNT(*)"),
+            1,
+            "the anchor must enforce every label, not just the first"
+        );
+    }
+
+    /// GRP-9: `WITH n.prop AS alias RETURN alias` returned the node ID — the
+    /// Property arm stored the node binding under the alias and the Variable
+    /// arm rendered nodes as their integer id.
+    #[test]
+    fn with_property_projection_yields_the_value() {
+        let mut s = social_graph();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (n:Person) WITH n.age AS a RETURN a").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 3);
+        let mut ages: Vec<i64> = r
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(PropValue::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        ages.sort_unstable();
+        assert_eq!(ages, vec![25, 30, 35], "got rows: {:?}", r.rows);
+
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher(r#"MATCH (n:Person) WITH n.name AS nm WHERE nm = "Alice" RETURN nm"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            r.rows,
+            vec![vec![PropValue::Text("Alice".into())]],
+            "a WITH-projected scalar must be usable in WHERE"
+        );
+    }
+
+    /// GRP-8: once eviction starts (>max_hot_nodes), Cypher reads were
+    /// hot-only — evicted nodes lost their properties and the property index's
+    /// proposals were rejected by the hot-only post-filter.
+    #[test]
+    fn cypher_reads_survive_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = GraphStore::open(dir.path()).unwrap();
+        s.max_hot_nodes = 4;
+        let n = 20i64;
+        for i in 1..=n {
+            s.create_node(vec!["N".into()], props(vec![("k", PropValue::Int(i))]));
+        }
+        assert!(
+            s.node_count_hot() <= 4,
+            "fixture must actually evict (hot={})",
+            s.node_count_hot()
+        );
+
+        // (1) RETURN n.k must surface every node's value, not NULLs.
+        let r = execute_cypher(&mut s, &parse_cypher("MATCH (n:N) RETURN n.k").unwrap()).unwrap();
+        let mut vals: Vec<i64> = r
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(PropValue::Int(v)) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        vals.sort_unstable();
+        assert_eq!(
+            vals,
+            (1..=n).collect::<Vec<_>>(),
+            "evicted nodes lost their properties in Cypher reads"
+        );
+
+        // (2) indexed MATCH must still find an evicted node.
+        execute_cypher(&mut s, &parse_cypher("CREATE INDEX ON :N(k)").unwrap()).unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (n:N {k: 17}) RETURN n.k").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            r.rows,
+            vec![vec![PropValue::Int(17)]],
+            "an indexed lookup of an evicted node returned nothing"
+        );
+
+        // (3) Dijkstra over an evicted weighted edge must read the stored
+        // weight, not default to 1.0.
+        let mut g = GraphStore::open(dir.path().join("dijkstra").as_path()).unwrap();
+        g.max_hot_nodes = 1;
+        let a = g.create_node(vec!["V".into()], Properties::new());
+        let b = g.create_node(vec!["V".into()], Properties::new());
+        let c = g.create_node(vec!["V".into()], Properties::new());
+        g.create_edge(
+            a,
+            b,
+            "E".into(),
+            props(vec![("dist", PropValue::Float(0.5))]),
+        );
+        g.create_edge(
+            b,
+            c,
+            "E".into(),
+            props(vec![("dist", PropValue::Float(0.5))]),
+        );
+        // Creating c evicted a and b's properties (and their edges').
+        let (cost, _) = g
+            .dijkstra(a, c, super::Direction::Outgoing, "dist")
+            .unwrap();
+        assert!(
+            (cost - 1.0).abs() < 1e-9,
+            "dijkstra read weight 1.0 for an evicted edge, got {cost}"
+        );
     }
 }

@@ -174,6 +174,18 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
 
                     // In pub/sub mode, only SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE,
                     // PUNSUBSCRIBE, PING, and QUIT are allowed.
+                    // Defense-in-depth: this loop is only reachable after an
+                    // authenticated SUBSCRIBE below, but any future
+                    // mode-entry refactor would reopen the hole this closes.
+                    if !handler.is_authenticated() {
+                        writer
+                            .write_all(&super::encoder::encode_error(
+                                "NOAUTH Authentication required.",
+                            ))
+                            .await?;
+                        writer.flush().await?;
+                        continue;
+                    }
                     let responses = handler.handle_pubsub_command(args);
                     for resp in responses {
                         writer.write_all(&resp).await?;
@@ -245,6 +257,19 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
                 let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
                 match cmd.as_str() {
                     "SUBSCRIBE" | "PSUBSCRIBE" => {
+                        // The intercept below calls handle_pubsub_command
+                        // directly, bypassing handle_command's NOAUTH gate —
+                        // and once in pub/sub mode EVERY command flowed
+                        // through the ungated path. Gate it here.
+                        if !handler.is_authenticated() {
+                            writer
+                                .write_all(&super::encoder::encode_error(
+                                    "NOAUTH Authentication required.",
+                                ))
+                                .await?;
+                            writer.flush().await?;
+                            continue;
+                        }
                         let responses = handler.handle_pubsub_command(args);
                         for resp in responses {
                             writer.write_all(&resp).await?;

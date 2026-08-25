@@ -53,7 +53,49 @@ async fn test_concat_functions() {
 async fn test_substring() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT SUBSTRING('hello world', 7, 5)").await;
-    assert_eq!(scalar(&results[0]), &Value::Text("world".into()));
+    assert_eq!(scalar(&results[0]), &Value::Text("world".to_string()));
+}
+
+// ── Date year bounds (WIR-9) ────────────────────────────────────────────
+
+#[tokio::test]
+async fn make_date_rejects_years_outside_pg_range() {
+    let ex = test_executor();
+    // The old code truncated the i64 argument to i32 and called ymd_to_days
+    // with no year check — debug panic from the i32 overflow, garbage in
+    // release.
+    let err = ex
+        .execute("SELECT MAKE_DATE(9999999, 1, 1)")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("out of range"), "got: {err}");
+    let err = ex
+        .execute("SELECT MAKE_DATE(7000000000, 1, 1)")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("out of range"),
+        "a year that does not even fit i32 must be rejected, got: {err}"
+    );
+    // Upper boundary still works and round-trips.
+    let results = exec(&ex, "SELECT MAKE_DATE(5874897, 1, 1)").await;
+    assert_eq!(
+        scalar(&results[0]),
+        &Value::Date(crate::types::ymd_to_days(5_874_897, 1, 1))
+    );
+}
+
+#[tokio::test]
+async fn to_timestamp_text_rejects_years_outside_pg_range() {
+    let ex = test_executor();
+    let err = ex
+        .execute("SELECT TO_TIMESTAMP('9999999-01-01 00:00:00')")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot parse timestamp"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1319,3 +1361,63 @@ async fn test_show_all() {
 }
 
 // ======================================================================
+
+/// QPP-11: ROUND with a NEGATIVE scale rounds to tens/hundreds (PG:
+/// round(123, -1) = 120), instead of ignoring the negative part.
+#[tokio::test]
+async fn test_round_negative_scale() {
+    let ex = test_executor();
+    let r = exec(&ex, "SELECT ROUND(CAST('123.45' AS NUMERIC), -1)").await;
+    assert_eq!(*scalar(&r[0]), Value::Numeric("120".into()));
+    let r = exec(&ex, "SELECT ROUND(CAST('125' AS NUMERIC), -1)").await;
+    assert_eq!(*scalar(&r[0]), Value::Numeric("130".into()));
+    let r = exec(&ex, "SELECT ROUND(123, -1)").await;
+    assert_eq!(*scalar(&r[0]), Value::Numeric("120".into()));
+    let r = exec(&ex, "SELECT ROUND(CAST('1234.56' AS NUMERIC), -2)").await;
+    assert_eq!(*scalar(&r[0]), Value::Numeric("1200".into()));
+    // Positive scale unchanged (half away from zero).
+    let r = exec(&ex, "SELECT ROUND(CAST('2.5' AS NUMERIC))").await;
+    assert_eq!(*scalar(&r[0]), Value::Numeric("3".into()));
+    let r = exec(&ex, "SELECT ROUND(CAST('2.345' AS NUMERIC), 2)").await;
+    assert_eq!(*scalar(&r[0]), Value::Numeric("2.35".into()));
+}
+
+/// GDPR_DELETE_PLAN must keep apostrophes in the id VALUE and escape them in
+/// the emitted condition — the old blind `.replace('\'', "")` turned
+/// `o'brien@x.com` into `obrien@x.com`, so automation driven by the plan
+/// silently deleted nobody.
+#[tokio::test]
+async fn gdpr_delete_plan_preserves_apostrophes_and_escapes_condition() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE users (email TEXT)").await;
+    let res = exec(
+        &ex,
+        "SELECT GDPR_DELETE_PLAN('users','email','o''brien@x.com')",
+    )
+    .await;
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected Text, got {other:?}"),
+    };
+    assert!(
+        json.contains("email = 'o''brien@x.com'"),
+        "condition must carry the value intact with doubled quotes: {json}"
+    );
+    assert!(
+        !json.contains("obrien@"),
+        "the apostrophe must not be stripped: {json}"
+    );
+}
+
+/// PII detection must not mangle apostrophe-bearing samples either.
+#[tokio::test]
+async fn pii_detect_category_accepts_apostrophe_sample() {
+    let ex = test_executor();
+    let res = exec(&ex, "SELECT PII_DETECT_CATEGORY('email', 'o''brien@x.com')").await;
+    // A category (EMAIL) or NONE — either way it must not error, and the
+    // apostrophe must survive to the detector.
+    match scalar(&res[0]) {
+        Value::Text(c) => assert!(!c.is_empty()),
+        other => panic!("expected Text, got {other:?}"),
+    }
+}

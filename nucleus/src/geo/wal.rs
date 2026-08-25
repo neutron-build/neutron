@@ -63,6 +63,15 @@ pub struct GeoWal {
     /// an acknowledged point mutation survived `kill -9` but not power loss.
     /// NU-006.
     syncer: WalSync,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no future recovery
+    /// reads while `group_sync`/`is_dirty` report healthy. Set when a
+    /// checkpoint replaced the log but its reopen failed; cleared by the next
+    /// successful reattach (or checkpoint reopen). See `reattach_if_stranded`.
+    stranded: std::sync::atomic::AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
+    #[cfg(test)]
+    fail_reopen_once: std::sync::atomic::AtomicBool,
 }
 
 impl GeoWal {
@@ -88,9 +97,44 @@ impl GeoWal {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: WalSync::new(),
+                stranded: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly instead of
+    /// letting it acknowledge a write to a dead inode.
+    fn reattach_if_stranded(&self, w: &mut BufWriter<File>) -> io::Result<()> {
+        if !self.stranded.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("geo.wal_reopen") {
+            return Err(e);
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "geo WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// Flush + `fsync` the log, capturing (under the writer lock) the highest
@@ -143,6 +187,7 @@ impl GeoWal {
         }
 
         let mut w = self.writer.lock();
+        self.reattach_if_stranded(&mut w)?;
         w.write_all(&buf)?;
         w.flush()?;
         self.syncer.on_append();
@@ -156,6 +201,7 @@ impl GeoWal {
         buf.extend_from_slice(&doc_id.to_le_bytes());
 
         let mut w = self.writer.lock();
+        self.reattach_if_stranded(&mut w)?;
         w.write_all(&buf)?;
         w.flush()?;
         self.syncer.on_append();
@@ -220,9 +266,38 @@ impl GeoWal {
         {
             let _ = d.sync_all();
         }
+        // The reopen is the hazardous half: the rename above already unlinked
+        // the inode `guard` holds, so a failure here leaves the writer
+        // pointing at a file no future recovery reads.
+        #[cfg(test)]
+        let injected: Option<io::Error> = self
+            .fail_reopen_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .then(|| io::Error::other("injected geo WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<io::Error> = None;
+        let file = if let Some(e) = injected {
+            Err(e)
+        } else if let Some(e) = crate::storage::crashpoint::io_fault("geo.wal_reopen") {
+            Err(e)
+        } else {
+            OpenOptions::new().append(true).open(&self.path)
+        };
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                // The rename already happened, so the handle in `guard` is
+                // now an unlinked inode. Mark the writer stranded: appends
+                // must reattach (or fail loudly), never write through it.
+                self.stranded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
+        };
         // Re-open in append mode for future writes
-        let file = OpenOptions::new().append(true).open(&self.path)?;
         *guard = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -477,6 +552,46 @@ mod tests {
         assert!(state.points.contains_key(&1));
         assert!(state.points.contains_key(&3));
         assert!(!state.points.contains_key(&2));
+    }
+
+    /// S31-14: a checkpoint whose reopen fails must not leave the writer
+    /// appending into the unlinked inode the rename displaced. Those appends
+    /// report success while no future recovery can ever read them, so an
+    /// acknowledged point silently vanishes at restart. The discriminator is
+    /// durability: the post-failure insert must land in the replaced file.
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = GeoWal::open(dir.path()).unwrap();
+            wal.log_insert(1, &Point::new(0.0, 0.0), "a", &HashMap::new())
+                .unwrap();
+            let mut points = HashMap::new();
+            points.insert(
+                1,
+                GeoWalPoint {
+                    doc_id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    name: "a".to_string(),
+                    properties: HashMap::new(),
+                },
+            );
+            wal.fail_reopen_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wal.checkpoint(&points)
+                .expect_err("the injected reopen failure must fail the checkpoint");
+            wal.log_insert(2, &Point::new(1.0, 1.0), "b", &HashMap::new())
+                .expect("a later append must reattach, not strand");
+        }
+        let (_wal2, state) = GeoWal::open(dir.path()).unwrap();
+        assert_eq!(
+            state.points.len(),
+            2,
+            "the post-checkpoint-failure insert went to the unlinked inode: it \
+             returned Ok and no recovery can ever read it"
+        );
+        assert!(state.points.contains_key(&2));
     }
 
     #[test]

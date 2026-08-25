@@ -7,6 +7,13 @@
 //! The rule is deliberately conservative: anything whose *name* looks like a
 //! credential is masked, and SQL text is scrubbed of the literal that follows
 //! a credential-bearing keyword before it is logged.
+//!
+//! **Status (PRC-11): test-only — not wired into any log path.** These
+//! helpers have zero production callers; SQL text still reaches logs
+//! unredacted (e.g. the `sql={sql}` sites in `main.rs`), so `CREATE ROLE ...
+//! PASSWORD '...'` is logged verbatim. Wiring them into the logging layer is
+//! the recorded follow-up; until then, do not assume a call site is covered
+//! just because this module exists.
 
 /// The replacement written in place of any secret.
 pub const REDACTED: &str = "[REDACTED]";

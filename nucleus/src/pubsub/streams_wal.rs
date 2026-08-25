@@ -29,6 +29,9 @@
 //!            [n_ids: u32] [per id: ms(u64) + seq(u64)]
 //! XACK:      [0x06] [stream_name] [group_name]
 //!            [n_ids: u32] [per id: ms(u64) + seq(u64)]
+//! XACK_V2:   [0x0B] [stream_name] [group_name]
+//!            [n_consumers: u32] [per consumer: len(u32) + name
+//!             + n_ids(u32) + per id: ms(u64) + seq(u64)]
 //! ```
 //!
 //! A SNAPSHOT (either version) resets all state. After `checkpoint()` the file
@@ -45,12 +48,35 @@
 //! reads a version header, because there is none and adding one would break
 //! exactly those old files.
 //!
+//! ## Transaction-tagged records (S63)
+//!
+//! Opcodes `0x07`-`0x0A` are the `_XACT` twins of the four mutation records,
+//! each carrying the coordinating transaction id (`u64 LE`) between the tag
+//! and the twin's body. Replay keeps a tagged record only if its id is
+//! `XACT_AUTOCOMMIT` (0 — written outside any explicit transaction, whose
+//! durability point is this log's own fsync) or appears in the committed set
+//! recovered from the SQL side; everything else was written inside a
+//! transaction that never committed and is discarded — absence of a commit
+//! record means discard, always. The untagged opcodes keep their keep-
+//! unconditionally meaning, so pre-S63 logs replay unchanged.
+//!
 //! The truncation contract in `replay` is preserved too: every new arm either
 //! applies whole or abandons the record at `entry_start`, so a torn tail is
 //! still truncated to the last valid boundary rather than half-applied. This
 //! log carries no checksum, so replay stopping remains the only detection
 //! there is — which is also why every count read off disk is bounded by
 //! `bounded_by_remaining` before it reaches `Vec::with_capacity`.
+//!
+//! ## Owner-tagged acks (S31-15)
+//!
+//! `ENTRY_XACK_V2` (`0x0B`) and its `_XACT` twin (`0x0C`) extend the ack
+//! record with the PEL owner of each acked id, grouped per consumer. The
+//! owner is known only before the ack removes the entry, and a statement
+//! that cannot log it must not perform it, so the executor collects owners,
+//! logs this record, and only then removes from the PELs. Replay removes
+//! each consumer's ids from exactly that consumer's pending list; the v1
+//! record (which recorded no owners) keeps its remove-from-everyone
+//! meaning, so pre-S31-15 logs replay unchanged.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -60,6 +86,7 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 
 use super::{ConsumerGroup, Stream, StreamEntryId};
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 
 // ---- Entry type tags --------------------------------------------------------
 
@@ -70,6 +97,24 @@ const ENTRY_SNAPSHOT_V2: u8 = 0x03;
 const ENTRY_XGROUP_CREATE: u8 = 0x04;
 const ENTRY_XREADGROUP: u8 = 0x05;
 const ENTRY_XACK: u8 = 0x06;
+/// S63: XADD carrying the coordinating transaction id. Body after the id is
+/// byte-identical to [`ENTRY_XADD`].
+const ENTRY_XADD_XACT: u8 = 0x07;
+/// S63: consumer-group create carrying the coordinating transaction id.
+const ENTRY_XGROUP_CREATE_XACT: u8 = 0x08;
+/// S63: group delivery (cursor advance + PEL additions) carrying the
+/// coordinating transaction id.
+const ENTRY_XREADGROUP_XACT: u8 = 0x09;
+/// S63: acknowledgement carrying the coordinating transaction id.
+const ENTRY_XACK_XACT: u8 = 0x0A;
+/// S31-15: acknowledgement that additionally records, per consumer, the ids
+/// that consumer's pending list owned at ack time — the one fact the removal
+/// itself destroys. Body layout otherwise follows [`ENTRY_XACK`] with the flat
+/// id list replaced by the per-consumer grouping.
+const ENTRY_XACK_V2: u8 = 0x0B;
+/// S31-15: owner-carrying acknowledgement with the coordinating transaction
+/// id. Body after the id is byte-identical to [`ENTRY_XACK_V2`].
+const ENTRY_XACK_V2_XACT: u8 = 0x0C;
 
 // ---- Public types -----------------------------------------------------------
 
@@ -94,6 +139,13 @@ pub struct StreamsWalState {
     pub groups: StreamGroupsMap,
     /// `stream_name -> max_len` for streams that carry a cap.
     pub max_len: HashMap<String, usize>,
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded. Seeds the XactId
+    /// high-water mark at executor construction (S63): a reopened process
+    /// must never mint an id that a surviving tagged record already carries,
+    /// or the recovery filter could resurrect stale records by matching a
+    /// fresh transaction against them.
+    pub max_xact_id: u64,
 }
 
 /// Append-only Streams WAL.
@@ -102,9 +154,18 @@ pub struct StreamsWal {
     writer: Mutex<BufWriter<File>>,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: crate::storage::wal_util::WalSync,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no recovery reads
+    /// while `group_sync`/`is_dirty` report healthy. Set when a checkpoint
+    /// replaced the log but its reopen failed; cleared by the next successful
+    /// reattach (or checkpoint reopen). See `reattach_if_stranded`.
+    stranded: std::sync::atomic::AtomicBool,
     /// Test-only append fault switch; see `append`.
     #[cfg(test)]
     fail_appends: std::sync::atomic::AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
+    #[cfg(test)]
+    fail_reopen_once: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -119,18 +180,23 @@ impl StreamsWal {
 impl StreamsWal {
     /// Open or create the WAL file in `dir`.
     ///
+    /// `committed` is the set of coordinating transaction ids that durably
+    /// committed on the SQL side (S63); a tagged record whose id is neither in
+    /// it nor `XACT_AUTOCOMMIT` is discarded — its transaction never
+    /// committed, and absence of a commit record means discard, always.
+    ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
     /// state is empty. A torn or corrupt tail ends replay and is truncated
     /// away, so subsequent appends land on a valid boundary (they would
     /// otherwise sit behind garbage and be lost to every future replay — this
     /// log carries no checksum, so replay stopping is the only detection there
     /// is). Same treatment as `blob/wal.rs::open`.
-    pub fn open(dir: &Path) -> io::Result<(Self, StreamsWalState)> {
+    pub fn open(dir: &Path, committed: &HashSet<u64>) -> io::Result<(Self, StreamsWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("streams.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            let (state, valid_end) = replay(&data);
+            let (state, valid_end) = replay(&data, committed);
             if valid_end < data.len() {
                 eprintln!(
                     "streams WAL: truncating {} torn/corrupt trailing bytes",
@@ -150,22 +216,37 @@ impl StreamsWal {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
+                stranded: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_appends: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
     }
 
     /// Log an XADD operation (stream append).
+    ///
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction,
+    /// `Some(id)` inside one, `None` to write the legacy untagged record
+    /// (kept unconditionally on replay — the pre-S63 compatibility rule).
     pub fn log_xadd(
         &self,
+        xact: Option<u64>,
         stream_name: &str,
         entry_id: &StreamEntryId,
         fields: &[(String, String)],
     ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(ENTRY_XADD);
+        match xact {
+            Some(x) => {
+                buf.push(ENTRY_XADD_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(ENTRY_XADD),
+        }
 
         // stream name
         write_str(&mut buf, stream_name);
@@ -192,13 +273,23 @@ impl StreamsWal {
     /// the vanished group returned an empty result — indistinguishable from
     /// "caught up", so a consumer silently skipped everything it had not yet
     /// processed instead of failing.
+    ///
+    /// `xact` mirrors [`StreamsWal::log_xadd`].
     pub fn log_xgroup_create(
         &self,
+        xact: Option<u64>,
         stream_name: &str,
         group: &str,
         start_id: &StreamEntryId,
     ) -> io::Result<()> {
-        let mut buf = vec![ENTRY_XGROUP_CREATE];
+        let mut buf = Vec::new();
+        match xact {
+            Some(x) => {
+                buf.push(ENTRY_XGROUP_CREATE_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(ENTRY_XGROUP_CREATE),
+        }
         write_str(&mut buf, stream_name);
         write_str(&mut buf, group);
         buf.extend_from_slice(&start_id.ms.to_le_bytes());
@@ -208,15 +299,25 @@ impl StreamsWal {
 
     /// Log a group delivery: the advanced cursor, the consumer that claimed the
     /// entries, and the ids added to that consumer's pending list (the PEL).
+    ///
+    /// `xact` mirrors [`StreamsWal::log_xadd`].
     pub fn log_xreadgroup(
         &self,
+        xact: Option<u64>,
         stream_name: &str,
         group: &str,
         consumer: &str,
         last_delivered: &StreamEntryId,
         delivered: &[StreamEntryId],
     ) -> io::Result<()> {
-        let mut buf = vec![ENTRY_XREADGROUP];
+        let mut buf = Vec::new();
+        match xact {
+            Some(x) => {
+                buf.push(ENTRY_XREADGROUP_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(ENTRY_XREADGROUP),
+        }
         write_str(&mut buf, stream_name);
         write_str(&mut buf, group);
         write_str(&mut buf, consumer);
@@ -227,16 +328,67 @@ impl StreamsWal {
     }
 
     /// Log an acknowledgement: the ids leave the group's pending list.
+    ///
+    /// Legacy v1 record: it names no owner, so replay removes the ids from
+    /// every consumer's pending list. New writers should prefer
+    /// [`StreamsWal::log_xack_owned`], which records the owner per id; this
+    /// one is kept so a pre-S31-15 log keeps replaying (and keeps being
+    /// testable) byte-for-byte.
+    ///
+    /// `xact` mirrors [`StreamsWal::log_xadd`].
     pub fn log_xack(
         &self,
+        xact: Option<u64>,
         stream_name: &str,
         group: &str,
         ids: &[StreamEntryId],
     ) -> io::Result<()> {
-        let mut buf = vec![ENTRY_XACK];
+        let mut buf = Vec::new();
+        match xact {
+            Some(x) => {
+                buf.push(ENTRY_XACK_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(ENTRY_XACK),
+        }
         write_str(&mut buf, stream_name);
         write_str(&mut buf, group);
         write_ids(&mut buf, ids);
+        self.append(&buf)
+    }
+
+    /// Log an acknowledgement recording, per consumer, the ids that
+    /// consumer's pending list owned at ack time (S31-15).
+    ///
+    /// The owner is only knowable before the ack removes the entry, which is
+    /// why the caller collects `owners` first, logs this record, and only
+    /// then mutates the PELs — on an append failure the statement fails and
+    /// nothing has to be restored. Replay removes each consumer's ids from
+    /// exactly that consumer's pending list.
+    ///
+    /// `xact` mirrors [`StreamsWal::log_xadd`].
+    pub fn log_xack_owned(
+        &self,
+        xact: Option<u64>,
+        stream_name: &str,
+        group: &str,
+        owners: &[(String, Vec<StreamEntryId>)],
+    ) -> io::Result<()> {
+        let mut buf = Vec::new();
+        match xact {
+            Some(x) => {
+                buf.push(ENTRY_XACK_V2_XACT);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(ENTRY_XACK_V2),
+        }
+        write_str(&mut buf, stream_name);
+        write_str(&mut buf, group);
+        buf.extend_from_slice(&(owners.len() as u32).to_le_bytes());
+        for (consumer, ids) in owners {
+            write_str(&mut buf, consumer);
+            write_ids(&mut buf, ids);
+        }
         self.append(&buf)
     }
 
@@ -261,9 +413,42 @@ impl StreamsWal {
             ));
         }
         let mut w = self.writer.lock();
+        self.reattach_if_stranded(&mut w)?;
         w.write_all(buf)?;
         w.flush()?;
         self.syncer.on_append();
+        Ok(())
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly instead of
+    /// letting it acknowledge a write to a dead inode.
+    fn reattach_if_stranded(&self, w: &mut BufWriter<File>) -> io::Result<()> {
+        if !self.stranded.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("streams.wal_reopen") {
+            return Err(e);
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "streams WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -378,8 +563,37 @@ impl StreamsWal {
         let mut w = self.writer.lock();
         w.flush()?;
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
-        let file = OpenOptions::new().append(true).open(&self.path)?;
+        // The reopen is the hazardous half: the rename above already unlinked
+        // the inode `w` holds, so a failure here leaves the writer pointing at
+        // a file no future recovery reads.
+        #[cfg(test)]
+        let injected: Option<io::Error> = self
+            .fail_reopen_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .then(|| io::Error::other("injected streams WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<io::Error> = None;
+        let file = if let Some(e) = injected {
+            Err(e)
+        } else if let Some(e) = crate::storage::crashpoint::io_fault("streams.wal_reopen") {
+            Err(e)
+        } else {
+            OpenOptions::new().append(true).open(&self.path)
+        };
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                // The rename already happened, so the handle in `w` is now an
+                // unlinked inode. Mark the writer stranded: appends must
+                // reattach (or fail loudly), never write through it.
+                self.stranded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
+        };
         *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
         // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
         let mark = self.syncer.on_append();
         self.syncer.mark_synced(mark);
@@ -437,14 +651,24 @@ fn write_ids(buf: &mut Vec<u8>, ids: &[StreamEntryId]) {
 /// Replay all entries in `data`. Returns the recovered state and the byte
 /// offset of the first torn/corrupt entry (== `data.len()` when fully valid).
 ///
+/// `committed` is the set of coordinating transaction ids that durably
+/// committed on the SQL side. A `_XACT` record whose id is `XACT_AUTOCOMMIT`
+/// or in the set is applied exactly like its untagged twin; any other id is
+/// parsed (so the next record's boundary is still found — this format is not
+/// length-framed) and then discarded: its transaction never committed, and
+/// absence of a commit record means discard, always. Ids seen on tagged
+/// records feed `max_xact_id` whether or not the record is kept, so the
+/// caller can seed the id high-water mark.
+///
 /// No arm here half-applies: the XADD arm pushes only after every field parses,
 /// and the SNAPSHOT arm builds a temporary map and swaps it in only on success.
 /// So the state accumulated when an entry is abandoned already equals a replay
 /// of the clean prefix, and `entry_start` is the truncation point.
-fn replay(data: &[u8]) -> (StreamsWalState, usize) {
+fn replay(data: &[u8], committed: &HashSet<u64>) -> (StreamsWalState, usize) {
     let mut streams: StreamsMap = HashMap::new();
     let mut groups: StreamGroupsMap = HashMap::new();
     let mut max_len: HashMap<String, usize> = HashMap::new();
+    let mut max_xact_id: u64 = 0;
     let mut pos = 0usize;
 
     while pos < data.len() {
@@ -456,6 +680,7 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                         streams,
                         groups,
                         max_len,
+                        max_xact_id,
                     },
                     entry_start,
                 );
@@ -467,8 +692,30 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
         };
         pos += 1;
 
+        // The tagged arms parse their id, then share the body parse with the
+        // untagged twin. `keep_tagged` is the S63 filter in one expression: an
+        // autocommit record is durable by its own fsync, a committed id was
+        // vouched for by a durable COMMIT record, anything else never
+        // happened. Parsing continues either way — the record must be fully
+        // consumed to find the next one, since nothing length-frames these.
+        let mut keep_tagged = true;
+        if matches!(
+            entry_type,
+            ENTRY_XADD_XACT
+                | ENTRY_XGROUP_CREATE_XACT
+                | ENTRY_XREADGROUP_XACT
+                | ENTRY_XACK_XACT
+                | ENTRY_XACK_V2_XACT
+        ) {
+            let Some(xact) = read_u64(data, &mut pos) else {
+                torn!();
+            };
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
+
         match entry_type {
-            ENTRY_XADD => {
+            ENTRY_XADD | ENTRY_XADD_XACT => {
                 let Some(stream_name) = read_string(data, &mut pos) else {
                     torn!();
                 };
@@ -504,10 +751,12 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                 if !ok {
                     torn!();
                 }
-                streams
-                    .entry(stream_name)
-                    .or_default()
-                    .push((StreamEntryId::new(ms, seq), fields));
+                if keep_tagged {
+                    streams
+                        .entry(stream_name)
+                        .or_default()
+                        .push((StreamEntryId::new(ms, seq), fields));
+                }
             }
             ENTRY_SNAPSHOT | ENTRY_SNAPSHOT_V2 => {
                 // Parse into a temporary map and only swap it in once the snapshot
@@ -529,7 +778,7 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                     torn!();
                 }
             }
-            ENTRY_XGROUP_CREATE => {
+            ENTRY_XGROUP_CREATE | ENTRY_XGROUP_CREATE_XACT => {
                 let Some(stream_name) = read_string(data, &mut pos) else {
                     torn!();
                 };
@@ -542,6 +791,9 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                 let Some(seq) = read_u64(data, &mut pos) else {
                     torn!();
                 };
+                if !keep_tagged {
+                    continue;
+                }
                 // Last-wins, matching `Stream::xgroup_recreate`. Replay must
                 // apply this record unconditionally: it exists only because a
                 // live create succeeded, and the only way a second record for
@@ -557,7 +809,7 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                     },
                 );
             }
-            ENTRY_XREADGROUP => {
+            ENTRY_XREADGROUP | ENTRY_XREADGROUP_XACT => {
                 let Some(stream_name) = read_string(data, &mut pos) else {
                     torn!();
                 };
@@ -576,6 +828,9 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                 let Some(ids) = read_ids(data, &mut pos) else {
                     torn!();
                 };
+                if !keep_tagged {
+                    continue;
+                }
                 // A delivery against a group the log never created cannot be
                 // applied to anything; skip it rather than inventing a group
                 // with a cursor nobody chose.
@@ -588,7 +843,7 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                     g.pending.entry(consumer).or_default().extend(ids);
                 }
             }
-            ENTRY_XACK => {
+            ENTRY_XACK | ENTRY_XACK_XACT => {
                 let Some(stream_name) = read_string(data, &mut pos) else {
                     torn!();
                 };
@@ -598,12 +853,59 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
                 let Some(ids) = read_ids(data, &mut pos) else {
                     torn!();
                 };
+                if !keep_tagged {
+                    continue;
+                }
                 if let Some(g) = groups
                     .get_mut(&stream_name)
                     .and_then(|m| m.get_mut(&group_name))
                 {
                     for pending in g.pending.values_mut() {
                         pending.retain(|id| !ids.contains(id));
+                    }
+                }
+            }
+            ENTRY_XACK_V2 | ENTRY_XACK_V2_XACT => {
+                let Some(stream_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(group_name) = read_string(data, &mut pos) else {
+                    torn!();
+                };
+                let Some(n_consumers) = read_u32(data, &mut pos) else {
+                    torn!();
+                };
+                // Off-disk count, unchecksummed file: bound it by the bytes
+                // actually present. A consumer section costs at least its two
+                // 4-byte length prefixes (name and id count).
+                let mut owners =
+                    Vec::with_capacity(bounded_by_remaining(data, pos, n_consumers as usize, 8));
+                let mut ok = true;
+                for _ in 0..n_consumers {
+                    let Some(consumer) = read_string(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(ids) = read_ids(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
+                    owners.push((consumer, ids));
+                }
+                if !ok {
+                    torn!();
+                }
+                if !keep_tagged {
+                    continue;
+                }
+                if let Some(g) = groups
+                    .get_mut(&stream_name)
+                    .and_then(|m| m.get_mut(&group_name))
+                {
+                    for (consumer, ids) in owners {
+                        if let Some(pending) = g.pending.get_mut(&consumer) {
+                            pending.retain(|id| !ids.contains(id));
+                        }
                     }
                 }
             }
@@ -619,6 +921,7 @@ fn replay(data: &[u8]) -> (StreamsWalState, usize) {
             streams,
             groups,
             max_len,
+            max_xact_id,
         },
         pos,
     )
@@ -805,6 +1108,86 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
 mod tests {
     use super::*;
 
+    // ── S63: the recovery filter ──────────────────────────────────────────
+
+    /// One buffered log exercising every filter decision at once: legacy and
+    /// autocommit records keep, committed ids keep, unknown ids discard —
+    /// and a discarded record in the MIDDLE does not stop the records after
+    /// it (they are parsed past, not abandoned).
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let mut buf = Vec::new();
+        // Legacy untagged XADD (pre-S63 log): keep unconditionally.
+        buf.push(ENTRY_XADD);
+        push_str_field(&mut buf, "legacy");
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        push_str_field(&mut buf, "k");
+        push_str_field(&mut buf, "legacy-v");
+        // Tagged autocommit (0): keep.
+        let xadd_tagged = |buf: &mut Vec<u8>, xact: u64, name: &str, val: &str| {
+            buf.push(ENTRY_XADD_XACT);
+            buf.extend_from_slice(&xact.to_le_bytes());
+            push_str_field(buf, name);
+            buf.extend_from_slice(&1u64.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            push_str_field(buf, "k");
+            push_str_field(buf, val);
+        };
+        xadd_tagged(&mut buf, 0, "s", "auto");
+        xadd_tagged(&mut buf, 7, "s", "committed");
+        xadd_tagged(&mut buf, 8, "s", "never-committed"); // discarded, mid-log
+        xadd_tagged(&mut buf, 9, "s", "committed-late");
+
+        let committed: HashSet<u64> = [7u64, 9u64].into_iter().collect();
+        let (state, valid_end) = replay(&buf, &committed);
+        assert_eq!(valid_end, buf.len(), "every record parses");
+        assert_eq!(
+            state.max_xact_id, 9,
+            "discarded records still feed the floor"
+        );
+        let entries = &state.streams["s"];
+        assert_eq!(entries.len(), 3, "auto + 7 + 9; 8 is discarded");
+        let vals: Vec<&str> = entries.iter().map(|(_, f)| f[0].1.as_str()).collect();
+        assert_eq!(vals, vec!["auto", "committed", "committed-late"]);
+        assert!(state.streams.contains_key("legacy"));
+    }
+
+    /// Group records filter the same way: an uncommitted group's create is
+    /// discarded, so its later deliveries (if any) find no group to touch.
+    #[test]
+    fn tagged_group_records_filter_on_the_committed_set() {
+        let mut buf = Vec::new();
+        // Group created inside txn 5, which never committed.
+        buf.push(ENTRY_XGROUP_CREATE_XACT);
+        buf.extend_from_slice(&5u64.to_le_bytes());
+        push_str_field(&mut buf, "s");
+        push_str_field(&mut buf, "g");
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // Same group, committed txn 6: the group exists.
+        buf.push(ENTRY_XGROUP_CREATE_XACT);
+        buf.extend_from_slice(&6u64.to_le_bytes());
+        push_str_field(&mut buf, "s");
+        push_str_field(&mut buf, "g2");
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        let committed: HashSet<u64> = [6u64].into_iter().collect();
+        let (state, valid_end) = replay(&buf, &committed);
+        assert_eq!(valid_end, buf.len());
+        assert!(
+            !state.groups.get("s").is_some_and(|m| m.contains_key("g")),
+            "the uncommitted group must not be resurrected"
+        );
+        assert!(
+            state.groups.get("s").is_some_and(|m| m.contains_key("g2")),
+            "the committed group must exist"
+        );
+    }
+
     // ── Unbounded-preallocation class (NU-385) ──
     //
     // These counts are `u32`s read straight out of the WAL, and this file
@@ -844,7 +1227,7 @@ mod tests {
         buf.extend_from_slice(&1000u64.to_le_bytes()); // ms
         buf.extend_from_slice(&0u64.to_le_bytes()); // seq
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_fields, a lie
-        let (state, _) = replay(&buf);
+        let (state, _) = replay(&buf, &HashSet::new());
         assert!(
             state.streams.is_empty(),
             "a field count the bytes cannot back must abandon the entry"
@@ -901,7 +1284,7 @@ mod tests {
         // Now a snapshot whose stream count is a lie.
         buf.push(ENTRY_SNAPSHOT);
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
-        let (state, _) = replay(&buf);
+        let (state, _) = replay(&buf, &HashSet::new());
         assert_eq!(state.streams.len(), 1);
         assert_eq!(state.streams["events"].len(), 1);
     }
@@ -909,22 +1292,75 @@ mod tests {
     #[test]
     fn group_sync_marks_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+        let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
-        wal.log_xadd("s", &StreamEntryId::new(1, 0), &[("k".into(), "v".into())])
-            .unwrap();
+        wal.log_xadd(
+            None,
+            "s",
+            &StreamEntryId::new(1, 0),
+            &[("k".into(), "v".into())],
+        )
+        .unwrap();
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
     }
 
+    /// S31-14: a checkpoint whose reopen fails must not leave the writer
+    /// appending into the unlinked inode the rename displaced. Those appends
+    /// report success while no future recovery can ever read them, so an
+    /// acknowledged entry silently vanishes at restart. The discriminator is
+    /// durability: the post-failure append must land in the replaced file.
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xadd(
+                None,
+                "s",
+                &StreamEntryId::new(1, 0),
+                &[("k".into(), "before".into())],
+            )
+            .unwrap();
+            let mut stream = Stream::new();
+            stream.xadd_with_id(
+                StreamEntryId::new(1, 0),
+                vec![("k".into(), "before".into())],
+            );
+            let mut streams = HashMap::new();
+            streams.insert("s".to_string(), stream);
+            wal.fail_reopen_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wal.checkpoint(&streams)
+                .expect_err("the injected reopen failure must fail the checkpoint");
+            wal.log_xadd(
+                None,
+                "s",
+                &StreamEntryId::new(2, 0),
+                &[("k".into(), "after".into())],
+            )
+            .expect("a later append must reattach, not strand");
+        }
+        let (_, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+        let entries = state.streams.get("s").expect("stream survived");
+        assert_eq!(
+            entries.len(),
+            2,
+            "the post-checkpoint-failure append went to the unlinked inode: it \
+             returned Ok and no recovery can ever read it"
+        );
+        assert_eq!(entries[1].0, StreamEntryId::new(2, 0));
+    }
+
     #[test]
     fn test_xadd_and_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert!(state.streams.is_empty());
 
         wal.log_xadd(
+            None,
             "events",
             &StreamEntryId::new(1000, 0),
             &[
@@ -934,6 +1370,7 @@ mod tests {
         )
         .unwrap();
         wal.log_xadd(
+            None,
             "events",
             &StreamEntryId::new(1001, 0),
             &[
@@ -943,6 +1380,7 @@ mod tests {
         )
         .unwrap();
         wal.log_xadd(
+            None,
             "logs",
             &StreamEntryId::new(2000, 0),
             &[("level".into(), "info".into())],
@@ -950,7 +1388,7 @@ mod tests {
         .unwrap();
         drop(wal);
 
-        let (_wal2, state2) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal2, state2) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert_eq!(state2.streams.len(), 2);
         assert_eq!(state2.streams["events"].len(), 2);
         assert_eq!(state2.streams["logs"].len(), 1);
@@ -964,15 +1402,17 @@ mod tests {
     #[test]
     fn test_rebuild_streams() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+        let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
 
         wal.log_xadd(
+            None,
             "mystream",
             &StreamEntryId::new(100, 0),
             &[("k".into(), "v1".into())],
         )
         .unwrap();
         wal.log_xadd(
+            None,
             "mystream",
             &StreamEntryId::new(200, 0),
             &[("k".into(), "v2".into())],
@@ -980,7 +1420,7 @@ mod tests {
         .unwrap();
         drop(wal);
 
-        let (_wal2, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal2, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         let rebuilt = rebuild_streams(&state);
         assert_eq!(rebuilt.len(), 1);
         let stream = &rebuilt["mystream"];
@@ -992,13 +1432,23 @@ mod tests {
     #[test]
     fn test_checkpoint_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+        let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
 
         // Add entries to two streams
-        wal.log_xadd("s1", &StreamEntryId::new(1, 0), &[("a".into(), "1".into())])
-            .unwrap();
-        wal.log_xadd("s2", &StreamEntryId::new(2, 0), &[("b".into(), "2".into())])
-            .unwrap();
+        wal.log_xadd(
+            None,
+            "s1",
+            &StreamEntryId::new(1, 0),
+            &[("a".into(), "1".into())],
+        )
+        .unwrap();
+        wal.log_xadd(
+            None,
+            "s2",
+            &StreamEntryId::new(2, 0),
+            &[("b".into(), "2".into())],
+        )
+        .unwrap();
 
         // Checkpoint with only s1
         let mut checkpoint_streams = HashMap::new();
@@ -1008,11 +1458,16 @@ mod tests {
         wal.checkpoint(&checkpoint_streams).unwrap();
 
         // Add new entry after checkpoint
-        wal.log_xadd("s1", &StreamEntryId::new(3, 0), &[("c".into(), "3".into())])
-            .unwrap();
+        wal.log_xadd(
+            None,
+            "s1",
+            &StreamEntryId::new(3, 0),
+            &[("c".into(), "3".into())],
+        )
+        .unwrap();
         drop(wal);
 
-        let (_wal2, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal2, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         // s2 was dropped by checkpoint, s1 has 2 entries (snapshot + post-checkpoint)
         assert_eq!(state.streams.len(), 1);
         assert!(state.streams.contains_key("s1"));
@@ -1023,7 +1478,7 @@ mod tests {
     #[test]
     fn test_empty_open() {
         let dir = tempfile::tempdir().unwrap();
-        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert!(state.streams.is_empty());
     }
 
@@ -1033,8 +1488,9 @@ mod tests {
         let wal_path = dir.path().join("streams.wal");
 
         {
-            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
             wal.log_xadd(
+                None,
                 "good_stream",
                 &StreamEntryId::new(42, 0),
                 &[("k".into(), "v".into())],
@@ -1050,7 +1506,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert_eq!(state.streams.len(), 1);
         assert!(state.streams.contains_key("good_stream"));
         assert_eq!(state.streams["good_stream"].len(), 1);
@@ -1067,9 +1523,14 @@ mod tests {
         let wal_path = dir.path().join("streams.wal");
 
         {
-            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
-            wal.log_xadd("s", &StreamEntryId::new(1, 0), &[("k".into(), "a".into())])
-                .unwrap();
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xadd(
+                None,
+                "s",
+                &StreamEntryId::new(1, 0),
+                &[("k".into(), "a".into())],
+            )
+            .unwrap();
             wal.group_sync().unwrap();
         }
         let clean_len = std::fs::metadata(&wal_path).unwrap().len();
@@ -1087,7 +1548,7 @@ mod tests {
 
         // Reopen: the torn bytes must be gone, and the good prefix intact.
         {
-            let (wal, state) = StreamsWal::open(dir.path()).unwrap();
+            let (wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
             assert_eq!(state.streams["s"].len(), 1);
             assert_eq!(
                 std::fs::metadata(&wal_path).unwrap().len(),
@@ -1095,13 +1556,18 @@ mod tests {
                 "the torn tail must be truncated away on open"
             );
             // Append a good record behind where the garbage used to be.
-            wal.log_xadd("s", &StreamEntryId::new(2, 0), &[("k".into(), "b".into())])
-                .unwrap();
+            wal.log_xadd(
+                None,
+                "s",
+                &StreamEntryId::new(2, 0),
+                &[("k".into(), "b".into())],
+            )
+            .unwrap();
             wal.group_sync().unwrap();
         }
 
         // The record written after the torn tail must survive a reopen.
-        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         let entries = &state.streams["s"];
         assert_eq!(
             entries.len(),
@@ -1115,12 +1581,13 @@ mod tests {
     #[test]
     fn test_multiple_streams_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+        let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
 
         for i in 0..5 {
             let name = format!("stream_{}", i);
             for j in 0..3 {
                 wal.log_xadd(
+                    None,
                     &name,
                     &StreamEntryId::new(i * 100 + j, 0),
                     &[("idx".into(), format!("{}-{}", i, j))],
@@ -1130,7 +1597,7 @@ mod tests {
         }
         drop(wal);
 
-        let (_wal2, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal2, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert_eq!(state.streams.len(), 5);
         for i in 0..5 {
             let name = format!("stream_{}", i);
@@ -1152,20 +1619,21 @@ mod tests {
         let id1 = StreamEntryId::new(10, 0);
         let id2 = StreamEntryId::new(20, 0);
         {
-            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
-            wal.log_xadd("s", &id1, &[("k".into(), "a".into())])
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xadd(None, "s", &id1, &[("k".into(), "a".into())])
                 .unwrap();
-            wal.log_xadd("s", &id2, &[("k".into(), "b".into())])
+            wal.log_xadd(None, "s", &id2, &[("k".into(), "b".into())])
                 .unwrap();
-            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+            wal.log_xgroup_create(None, "s", "g", &StreamEntryId::new(0, 0))
                 .unwrap();
-            wal.log_xreadgroup("s", "g", "c1", &id2, &[id1.clone(), id2.clone()])
+            wal.log_xreadgroup(None, "s", "g", "c1", &id2, &[id1.clone(), id2.clone()])
                 .unwrap();
-            wal.log_xack("s", "g", std::slice::from_ref(&id1)).unwrap();
+            wal.log_xack(None, "s", "g", std::slice::from_ref(&id1))
+                .unwrap();
             wal.group_sync().unwrap();
         }
 
-        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         let rebuilt = rebuild_streams(&state);
         let stream = &rebuilt["s"];
         assert_eq!(stream.xlen(), 2);
@@ -1183,12 +1651,96 @@ mod tests {
         );
     }
 
+    /// S31-15: the ack record names, per consumer, the ids that consumer's
+    /// pending list owned at ack time, and replay removes them from exactly
+    /// those consumers — a consumer not named keeps its PEL untouched. A v1
+    /// record (no owners) beside it still replays with its old
+    /// remove-from-everyone meaning: addition-only compatibility.
+    #[test]
+    fn xack_v2_records_owners_and_replays_per_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let id1 = StreamEntryId::new(10, 0);
+        let id2 = StreamEntryId::new(20, 0);
+        let id3 = StreamEntryId::new(30, 0);
+        {
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xadd(None, "s", &id1, &[("k".into(), "a".into())])
+                .unwrap();
+            wal.log_xadd(None, "s", &id2, &[("k".into(), "b".into())])
+                .unwrap();
+            wal.log_xadd(None, "s", &id3, &[("k".into(), "c".into())])
+                .unwrap();
+            wal.log_xgroup_create(None, "s", "g", &StreamEntryId::new(0, 0))
+                .unwrap();
+            wal.log_xreadgroup(None, "s", "g", "c1", &id2, &[id1.clone(), id2.clone()])
+                .unwrap();
+            wal.log_xreadgroup(None, "s", "g", "c2", &id3, std::slice::from_ref(&id3))
+                .unwrap();
+            // c1 acks id1; the record must carry that c1 (not c2) owned it.
+            wal.log_xack_owned(None, "s", "g", &[("c1".into(), vec![id1.clone()])])
+                .unwrap();
+            wal.group_sync().unwrap();
+        }
+
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+        let g = &rebuild_streams(&state)["s"].groups["g"];
+        assert_eq!(
+            g.pending["c1"],
+            vec![id2.clone()],
+            "only the owned id left c1's pending list"
+        );
+        assert_eq!(
+            g.pending["c2"],
+            vec![id3.clone()],
+            "a consumer the record does not name keeps its PEL untouched"
+        );
+
+        // A v1 XACK beside a V2 one still replays against every consumer.
+        {
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xack(None, "s", "g", std::slice::from_ref(&id2))
+                .unwrap();
+            wal.group_sync().unwrap();
+        }
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+        let g = &rebuild_streams(&state)["s"].groups["g"];
+        assert!(
+            g.pending["c1"].is_empty(),
+            "the v1 record removed id2 from wherever it was pending"
+        );
+        assert_eq!(g.pending["c2"], vec![id3]);
+    }
+
+    /// NU-385 class on the new opcode: a consumer count the bytes cannot
+    /// back must be refused, not reserved.
+    #[test]
+    fn absurd_xack_v2_consumer_count_is_refused_not_reserved() {
+        let mut buf = vec![ENTRY_XACK_V2];
+        push_str_field(&mut buf, "s");
+        push_str_field(&mut buf, "g");
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_consumers, a lie
+        let (state, end) = replay(&buf, &HashSet::new());
+        assert_eq!(end, 0, "the record must be abandoned at its own start");
+        assert!(state.groups.is_empty());
+
+        // Same for the torn body of the per-consumer sections themselves.
+        let mut buf = vec![ENTRY_XACK_V2];
+        push_str_field(&mut buf, "s");
+        push_str_field(&mut buf, "g");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // one consumer section
+        push_str_field(&mut buf, "c");
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_ids, a lie
+        let (state, end) = replay(&buf, &HashSet::new());
+        assert_eq!(end, 0);
+        assert!(state.groups.is_empty());
+    }
+
     /// A checkpoint rewrites the log from live memory, so a snapshot that
     /// dropped group state would silently un-persist every record above.
     #[test]
     fn checkpoint_round_trips_groups_and_max_len() {
         let dir = tempfile::tempdir().unwrap();
-        let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+        let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
 
         let mut s = Stream::with_max_len(4);
         let a = s.xadd_with_id(StreamEntryId::new(1, 0), vec![("k".into(), "a".into())]);
@@ -1204,7 +1756,7 @@ mod tests {
         wal.checkpoint(&live).unwrap();
         drop(wal);
 
-        let (_wal2, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal2, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         let rebuilt = rebuild_streams(&state);
         let got = &rebuilt["s"];
         assert_eq!(got.xlen(), 2);
@@ -1238,9 +1790,9 @@ mod tests {
             live.insert(name.to_string(), s);
         }
 
-        let (wal_a, _) = StreamsWal::open(dir_a.path()).unwrap();
+        let (wal_a, _) = StreamsWal::open(dir_a.path(), &HashSet::new()).unwrap();
         wal_a.checkpoint(&live).unwrap();
-        let (wal_b, _) = StreamsWal::open(dir_b.path()).unwrap();
+        let (wal_b, _) = StreamsWal::open(dir_b.path(), &HashSet::new()).unwrap();
         wal_b.checkpoint(&live).unwrap();
         assert_eq!(
             std::fs::read(dir_a.path().join("streams.wal")).unwrap(),
@@ -1253,11 +1805,11 @@ mod tests {
     fn group_on_an_entryless_stream_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
-            wal.log_xgroup_create("empty", "g", &StreamEntryId::new(0, 0))
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xgroup_create(None, "empty", "g", &StreamEntryId::new(0, 0))
                 .unwrap();
         }
-        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         let rebuilt = rebuild_streams(&state);
         assert!(
             rebuilt["empty"].groups.contains_key("g"),
@@ -1276,16 +1828,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = StreamEntryId::new(5, 0);
         {
-            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
-            wal.log_xadd("s", &id, &[("k".into(), "v".into())]).unwrap();
-            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xadd(None, "s", &id, &[("k".into(), "v".into())])
                 .unwrap();
-            wal.log_xreadgroup("s", "g", "c", &id, std::slice::from_ref(&id))
+            wal.log_xgroup_create(None, "s", "g", &StreamEntryId::new(0, 0))
                 .unwrap();
-            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+            wal.log_xreadgroup(None, "s", "g", "c", &id, std::slice::from_ref(&id))
+                .unwrap();
+            wal.log_xgroup_create(None, "s", "g", &StreamEntryId::new(0, 0))
                 .unwrap();
         }
-        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         let g = &rebuild_streams(&state)["s"].groups["g"];
         assert_eq!(g.last_delivered_id, StreamEntryId::new(0, 0));
         assert!(g.pending.is_empty());
@@ -1327,7 +1880,7 @@ mod tests {
         let old_len = old.len();
         std::fs::write(&path, &old).unwrap();
 
-        let (wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().len() as usize,
             old_len,
@@ -1340,11 +1893,11 @@ mod tests {
         );
 
         // And the upgraded server can keep writing group records into it.
-        wal.log_xgroup_create("events", "g", &StreamEntryId::new(0, 0))
+        wal.log_xgroup_create(None, "events", "g", &StreamEntryId::new(0, 0))
             .unwrap();
         wal.group_sync().unwrap();
         drop(wal);
-        let (_wal2, state2) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal2, state2) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         assert_eq!(state2.streams["events"].len(), 2);
         assert!(state2.groups["events"].contains_key("g"));
     }
@@ -1362,7 +1915,7 @@ mod tests {
         // Then an old-format snapshot declaring zero streams.
         buf.push(ENTRY_SNAPSHOT);
         buf.extend_from_slice(&0u32.to_le_bytes());
-        let (state, end) = replay(&buf);
+        let (state, end) = replay(&buf, &HashSet::new());
         assert_eq!(end, buf.len());
         assert!(state.streams.is_empty());
         assert!(state.groups.is_empty(), "a snapshot resets ALL state");
@@ -1378,8 +1931,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("streams.wal");
         {
-            let (wal, _) = StreamsWal::open(dir.path()).unwrap();
-            wal.log_xgroup_create("s", "g", &StreamEntryId::new(0, 0))
+            let (wal, _) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
+            wal.log_xgroup_create(None, "s", "g", &StreamEntryId::new(0, 0))
                 .unwrap();
             wal.group_sync().unwrap();
         }
@@ -1396,7 +1949,7 @@ mod tests {
         }
 
         {
-            let (wal, state) = StreamsWal::open(dir.path()).unwrap();
+            let (wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
             assert!(state.groups["s"].contains_key("g"));
             assert_eq!(
                 std::fs::metadata(&path).unwrap().len(),
@@ -1404,6 +1957,7 @@ mod tests {
                 "the torn record must be truncated away on open"
             );
             wal.log_xreadgroup(
+                None,
                 "s",
                 "g",
                 "c",
@@ -1414,7 +1968,7 @@ mod tests {
             wal.group_sync().unwrap();
         }
 
-        let (_wal, state) = StreamsWal::open(dir.path()).unwrap();
+        let (_wal, state) = StreamsWal::open(dir.path(), &HashSet::new()).unwrap();
         let g = &state.groups["s"]["g"];
         assert_eq!(g.last_delivered_id, StreamEntryId::new(9, 0));
         assert_eq!(g.pending["c"], vec![StreamEntryId::new(9, 0)]);
@@ -1429,7 +1983,7 @@ mod tests {
         push_str_field(&mut buf, "s");
         push_str_field(&mut buf, "g");
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_ids, a lie
-        let (state, end) = replay(&buf);
+        let (state, end) = replay(&buf, &HashSet::new());
         assert_eq!(end, 0, "the record must be abandoned at its own start");
         assert!(state.groups.is_empty());
 
@@ -1449,7 +2003,7 @@ mod tests {
         snap.extend_from_slice(&1u32.to_le_bytes()); // n_pending
         push_str_field(&mut snap, "c");
         snap.extend_from_slice(&u32::MAX.to_le_bytes()); // n_ids, a lie
-        let (state, end) = replay(&snap);
+        let (state, end) = replay(&snap, &HashSet::new());
         assert_eq!(end, 0);
         assert!(state.streams.is_empty() && state.groups.is_empty());
     }
@@ -1469,7 +2023,7 @@ mod tests {
         snap.extend_from_slice(&0u64.to_le_bytes());
         snap.extend_from_slice(&0u64.to_le_bytes());
         snap.extend_from_slice(&u32::MAX.to_le_bytes()); // n_consumers, a lie
-        let (state, end) = replay(&snap);
+        let (state, end) = replay(&snap, &HashSet::new());
         assert_eq!(end, 0);
         assert!(state.streams.is_empty() && state.groups.is_empty());
     }

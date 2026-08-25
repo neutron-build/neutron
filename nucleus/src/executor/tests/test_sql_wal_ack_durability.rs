@@ -137,6 +137,11 @@ async fn acked_specialty_writes_are_fsync_durable() {
         !ex.blob_store().read().wal_is_dirty(),
         "a blob write was left un-fsynced past the next commit"
     );
+    assert!(
+        !ex.blob_store().read().segments_dirty(),
+        "blob payload segments were left un-fsynced past the commit that \
+         acked the manifest referencing them (BLO-1)"
+    );
 
     assert!(
         !ex.columnar_store().read().wal_is_dirty(),

@@ -1,16 +1,15 @@
-//! Pub/Sub messaging and job queue system.
+//! Pub/Sub messaging and Redis-style streams.
 //!
 //! Supports:
 //!   - Publish/subscribe channels (fan-out messaging)
-//!   - Job queues with priorities, retries, and dead-letter
 //!   - Reliable delivery with acknowledgments
 //!
-//! Replaces Redis Pub/Sub, BullMQ, Redis Streams.
+//! Replaces Redis Pub/Sub, Redis Streams.
 
 pub mod streams_wal;
 
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -55,6 +54,7 @@ impl PubSubHub {
             timestamp: ts,
         });
 
+        self.prune_empty_channels();
         if let Some(tx) = self.channels.get(channel) {
             tx.send(msg).unwrap_or(0)
         } else {
@@ -64,11 +64,22 @@ impl PubSubHub {
 
     /// Subscribe to a channel. Returns a receiver for messages.
     pub fn subscribe(&mut self, channel: &str) -> broadcast::Receiver<Arc<Message>> {
+        self.prune_empty_channels();
         let tx = self
             .channels
             .entry(channel.to_string())
             .or_insert_with(|| broadcast::channel(self.capacity).0);
         tx.subscribe()
+    }
+
+    /// Drop channels whose last subscriber has gone. A `broadcast::Sender`
+    /// retains up to `capacity` buffered messages with zero receivers, so
+    /// every channel ever subscribed to used to pin a buffer forever. Cheap
+    /// amortized pass on the mutating paths; `channels()` filters live
+    /// channels regardless, so visibility never depends on when the prune
+    /// last ran.
+    fn prune_empty_channels(&mut self) {
+        self.channels.retain(|_, tx| tx.receiver_count() > 0);
     }
 
     /// Get the number of subscribers on a channel.
@@ -79,178 +90,15 @@ impl PubSubHub {
             .unwrap_or(0)
     }
 
-    /// List all active channels.
+    /// List channels with at least one live subscriber (Redis `PUBSUB
+    /// CHANNELS` semantics). Dead-but-unpruned entries are excluded from the
+    /// answer even before the next prune reclaims them.
     pub fn channels(&self) -> Vec<&str> {
-        self.channels.keys().map(|s| s.as_str()).collect()
-    }
-}
-
-// ============================================================================
-// Job Queue
-// ============================================================================
-
-/// Priority level for jobs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Priority {
-    Low = 0,
-    Normal = 1,
-    High = 2,
-    Critical = 3,
-}
-
-/// A job in the queue.
-#[derive(Debug, Clone)]
-pub struct Job {
-    pub id: u64,
-    pub queue: String,
-    pub payload: String,
-    pub priority: Priority,
-    pub max_retries: u32,
-    pub retry_count: u32,
-    pub status: JobStatus,
-    pub created_at: u64,
-}
-
-/// Job status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobStatus {
-    Pending,
-    Processing,
-    Completed,
-    Failed,
-    DeadLetter,
-}
-
-/// Job queue with priorities, retries, and dead-letter.
-pub struct JobQueue {
-    /// Queue name → priority queue of pending jobs (BTreeMap key = (priority_inv, id) for ordering).
-    queues: HashMap<String, BTreeMap<(u8, u64), Job>>,
-    /// All jobs by ID.
-    jobs: HashMap<u64, Job>,
-    /// Dead-letter queue per queue name.
-    dead_letter: HashMap<String, VecDeque<Job>>,
-    /// Next job ID.
-    next_id: u64,
-}
-
-impl Default for JobQueue {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl JobQueue {
-    pub fn new() -> Self {
-        Self {
-            queues: HashMap::new(),
-            jobs: HashMap::new(),
-            dead_letter: HashMap::new(),
-            next_id: 1,
-        }
-    }
-
-    /// Add a job to a queue. Returns the job ID.
-    pub fn enqueue(
-        &mut self,
-        queue: &str,
-        payload: String,
-        priority: Priority,
-        max_retries: u32,
-    ) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let job = Job {
-            id,
-            queue: queue.to_string(),
-            payload,
-            priority,
-            max_retries,
-            retry_count: 0,
-            status: JobStatus::Pending,
-            created_at: ts,
-        };
-
-        // Priority key: invert priority so Critical (3) sorts first (lower key = first in BTreeMap)
-        let key = (3 - priority as u8, id);
-        self.queues
-            .entry(queue.to_string())
-            .or_default()
-            .insert(key, job.clone());
-        self.jobs.insert(id, job);
-
-        id
-    }
-
-    /// Dequeue the highest-priority pending job. Returns it in Processing state.
-    pub fn dequeue(&mut self, queue: &str) -> Option<Job> {
-        let btree = self.queues.get_mut(queue)?;
-        let key = *btree.keys().next()?;
-        let mut job = btree.remove(&key)?;
-        job.status = JobStatus::Processing;
-        self.jobs.insert(job.id, job.clone());
-        Some(job)
-    }
-
-    /// Mark a job as completed.
-    pub fn complete(&mut self, job_id: u64) -> bool {
-        if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.status = JobStatus::Completed;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Mark a job as failed. Retries if under max_retries, otherwise moves to dead-letter.
-    pub fn fail(&mut self, job_id: u64) -> JobStatus {
-        let job = match self.jobs.get_mut(&job_id) {
-            Some(j) => j,
-            None => return JobStatus::Failed,
-        };
-
-        job.retry_count += 1;
-        if job.retry_count <= job.max_retries {
-            // Re-enqueue
-            job.status = JobStatus::Pending;
-            let key = (3 - job.priority as u8, job.id);
-            self.queues
-                .entry(job.queue.clone())
-                .or_default()
-                .insert(key, job.clone());
-            JobStatus::Pending
-        } else {
-            // Dead letter
-            job.status = JobStatus::DeadLetter;
-            self.dead_letter
-                .entry(job.queue.clone())
-                .or_default()
-                .push_back(job.clone());
-            JobStatus::DeadLetter
-        }
-    }
-
-    /// Get the number of pending jobs in a queue.
-    pub fn pending_count(&self, queue: &str) -> usize {
-        self.queues.get(queue).map_or(0, |q| q.len())
-    }
-
-    /// Get dead-letter queue contents.
-    pub fn dead_letter_jobs(&self, queue: &str) -> Vec<&Job> {
-        self.dead_letter
-            .get(queue)
-            .map(|q| q.iter().collect())
-            .unwrap_or_default()
-    }
-
-    /// Get a job by ID.
-    pub fn get_job(&self, job_id: u64) -> Option<&Job> {
-        self.jobs.get(&job_id)
+        self.channels
+            .iter()
+            .filter(|(_, tx)| tx.receiver_count() > 0)
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 }
 
@@ -671,6 +519,35 @@ impl Stream {
 mod tests {
     use super::*;
 
+    /// S31-16: channels whose last subscriber dropped must stop being listed
+    /// (Redis `PUBSUB CHANNELS` semantics) and must be reclaimed — the hub
+    /// used to keep every channel ever subscribed, each pinning a
+    /// capacity-sized buffer, forever.
+    #[tokio::test]
+    async fn dead_channels_are_not_listed_and_are_pruned() {
+        let mut hub = PubSubHub::new(16);
+        {
+            let _rx = hub.subscribe("a");
+            let _rx2 = hub.subscribe("b");
+            let mut listed = hub.channels();
+            listed.sort_unstable();
+            assert_eq!(listed, vec!["a", "b"]);
+        }
+        // Receivers dropped: channels() reflects only live channels...
+        assert!(
+            hub.channels().is_empty(),
+            "channels with zero subscribers must not be listed: {:?}",
+            hub.channels()
+        );
+        // ...and the next mutating call reclaims the entries.
+        hub.publish("a", "gone".into());
+        let rx_c = hub.subscribe("c");
+        assert_eq!(hub.channels(), vec!["c"]);
+        drop(rx_c);
+        assert!(hub.channels().is_empty());
+        assert_eq!(hub.subscriber_count("a"), 0);
+    }
+
     #[tokio::test]
     async fn pubsub_basic() {
         let mut hub = PubSubHub::new(16);
@@ -698,50 +575,6 @@ mod tests {
         let m2 = rx2.recv().await.unwrap();
         assert_eq!(m1.payload, "breaking");
         assert_eq!(m2.payload, "breaking");
-    }
-
-    #[test]
-    fn job_queue_priority() {
-        let mut q = JobQueue::new();
-        q.enqueue("tasks", "low-job".into(), Priority::Low, 0);
-        q.enqueue("tasks", "critical-job".into(), Priority::Critical, 0);
-        q.enqueue("tasks", "normal-job".into(), Priority::Normal, 0);
-
-        // Should dequeue in priority order: Critical > Normal > Low
-        let j1 = q.dequeue("tasks").unwrap();
-        assert_eq!(j1.payload, "critical-job");
-        let j2 = q.dequeue("tasks").unwrap();
-        assert_eq!(j2.payload, "normal-job");
-        let j3 = q.dequeue("tasks").unwrap();
-        assert_eq!(j3.payload, "low-job");
-    }
-
-    #[test]
-    fn job_retry_and_dead_letter() {
-        let mut q = JobQueue::new();
-        let id = q.enqueue("work", "flaky-job".into(), Priority::Normal, 2);
-
-        let job = q.dequeue("work").unwrap();
-        assert_eq!(job.status, JobStatus::Processing);
-
-        // Fail it 3 times (max_retries = 2, so 3rd failure → dead letter)
-        assert_eq!(q.fail(id), JobStatus::Pending); // retry 1
-        let _ = q.dequeue("work");
-        assert_eq!(q.fail(id), JobStatus::Pending); // retry 2
-        let _ = q.dequeue("work");
-        assert_eq!(q.fail(id), JobStatus::DeadLetter); // exceeded
-
-        assert_eq!(q.dead_letter_jobs("work").len(), 1);
-        assert_eq!(q.pending_count("work"), 0);
-    }
-
-    #[test]
-    fn job_complete() {
-        let mut q = JobQueue::new();
-        let id = q.enqueue("tasks", "my-job".into(), Priority::High, 0);
-        let _ = q.dequeue("tasks");
-        assert!(q.complete(id));
-        assert_eq!(q.get_job(id).unwrap().status, JobStatus::Completed);
     }
 
     // ====================================================================

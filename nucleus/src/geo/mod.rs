@@ -16,6 +16,17 @@ use std::fmt;
 // Geometry types
 // ============================================================================
 
+/// Boundary-inclusive point-on-segment test. `cross` has units of length^2,
+/// so comparing against eps * len^2 keeps the test scale-invariant.
+fn point_on_segment(p: &Point, a: &Point, b: &Point) -> bool {
+    let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let len2 = (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y);
+    if cross.abs() > 1e-9 * len2.max(1e-30) {
+        return false;
+    }
+    p.x >= a.x.min(b.x) && p.x <= a.x.max(b.x) && p.y >= a.y.min(b.y) && p.y <= a.y.max(b.y)
+}
+
 /// A 2D point (x, y) or (longitude, latitude).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
@@ -122,6 +133,12 @@ impl Polygon {
     }
 
     /// Check if a point is inside this polygon using ray casting algorithm.
+    ///
+    /// OGC Contains semantics: boundary points are NOT contained. The bare
+    /// PNPOLY half-open y-rule classified boundary points by edge orientation
+    /// (the unit square answered POINT(5 0) true and POINT(5 10) false), so
+    /// an explicit point-on-segment check runs first and rejects any
+    /// boundary hit consistently.
     pub fn contains(&self, p: &Point) -> bool {
         let n = self.exterior.len();
         if n < 3 {
@@ -133,6 +150,10 @@ impl Polygon {
         for i in 0..n {
             let pi = &self.exterior[i];
             let pj = &self.exterior[j];
+
+            if point_on_segment(p, pi, pj) {
+                return false;
+            }
 
             if ((pi.y > p.y) != (pj.y > p.y))
                 && (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x)
@@ -412,18 +433,47 @@ impl RTree {
     pub fn search_radius(&self, center: &Point, radius_m: f64) -> Vec<u64> {
         // Compute a bounding box that encompasses the radius.
         // Latitude: 1 degree ≈ 111,320 meters (constant).
-        // Longitude: varies by cos(latitude), clamped to avoid division by zero near poles.
         let lat_deg = radius_m / 111_320.0;
-        let lon_deg = radius_m / (111_320.0 * center.y.to_radians().cos().abs().max(0.01));
-        let query_bbox = BBox::new(
-            center.x - lon_deg,
-            center.y - lat_deg,
-            center.x + lon_deg,
-            center.y + lat_deg,
-        );
+        let min_lat = center.y - lat_deg;
+        let max_lat = center.y + lat_deg;
 
-        // Get candidates from R-tree bounding-box search
-        let candidates = self.search_bbox(&query_bbox);
+        // Longitude span measured at the box edge nearest a pole — the worst
+        // case for any member the lat box can contain. If the box contains a
+        // pole, every longitude is reachable. The old form clamped cos(lat)
+        // at 0.01, capping the span at radius/1113.2° — within ~0.57° of a
+        // pole the true extent is far larger, so valid candidates were
+        // excluded before the exact filter ever ran (GDL-7).
+        let (min_lon, max_lon) = if max_lat >= 90.0 || min_lat <= -90.0 {
+            (-180.0, 180.0)
+        } else {
+            let edge_lat = if max_lat.abs() >= min_lat.abs() {
+                max_lat
+            } else {
+                min_lat
+            };
+            let lon_deg = (radius_m / (111_320.0 * edge_lat.to_radians().cos())).min(180.0);
+            (center.x - lon_deg, center.x + lon_deg)
+        };
+        let lat_lo = min_lat.max(-90.0);
+        let lat_hi = max_lat.min(90.0);
+
+        // Antimeridian: a box that exits [-180,180] is two disjoint boxes —
+        // BBox::intersects on a min_x > max_x box matches nothing on the far
+        // side, so members just across ±180 were invisible to GEORADIUS
+        // (GDL-4). Split and union.
+        let mut candidates: Vec<u64> = if min_lon < -180.0 {
+            let mut ids = self.search_bbox(&BBox::new(min_lon + 360.0, lat_lo, 180.0, lat_hi));
+            ids.extend(self.search_bbox(&BBox::new(-180.0, lat_lo, max_lon, lat_hi)));
+            ids
+        } else if max_lon > 180.0 {
+            let mut ids = self.search_bbox(&BBox::new(min_lon, lat_lo, 180.0, lat_hi));
+            ids.extend(self.search_bbox(&BBox::new(-180.0, lat_lo, max_lon - 360.0, lat_hi)));
+            ids
+        } else {
+            self.search_bbox(&BBox::new(min_lon, lat_lo, max_lon, lat_hi))
+        };
+        candidates.sort_unstable();
+        candidates.dedup();
 
         // Filter by actual Haversine distance using stored point coordinates
         candidates
@@ -706,5 +756,86 @@ mod tests {
         assert!(results.contains(&2));
         // Point 3 is far away and should not be in results
         assert!(!results.contains(&3));
+    }
+
+    /// GDL-4: a radius query whose longitude box exits [-180, 180] is two
+    /// disjoint boxes, not one with min_x > max_x (which intersects nothing).
+    /// Points 179.9 and -179.9 are ~22 km apart across the antimeridian.
+    #[test]
+    fn rtree_search_radius_antimeridian() {
+        let mut tree = RTree::new();
+        tree.insert(&Point::new(179.9, 0.0), 1);
+        tree.insert(&Point::new(-179.9, 0.0), 2);
+
+        let results = tree.search_radius(&Point::new(179.9, 0.0), 100_000.0);
+        assert!(
+            results.contains(&1) && results.contains(&2),
+            "the member ~22km east across the antimeridian must be found: {results:?}"
+        );
+    }
+
+    /// GDL-7: near a pole the true longitude span of a radius circle grows
+    /// far beyond radius/1113.2 degrees — the old 0.01 cos clamp excluded
+    /// valid candidates before the exact haversine filter ever ran.
+    #[test]
+    fn rtree_search_radius_polar() {
+        // ~2.2 km apart over the pole: needs the full longitude range once
+        // the latitude box touches 90°.
+        let mut tree = RTree::new();
+        tree.insert(&Point::new(0.0, 89.99), 1);
+        tree.insert(&Point::new(179.0, 89.99), 2);
+        let results = tree.search_radius(&Point::new(0.0, 89.99), 5_000.0);
+        assert!(
+            results.contains(&1) && results.contains(&2),
+            "the member ~2.2km away over the pole must be found: {results:?}"
+        );
+
+        // ~0.5 km apart along the 89.99° parallel: the old clamp capped the
+        // box at ~4.5° of longitude and excluded the second member.
+        let mut tree = RTree::new();
+        tree.insert(&Point::new(0.0, 89.99), 1);
+        tree.insert(&Point::new(25.0, 89.99), 2);
+        let results = tree.search_radius(&Point::new(0.0, 89.99), 5_000.0);
+        assert!(
+            results.contains(&1) && results.contains(&2),
+            "the member ~0.5km east along the polar parallel must be found: {results:?}"
+        );
+    }
+
+    /// GDL-10: OGC Contains excludes ALL boundary points. The bare PNPOLY
+    /// ray cast classified them by edge orientation — the unit square
+    /// answered POINT(5 0) true and POINT(5 10) false.
+    #[test]
+    fn polygon_contains_excludes_boundary_points() {
+        let poly = Polygon::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(0.0, 10.0),
+        ]);
+        assert!(poly.contains(&Point::new(5.0, 5.0)), "interior");
+        // All four edge midpoints are on the boundary → false.
+        assert!(
+            !poly.contains(&Point::new(5.0, 0.0)),
+            "bottom edge midpoint"
+        );
+        assert!(!poly.contains(&Point::new(5.0, 10.0)), "top edge midpoint");
+        assert!(!poly.contains(&Point::new(0.0, 5.0)), "left edge midpoint");
+        assert!(
+            !poly.contains(&Point::new(10.0, 5.0)),
+            "right edge midpoint"
+        );
+        // Vertices too.
+        assert!(!poly.contains(&Point::new(0.0, 0.0)), "vertex");
+        assert!(!poly.contains(&Point::new(10.0, 10.0)), "vertex");
+
+        // A diagonal edge must behave like the axis-aligned ones.
+        let tri = Polygon::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(0.0, 10.0),
+        ]);
+        assert!(tri.contains(&Point::new(1.0, 1.0)), "triangle interior");
+        assert!(!tri.contains(&Point::new(5.0, 5.0)), "hypotenuse midpoint");
     }
 }

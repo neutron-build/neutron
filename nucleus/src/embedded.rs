@@ -290,6 +290,10 @@ impl Database {
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>, ExecError> {
         let results = self.executor.execute(sql).await?;
         for result in results.into_iter().rev() {
+            // materialize(): under stream_results=on a SELECT yields a
+            // SelectStream, which used to fall through here and silently
+            // return no rows (PRC-8).
+            let result = result.materialize().await?;
             if let ExecResult::Select { rows, .. } = result {
                 return Ok(rows);
             }
@@ -301,6 +305,7 @@ impl Database {
     pub async fn query_with_columns(&self, sql: &str) -> Result<QueryResult, ExecError> {
         let results = self.executor.execute(sql).await?;
         for result in results.into_iter().rev() {
+            let result = result.materialize().await?;
             if let ExecResult::Select { columns, rows } = result {
                 return Ok(QueryResult { columns, rows });
             }
@@ -333,17 +338,17 @@ impl Database {
     }
 
     /// Execute a batch of SQL statements separated by semicolons.
+    ///
+    /// Statement splitting is the parser's job: a hand-rolled `split(';')`
+    /// broke any statement containing a quoted semicolon
+    /// (`INSERT ... VALUES ('semi;colon')`), which the real grammar accepts —
+    /// the server path has always parsed the whole string; this now does too.
+    /// Delta: the executor's extension-prefix dispatch (CALL, SUBSCRIBE,
+    /// CACHE_*, SHOW, procedure/model DDL, ...) sees the WHOLE string here,
+    /// so a batch mixing an extension command with other statements no
+    /// longer runs the extension command fragment-by-fragment.
     pub async fn execute_batch(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
-        let mut all_results = Vec::new();
-        for stmt in sql.split(';') {
-            let trimmed = stmt.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let mut results = self.execute(trimmed).await?;
-            all_results.append(&mut results);
-        }
-        Ok(all_results)
+        self.execute(sql).await
     }
 
     /// Fsync the WAL to stable storage, ensuring all auto-committed writes
@@ -1013,9 +1018,10 @@ impl DatalogHandle<'_> {
     pub fn assert_fact(&self, predicate: &str, args: Vec<String>) {
         self.store.write().assert_fact(predicate, args);
     }
-    /// Add a rule (e.g., ancestor(X,Y) :- parent(X,Y)).
-    pub fn add_rule(&self, rule: crate::datalog::Rule) {
-        self.store.write().add_rule(rule);
+    /// Add a rule (e.g., ancestor(X,Y) :- parent(X,Y)). Rejects unsafe
+    /// negation and unstratifiable programs, mirroring the store.
+    pub fn add_rule(&self, rule: crate::datalog::Rule) -> Result<(), String> {
+        self.store.write().add_rule(rule)
     }
     /// Retract a ground fact.
     pub fn retract_fact(&self, predicate: &str, args: &[String]) {
@@ -1026,7 +1032,9 @@ impl DatalogHandle<'_> {
         self.store.write().clear_predicate(predicate);
     }
     /// Query a relation (evaluates rules first). Returns list of tuples.
-    pub fn query(&self, literal: &crate::datalog::Literal) -> Vec<Vec<String>> {
+    /// Errors when the program is unstratifiable instead of silently
+    /// returning an empty derived set.
+    pub fn query(&self, literal: &crate::datalog::Literal) -> Result<Vec<Vec<String>>, String> {
         self.store.write().query(literal)
     }
 }
@@ -1088,6 +1096,10 @@ impl Transaction {
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>, ExecError> {
         let results = self.executor.execute(sql).await?;
         for result in results.into_iter().rev() {
+            // materialize(): under stream_results=on a SELECT yields a
+            // SelectStream, which used to fall through here and silently
+            // return no rows (PRC-8).
+            let result = result.materialize().await?;
             if let ExecResult::Select { rows, .. } = result {
                 return Ok(rows);
             }
@@ -1206,8 +1218,18 @@ impl StreamsHandle<'_> {
         // The lock is released before logging: `log_xadd` performs file I/O, and
         // holding the streams write lock across it would serialise every reader
         // behind a disk write.
+        //
+        // Tagged XACT_AUTOCOMMIT explicitly (S63): this handle has no session,
+        // so it can never be inside an explicit transaction — and the id is a
+        // required parameter precisely so that a future writer cannot forget
+        // to answer the question.
         if let Some(wal) = self.wal
-            && let Err(e) = wal.log_xadd(stream, &id, &fields)
+            && let Err(e) = wal.log_xadd(
+                Some(crate::executor::enlistment::XACT_AUTOCOMMIT),
+                stream,
+                &id,
+                &fields,
+            )
         {
             tracing::error!(
                 stream = %stream,
@@ -1498,6 +1520,54 @@ mod tests {
         let db = Database::memory();
         let results = db.execute_batch("").await.unwrap();
         assert!(results.is_empty());
+    }
+
+    /// A quoted semicolon is not a statement separator — only the real
+    /// parser knows where statements end. The hand-rolled `split(';')` broke
+    /// any statement containing one.
+    #[tokio::test]
+    async fn embedded_execute_batch_quoted_semicolon() {
+        let db = Database::memory();
+        db.execute_batch(
+            "CREATE TABLE semi (id INT NOT NULL, note TEXT);
+             INSERT INTO semi VALUES (1, 'semi;colon')",
+        )
+        .await
+        .expect("quoted semicolon must survive the batch");
+        let val = db
+            .query_one("SELECT note FROM semi WHERE id = 1")
+            .await
+            .unwrap();
+        assert_eq!(val, Some(Value::Text("semi;colon".into())));
+    }
+
+    /// With stream_results=on, query()/query_with_columns() must return the
+    /// same rows as with it off — a SelectStream used to fall through the
+    /// materialized-only match and silently produce zero rows.
+    #[tokio::test]
+    async fn embedded_query_streams_are_materialized() {
+        let db = Database::memory();
+        db.execute("CREATE TABLE strm (id INT NOT NULL)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO strm VALUES (1), (2), (3)")
+            .await
+            .unwrap();
+
+        let materialized = db.query("SELECT id FROM strm ORDER BY id").await.unwrap();
+        db.execute("SET stream_results = on").await.unwrap();
+        let streamed = db.query("SELECT id FROM strm ORDER BY id").await.unwrap();
+        assert_eq!(
+            streamed, materialized,
+            "streaming and materialized query() must agree"
+        );
+        assert_eq!(streamed.len(), 3, "streaming must not silently drop rows");
+        let with_cols = db
+            .query_with_columns("SELECT id FROM strm ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(with_cols.rows.len(), 3);
+        db.execute("SET stream_results = off").await.unwrap();
     }
 
     #[tokio::test]
@@ -1796,11 +1866,13 @@ mod tests {
         let dl = db.datalog();
         dl.assert_fact("parent", vec!["alice".into(), "bob".into()]);
         dl.assert_fact("parent", vec!["bob".into(), "charlie".into()]);
-        let results = dl.query(&Literal {
-            negated: false,
-            predicate: "parent".to_string(),
-            args: vec![Term::Var("X".into()), Term::Const("bob".into())],
-        });
+        let results = dl
+            .query(&Literal {
+                negated: false,
+                predicate: "parent".to_string(),
+                args: vec![Term::Var("X".into()), Term::Const("bob".into())],
+            })
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0][0], "alice");
     }
@@ -1813,11 +1885,13 @@ mod tests {
         dl.assert_fact("likes", vec!["alice".into(), "pizza".into()]);
         dl.assert_fact("likes", vec!["bob".into(), "pasta".into()]);
         dl.retract_fact("likes", &["alice".into(), "pizza".into()]);
-        let results = dl.query(&Literal {
-            negated: false,
-            predicate: "likes".to_string(),
-            args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-        });
+        let results = dl
+            .query(&Literal {
+                negated: false,
+                predicate: "likes".to_string(),
+                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+            })
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0][0], "bob");
     }
@@ -2064,6 +2138,44 @@ mod tests {
             Some(Value::Int64(1)),
             "an embedded stream append must survive a reopen; got {recovered:?}"
         );
+    }
+
+    /// S63 on the durable_mvcc stack: a committed transaction's XADD carries
+    /// its coordinating id and must survive not one reopen but TWO — the
+    /// second one opens a WAL that `compact` rewrote as a txn-0 baseline,
+    /// where only the preserved XactCommit markers can vouch for it. The
+    /// abandoned transaction's XADD is discarded by the same filter on the
+    /// same reopen.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn committed_xadd_survives_two_mvcc_reopens_and_abandoned_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            db.execute("BEGIN").await.unwrap();
+            db.execute("SELECT STREAM_XADD('ev', 'k', 'committed')")
+                .await
+                .unwrap();
+            db.execute("COMMIT").await.unwrap();
+            // Abandoned: no COMMIT, dropped with the database open.
+            db.execute("BEGIN").await.unwrap();
+            db.execute("SELECT STREAM_XADD('ev', 'k', 'abandoned')")
+                .await
+                .unwrap();
+        }
+
+        for reopen in 1..=2 {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            let rows = db.query("SELECT STREAM_XLEN('ev')").await.unwrap();
+            let recovered = rows.first().and_then(|r| r.first()).cloned();
+            assert_eq!(
+                recovered,
+                Some(Value::Int64(1)),
+                "reopen {reopen}: the committed XADD must survive (the second reopen \
+                 reads a compacted WAL — only the preserved marker vouches for it), and \
+                 the abandoned one must be discarded; got {recovered:?}"
+            );
+        }
     }
 
     #[cfg(feature = "server")]

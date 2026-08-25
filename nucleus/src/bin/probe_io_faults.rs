@@ -14,6 +14,11 @@
 //!      (`vector.wal_append`). A failed append must fail the statement —
 //!      printed-and-acknowledged is exactly NU-013/NU-048 — and only what was
 //!      acknowledged may survive a restart.
+//!   5. drives KV keys past the eviction threshold and checkpoints under the
+//!      fault (`lsm.sst_write`, STO-1/2): a failed cold-tier SSTable write
+//!      must fail the checkpoint so the WAL is never truncated past keys
+//!      whose only copy is still in RAM. Every acknowledged key must survive
+//!      the reopen.
 //!
 //! The parent then reopens and asserts:
 //!   A. The failure surfaced as an ERROR — a write that could not be made
@@ -24,6 +29,9 @@
 //!      not leave a half-applied or corrupt record behind.
 //!   D. Every acknowledged DATALOG_ASSERT survives the reopen verbatim, and
 //!      the recovered HNSW index holds exactly the acknowledged vectors.
+//!   E. Every acknowledged KV key survives the reopen — via the hot WAL
+//!      snapshot, the fsynced cold SSTable, or the un-truncated WAL when the
+//!      checkpoint refused.
 //!
 //! Run: `cargo run --release --features server --bin probe_io_faults`
 #![cfg(feature = "server")]
@@ -42,6 +50,11 @@ const ROWS: i64 = 30;
 /// protect.
 const SKIPS: &[u64] = &[0, 2, 8];
 const KINDS: &[&str] = &["full", "perm", "io"];
+/// KV cold-tier section: 64 KiB values under a 1 MiB hot budget (the parent
+/// sets NUCLEUS_KV_MAX_HOT_MB=1 for the child) spill most keys to the cold
+/// LsmTree, so the checkpoint's SSTable write is the durability boundary
+/// under test.
+const KV_KEYS: i64 = 20;
 
 fn marker_for(id: i64) -> i64 {
     id.wrapping_mul(2_654_435_761) % 1_000_003
@@ -110,6 +123,31 @@ fn recover_vector_index(dir: &Path) -> Result<Vec<u64>, String> {
         .ok_or_else(|| "HNSW index iov_idx did not survive reopen".to_string())?
         .into_iter()
         .collect())
+}
+
+/// Reopen and read back which KV cold-tier keys are present.
+fn recover_kv(dir: &Path) -> Result<Vec<i64>, String> {
+    use nucleus::embedded::Database;
+    let db = Database::durable_mvcc(dir).map_err(|e| format!("reopen: {e:?}"))?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let mut present = Vec::new();
+    for i in 0..KV_KEYS {
+        let sql = format!("SELECT KV_GET('iofk{i}')");
+        let res = rt
+            .block_on(db.execute(&sql))
+            .map_err(|e| format!("query: {e:?}"))?;
+        let got = res.into_iter().any(|r| match r {
+            ExecResult::Select { rows, .. } => rows
+                .first()
+                .and_then(|row| row.first())
+                .is_some_and(|v| !matches!(v, Value::Null)),
+            _ => false,
+        });
+        if got {
+            present.push(i);
+        }
+    }
+    Ok(present)
 }
 
 fn child_main(dir: &str) -> ! {
@@ -191,6 +229,33 @@ fn child_main(dir: &str) -> ! {
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
+    // ── KV cold tier (STO-1/2): a failed SSTable write must fail the
+    //    checkpoint, and only acknowledged keys may be required to survive.
+    //    Values are large enough that the parent-set 1 MiB hot budget forces
+    //    eviction, so the checkpoint's flush is what makes them durable. ──
+    let pad = "kv".repeat(64 * 1024);
+    for i in 0..KV_KEYS {
+        let sql = format!("SELECT KV_SET('iofk{i}', '{pad}')");
+        match rt.block_on(db.execute(&sql)) {
+            Ok(_) => println!("KV_ACKED {i}"),
+            Err(_) => {
+                saw_error = true;
+                println!("KV_ERRORED {i}");
+            }
+        }
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+    match db.executor().kv_store().checkpoint() {
+        Ok(()) => println!("KV_CKPT_OK"),
+        Err(_) => {
+            saw_error = true;
+            println!("KV_CKPT_ERRORED");
+        }
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
     println!("SAW_ERROR {saw_error}");
     std::process::exit(0);
 }
@@ -314,6 +379,9 @@ fn run_case(
         .env("NUCLEUS_IOFAULT", point)
         .env("NUCLEUS_IOFAULT_KIND", kind)
         .env("NUCLEUS_IOFAULT_SKIP", skip.to_string())
+        // Small hot budget so the KV section actually spills to the cold
+        // tier and the checkpoint's SSTable write is load-bearing.
+        .env("NUCLEUS_KV_MAX_HOT_MB", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -330,6 +398,7 @@ fn run_case(
     let acked = collect("ACKED ");
     let mut dl_acked = collect("DL_ACKED ");
     let mut v_acked = collect("V_ACKED ");
+    let kv_acked = collect("KV_ACKED ");
     if perturb == Some("datalog") {
         dl_acked.extend(collect("DL_ERRORED "));
     }
@@ -341,6 +410,8 @@ fn run_case(
             || l.starts_with("DL_ERRORED")
             || l.starts_with("V_ERRORED")
             || l.starts_with("V_SETUP_ERRORED")
+            || l.starts_with("KV_ERRORED")
+            || l == "KV_CKPT_ERRORED"
     });
 
     if !errored {
@@ -434,6 +505,35 @@ fn run_case(
             }
             Err(e) => {
                 findings.push(format!("{label}: vector recovery FAILED: {e}"));
+            }
+        }
+    }
+    // (E) KV cold tier: every acknowledged key must survive — through the
+    // hot WAL snapshot and fsynced SSTable when the checkpoint succeeded,
+    // or through the un-truncated WAL when it refused (STO-2). Verified
+    // whenever the child reached the section at all, exactly like (D): a
+    // checkpoint that silently truncated past a failed cold flush is what
+    // this catches.
+    let reached_kv = stdout
+        .lines()
+        .any(|l| l.starts_with("KV_ACKED") || l.starts_with("KV_ERRORED"));
+    if reached_kv {
+        match recover_kv(dir) {
+            Ok(present) => {
+                let got: std::collections::HashSet<i64> = present.into_iter().collect();
+                for id in &kv_acked {
+                    if !got.contains(id) {
+                        findings.push(format!(
+                            "{label}: KV key iofk{id} acknowledged but missing after \
+                             recovery (cold tier lost below a checkpoint boundary — \
+                             STO-1/2 class)"
+                        ));
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                findings.push(format!("{label}: KV recovery FAILED: {e}"));
             }
         }
     }

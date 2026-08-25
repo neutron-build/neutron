@@ -119,6 +119,7 @@ pub enum TensorError {
     ShapeMismatch { expected: usize, actual: usize },
     VersionNotFound(String),
     IncompatibleShapes,
+    DuplicateVersion { name: String, version: String },
 }
 
 impl std::fmt::Display for TensorError {
@@ -132,6 +133,10 @@ impl std::fmt::Display for TensorError {
             }
             TensorError::VersionNotFound(v) => write!(f, "version not found: {v}"),
             TensorError::IncompatibleShapes => write!(f, "incompatible tensor shapes"),
+            TensorError::DuplicateVersion { name, version } => write!(
+                f,
+                "tensor '{name}' already has version '{version}'; use a new version string"
+            ),
         }
     }
 }
@@ -253,6 +258,22 @@ impl TensorStore {
         tensor: Tensor,
         metadata: HashMap<String, String>,
     ) -> Result<(), TensorError> {
+        // Every reader resolves versions with first-match `.find()`, so a
+        // second entry under the same (name, version) would be stored yet
+        // unreachable — `get` and `get_latest` would return the first entry
+        // forever. Reject instead: a version later versions delta against
+        // cannot be safely replaced in place either.
+        if self
+            .tensors
+            .get(name)
+            .is_some_and(|versions| versions.iter().any(|v| v.version == version))
+        {
+            return Err(TensorError::DuplicateVersion {
+                name: name.to_string(),
+                version: version.to_string(),
+            });
+        }
+
         // Check if there's a previous version to delta against
         let prev_info = self
             .tensors
@@ -392,6 +413,37 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    /// VEC-5: a duplicate (name, version) `put` must be rejected, not stored
+    /// unreachable. Readers resolve versions with first-match `.find()`, so a
+    /// second entry under the same version string would be shadowed forever
+    /// while `get_latest` keeps returning the old data wearing the new
+    /// entry's shape.
+    #[test]
+    fn a_duplicate_version_string_is_rejected_not_shadowed() {
+        let mut store = TensorStore::new();
+        let mut a = Tensor::zeros(vec![2, 2], DType::Float32);
+        a.set_f32(0, 1.0);
+        let mut b = Tensor::zeros(vec![2, 2], DType::Float32);
+        b.set_f32(0, 9.0);
+
+        store
+            .put("w", "v1", a, HashMap::new())
+            .expect("first put of (w, v1)");
+        let dup = store.put("w", "v1", b, HashMap::new());
+        assert!(
+            dup.is_err(),
+            "a second put under the same (name, version) was accepted and stored \
+             shadowed: every reader would return the first entry forever"
+        );
+
+        let latest = store.get_latest("w").unwrap();
+        assert!(
+            (latest.get_f32(0).unwrap() - 1.0).abs() < 1e-6,
+            "after the rejected put, the original version must still be intact"
+        );
+        assert_eq!(store.list_versions("w"), vec!["v1"]);
+    }
 
     #[test]
     fn tensor_creation() {

@@ -195,6 +195,17 @@ pub struct DiskEngine {
     txn_state: parking_lot::Mutex<Option<DiskTxnState>>,
     /// Monotonically increasing transaction ID counter for WAL records.
     next_txn_id: AtomicU64,
+    /// Staged S63 enlistment payloads (session id → commit-record body),
+    /// parked by `set_pending_enlistment` and consumed by that session's
+    /// `commit_txn` — the same contract `BufferedDiskEngine` implements for
+    /// the buffered path. Keyed by session so interleaved commits cannot
+    /// pick up each other's marker.
+    pending_enlistment: parking_lot::RwLock<std::collections::HashMap<u64, [u8; 10]>>,
+    /// Coordinating transaction ids recovered from COMMIT-record bodies
+    /// (S63). Read once at open by whoever opens the specialty WALs, so a
+    /// snapshot is enough; shared by `Arc` because the recovery filter
+    /// borrows it for the lifetime of the process.
+    committed_xacts: std::sync::Arc<HashSet<u64>>,
     /// Calls that reached [`StorageEngine::scan_projected`] on this engine.
     ///
     /// Column pruning has no observable effect on results — same rows, same
@@ -213,6 +224,19 @@ pub struct DiskEngine {
     /// the directory save is serialized — the WAL force itself stays
     /// concurrent so group commit keeps batching fsyncs.
     dir_save_lock: parking_lot::Mutex<()>,
+}
+
+/// The storage session id of the current execution context (0 = default /
+/// embedded), for the session-keyed S63 enlistment slot.
+fn session_id_for_enlistment() -> u64 {
+    #[cfg(feature = "server")]
+    {
+        super::STORAGE_SESSION_ID.try_with(|&id| id).unwrap_or(0)
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        super::get_storage_session_id()
+    }
 }
 
 /// Linked-list pointers stored in the data page's reserved area.
@@ -609,6 +633,7 @@ impl DiskEngine {
         // must start above every LSN already stamped on data pages.
         let mut lsn_floor: u64 = 0;
         let mut txn_id_floor: u64 = 0;
+        let mut committed_xacts: HashSet<u64> = HashSet::new();
         if !is_new {
             let single_file_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
             // A missing WAL is normal (first open after a clean create); any
@@ -650,9 +675,11 @@ impl DiskEngine {
             // run's transaction 5 — and recovery would treat its uncommitted
             // pages as committed, which is the exact bug this work removes.
             txn_id_floor = records.iter().map(|r| r.txn_id).max().unwrap_or(0);
-            let recovered = Self::apply_wal_records(records, &mut disk, &mut initial_pages)?;
-            if recovered > 0 {
-                tracing::info!("WAL recovery: replayed {recovered} page(s)");
+            let (recovered_pages, recovered_xacts) =
+                Self::apply_wal_records(records, &mut disk, &mut initial_pages)?;
+            committed_xacts = recovered_xacts;
+            if recovered_pages > 0 {
+                tracing::info!("WAL recovery: replayed {recovered_pages} page(s)");
             }
 
             // The WAL is not a sufficient floor on its own. A page can carry an
@@ -800,6 +827,8 @@ impl DiskEngine {
             txn_state: parking_lot::Mutex::new(None),
             dir_save_lock: parking_lot::Mutex::new(()),
             next_txn_id: AtomicU64::new(txn_id_floor + 1),
+            pending_enlistment: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            committed_xacts: std::sync::Arc::new(committed_xacts),
             projected_scans: AtomicU64::new(0),
         };
 
@@ -818,14 +847,18 @@ impl DiskEngine {
     /// page's LSN. If the record is newer, applies the page image to the data
     /// file (with the correct LSN and checksum set).
     ///
-    /// Returns the number of pages recovered.
+    /// Returns the number of pages recovered plus the set of coordinating
+    /// transaction ids found in COMMIT-record bodies (S63) — the set the
+    /// specialty-WAL recovery filter keys on. A COMMIT record with no body is
+    /// a pre-S63 record and contributes nothing, which is correct: no
+    /// specialty record written before S63 carries an id to match.
     fn apply_wal_records(
         records: Vec<wal::WalRecord>,
         disk: &mut DiskManager,
         initial_pages: &mut u32,
-    ) -> Result<usize, StorageError> {
+    ) -> Result<(usize, HashSet<u64>), StorageError> {
         if records.is_empty() {
-            return Ok(0);
+            return Ok((0, HashSet::new()));
         }
 
         // ── Analysis ────────────────────────────────────────────────────────
@@ -836,11 +869,22 @@ impl DiskEngine {
         // wrote everything that way) and are always redone.
         let mut committed: HashSet<u64> = HashSet::new();
         let mut ended: HashSet<u64> = HashSet::new();
+        let mut committed_xacts: HashSet<u64> = HashSet::new();
         for record in &records {
             match record.record_type {
                 wal::RECORD_COMMIT => {
                     committed.insert(record.txn_id);
                     ended.insert(record.txn_id);
+                    if let Some(ref body) = record.control_body
+                        && body.len() >= 8
+                    {
+                        let xact = u64::from_le_bytes([
+                            body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+                        ]);
+                        if xact != 0 {
+                            committed_xacts.insert(xact);
+                        }
+                    }
                 }
                 wal::RECORD_ABORT => {
                     ended.insert(record.txn_id);
@@ -950,7 +994,7 @@ impl DiskEngine {
             disk.sync().map_err(|e| StorageError::Io(e.to_string()))?;
         }
 
-        Ok(recovered)
+        Ok((recovered, committed_xacts))
     }
 
     /// Ground-truth LSN floor: the highest LSN stamped on any data page.
@@ -1052,6 +1096,29 @@ impl DiskEngine {
             let _ = self.pool.wal_truncate_before(cp_lsn);
         }
         Ok(())
+    }
+
+    /// [`DiskEngine::checkpoint`], but holding every segment carrying a
+    /// record at or after `retain_lsn` against step 4's truncation (S7).
+    /// `retain_lsn == 1` holds everything (a fresh process folds nothing
+    /// until its first specialty pass); `0` pins nothing (legacy behaviour).
+    ///
+    /// The retention horizon is the LSN of the last completed
+    /// specialty-checkpoint pass: a COMMIT record below it has certainly been
+    /// folded into its specialty snapshot, so reclaiming it is safe; one at or
+    /// after it may still be the only durable proof an enlisted transaction
+    /// committed, and pruning it would make the S6 recovery filter discard
+    /// acknowledged writes. Pages still flush and the checkpoint record still
+    /// writes — only truncation is held back, so the cost of a long-open
+    /// enlisted transaction is bounded WAL growth (the idle-in-transaction
+    /// sweep closes it), not a durability regression.
+    pub fn checkpoint_retaining(&self, retain_lsn: u64) -> Result<(), StorageError> {
+        let pinned = retain_lsn >= 1 && self.pool.wal_pin_retention(retain_lsn);
+        let result = self.checkpoint();
+        if pinned {
+            self.pool.wal_unpin_retention();
+        }
+        result
     }
 
     /// How many times a page slot is re-read before an online backup gives up
@@ -1242,8 +1309,15 @@ impl DiskEngine {
             page::read_u32(&pg, PAGE_SIZE - 4)
         };
 
-        // Follow overflow page chain
+        // Follow overflow page chain. Cycle-guarded: a corrupted overflow
+        // pointer used to append to `dir_data` without bound.
+        let mut seen_overflow: HashSet<u32> = HashSet::new();
         while overflow_page_id != INVALID_PAGE_ID {
+            if !seen_overflow.insert(overflow_page_id) {
+                return Err(StorageError::Io(format!(
+                    "load_table_directory: cyclic overflow chain detected at page {overflow_page_id}"
+                )));
+            }
             let opg = self
                 .pool
                 .read_guard(overflow_page_id)
@@ -1350,19 +1424,35 @@ impl DiskEngine {
                 offset += nlen;
             }
 
-            // Walk chain to find last page for fast appends
+            // Walk chain to find last page for fast appends. Same shape as
+            // `table_pages`: read errors propagate instead of unwrapping (a
+            // checksum failure here used to panic the boot path for every
+            // restored table), and a corrupted next-pointer that cycles is
+            // an error, not a hang.
             let mut last = first_page;
-            if last != INVALID_PAGE_ID {
-                loop {
-                    let next = {
-                        let pg = self.pool.read_guard(last).unwrap();
-                        get_next_page(&pg)
-                    };
-                    if next == INVALID_PAGE_ID {
-                        break;
-                    }
-                    last = next;
+            let mut seen: HashSet<u32> = HashSet::new();
+            while last != INVALID_PAGE_ID {
+                if !seen.insert(last) {
+                    tracing::error!(
+                        table = name,
+                        page_id = last,
+                        "load_table_directory: cyclic page chain detected"
+                    );
+                    return Err(StorageError::Io(format!(
+                        "load_table_directory({name}): cyclic page chain detected at page {last}"
+                    )));
                 }
+                let next = {
+                    let pg = self
+                        .pool
+                        .read_guard(last)
+                        .map_err(|e| StorageError::Io(e.to_string()))?;
+                    get_next_page(&pg)
+                };
+                if next == INVALID_PAGE_ID {
+                    break;
+                }
+                last = next;
             }
             restored.insert(
                 name,
@@ -3063,6 +3153,10 @@ impl StorageEngine for DiskEngine {
         eq_value: Option<&Value>,
         range: Option<(&Value, &Value)>,
     ) -> Option<Vec<Row>> {
+        // Before the indexes lock: col_types takes `tables` (L1), which may
+        // not be acquired under `indexes` (L3) — same order as
+        // `index_lookup_inner`.
+        let col_types = self.col_types(table).ok()?;
         let indexes = self.indexes.read();
         let idx = indexes.get(index_name)?;
         if idx.table != table {
@@ -3070,13 +3164,27 @@ impl StorageEngine for DiskEngine {
         }
 
         if let Some(val) = eq_value {
-            // Point lookup: get keys matching the value, return as single-column rows
+            // Point lookup: entries matching the value, each verified against
+            // the heap. An index-only answer used to be fabricated per
+            // B-tree entry without touching the heap, so a stale entry
+            // fabricated a phantom row.
             let key = serialize_index_key(val);
             let row_ids = idx.btree.lookup(&key).ok()?;
-            // Each matching RowId means one row — return the key value without heap access
-            Some(row_ids.iter().map(|_| vec![val.clone()]).collect())
+            let mut rows = Vec::with_capacity(row_ids.len());
+            for rid in row_ids {
+                let pg = self.pool.read_guard(rid.page_id).ok()?;
+                if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types)
+                    && idx.col_idx < row.len()
+                    && serialize_index_key(&row[idx.col_idx]) == key
+                {
+                    rows.push(vec![row[idx.col_idx].clone()]);
+                }
+            }
+            Some(rows)
         } else if let Some((low, high)) = range {
-            // Range scan: iterate B-tree leaf keys without touching heap pages
+            // Range scan: iterate B-tree leaf keys, verifying heap liveness
+            // per entry (key_bytes is the entry's own key, so the recheck
+            // needs no reconstruction).
             let low_norm = normalize_index_bound_value(low, &idx.col_type)?;
             let high_norm = normalize_index_bound_value(high, &idx.col_type)?;
             let low_key = serialize_index_key(&low_norm);
@@ -3086,19 +3194,27 @@ impl StorageEngine for DiskEngine {
             }
             let key_rids = idx.btree.range_scan(Some(&low_key), Some(&high_key)).ok()?;
             let mut rows = Vec::with_capacity(key_rids.len());
-            for (key_bytes, _rid) in &key_rids {
-                if let Some(val) = deserialize_index_key(key_bytes, &idx.col_type) {
-                    rows.push(vec![val]);
+            for (key_bytes, rid) in &key_rids {
+                let pg = self.pool.read_guard(rid.page_id).ok()?;
+                if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types)
+                    && idx.col_idx < row.len()
+                    && serialize_index_key(&row[idx.col_idx]) == key_bytes.as_slice()
+                {
+                    rows.push(vec![row[idx.col_idx].clone()]);
                 }
             }
             Some(rows)
         } else {
-            // Full index scan: iterate all B-tree leaf entries
+            // Full index scan: same liveness loop over every leaf entry.
             let key_rids = idx.btree.range_scan(None, None).ok()?;
             let mut rows = Vec::with_capacity(key_rids.len());
-            for (key_bytes, _rid) in &key_rids {
-                if let Some(val) = deserialize_index_key(key_bytes, &idx.col_type) {
-                    rows.push(vec![val]);
+            for (key_bytes, rid) in &key_rids {
+                let pg = self.pool.read_guard(rid.page_id).ok()?;
+                if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types)
+                    && idx.col_idx < row.len()
+                    && serialize_index_key(&row[idx.col_idx]) == key_bytes.as_slice()
+                {
+                    rows.push(vec![row[idx.col_idx].clone()]);
                 }
             }
             Some(rows)
@@ -3154,14 +3270,46 @@ impl StorageEngine for DiskEngine {
     /// Commit the transaction: write a WAL COMMIT record and clear tracking state.
     async fn commit_txn(&self) -> Result<(), StorageError> {
         let txn_id = self.next_txn_id.fetch_add(1, AtomicOrdering::Relaxed);
-        let _ = self.pool.wal_log_commit(txn_id);
+        // This session's staged S63 marker rides the COMMIT record (taken,
+        // not peeked, so a failed commit cannot leak it into a later one).
+        let body = self
+            .pending_enlistment
+            .write()
+            .remove(&session_id_for_enlistment());
+        let _ = self
+            .pool
+            .wal_log_commit(txn_id, body.as_ref().map(|b| &b[..]));
         *self.txn_state.lock() = None;
         Ok(())
+    }
+
+    fn set_pending_enlistment(&self, body: [u8; 10]) {
+        self.pending_enlistment
+            .write()
+            .insert(session_id_for_enlistment(), body);
+    }
+
+    fn committed_xacts(&self) -> std::sync::Arc<HashSet<u64>> {
+        std::sync::Arc::clone(&self.committed_xacts)
+    }
+
+    fn current_wal_lsn(&self) -> u64 {
+        self.pool.wal_current_lsn()
+    }
+
+    fn log_xact_commit(&self, body: &[u8; 10]) -> Result<(), StorageError> {
+        DiskEngine::log_xact_commit(self, body)
     }
 
     /// Abort the transaction: reload dirty pre-existing pages from disk, evict new pages,
     /// and restore in-memory metadata to its pre-txn state.
     async fn abort_txn(&self) -> Result<(), StorageError> {
+        // The staged S63 marker dies with the transaction: leaving it would
+        // brand the NEXT commit with an id whose specialty writes were just
+        // rolled back — the filter would resurrect them.
+        self.pending_enlistment
+            .write()
+            .remove(&session_id_for_enlistment());
         let ts = {
             let mut guard = self.txn_state.lock();
             guard.take()
@@ -3226,13 +3374,28 @@ impl DiskEngine {
     /// the page images it vouches for would tell recovery to redo a
     /// transaction whose pages are missing; a sync per step would put two
     /// fsyncs on every commit.
-    pub fn commit_page_txn(&self, txn_id: u64) -> Result<(), StorageError> {
+    ///
+    /// `commit_body` is the optional S63 enlistment payload (`[xact_id u64][
+    /// enlisted u16]`) carried inside the COMMIT record, so recovery can
+    /// rebuild the committed-xact set the specialty-WAL filter keys on. It
+    /// rides the same single sync as the pages — no extra fsync.
+    pub fn commit_page_txn(
+        &self,
+        txn_id: u64,
+        commit_body: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
         // A transaction that wrote nothing gets no records and no sync. This
         // preserves `make_durable`'s gate: an explicit BEGIN/COMMIT around
         // reads used to cost nothing, and making every COMMIT fsync would be a
         // silent latency regression on read-only transactions.
+        //
+        // An enlisted transaction is the exception: even with no SQL pages to
+        // log, its COMMIT record is the ONLY durable proof its specialty
+        // writes (which may all live in other WALs) may be kept on recovery.
+        // Without it a read-SQL/write-specialty transaction would be durable
+        // in the specialty log and discarded by the filter on every restart.
         let touched = self.pool.page_txn_touched();
-        if !touched && !self.pool.wal_force_needed() {
+        if commit_body.is_none() && !touched && !self.pool.wal_force_needed() {
             self.pool.close_page_txn_silently();
             return Ok(());
         }
@@ -3247,10 +3410,33 @@ impl DiskEngine {
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let commit_lsn = self
             .pool
-            .end_page_txn(txn_id, true)
+            .end_page_txn(txn_id, true, commit_body)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         self.pool
             .wal_sync_up_to(commit_lsn.max(pages_lsn))
+            .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
+    /// Durable marker that coordinating transaction `xact` committed, for
+    /// engines-driven transactions that never open a page-txn window.
+    ///
+    /// A non-MVCC `DiskEngine` (the embedded `Database::open` path) has no
+    /// `commit_txn` of its own: an explicit `BEGIN`/`COMMIT` that only touches
+    /// specialty models writes no SQL record at all, so there is nothing on
+    /// this side of recovery to vouch for the transaction. This logs a
+    /// txn-0 COMMIT control record — page writes at txn 0 are already
+    /// "committed state" to recovery, and the body is what the S63 filter
+    /// reads — and fsyncs it, so the marker is durable before COMMIT is
+    /// acknowledged. Enlisted commits on this path are the rare case (the
+    /// served path rides the real COMMIT record instead), so one fsync here
+    /// buys simplicity rather than costing throughput.
+    pub fn log_xact_commit(&self, commit_body: &[u8]) -> Result<(), StorageError> {
+        let lsn = self
+            .pool
+            .wal_log_commit(0, Some(commit_body))
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        self.pool
+            .wal_sync_up_to(lsn)
             .map_err(|e| StorageError::Io(e.to_string()))
     }
 
@@ -3261,7 +3447,7 @@ impl DiskEngine {
     /// reach disk changes nothing. It is logged for readability of the log.
     pub fn abort_page_txn(&self, txn_id: u64) -> Result<(), StorageError> {
         self.pool
-            .end_page_txn(txn_id, false)
+            .end_page_txn(txn_id, false, None)
             .map(|_| ())
             .map_err(|e| StorageError::Io(e.to_string()))
     }
@@ -3388,7 +3574,16 @@ impl DiskEngine {
                 .read_guard(rid.page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types) {
-                rows.push(row);
+                // Stale-entry recheck: index maintenance is deferred past the
+                // page write, and a failed index delete strands an entry
+                // forever. A slot the entry names may now hold a different
+                // live row (slots are recycled); returning that occupant
+                // verbatim is how `WHERE k = 3` answered with the k = 2 row.
+                // Serialized-key compare, not Value equality: the B-tree
+                // matched canonicalized bytes (Int32/Int64 identity).
+                if idx.col_idx < row.len() && serialize_index_key(&row[idx.col_idx]) == key {
+                    rows.push(row);
+                }
             }
         }
         Ok(rows)
@@ -3428,7 +3623,10 @@ impl DiskEngine {
                 .pool
                 .read_guard(rid.page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types) {
+            if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types)
+                && idx.col_idx < row.len()
+                && serialize_index_key(&row[idx.col_idx]) == key
+            {
                 out.push((encode_row_pos(rid.page_id, rid.slot_idx), row));
             }
         }
@@ -3544,8 +3742,8 @@ impl DiskEngine {
     /// *indexed* column, the pairs can still apply in the opposite order to
     /// the page writes and strand a stale entry for the superseded key. That
     /// entry names a row whose key no longer matches, and the lookup path
-    /// rechecks the key against the fetched row, so it yields no rows rather
-    /// than a wrong one.
+    /// now rechecks the serialized key against the fetched row
+    /// (`index_lookup_inner`), so it yields no rows rather than a wrong one.
     fn index_apply_ops(&self, table: &str, ops: &mut Vec<IndexOp>) -> Result<(), StorageError> {
         if ops.is_empty() {
             return Ok(());
@@ -3755,77 +3953,6 @@ fn serialize_index_key(val: &Value) -> Vec<u8> {
     }
 }
 
-/// Reconstruct an integer key at the index column's declared width, so an
-/// index-only scan returns the same type a heap scan would (an `INT` column
-/// yields `Int32`, not `Int64`).
-fn int_value_for_type(i: i64, col_type: &DataType) -> Value {
-    match col_type {
-        DataType::Int32 => match i32::try_from(i) {
-            Ok(v) => Value::Int32(v),
-            Err(_) => Value::Int64(i),
-        },
-        _ => Value::Int64(i),
-    }
-}
-
-/// Deserialize a B-tree index key back into a Value. Inverse of
-/// `serialize_index_key`. `col_type` is the index column's declared type, used to
-/// reconstruct integer keys at the correct width.
-fn deserialize_index_key(data: &[u8], col_type: &DataType) -> Option<Value> {
-    if data.is_empty() {
-        return None;
-    }
-    match data[0] {
-        0 => Some(Value::Null),
-        1 => data.get(1).map(|&b| Value::Bool(b != 0)),
-        // Canonical integer key (current format).
-        7 if data.len() >= 9 => {
-            let u = u64::from_be_bytes([
-                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-            ]);
-            Some(int_value_for_type(
-                (u ^ 0x8000_0000_0000_0000) as i64,
-                col_type,
-            ))
-        }
-        // Legacy Int32 (4-byte) key — never written by current code; decoded
-        // defensively so a pre-canonicalization key can't silently drop a row.
-        2 if data.len() >= 5 => {
-            let u = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-            Some(int_value_for_type(
-                ((u ^ 0x8000_0000) as i32) as i64,
-                col_type,
-            ))
-        }
-        // Legacy Int64 (8-byte) key — likewise defensive.
-        3 if data.len() >= 9 => {
-            let u = u64::from_be_bytes([
-                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-            ]);
-            Some(int_value_for_type(
-                (u ^ 0x8000_0000_0000_0000) as i64,
-                col_type,
-            ))
-        }
-        4 if data.len() >= 9 => {
-            let u = u64::from_be_bytes([
-                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-            ]);
-            let bits = if u & 0x8000_0000_0000_0000 != 0 {
-                u ^ 0x8000_0000_0000_0000
-            } else {
-                !u
-            };
-            Some(Value::Float64(f64::from_bits(bits)))
-        }
-        5 => {
-            let s = std::str::from_utf8(&data[1..]).ok()?;
-            Some(Value::Text(s.to_string()))
-        }
-        _ => None,
-    }
-}
-
 impl std::fmt::Debug for DiskEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tables = self.tables.read();
@@ -4011,6 +4138,101 @@ mod tests {
                     .0
             })
             .collect()
+    }
+
+    /// Build a multi-page table, flush it clean, and return (db_path,
+    /// first_page, second_page) of its chain. The WAL is removed so a reopen
+    /// replays nothing over the pages the caller is about to corrupt.
+    async fn multipage_chain(dir: &std::path::Path) -> (std::path::PathBuf, u32, u32) {
+        let db_path = dir.join("cycle.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
+            register_simple_table(&catalog, "t").await;
+            engine.create_table("t").await.unwrap();
+            for id in 0..3000 {
+                engine.insert("t", simple_row(id, "seed")).await.unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        for suffix in ["wal", "wal.d"] {
+            let p = db_path.with_extension(suffix);
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(p);
+            } else {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let first_page = {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open(&db_path, catalog).unwrap();
+            engine.tables.read().get("t").map(|m| m.first_page)
+        };
+        // The engine above re-opened clean; drop it again before corrupting.
+        let Some(first_page) = first_page else {
+            panic!("table 't' not in the restored directory");
+        };
+        let disk = DiskManager::open(&db_path).unwrap();
+        let mut buf = Box::new([0u8; PAGE_SIZE]);
+        disk.read_page(first_page, buf.as_mut()).unwrap();
+        let second_page = get_next_page(&buf);
+        assert!(
+            second_page != INVALID_PAGE_ID,
+            "fixture must span multiple pages"
+        );
+        (db_path, first_page, second_page)
+    }
+
+    /// STO-4: a corrupted cyclic `next` pointer must be an error at open, not
+    /// an unbounded walk burning CPU forever.
+    #[tokio::test]
+    async fn reopen_detects_cyclic_page_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db_path, first_page, second_page) = multipage_chain(tmp.path()).await;
+
+        // Point the second page's next back at the first — a cycle.
+        let disk = DiskManager::open(&db_path).unwrap();
+        let mut buf = Box::new([0u8; PAGE_SIZE]);
+        disk.read_page(second_page, buf.as_mut()).unwrap();
+        set_next_page(buf.as_mut(), first_page);
+        page::write_checksum(buf.as_mut());
+        disk.write_page(second_page, buf.as_ref()).unwrap();
+        drop(disk);
+
+        let catalog = Arc::new(Catalog::new());
+        let err = DiskEngine::open(&db_path, catalog)
+            .expect_err("a cyclic page chain must fail the open");
+        assert!(
+            err.to_string().contains("cyclic page chain"),
+            "the error must name the cycle, got: {err}"
+        );
+    }
+
+    /// STO-4: a checksum failure during the directory chain walk must be an
+    /// error at open, not a panic on the boot path (a panic here crash-loops
+    /// every restored table).
+    #[tokio::test]
+    async fn reopen_reports_checksum_error_instead_of_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db_path, first_page, _second) = multipage_chain(tmp.path()).await;
+
+        // Corrupt the first data page's payload, leaving the stale checksum.
+        let disk = DiskManager::open(&db_path).unwrap();
+        let mut buf = Box::new([0u8; PAGE_SIZE]);
+        disk.read_page(first_page, buf.as_mut()).unwrap();
+        buf[300] ^= 0xFF;
+        disk.write_page(first_page, buf.as_ref()).unwrap();
+        drop(disk);
+
+        let catalog = Arc::new(Catalog::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            DiskEngine::open(&db_path, catalog).is_ok()
+        }));
+        match result {
+            Ok(true) => panic!("open must fail on a checksum-corrupted page"),
+            Ok(false) => {}
+            Err(_) => panic!("open panicked on a checksum-corrupted page (boot-path unwrap)"),
+        }
     }
 
     // ── 1. create_and_scan_empty_table ─────────────────────────────
@@ -4509,6 +4731,117 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    /// Seed a stale index entry the exact way deferred maintenance strands
+    /// one: the key for id=3 pointing at the slot that now holds id=2.
+    /// Returns the borrowed RowId of the id=2 row that was duplicated.
+    async fn strand_stale_entry(engine: &DiskEngine) {
+        let rids = {
+            let indexes = engine.indexes.read();
+            let idx = indexes.get("ix").unwrap();
+            idx.btree
+                .lookup(&serialize_index_key(&Value::Int32(2)))
+                .unwrap()
+        };
+        assert_eq!(rids.len(), 1, "fixture: id=2 must have exactly one entry");
+        let stale_rid = rids[0];
+        let mut indexes = engine.indexes.write();
+        let idx = indexes.get_mut("ix").unwrap();
+        idx.btree
+            .insert(&serialize_index_key(&Value::Int32(3)), stale_rid)
+            .unwrap();
+    }
+
+    /// STO-3: an index entry naming a slot whose occupant no longer matches
+    /// the key must yield NO rows — not the occupant's row.
+    #[tokio::test]
+    async fn index_lookup_rejects_stale_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "stale1").await;
+        engine.create_table("stale1").await.unwrap();
+        for i in 1..=3 {
+            engine
+                .insert("stale1", simple_row(i, &format!("u{i}")))
+                .await
+                .unwrap();
+        }
+        engine.create_index("stale1", "ix", 0).await.unwrap();
+        strand_stale_entry(&engine).await;
+
+        let stale = engine
+            .index_lookup("stale1", "ix", &Value::Int32(3))
+            .await
+            .unwrap()
+            .unwrap();
+        // The stranded entry names id=2's slot; the live id=3 row must be the
+        // ONLY match — pre-fix this also returned the k=2 row.
+        assert_eq!(
+            stale,
+            vec![simple_row(3, "u3")],
+            "stale entry must not surface the k=2 row as a match for k=3"
+        );
+
+        let live = engine
+            .index_lookup("stale1", "ix", &Value::Int32(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live, vec![simple_row(2, "u2")]);
+
+        let positions = engine
+            .index_positions_inner("stale1", "ix", &Value::Int32(3))
+            .unwrap();
+        assert_eq!(
+            positions.len(),
+            1,
+            "index_positions must apply the same recheck: {positions:?}"
+        );
+        assert_eq!(positions[0].1, simple_row(3, "u3"));
+    }
+
+    /// STO-3: index-only scans fabricated a row per B-tree entry without
+    /// touching the heap — a stale entry fabricated a phantom.
+    #[tokio::test]
+    async fn index_only_scan_rejects_stale_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "stale2").await;
+        engine.create_table("stale2").await.unwrap();
+        for i in 1..=3 {
+            engine
+                .insert("stale2", simple_row(i, &format!("u{i}")))
+                .await
+                .unwrap();
+        }
+        engine.create_index("stale2", "ix", 0).await.unwrap();
+        strand_stale_entry(&engine).await;
+
+        let stale = engine.index_only_scan("stale2", "ix", Some(&Value::Int32(3)), None);
+        // Exactly the live row — pre-fix the stale entry fabricated a second
+        // phantom `[Int32(3)]` with no heap behind it.
+        assert_eq!(
+            stale,
+            Some(vec![vec![Value::Int32(3)]]),
+            "a stale entry must not fabricate a phantom row"
+        );
+
+        let live = engine.index_only_scan("stale2", "ix", Some(&Value::Int32(2)), None);
+        assert_eq!(live, Some(vec![vec![Value::Int32(2)]]));
+
+        // Range arm: the stale entry must not appear here either.
+        let range = engine.index_only_scan(
+            "stale2",
+            "ix",
+            None,
+            Some((&Value::Int32(3), &Value::Int32(3))),
+        );
+        assert_eq!(
+            range,
+            Some(vec![vec![Value::Int32(3)]]),
+            "range arm must verify heap liveness too"
+        );
     }
 
     #[tokio::test]
@@ -7634,7 +7967,7 @@ mod wal_recovery_tests {
             seg.log_page_write(0, 9, &marker_page(0xAA)).unwrap();
             seg.log_page_undo(7, 9, &marker_page(0xAA)).unwrap();
             seg.log_page_write(7, 9, &marker_page(0xBB)).unwrap();
-            seg.log_commit(7).unwrap();
+            seg.log_commit(7, None).unwrap();
             seg.sync().unwrap();
         }
 
@@ -7688,7 +8021,7 @@ mod wal_recovery_tests {
             seg.log_page_write(7, 9, &marker_page(0xBB)).unwrap();
             // A later transaction commits its own version of the same page.
             seg.log_page_write(8, 9, &marker_page(0xCC)).unwrap();
-            seg.log_commit(8).unwrap();
+            seg.log_commit(8, None).unwrap();
             seg.sync().unwrap();
         }
 
@@ -7776,7 +8109,7 @@ mod wal_recovery_tests {
             let wal_dir = db_path.with_extension("wal.d");
             let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
             seg.log_page_write(500, 9, &marker_page(0xAA)).unwrap();
-            seg.log_commit(500).unwrap();
+            seg.log_commit(500, None).unwrap();
             seg.sync().unwrap();
         }
 

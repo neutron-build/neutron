@@ -7,37 +7,48 @@ these files scales past one instance, on purpose.
 
 ## What has actually been verified
 
-Written is not validated. This table is the honest state as of 2026-07-24; do
+Written is not validated. This table is the honest state as of 2026-08-24; do
 not upgrade a row without running the command in the last column.
 
 | Artifact | Verified | Not verified | How to close the gap |
 |---|---|---|---|
-| `nucleus/Dockerfile` | Parses and is accepted by the buildah/podman frontend (reaches `STEP 1/5`) | **The image has never been built or run.** | `docker buildx build -t nucleus:dev ./nucleus` on a Linux host |
-| `nucleus/Dockerfile.dist` | Parses, `STEP 1/13` | Never built; the multi-arch `TARGETARCH` selection is untested | See "Container" below |
+| `nucleus/Dockerfile` | **Built, run, and smoke-tested 2026-08-24** (podman machine, applehv, 6 CPU/16 GiB): image builds end-to-end from source; container boots with `NUCLEUS_PASSWORD` alone; serves pgwire DDL/DML/query; graceful SIGTERM shutdown ("Data flushed to disk successfully"); data survives a restart on a named volume | The multi-arch/QEMU path (single arm64 host) | Run the release job's multi-arch build |
+| `nucleus/Dockerfile.dist` | Parses; its runtime stanza is the same shape as `Dockerfile`'s (kept in sync) | **Never built** — it requires a *Linux* release binary in `dist/<arch>/nucleus`; the 2026-08-24 attempt packaged the host's macOS binary by mistake (Exec format error) and was not retried | Run the release workflow, or cross-compile, then build with the produced binaries |
 | `nucleus/.dockerignore` | Reduces the build context to ~11 MB | — | — |
-| `deploy/systemd/nucleus.service` | Hand-checked against the binary's real behaviour (drain budget, signal handling, env-var names) | **Never loaded by systemd.** The hardening block in particular is untested and is the most likely thing to block startup | See "systemd" below |
-| `deploy/k3s/*.yaml` | `kubeconform -strict -kubernetes-version 1.31.0` — 5 resources, 0 invalid | **Never applied to a cluster.** Schema-valid is not the same as working: probes, fsGroup/PV permissions and the graceful-shutdown window are all untested | See "k3s" below |
+| `deploy/systemd/nucleus.service` | Flags and `ExecStart` re-verified 2026-08-24 against `nucleus start --help` — every flag exists; binary path matches the image's `/usr/local/bin/nucleus` | **Never loaded by systemd.** The hardening block in particular is untested and is the most likely thing to block startup | Load on a Linux host |
+| `deploy/k3s/*.yaml` | `kubeconform -strict -kubernetes-version 1.31.0` — 5 resources, 0 invalid | **Never applied to a cluster.** Schema-valid is not the same as working: probes, fsGroup/PV permissions and the graceful-shutdown window are all untested | Apply to a k3s cluster |
 
-Why the container was not built here: the development machine is macOS, and its
-podman VM's overlay storage is currently faulting —
+2026-08-24 findings from the runtime validation (all fixed the same day):
 
-```
-Error: mounting new container: ... creating overlay mount to
-/var/home/core/.local/share/containers/storage/overlay/.../merged, ...:
-input/output error
-```
+1. **The image could not boot at all.** `start --host 0.0.0.0` (required in any
+   container) tripped the cluster/replication token guards even with zero
+   clustering configured — the documented `docker run` failed at step one. The
+   guards and the listeners are now engagement-gated (`--join`/`--replicate-from`
+   or config-driven replica); a single-node server no longer listens on the
+   cluster port at all.
+2. **The replication listener skipped auth when no token was set** — an
+   unauthenticated listener that would hand any caller the full WAL stream on a
+   non-loopback bind. Now fail-closed: no token configured means inbound
+   replicas are refused outright.
+3. **The bootstrap role is `nucleus`, not `postgres`** — the connection
+   examples below said `postgres://postgres:...`, which fails auth. Fixed below.
+4. **`HEALTHCHECK` is silently dropped when the image is built in OCI format**
+   (podman's default): `docker inspect .State.Health.Status` returns nothing.
+   Build with `--format docker` if you rely on Docker health status.
 
-— for *every* image including `debian:bookworm-slim`, so nothing containerised
-can run on it until that VM is repaired. That is an environment fault, not a
-Dockerfile fault: the build reached `STEP 1/5`, which means the frontend parsed
-the file and resolved the base image before failing on the mount.
+Why the container was not built before 2026-08-24: the development machine's
+podman VM was faulting in July (overlay mount I/O errors — since healed), and in
+August the build was OOM-killed at the final crate: the machine's default 4 GiB
+cannot compile this crate. Raised to 6 CPU / 16 GiB
+(`podman machine set --cpus 6 --memory 16384`) for the validated build above.
 
 ## Container
 
 ```bash
 # From the repository root. BuildKit is required (buildx, or podman/buildah):
 # the builder stage uses `--mount=type=cache`, which the legacy docker builder
-# does not understand.
+# does not understand. The in-container release compile needs ~16 GiB of VM
+# memory (see above).
 docker buildx build -t nucleus:dev ./nucleus
 
 docker run --rm -d --name nucleus \
@@ -45,6 +56,9 @@ docker run --rm -d --name nucleus \
   -e NUCLEUS_PASSWORD=changeme \
   -v nucleus-data:/data \
   nucleus:dev
+
+# The bootstrap role is "nucleus" (NOT postgres):
+psql "postgres://nucleus:changeme@127.0.0.1:5432/nucleus" -c 'SELECT 1'
 ```
 
 Properties worth knowing:
@@ -68,17 +82,21 @@ Acceptance sequence once a working container runtime is available:
 docker buildx build -t nucleus:dev ./nucleus
 docker run --rm -d --name nucleus -p 5432:5432 \
   -e NUCLEUS_PASSWORD=changeme -v nucleus-data:/data nucleus:dev
-# 1. becomes healthy
+# 1. becomes healthy (only with --format docker builds; OCI images drop HEALTHCHECK)
 docker inspect --format '{{.State.Health.Status}}' nucleus
-# 2. serves a real query
-psql "postgres://postgres:changeme@127.0.0.1:5432/nucleus" -c 'SELECT 1'
+# 2. serves a real query (bootstrap role is "nucleus", NOT postgres)
+psql "postgres://nucleus:changeme@127.0.0.1:5432/nucleus" -c 'SELECT 1'
 # 3. survives a restart with its data
-psql ... -c 'CREATE TABLE t(id INT PRIMARY KEY); INSERT INTO t VALUES (1);'
+psql "postgres://nucleus:changeme@127.0.0.1:5432/nucleus" -c 'CREATE TABLE t(id INT PRIMARY KEY); INSERT INTO t VALUES (1);'
 docker restart nucleus && sleep 15
-psql ... -c 'SELECT * FROM t'            # must return the row
+psql "postgres://nucleus:changeme@127.0.0.1:5432/nucleus" -c 'SELECT * FROM t'            # must return the row
 # 4. does not run as root
 docker exec nucleus id                   # uid=10001
 ```
+
+Steps 2 and 3 (and graceful SIGTERM shutdown) were executed against a real
+container on 2026-08-24; step 1 was verified to be a no-op under podman's OCI
+format, which is why it carries the caveat above.
 
 ## systemd
 

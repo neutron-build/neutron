@@ -2997,7 +2997,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nucleus"
+name = "nucleusdb"
 version = "0.1.8"
 dependencies = [
  "aes-gcm",

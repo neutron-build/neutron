@@ -11,33 +11,41 @@ today by asserting the current bad behaviour and fail the moment it improves.
 That is deliberate: an unfixed limitation with a test attached cannot quietly
 become folklore.
 
-Last verified: 2026-08-20, against a tree with 43 of 43 probe harnesses passing
-and 28 of 28 CI workflows green.
+Last verified: 2026-08-23, against the working tree carrying eight fix waves
+(2026-08-21 → 08-23, documented in the private progress ledger) plus the
+durability pass (LSM SSTable fsync + CRC32C, FLUSHDB cold-tier clearing, blob
+segment fsync) — with 43 of 43 probe harnesses passing. CI counts will be
+re-verified after that tree is committed and the workflows run it.
 
 ---
 
-## 1. A transaction spanning SQL and a specialty model is not atomic
+## 1. A transaction spanning SQL and a specialty model is not atomic — outside streams
 
-**Status: known, designed, not implemented.**
+**Status: implemented for streams (2026-08-21); designed, not implemented, for
+the other twelve models.**
 
 Nucleus has fourteen data models. SQL writes go through the page WAL with a
-commit record. The other thirteen — KV, document, FTS, vector, graph, streams,
-geo, columnar, datalog, CDC and the rest — each own an append log with no
-notion of the transaction that produced a record.
+commit record. The other thirteen each own an append log.
 
-So a transaction that writes a row and a document, and then crashes between the
-two fsyncs, can leave one without the other. Rolling back a transaction does not
-retract what its specialty writes already appended.
+For **streams**, the fix is implemented end to end: every XADD and
+consumer-group write is tagged with the coordinating transaction id, the
+commit record is CRC-covered on both WAL backends and survives compaction,
+specialty checkpoints are ordered before the SQL checkpoint with a retention
+pin, and recovery discards tagged records whose transaction never committed —
+absence of a commit record means discard, so there is no in-doubt state and no
+operator call. A crash anywhere between the streams append and the commit
+record leaves both writes or neither, and rollback retracts what the
+transaction appended. Pinned by `probe_crossmodel_commit_order` and
+`probe_crossmodel_atomicity`.
 
-The mechanism to fix it is chosen and written down: tag every specialty record
-with the coordinating transaction id, fsync the specialty logs before the SQL
-commit record rather than after, and have recovery discard records whose id
-never committed. Absence of a commit record means discard, always, so there is
-no in-doubt state needing an operator. What is missing is the implementation
-across twelve log formats.
+The remaining twelve models — KV, document, FTS, vector, graph, timeseries,
+geo, columnar, datalog, CDC, blob, pub/sub — still append with no notion of
+the transaction that produced a record. A transaction that writes a row and a
+document and crashes between the two fsyncs can leave one without the other,
+and rolling it back does not retract what its specialty writes appended.
 
 **If this matters to you:** keep cross-model writes idempotent, or confine a
-transaction to SQL.
+transaction to SQL and streams.
 
 ## 2. Two index paths read the whole table and then narrow the answer
 
@@ -130,18 +138,23 @@ that directory.
 
 There is no published comparison of:
 
-- **graph** traversal against Neo4j
 - **full-text search** against Elasticsearch
 - **OLAP** aggregation against ClickHouse (blocked locally on an operator-level
   Gatekeeper quarantine of the installed binary, not on the code)
-- **vector** search against Qdrant (no Homebrew formula; the local container
-  runtime cannot mount new images)
 
-Vector search *has* been measured against pgvector, and SQL against PostgreSQL,
-SQLite, SurrealDB, CockroachDB, TiDB, MongoDB and Redis.
+Graph traversal **has** been measured against Neo4j 5.26
+(`nucleus/docs/BENCH_VS_NEO4J.md`, 2026-08-20) and vector search against
+Qdrant 1.19 with pgvector as an in-run control (`BENCH_VS_QDRANT.md`,
+2026-08-20) — both on a single development machine, and the Qdrant run under
+stated resource handicaps (4-vCPU VM against a 10-core host, REST/JSON rather
+than gRPC). Treat those two as measured-once-with-caveats, not as defensible
+numbers. Vector search is also measured against pgvector, and SQL against
+PostgreSQL, SQLite, SurrealDB, CockroachDB, TiDB, MongoDB and Redis.
 
-**If this matters to you:** treat any specialist-workload comparison as unproven
-until one of these exists.
+**If this matters to you:** treat every specialist-workload comparison other
+than graph and vector as unproven until one exists; treat the graph and vector
+ones as single-machine indications, and run the harness on your own hardware
+before quoting either.
 
 ## 9. Scale beyond a development machine has never been run
 
@@ -187,6 +200,21 @@ a green unit suite over a mocked transport proves the mock.
 
 It has no tests and no CI workflow. It is not a supported pillar, and nothing
 public claims it is.
+
+## 13. An open enlisted transaction pins the WAL, and nothing sweeps it by default
+
+Making streams transactions crash-safe (row 1) has a cost: while any enlisted
+transaction is open, WAL truncation is held so its commit record cannot be
+pruned. The idle-in-transaction sweep that would bound this is off by default
+(`idle_in_transaction_timeout_secs = 0`), so one forgotten `BEGIN` plus one
+XADD grows the WAL without bound.
+
+Related known gap: `STREAM_XACK` used to discard its WAL error (acknowledged
+work could be lost on a crash); since 2026-08-23 it records the PEL owner
+pre-ack and fails the statement when the WAL append fails, like XADD.
+
+**If this matters to you:** set `idle_in_transaction_timeout_secs`, or close
+enlisted transactions promptly.
 
 ---
 

@@ -1852,3 +1852,39 @@ async fn test_timestamp_column_with_now_default() {
         "created_at should be TimestampTz"
     );
 }
+
+/// SUBSCRIBE matched case-insensitively at dispatch but stripped the prefix
+/// case-sensitively — `SubScribe 'SELECT ...'` registered a subscription
+/// watching ZERO tables: a sub id that can never fire.
+#[tokio::test]
+async fn test_subscribe_prefix_strip_is_case_insensitive() {
+    let ex = test_executor();
+    ex.execute("CREATE TABLE ci_feed (id INT)").await.unwrap();
+
+    let sub_results = ex
+        .execute("SubScribe 'SELECT * FROM ci_feed'")
+        .await
+        .unwrap();
+    let sub_id = match &sub_results[0] {
+        ExecResult::Select { rows, .. } => match &rows[0][0] {
+            Value::Int64(id) => *id,
+            _ => panic!("expected Int64"),
+        },
+        _ => panic!("expected select"),
+    };
+
+    ex.execute("INSERT INTO ci_feed VALUES (7)").await.unwrap();
+
+    let results = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id}"))
+        .await
+        .unwrap();
+    match &results[0] {
+        ExecResult::Select { rows, .. } => assert_eq!(
+            rows.len(),
+            1,
+            "the subscription must watch the parsed query's tables"
+        ),
+        _ => panic!("expected select"),
+    }
+}

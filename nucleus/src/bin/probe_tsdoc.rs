@@ -146,14 +146,16 @@ fn float_near(got: f64, expected: f64) -> bool {
 /// In-memory reference state for one named series.
 #[derive(Default)]
 struct TsRef {
-    /// Sorted by timestamp (duplicates allowed — matches TS store behaviour).
-    points: Vec<(u64, f64)>,
+    /// timestamp -> value, deduplicated last-write-wins (insertion order
+    /// decides among equal timestamps) — the TS store's LWW semantics
+    /// (DKV-9). Duplicates are retries (OTLP does this constantly) and must
+    /// not double-count in aggregates.
+    points: std::collections::BTreeMap<u64, f64>,
 }
 
 impl TsRef {
     fn insert(&mut self, ts: u64, val: f64) {
-        self.points.push((ts, val));
-        self.points.sort_by_key(|p| p.0);
+        self.points.insert(ts, val);
     }
 
     fn count(&self) -> i64 {
@@ -161,19 +163,11 @@ impl TsRef {
     }
 
     fn range_count(&self, start: u64, end: u64) -> i64 {
-        self.points
-            .iter()
-            .filter(|(ts, _)| *ts >= start && *ts <= end)
-            .count() as i64
+        self.points.range(start..=end).count() as i64
     }
 
     fn range_avg(&self, start: u64, end: u64) -> Option<f64> {
-        let vals: Vec<f64> = self
-            .points
-            .iter()
-            .filter(|(ts, _)| *ts >= start && *ts <= end)
-            .map(|(_, v)| *v)
-            .collect();
+        let vals: Vec<f64> = self.range(start, end);
         if vals.is_empty() {
             None
         } else {
@@ -181,11 +175,15 @@ impl TsRef {
         }
     }
 
-    /// Last value = the one with the maximum timestamp (insertion order among
-    /// equal timestamps: last inserted wins — matching the TS engine's
-    /// last_value() which returns the last DataPoint in the backing store).
+    fn range(&self, start: u64, end: u64) -> Vec<f64> {
+        self.points.range(start..=end).map(|(_, v)| *v).collect()
+    }
+
+    /// Last value = the one with the maximum timestamp; among writes at that
+    /// timestamp, the last write won — matching the TS engine's LWW columnar
+    /// store and its last_values cache.
     fn last(&self) -> Option<f64> {
-        self.points.last().map(|(_, v)| *v)
+        self.points.values().next_back().copied()
     }
 }
 

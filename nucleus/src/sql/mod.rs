@@ -653,6 +653,149 @@ pub enum ParseError {
 // Tests
 // ============================================================================
 
+/// Substitute `$1`/`$2`... (positional) and `$name` (named) placeholders in
+/// SQL text, honoring single/double quotes and line/block comments.
+///
+/// The one shared substitution scanner for procedure bodies and UDF bodies
+/// (previously two hand-copied scanners that each grew the same bugs).
+/// UTF-8-safe by construction: literal runs are copied as raw bytes and the
+/// result is decoded once at the end — copying SQL bytes through
+/// `out.push(bytes[i] as char)` mojibaked every multi-byte sequence into
+/// Latin-1 (the WIR-4 family). All edits here touch ASCII delimiters only,
+/// so the input's UTF-8 validity carries through.
+pub(crate) fn substitute_sql_placeholders(
+    sql: &str,
+    positional: &[String],
+    named: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len() + 32);
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while i < bytes.len() {
+        if in_line_comment {
+            out.push(bytes[i]);
+            if bytes[i] == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                out.push(b'*');
+                out.push(b'/');
+                in_block_comment = false;
+                i += 2;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if in_single {
+            out.push(bytes[i]);
+            if bytes[i] == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push(b'\'');
+                    i += 2;
+                } else {
+                    in_single = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_double {
+            out.push(bytes[i]);
+            if bytes[i] == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push(b'"');
+                    i += 2;
+                } else {
+                    in_double = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            out.push(b'-');
+            out.push(b'-');
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            out.push(b'/');
+            out.push(b'*');
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            out.push(b'\'');
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            out.push(b'"');
+            in_double = true;
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] == b'$' {
+            let start = i;
+            i += 1;
+            if i < bytes.len() && bytes[i].is_ascii_digit() {
+                let mut idx = 0usize;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    idx = idx * 10 + (bytes[i] - b'0') as usize;
+                    i += 1;
+                }
+                if idx > 0 && idx <= positional.len() {
+                    out.extend_from_slice(positional[idx - 1].as_bytes());
+                } else {
+                    out.extend_from_slice(&bytes[start..i]);
+                }
+                continue;
+            }
+            if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                let ident_start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let ident = &sql[ident_start..i];
+                if let Some(repl) = named.get(ident) {
+                    out.extend_from_slice(repl.as_bytes());
+                } else {
+                    out.extend_from_slice(&bytes[start..i]);
+                }
+                continue;
+            }
+            out.push(b'$');
+            continue;
+        }
+
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

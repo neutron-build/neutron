@@ -18,6 +18,8 @@ falls back to its default.
 | `idle_timeout_secs` | `u64` | `300` | `NUCLEUS_SERVER_IDLE_TIMEOUT_SECS` | - |
 | `max_memory_mb` | `usize` | `512` | `NUCLEUS_MAX_MEMORY_MB` | Global memory limit in MB. All subsystems (buffer pool, cache, KV, FTS, columnar) share this budget. 0 means no limit. |
 | `idle_in_transaction_timeout_secs` | `u64` | `0` | `-` | Seconds a transaction may sit open with no activity before the server rolls it back, releasing its MVCC snapshot so GC can advance (T1.3). Mirrors Postgres `idle_in_transaction_session_timeout`. 0 disables it (the default) — an abandoned `BEGIN` otherwise pins the GC watermark forever and grows the database without bound. |
+| `query_memory_percent` | `usize` | `75` | `-` | Percent of `max_memory_mb` a single query's working set may reserve.  These were the same number, which made the query budget useless as a guard: one query could reserve the entire RSS cap, so the working-set limit could never fire BEFORE the RSS watchdog did. Keeping it below 100 means an oversized query gets a clean 53200 naming the query, while the rest of the server keeps serving. |
+| `reject_writes_on_memory_critical` | `bool` | `false` | `-` | Reject ALL writes while the RSS watchdog reports critical pressure.  Off by default, and it should stay off. RSS is not the server's working set — it includes the buffer pool and whatever the allocator has not returned to the OS — so the flag can be set while the server is perfectly able to serve a small INSERT. Worse, rejecting writes has no feedback path to RSS (the memory is held by caches and the pool, not by pending writes), so it does not clear the condition it reacts to; it just blocks the workload until something else frees memory. Bounding query working sets is the mechanism that actually limits allocation.  Space-reclaiming statements (DELETE, TRUNCATE) are never rejected even when this is on: refusing the retention job that would free the memory is the exact opposite of the intent. |
 
 ## `[storage]`
 
@@ -41,8 +43,9 @@ falls back to its default.
 | `enabled` | `bool` | `true` | `NUCLEUS_WAL_ENABLED` | - |
 | `segment_size_mb` | `usize` | `64` | `NUCLEUS_WAL_SEGMENT_SIZE_MB` | - |
 | `checkpoint_interval_secs` | `u64` | `300` | `NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS` | - |
+| `archive_timeout_secs` | `u64` | `60` | `NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS` | Seal and archive the active WAL segment after this many seconds, even if it has not filled. `0` disables it. Only has an effect when `NUCLEUS_WAL_ARCHIVE_DIR` is set.  Without this, a segment reaches the archive only when it fills, so the PITR recovery point is the last rollover rather than the last commit. At the default 64 MiB segment a low-write database can go days between rollovers, and every commit in the current segment is missing from the archive. This bounds that exposure in wall-clock terms: it is the recovery-point objective, and it defaults to a minute rather than to `off` because anyone who has configured an archive at all has said they want point-in-time recovery. |
 | `group_commit_interval_us` | `u64` | `1000` | `NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US` | - |
-| `sync_mode` | `String` | `"fsync"` | `NUCLEUS_WAL_SYNC_MODE` | - |
+| `sync_mode` | `String` | `"fsync"` | `NUCLEUS_WAL_SYNC_MODE` | How the WAL is forced to stable storage. One of:  - `fsync` (default) — `sync_all`. On macOS this is `F_FULLFSYNC`, a true   drive-cache barrier: survives power loss, and costs ~4,253 µs here. - `fdatasync` — `sync_data`. Distinct on Linux; on macOS it is measurably   the same as `fsync` (3,849 vs 3,872 µs), so it is a knob that does   nothing there. - `flush_os` — plain `fsync(2)`, ~41 µs on this host. Survives process   crash, OS panic and `kill -9`; does NOT survive power loss, because the   drive may still hold the data in a volatile cache. This is the   guarantee PostgreSQL gives on macOS with its default   `wal_sync_method`, which is what makes an equal-footing write   comparison possible at all. On Linux `fsync(2)` normally does flush the   device, so the mode is not weaker there. - `none` / `off` — no sync. Loses committed data on any crash.  The default stays `fsync`: durability is not something to trade away by accident, only deliberately. |
 | `synchronous_commit` | `String` | `"on"` | `NUCLEUS_WAL_SYNCHRONOUS_COMMIT` | Commit-time durability: "on" (default) forces the WAL (group commit) before a write statement or COMMIT is acked; "off" defers durability to the next flush/checkpoint (bounded loss window, higher throughput). Sessions can override with `SET synchronous_commit = on|off`. |
 
 ## `[pool]`
@@ -115,6 +118,8 @@ probe hooks, not supported configuration.
 | `NUCLEUS_ALLOW_INSECURE_CLUSTER` | `src/main.rs` |
 | `NUCLEUS_ALLOW_INSECURE_REPLICATION` | `src/main.rs` |
 | `NUCLEUS_ALLOW_NO_AUTH` | `src/main.rs` |
+| `NUCLEUS_AUDIT_KEEP` | `src/audit/mod.rs` |
+| `NUCLEUS_AUDIT_MAX_BYTES` | `src/audit/mod.rs` |
 | `NUCLEUS_AUTH_METHOD` | `src/main.rs` |
 | `NUCLEUS_BLOB_CACHE_BYTES` | `src/blob/mod.rs` |
 | `NUCLEUS_CACHE_DEFAULT_TTL_SECS` | `src/config/mod.rs` |
@@ -134,14 +139,16 @@ probe hooks, not supported configuration.
 | `NUCLEUS_ENCRYPT_KEY` | `src/main.rs` |
 | `NUCLEUS_ENCRYPT_PASSPHRASE` | `src/main.rs` |
 | `NUCLEUS_ENCRYPTION_KEY` | `src/bin/probe_index_coherence.rs` |
+| `NUCLEUS_EXPERIMENTAL_REPLICATION` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_CA` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_CERT` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_KEY` | `src/main.rs` |
 | `NUCLEUS_INTERNAL_TLS_SERVER_NAME` | `src/main.rs` |
-| `NUCLEUS_IOFAULT` | `src/bin/probe_io_faults.rs` |
-| `NUCLEUS_IOFAULT_KIND` | `src/bin/probe_io_faults.rs` |
-| `NUCLEUS_IOFAULT_SKIP` | `src/bin/probe_io_faults.rs` |
+| `NUCLEUS_IOFAULT` | `src/wire/mod.rs` |
+| `NUCLEUS_IOFAULT_KIND` | `src/wire/mod.rs` |
+| `NUCLEUS_IOFAULT_SKIP` | `src/wire/mod.rs` |
+| `NUCLEUS_KV_MAX_HOT_MB` | `src/kv/mod.rs` |
 | `NUCLEUS_LOGGING_FILE` | `src/config/mod.rs` |
 | `NUCLEUS_LOGGING_FORMAT` | `src/config/mod.rs` |
 | `NUCLEUS_LOGGING_LEVEL` | `src/config/mod.rs` |
@@ -151,6 +158,7 @@ probe hooks, not supported configuration.
 | `NUCLEUS_METRICS_ENDPOINT` | `src/config/mod.rs` |
 | `NUCLEUS_METRICS_PORT` | `src/config/mod.rs` |
 | `NUCLEUS_PASSWORD` | `src/main.rs` |
+| `NUCLEUS_PLAN_COUNTERS` | `src/bin/compete.rs` |
 | `NUCLEUS_POOL_ACQUIRE_TIMEOUT_SECS` | `src/config/mod.rs` |
 | `NUCLEUS_POOL_MAX_IDLE_TIME_SECS` | `src/config/mod.rs` |
 | `NUCLEUS_POOL_MAX_LIFETIME_SECS` | `src/config/mod.rs` |
@@ -177,6 +185,7 @@ probe hooks, not supported configuration.
 | `NUCLEUS_TLS_CLIENT_CA` | `src/main.rs` |
 | `NUCLEUS_TLS_KEY` | `src/tls.rs` |
 | `NUCLEUS_WAL_ARCHIVE_DIR` | `src/storage/wal.rs` |
+| `NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS` | `src/config/mod.rs` |
 | `NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS` | `src/config/mod.rs` |
 | `NUCLEUS_WAL_ENABLED` | `src/config/mod.rs` |
 | `NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US` | `src/config/mod.rs` |

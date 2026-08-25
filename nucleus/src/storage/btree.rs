@@ -330,8 +330,21 @@ impl BTreeIndex {
             ka.cmp(kb)
         });
 
-        // Split at midpoint
-        let mid = entries.len() / 2;
+        // Split at midpoint, with one rule on top of it: duplicate keys must
+        // never straddle the split. Exact descent (`find_child`) routes a key
+        // EQUAL to the separator into the right page, so any copy of the
+        // separator key left in the left page is unreachable by `lookup` —
+        // `WHERE id = K` would miss live rows that `range_scan` (which walks
+        // right through siblings) still finds, the exact post-soak coherence
+        // signature. Duplicate (key, RowId) pairs do occur: deferred index
+        // maintenance strands stale entries when its Remove targets a RowId
+        // the tree no longer holds under that key, and the delete is
+        // best-effort. Move every trailing copy of the split key into the
+        // right page so one leaf holds all copies of a key.
+        let mut mid = entries.len() / 2;
+        while mid > 0 && extract_key(&entries[mid - 1]) == extract_key(&entries[mid]) {
+            mid -= 1;
+        }
         let left_entries = &entries[..mid];
         let right_entries = &entries[mid..];
 
@@ -1474,6 +1487,130 @@ mod tests {
         assert_eq!(all.len(), count as usize);
         for i in 0..all.len() - 1 {
             assert!(all[i].0 <= all[i + 1].0, "not sorted at index {i}");
+        }
+    }
+
+    /// Mixed random insert/delete/re-add stress with full invariant checks.
+    ///
+    /// The existing tests insert ascending sequences and delete strided
+    /// subsets of them. probe_soak's churn — the workload behind the CI
+    /// `post-soak coherence` failures — is RANDOM interleaved insert, delete
+    /// and in-place update (remove + re-add of the same key), the shape
+    /// deferred index maintenance actually produces. This drives that mix
+    /// single-threaded with a seeded RNG (so a failure is a deterministic,
+    /// replayable key/op sequence, not a thread race) and checks after every
+    /// batch that:
+    ///   1. `lookup(k)` returns exactly the live RowIds for every live key,
+    ///   2. `range_scan(k, k)` agrees with `lookup(k)` — the exact-vs-seek
+    ///      divergence seen in the CI failures,
+    ///   3. a full `range_scan` sees exactly the live entry count (no ghost
+    ///      or lost entries).
+    #[test]
+    fn btree_random_mixed_ops_keep_lookup_and_range_agreeing() {
+        struct XorShift(u64);
+        impl XorShift {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        for seed in [0x50ACBEEF1234u64, 0xC0FFEE] {
+            let (mut idx, _dir) = make_test_btree();
+            let mut rng = XorShift(seed);
+            // key space small enough that keys repeat across delete/re-add
+            // cycles (duplicate-key entries at split boundaries are the
+            // suspect), large enough to force many leaf splits.
+            let key_space: usize = 600;
+            let mut live: std::collections::HashMap<i64, Vec<RowId>> =
+                std::collections::HashMap::new();
+            let mut next_page = 1u32;
+
+            for step in 0..12_000 {
+                let choice = rng.below(100);
+                let keys: Vec<i64> = live.keys().copied().collect();
+                if choice < 45 || keys.is_empty() {
+                    // insert a (possibly duplicate) key with a fresh rid
+                    let k = rng.below(key_space) as i64;
+                    let rid = RowId {
+                        page_id: next_page,
+                        slot_idx: (step % 7) as u16,
+                    };
+                    next_page += 1;
+                    idx.insert(&int_key(k), rid).unwrap();
+                    live.entry(k).or_default().push(rid);
+                } else if choice < 70 {
+                    // delete one live entry (random key, first rid)
+                    let k = keys[rng.below(keys.len())];
+                    let rids = live.get_mut(&k).unwrap();
+                    let pos = rng.below(rids.len());
+                    let rid = rids.swap_remove(pos);
+                    if rids.is_empty() {
+                        live.remove(&k);
+                    }
+                    assert!(
+                        idx.delete(&int_key(k), rid).unwrap(),
+                        "seed {seed:#x} step {step}: delete said entry not present (k={k})"
+                    );
+                } else {
+                    // update shape: remove + re-add the SAME key, new rid
+                    let k = keys[rng.below(keys.len())];
+                    let rids = live.get_mut(&k).unwrap();
+                    let pos = rng.below(rids.len());
+                    let rid = rids.swap_remove(pos);
+                    if rids.is_empty() {
+                        live.remove(&k);
+                    }
+                    idx.delete(&int_key(k), rid).unwrap();
+                    let new_rid = RowId {
+                        page_id: next_page,
+                        slot_idx: (step % 5) as u16,
+                    };
+                    next_page += 1;
+                    idx.insert(&int_key(k), new_rid).unwrap();
+                    live.entry(k).or_default().push(new_rid);
+                }
+
+                if step % 500 == 0 || step == 11_999 {
+                    let mut total = 0usize;
+                    for (k, rids) in &live {
+                        let got = idx.lookup(&int_key(*k)).unwrap();
+                        let mut want = rids.clone();
+                        want.sort_unstable_by_key(|r| (r.page_id, r.slot_idx));
+                        let mut got = got;
+                        got.sort_unstable_by_key(|r| (r.page_id, r.slot_idx));
+                        assert_eq!(
+                            got, want,
+                            "seed {seed:#x} step {step}: lookup(k={k}) diverged"
+                        );
+                        let via_range = idx
+                            .range_scan(Some(&int_key(*k)), Some(&int_key(*k)))
+                            .unwrap();
+                        assert_eq!(
+                            via_range.len(),
+                            want.len(),
+                            "seed {seed:#x} step {step}: range_scan(k={k}) saw {} entries, lookup sees {}",
+                            via_range.len(),
+                            want.len()
+                        );
+                        total += want.len();
+                    }
+                    let all = idx.range_scan(None, None).unwrap();
+                    assert_eq!(
+                        all.len(),
+                        total,
+                        "seed {seed:#x} step {step}: full range_scan count {} != live count {total}",
+                        all.len()
+                    );
+                }
+            }
         }
     }
 

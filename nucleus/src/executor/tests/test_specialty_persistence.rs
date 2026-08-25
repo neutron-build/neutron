@@ -213,7 +213,9 @@ async fn test_hnsw_index_survives_wal_checkpoint_restart() {
 
     {
         let ex = open_executor(dir.path()).await;
-        exec(&ex, "CREATE TABLE embs (id INT, v VECTOR(3))").await;
+        // INT PRIMARY KEY, not bare INT: HNSW postings require an integer PK
+        // (a positional index desynchronizes on DELETE/WHERE — VEC-2).
+        exec(&ex, "CREATE TABLE embs (id INT PRIMARY KEY, v VECTOR(3))").await;
         for (i, v) in ["[1,0,0]", "[0,1,0]", "[0,0,1]", "[1,1,0]", "[0,1,1]"]
             .iter()
             .enumerate()
@@ -464,4 +466,110 @@ async fn test_fts_index_survives_restart() {
         .await;
         assert_eq!(rows(&after[0]).len(), 2);
     }
+}
+
+// ── HNSW WAL fault paths (NU-048 class: a failed append must fail the
+//    statement and leave no half-state a later snapshot launders in) ──────────
+
+/// `CREATE INDEX ... USING HNSW` logged its creation and backfill inserts to
+/// the vector WAL with `eprintln`-and-carry-on: under a failing disk the DDL
+/// returned success, the index went live in memory, and no WAL record of its
+/// existence ever landed — so a restart lost the whole index, acknowledged
+/// inserts included. probe_io_faults catches this as `vector.wal_append` with
+/// skip=0 ("HNSW index iov_idx did not survive reopen").
+#[tokio::test]
+async fn create_index_fails_when_its_wal_record_cannot_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE iov (id INT PRIMARY KEY, x VECTOR(4))").await;
+        // A pre-existing row makes the DDL's backfill loop (one INSERT record
+        // per existing vector) part of the faulted path too.
+        exec(&ex, "INSERT INTO iov VALUES (1, VECTOR('[1,2,3,4]'))").await;
+
+        ex.vector_wal
+            .as_ref()
+            .expect("a durable executor opened a vector WAL")
+            .set_fail_appends(true);
+
+        let err = ex
+            .execute("CREATE INDEX iov_idx ON iov USING HNSW (x)")
+            .await
+            .expect_err("a CREATE INDEX whose WAL append failed must not succeed");
+        assert!(
+            err.to_string().contains("iov_idx"),
+            "the error must name the index, got {err}"
+        );
+
+        // No half-state: the index is not live in memory, so a later
+        // checkpoint cannot snapshot an index the WAL never recorded.
+        assert!(
+            ex.vector_indexes.read().get("iov_idx").is_none(),
+            "a failed CREATE INDEX must remove its in-memory index"
+        );
+
+        ex.vector_wal.as_ref().unwrap().set_fail_appends(false);
+    }
+
+    // And it does not exist after a restart.
+    let ex = open_executor(dir.path()).await;
+    assert!(
+        ex.vector_indexes.read().get("iov_idx").is_none(),
+        "no WAL record of the index landed, so no restart may produce it"
+    );
+}
+
+/// The INSERT counterpart: `update_vector_indexes` mutated the in-memory HNSW
+/// first and logged second, so a failed WAL append left the vector live in
+/// memory for a statement that was reported as failed. The in-memory state
+/// then diverged from the WAL — and the next `checkpoint_vector_wal` (a
+/// background task on a live server) snapshots live memory, laundering the
+/// rejected vector into the durable log.
+#[tokio::test]
+async fn failed_insert_wal_append_leaves_no_state_a_checkpoint_can_launder() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            "CREATE TABLE launder (id INT PRIMARY KEY, x VECTOR(3))",
+        )
+        .await;
+        exec(&ex, "CREATE INDEX launder_x ON launder USING HNSW (x)").await;
+        exec(&ex, "INSERT INTO launder VALUES (1, VECTOR('[1,0,0]'))").await;
+
+        ex.vector_wal
+            .as_ref()
+            .expect("a durable executor opened a vector WAL")
+            .set_fail_appends(true);
+
+        let err = ex
+            .execute("INSERT INTO launder VALUES (2, VECTOR('[0,1,0]'))")
+            .await
+            .expect_err("an INSERT whose vector WAL append failed must not succeed");
+        assert!(
+            err.to_string().contains("launder_x"),
+            "the error must name the index, got {err}"
+        );
+
+        ex.vector_wal.as_ref().unwrap().set_fail_appends(false);
+
+        // The laundering attempt: a checkpoint snapshots live memory. With the
+        // rejected vector still live in memory, this makes it durable.
+        ex.checkpoint_vector_wal()
+            .expect("disarmed checkpoint must succeed");
+    }
+
+    // Reopen: exactly the one acknowledged vector may be live.
+    let ex = open_executor(dir.path()).await;
+    let live = ex
+        .hnsw_index_live_ids("launder_x")
+        .expect("the acknowledged index must survive");
+    assert_eq!(
+        live.len(),
+        1,
+        "only the acknowledged insert may be live after the checkpoint + restart"
+    );
 }

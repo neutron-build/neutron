@@ -80,7 +80,19 @@ fn ref_area(pts: &[(f64, f64)]) -> f64 {
     (sum / 2.0).abs()
 }
 
-/// Ray-cast point-in-polygon — same algorithm as geo::Polygon::contains().
+/// Boundary-inclusive point-on-segment — mirrors geo::point_on_segment.
+fn ref_point_on_segment(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> bool {
+    let cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+    let len2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+    if cross.abs() > 1e-9 * len2.max(1e-30) {
+        return false;
+    }
+    px >= ax.min(bx) && px <= ax.max(bx) && py >= ay.min(by) && py <= ay.max(by)
+}
+
+/// Ray-cast point-in-polygon — same algorithm as geo::Polygon::contains():
+/// boundary points are rejected first (OGC Contains excludes the boundary),
+/// then the ray cast decides interior points.
 fn ref_contains(poly: &[(f64, f64)], px: f64, py: f64) -> bool {
     let n = poly.len();
     if n < 3 {
@@ -91,6 +103,9 @@ fn ref_contains(poly: &[(f64, f64)], px: f64, py: f64) -> bool {
     for i in 0..n {
         let (ix, iy) = poly[i];
         let (jx, jy) = poly[j];
+        if ref_point_on_segment(px, py, ix, iy, jx, jy) {
+            return false;
+        }
         if ((iy > py) != (jy > py)) && (px < (jx - ix) * (py - iy) / (jy - iy) + ix) {
             inside = !inside;
         }

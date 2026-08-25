@@ -466,10 +466,15 @@ impl StorageEngine for LsmStorageEngine {
     }
 
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
-        // Force-flush all memtables to disk (writes pending entries as SSTable files).
+        // Force-flush all memtables to disk (writes pending entries as SSTable
+        // files). This is the COMMIT-ack path for `engine='lsm'` tables: a
+        // failed flush must fail the commit, not ack a table that lives only
+        // in RAM.
         let mut tables = self.tables.write();
         for t in tables.values_mut() {
-            t.tree.force_flush();
+            t.tree
+                .force_flush()
+                .map_err(|e| StorageError::Io(format!("LSM flush failed: {e}")))?;
         }
         Ok(())
     }

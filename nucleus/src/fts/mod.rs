@@ -1074,8 +1074,10 @@ impl InvertedIndex {
         }
 
         // Score all matching documents (same logic as search())
+        let mut seen_terms = std::collections::HashSet::new();
         let mut term_postings: Vec<(&str, &Vec<Posting>)> = query_tokens
             .iter()
+            .filter(|t| seen_terms.insert(t.term.as_str()))
             .filter_map(|token| {
                 self.postings
                     .get(&token.term)
@@ -1137,8 +1139,12 @@ impl InvertedIndex {
         if query_tokens.is_empty() {
             return vec![];
         }
+        // Deduplicated, as in `search` — OR semantics score each DISTINCT
+        // query term once.
+        let mut seen_terms = std::collections::HashSet::new();
         let mut term_postings: Vec<(&str, &Vec<Posting>)> = query_tokens
             .iter()
+            .filter(|t| seen_terms.insert(t.term.as_str()))
             .filter_map(|token| {
                 self.postings
                     .get(&token.term)
@@ -1178,12 +1184,12 @@ impl InvertedIndex {
         if query_tokens.is_empty() {
             return vec![];
         }
-
-        // Collect (term, posting_list_ref) pairs and sort by posting list length
-        // (shortest first). This ensures the rarest terms are processed first,
-        // which is the classic inverted index optimization.
+        // Deduplicate query terms — OR semantics score each DISTINCT term
+        // once, matching `search_scored`.
+        let mut seen_terms = std::collections::HashSet::new();
         let mut term_postings: Vec<(&str, &Vec<Posting>)> = query_tokens
             .iter()
+            .filter(|t| seen_terms.insert(t.term.as_str()))
             .filter_map(|token| {
                 self.postings
                     .get(&token.term)
@@ -1192,7 +1198,6 @@ impl InvertedIndex {
             .collect();
         term_postings.sort_by_key(|(_, postings)| postings.len());
 
-        // Score each document using BM25
         let mut scores: HashMap<u64, f64> = HashMap::new();
 
         for (_, postings) in &term_postings {
@@ -1358,6 +1363,7 @@ impl InvertedIndex {
         Bm25Stats {
             doc_count: self.doc_count,
             avgdl: self.avgdl(),
+            analyzer: self.analyzer,
             df,
         }
     }
@@ -1411,9 +1417,12 @@ impl InvertedIndex {
             return vec![];
         }
 
-        // Collect (term, posting list) pairs sorted shortest-first.
+        // Collect (term, posting list) pairs sorted shortest-first,
+        // deduplicated as in `search`.
+        let mut seen_terms = std::collections::HashSet::new();
         let mut term_postings: Vec<(&str, &Vec<Posting>)> = query_tokens
             .iter()
+            .filter(|t| seen_terms.insert(t.term.as_str()))
             .filter_map(|token| {
                 self.postings
                     .get(&token.term)
@@ -1678,6 +1687,10 @@ pub struct Bm25Stats {
     pub doc_count: u64,
     /// Mean document length in tokens.
     pub avgdl: f64,
+    /// Analyzer the source index tokenizes with — the document side of
+    /// `bm25_score` must produce the same term keys the `df` map was built
+    /// with, or a non-English column scores ~0 against its own stats.
+    pub analyzer: Analyzer,
     /// Stemmed query term → number of documents containing it.
     pub df: HashMap<String, usize>,
 }
@@ -1702,7 +1715,7 @@ impl Bm25Stats {
 /// The query is not a parameter: `stats.df` already enumerates its terms, so a
 /// caller cannot pair stats with a query they were not computed for.
 pub fn bm25_score(text: &str, stats: &Bm25Stats) -> f64 {
-    let doc_tokens = tokenize(text);
+    let doc_tokens = tokenize_with(text, stats.analyzer);
     let dl = doc_tokens.len() as f64;
     if stats.df.is_empty() {
         return 0.0;
@@ -2858,6 +2871,53 @@ mod tests {
                     "query '{query}' doc {id}: row-local {actual} vs index {expected}"
                 );
             }
+        }
+    }
+
+    /// VEC-4: the document side of `bm25_score` must tokenize with the SAME
+    /// analyzer the stats (and the index) were built with. The stats' df keys
+    /// come from the column's analyzer; tokenizing the document with the
+    /// default English analyzer stems "running" to "run", which never matches
+    /// a simple-built "running" key — every score collapses to 0.
+    #[test]
+    fn bm25_score_tokenizes_the_document_with_the_index_analyzer() {
+        let mut idx = InvertedIndex::with_analyzer(Analyzer::Simple);
+        idx.add_document(1, "running slowly");
+        idx.add_document(2, "walking briskly");
+        let stats = idx.bm25_stats("running");
+        let score = bm25_score("running slowly", &stats);
+        assert!(
+            score > 0.0,
+            "the document scored 0 against its own index: the doc side \
+             tokenized with the English analyzer while the df keys were \
+             built with the index's simple analyzer"
+        );
+    }
+
+    /// VEC-6: OR-semantics search must score each DISTINCT query term once,
+    /// like `search_scored` already does. Repeating a term doubled its BM25
+    /// contribution, so `search("machine machine")` outranked
+    /// `search("machine")` for every document.
+    #[test]
+    fn or_search_scores_each_distinct_query_term_once() {
+        let mut idx = InvertedIndex::new();
+        for (id, text) in scoring_corpus() {
+            idx.add_document(id, text);
+        }
+        let single = idx.search("machine", usize::MAX);
+        let doubled = idx.search("machine machine", usize::MAX);
+        assert_eq!(
+            single.len(),
+            doubled.len(),
+            "repeating a term must not change the hit set"
+        );
+        for ((id_s, sc_s), (id_d, sc_d)) in single.iter().zip(doubled.iter()) {
+            assert_eq!(id_s, id_d);
+            assert!(
+                (sc_s - sc_d).abs() < 1e-9,
+                "doc {id_s}: 'machine machine' scored {sc_d} vs 'machine' {sc_s} — \
+                 a repeated query term was counted twice"
+            );
         }
     }
 

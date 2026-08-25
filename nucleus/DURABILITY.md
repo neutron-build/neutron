@@ -25,6 +25,7 @@ and the compaction behavior are directly exercised by the crash matrix.
 | `catalog.json` | Catalog | Tables, columns, constraints, indexes | Loaded on open; written via temp + atomic rename |
 | `meta.json` | Executor metadata | Sequences, views, extensions, policy catalog | Loaded on open; written via temp + atomic rename |
 | `kv/kv.wal` | Key-value | KV mutations | Replayed on open |
+| `kv/kv_cold/*.sst` | KV cold tier | Evicted (overflow) keys, LSM SSTables: fsynced on write (data + directory entry), per-entry CRC32C in the v2 `LSM2` format | Loaded on open; corrupt files are skipped with an error log. A checkpoint truncates `kv.wal` only after the cold flush is durable |
 | `kv/collections.wal` | KV collections | Collection mutations | Replayed on open |
 | `doc/doc.wal` | Document | Document inserts/updates/deletes | Replayed on open |
 | `graph/graph.wal` | Graph | Node/edge mutations | Replayed on open |
@@ -36,7 +37,7 @@ and the compaction behavior are directly exercised by the crash matrix.
 | `streams/streams.wal` | Streams | Stream appends | Replayed on open |
 | `cdc/cdc.wal` | CDC | Change events | Replayed on open |
 | `blob/blob.wal` | Blob | Blob metadata | Replayed on open |
-| `blob/segments/seg-NNNNNNNN.seg` | Blob | Blob payload segments | Referenced by `blob.wal` |
+| `blob/segments/seg-NNNNNNNN.seg` | Blob | Blob payload segments, fsynced at the commit boundary BEFORE the WAL record that references them (data + directory entry when new segments appear) | Referenced by `blob.wal`; records carry CRC32C |
 
 Derived, never authoritative: B-tree and HNSW index structures (rebuilt from
 base rows/vectors), query and plan caches, columnar granule statistics, and the
@@ -193,11 +194,14 @@ NUCLEUS_IOFAULT=wal.fsync NUCLEUS_IOFAULT_KIND=full   # ENOSPC on fsync
 NUCLEUS_IOFAULT=wal.append NUCLEUS_IOFAULT_SKIP=10    # fail the 11th append
 ```
 
-Points: `wal.append`, `wal.fsync`, `meta.write`. Kinds: `full` (ENOSPC),
+Points: the registry in `storage::crashpoint::ALL_IO_POINTS` — the SQL WAL
+(`wal.append`, `wal.fsync`), `meta.write`, the Raft hardstate/log paths, the
+specialty-store WAL appends/fsyncs/reopens (KV, collections, timeseries,
+vector, graph, streams, datalog, FTS, columnar, document, CDC), and the KV
+cold tier's SSTable writes (`lsm.sst_write`). Kinds: `full` (ENOSPC),
 `perm` / `ro` (permission denied), `io` (generic).
 
-`probe_io_faults` walks every point × kind × depth (21 combinations) and
-asserts:
+`probe_io_faults` walks every point × kind × depth and asserts:
 
 - **A.** The failure surfaces as an error. A write that could not be made
   durable must never report success — silent success is the worst outcome,
@@ -205,8 +209,18 @@ asserts:
 - **B.** Every row the child saw acknowledged (write *and* fsync both
   succeeded) is present after recovery.
 - **C.** Recovery contains no corrupt or half-applied record.
+- **D.** Every acknowledged Datalog fact and vector survives verbatim, and
+  only acknowledged ones may.
+- **E.** Every acknowledged KV key survives the reopen — through the hot WAL
+  snapshot, the fsynced cold SSTable, or the un-truncated WAL when a failed
+  cold flush made the checkpoint refuse (the `lsm.sst_write` arm).
 
-Current result: 21 combinations exercised, 0 findings.
+Current result (2026-08-23): 69 combinations exercised, 27 of them reachable
+only through the KV cold-tier section. Three findings stand, all in the
+`vector.wal_append[skip=0]` arm (an HNSW index whose WAL never took a record
+does not survive reopen) — verified pre-existing by running the same arm with
+the KV section removed; everything else, including every KV and
+`lsm.sst_write` arm, is clean.
 
 ## Format guards
 
@@ -403,14 +417,20 @@ refuses a data directory a live instance holds, unless overridden.
 - Read-only *media* is simulated by injected `PermissionDenied` rather than an
   actually read-only mount.
 - Multi-node / replica crash behavior is out of scope here (M9).
-- Datalog, sparse vectors and tensors have **no durable store at all** — writes
-  are acknowledged and lost on restart, with no error. See
-  `docs/MODEL_SEMANTICS.md`.
+- Sparse vectors and tensors have **no durable store at all** — writes
+  are acknowledged and lost on restart, with no error. (Datalog was in this
+  list until 2026-08-17/NU-013 — its four mutators now append and a failed
+  append fails the statement; its remaining gap is rollback compensation, not
+  durability — see `docs/MODEL_SEMANTICS.md`.)
 - The FTS snapshot is rewritten whole with `std::fs::write` (no temp + rename,
   no fsync) and a parse failure on load is swallowed, so a crash mid-rewrite
   silently starts the server with a stale index.
-- There is no shared commit record between the SQL WAL and the model WALs, so a
-  transaction spanning both is not atomic across a crash by construction.
+- There is no shared commit record between the SQL WAL and the model WALs,
+  **except streams** — since the 2026-08-21 cross-model slice, streams records
+  carry the coordinating transaction id and recovery discards records whose
+  commit record never landed (see `probe_crossmodel_atomicity`). For the other
+  twelve models a transaction spanning both is still not atomic across a crash
+  by construction.
 - **ROLLBACK durability is per-store, and vector is not covered.** A `ROLLBACK`
   used to revert memory only and leave the mutation records in the specialty
   WAL, so a crash after a successful rollback resurrected the rolled-back writes

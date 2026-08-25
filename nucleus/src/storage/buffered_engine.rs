@@ -254,6 +254,13 @@ pub struct BufferedDiskEngine {
     poisoned: RwLock<std::collections::HashSet<u64>>,
     /// Metrics registry, attached after construction (see `set_metrics`).
     metrics: RwLock<Option<Arc<crate::metrics::MetricsRegistry>>>,
+    /// Staged S63 enlistment payloads (session id → commit-record body),
+    /// parked by `set_pending_enlistment` and consumed by that session's next
+    /// `commit_txn`, which writes them into its COMMIT record. Keyed by
+    /// session because the executor stages and commits on the same task-local
+    /// session scope — a plain Option here could hand session A's marker to
+    /// session B's interleaved commit.
+    pending_enlistment: RwLock<HashMap<u64, [u8; 10]>>,
 }
 
 /// The storage session id of the current execution context (0 = default /
@@ -279,6 +286,7 @@ impl BufferedDiskEngine {
             serializable_txns: RwLock::new(std::collections::HashSet::new()),
             poisoned: RwLock::new(std::collections::HashSet::new()),
             metrics: RwLock::new(None),
+            pending_enlistment: RwLock::new(HashMap::new()),
         }
     }
 
@@ -914,6 +922,23 @@ impl StorageEngine for BufferedDiskEngine {
 
     // -- Transaction lifecycle --
 
+    fn set_pending_enlistment(&self, body: [u8; 10]) {
+        let id = current_session_id();
+        self.pending_enlistment.write().insert(id, body);
+    }
+
+    fn committed_xacts(&self) -> std::sync::Arc<std::collections::HashSet<u64>> {
+        self.inner.committed_xacts()
+    }
+
+    fn current_wal_lsn(&self) -> u64 {
+        self.inner.current_wal_lsn()
+    }
+
+    fn log_xact_commit(&self, body: &[u8; 10]) -> Result<(), StorageError> {
+        self.inner.log_xact_commit(body)
+    }
+
     async fn begin_txn(&self) -> Result<(), StorageError> {
         let id = current_session_id();
         // Consume the level requested for this transaction. Taking it (rather
@@ -980,6 +1005,10 @@ impl StorageEngine for BufferedDiskEngine {
         let page_txn = self
             .inner
             .begin_page_txn(crate::storage::current_storage_session());
+        // This session's staged S63 marker, if its transaction enlisted a
+        // specialty model. Taken BEFORE applying so a failed apply cannot
+        // leak it into a later transaction: the slot is consumed either way.
+        let enlistment_body = self.pending_enlistment.write().remove(&id);
         let applied = self.apply_buffer(ops).await;
         // COMMIT is the durability point for the buffered ops just applied.
         // The executor's statement-level make_durable skipped them while the
@@ -990,8 +1019,10 @@ impl StorageEngine for BufferedDiskEngine {
                 // Logs every dirty page, then the COMMIT record, then syncs
                 // once covering both — replacing the bare `make_durable`,
                 // which logged the pages but nothing saying they were a
-                // transaction, so recovery redid them either way.
-                self.inner.commit_page_txn(page_txn)
+                // transaction, so recovery redid them either way. The
+                // enlistment body rides the same record and the same sync.
+                self.inner
+                    .commit_page_txn(page_txn, enlistment_body.as_ref().map(|b| &b[..]))
             }
             Err(e) => {
                 // The buffer is discarded, but pages this transaction already
@@ -1015,6 +1046,10 @@ impl StorageEngine for BufferedDiskEngine {
         let id = current_session_id();
         // Discard this session's buffered operations.
         self.txn_bufs.write().remove(&id);
+        // And its staged S63 marker, which dies with the transaction: leaving
+        // it would brand the NEXT commit with an id whose specialty writes
+        // were just rolled back — the filter would resurrect them.
+        self.pending_enlistment.write().remove(&id);
         self.end_serializable_txn(id);
         Ok(())
     }
@@ -1080,6 +1115,7 @@ impl StorageEngine for BufferedDiskEngine {
         // transaction on that table permanently.
         self.txn_bufs.write().remove(&id);
         self.pending_level.write().remove(&id);
+        self.pending_enlistment.write().remove(&id);
         self.end_serializable_txn(id);
     }
 

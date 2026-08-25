@@ -832,13 +832,97 @@ fn run_datalog(
 /// Compared through `hnsw_index_live_ids` because a SQL KNN query falls back
 /// to a base-table scan and would mask both.
 ///
-/// `control_shape` exists because the recovery surface is currently red in
-/// two places (see PROBES.md): checkpoint snapshots drop HNSW tombstones, and
-/// post-reopen incremental maintenance runs with an empty PK registry so
-/// deletes tombstone physical row positions instead of WAL node ids — a
-/// different id space. The control variant uses the one faithful shape
-/// (insert-only, one reopen, no checkpoints) so a clean baseline exists for
-/// the perturbation to diverge from; the honest shape stays in normal runs.
+/// `control_shape` predates the two fixes that made the honest shape clean
+/// (serialized HNSW tombstones, F1a; the persisted PK registry, F1b) and is
+/// kept for the negative control's clean-baseline arm: it uses the
+/// insert-only, one-reopen, no-checkpoints shape. The honest shape runs in
+/// normal gating.
+/// GDL-3 fixed-case section: quoted datalog constants must survive a
+/// checkpoint → reopen → replay cycle exactly. The checkpoint REGENERATES
+/// Datalog text from parsed args, so any argument that is not a bare
+/// lowercase atom or number was either silently DROPPED by replay's
+/// `if let Ok` parse or re-parsed with a different arity (silently wrong
+/// data). Deterministic — the section's domain is fixed cases, no rng.
+///
+/// The checkpoint is forced the way production forces it: a datalog-touching
+/// ROLLBACK rewrites the log to the restored state (cross-model compensation).
+fn run_datalog_quoting(kind: EngineKind, perturb: bool, sec: &mut Sections) {
+    let tmp = TmpDir::new("datalog_quoting");
+    // (query, expected tuples as (pred, args) pairs)
+    let cases: &[(&str, &str, Vec<Vec<String>>)] = &[
+        (
+            "city(N, P)",
+            "city",
+            vec![vec!["New York".into(), "8.4".into()]],
+        ),
+        ("tag(X)", "tag", vec![vec!["a, b".into()]]),
+        ("note(X)", "note", vec![vec!["it's here".into()]]),
+        ("ny(P)", "ny", vec![vec!["8.4".into()]]),
+    ];
+
+    let db = match open_harness(kind, tmp.0.as_path()) {
+        Ok(d) => d,
+        Err(e) => {
+            sec.push("datalog-quoting", format!("OPEN FAILED: {e}"));
+            return;
+        }
+    };
+    for sql in [
+        "SELECT DATALOG_ASSERT('city(\"New York\", 8.4)')",
+        "SELECT DATALOG_ASSERT('tag(\"a, b\")')",
+        "SELECT DATALOG_ASSERT('note(\"it''s here\")')",
+        "SELECT DATALOG_RULE('ny(P) :- city(\"New York\", P)')",
+        // Force the checkpoint: BEGIN + a datalog touch + ROLLBACK rewrites
+        // the WAL to the (still-quoted) restored state.
+        "BEGIN",
+        "SELECT DATALOG_ASSERT('scratch(x)')",
+        "ROLLBACK",
+    ] {
+        if let Err(e) = harness_exec(&db, sql) {
+            sec.push("datalog-quoting", format!("setup failed ({sql}): {e}"));
+            return;
+        }
+    }
+    drop(db);
+
+    // Reopen: replay must reproduce every quoted constant exactly.
+    let db = match open_harness(kind, tmp.0.as_path()) {
+        Ok(d) => d,
+        Err(e) => {
+            sec.push("datalog-quoting", format!("REOPEN FAILED: {e}"));
+            return;
+        }
+    };
+    for (q, pred, want) in cases {
+        // Negative control: model the pre-fix corruption — every quoted
+        // fact/rule was dropped or arity-garbled on replay, i.e. absent.
+        let want = if perturb { Vec::new() } else { want.clone() };
+        let sql = format!("SELECT DATALOG_QUERY('{q}')");
+        match harness_exec(&db, &sql) {
+            Ok(rows) => {
+                let got: BTreeSet<Vec<String>> = rows
+                    .iter()
+                    .flat_map(|r| parse_fact_tuples(&r.join("")))
+                    .collect();
+                let want: BTreeSet<Vec<String>> = want.into_iter().collect();
+                if got != want {
+                    sec.push(
+                        "datalog-quoting",
+                        format!(
+                            "predicate {pred} recovered {got:?} after checkpoint+reopen, \
+                             model has {want:?} — a quoted constant was dropped or \
+                             re-parsed with a different arity"
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                sec.push("datalog-quoting", format!("DATALOG_QUERY({q}) failed: {e}"));
+            }
+        }
+    }
+}
+
 fn run_vector(
     seed: u64,
     iterations: usize,
@@ -877,13 +961,12 @@ fn run_vector(
             } else {
                 // Reopen comparison. The recovered live set is compared by
                 // COUNT, not by id: PK-keyed HNSW logs its internal monotonic
-                // node ids to the WAL and the node→PK registry is deliberately
-                // not persisted (query paths fall back to brute force until a
-                // rebuild repopulates it), so ids are a fresh space after every
-                // restart. The count is the stable observable — it catches the
-                // NU-048 shapes in aggregate: acknowledged inserts lost shrink
-                // it, deleted vectors resurrecting (checkpoint snapshots drop
-                // tombstones) grow it.
+                // node ids to the WAL, and the node→PK registry is persisted
+                // now (F1b) but a full rebuild renumbers the space, so ids are
+                // not comparable across a restart that rebuilt. The count is
+                // the stable observable — it catches the NU-048 shapes in
+                // aggregate: acknowledged inserts lost shrink it, deleted
+                // vectors resurrecting grow it.
                 let mut want = model.len();
                 if perturb && want > 0 {
                     // Model of the bug: one acknowledged insert silently
@@ -1307,9 +1390,12 @@ fn main_impl() {
             "--skip-section" => {
                 i += 1;
                 let name = args[i].clone();
-                if !matches!(name.as_str(), "datalog" | "vector" | "catalog") {
+                if !matches!(
+                    name.as_str(),
+                    "datalog" | "datalog-quoting" | "vector" | "catalog"
+                ) {
                     eprintln!(
-                        "--skip-section takes one of: datalog, vector, catalog (got {name:?})"
+                        "--skip-section takes one of: datalog, datalog-quoting, vector, catalog (got {name:?})"
                     );
                     std::process::exit(2);
                 }
@@ -1332,9 +1418,10 @@ fn main_impl() {
             "--negative-control" => {
                 i += 1;
                 let section = args[i].clone();
-                if !["datalog", "vector", "catalog"].contains(&section.as_str()) {
+                if !["datalog", "datalog-quoting", "vector", "catalog"].contains(&section.as_str())
+                {
                     eprintln!(
-                        "--negative-control takes one of: datalog, vector, catalog (got {section:?})"
+                        "--negative-control takes one of: datalog, datalog-quoting, vector, catalog (got {section:?})"
                     );
                     std::process::exit(2);
                 }
@@ -1360,7 +1447,7 @@ fn main_impl() {
         let base = run_s35_sections(seed, 1, ops_per, engine, None, vcs, &[]);
         let pert = run_s35_sections(seed, 1, ops_per, engine, Some(section.as_str()), vcs, &[]);
         println!("\n════ SUMMARY (control, 1 iteration) ════");
-        for s in ["datalog", "vector", "catalog"] {
+        for s in ["datalog", "datalog-quoting", "vector", "catalog"] {
             println!(
                 "{s:<9}: {} divergence(s)  (clean baseline: {})",
                 pert.count(s),
@@ -1368,7 +1455,7 @@ fn main_impl() {
             );
         }
         let gained = pert.count(section) as i64 - base.count(section) as i64;
-        let spilled: i64 = ["datalog", "vector", "catalog"]
+        let spilled: i64 = ["datalog", "datalog-quoting", "vector", "catalog"]
             .iter()
             .filter(|s| **s != section.as_str())
             .map(|s| pert.count(s) as i64 - base.count(s) as i64)
@@ -1453,7 +1540,7 @@ fn main_impl() {
     println!("\n════ SUMMARY ════");
     println!("recovery round-trips verified : {total}");
     println!("divergences                   : {divergences}");
-    for s in ["datalog", "vector", "catalog"] {
+    for s in ["datalog", "datalog-quoting", "vector", "catalog"] {
         if skip.iter().any(|k| k == s) {
             println!("s35/{s:<9}            : SKIPPED (not covered by this run)");
         } else {
@@ -1504,6 +1591,17 @@ fn run_s35_sections(
         if r.is_err() {
             sec.push(
                 "datalog",
+                "PANIC during section (counted as divergence)".to_string(),
+            );
+        }
+    }
+    if !skipped("datalog-quoting") {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_datalog_quoting(engine, perturb == Some("datalog-quoting"), &mut sec);
+        }));
+        if r.is_err() {
+            sec.push(
+                "datalog-quoting",
                 "PANIC during section (counted as divergence)".to_string(),
             );
         }

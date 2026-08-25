@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{self, Expr, Statement};
 
 use crate::catalog::TableDef;
 use crate::planner;
@@ -592,6 +592,59 @@ impl Executor {
         Ok(())
     }
 
+    /// PK/UNIQUE validation over an in-memory, already-recast row set.
+    /// `validate_existing_unique_constraints` cannot be reused here: it scans
+    /// storage, which still holds the PRE-cast values until the rewrite
+    /// lands.
+    fn validate_retyped_uniqueness(
+        table_name: &str,
+        table_def: &TableDef,
+        rows: &[Row],
+    ) -> Result<(), ExecError> {
+        use std::collections::HashSet;
+        for constraint in &table_def.constraints {
+            let (kind, name, columns) = match constraint {
+                crate::catalog::TableConstraint::PrimaryKey { columns, name } => {
+                    ("primary key", name, columns)
+                }
+                crate::catalog::TableConstraint::Unique { columns, name } => {
+                    ("unique constraint", name, columns)
+                }
+                _ => continue,
+            };
+            let idxs: Vec<usize> = columns
+                .iter()
+                .map(|c| table_def.column_index(c))
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default();
+            if idxs.len() != columns.len() {
+                continue;
+            }
+            let mut seen: HashSet<Vec<Value>> = HashSet::new();
+            for row in rows {
+                // PG UNIQUE allows repeated NULLs; PK columns are NOT NULL
+                // by definition.
+                let key: Vec<Value> = idxs.iter().map(|&i| row[i].clone()).collect();
+                if key.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                if !seen.insert(key.clone()) {
+                    return Err(ExecError::ConstraintViolation(format!(
+                        "cannot alter column type of \"{table_name}\": values {} collide after \
+                         cast, violating {} \"{}\"",
+                        key.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        kind,
+                        name.clone().unwrap_or_else(|| "unnamed".into())
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn validate_existing_unique_constraints(
         &self,
         table_name: &str,
@@ -784,6 +837,7 @@ impl Executor {
                 increment: 1,
                 min_value: 1,
                 max_value: i64::MAX,
+                start: 1,
             };
             self.sequences
                 .write()
@@ -1452,6 +1506,49 @@ impl Executor {
                             )));
                         }
                     }
+                    // Foreign keys in OTHER tables referencing this one:
+                    // dropping the parent bricks every child. PostgreSQL's
+                    // default is RESTRICT.
+                    let fk_dependents: Vec<String> = self
+                        .catalog
+                        .list_tables()
+                        .await
+                        .into_iter()
+                        .filter(|table| table.name != table_name)
+                        .filter(|table| {
+                            table.constraints.iter().any(|constraint| {
+                                matches!(
+                                    constraint,
+                                    crate::catalog::TableConstraint::ForeignKey {
+                                        ref_table, ..
+                                    } if ref_table.eq_ignore_ascii_case(&table_name)
+                                )
+                            })
+                        })
+                        .map(|table| table.name.clone())
+                        .collect();
+                    if !fk_dependents.is_empty() {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "cannot drop table \"{table_name}\" because foreign key constraints of \
+                             table(s) {} reference it; drop those constraints first",
+                            fk_dependents.join(", ")
+                        )));
+                    }
+                    // Materialized views over this table silently stop
+                    // refreshing (their write-time refresh failures are
+                    // swallowed by design) — refuse instead.
+                    {
+                        let deps = self.mv_deps.read().await;
+                        if let Some(mvs) = deps.get(&table_name)
+                            && !mvs.is_empty()
+                        {
+                            return Err(ExecError::Unsupported(format!(
+                                "cannot drop table '{table_name}' because materialized view(s) {} \
+                                 depend on it; drop them first",
+                                mvs.join(", ")
+                            )));
+                        }
+                    }
                     match self.catalog.drop_table(&table_name).await {
                         Ok(()) => {
                             if let Err(e) =
@@ -1511,17 +1608,36 @@ impl Executor {
             ast::ObjectType::View => {
                 for name in &names {
                     let view_name = name.to_string();
+                    // Refuse while other views depend on this one —
+                    // otherwise the dependent view's stored SQL selects a
+                    // dropped name and only fails at SELECT time.
+                    {
+                        let deps = self.view_deps.read();
+                        if let Some(dependents) = deps.get(&view_name)
+                            && !dependents.is_empty()
+                        {
+                            let list: Vec<&str> = dependents.iter().map(|s| s.as_str()).collect();
+                            return Err(ExecError::Unsupported(format!(
+                                "cannot drop view '{view_name}' because view(s) {} depend on it; drop them first",
+                                list.join(", ")
+                            )));
+                        }
+                    }
                     let removed = self.views.write().await.remove(&view_name);
                     if removed.is_none() && !if_exists {
                         return Err(ExecError::Unsupported(format!(
                             "view {view_name} does not exist"
                         )));
                     }
-                    // Remove this view from dependency tracking.
+                    // Remove this view's outgoing edges, then its own key
+                    // (provably empty after the check above). A stale key
+                    // used to make a future same-named TABLE's DROP guard
+                    // refuse forever.
                     let mut deps = self.view_deps.write();
                     for views in deps.values_mut() {
                         views.remove(&view_name);
                     }
+                    deps.remove(&view_name);
                 }
                 Ok(ExecResult::Command {
                     tag: "DROP VIEW".into(),
@@ -1529,8 +1645,24 @@ impl Executor {
                 })
             }
             ast::ObjectType::Sequence => {
+                let mut dropped = false;
                 for name in &names {
-                    self.sequences.write().remove(&name.to_string());
+                    if self.sequences.write().remove(&name.to_string()).is_some() {
+                        dropped = true;
+                    }
+                }
+                if dropped {
+                    // meta.json is rewritten by the is_ddl persist block, but
+                    // load_sequences_sync applies sequences.json OVER meta at
+                    // boot and re-inserts file entries unconditionally — the
+                    // dropped sequence would resurrect. Rewrite sequences.json
+                    // now, from the live map.
+                    self.persist_sequences_sync().map_err(|e| {
+                        ExecError::Runtime(format!(
+                            "DROP SEQUENCE: sequences.json could not be updated ({e}); \
+                             the sequence was removed in memory but a restart will restore it"
+                        ))
+                    })?;
                 }
                 Ok(ExecResult::Command {
                     tag: "DROP SEQUENCE".into(),
@@ -1602,15 +1734,33 @@ impl Executor {
                 })
             }
             ast::ObjectType::Role => {
-                let mut roles = self.roles.write().await;
-                for name in &names {
-                    let role_name = name.to_string();
-                    let removed = roles.remove(&role_name);
-                    if removed.is_none() && !if_exists {
-                        return Err(ExecError::Unsupported(format!(
-                            "role '{role_name}' does not exist"
-                        )));
+                #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+                let mut dropped: Vec<String> = Vec::new();
+                {
+                    let mut roles = self.roles.write().await;
+                    for name in &names {
+                        let role_name = name.to_string();
+                        if roles.remove(&role_name).is_some() {
+                            dropped.push(role_name);
+                        } else if !if_exists {
+                            return Err(ExecError::Unsupported(format!(
+                                "role '{role_name}' does not exist"
+                            )));
+                        }
                     }
+                }
+                // Audited after the role lock is released so a slow audit
+                // fsync cannot hold the role catalog (same ordering as
+                // execute_alter_role). Only names actually removed are
+                // recorded.
+                #[cfg(feature = "server")]
+                for role_name in &dropped {
+                    self.audit(
+                        crate::audit::AuditKind::RoleDropped,
+                        role_name,
+                        &format!("by {}", self.acting_principal()),
+                        None,
+                    );
                 }
                 Ok(ExecResult::Command {
                     tag: "DROP ROLE".into(),
@@ -1744,6 +1894,48 @@ impl Executor {
             }
         }
 
+        // HNSW postings are keyed on the table's integer PK when one exists;
+        // without one they fall back to positional offsets, which any DELETE
+        // or WHERE clause desynchronizes — the index would then resolve ids
+        // to the WRONG rows (VEC-2). Refuse at DDL time, mirroring FTS: the
+        // actionable fix is an int PK. IVFFlat is exempt: it has no PK-keyed
+        // path at all, and its positional scans are guarded at query time.
+        if matches!(index_type, crate::catalog::IndexType::Hnsw)
+            && self.resolve_pk_column(&table_name, &table_def).is_none()
+        {
+            return Err(ExecError::Unsupported(format!(
+                "HNSW index on '{table_name}' requires an integer PRIMARY KEY column \
+                 to key postings on; without one, DELETEs and WHERE clauses \
+                 desynchronize positional ids and the index cannot serve them safely"
+            )));
+        }
+
+        // `WITH (metric = '…')` on vector indexes selects the distance metric
+        // the index is built with. Before this was parsed the option was
+        // silently ignored and every index was L2 — a query asking for cosine
+        // could never be served by an index that actually computed it.
+        let mut vec_metric = vector::DistanceMetric::L2;
+        if let Some(requested) = Self::extract_index_with_option(&create_index.with, "metric") {
+            if !matches!(
+                index_type,
+                crate::catalog::IndexType::Hnsw | crate::catalog::IndexType::IvfFlat
+            ) {
+                return Err(ExecError::Unsupported(
+                    "metric = '…' applies only to HNSW/IVFFLAT indexes".into(),
+                ));
+            }
+            vec_metric = match requested.to_lowercase().as_str() {
+                "l2" | "euclidean" => vector::DistanceMetric::L2,
+                "cosine" => vector::DistanceMetric::Cosine,
+                "inner" | "ip" | "dot" => vector::DistanceMetric::InnerProduct,
+                other => {
+                    return Err(ExecError::Unsupported(format!(
+                        "unknown metric '{other}'; expected 'l2', 'cosine', or 'inner'"
+                    )));
+                }
+            };
+        }
+
         // Parse index options (for vector indexes: distance metric, dims, etc.)
         let mut options = std::collections::HashMap::new();
 
@@ -1863,7 +2055,14 @@ impl Executor {
                     vec_col_idx = Some(ci);
                     vec_dims = dims;
                     options.insert("dims".to_string(), dims.to_string());
-                    options.insert("metric".to_string(), "l2".to_string());
+                    options.insert(
+                        "metric".to_string(),
+                        match vec_metric {
+                            vector::DistanceMetric::L2 => "l2".to_string(),
+                            vector::DistanceMetric::Cosine => "cosine".to_string(),
+                            vector::DistanceMetric::InnerProduct => "inner".to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -1885,7 +2084,7 @@ impl Executor {
 
         // Build the live vector index if applicable
         if let Some(col_idx) = vec_col_idx {
-            let metric = vector::DistanceMetric::L2;
+            let metric = vec_metric;
             let col_name = columns.first().cloned().unwrap_or_default();
 
             let existing_rows = self.storage.scan(&table_name).await.unwrap_or_default();
@@ -1902,8 +2101,10 @@ impl Executor {
                     let pk_column = self.resolve_pk_column(&table_name, &table_def);
                     let pk_col = pk_column.as_ref().and_then(|n| table_def.column_index(n));
                     let mut registry = crate::executor::types::PkRegistry::default();
-                    // (node, vector) pairs captured during build, for the WAL loop.
-                    let mut wal_entries: Vec<(u64, Vec<f32>)> = Vec::new();
+                    // (node, vector, pk) triples captured during build, for the
+                    // WAL loop. The pk rides in the record's metadata so replay
+                    // can rebuild the registry from delta records (F1b).
+                    let mut wal_entries: Vec<(u64, Vec<f32>, Option<u64>)> = Vec::new();
 
                     // Scan existing rows into the index. Registry allocates a fresh
                     // monotonic node id per PK; positional (no PK) uses the offset.
@@ -1911,12 +2112,13 @@ impl Executor {
                         if col_idx < row.len()
                             && let Value::Vector(v) = &row[col_idx]
                         {
-                            let node = match pk_col.and_then(|pc| Self::stable_row_id(row, pc)) {
+                            let row_pk = pk_col.and_then(|pc| Self::stable_row_id(row, pc));
+                            let node = match row_pk {
                                 Some(pk) => registry.upsert(pk).0,
                                 None => row_id as u64,
                             };
                             hnsw.insert(node, vector::Vector::new(v.clone()));
-                            wal_entries.push((node, v.clone()));
+                            wal_entries.push((node, v.clone(), row_pk));
                         }
                     }
 
@@ -1932,29 +2134,45 @@ impl Executor {
                         },
                     );
 
-                    // Log CREATE INDEX + existing row insertions to WAL
+                    // Log CREATE INDEX + existing row insertions to WAL. A
+                    // failed append fails the DDL and removes the in-memory
+                    // index (NU-048): swallowing it acknowledged an index no
+                    // WAL record vouched for, so a restart lost it — and the
+                    // live copy let a later checkpoint snapshot launder it
+                    // back into the durable log.
                     if let Some(ref wal) = self.vector_wal {
                         let metric_byte = match metric {
                             vector::DistanceMetric::L2 => 0u8,
                             vector::DistanceMetric::Cosine => 1u8,
                             vector::DistanceMetric::InnerProduct => 2u8,
                         };
-                        if let Err(e) = wal.log_create_index(
-                            &index_name,
-                            vec_dims as u32,
-                            metric_byte,
-                            hnsw_m as u32,
-                            hnsw_ef as u32,
-                        ) {
-                            eprintln!("vector WAL: failed to log create_index '{index_name}': {e}");
-                        }
-                        // Log existing row vectors under their assigned node ids.
-                        for (node, v) in &wal_entries {
-                            if let Err(e) = wal.log_insert(&index_name, *node, v, "") {
-                                eprintln!(
-                                    "vector WAL: failed to log insert for '{index_name}/{node}': {e}"
-                                );
+                        let mut wal_err = wal
+                            .log_create_index(
+                                &index_name,
+                                vec_dims as u32,
+                                metric_byte,
+                                hnsw_m as u32,
+                                hnsw_ef as u32,
+                            )
+                            .err()
+                            .map(|e| format!("CREATE INDEX record for '{index_name}' ({e})"));
+                        for (node, v, pk) in &wal_entries {
+                            if wal_err.is_some() {
+                                break;
                             }
+                            let metadata = pk.map(|p| p.to_string()).unwrap_or_default();
+                            if let Err(e) = wal.log_insert(&index_name, *node, v, &metadata) {
+                                wal_err = Some(format!(
+                                    "backfill insert for '{index_name}/{node}' ({e})"
+                                ));
+                            }
+                        }
+                        if let Some(reason) = wal_err {
+                            self.vector_indexes.write().remove(&index_name);
+                            return Err(ExecError::Runtime(format!(
+                                "vector index {index_name}: index was built in memory but its \
+                                 WAL append failed — {reason}; it would not survive a restart"
+                            )));
                         }
                         self.save_vector_index_meta();
                     }
@@ -2177,12 +2395,60 @@ impl Executor {
     // ALTER TABLE
     // ========================================================================
 
+    /// Rewrite every FROM-clause table factor named `from` to `to`,
+    /// recursively (subqueries, joins, nested joins). Also rewrites the
+    /// leading segment of qualified column references (`from.col` ->
+    /// `to.col`) in projections. Used by RENAME TO to keep stored view/matview
+    /// SQL pointing at the renamed table.
+    fn rewrite_query_table_refs(query: &mut ast::Query, from: &str, to: &str) {
+        if let ast::SetExpr::Select(sel) = query.body.as_mut() {
+            for item in &mut sel.from {
+                Self::rewrite_table_factor(&mut item.relation, from, to);
+                for join in &mut item.joins {
+                    Self::rewrite_table_factor(&mut join.relation, from, to);
+                }
+            }
+            for item in &mut sel.projection {
+                if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(parts)) = item
+                    && parts
+                        .first()
+                        .is_some_and(|p| p.value.eq_ignore_ascii_case(from))
+                {
+                    parts[0] = ast::Ident::new(to);
+                }
+            }
+        }
+    }
+
+    fn rewrite_table_factor(tf: &mut ast::TableFactor, from: &str, to: &str) {
+        match tf {
+            ast::TableFactor::Table { name, .. } => {
+                if crate::sql::object_name_key(name).eq_ignore_ascii_case(from) {
+                    *name = ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+                        ast::Ident::new(to),
+                    )]);
+                }
+            }
+            ast::TableFactor::Derived { subquery, .. } => {
+                Self::rewrite_query_table_refs(subquery, from, to);
+            }
+            ast::TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                Self::rewrite_table_factor(&mut table_with_joins.relation, from, to);
+                for join in &mut table_with_joins.joins {
+                    Self::rewrite_table_factor(&mut join.relation, from, to);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) async fn execute_alter_table(
         &self,
         alter_table: ast::AlterTable,
     ) -> Result<ExecResult, ExecError> {
-        let table_name = crate::sql::object_name_key(&alter_table.name);
-        let table_def = self.get_table(&table_name).await?;
+        let mut table_name = crate::sql::object_name_key(&alter_table.name);
 
         // Structural DDL is privileged, not just the RLS-specific operations
         // below. Without this, a policy-restricted principal could rewrite the
@@ -2199,6 +2465,14 @@ impl Executor {
         self.require_security_admin("alter a table")?;
 
         for op in &alter_table.operations {
+            // Re-fetch per iteration: every arm clones `table_def` and
+            // `update_table` REPLACES the whole TableDef, so a clone of the
+            // pre-statement def silently reverts the previous operation's
+            // catalog change while its physical rewrite already happened
+            // (dropped-column resurrection / shifted rows). A fresh fetch also
+            // keeps next_column_id() monotonic across successive ADDs, and
+            // follows a RENAME so later ops address the renamed table.
+            let table_def = self.get_table(&table_name).await?;
             match op {
                 ast::AlterTableOperation::EnableRowLevelSecurity => {
                     self.require_security_admin("enable row level security")?;
@@ -2310,7 +2584,104 @@ impl Executor {
                             }
                         }
                     }
+
+                    // ── Dependents that reference the table BY NAME ──────
+                    // 1. Incoming foreign keys in OTHER tables (mirror
+                    //    RenameColumn's ref_columns rewrite). Left stale,
+                    //    every child INSERT/UPDATE errors "table <old> does
+                    //    not exist" inside FK validation, forever.
+                    for dependency in self.catalog.list_tables().await {
+                        if dependency.name == table_name {
+                            continue;
+                        }
+                        let mut changed = false;
+                        let mut rewritten = (*dependency).clone();
+                        for constraint in &mut rewritten.constraints {
+                            if let crate::catalog::TableConstraint::ForeignKey { ref_table, .. } =
+                                constraint
+                                && ref_table.eq_ignore_ascii_case(&table_name)
+                            {
+                                *ref_table = new.clone();
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            self.catalog.update_table(rewritten).await?;
+                        }
+                    }
+                    // 1b. Self-referential FK on the renamed table itself.
+                    if let Some(current) = self.catalog.get_table(&new).await {
+                        let mut rewritten = (*current).clone();
+                        let mut changed = false;
+                        for constraint in &mut rewritten.constraints {
+                            if let crate::catalog::TableConstraint::ForeignKey { ref_table, .. } =
+                                constraint
+                                && ref_table.eq_ignore_ascii_case(&table_name)
+                            {
+                                *ref_table = new.clone();
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            self.catalog.update_table(rewritten).await?;
+                        }
+                    }
+                    // 2. Views: stored SQL is re-executed verbatim at SELECT
+                    //    time. Re-parse, rewrite table factors, re-serialize.
+                    //    Unparseable view SQL is logged and left untouched.
+                    {
+                        let mut views = self.views.write().await;
+                        for def in views.values_mut() {
+                            let Ok(stmts) = crate::sql::parse(&def.sql) else {
+                                tracing::warn!(
+                                    "RENAME TABLE: view '{}' SQL unparseable, not rewritten",
+                                    def.name
+                                );
+                                continue;
+                            };
+                            if let Some(Statement::Query(mut q)) = stmts.into_iter().next() {
+                                Self::rewrite_query_table_refs(&mut q, &table_name, &new);
+                                def.sql = format!("{q}");
+                            }
+                        }
+                    }
+                    // 3. view_deps: re-key the old name's dependent set onto
+                    //    the new name so the DROP guard fires for the renamed
+                    //    table.
+                    {
+                        let mut deps = self.view_deps.write();
+                        if let Some(dependent_views) = deps.remove(&table_name) {
+                            deps.entry(new.clone()).or_default().extend(dependent_views);
+                        }
+                    }
+                    // 4. Materialized views: source_tables bookkeeping AND the
+                    //    stored SQL.
+                    {
+                        let mut mvs = self.materialized_views.write().await;
+                        for mv in mvs.values_mut() {
+                            for src in &mut mv.source_tables {
+                                if src.eq_ignore_ascii_case(&table_name) {
+                                    *src = new.clone();
+                                }
+                            }
+                            if let Ok(stmts) = crate::sql::parse(&mv.sql)
+                                && let Some(Statement::Query(mut q)) = stmts.into_iter().next()
+                            {
+                                Self::rewrite_query_table_refs(&mut q, &table_name, &new);
+                                mv.sql = format!("{q}");
+                            }
+                        }
+                    }
+                    {
+                        let mut deps = self.mv_deps.write().await;
+                        if let Some(dependent_mvs) = deps.remove(&table_name) {
+                            deps.entry(new.clone()).or_default().extend(dependent_mvs);
+                        }
+                    }
                     self.bump_policy_gen();
+                    // Ops after a RENAME TO in the same statement must address
+                    // the renamed table; the post-loop cache refresh too.
+                    table_name = new.clone();
                 }
                 ast::AlterTableOperation::AddColumn {
                     column_keyword: _,
@@ -2358,28 +2729,8 @@ impl Executor {
                         analyzer: None,
                     };
                     let mut updated = (*table_def).clone();
-                    updated.columns.push(new_col);
+                    updated.columns.push(new_col.clone());
                     self.catalog.update_table(updated).await?;
-
-                    // Add default value to existing rows
-                    let default_val = if let Some(expr_str) = &default_expr {
-                        let parsed = sql::parse(&format!("SELECT {expr_str}"))?;
-                        if let Statement::Query(q) = &parsed[0] {
-                            if let SetExpr::Select(sel) = q.body.as_ref() {
-                                if let SelectItem::UnnamedExpr(expr) = &sel.projection[0] {
-                                    self.eval_const_expr(expr)?
-                                } else {
-                                    Value::Null
-                                }
-                            } else {
-                                Value::Null
-                            }
-                        } else {
-                            Value::Null
-                        }
-                    } else {
-                        Value::Null
-                    };
 
                     let engine = self.storage_for(&table_name);
                     let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
@@ -2391,13 +2742,19 @@ impl Executor {
                     // churn, and the rewrite then lands on the WRONG rows
                     // (duplicated PKs under the concurrency probe).
                     let rows = engine.scan_physical(&table_name).await?;
+                    // Evaluate the default PER ROW (INSERT-time defaults
+                    // already are — eval_column_default): a volatile default
+                    // (gen_random_uuid, nextval) evaluated once and cloned
+                    // would give every row the same value. Re-parsing per row
+                    // is acceptable: this is a one-time backfill.
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
                         .map(|(vidx, mut r)| {
-                            r.push(default_val.clone());
-                            (vidx, r)
+                            let v = self.eval_column_default(&new_col)?;
+                            r.push(v);
+                            Ok((vidx, r))
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, ExecError>>()?;
                     // Sync the engine's cached column schema to the new shape
                     // before writing the widened rows — otherwise an engine that
                     // caches col_types (the disk engine) serializes them against
@@ -2605,9 +2962,20 @@ impl Executor {
                             (vidx, new_row)
                         })
                         .collect();
+                    // Sync the engine's cached column schema to the post-drop
+                    // shape before writing narrowed rows — same invariant as
+                    // AddColumn: an engine that caches col_types (the disk
+                    // engine) must not serialize N-1-wide rows against the
+                    // stale N-wide schema, or reads fail to deserialize and
+                    // every row silently vanishes until restart.
+                    engine.sync_schema(&table_name).await?;
                     if !updates.is_empty() {
                         engine.update(&table_name, &updates).await?;
                     }
+                    // The rewrite's deferred index maintenance reads pre-drop
+                    // tuples under the new schema and skips the Remove ops;
+                    // rebuild like AddColumn does.
+                    engine.rebuild_table_indexes(&table_name).await?;
                 }
                 ast::AlterTableOperation::RenameColumn {
                     old_column_name,
@@ -2879,6 +3247,11 @@ impl Executor {
                         let storage = self.storage_for(&table_name);
                         let rows = storage.scan_physical(&table_name).await?;
                         let mut rewrites = Vec::new();
+                        // Full post-cast row set: float→int casts ROUND, so
+                        // distinct values can collide. Validate PK/UNIQUE and
+                        // CHECK over the recast rows before publishing
+                        // anything.
+                        let mut post_rows: Vec<Row> = Vec::with_capacity(rows.len());
                         for (pos, mut row) in rows {
                             if let Some(v) = row.get(col_idx)
                                 && !matches!(v, Value::Null)
@@ -2890,17 +3263,36 @@ impl Executor {
                                         column_name.value
                                     ))
                                 })?;
-                                if &cast != v {
-                                    row[col_idx] = cast;
-                                    rewrites.push((pos, row));
-                                }
+                                row[col_idx] = cast;
                             }
+                            // Rewrite EVERY row, not just value-changed ones:
+                            // PartialEq folds integer widths (Int32(100000) ==
+                            // Int64(100000)), so a value-equality filter would
+                            // skip the rewrite and leave 4-byte rows under an
+                            // 8-byte schema — undecodable after the sync.
+                            rewrites.push((pos, row.clone()));
+                            post_rows.push(row);
                         }
+                        Self::validate_retyped_uniqueness(&table_name, &updated, &post_rows)?;
+                        for row in &post_rows {
+                            self.check_check_constraints(&updated, row)?;
+                        }
+                        // Publish the catalog FIRST so sync_schema re-reads the
+                        // fresh type, then sync the engine cache, then write
+                        // recast rows under the NEW schema. Writing under the
+                        // stale cache wraps Int64→Int32 (tuple.rs), mis-sizes
+                        // TEXT/INT rows, and the DDL-commit flush_schema would
+                        // persist the stale schema permanently.
+                        self.catalog.update_table(updated).await?;
+                        let _rewrite = RewriteGuard::new(storage.clone(), &table_name);
+                        storage.sync_schema(&table_name).await?;
                         if !rewrites.is_empty() {
                             storage.update(&table_name, &rewrites).await?;
                         }
+                        storage.rebuild_table_indexes(&table_name).await?;
+                    } else {
+                        self.catalog.update_table(updated).await?;
                     }
-                    self.catalog.update_table(updated).await?;
                 }
                 // ── ADD CONSTRAINT ──────────────────────────────────────────────
                 ast::AlterTableOperation::AddConstraint { constraint, .. } => {
@@ -3357,21 +3749,33 @@ impl Executor {
         })
     }
 
+    /// Convert an evaluated [`Value`] to a procedure-engine argument
+    /// (mirror of the reverse mapping in `execute_proc_result`).
+    fn value_to_proc_value(v: &Value) -> crate::procedures::ProcValue {
+        use crate::procedures::ProcValue;
+        match v {
+            Value::Null => ProcValue::Null,
+            Value::Bool(b) => ProcValue::Bool(*b),
+            Value::Int32(n) => ProcValue::Int(*n as i64),
+            Value::Int64(n) => ProcValue::Int(*n),
+            Value::Float64(f) => ProcValue::Float(*f),
+            Value::Text(s) => ProcValue::Text(s.clone()),
+            Value::Bytea(b) => ProcValue::Bytes(b.clone()),
+            other => ProcValue::Text(other.to_string()),
+        }
+    }
+
     /// CALL procedure_name(args...) — execute a stored procedure.
+    ///
+    /// Dispatches over BOTH registries: CREATE FUNCTION definitions first,
+    /// then the procedure engine (CREATE PROCEDURE + builtins). Arguments
+    /// are evaluated by the real expression evaluator — the raw-text
+    /// intercept this replaced split literals on commas and lost quoted
+    /// numbers' types.
     pub(super) async fn execute_call(&self, func: ast::Function) -> Result<ExecResult, ExecError> {
         let func_name = func.name.to_string().to_lowercase();
 
-        // Look up the function
-        let func_def = {
-            let functions = self.functions.read();
-            functions.get(&func_name).cloned()
-        };
-
-        let func_def = func_def.ok_or_else(|| {
-            ExecError::Unsupported(format!("procedure {func_name} does not exist"))
-        })?;
-
-        // Evaluate arguments
+        // Evaluate arguments via the expression evaluator (typed Values).
         let empty_row: Row = Vec::new();
         let empty_meta: Vec<ColMeta> = Vec::new();
         let args: Vec<Value> = if let ast::FunctionArguments::List(ref arg_list) = func.args {
@@ -3389,32 +3793,108 @@ impl Executor {
             Vec::new()
         };
 
-        // Substitute parameters and execute.
-        let mut positional = Vec::with_capacity(func_def.params.len());
-        let mut named = HashMap::new();
-        for (i, (param_name, _)) in func_def.params.iter().enumerate() {
-            if let Some(val) = args.get(i) {
-                let replacement = sql_replacement_for_value(val);
-                positional.push(replacement.clone());
-                if !param_name.is_empty() {
-                    named.insert(param_name.clone(), replacement);
+        // Registry 1: CREATE FUNCTION definitions.
+        let func_def = {
+            let functions = self.functions.read();
+            functions.get(&func_name).cloned()
+        };
+        if let Some(func_def) = func_def {
+            // Depth guard: the body is executed as SQL, which may CALL (or
+            // SELECT) this function again — unbounded recursion used to
+            // overflow the stack and abort the process.
+            let _depth = self.enter_call()?;
+
+            let mut positional = Vec::with_capacity(func_def.params.len());
+            let mut named = HashMap::new();
+            for (i, (param_name, _)) in func_def.params.iter().enumerate() {
+                if let Some(val) = args.get(i) {
+                    let replacement = sql_replacement_for_value(val);
+                    positional.push(replacement.clone());
+                    if !param_name.is_empty() {
+                        named.insert(param_name.clone(), replacement);
+                    }
+                } else {
+                    positional.push("NULL".to_string());
                 }
+            }
+            let body = substitute_sql_placeholders(&func_def.body, &positional, &named);
+
+            let results = self.execute(&body).await?;
+            if let Some(last) = results.into_iter().last() {
+                Ok(last)
             } else {
-                positional.push("NULL".to_string());
+                Ok(ExecResult::Command {
+                    tag: "CALL".into(),
+                    rows_affected: 0,
+                })
+            }
+        } else {
+            // Registry 2: the procedure engine (CREATE PROCEDURE + builtins).
+            let proc_args: Vec<crate::procedures::ProcValue> =
+                args.iter().map(Self::value_to_proc_value).collect();
+            let proc_result = {
+                let mut eng = self.procedure_engine.write();
+                eng.execute(&func_name, &proc_args)
+            };
+            self.execute_proc_result(&func_name, proc_result).await
+        }
+    }
+
+    /// Convert a procedure engine result into an [`ExecResult`].
+    ///
+    /// `SqlBody` (a registered SQL procedure's substituted body) is executed
+    /// depth-guarded. Everything else is DATA: builtin output must never be
+    /// executed even when it looks like SQL — the keyword sniff this
+    /// replaced made `CALL json_extract('{"a":"DROP TABLE t"}','a')` run the
+    /// DROP under the caller's privileges.
+    async fn execute_proc_result(
+        &self,
+        proc_name: &str,
+        proc_result: crate::procedures::ProcResult,
+    ) -> Result<ExecResult, ExecError> {
+        use crate::procedures::{ProcResult, ProcValue};
+
+        fn proc_value_to_value(v: ProcValue) -> Value {
+            match v {
+                ProcValue::Null => Value::Null,
+                ProcValue::Bool(b) => Value::Bool(b),
+                ProcValue::Int(i) => Value::Int64(i),
+                ProcValue::Float(f) => Value::Float64(f),
+                ProcValue::Text(s) => Value::Text(s),
+                ProcValue::Bytes(b) => Value::Bytea(b),
+                ProcValue::Array(a) => Value::Text(format!("{a:?}")),
+                ProcValue::Map(m) => Value::Text(format!("{m:?}")),
             }
         }
-        let body = substitute_sql_placeholders(&func_def.body, &positional, &named);
 
-        // Execute the procedure body
-        let results = self.execute(&body).await?;
-        // Return the last result, or a CALL tag
-        if let Some(last) = results.into_iter().last() {
-            Ok(last)
-        } else {
-            Ok(ExecResult::Command {
-                tag: "CALL".into(),
-                rows_affected: 0,
-            })
+        match proc_result {
+            ProcResult::SqlBody(sql_body) => {
+                let _depth = self.enter_call()?;
+                let results = self.execute(&sql_body).await?;
+                Ok(results.into_iter().next().unwrap_or(ExecResult::Command {
+                    tag: format!("CALL {proc_name}"),
+                    rows_affected: 0,
+                }))
+            }
+            ProcResult::Ok(value) => Ok(ExecResult::Select {
+                columns: vec![("result".into(), DataType::Text)],
+                rows: vec![vec![proc_value_to_value(value)]],
+            }),
+            ProcResult::Rows(rows) => {
+                let ncols = rows.first().map(|r| r.len()).unwrap_or(1);
+                let columns = (0..ncols)
+                    .map(|i| (format!("col{i}"), DataType::Text))
+                    .collect();
+                let result_rows: Vec<Row> = rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(proc_value_to_value).collect())
+                    .collect();
+                Ok(ExecResult::Select {
+                    columns,
+                    rows: result_rows,
+                })
+            }
+            ProcResult::Error(e) => Err(ExecError::Runtime(format!("CALL {proc_name}: {e}"))),
         }
     }
 
@@ -3625,12 +4105,14 @@ impl Executor {
         let mut increment = 1i64;
         let mut min_val = 1i64;
         let mut max_val = i64::MAX;
+        let mut saw_start = false;
 
         for opt in options {
             match opt {
                 ast::SequenceOptions::StartWith(v, _) => {
                     if let Some(n) = self.sequence_option_to_i64(v) {
                         start = n;
+                        saw_start = true;
                     }
                 }
                 ast::SequenceOptions::IncrementBy(v, _) => {
@@ -3648,8 +4130,23 @@ impl Executor {
                         max_val = n;
                     }
                 }
+                // sqlparser maps NO CYCLE to Cycle(true); plain CYCLE is
+                // Cycle(false). Accepted-and-ignored is the worst class —
+                // sequences do not wrap, so refuse until wraparound exists.
+                ast::SequenceOptions::Cycle(false) => {
+                    return Err(ExecError::Unsupported(
+                        "CREATE SEQUENCE ... CYCLE is not supported: sequences do not \
+                         wrap. Use NO CYCLE (the default) or raise MAXVALUE"
+                            .into(),
+                    ));
+                }
+                ast::SequenceOptions::Cycle(true) => {}
                 _ => {}
             }
+        }
+        // PG default: absent START means min for ascending, max for descending.
+        if !saw_start {
+            start = if increment >= 0 { min_val } else { max_val };
         }
 
         let seq = SequenceDef {
@@ -3657,6 +4154,7 @@ impl Executor {
             increment,
             min_value: min_val,
             max_value: max_val,
+            start,
         };
         self.sequences
             .write()
@@ -3672,6 +4170,23 @@ impl Executor {
         match expr {
             Expr::Value(v) => match &v.value {
                 ast::Value::Number(n, _) => n.parse::<i64>().ok(),
+                _ => None,
+            },
+            // sqlparser hands a signed literal (e.g. INCREMENT BY -1) to
+            // this function as UnaryOp(Minus, Number). Dropping it here
+            // silently kept the caller's default — a descending sequence
+            // came out ascending (wave 6 CAT-8).
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Minus,
+                expr: inner,
+            } => match &**inner {
+                Expr::Value(v) => match &v.value {
+                    ast::Value::Number(n, _) => match n.parse::<i64>() {
+                        Ok(m) => m.checked_neg(),
+                        Err(_) => None,
+                    },
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
@@ -3716,9 +4231,20 @@ impl Executor {
                             ));
                         }
                     } else {
-                        seq.current = seq.min_value - seq.increment;
+                        // PG: bare RESTART rewinds to the sequence's START,
+                        // not its MINVALUE — a START 100 sequence must not
+                        // hand out 1 (below live rows).
+                        seq.current = seq.start - seq.increment;
                         i += 1;
                     }
+                }
+                "CYCLE" => {
+                    return Err(ExecError::Unsupported(
+                        "ALTER SEQUENCE ... CYCLE is not supported: sequences do not wrap".into(),
+                    ));
+                }
+                "NOCYCLE" => {
+                    i += 1;
                 }
                 "INCREMENT" => {
                     let skip = if i + 1 < tokens.len() && tokens[i + 1].to_uppercase() == "BY" {

@@ -76,9 +76,9 @@ pub(crate) enum VectorIndexKind {
 /// keeping the graph clean (in-place overwrite corrupts edges — see the
 /// recall-harness cosine collapse that motivated this).
 ///
-/// Empty for positional indexes and immediately after a reopen (it is not
-/// persisted); an empty registry makes resolve fall back to the exact
-/// brute-force scan, and the next full rebuild repopulates it from base data.
+/// Empty for positional indexes. Persisted (F1b): the checkpoint snapshot
+/// carries it inside the serialized HNSW blob, and delta INSERT records
+/// carry the pk, so it survives a reopen.
 #[derive(Clone, Default)]
 pub(crate) struct PkRegistry {
     /// pk (bit-cast to u64) -> current live node id.
@@ -92,6 +92,27 @@ pub(crate) struct PkRegistry {
 }
 
 impl PkRegistry {
+    /// The minimal persisted form: `node_to_pk` is derivable, so it stays
+    /// behind. See `vector::RegistrySection`.
+    pub(crate) fn to_section(&self) -> crate::vector::RegistrySection {
+        crate::vector::RegistrySection {
+            pk_to_node: self.pk_to_node.clone(),
+            next_node: self.next_node,
+            tombstones: self.tombstones,
+        }
+    }
+
+    /// Rebuild a registry from its persisted form, re-deriving `node_to_pk`.
+    pub(crate) fn from_section(section: crate::vector::RegistrySection) -> Self {
+        let node_to_pk = section.pk_to_node.iter().map(|(&p, &n)| (n, p)).collect();
+        PkRegistry {
+            pk_to_node: section.pk_to_node,
+            node_to_pk,
+            next_node: section.next_node,
+            tombstones: section.tombstones,
+        }
+    }
+
     /// Allocate a fresh node for `pk`, tombstoning any prior node for it.
     /// Returns (new_node, old_node_to_tombstone).
     pub fn upsert(&mut self, pk: u64) -> (u64, Option<u64>) {
@@ -133,7 +154,7 @@ pub(crate) struct VectorIndexEntry {
     /// live catalog.
     pub pk_column: Option<String>,
     /// PK -> node id registry for incremental HNSW maintenance (empty for
-    /// positional indexes and right after a reopen, until the next rebuild).
+    /// positional indexes; persisted and recovered across a reopen).
     pub registry: PkRegistry,
 }
 

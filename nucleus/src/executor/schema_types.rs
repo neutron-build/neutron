@@ -32,6 +32,10 @@ pub(crate) struct SequenceDef {
     pub increment: i64,
     pub min_value: i64,
     pub max_value: i64,
+    /// START value, so a bare `ALTER SEQUENCE … RESTART` rewinds here (PG
+    /// semantics) instead of MINVALUE. Pre-upgrade files without it load
+    /// with min_value (sequences.json) / 1 (meta.json).
+    pub start: i64,
 }
 
 #[allow(dead_code)]

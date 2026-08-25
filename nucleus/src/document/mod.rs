@@ -563,6 +563,18 @@ impl DocumentStore {
             }
             // Silently skip documents whose JSONB is corrupt.
         }
+        // next_id must also consider the cold tier: eviction order is
+        // arbitrary, so ids above max(hot) routinely live ONLY in cold.
+        // Deriving it from the WAL snapshot alone reuses a live cold id —
+        // the next insert silently shadows it, and deleting the new doc
+        // resurrects the old one under that id. Tombstones count (a deleted
+        // id still reserves its slot): ids only ever move up, which is the
+        // safe direction. (DKV-6)
+        if let Some(ref cold) = store.cold
+            && let Some(max_id) = cold.lock().max_u64_le_key()
+        {
+            store.next_id = store.next_id.max(max_id.saturating_add(1));
+        }
         Ok(store)
     }
 
@@ -670,6 +682,24 @@ impl DocumentStore {
     }
 
     fn delete_inner(&mut self, id: u64) -> bool {
+        // Delete from BOTH tiers regardless of where the doc was found.
+        //
+        // Eviction is unlogged, so WAL replay/checkpoint restore re-insert
+        // docs into hot while cold keeps the copy an earlier eviction left
+        // there — a doc can be in both tiers at once. Removing only the hot
+        // copy leaves the cold one behind, and the next get_promoting
+        // resurrects it, against the WAL's own tombstone. cold.delete is
+        // idempotent; matches KvStore::del and TieredDocumentStore::delete.
+        // Detect cold residency BEFORE purging: cold.delete plants a
+        // memtable tombstone and LsmTree::get checks the memtable first,
+        // so probing after the purge always misses.
+        let cold_hit = self
+            .cold
+            .as_ref()
+            .is_some_and(|c| c.lock().get(&id.to_le_bytes()).is_some());
+        if let Some(ref cold) = self.cold {
+            cold.lock().delete(id.to_le_bytes().to_vec());
+        }
         if let Some(old) = self.docs.remove(&id) {
             if let Some(ref wal) = self.wal
                 && let Err(e) = wal.log_delete(id)
@@ -679,22 +709,17 @@ impl DocumentStore {
             self.gin.remove(id, &old);
             self.txn_touched.insert(id);
             true
-        } else {
-            // Try cold tier
-            if let Some(ref cold) = self.cold {
-                let key = id.to_le_bytes();
-                let found = cold.lock().get(&key).is_some();
-                if found {
-                    if let Some(ref wal) = self.wal
-                        && let Err(e) = wal.log_delete(id)
-                    {
-                        eprintln!("document WAL: failed to log delete {id}: {e}");
-                    }
-                    cold.lock().delete(key.to_vec());
-                    self.txn_touched.insert(id);
-                    return true;
-                }
+        } else if cold_hit {
+            // The cold copy was already purged above; only the tombstone and
+            // the transaction write-set entry remain.
+            if let Some(ref wal) = self.wal
+                && let Err(e) = wal.log_delete(id)
+            {
+                eprintln!("document WAL: failed to log delete {id}: {e}");
             }
+            self.txn_touched.insert(id);
+            true
+        } else {
             false
         }
     }
@@ -707,12 +732,32 @@ impl DocumentStore {
         self.docs.get(&id)
     }
 
+    /// Get a document by ID from either tier WITHOUT promotion (read-only —
+    /// usable behind a read lock, unlike `get_promoting`). (DKV-7 point
+    /// reads: past `max_hot_docs`, DOC_GET/DOC_PATH must not lie with NULL
+    /// for a document that exists.)
+    pub fn get_any(&self, id: u64) -> Option<JsonValue> {
+        if let Some(jv) = self.docs.get(&id) {
+            return Some(jv.clone());
+        }
+        if let Some(ref cold) = self.cold {
+            let bytes = cold.lock().get(&id.to_le_bytes());
+            if let Some(bytes) = bytes {
+                return cold_decode_json(&bytes);
+            }
+        }
+        None
+    }
+
     /// Get a document by ID, only if it belongs to `collection`.
-    pub fn get_in(&self, collection: &str, id: u64) -> Option<&JsonValue> {
+    ///
+    /// Cold-aware without promotion (DKV-7): the doc is read from whichever
+    /// tier holds it; `get_promoting` remains the API that refills hot.
+    pub fn get_in(&self, collection: &str, id: u64) -> Option<JsonValue> {
         if !self.in_collection(id, collection) {
             return None;
         }
-        self.docs.get(&id)
+        self.get_any(id)
     }
 
     /// Get a document by ID, with cold-tier fallback and promotion.
@@ -789,6 +834,11 @@ impl DocumentStore {
     }
 
     /// [`query_contains`](Self::query_contains) restricted to `collection`.
+    ///
+    /// Hot-only (DKV-7): the set-read half of the cold-tier fix is
+    /// deliberately unwired — a cold scan has no GIN, so it is O(cold)
+    /// decode per query and lands with the full option, not the interim.
+    /// Point reads (`get_in`/`get_any`) are cold-aware.
     pub fn query_contains_in(&self, collection: &str, query: &JsonValue) -> Vec<u64> {
         self.query_contains(query)
             .into_iter()
@@ -797,6 +847,9 @@ impl DocumentStore {
     }
 
     /// Number of documents in `collection`.
+    ///
+    /// Hot-only, like `query_contains_in` (DKV-7): the set-read cold scan
+    /// is the deferred half.
     pub fn len_in(&self, collection: &str) -> usize {
         self.docs
             .keys()
@@ -1089,14 +1142,18 @@ impl DocumentStore {
     /// snapshot entry and truncate the log to just that entry. No-op if no
     /// WAL is attached.
     ///
-    /// Only hot-tier (`self.docs`) documents need to be in the snapshot.
-    /// Documents evicted to the cold LsmTree tier (see `maybe_evict`)
-    /// persist independently of this WAL — `cold.put()` is durable on its
-    /// own, so truncating away a since-evicted document's original
-    /// `log_insert` entry here does not lose data (`test_reopen_...`-style
-    /// coverage for this invariant already exists for the KV store, whose
-    /// hot/cold split works the same way).
+    /// The snapshot below covers the hot tier only and truncates the WAL to
+    /// it: `cold.put()` buffers in the memtable until the flush threshold,
+    /// so without flushing the cold tier first, an evicted document's last
+    /// WAL record is truncated away while its only remaining copy is still
+    /// in RAM.
     pub fn checkpoint(&self) -> std::io::Result<()> {
+        // Flush the cold tier BEFORE snapshotting, and never after — mirrors
+        // KvStore::checkpoint. Never best-effort: a swallowed failure here
+        // re-creates the exact silent-loss window this ordering closes.
+        if let Some(ref cold) = self.cold {
+            cold.lock().flush_memtable()?;
+        }
         if let Some(ref wal) = self.wal {
             let docs: Vec<(u64, Vec<u8>)> = self
                 .docs
@@ -2510,7 +2567,7 @@ mod tests {
             }
             // Force flush cold LsmTree
             if let Some(ref cold) = store.cold {
-                cold.lock().force_flush();
+                cold.lock().force_flush().unwrap();
             }
         }
         // Reopen — WAL restores hot entries, cold persists independently
@@ -2519,6 +2576,94 @@ mod tests {
         for id in 1..=20u64 {
             let doc = store2.get_promoting(id);
             assert!(doc.is_some(), "doc {id} should survive reopen");
+        }
+    }
+
+    #[test]
+    fn test_doc_checkpoint_flushes_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.max_hot_docs = 5;
+            for i in 0..20 {
+                let doc = json_obj(vec![("val", JsonValue::Number(i as f64))]);
+                store.insert(doc);
+            } // 15 evicted into the cold MEMTABLE (threshold 1000 — not flushed)
+            store.checkpoint().unwrap();
+        } // clean restart
+        let mut store2 = DocumentStore::open(dir.path()).unwrap();
+        for id in 1..=20u64 {
+            assert!(store2.get_promoting(id).is_some(), "doc {id} lost");
+        }
+    }
+
+    /// DKV-6: `next_id` must consider the cold tier. Eviction order is
+    /// arbitrary, so after a checkpoint/reopen cycle the max id routinely
+    /// lives only in cold — deriving `next_id` from the WAL (hot) snapshot
+    /// alone reuses a live cold id: the insert shadows it, and deleting the
+    /// new doc resurrects the old one. Three phases, so the final reopen's
+    /// WAL snapshot is EMPTY while cold deterministically holds every id.
+    #[test]
+    fn test_next_id_considers_cold_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.max_hot_docs = 5;
+            for i in 0..20 {
+                store.insert(json_obj(vec![("v", JsonValue::Number(i as f64))]));
+            }
+            store.checkpoint().unwrap();
+        }
+        {
+            // Reopen: the WAL snapshot holds only the hot survivors. Evict
+            // EVERYTHING (max_hot_docs = 0) so cold deterministically holds
+            // all 20 ids regardless of eviction order, then checkpoint an
+            // empty hot tier — the WAL snapshot is now empty.
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.max_hot_docs = 0;
+            store.maybe_evict();
+            assert_eq!(store.len_hot(), 0);
+            store.checkpoint().unwrap();
+        }
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            let id = store.insert(json_obj(vec![("v", JsonValue::Number(99.0))]));
+            assert!(id > 20, "insert must not reuse a live cold id, got {id}");
+            // The shadowing hazard, directly: doc 1 lives only in cold and
+            // must still read as its original self after the new insert.
+            let doc1 = store.get_any(1).expect("cold doc 1 must be readable");
+            assert_eq!(
+                doc1.get_path(&["v"]),
+                Some(&JsonValue::Number(0.0)),
+                "doc 1 was shadowed by the new insert"
+            );
+        }
+    }
+
+    /// DKV-7 (point reads): past `max_hot_docs`, every SQL document point
+    /// read (DOC_GET/DOC_PATH → `get_in`) consulted hot only and returned
+    /// NULL for a document that exists in cold. Eviction order is
+    /// arbitrary, so assert over all ids.
+    #[test]
+    fn test_get_in_resolves_cold_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DocumentStore::open(dir.path()).unwrap();
+        store.max_hot_docs = 5;
+        for i in 0..20u64 {
+            let city = if i % 2 == 0 { "NYC" } else { "LA" };
+            store.insert(json_obj(vec![("city", JsonValue::Str(city.to_string()))]));
+        }
+        assert!(store.len_hot() <= 5);
+        for id in 1..=20u64 {
+            let doc = store
+                .get_in("", id)
+                .unwrap_or_else(|| panic!("doc {id} must resolve from either tier"));
+            let expected = if (id - 1) % 2 == 0 { "NYC" } else { "LA" };
+            assert_eq!(
+                doc.get_path(&["city"]),
+                Some(&JsonValue::Str(expected.to_string())),
+                "doc {id} came back wrong"
+            );
         }
     }
 
@@ -2557,6 +2702,45 @@ mod tests {
         assert!(
             idx.entries.is_empty(),
             "removing the only document must drop empty posting lists, not leak them"
+        );
+    }
+
+    /// DKV-4: delete must purge BOTH tiers. Eviction is unlogged, so WAL
+    /// replay re-inserts docs into hot while a FLUSHED cold tier keeps the
+    /// evicted copies — after a reopen a doc can live in both tiers at once.
+    /// Removing only the hot copy left the cold one behind, and the next
+    /// get_promoting resurrected the deleted doc, against the WAL's own
+    /// tombstone. >1000 docs so the cold memtable crosses its flush
+    /// threshold and the evictions become durable; evictions are
+    /// HashMap-order-arbitrary, so assert over all ids.
+    #[test]
+    fn test_doc_delete_purges_cold_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.max_hot_docs = 5;
+            for i in 0..1200 {
+                store.insert(json_obj(vec![("v", JsonValue::Number(i as f64))]));
+            }
+            // Sanity: the hot tier stayed capped; the overflow went to cold.
+            assert!(store.len_hot() <= 5);
+        }
+        // Reopen: WAL replay restores every doc into hot while the flushed
+        // cold tier still holds the evicted copies — the dual-residency state.
+        let mut store = DocumentStore::open(dir.path()).unwrap();
+
+        for id in 1..=1200u64 {
+            assert!(store.delete(id), "doc {id} existed");
+        }
+        let mut resurrected = 0usize;
+        for id in 1..=1200u64 {
+            if store.get_promoting(id).is_some() {
+                resurrected += 1;
+            }
+        }
+        assert_eq!(
+            resurrected, 0,
+            "{resurrected} docs resurrected from the cold tier after delete"
         );
     }
 }

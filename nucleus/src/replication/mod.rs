@@ -1867,6 +1867,7 @@ pub fn to_storage_wal_record(rec: &WalRecord) -> crate::storage::wal::WalRecord 
                 record_type: crate::storage::wal::RECORD_PAGE_WRITE,
                 page_id: *page_id as u32,
                 page_image: Some(page_buf),
+                control_body: None,
             }
         }
         WalPayload::Commit { txn_id } => crate::storage::wal::WalRecord {
@@ -1875,6 +1876,7 @@ pub fn to_storage_wal_record(rec: &WalRecord) -> crate::storage::wal::WalRecord 
             record_type: crate::storage::wal::RECORD_COMMIT,
             page_id: 0,
             page_image: None,
+            control_body: None,
         },
         WalPayload::Abort { txn_id } => crate::storage::wal::WalRecord {
             lsn: rec.lsn,
@@ -1882,6 +1884,7 @@ pub fn to_storage_wal_record(rec: &WalRecord) -> crate::storage::wal::WalRecord 
             record_type: crate::storage::wal::RECORD_ABORT,
             page_id: 0,
             page_image: None,
+            control_body: None,
         },
         WalPayload::Checkpoint => crate::storage::wal::WalRecord {
             lsn: rec.lsn,
@@ -1889,6 +1892,7 @@ pub fn to_storage_wal_record(rec: &WalRecord) -> crate::storage::wal::WalRecord 
             record_type: crate::storage::wal::RECORD_CHECKPOINT,
             page_id: 0,
             page_image: None,
+            control_body: None,
         },
     }
 }
@@ -2192,8 +2196,20 @@ impl ReplicationServer {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        if let Some(expected) = auth_token.as_deref() {
-            match framing::read_message(&mut stream).await? {
+        match auth_token.as_deref() {
+            // Fail closed: a server with no replication token configured must
+            // refuse inbound replicas outright. Skipping the handshake when
+            // unset meant an unauthenticated listener handed any caller the
+            // full WAL stream — reachable whenever the server bound
+            // non-loopback (every containerized deployment).
+            None => {
+                return Err(ReplicationError::ProtocolError(
+                    "replication server has no auth token configured; refusing replica connection \
+                     (set NUCLEUS_REPLICATION_TOKEN on the primary)"
+                        .into(),
+                ));
+            }
+            Some(expected) => match framing::read_message(&mut stream).await? {
                 Some(ReplicationMessage::Auth { token })
                     if constant_time_eq_token(token.as_bytes(), expected.as_bytes()) => {}
                 Some(_) => {
@@ -2206,7 +2222,7 @@ impl ReplicationServer {
                         "replication auth failed: connection closed".into(),
                     ));
                 }
-            }
+            },
         }
 
         let (reader, writer) = tokio::io::split(stream);
@@ -3484,6 +3500,7 @@ mod tests {
             record_type: crate::storage::wal::RECORD_PAGE_WRITE,
             page_id: 5,
             page_image: Some(page_data),
+            control_body: None,
         };
 
         // Convert to replication format
@@ -3518,6 +3535,7 @@ mod tests {
             record_type: crate::storage::wal::RECORD_COMMIT,
             page_id: 0,
             page_image: None,
+            control_body: None,
         };
 
         let repl_rec = from_storage_wal_record(&storage_rec);
@@ -3542,6 +3560,7 @@ mod tests {
             record_type: crate::storage::wal::RECORD_ABORT,
             page_id: 0,
             page_image: None,
+            control_body: None,
         };
 
         let repl_rec = from_storage_wal_record(&storage_rec);
@@ -3560,6 +3579,7 @@ mod tests {
             record_type: crate::storage::wal::RECORD_CHECKPOINT,
             page_id: 0,
             page_image: None,
+            control_body: None,
         };
 
         let repl_rec = from_storage_wal_record(&storage_rec);
@@ -3577,6 +3597,7 @@ mod tests {
             record_type: 255, // unknown
             page_id: 0,
             page_image: None,
+            control_body: None,
         };
 
         let repl_rec = from_storage_wal_record(&storage_rec);
@@ -3648,7 +3669,7 @@ mod tests {
         let page = [0u8; crate::storage::page::PAGE_SIZE];
         storage_wal.log_page_write(1, 100, &page).unwrap();
         storage_wal.log_page_write(1, 101, &page).unwrap();
-        storage_wal.log_commit(1).unwrap();
+        storage_wal.log_commit(1, None).unwrap();
         storage_wal.sync().unwrap();
 
         // Create a replication manager and bridge
@@ -3691,6 +3712,50 @@ mod tests {
     }
 
     // -- WalNotifier (broadcast channel bridge) --------------------------------
+
+    #[tokio::test]
+    async fn replication_server_without_token_refuses_replicas() {
+        // Fail-closed contract: a primary configured with no
+        // NUCLEUS_REPLICATION_TOKEN must refuse inbound replica connections,
+        // not skip the handshake. Skipping it handed any caller the full WAL
+        // stream whenever the server bound non-loopback (every container).
+        // Observable discriminator: the refused connection is CLOSED by the
+        // server promptly; with the handshake skipped it stayed open.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let notifier = std::sync::Arc::new(tokio::sync::Mutex::new(WalNotifier::new(4)));
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let server = std::sync::Arc::new(ReplicationServer::new(
+            format!("127.0.0.1:{port}"),
+            notifier,
+            None,
+        ));
+        let srv = server.clone();
+        let task = tokio::spawn(async move { srv.run().await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("server should accept TCP");
+        sock.write_all(&[0u8]).await.unwrap();
+        sock.shutdown().await.unwrap();
+
+        // The server must close its side; a read hits EOF instead of hanging
+        // (the old no-token path skipped the handshake and kept the stream
+        // open indefinitely, waiting to stream WAL).
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut buf))
+            .await
+            .expect("server must close the refused connection within 2s");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF/error from the refused replica connection, got {read:?}"
+        );
+        task.abort();
+    }
 
     #[tokio::test]
     async fn wal_notifier_basic_subscribe_and_notify() {
@@ -3777,7 +3842,7 @@ mod tests {
         // Write records to storage WAL
         let page = [0u8; crate::storage::page::PAGE_SIZE];
         storage_wal.log_page_write(1, 100, &page).unwrap();
-        storage_wal.log_commit(1).unwrap();
+        storage_wal.log_commit(1, None).unwrap();
         storage_wal.sync().unwrap();
 
         let mut notifier = WalNotifier::new(16);

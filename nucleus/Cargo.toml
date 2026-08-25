@@ -1,5 +1,11 @@
 [package]
-name = "nucleus"
+# The crates.io artifact name. Bare `nucleus` is taken there by an unrelated
+# 2020 crate (nucleus-db is also taken, by an STM32 toolchain since 2026-06),
+# so the engine publishes as `nucleusdb` — product "Nucleus", crate
+# `nucleusdb`, same pattern as duckdb/surrealdb. The lib and binary names
+# below stay `nucleus`: every in-tree `use nucleus::` and the installed
+# server binary are unchanged.
+name = "nucleusdb"
 version = "0.1.8"
 edition = "2024"
 autobins = false
@@ -7,6 +13,10 @@ description = "The definitive database engine"
 license = "BSL-1.1"
 authors = ["Tyler"]
 repository = "https://github.com/neutron-build/neutron"
+
+[lib]
+name = "nucleus"
+path = "src/lib.rs"
 
 [dependencies]
 aes-gcm = "0.10"
@@ -248,6 +258,11 @@ required-features = ["server"]
 [[bin]]
 name = "probe_crossmodel_commit_order"
 path = "src/bin/probe_crossmodel_commit_order.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_crossmodel_atomicity"
+path = "src/bin/probe_crossmodel_atomicity.rs"
 required-features = ["server"]
 
 [[bin]]

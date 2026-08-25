@@ -285,3 +285,82 @@ async fn create_binds_the_stable_column_id() {
         "the column id must be resolved at CREATE, not left for a later rename"
     );
 }
+
+/// SEC-2: masking DDL inside a transaction staged into `security_pending`,
+/// SHOW (which reads the staged view) listed it, and COMMIT then silently
+/// discarded the staged catalog — masking never set `policy_dirty`, so the
+/// publish gate at COMMIT skipped it and the policy vanished. Mirror of
+/// test_rls' `policy_ddl_obeys_transactions_and_savepoints`.
+#[tokio::test]
+async fn masking_ddl_obeys_transactions_and_savepoints() {
+    let ex = seeded().await;
+    let sid = as_analyst(&ex).await;
+
+    // COMMIT publishes: staged for this session, invisible to others, then
+    // live for everyone.
+    exec(&ex, "BEGIN").await;
+    exec(
+        &ex,
+        "CREATE MASKING POLICY ON people (ssn) TO analyst USING REDACT '***'",
+    )
+    .await;
+    let staged = exec(&ex, "SHOW MASKING POLICIES").await;
+    assert_eq!(
+        rows(&staged[0]).len(),
+        1,
+        "the creating session must see its own staged policy"
+    );
+    let res = ex
+        .execute_with_session(sid, "SELECT ssn FROM people")
+        .await
+        .unwrap();
+    assert_eq!(
+        cell(&res[0], 0, 0),
+        "123-45-6789",
+        "an uncommitted mask leaked to another session"
+    );
+    exec(&ex, "COMMIT").await;
+
+    // THE drop point: still listed — and enforced — after COMMIT.
+    let listed = exec(&ex, "SHOW MASKING POLICIES").await;
+    assert_eq!(
+        rows(&listed[0]).len(),
+        1,
+        "COMMIT silently dropped the staged masking policy"
+    );
+    let res = ex
+        .execute_with_session(sid, "SELECT ssn FROM people")
+        .await
+        .unwrap();
+    assert_eq!(
+        cell(&res[0], 0, 0),
+        "***",
+        "COMMIT did not publish the mask to enforcement"
+    );
+
+    // ROLLBACK discards.
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "DROP MASKING POLICY ON people (ssn) TO analyst").await;
+    exec(&ex, "ROLLBACK").await;
+    let listed = exec(&ex, "SHOW MASKING POLICIES").await;
+    assert_eq!(rows(&listed[0]).len(), 1, "ROLLBACK kept the drop");
+
+    // ROLLBACK TO SAVEPOINT reverts the DDL after the savepoint and keeps
+    // the DDL before it.
+    exec(&ex, "BEGIN").await;
+    exec(
+        &ex,
+        "CREATE MASKING POLICY ON people (email) TO analyst USING EMAIL",
+    )
+    .await;
+    exec(&ex, "SAVEPOINT before_drop").await;
+    exec(&ex, "DROP MASKING POLICY ON people (ssn) TO analyst").await;
+    exec(&ex, "ROLLBACK TO SAVEPOINT before_drop").await;
+    exec(&ex, "COMMIT").await;
+    let listed = exec(&ex, "SHOW MASKING POLICIES").await;
+    assert_eq!(
+        rows(&listed[0]).len(),
+        2,
+        "savepoint rollback must restore the pair exactly: {listed:?}"
+    );
+}

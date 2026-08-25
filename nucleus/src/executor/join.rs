@@ -67,8 +67,15 @@ impl Executor {
             ast::JoinOperator::Left(c) | ast::JoinOperator::LeftOuter(c) => (c, JoinType::Left),
             ast::JoinOperator::Right(c) | ast::JoinOperator::RightOuter(c) => (c, JoinType::Right),
             ast::JoinOperator::FullOuter(c) => (c, JoinType::Full),
-            ast::JoinOperator::Semi(c) | ast::JoinOperator::LeftSemi(c) => (c, JoinType::Inner),
-            ast::JoinOperator::Anti(c) | ast::JoinOperator::LeftAnti(c) => (c, JoinType::Left),
+            // SEMI/ANTI previously degraded to Inner/Left and returned wrong
+            // rows (right columns leak / matched rows emitted for ANTI).
+            // Until real semi/anti semantics land, refuse loudly.
+            ast::JoinOperator::Semi(_) | ast::JoinOperator::LeftSemi(_) => {
+                return Err(ExecError::Unsupported("SEMI JOIN is not supported".into()));
+            }
+            ast::JoinOperator::Anti(_) | ast::JoinOperator::LeftAnti(_) => {
+                return Err(ExecError::Unsupported("ANTI JOIN is not supported".into()));
+            }
             ast::JoinOperator::CrossJoin(_) => {
                 return self.cross_join(left_meta, left_rows, right_meta, right_rows);
             }
@@ -426,10 +433,7 @@ impl Executor {
                                 let rr = &right_rows[*ri];
                                 let combined: Row = lr.iter().chain(rr.iter()).cloned().collect();
                                 if let Some(res) = residual {
-                                    if self
-                                        .eval_where(res, &combined, combined_meta)
-                                        .unwrap_or(false)
-                                    {
+                                    if self.eval_where(res, &combined, combined_meta)? {
                                         result_rows.push(combined);
                                         matched = true;
                                     }
@@ -467,10 +471,7 @@ impl Executor {
                                 let lr = &left_rows[*li];
                                 let combined: Row = lr.iter().chain(rr.iter()).cloned().collect();
                                 if let Some(res) = residual {
-                                    if self
-                                        .eval_where(res, &combined, combined_meta)
-                                        .unwrap_or(false)
-                                    {
+                                    if self.eval_where(res, &combined, combined_meta)? {
                                         result_rows.push(combined);
                                         matched = true;
                                     }
@@ -510,10 +511,7 @@ impl Executor {
                                 let rr = &right_rows[*ri];
                                 let combined: Row = lr.iter().chain(rr.iter()).cloned().collect();
                                 if let Some(res) = residual {
-                                    if self
-                                        .eval_where(res, &combined, combined_meta)
-                                        .unwrap_or(false)
-                                    {
+                                    if self.eval_where(res, &combined, combined_meta)? {
                                         result_rows.push(combined);
                                         left_matched = true;
                                         right_matched[*ri] = true;

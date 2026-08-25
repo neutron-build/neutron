@@ -32,17 +32,31 @@ pub(super) fn scalar(result: &ExecResult) -> &Value {
     &r[0][0]
 }
 
+/// Helper: extract a TEXT scalar (panics on any other shape).
+pub(super) fn text_of(result: ExecResult) -> String {
+    match scalar(&result) {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected TEXT, got {other:?}"),
+    }
+}
+
 mod test_2pl_census; // R6: serializable anomaly census for the DISK engine (strict 2PL)
 mod test_admin;
+mod test_aggregate_overflow_checked; // QPP-4 family: aggregate overflow errors on every path
 mod test_alter_policy; // N14: ALTER POLICY and policy introspection
+mod test_ast_cache_utf8; // AST-cache literal extraction must be UTF-8-safe (WIR-4 family)
 mod test_audit_events; // N18: durable security audit events
 mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
+mod test_call_pipeline; // EXE-1/5 + PRC-1/3/4/5/7: the CALL pipeline end-to-end
 mod test_collections;
 mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
+mod test_cross_model_atomicity; // S63 slice 1: SQL+streams discard-on-no-commit-record
 mod test_ddl;
 mod test_dml;
 mod test_doc_collections; // GO-055: `collection` must isolate, not decorate
+mod test_drop_table_dependents; // CAT-5: DROP TABLE must respect FK and matview dependents
+mod test_drop_view_dependents; // CAT-11: DROP VIEW must refuse dependents and clear dep keys
 mod test_durability_format; // M3: format rejection + full-state recovery
 mod test_e2e_smoke; // End-to-end smoke tests exercising all Nucleus capabilities
 mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filtering
@@ -67,10 +81,13 @@ mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross
 mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_query;
 mod test_read_only_mode; // M10: degraded read-only write admission
+mod test_rename_table_dependents; // CAT-4: RENAME TO must rewrite FK/view/matview dependents
 mod test_rls;
 mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
 mod test_row_locks;
+mod test_s33_executor_edges; // S33-11/S33-14: hash-join decline + SIMD case-insensitive binding
 mod test_scalar_fns;
+mod test_semi_anti_joins; // QPP-1a/QPP-12: SEMI/ANTI refusals + hash-join residual propagation
 mod test_specialty_persistence;
 mod test_specialty_surface_guard; // N15: the specialty fail-closed guard, audited against the dispatcher
 mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
@@ -86,5 +103,6 @@ mod test_streams_persistence; // S31-04/S31-05: stream rollback compensation + c
 mod test_table_engine_checkpoint; // R4: per-table engine WAL compaction is reachable, not just implemented
 mod test_temporal_predicates; // mixed temporal literal/column comparisons
 mod test_temporal_range_cost; // S66: TIMESTAMP/DATE range predicates must prune // S65: UPDATE/DELETE by PK must not scan the table
+mod test_triggers; // EXE-2: row-binding tables must never touch user tables named _new/_old
 mod test_txn;
 mod test_txn_lazy_snapshot; // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

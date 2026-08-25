@@ -275,7 +275,11 @@ async fn test_vector_hnsw_index_populated() {
     let ex = test_executor();
 
     // Create table and insert vectors first
-    exec(&ex, "CREATE TABLE items (id INT, embedding VECTOR(3))").await;
+    exec(
+        &ex,
+        "CREATE TABLE items (id INT PRIMARY KEY, embedding VECTOR(3))",
+    )
+    .await;
     exec(&ex, "INSERT INTO items VALUES (1, VECTOR('[1,0,0]'))").await;
     exec(&ex, "INSERT INTO items VALUES (2, VECTOR('[0,1,0]'))").await;
     exec(&ex, "INSERT INTO items VALUES (3, VECTOR('[0,0,1]'))").await;
@@ -310,7 +314,7 @@ async fn test_vector_index_accelerated_search() {
     let ex = test_executor();
     exec(
         &ex,
-        "CREATE TABLE search_test (id INT, embedding VECTOR(3))",
+        "CREATE TABLE search_test (id INT PRIMARY KEY, embedding VECTOR(3))",
     )
     .await;
 
@@ -398,7 +402,11 @@ async fn test_vector_index_insert_maintains() {
     let ex = test_executor();
 
     // Create table, create HNSW index, then insert — index should grow
-    exec(&ex, "CREATE TABLE docs (id INT, embedding VECTOR(3))").await;
+    exec(
+        &ex,
+        "CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR(3))",
+    )
+    .await;
     exec(&ex, "CREATE INDEX docs_idx ON docs USING hnsw (embedding)").await;
 
     // Index should be empty
@@ -1657,6 +1665,58 @@ async fn test_datalog_assert_and_query() {
     assert!(json.contains("bob"), "result should contain bob: {json}");
 }
 
+/// GDL-2 executor mirror: a rule consuming an aggregate predicate must see
+/// the aggregate's output (aggregate consumers sit in a later stratum).
+#[tokio::test]
+async fn test_datalog_aggregate_consumer_rule() {
+    let ex = test_executor();
+    exec(&ex, "SELECT DATALOG_ASSERT('emp(d1, 10)')").await;
+    exec(&ex, "SELECT DATALOG_ASSERT('emp(d1, 20)')").await;
+    exec(&ex, "SELECT DATALOG_ASSERT('emp(d2, 30)')").await;
+    exec(&ex, "SELECT DATALOG_RULE('cnt(D, count()) :- emp(D, S)')").await;
+    exec(&ex, "SELECT DATALOG_RULE('big(D) :- cnt(D, N)')").await;
+    let r = exec(&ex, "SELECT DATALOG_QUERY('big(D)')").await;
+    let json = match scalar(&r[0]) {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected Text, got {other:?}"),
+    };
+    assert!(
+        json.contains("d1") && json.contains("d2"),
+        "aggregate consumer saw nothing: {json}"
+    );
+}
+
+/// GDL-5 executor mirror: an unstratifiable pair is rejected with an error
+/// (not an ack), and unrelated queries still answer afterwards.
+#[tokio::test]
+async fn test_datalog_unstratifiable_rejected_over_sql() {
+    let ex = test_executor();
+    exec(&ex, "SELECT DATALOG_ASSERT('node(a)')").await;
+    exec(&ex, "SELECT DATALOG_ASSERT('node(b)')").await;
+    exec(
+        &ex,
+        "SELECT DATALOG_RULE('reach(X, Y) :- edge(X, Y), \\+ blocked(Y)')",
+    )
+    .await;
+    let r = ex
+        .execute("SELECT DATALOG_RULE('edge(X, Y) :- node(X), node(Y), \\+ reach(X, Y)')")
+        .await;
+    match r {
+        Err(e) => assert!(
+            e.to_string().to_lowercase().contains("stratifiable"),
+            "unexpected error: {e}"
+        ),
+        Ok(_) => panic!("the negation-cycle pair must be rejected, not acked"),
+    }
+    // The store was not poisoned: base facts still answer.
+    let r = exec(&ex, "SELECT DATALOG_QUERY('node(A)')").await;
+    let json = match scalar(&r[0]) {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected Text, got {other:?}"),
+    };
+    assert!(json.contains("a"), "store poisoned: {json}");
+}
+
 #[tokio::test]
 async fn test_datalog_rule_recursive() {
     let ex = test_executor();
@@ -1993,4 +2053,40 @@ async fn a_malformed_stream_cursor_is_refused() {
             "{cursor} must be refused, not read as position 0"
         );
     }
+}
+
+// ======================================================================
+// S31-15 write side: duplicate field names in one XADD are a client error
+//
+// The read side already renders duplicates deterministically (last-wins in
+// the JSON form) for entries written before this, but a new XADD that
+// repeats a field name silently collapses on read — the second value wins
+// and the first is unrecoverable, which is data loss dressed as syntax.
+// ======================================================================
+
+#[tokio::test]
+async fn stream_xadd_rejects_duplicate_field_names() {
+    let ex = test_executor();
+    let err = ex
+        .execute("SELECT STREAM_XADD('dup_fields', 'a', 1, 'a', 2)")
+        .await
+        .expect_err("an XADD that repeats a field name must be refused");
+    assert!(
+        err.to_string().contains("STREAM_XADD")
+            && (err.to_string().contains("duplicate") || err.to_string().contains("unique")),
+        "the error must name the function and the problem, got {err}"
+    );
+
+    // Nothing was written: a refused statement must not leave its entry behind.
+    let r = exec(&ex, "SELECT STREAM_XLEN('dup_fields')").await;
+    assert_eq!(scalar(&r[0]), &Value::Int64(0));
+
+    // Distinct field names on the same shape still succeed.
+    let r = exec(&ex, "SELECT STREAM_XADD('dup_fields', 'a', 1, 'b', 2)").await;
+    match scalar(&r[0]) {
+        Value::Text(id) => assert!(id.contains('-'), "XADD returns an id, got {id}"),
+        other => panic!("expected the entry id, got {other:?}"),
+    }
+    let r = exec(&ex, "SELECT STREAM_XLEN('dup_fields')").await;
+    assert_eq!(scalar(&r[0]), &Value::Int64(1));
 }

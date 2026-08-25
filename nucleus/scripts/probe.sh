@@ -103,19 +103,19 @@ PROBES=(
   # KNOWN-RED HOLDOUT, added 2026-08-18 with S35 (c9a6c893). The vector and
   # catalog sections each report a real, open finding, so running them here
   # would make this suite permanently red and teach everyone to ignore it:
-  #   vector  - HnswIndex::serialize never writes the `deleted` tombstone set,
-  #             and post-reopen deletes resolve ids through the unpersisted PK
-  #             registry, tombstoning a physical row position instead.
   #   catalog - DatabaseBuilder::build never loads meta.json, so the first
   #             post-reopen DDL writes emptied state back over it.
-  # Both are written up in _internal/OPEN_WORK.md and nucleus/docs/PROBES.md.
-  # The datalog section still runs and still gates. The skip is announced by
-  # the probe itself on every run, so a green suite cannot read as full
-  # coverage.
+  # Written up in _internal/OPEN_WORK.md and nucleus/docs/PROBES.md.
+  # The vector holdout was removed 2026-08-22: HNSW tombstones serialize
+  # (S35 F1a) and the PK registry persists across reopen (F1b), and the
+  # section runs clean at 80 iterations x 40 ops with its negative control
+  # still discriminating. The datalog and vector sections gate.
+  # The skip is announced by the probe itself on every run, so a green suite
+  # cannot read as full coverage.
   #
-  # EXPIRY: remove these two --skip-section flags when F1 and F2 are fixed.
-  # If they are still here after 2026-09-30, that is the bug, not the backlog.
-  "probe_recover_engines|--iterations $((300 * M)) --skip-section vector --skip-section catalog"
+  # EXPIRY: remove the remaining --skip-section flag when F2 is fixed.
+  # If it is still here after 2026-09-30, that is the bug, not the backlog.
+  "probe_recover_engines|--iterations $((300 * M)) --skip-section catalog"
   "probe_blob|"
   # ── S35 class probes (2026-08-18) ──
   # Both carry their own negative controls, and both are cheap, so the controls

@@ -937,6 +937,243 @@ async fn test_similarity_search_reaches_the_vector_index() {
     );
 }
 
+/// VEC-1: the index path must honor VECTOR_DISTANCE's metric argument.
+///
+/// The corpus is the divergence fixture: id 1 is collinear with the query but
+/// far, ids 2 and 3 are near but angled. Cosine ranks 1 < 2 < 3; L2 ranks
+/// 3 < 2 < 1. The index is built L2 (the DDL default), so a scan that ignores
+/// the 'cosine' argument answers in L2 order — silently the wrong rows.
+#[tokio::test]
+async fn vector_distance_metric_argument_is_honored_by_the_index_path() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE m (id INT PRIMARY KEY, e VECTOR(8))").await;
+    exec(
+        &ex,
+        "INSERT INTO m VALUES (1, VECTOR('[10,0,0,0,0,0,0,0]'))",
+    )
+    .await;
+    exec(&ex, "INSERT INTO m VALUES (2, VECTOR('[2,1,0,0,0,0,0,0]'))").await;
+    exec(&ex, "INSERT INTO m VALUES (3, VECTOR('[1,1,0,0,0,0,0,0]'))").await;
+    exec(&ex, "CREATE INDEX m_e ON m USING HNSW (e)").await;
+
+    async fn top1(ex: &Executor, metric: &str) -> i64 {
+        let sql = format!(
+            "SELECT id FROM m ORDER BY VECTOR_DISTANCE(e, VECTOR('[1,0,0,0,0,0,0,0]'), '{metric}') LIMIT 1"
+        );
+        ex.clear_all_query_caches();
+        let r = rows(&exec(ex, &sql).await[0]).clone();
+        match r.first().and_then(|row| row.first()) {
+            Some(Value::Int32(n)) => *n as i64,
+            Some(Value::Int64(n)) => *n,
+            other => panic!("unexpected id column: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        top1(&ex, "l2").await,
+        3,
+        "L2 sanity: the nearest-by-euclidean row is id 3"
+    );
+    assert_eq!(
+        top1(&ex, "cosine").await,
+        1,
+        "cosine: the collinear-but-far row must rank first; the index served \
+         the request in L2 order instead of honoring the metric argument"
+    );
+}
+
+/// VEC-1 Part B: `WITH (metric = '…')` must select the metric the index is
+/// built with, reject unknown spellings, and produce an index that actually
+/// serves queries in that metric.
+#[tokio::test]
+async fn with_metric_builds_an_index_of_that_metric() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE m (id INT PRIMARY KEY, e VECTOR(8))").await;
+    exec(
+        &ex,
+        "INSERT INTO m VALUES (1, VECTOR('[10,0,0,0,0,0,0,0]'))",
+    )
+    .await;
+    exec(&ex, "INSERT INTO m VALUES (2, VECTOR('[2,1,0,0,0,0,0,0]'))").await;
+    exec(&ex, "INSERT INTO m VALUES (3, VECTOR('[1,1,0,0,0,0,0,0]'))").await;
+    exec(
+        &ex,
+        "CREATE INDEX m_c ON m USING HNSW (e) WITH (metric = 'cosine')",
+    )
+    .await;
+
+    let sql = "SELECT id FROM m ORDER BY VECTOR_DISTANCE(e, VECTOR('[1,0,0,0,0,0,0,0]'), 'cosine') LIMIT 1";
+    let served0 = ex.metrics().index_scan_served.get();
+    ex.clear_all_query_caches();
+    let r = rows(&exec(&ex, sql).await[0]).clone();
+    let served1 = ex.metrics().index_scan_served.get();
+    assert!(
+        served1 > served0,
+        "a cosine query against a cosine index must be served by the index, \
+         not silently rebuilt as L2 and declined"
+    );
+    assert_eq!(
+        r.first().and_then(|row| row.first()),
+        Some(&Value::Int32(1)),
+        "the cosine-nearest row must rank first"
+    );
+
+    let bad = ex
+        .execute("CREATE INDEX m_x ON m USING HNSW (e) WITH (metric = 'hypercube')")
+        .await;
+    assert!(
+        bad.is_err(),
+        "an unknown metric must be rejected at DDL time, not ignored"
+    );
+}
+
+/// VEC-2 (DDL gate): a new HNSW index requires an integer PK. Without one,
+/// postings are positional and any DELETE or WHERE desynchronizes them —
+/// the index would serve wrong rows. Mirrors the FTS precedent.
+#[tokio::test]
+async fn hnsw_index_requires_an_integer_pk() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE np (id INT, e VECTOR(8))").await;
+    match ex.execute("CREATE INDEX np_e ON np USING HNSW (e)").await {
+        Err(e) => assert!(
+            e.to_string().contains("PRIMARY KEY"),
+            "the error should name the fix, got: {e}"
+        ),
+        Ok(_) => panic!(
+            "HNSW on a no-PK table was accepted: its positional postings \
+             desynchronize on DELETE/WHERE and serve wrong rows"
+        ),
+    }
+}
+
+/// VEC-2 (eligibility guard): positional resolution is only interpretable
+/// when `rows` IS the unfiltered full scan of an un-deleted table.
+///
+/// The discriminator is the WHERE half: `rows` is the post-WHERE slice while
+/// positional node ids are offsets into the full scan, so `rows.get(id)`
+/// resolves ids to the WRONG row. Exact model: among ids {2,3,4} with
+/// q = [2.9, 0, …] the top-2 are {4, 3}; pre-fix the scan can only resolve
+/// nodes {0,1,2} to rows {2,3,4} — id 4 is unreachable and the shifted
+/// mapping is wrong.
+///
+/// (The DELETE half of the finding is healed before the scan: DELETE on an
+/// IvfFlat table is never incremental-maintenance-eligible — postings are
+/// positional — so `rebuild_table_derived_state` re-syncs positions. The
+/// tombstone arm of the guard remains defense for pre-gate HNSW WALs that
+/// recover with tombstones.)
+#[tokio::test]
+async fn positional_index_scan_declines_under_a_where_clause() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE pw (id INT, e VECTOR(8))").await;
+    exec(
+        &ex,
+        "INSERT INTO pw VALUES (1, VECTOR('[0.5,0,0,0,0,0,0,0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO pw VALUES (2, VECTOR('[1.0,0,0,0,0,0,0,0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO pw VALUES (3, VECTOR('[2.0,0,0,0,0,0,0,0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO pw VALUES (4, VECTOR('[3.0,0,0,0,0,0,0,0]'))",
+    )
+    .await;
+    exec(&ex, "CREATE INDEX pw_e ON pw USING IVFFLAT (e)").await;
+
+    let sql = "SELECT id FROM pw WHERE id >= 2 ORDER BY VECTOR_DISTANCE(e, VECTOR('[2.9,0,0,0,0,0,0,0]')) LIMIT 2";
+    ex.clear_all_query_caches();
+    let r = rows(&exec(&ex, sql).await[0]).clone();
+    let mut ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(Value::Int32(n)) => Some(*n as i64),
+            Some(Value::Int64(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![3, 4],
+        "under WHERE, the positional index scan resolved node ids against the \
+         filtered row slice and returned the wrong rows"
+    );
+}
+
+/// VEC-3: a wrong-dimension literal must be rejected at INSERT, not stored
+/// and silently min-clamped by every later distance computation.
+#[tokio::test]
+async fn vector_dimension_mismatch_is_rejected_on_write() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE vd (id INT PRIMARY KEY, e VECTOR(4))").await;
+    let r = ex
+        .execute("INSERT INTO vd VALUES (1, VECTOR('[1,2,3]'))")
+        .await;
+    assert!(
+        r.is_err(),
+        "a 3-dim literal into VECTOR(4) was accepted; later searches would \
+         rank it over the clamped prefix"
+    );
+    let r = ex.execute("INSERT INTO vd VALUES (2, '1,2,3,4,5')").await;
+    assert!(
+        r.is_err(),
+        "a 5-dim text literal into VECTOR(4) was accepted"
+    );
+    exec(&ex, "INSERT INTO vd VALUES (3, VECTOR('[1,2,3,4]'))").await;
+    let r = rows(&exec(&ex, "SELECT COUNT(*) FROM vd").await[0]).clone();
+    let count = match r[0][0] {
+        Value::Int32(n) => n as i64,
+        Value::Int64(n) => n,
+        ref other => panic!("expected count, got {other:?}"),
+    };
+    assert_eq!(count, 1, "only the well-formed row is stored");
+}
+
+/// VEC-3 (query side): a wrong-dimension query must not reach the index,
+/// where it used to panic inside `distance` (dimensions assert) or silently
+/// rank over the clamped prefix. The ORDER BY policy maps an errored sort
+/// key to NULL (documented in `apply_order_by`), so the observable is: no
+/// panic, all rows returned. The SELECT-list form must carry the proper
+/// error — there the scalar eval is in the projection and is not swallowed.
+#[tokio::test]
+async fn vector_dimension_mismatch_errors_on_query() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE vq (id INT PRIMARY KEY, e VECTOR(4))").await;
+    exec(&ex, "INSERT INTO vq VALUES (1, VECTOR('[1,2,3,4]'))").await;
+    exec(&ex, "INSERT INTO vq VALUES (2, VECTOR('[2,2,3,4]'))").await;
+    exec(&ex, "INSERT INTO vq VALUES (3, VECTOR('[3,2,3,4]'))").await;
+    exec(&ex, "CREATE INDEX vq_e ON vq USING HNSW (e)").await;
+    let r = ex
+        .execute(
+            "SELECT id FROM vq ORDER BY VECTOR_DISTANCE(e, VECTOR('[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]')) LIMIT 2",
+        )
+        .await;
+    let r = r.expect(
+        "a wrong-dimension ORDER BY must not panic in the index path; \
+         NULL sort keys are the documented ORDER BY error policy",
+    );
+    assert_eq!(
+        rows(&r[0]).len(),
+        2,
+        "with NULL sort keys the LIMIT still applies to the full row set"
+    );
+    let r = ex
+        .execute("SELECT VECTOR_DISTANCE(e, VECTOR('[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]')) FROM vq")
+        .await;
+    assert!(
+        r.is_err(),
+        "a wrong-dimension VECTOR_DISTANCE in the projection must error, not \
+         compute over a clamped prefix"
+    );
+}
+
 // ============================================================================
 // CHARACTERIZATION — these pin behaviour that is KNOWN WRONG.
 //

@@ -39,10 +39,23 @@ impl Clone for GeoSet {
     fn clone(&self) -> Self {
         let mut new = GeoSet::new();
         for (member, &(lon, lat)) in &self.members {
-            new.add(lon, lat, member);
+            // Members of a live set were validated on insert; the ignore is
+            // belt-and-braces so a clone of a legacy set cannot abort.
+            let _ = new.add(lon, lat, member);
         }
         new
     }
+}
+
+/// Whether (lon, lat) is a storable coordinate pair: finite and in range.
+/// A NaN member is GEOPOS-visible but invisible to every R-tree predicate
+/// forever (NaN comparisons fail `contains_point`/`intersects`), and moving
+/// it later fails `RTree::remove` — one leaked entry per update.
+pub fn is_valid_coords(lon: f64, lat: f64) -> bool {
+    lon.is_finite()
+        && lat.is_finite()
+        && (-180.0..=180.0).contains(&lon)
+        && (-90.0..=90.0).contains(&lat)
 }
 
 impl Default for GeoSet {
@@ -61,9 +74,14 @@ impl GeoSet {
         }
     }
 
-    /// Add a member with (longitude, latitude). Returns true if the member is
-    /// new, false if it was updated.
-    pub fn add(&mut self, lon: f64, lat: f64, member: &str) -> bool {
+    /// Add a member with (longitude, latitude). Returns Ok(true) if the member
+    /// is new, Ok(false) if it was updated, Err for unstorable coordinates.
+    pub fn add(&mut self, lon: f64, lat: f64, member: &str) -> Result<bool, String> {
+        if !is_valid_coords(lon, lat) {
+            return Err(format!(
+                "invalid longitude/latitude for member '{member}' (lon {lon}, lat {lat})"
+            ));
+        }
         let previous = self.members.insert(member.to_string(), (lon, lat));
         let is_new = previous.is_none();
         let id = if let Some(&existing_id) = self.member_ids.get(member) {
@@ -88,7 +106,7 @@ impl GeoSet {
         if previous.is_none() || previous != Some((lon, lat)) {
             self.tree.insert(&point, id);
         }
-        is_new
+        Ok(is_new)
     }
 
     /// Number of entries in the R-tree index.
@@ -1614,8 +1632,25 @@ impl ShardedCollections {
         group_name: &str,
         ids: &[super::streams::StreamId],
     ) -> Result<usize, String> {
+        // The append runs BEFORE the mutation and its failure fails the
+        // command (the SQL-path XACK semantics, S31-13): nothing has been
+        // touched when it fails, and an acknowledged ack a restart cannot
+        // reproduce hands the entry to another consumer. `log_write` swallows
+        // the error, so the wal call is made directly here.
         #[cfg(feature = "server")]
-        let _in_flight = self.log_write(|wal| wal.log_xack(key, group_name, ids));
+        let _in_flight = match self.wal.as_ref() {
+            None => None,
+            Some(wal) => match wal.log_xack(key, group_name, ids) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+                    return Err(format!(
+                        "MISCONF XACK could not log the acknowledgement of {ids:?} for \
+                         group '{group_name}': {e}"
+                    ));
+                }
+            },
+        };
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -1641,6 +1676,14 @@ impl ShardedCollections {
         lat: f64,
         member: &str,
     ) -> Result<bool, WrongTypeError> {
+        // Validate BEFORE the WAL append: a rejected value must never be
+        // logged, or replay would re-poison the tree on every restart.
+        if !is_valid_coords(lon, lat) {
+            return Err(WrongTypeError {
+                expected: "valid longitude/latitude",
+                actual: "out-of-range or non-finite coordinates",
+            });
+        }
         #[cfg(feature = "server")]
         let _in_flight = self.log_write(|wal| wal.log_geoadd(key, lon, lat, member));
         let shard = self.shard(key);
@@ -1649,7 +1692,10 @@ impl ShardedCollections {
             .entry(key.to_string())
             .or_insert_with(|| KvCollection::Geo(GeoSet::new()));
         match entry {
-            KvCollection::Geo(g) => Ok(g.add(lon, lat, member)),
+            KvCollection::Geo(g) => g.add(lon, lat, member).map_err(|_| WrongTypeError {
+                expected: "valid longitude/latitude",
+                actual: "out-of-range or non-finite coordinates",
+            }),
             other => Err(WrongTypeError {
                 expected: "geo",
                 actual: other.type_name(),
@@ -2454,5 +2500,45 @@ mod tests {
         }
 
         assert_eq!(c.hlen("concurrent_hash").unwrap(), 200);
+    }
+
+    // ── Stream WAL-failure semantics ──────────────────────────────────────
+
+    /// S31-13 completion, RESP side: XACK's WAL append used to be swallowed
+    /// by `log_write`, so a failed append still acknowledged the ack — a
+    /// restart would hand the entry to another consumer while the client
+    /// was told it was acknowledged. The landed SQL-path XACK semantics
+    /// (fail the statement, touch nothing) apply here too: the append runs
+    /// BEFORE the mutation, so a rejected command leaves the PEL untouched.
+    #[cfg(feature = "server")]
+    #[test]
+    fn xack_fails_the_command_when_its_wal_append_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, mut c) = crate::kv::collections_wal::CollectionWal::open(dir.path()).unwrap();
+        let wal = std::sync::Arc::new(wal);
+        c.set_wal(std::sync::Arc::clone(&wal));
+
+        let id = c
+            .xadd("s", "*", vec![("k".to_string(), "v".to_string())])
+            .unwrap();
+        c.xgroup_create("s", "g", "0").unwrap();
+        c.xreadgroup("s", "g", "c1", ">", Some(10)).unwrap();
+
+        wal.fail_next_append();
+        let err = c
+            .xack("s", "g", &[id])
+            .expect_err("an ack whose WAL append failed must not be acknowledged");
+        assert!(
+            err.contains("MISCONF") && err.contains("XACK"),
+            "the error must name the failed ack, got: {err}"
+        );
+
+        // Nothing was mutated: the entry is still pending, so a later
+        // successful ack of the same id reports 1, not 0.
+        let acked = c.xack("s", "g", &[id]).unwrap();
+        assert_eq!(
+            acked, 1,
+            "the rejected ack must leave the pending list untouched"
+        );
     }
 }

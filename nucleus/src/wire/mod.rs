@@ -1113,6 +1113,9 @@ impl NucleusHandler {
     }
 
     /// Execute a SQL query using the default session (for internal/test use).
+    /// No production caller remains: the Describe probe now runs on the
+    /// describing client's session (see `describe_select_columns`).
+    #[allow(dead_code)] // kept as a thin wrapper used by unit tests
     async fn execute_sql(&self, sql: &str) -> PgWireResult<Vec<ExecResult>> {
         self.execute_sql_session(0, sql).await
     }
@@ -1314,7 +1317,11 @@ fn sanitize_sql_text_literal(value: &str) -> String {
 }
 
 fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> String {
-    let mut out = String::with_capacity(sql.len() + 32);
+    // Byte accumulation + one UTF-8 decode at the end: copying SQL bytes
+    // through `out.push(bytes[i] as char)` mojibakes every multi-byte
+    // sequence into Latin-1 (the WIR-4 family). All edits here touch ASCII
+    // delimiters only, so the input's UTF-8 validity carries through.
+    let mut out = Vec::with_capacity(sql.len() + 32);
     let bytes = sql.as_bytes();
     let mut i = 0usize;
     let mut in_single = false;
@@ -1324,7 +1331,7 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
 
     while i < bytes.len() {
         if in_line_comment {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             if bytes[i] == b'\n' {
                 in_line_comment = false;
             }
@@ -1333,21 +1340,21 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
         }
         if in_block_comment {
             if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                out.push('*');
-                out.push('/');
+                out.push(b'*');
+                out.push(b'/');
                 in_block_comment = false;
                 i += 2;
             } else {
-                out.push(bytes[i] as char);
+                out.push(bytes[i]);
                 i += 1;
             }
             continue;
         }
         if in_single {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             if bytes[i] == b'\'' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    out.push('\'');
+                    out.push(b'\'');
                     i += 2;
                 } else {
                     in_single = false;
@@ -1359,10 +1366,10 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
             continue;
         }
         if in_double {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             if bytes[i] == b'"' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    out.push('"');
+                    out.push(b'"');
                     i += 2;
                 } else {
                     in_double = false;
@@ -1375,27 +1382,27 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
         }
 
         if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            out.push('-');
-            out.push('-');
+            out.push(b'-');
+            out.push(b'-');
             in_line_comment = true;
             i += 2;
             continue;
         }
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            out.push('/');
-            out.push('*');
+            out.push(b'/');
+            out.push(b'*');
             in_block_comment = true;
             i += 2;
             continue;
         }
         if bytes[i] == b'\'' {
-            out.push('\'');
+            out.push(b'\'');
             in_single = true;
             i += 1;
             continue;
         }
         if bytes[i] == b'"' {
-            out.push('"');
+            out.push(b'"');
             in_double = true;
             i += 1;
             continue;
@@ -1413,21 +1420,21 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
             }
             if found_digit {
                 if idx > 0 && idx <= replacements.len() {
-                    out.push_str(&replacements[idx - 1]);
+                    out.extend_from_slice(replacements[idx - 1].as_bytes());
                 } else {
-                    out.push_str(&sql[start..i]);
+                    out.extend_from_slice(&sql.as_bytes()[start..i]);
                 }
                 continue;
             }
-            out.push('$');
+            out.push(b'$');
             continue;
         }
 
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
 
-    out
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
 }
 
 // ============================================================================
@@ -1934,7 +1941,7 @@ impl ExtendedQueryHandler for NucleusHandler {
 
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         stmt: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -1962,7 +1969,13 @@ impl ExtendedQueryHandler for NucleusHandler {
             // old probe executed `$1` literally, errored, and advertised zero
             // fields — its query engine then panicked on the arity mismatch.)
             let probe_sql = replace_placeholders_with_null(sql);
-            match self.describe_select_columns(&probe_sql, None).await {
+            // The probe must run as the DESCRIBING client, not session 0
+            // (the bootstrap superuser).
+            let session_id = self.session_id_from_client(client)?;
+            match self
+                .describe_select_columns(session_id, &probe_sql, None)
+                .await
+            {
                 Ok(cols) => cols,
                 Err(e) => {
                     tracing::warn!("Failed to describe SELECT columns: {e}");
@@ -1978,7 +1991,7 @@ impl ExtendedQueryHandler for NucleusHandler {
 
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -1994,8 +2007,13 @@ impl ExtendedQueryHandler for NucleusHandler {
             // more accurately by substituting and executing.
             let substituted =
                 Self::substitute_parameters_with_executor(sql, portal, Some(&self.executor))?;
+            let session_id = self.session_id_from_client(client)?;
             match self
-                .describe_select_columns(&substituted, Some(&portal.result_column_format))
+                .describe_select_columns(
+                    session_id,
+                    &substituted,
+                    Some(&portal.result_column_format),
+                )
                 .await
             {
                 Ok(cols) => cols,
@@ -2818,31 +2836,30 @@ impl NucleusHandler {
     /// probe-executing `SELECT KV_SETNX(...)` here fired the write at
     /// Describe time and again at Execute — the client's Execute then saw
     /// the second evaluation (KV_SETNX false with the key actually set).
+    ///
+    /// The probe runs on the describing CLIENT's session. And on ANY probe
+    /// failure — including the parse failure a statement already ending in
+    /// its own LIMIT produces (`… LIMIT 5 LIMIT 0` is invalid SQL) — no
+    /// fields are returned and nothing else executes: the former fallback
+    /// executed the ORIGINAL statement here, running side effects at
+    /// Describe time under session 0, the bootstrap superuser, outside the
+    /// client's identity and RLS.
     async fn describe_select_columns(
         &self,
+        session_id: u64,
         sql: &str,
         formats: Option<&Format>,
     ) -> Result<Vec<FieldInfo>, PgWireError> {
-        // Try executing the query directly with LIMIT 0 appended, or if that
-        // fails, run the original query. This avoids the subquery wrapping
-        // that can trigger nesting depth errors for function calls like VERSION().
         let trimmed = sql.trim().trim_end_matches(';').trim();
 
         if let Some(fields) = describe_static_fields(trimmed, formats) {
             return Ok(fields);
         }
 
-        // First try: add LIMIT 0 to avoid returning data
         let probe_sql = format!("{trimmed} LIMIT 0");
-        let result = match self.execute_sql(&probe_sql).await {
+        let result = match self.execute_sql_session(session_id, &probe_sql).await {
             Ok(r) => r,
-            Err(_) => {
-                // LIMIT 0 might not work for all queries — try the original
-                match self.execute_sql(trimmed).await {
-                    Ok(r) => r,
-                    Err(_) => return Ok(Vec::new()),
-                }
-            }
+            Err(_) => return Ok(Vec::new()),
         };
 
         for r in result {
@@ -5976,6 +5993,25 @@ mod security_tests {
         assert_eq!(tricky, "SELECT 'a\\'', 1); --'");
     }
 
+    #[test]
+    fn parameter_substitution_preserves_utf8() {
+        // The scanner copies SQL bytes through `out.push(bytes[i] as char)`,
+        // mojibaking every multi-byte sequence into Latin-1 (the WIR-4 bug
+        // family, pg-wire copy). A non-ASCII literal elsewhere in the same
+        // statement as a placeholder must survive byte-exact.
+        let result = NucleusHandler::substitute_parameters_raw(
+            "SELECT 'Zoë' AS a FROM \"Täble\" WHERE note = 'café' AND n = $1 -- héllo",
+            &["7"],
+        );
+        assert_eq!(
+            result,
+            "SELECT 'Zoë' AS a FROM \"Täble\" WHERE note = 'café' AND n = '7' -- héllo"
+        );
+        // Multi-byte inside a comment (block-comment copy path).
+        let result = NucleusHandler::substitute_parameters_raw("SELECT /* Zoë */ $1", &["x"]);
+        assert_eq!(result, "SELECT /* Zoë */ 'x'");
+    }
+
     // ── COPY helper tests ──────────────────────────────────────────────
 
     #[test]
@@ -6803,5 +6839,368 @@ mod security_tests {
         // call still get a static answer — execution is never the fallback.
         let fields = describe_static_fields("SELECT KV_SETNX('k', 'v', 30) UNION SELECT 1", None);
         assert!(fields.is_some());
+    }
+
+    // ── A failing side-effecting function evaluates exactly once ──
+    //
+    // HANDOFF §4a-quinquies: a failing `SELECT STREAM_XADD(...)` over pgwire
+    // evaluated TWICE inside one statement — two WAL-refusal ERROR lines with
+    // sequence ids `-0` then `-1` — and the client saw only the second
+    // evaluation's error. Root cause: `eval_const_expr`'s Function arm ran
+    // `eval_row_expr(..).or_else(|_| eval_scalar_fn(..))`, and since
+    // eval_row_expr's Function arm delegates straight to eval_scalar_fn for
+    // every non-aggregate name, the retry re-ran the same function with the
+    // first error discarded (src/executor/expr.rs).
+    //
+    // The I/O fault is armed once per process into a OnceLock, so the
+    // arm-and-drive runs in a child of this test binary (the same pattern as
+    // tests/kv_wal_append_failure.rs). The child starts a REAL pgwire server
+    // on a loopback port and speaks both query protocols with a hand-rolled
+    // client — the defect is client-visible only over the wire.
+    //
+    // NUCLEUS_IOFAULT_SKIP=1: the first XADD passes (proving the fault was
+    // armed), every later one fails. Exactly-one-evaluation is asserted two
+    // ways per protocol: the client sees exactly one ErrorResponse, and the
+    // entry id it names ends in `-0` — a reported `-1` can only mean an
+    // earlier, swallowed evaluation already consumed `-0` in the same
+    // millisecond.
+
+    mod single_eval_pgwire {
+        pub(crate) struct PgMessage {
+            pub(crate) tag: u8,
+            pub(crate) payload: Vec<u8>,
+        }
+
+        pub(crate) async fn read_message(stream: &mut tokio::net::TcpStream) -> Option<PgMessage> {
+            use tokio::io::AsyncReadExt;
+            let mut hdr = [0u8; 5];
+            stream.read_exact(&mut hdr).await.ok()?;
+            let len = i32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+            let mut payload = vec![0u8; len.saturating_sub(4)];
+            stream.read_exact(&mut payload).await.ok()?;
+            Some(PgMessage {
+                tag: hdr[0],
+                payload,
+            })
+        }
+
+        pub(crate) async fn send_message(stream: &mut tokio::net::TcpStream, tag: u8, body: &[u8]) {
+            use tokio::io::AsyncWriteExt;
+            let len = (body.len() + 4) as i32;
+            let mut buf = Vec::with_capacity(body.len() + 5);
+            buf.push(tag);
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(body);
+            stream.write_all(&buf).await.unwrap();
+        }
+
+        /// The 'M' field of an ErrorResponse.
+        pub(crate) fn error_message(payload: &[u8]) -> String {
+            let mut i = 0;
+            while i < payload.len() && payload[i] != 0 {
+                let code = payload[i];
+                let start = i + 1;
+                let end = payload[start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| start + p)
+                    .unwrap_or(payload.len());
+                if code == b'M' {
+                    return String::from_utf8_lossy(&payload[start..end]).into_owned();
+                }
+                i = end + 1;
+            }
+            String::new()
+        }
+
+        /// Text values of the first DataRow seen, for asserting query output.
+        pub(crate) fn data_row_values(payload: &[u8]) -> Vec<String> {
+            if payload.len() < 2 {
+                return Vec::new();
+            }
+            let ncols = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+            let mut out = Vec::with_capacity(ncols);
+            let mut i = 2;
+            for _ in 0..ncols {
+                if i + 4 > payload.len() {
+                    break;
+                }
+                let len = i32::from_be_bytes([
+                    payload[i],
+                    payload[i + 1],
+                    payload[i + 2],
+                    payload[i + 3],
+                ]);
+                i += 4;
+                if len < 0 {
+                    out.push(String::new());
+                    continue;
+                }
+                let len = len as usize;
+                if i + len > payload.len() {
+                    break;
+                }
+                out.push(String::from_utf8_lossy(&payload[i..i + len]).into_owned());
+                i += len;
+            }
+            out
+        }
+
+        /// Startup (protocol 3.0, trust) and drain to ReadyForQuery.
+        pub(crate) async fn startup(stream: &mut tokio::net::TcpStream) {
+            let mut body = Vec::new();
+            body.extend_from_slice(&196_608i32.to_be_bytes());
+            body.extend_from_slice(b"user\0app\0\0");
+            let len = (body.len() + 4) as i32;
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(&len.to_be_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            loop {
+                let m =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), read_message(stream))
+                        .await
+                        .expect("startup read timeout")
+                        .expect("startup eof");
+                if m.tag == b'Z' {
+                    return;
+                }
+            }
+        }
+
+        /// Simple-protocol Query. Returns (error count, first error message,
+        /// first DataRow values).
+        pub(crate) async fn simple_query(
+            stream: &mut tokio::net::TcpStream,
+            sql: &str,
+        ) -> (usize, String, Vec<String>) {
+            let mut body = sql.as_bytes().to_vec();
+            body.push(0);
+            send_message(stream, b'Q', &body).await;
+            let mut errors = 0usize;
+            let mut first_err = String::new();
+            let mut first_row = Vec::new();
+            loop {
+                let m =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), read_message(stream))
+                        .await
+                        .expect("query read timeout")
+                        .expect("query eof");
+                match m.tag {
+                    b'E' => {
+                        errors += 1;
+                        if first_err.is_empty() {
+                            first_err = error_message(&m.payload);
+                        }
+                    }
+                    b'D' if first_row.is_empty() => {
+                        first_row = data_row_values(&m.payload);
+                    }
+                    b'Z' => return (errors, first_err, first_row),
+                    _ => {}
+                }
+            }
+        }
+
+        /// Extended protocol (Parse/Describe/Bind/Execute/Sync), one
+        /// statement, no parameters. Describe is included because real
+        /// drivers (pgx, Prisma) describe before executing, and a describe
+        /// that probe-executes would itself be a second evaluation.
+        pub(crate) async fn extended_query(
+            stream: &mut tokio::net::TcpStream,
+            sql: &str,
+        ) -> (usize, String, Vec<String>) {
+            let mut parse = Vec::new();
+            parse.push(0u8); // unnamed statement
+            parse.extend_from_slice(sql.as_bytes());
+            parse.push(0);
+            parse.extend_from_slice(&0i16.to_be_bytes()); // zero param types
+            send_message(stream, b'P', &parse).await;
+
+            let mut describe = vec![b'S']; // describe the statement
+            describe.push(0u8);
+            send_message(stream, b'D', &describe).await;
+
+            let mut bind = Vec::new();
+            bind.push(0u8); // unnamed portal
+            bind.push(0u8); // unnamed statement
+            bind.extend_from_slice(&0i16.to_be_bytes()); // param format codes
+            bind.extend_from_slice(&0i16.to_be_bytes()); // params
+            bind.extend_from_slice(&0i16.to_be_bytes()); // result format codes
+            send_message(stream, b'B', &bind).await;
+
+            let mut execute = Vec::new();
+            execute.push(0u8); // unnamed portal
+            execute.extend_from_slice(&0i32.to_be_bytes()); // no row limit
+            send_message(stream, b'E', &execute).await;
+
+            send_message(stream, b'S', &[]).await; // Sync
+
+            let mut errors = 0usize;
+            let mut first_err = String::new();
+            let mut first_row = Vec::new();
+            loop {
+                let m =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), read_message(stream))
+                        .await
+                        .expect("extended query read timeout")
+                        .expect("extended query eof");
+                match m.tag {
+                    b'E' => {
+                        errors += 1;
+                        if first_err.is_empty() {
+                            first_err = error_message(&m.payload);
+                        }
+                    }
+                    b'D' if first_row.is_empty() => {
+                        first_row = data_row_values(&m.payload);
+                    }
+                    b'Z' => return (errors, first_err, first_row),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Child half: arms nothing itself (env inherited), runs the real server.
+    #[tokio::test]
+    #[ignore = "child process driven by failing_stream_xadd_evaluates_once"]
+    async fn stream_xadd_single_eval_child() {
+        let Ok(dir) = std::env::var("XADD_FAULT_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+
+        let catalog = Arc::new(crate::catalog::Catalog::new());
+        let engine =
+            crate::storage::DiskEngine::open(&dir.join("nucleus.db"), catalog.clone()).unwrap();
+        let storage: Arc<dyn crate::storage::StorageEngine> = Arc::new(engine);
+        let ex = Arc::new(crate::executor::Executor::new_with_persistence(
+            catalog,
+            storage,
+            None,
+            Some(&dir),
+        ));
+        let server = Arc::new(NucleusServer::new(Arc::new(NucleusHandler::new(ex))));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                let _ = process_socket_closing_on_terminate(socket, None, server).await;
+            }
+        });
+
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .expect("connect timeout")
+        .expect("connect server");
+        single_eval_pgwire::startup(&mut client).await;
+
+        // 1. Fault arrives with skip=1, so the first append passes.
+        let (errs, err, row) =
+            single_eval_pgwire::simple_query(&mut client, "SELECT STREAM_XADD('once','k','v')")
+                .await;
+        println!(
+            "OK1 {errs} {err} {}",
+            row.first().cloned().unwrap_or_default()
+        );
+
+        // 2. Same statement shape on the SIMPLE protocol — this one fails.
+        let (errs, err, _) =
+            single_eval_pgwire::simple_query(&mut client, "SELECT STREAM_XADD('once','k','v2')")
+                .await;
+        println!("SIMPLE {errs} {err}");
+
+        // 3. EXTENDED protocol (Parse/Describe/Bind/Execute/Sync).
+        let (errs, err, _) =
+            single_eval_pgwire::extended_query(&mut client, "SELECT STREAM_XADD('twice','k','v')")
+                .await;
+        println!("EXTENDED {errs} {err}");
+
+        // 4. Stream state: only the first (pre-fault) entry survives.
+        let (errs, err, row) =
+            single_eval_pgwire::simple_query(&mut client, "SELECT STREAM_XLEN('once')").await;
+        println!(
+            "LEN {errs} {err} {}",
+            row.first().cloned().unwrap_or_default()
+        );
+
+        println!("DONE");
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), accept).await;
+    }
+
+    #[test]
+    fn failing_stream_xadd_evaluates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("wire::security_tests::stream_xadd_single_eval_child")
+            .arg("--nocapture")
+            .arg("--ignored")
+            .env("NUCLEUS_IOFAULT", "streams.wal_append")
+            .env("NUCLEUS_IOFAULT_KIND", "full")
+            .env("NUCLEUS_IOFAULT_SKIP", "1")
+            .env("XADD_FAULT_DIR", dir.path())
+            .output()
+            .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("DONE"),
+            "child did not finish:\n{stdout}\n{stderr}"
+        );
+
+        // 1. The pre-fault append succeeded with the first sequence id.
+        let ok1 = stdout
+            .lines()
+            .find(|l| l.starts_with("OK1 "))
+            .unwrap_or_else(|| panic!("missing OK1 in:\n{stdout}"));
+        let (_, rest) = ok1.split_once("OK1 ").unwrap();
+        let (errs, rest) = rest.split_once(' ').unwrap();
+        assert_eq!(errs, "0", "first append must succeed: {ok1}");
+        let id = rest.trim();
+        assert!(
+            id.ends_with("-0"),
+            "first append id must be <ms>-0, got {id}"
+        );
+
+        // 2 + 3. Each failing statement: ONE error naming entry <ms>-0.
+        for marker in ["SIMPLE ", "EXTENDED "] {
+            let line = stdout
+                .lines()
+                .find(|l| l.starts_with(marker))
+                .unwrap_or_else(|| panic!("missing {marker} line in:\n{stdout}"));
+            let rest = &line[marker.len()..];
+            let (count, msg) = rest.split_once(' ').unwrap();
+            assert_eq!(
+                count, "1",
+                "{marker}statement must report exactly one ERROR: {line}"
+            );
+            let entry_id = msg
+                .split("entry ")
+                .nth(1)
+                .and_then(|s| s.split(" for stream").next())
+                .unwrap_or_else(|| panic!("no entry id in error: {msg}"));
+            assert!(
+                entry_id.ends_with("-0"),
+                "{marker}error names {entry_id} — a -1 suffix means an earlier \
+                 evaluation's error was swallowed and the statement re-run: {msg}"
+            );
+        }
+
+        // 4. The failed evaluations left no entries behind.
+        let len_line = stdout
+            .lines()
+            .find(|l| l.starts_with("LEN "))
+            .unwrap_or_else(|| panic!("missing LEN line in:\n{stdout}"));
+        assert!(
+            len_line.ends_with(" 1"),
+            "stream must hold exactly the pre-fault entry: {len_line}"
+        );
     }
 }

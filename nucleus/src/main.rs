@@ -258,6 +258,44 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Import a foreign database into a Nucleus data directory, with a
+    /// validation report itemizing every lossy decision. Sources: a
+    /// postgres:// URL (live connection), a SQLite file path, or a .sql text
+    /// dump path.
+    Import {
+        /// Source: postgres:// URL, SQLite file path, or .sql text dump path.
+        #[arg(short, long)]
+        from: String,
+
+        /// Data directory to import into (created if missing).
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Write the JSON validation report here (human summary always prints).
+        #[arg(short, long)]
+        report: Option<PathBuf>,
+    },
+
+    /// Export a Nucleus data directory as SQL text for PostgreSQL or SQLite,
+    /// with a validation report itemizing any lossy type mappings.
+    Export {
+        /// Target dialect.
+        #[arg(short, long, value_enum)]
+        target: ExportFormat,
+
+        /// Data directory to export from.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Output .sql file (writes to stdout if omitted).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Write the JSON validation report here.
+        #[arg(short, long)]
+        report: Option<PathBuf>,
+    },
+
     /// Restore a logical dump produced by `nucleus dump` into a data directory
     /// (creates it if missing) by replaying the SQL through the executor.
     Load {
@@ -344,6 +382,21 @@ impl CliAuthMethod {
         match self {
             Self::ScramSha256 => AuthMethod::ScramSha256,
             Self::Cleartext => AuthMethod::Cleartext,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ExportFormat {
+    Postgres,
+    Sqlite,
+}
+
+impl ExportFormat {
+    fn to_target(self) -> nucleus::import_export::ExportTarget {
+        match self {
+            Self::Postgres => nucleus::import_export::ExportTarget::Postgres,
+            Self::Sqlite => nucleus::import_export::ExportTarget::Sqlite,
         }
     }
 }
@@ -471,6 +524,17 @@ async fn main() {
         }
         Some(Commands::Dump { data, output }) => {
             cmd_dump(data, output).await;
+        }
+        Some(Commands::Import { from, data, report }) => {
+            cmd_import(from, data, report).await;
+        }
+        Some(Commands::Export {
+            target,
+            data,
+            output,
+            report,
+        }) => {
+            cmd_export(target, data, output, report).await;
         }
         Some(Commands::Load { input, data }) => {
             cmd_load(input, data).await;
@@ -776,14 +840,29 @@ async fn cmd_start(cfg: StartConfig) {
     let allow_insecure_cluster = env_var_truthy("NUCLEUS_ALLOW_INSECURE_CLUSTER");
     let allow_insecure_replication = env_var_truthy("NUCLEUS_ALLOW_INSECURE_REPLICATION");
 
-    if !is_loopback_host(&host) && cluster_token.is_none() && !allow_insecure_cluster {
+    // Cluster/replication transports only engage when this node actually
+    // joins or replicates. A single-node server bound non-loopback (i.e.
+    // every containerized deployment) must not be refused for lacking
+    // cluster tokens — and per the listener below, must not listen on the
+    // cluster ports at all: an unauthenticated cluster port on every
+    // containerized server was the real exposure this guard exists for.
+    let cluster_engaged = join.is_some() || replicate_from.is_some();
+    if cluster_engaged
+        && !is_loopback_host(&host)
+        && cluster_token.is_none()
+        && !allow_insecure_cluster
+    {
         tracing::error!(
             "Refusing to start with non-loopback cluster transport and no NUCLEUS_CLUSTER_TOKEN. \
              Set NUCLEUS_CLUSTER_TOKEN or NUCLEUS_ALLOW_INSECURE_CLUSTER=1 for development."
         );
         std::process::exit(1);
     }
-    if !is_loopback_host(&host) && replication_token.is_none() && !allow_insecure_replication {
+    if replicate_from.is_some()
+        && !is_loopback_host(&host)
+        && replication_token.is_none()
+        && !allow_insecure_replication
+    {
         tracing::error!(
             "Refusing to start with non-loopback replication transport and no NUCLEUS_REPLICATION_TOKEN. \
              Set NUCLEUS_REPLICATION_TOKEN or NUCLEUS_ALLOW_INSECURE_REPLICATION=1 for development."
@@ -1403,7 +1482,10 @@ async fn cmd_start(cfg: StartConfig) {
         tracing::info!("Internal node-to-node TLS is enabled (cluster + replication)");
     }
 
-    // Set up cluster transport — always listen so other nodes can join us
+    // Set up cluster transport — listen ONLY when clustering is engaged
+    // (--join / --replicate-from / config-driven replica). A single-node
+    // server gains nothing from an open cluster port, and an unauthenticated
+    // one is a standing hazard in container deployments.
     let cluster_listen = format!("{}:{}", host, cluster_port);
     let transport = Arc::new(TcpTransport::new_with_auth_and_tls(
         node_id,
@@ -1411,9 +1493,15 @@ async fn cmd_start(cfg: StartConfig) {
         cluster_token.clone(),
         internal_tls.clone(),
     ));
-    match transport.listen().await {
-        Ok(addr) => tracing::info!("Cluster transport on {addr} (node_id={node_id:#x})"),
-        Err(e) => tracing::warn!("Failed to bind cluster port {cluster_listen}: {e}"),
+    if cluster_engaged {
+        match transport.listen().await {
+            Ok(addr) => tracing::info!("Cluster transport on {addr} (node_id={node_id:#x})"),
+            Err(e) => tracing::warn!("Failed to bind cluster port {cluster_listen}: {e}"),
+        }
+    } else {
+        tracing::debug!(
+            "Cluster transport idle: single-node server, not listening on {cluster_listen}"
+        );
     }
 
     // If --join, perform the join handshake
@@ -1742,71 +1830,120 @@ async fn cmd_start(cfg: StartConfig) {
                         // opened for recovery but never appended to (geo data
                         // persists as ordinary SQL columns), so it needs no
                         // checkpoint here.
+                        //
+                        // S7 ordering, two rules:
+                        //
+                        // 1. Specialty checkpoints run BEFORE the SQL engine
+                        //    checkpoint, and are skipped while any enlisted
+                        //    transaction is open. A specialty snapshot is a
+                        //    fold of apply-at-DML in-memory state and carries
+                        //    no transaction id, so a checkpoint during an open
+                        //    enlisted transaction bakes uncommitted state into
+                        //    a form the S6 recovery filter cannot discard —
+                        //    and a SQL prune that ran first would launder the
+                        //    same state past the filter from the other
+                        //    direction: reclaim the COMMIT records, let the
+                        //    snapshot "commit-by-construction" the writes.
+                        // 2. The SQL checkpoint still runs on every pass — its
+                        //    WAL is undo/redo, not a fold, and skipping it
+                        //    would stall page flushing and segment pruning for
+                        //    the life of one long transaction — but truncation
+                        //    is pinned at the specialty horizon (the LSN read
+                        //    just before this pass's specialty block; before
+                        //    any pass has completed, 1 = protect everything)
+                        //    so pruning can never reclaim the COMMIT records
+                        //    that vouch for specialty writes the snapshots
+                        //    have not yet folded.
+                        //
+                        // The horizon is read BEFORE the specialty block runs:
+                        // a transaction committing mid-pass then sits above it
+                        // (its commit record retained) while everything below
+                        // it is folded by the snapshots this pass is about to
+                        // take. The idle-in-transaction sweep is the bound on
+                        // how long an open enlisted transaction can hold
+                        // truncation back.
+                        let mut horizon = executor_for_workers.specialty_checkpoint_horizon();
+                        if executor_for_workers.any_open_enlisted_txn() {
+                            tracing::debug!(
+                                "specialty checkpoint skipped: enlisted transaction open"
+                            );
+                        } else {
+                            if let Some(ref engine) = disk_for_workers {
+                                horizon = engine.current_wal_lsn();
+                            }
+                            if let Err(e) = executor_for_workers.checkpoint_cdc_wal() {
+                                tracing::warn!("CDC WAL checkpoint failed: {e}");
+                            }
+                            if let Err(e) = executor_for_workers.checkpoint_streams_wal() {
+                                tracing::warn!("Streams WAL checkpoint failed: {e}");
+                            }
+                            if let Err(e) = executor_for_workers.kv_store().checkpoint() {
+                                tracing::warn!("KV WAL checkpoint failed: {e}");
+                            }
+                            if let Err(e) = executor_for_workers.blob_store().read().checkpoint() {
+                                tracing::warn!("Blob WAL checkpoint failed: {e}");
+                            }
+                            if let Err(e) =
+                                executor_for_workers.graph_store().read().checkpoint_wal()
+                            {
+                                tracing::warn!("Graph WAL checkpoint failed: {e}");
+                            }
+                            if let Err(e) = executor_for_workers.doc_store().read().checkpoint() {
+                                tracing::warn!("Document WAL checkpoint failed: {e}");
+                            }
+                            // FTS is checkpoint + tail (NU-014): write
+                            // `fts_index.json` first, which then truncates the tail
+                            // it absorbed, and compact whatever is left. Order
+                            // matters — a crash between them leaves a tail that is
+                            // a subset of the checkpoint, which replays
+                            // idempotently.
+                            executor_for_workers.save_fts_index();
+                            if let Err(e) = executor_for_workers.fts_index().read().checkpoint_wal()
+                            {
+                                tracing::warn!("FTS WAL checkpoint failed: {e}");
+                            }
+                            // Vector index WAL: HNSW inserts/deletes log one record
+                            // each; snapshot every live HNSW index (IvfFlat rebuilds
+                            // from base-table data, never logged here).
+                            if let Err(e) = executor_for_workers.checkpoint_vector_wal() {
+                                tracing::warn!("Vector WAL checkpoint failed: {e}");
+                            }
+                            // TimeSeries retention (T1.3): purge points older than the
+                            // configured TS_RETENTION policy BEFORE snapshotting, so the
+                            // WAL is truncated to the retained state and old data does
+                            // not grow the store forever. No-op when no policy is set.
+                            executor_for_workers.ts_store().write().apply_retention();
+                            // TimeSeries WAL: every insert appends a record; snapshot
+                            // truncates it to the current series state.
+                            executor_for_workers.ts_store().read().snapshot();
+                            // Columnar WAL: every append/create logs a record; snapshot
+                            // truncates it to the current table state.
+                            if let Err(e) =
+                                executor_for_workers.columnar_store().write().checkpoint()
+                            {
+                                tracing::warn!("Columnar WAL checkpoint failed: {e}");
+                            }
+                            // Per-table storage engines (WITH (engine='columnar'
+                            // |'mergetree'|'lsm')): distinct from the columnar
+                            // MODEL checkpointed just above. Each has its own WAL
+                            // that otherwise grows unbounded — see
+                            // `checkpoint_table_engines`'s doc comment.
+                            executor_for_workers.checkpoint_table_engines().await;
+                            executor_for_workers.note_specialty_checkpoint_pass(horizon);
+                        }
                         // SQL disk engine: flush dirty pages, checkpoint the
-                        // WAL, and prune fully-checkpointed segments. With
+                        // WAL, and prune fully-checkpointed segments — held at
+                        // the specialty horizon above. With
                         // synchronous_commit=on (default) acked commits are
                         // already WAL-forced at commit time, so this interval
                         // is about data-page flushing + segment pruning; it is
                         // the crash-loss bound ONLY for sessions running
                         // synchronous_commit=off (wal.checkpoint_interval_secs).
                         if let Some(ref engine) = disk_for_workers
-                            && let Err(e) = engine.checkpoint()
+                            && let Err(e) = engine.checkpoint_retaining(horizon)
                         {
                             tracing::warn!("SQL WAL checkpoint failed: {e}");
                         }
-                        if let Err(e) = executor_for_workers.checkpoint_cdc_wal() {
-                            tracing::warn!("CDC WAL checkpoint failed: {e}");
-                        }
-                        if let Err(e) = executor_for_workers.checkpoint_streams_wal() {
-                            tracing::warn!("Streams WAL checkpoint failed: {e}");
-                        }
-                        if let Err(e) = executor_for_workers.kv_store().checkpoint() {
-                            tracing::warn!("KV WAL checkpoint failed: {e}");
-                        }
-                        if let Err(e) = executor_for_workers.blob_store().read().checkpoint() {
-                            tracing::warn!("Blob WAL checkpoint failed: {e}");
-                        }
-                        if let Err(e) = executor_for_workers.graph_store().read().checkpoint_wal() {
-                            tracing::warn!("Graph WAL checkpoint failed: {e}");
-                        }
-                        if let Err(e) = executor_for_workers.doc_store().read().checkpoint() {
-                            tracing::warn!("Document WAL checkpoint failed: {e}");
-                        }
-                        // FTS is checkpoint + tail (NU-014): write
-                        // `fts_index.json` first, which then truncates the tail
-                        // it absorbed, and compact whatever is left. Order
-                        // matters — a crash between them leaves a tail that is
-                        // a subset of the checkpoint, which replays
-                        // idempotently.
-                        executor_for_workers.save_fts_index();
-                        if let Err(e) = executor_for_workers.fts_index().read().checkpoint_wal() {
-                            tracing::warn!("FTS WAL checkpoint failed: {e}");
-                        }
-                        // Vector index WAL: HNSW inserts/deletes log one record
-                        // each; snapshot every live HNSW index (IvfFlat rebuilds
-                        // from base-table data, never logged here).
-                        if let Err(e) = executor_for_workers.checkpoint_vector_wal() {
-                            tracing::warn!("Vector WAL checkpoint failed: {e}");
-                        }
-                        // TimeSeries retention (T1.3): purge points older than the
-                        // configured TS_RETENTION policy BEFORE snapshotting, so the
-                        // WAL is truncated to the retained state and old data does
-                        // not grow the store forever. No-op when no policy is set.
-                        executor_for_workers.ts_store().write().apply_retention();
-                        // TimeSeries WAL: every insert appends a record; snapshot
-                        // truncates it to the current series state.
-                        executor_for_workers.ts_store().read().snapshot();
-                        // Columnar WAL: every append/create logs a record; snapshot
-                        // truncates it to the current table state.
-                        if let Err(e) = executor_for_workers.columnar_store().write().checkpoint() {
-                            tracing::warn!("Columnar WAL checkpoint failed: {e}");
-                        }
-                        // Per-table storage engines (WITH (engine='columnar'
-                        // |'mergetree'|'lsm')): distinct from the columnar
-                        // MODEL checkpointed just above. Each has its own WAL
-                        // that otherwise grows unbounded — see
-                        // `checkpoint_table_engines`'s doc comment.
-                        executor_for_workers.checkpoint_table_engines().await;
                     }
                     nucleus::background::BackgroundTask::ReplicationSync => {
                         if let Some(ref wal_path) = wal_path_for_workers {
@@ -2360,8 +2497,8 @@ async fn cmd_start(cfg: StartConfig) {
         // silently dropped socket, which clients report as "server closed the
         // connection unexpectedly".
         let pool_ref = conn_pool.clone();
-        let conn_id = match pool_ref.try_acquire(&peer_addr.to_string()).await {
-            Ok(id) => id,
+        let (conn_id, conn_permit) = match pool_ref.try_acquire(&peer_addr.to_string()).await {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(
                     "Rejected connection from {peer_addr}: {e} (limit {})",
@@ -2382,6 +2519,7 @@ async fn cmd_start(cfg: StartConfig) {
         let Some(inflight) = drain_for_accept.try_admit() else {
             tracing::debug!("Refusing connection from {peer_addr}: server is shutting down");
             pool_ref.release_with_metadata_cleanup(conn_id).await;
+            drop(conn_permit);
             continue;
         };
 
@@ -2398,6 +2536,12 @@ async fn cmd_start(cfg: StartConfig) {
         let router_ref = router.clone();
         let handler_cleanup = handler_ref.clone();
         let peer_addr_str = peer_addr.to_string();
+        // Bookkeeping-side twin of the admission permit: its Drop (also on a
+        // panic unwind) returns the pool slot, so a handler panic cannot
+        // ratchet max_connections down. Disarmed on the normal path below,
+        // where the explicit cleanup does the fuller release.
+        let mut slot_guard =
+            nucleus::pool::async_pool::PoolSlotGuard::new(conn_pool.clone(), conn_id);
         metrics_ref.active_connections.inc();
         connection_tasks.spawn(async move {
             // Not pgwire's own `process_socket`: that one ignores Terminate and
@@ -2416,11 +2560,17 @@ async fn cmd_start(cfg: StartConfig) {
             metrics_ref.active_connections.dec();
             router_ref.connection_ended(core);
             pool_ref.release_with_metadata_cleanup(conn_id).await;
-            // Dropped last so the drain coordinator only considers this
-            // connection finished after its cleanup has run. Dropping on a
-            // panic unwind too, so a blown-up connection cannot wedge
+            slot_guard.disarm();
+            // Dropped second-to-last so the drain coordinator only considers
+            // this connection finished after its cleanup has run. Dropping on
+            // a panic unwind too, so a blown-up connection cannot wedge
             // shutdown.
             drop(inflight);
+            // Dropped last: the admission slot frees with the task. On a
+            // panic anywhere above, the unwind drops the permit — a
+            // connection-task panic can no longer ratchet max_connections
+            // down toward refusing everyone.
+            drop(conn_permit);
         });
     }
 
@@ -3019,6 +3169,121 @@ async fn cmd_load(input: PathBuf, data: PathBuf) {
             std::process::exit(1);
         }
     }
+}
+
+/// Disambiguate `nucleus import --from` by shape: postgres:// URL, .sql text
+/// dump, or SQLite file path.
+async fn cmd_import(from: String, data: PathBuf, report_path: Option<PathBuf>) {
+    use nucleus::import_export::{ImportOptions, SqlTextSource, run_import};
+
+    let executor = match nucleus::executor::open_persistent_executor(&data).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Import failed to open '{}': {e}", data.display());
+            std::process::exit(1);
+        }
+    };
+
+    let outcome = if from.starts_with("postgres://") || from.starts_with("postgresql://") {
+        #[cfg(feature = "server")]
+        {
+            match nucleus::import_export::PgSource::connect(&from).await {
+                Ok(mut src) => run_import(&executor, &mut src, &ImportOptions::default()).await,
+                Err(e) => {
+                    eprintln!("Import failed to connect to '{from}': {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            let _ = &from;
+            eprintln!("Import from PostgreSQL needs a build with the `server` feature.");
+            std::process::exit(1);
+        }
+    } else if from.to_ascii_lowercase().ends_with(".sql") {
+        let script = match std::fs::read_to_string(&from) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Import failed to read '{}': {e}", from);
+                std::process::exit(1);
+            }
+        };
+        let mut src = SqlTextSource::from_script(script);
+        run_import(&executor, &mut src, &ImportOptions::default()).await
+    } else {
+        #[cfg(feature = "rusqlite")]
+        {
+            match nucleus::import_export::SqliteSource::open(std::path::Path::new(&from)) {
+                Ok(mut src) => run_import(&executor, &mut src, &ImportOptions::default()).await,
+                Err(e) => {
+                    eprintln!("Import failed to open '{}': {e}", from);
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "rusqlite"))]
+        {
+            let _ = &from;
+            eprintln!("Import from SQLite needs a build with the `rusqlite` feature.");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(path) = &report_path {
+        let json = outcome.report.to_json().unwrap_or_else(|e| {
+            eprintln!("Import could not serialize the report: {e}");
+            std::process::exit(1);
+        });
+        if let Err(e) = std::fs::write(path, json) {
+            eprintln!("Import failed to write '{}': {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+    print!("{}", outcome.report.human_summary());
+    if let Some(fatal) = &outcome.fatal {
+        eprintln!("Import fatal: {fatal}");
+        std::process::exit(1);
+    }
+}
+
+async fn cmd_export(
+    target: ExportFormat,
+    data: PathBuf,
+    output: Option<PathBuf>,
+    report_path: Option<PathBuf>,
+) {
+    use nucleus::import_export::run_export;
+
+    let executor = match nucleus::executor::open_persistent_executor(&data).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Export failed to open '{}': {e}", data.display());
+            std::process::exit(1);
+        }
+    };
+
+    let (sql, report) = run_export(&executor, target.to_target()).await;
+    match &output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &sql) {
+                eprintln!("Export failed to write '{}': {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+        None => print!("{sql}"),
+    }
+    if let Some(path) = &report_path {
+        let json = report.to_json().unwrap_or_else(|e| {
+            eprintln!("Export could not serialize the report: {e}");
+            std::process::exit(1);
+        });
+        if let Err(e) = std::fs::write(path, json) {
+            eprintln!("Export failed to write '{}': {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+    print!("{}", report.human_summary());
 }
 
 fn cmd_version() {

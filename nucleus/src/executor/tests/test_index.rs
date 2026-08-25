@@ -1679,3 +1679,87 @@ async fn test_index_only_scan_text_key() {
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("bob".into()));
 }
+
+/// QPP-2: the comma-join index-NL fast path probes ONE base table for the
+/// accumulated left side. Once the left is itself a join result (3+ comma
+/// factors), the probe returns single-table-width rows while the hash join
+/// runs with multi-table metadata — columns vanish or shift. The guard must
+/// limit the optimization to single-table left sides; results must equal the
+/// plan-off execution.
+#[tokio::test]
+async fn test_comma_join_index_nl_multi_table_left() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE cj_a (x INT)").await;
+    exec(&ex, "CREATE TABLE cj_b (y INT)").await;
+    exec(&ex, "CREATE TABLE cj_c (w INT)").await;
+    exec(&ex, "CREATE TABLE cj_d (w INT)").await;
+    for i in 0..5 {
+        exec(&ex, &format!("INSERT INTO cj_a VALUES ({i})")).await;
+        exec(&ex, &format!("INSERT INTO cj_b VALUES ({i})")).await;
+        exec(&ex, &format!("INSERT INTO cj_c VALUES ({i})")).await;
+        exec(&ex, &format!("INSERT INTO cj_d VALUES ({i})")).await;
+    }
+    // Index on the probed left column (a.x) — the precondition for the
+    // index-NL fast path to trigger inside the from[1..] loop.
+    exec(&ex, "CREATE INDEX idx_cj_a_x ON cj_a (x)").await;
+
+    let sql = "SELECT * FROM cj_a, cj_b, cj_c JOIN cj_d ON cj_c.w = cj_d.w WHERE a_x_ref()"
+        .replace("a_x_ref()", "cj_a.x = cj_c.w");
+    let fast = ex.execute(&sql).await.expect("fast path must not panic");
+
+    let ex2 = test_executor();
+    exec(&ex2, "CREATE TABLE cj_a (x INT)").await;
+    exec(&ex2, "CREATE TABLE cj_b (y INT)").await;
+    exec(&ex2, "CREATE TABLE cj_c (w INT)").await;
+    exec(&ex2, "CREATE TABLE cj_d (w INT)").await;
+    for i in 0..5 {
+        exec(&ex2, &format!("INSERT INTO cj_a VALUES ({i})")).await;
+        exec(&ex2, &format!("INSERT INTO cj_b VALUES ({i})")).await;
+        exec(&ex2, &format!("INSERT INTO cj_c VALUES ({i})")).await;
+        exec(&ex2, &format!("INSERT INTO cj_d VALUES ({i})")).await;
+    }
+    exec(&ex2, "CREATE INDEX idx_cj_a_x ON cj_a (x)").await;
+    exec(&ex2, "SET plan_execution = off").await;
+    let slow = ex2.execute(&sql).await.expect("AST path must answer");
+
+    let fast_rows = rows(&fast[0]);
+    let slow_rows = rows(&slow[0]);
+    assert_eq!(
+        fast_rows.len(),
+        slow_rows.len(),
+        "multi-table left via index NL lost rows: fast {fast_rows:?} vs AST {slow_rows:?}"
+    );
+    // Row-for-row equality (both sorted identically by construction).
+    for (f, s) in fast_rows.iter().zip(slow_rows.iter()) {
+        assert_eq!(f, s, "column shift: fast {f:?} vs AST {s:?}");
+    }
+}
+
+/// QPP-3: the comma-join index-NL fast path never applied the LEFT table's
+/// single-table WHERE predicates — `SELECT * FROM a, b WHERE a.x = b.y AND
+/// a.z = 7` returned rows with a.z <> 7 when a.x was indexed.
+#[tokio::test]
+async fn test_comma_join_index_nl_applies_left_pushdown() {
+    let ex = test_executor();
+    // The finding's trigger: the AST path with its comma fast path, which
+    // the default plan path would otherwise bypass via desugaring.
+    exec(&ex, "SET plan_execution = off").await;
+    exec(&ex, "CREATE TABLE lp_a (x INT, z INT)").await;
+    exec(&ex, "CREATE TABLE lp_b (y INT)").await;
+    for i in 0..5 {
+        exec(&ex, &format!("INSERT INTO lp_a VALUES ({i}, {i})")).await;
+        exec(&ex, &format!("INSERT INTO lp_b VALUES ({i})")).await;
+    }
+    // Only z=3 may survive; index on the join column arms the fast path.
+    exec(&ex, "CREATE INDEX idx_lp_a_x ON lp_a (x)").await;
+
+    let results = exec(
+        &ex,
+        "SELECT lp_a.x, lp_a.z FROM lp_a, lp_b WHERE lp_a.x = lp_b.y AND lp_a.z = 3",
+    )
+    .await;
+    let r = rows(&results[0]);
+    assert_eq!(r.len(), 1, "left pushdown dropped: {r:?}");
+    assert_eq!(r[0][0], Value::Int32(3));
+    assert_eq!(r[0][1], Value::Int32(3));
+}

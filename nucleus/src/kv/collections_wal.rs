@@ -246,11 +246,20 @@ pub struct CollectionWal {
     /// acknowledgement into a `-MISCONF` error, so the failure reaches whoever
     /// is relying on it instead of only the log file.
     write_error: AtomicBool,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no future recovery
+    /// reads while `group_sync`/`is_dirty` report healthy. Set when a
+    /// checkpoint replaced the log but its reopen failed; cleared by the next
+    /// successful reattach (or checkpoint reopen). See `reattach_if_stranded`.
+    stranded: AtomicBool,
     /// Test-only: fail the next append, to exercise the path above without a
     /// full disk. The env-var fault point `collections.wal_append` covers the
     /// same path out-of-process for the probes.
     #[cfg(test)]
     fail_next_append: AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
+    #[cfg(test)]
+    fail_reopen_once: AtomicBool,
 }
 
 /// Outstanding-append guard: alive from the moment a record reaches the log
@@ -319,8 +328,11 @@ impl CollectionWal {
                 syncer: crate::storage::wal_util::WalSync::new(),
                 in_flight: AtomicU64::new(0),
                 write_error: AtomicBool::new(false),
+                stranded: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_reopen_once: AtomicBool::new(false),
             },
             collections,
         ))
@@ -389,6 +401,10 @@ impl CollectionWal {
         // the count to reach zero. Under the lock, a writer that has not yet
         // entered cannot have incremented, so the count can always drain.
         let mut w = self.writer.lock();
+        if let Err(e) = self.reattach_if_stranded(&mut w) {
+            self.note_write_error();
+            return Err(e);
+        }
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let write = w.write_all(&buf).and_then(|()| w.flush());
         if let Err(e) = write {
@@ -398,6 +414,37 @@ impl CollectionWal {
         }
         self.syncer.on_append();
         Ok(InFlight { wal: self })
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly instead of
+    /// letting it acknowledge a write to a dead inode.
+    fn reattach_if_stranded(&self, w: &mut BufWriter<File>) -> io::Result<()> {
+        if !self.stranded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("collections.wal_reopen") {
+            return Err(e);
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "collections WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        *w = BufWriter::new(file);
+        self.stranded.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Flush + `fsync` the log, capturing (under the writer lock) the highest
@@ -679,8 +726,39 @@ impl CollectionWal {
         // mid-checkpoint leaves the old log or the new snapshot, never an empty
         // file.
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
-        let file = OpenOptions::new().append(true).open(&self.path)?;
+        // The reopen is the hazardous half: the rename above already unlinked
+        // the inode `w` holds, so a failure here leaves the writer pointing at
+        // a file no future recovery reads.
+        #[cfg(test)]
+        let injected: Option<io::Error> = self
+            .fail_reopen_once
+            .swap(false, Ordering::AcqRel)
+            .then(|| io::Error::other("injected collections WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<io::Error> = None;
+        let file = if let Some(e) = injected {
+            Err(e)
+        } else if let Some(e) = crate::storage::crashpoint::io_fault("collections.wal_reopen") {
+            Err(e)
+        } else {
+            OpenOptions::new().append(true).open(&self.path)
+        };
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                // The rename already happened, so the handle in `w` is now an
+                // unlinked inode. Mark the writer stranded: appends must
+                // reattach (or fail loudly), never write through it. The
+                // checkpoint itself is also a failed write to this log — flag
+                // it so an acknowledgement cannot claim durability the log no
+                // longer has a healthy writer for.
+                self.note_write_error();
+                self.stranded.store(true, Ordering::Release);
+                return Err(e);
+            }
+        };
         *w = BufWriter::new(file);
+        self.stranded.store(false, Ordering::Release);
         self.checksummed.store(true, Ordering::Release);
         // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
         let mark = self.syncer.on_append();
@@ -901,7 +979,11 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
                     let member = read_string(data, pos)?;
                     let lon = read_f64(data, pos)?;
                     let lat = read_f64(data, pos)?;
-                    geo.add(lon, lat, &member);
+                    // A legacy snapshot may carry a pre-validation NaN member;
+                    // warn-skip it (never abort recovery over one bad entry).
+                    if let Err(e) = geo.add(lon, lat, &member) {
+                        tracing::warn!("collections WAL snapshot: {e}");
+                    }
                 }
                 KvCollection::Geo(geo)
             }
@@ -1686,6 +1768,37 @@ mod tests {
         );
         let members = colls2.smembers("set").unwrap();
         assert_eq!(members, vec!["x", "y"]);
+    }
+
+    /// S31-14: a checkpoint whose reopen fails must not leave the writer
+    /// appending into the unlinked inode the rename displaced. Those appends
+    /// report success while no future recovery can ever read them, so an
+    /// acknowledged collection op silently vanishes at restart. The
+    /// discriminator is durability: the post-failure op must land in the
+    /// replaced file.
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
+            colls.rpush("l", Value::Int32(1)).unwrap();
+            drop(wal.log_rpush("l", &Value::Int32(1)).unwrap());
+            wal.fail_reopen_once.store(true, Ordering::SeqCst);
+            wal.checkpoint(&colls)
+                .expect_err("the injected reopen failure must fail the checkpoint");
+            colls.rpush("l", Value::Int32(2)).unwrap();
+            drop(
+                wal.log_rpush("l", &Value::Int32(2))
+                    .expect("a later append must reattach, not strand"),
+            );
+        }
+        let (_wal2, colls2) = CollectionWal::open(dir.path()).unwrap();
+        assert_eq!(
+            colls2.lrange("l", 0, -1).unwrap(),
+            vec![Value::Int32(1), Value::Int32(2)],
+            "the post-checkpoint-failure append went to the unlinked inode: it \
+             returned Ok and no recovery can ever read it"
+        );
     }
 
     #[test]

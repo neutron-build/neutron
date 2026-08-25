@@ -291,6 +291,18 @@ impl SparseIndex {
             return Vec::new();
         }
 
+        // WAND's per-dimension bound qval * max_weight is an UPPER bound
+        // only for qval >= 0. With a negative query weight the true upper
+        // bound is qval * MIN_weight; using max_weight there makes the pivot
+        // sum never cross the threshold, so the pruned loop returns [] where
+        // search_exact (and the accumulator below) return correct
+        // positive-scored docs (e.g. doc {(0,-5.0)}, query {(0,-1.0)}).
+        // Negative weights are legal, so degrade to the accumulator: same
+        // results as SPARSE_SEARCH, no pruning.
+        if query.values.iter().any(|q| *q < 0.0) {
+            return self.search_wand(query, top_k);
+        }
+
         // One cursor per non-zero query dimension (skip dims not in index).
         // cursor: (current_pos, query_weight, &PostingList)
         let mut cursors: Vec<(usize, f32, &PostingList)> = query
@@ -850,5 +862,29 @@ mod tests {
         if !exact.is_empty() {
             assert_eq!(wand[0].0, exact[0].0, "top result doc_id mismatch");
         }
+    }
+
+    /// DKV-8: WAND's per-dimension bound qval * max_weight is an UPPER bound
+    /// only for qval >= 0. With a negative query weight the pruned loop never
+    /// crosses the threshold and returns [] where the exact accumulator (and
+    /// search_wand itself) return the correct positive-scored documents.
+    #[test]
+    fn search_wand_pruned_agrees_with_exact_on_negative_weights() {
+        let mut index = SparseIndex::new();
+        index.insert(1, SparseVector::new(vec![(0, -5.0)]));
+        index.insert(2, SparseVector::new(vec![(0, 1.0)]));
+        let query = SparseVector::new(vec![(0, -1.0)]);
+
+        let exact = index.search_exact(&query, 10);
+        assert_eq!(
+            exact,
+            vec![(1, 5.0f32)],
+            "negative weights are legal: doc 1 scores +5.0"
+        );
+        let pruned = index.search_wand_pruned(&query, 10);
+        assert_eq!(
+            pruned, exact,
+            "the pruned path must degrade to the exact accumulator for negative query weights"
+        );
     }
 }

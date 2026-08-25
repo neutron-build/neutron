@@ -366,6 +366,26 @@ fn decode_raft_entry(r: &mut BufReader<'_>) -> Result<RaftEntry, TransportError>
 // Message encode / decode (public API)
 // ============================================================================
 
+/// Reject a peer-supplied element count that cannot fit in the bytes
+/// remaining. Mirrors the NU-385 guard in `wire::decode_binary_array`:
+/// `Vec::with_capacity(count)` on a huge count attempts a huge allocation,
+/// and a Rust allocation failure ABORTS the process (SIGABRT, no unwind,
+/// no `Err`).
+fn check_count(
+    r: &BufReader<'_>,
+    count: usize,
+    min_entry_bytes: usize,
+    what: &str,
+) -> Result<(), TransportError> {
+    if count > r.remaining() / min_entry_bytes {
+        return Err(TransportError::Protocol(format!(
+            "{what} count {count} exceeds remaining bytes ({})",
+            r.remaining()
+        )));
+    }
+    Ok(())
+}
+
 /// Serialize a `Message` to a binary byte vector.
 pub fn encode(msg: &Message) -> Vec<u8> {
     let mut w = BufWriter::new();
@@ -547,6 +567,8 @@ pub fn decode(data: &[u8]) -> Result<Message, TransportError> {
             let prev_log_index = r.read_u64()?;
             let prev_log_term = r.read_u64()?;
             let count = r.read_u64()? as usize;
+            // Each entry is >= index(8) + term(8) + command tag(1).
+            check_count(&r, count, 17, "append-entries")?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
                 entries.push(decode_raft_entry(&mut r)?);
@@ -579,6 +601,8 @@ pub fn decode(data: &[u8]) -> Result<Message, TransportError> {
         TAG_FORWARD_QUERY_RESPONSE => {
             let success = r.read_bool()?;
             let row_count = r.read_u64()? as usize;
+            // Each row is >= its 8-byte length prefix.
+            check_count(&r, row_count, 8, "forward-query-response row")?;
             let mut rows = Vec::with_capacity(row_count);
             for _ in 0..row_count {
                 rows.push(r.read_bytes()?);
@@ -603,6 +627,8 @@ pub fn decode(data: &[u8]) -> Result<Message, TransportError> {
         TAG_JOIN_CLUSTER_RESPONSE => {
             let success = r.read_bool()?;
             let count = r.read_u64()? as usize;
+            // Each node is >= NodeId(8) + string length prefix(8).
+            check_count(&r, count, 16, "join-cluster node")?;
             let mut cluster_nodes = Vec::with_capacity(count);
             for _ in 0..count {
                 let nid = r.read_u64()?;
@@ -662,6 +688,8 @@ pub fn decode(data: &[u8]) -> Result<Message, TransportError> {
         TAG_PUBSUB_GOSSIP => {
             let node_id = r.read_u64()?;
             let count = r.read_u64()? as usize;
+            // Each channel is >= its 8-byte string length prefix.
+            check_count(&r, count, 8, "pubsub-gossip channel")?;
             let mut channels = Vec::with_capacity(count);
             for _ in 0..count {
                 channels.push(r.read_string()?);
@@ -1482,6 +1510,67 @@ mod tests {
             shard_id: 7,
             success: true,
         });
+    }
+
+    // ---------- decode guards (WIR-3) ---------------------------------------
+    //
+    // A count read off a peer frame and handed to `Vec::with_capacity`
+    // reserves that much; a Rust allocation failure ABORTS the process
+    // (SIGABRT, no unwind, no `Err`) on Linux, and this overcommitting macOS
+    // may let the reservation silently succeed. So the count must be checked
+    // against the bytes remaining BEFORE any reservation.
+
+    fn expect_protocol_error(bytes: &[u8], what: &str) {
+        match decode(bytes) {
+            Err(TransportError::Protocol(msg)) => {
+                assert!(msg.contains(what), "error should name {what}, got: {msg}");
+            }
+            other => panic!("{what}: expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_absurd_entry_counts() {
+        // TAG_APPEND_ENTRIES: count the trailing bytes cannot back.
+        let mut b = vec![TAG_APPEND_ENTRIES];
+        b.extend_from_slice(&[0u8; 32]); // term, leader, prev index, prev term
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.extend_from_slice(&[0u8; 2]); // not even one entry (min 17 bytes)
+        expect_protocol_error(&b, "append-entries");
+
+        // TAG_FORWARD_QUERY_RESPONSE rows.
+        let mut b = vec![TAG_FORWARD_QUERY_RESPONSE];
+        b.push(1); // success
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.extend_from_slice(&[0u8; 4]); // not even one row (min 8-byte length)
+        expect_protocol_error(&b, "forward-query-response");
+
+        // TAG_JOIN_CLUSTER_RESPONSE nodes.
+        let mut b = vec![TAG_JOIN_CLUSTER_RESPONSE];
+        b.push(1); // success
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.extend_from_slice(&[0u8; 8]); // not even one node (min 16 bytes)
+        expect_protocol_error(&b, "join-cluster");
+
+        // TAG_PUBSUB_GOSSIP channels.
+        let mut b = vec![TAG_PUBSUB_GOSSIP];
+        b.extend_from_slice(&[0u8; 8]); // node id
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.extend_from_slice(&[0u8; 8]); // not even one channel (min 8 bytes)
+        expect_protocol_error(&b, "pubsub-gossip");
+    }
+
+    #[test]
+    fn decode_rejects_terabyte_counts() {
+        // 2^40 entries of ~40 bytes ≈ 44 TB of reservation: below isize::MAX
+        // so it attempts a REAL allocation instead of a capacity-overflow
+        // panic — the exact NU-385 abort class. It must be refused on the
+        // count check, not by attempting it.
+        let mut b = vec![TAG_APPEND_ENTRIES];
+        b.extend_from_slice(&[0u8; 32]);
+        b.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        b.extend_from_slice(&[0u8; 2]);
+        expect_protocol_error(&b, "append-entries");
     }
 
     // ---------- Envelope round-trip -----------------------------------------

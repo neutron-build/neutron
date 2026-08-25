@@ -94,6 +94,13 @@ pub struct EdgePattern {
     pub direction: Direction,
     pub from_idx: usize,
     pub to_idx: usize,
+    /// The pattern carried a `*` hop modifier (fixed, open or bare range).
+    /// min/max alone cannot express bare `*` (normalized to 1..inf, which is
+    /// also the default when no hops are spelled at all).
+    pub star: bool,
+    /// Inline property map on the relationship pattern — a per-hop filter,
+    /// never silently discardable.
+    pub properties: BTreeMap<String, PropValue>,
     pub min_hops: Option<usize>,
     pub max_hops: Option<usize>,
 }
@@ -110,6 +117,13 @@ pub enum Condition {
     PropertyEquals {
         variable: String,
         property: String,
+        value: PropValue,
+    },
+    /// `WHERE var = value` with no property path — compares the binding
+    /// itself, which is how a WITH-projected scalar (`WITH n.name AS nm …
+    /// WHERE nm = 'Alice'`) reaches the filter.
+    VariableEquals {
+        variable: String,
         value: PropValue,
     },
     And(Box<Condition>, Box<Condition>),
@@ -393,21 +407,33 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CypherError> {
             continue;
         }
 
-        // String literal (single or double quotes)
+        // String literal (single or double quotes). Escape-aware SCAN was
+        // never paired with escape-aware BUILD — the source was sliced
+        // verbatim, backslash included, so 'O\'Brien' stayed 9 chars.
         if ch == '\'' || ch == '"' {
             let quote = ch;
             i += 1;
-            let start = i;
+            let mut s = String::new();
             while i < len && chars[i] != quote {
-                if chars[i] == '\\' {
-                    i += 1; // skip escaped char
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 1;
+                    s.push(match chars[i] {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        'b' => '\u{0008}',
+                        'f' => '\u{000C}',
+                        // covers \\ \' \" and, leniently, unknown escapes
+                        c => c,
+                    });
+                } else {
+                    s.push(chars[i]);
                 }
                 i += 1;
             }
             if i >= len {
                 return Err(CypherError::InvalidSyntax("unterminated string".into()));
             }
-            let s: String = chars[start..i].iter().collect();
             tokens.push(Token::StringLit(s));
             i += 1; // skip closing quote
             continue;
@@ -439,6 +465,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CypherError> {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
+
+            // `__`-prefixed identifiers are reserved for the executor's
+            // positional internal bindings (`__node_{idx}`); a user variable
+            // using the prefix could collide with one.
+            if word.starts_with("__") {
+                return Err(CypherError::InvalidSyntax(format!(
+                    "identifiers beginning with __ are reserved: '{word}'"
+                )));
+            }
 
             // Check for boolean literals
             if word.eq_ignore_ascii_case("true") {
@@ -946,27 +981,62 @@ impl Parser {
 
             // Parse edge bracket
             self.expect_token(&Token::LBracket)?;
-            let (variable, edge_type, _props) = self.parse_edge_internals()?;
+            let (variable, edge_type, edge_props) = self.parse_edge_internals()?;
 
-            // Check for variable-length pattern *min..max
+            // Variable-length pattern `*`, `*n`, `*..m`, `*n..`, `*n..m`.
+            // Normalized per the Cypher hop table so the AST can express
+            // every spelling: bare `*` is 1..inf (NOT a single hop), `*n`
+            // without `..` is exactly n hops (NOT n..=10), `*n..` is
+            // unbounded, and a spelled 0 minimum keeps the zero-hop
+            // terminal (the source itself).
+            let mut star = false;
             let mut min_hops = None;
             let mut max_hops = None;
             if self.check_token(&Token::Star) {
                 self.advance()?; // consume '*'
+                star = true;
+                let mut spelled_min = None;
                 if let Some(Token::IntLit(_)) = self.peek() {
                     let tok = self.advance()?.clone();
                     if let Token::IntLit(n) = tok {
-                        min_hops = Some(n as usize);
+                        spelled_min = Some(n as usize);
                     }
                 }
+                let mut saw_range = false;
                 if self.check_token(&Token::Dot) {
                     self.advance()?; // consume first '.'
                     self.expect_token(&Token::Dot)?; // consume second '.'
+                    saw_range = true;
                     if let Some(Token::IntLit(_)) = self.peek() {
                         let tok = self.advance()?.clone();
                         if let Token::IntLit(n) = tok {
                             max_hops = Some(n as usize);
                         }
+                    }
+                }
+                match (spelled_min, max_hops, saw_range) {
+                    // bare `*` or `*..`: 1..inf
+                    (None, None, _) => {
+                        min_hops = Some(1);
+                    }
+                    // `*n` (no `..` was consumed): exactly n hops
+                    (Some(n), None, false) => {
+                        min_hops = Some(n);
+                        max_hops = Some(n);
+                    }
+                    // `*n..`: n..inf
+                    (Some(n), None, true) => {
+                        min_hops = Some(n);
+                    }
+                    // `*..m`: 1..=m
+                    (None, Some(m), _) => {
+                        min_hops = Some(1);
+                        max_hops = Some(m);
+                    }
+                    // `*n..m` / `*0..m` / `*0..`
+                    (Some(n), Some(m), _) => {
+                        min_hops = Some(n);
+                        max_hops = Some(m);
                     }
                 }
             }
@@ -992,6 +1062,8 @@ impl Parser {
                 direction,
                 from_idx,
                 to_idx,
+                star,
+                properties: edge_props,
                 min_hops,
                 max_hops,
             });
@@ -1164,7 +1236,7 @@ impl Parser {
 
     fn parse_condition(&mut self) -> Result<Condition, CypherError> {
         // Parse: variable.property = value
-        // or:    variable.property > value  (treat as equality for this basic parser — extend later)
+        // or:    variable = value          (binding itself — WITH scalars)
         let var_tok = self.advance()?.clone();
         let variable = match var_tok {
             Token::Ident(name) => name,
@@ -1175,6 +1247,31 @@ impl Parser {
                 });
             }
         };
+
+        // A bare variable (no `.property` path) compares the binding itself.
+        if self.check_token(&Token::Eq)
+            || self.check_token(&Token::Gt)
+            || self.check_token(&Token::Lt)
+        {
+            let op = self.advance()?.clone();
+            match op {
+                Token::Eq => {}
+                Token::Gt | Token::Lt => {
+                    return Err(CypherError::InvalidSyntax(
+                        "range operators (> and <) are not supported in Cypher WHERE yet; only ="
+                            .into(),
+                    ));
+                }
+                other => {
+                    return Err(CypherError::UnexpectedToken {
+                        expected: "operator (=)".into(),
+                        found: other.to_string(),
+                    });
+                }
+            }
+            let value = self.parse_prop_value()?;
+            return Ok(Condition::VariableEquals { variable, value });
+        }
 
         self.expect_token(&Token::Dot)?;
 
@@ -1189,13 +1286,23 @@ impl Parser {
             }
         };
 
-        // Accept = or > or < (all mapped to PropertyEquals for now)
+        // Range operators are deliberately REJECTED rather than silently
+        // evaluated as equality (which returned only the `= value` row for a
+        // `> value` query — wrong rows, no error). Property ranges need
+        // Condition variants plus index narrowing with Bound::Excluded; a
+        // loud error beats a wrong row until then.
         let op = self.advance()?.clone();
         match op {
-            Token::Eq | Token::Gt | Token::Lt => {}
+            Token::Eq => {}
+            Token::Gt | Token::Lt => {
+                return Err(CypherError::InvalidSyntax(
+                    "range operators (> and <) are not supported in Cypher WHERE yet; only ="
+                        .into(),
+                ));
+            }
             other => {
                 return Err(CypherError::UnexpectedToken {
-                    expected: "operator (=, >, <)".into(),
+                    expected: "operator (=)".into(),
                     found: other.to_string(),
                 });
             }
@@ -1332,7 +1439,89 @@ pub fn parse_cypher(input: &str) -> Result<CypherStatement, CypherError> {
     }
     let mut parser = Parser::new(tokens);
     let stmt = parser.parse_statement()?;
+    // Trailing tokens were previously ignored, which silently DROPPED
+    // LIMIT/SKIP/ORDER BY/DELETE appended after a complete statement — the
+    // query answered something other than what was written. Reject instead.
+    if !parser.at_end() {
+        return Err(CypherError::UnexpectedToken {
+            expected: "end of statement".into(),
+            found: parser.peek().map(|t| t.to_string()).unwrap_or_default(),
+        });
+    }
     Ok(stmt)
+}
+
+#[cfg(test)]
+mod grp_parse_tests {
+    use super::*;
+
+    /// GRP-1: `>`/`<` in WHERE used to be silently evaluated as equality —
+    /// `WHERE n.age > 25` returned only the `age = 25` row. Reject loudly
+    /// until ranges are implemented; a loud error beats a wrong row.
+    #[test]
+    fn range_operators_in_where_are_rejected_not_silenced() {
+        let err = parse_cypher("MATCH (n:Person) WHERE n.age > 25 RETURN n.name").unwrap_err();
+        assert!(
+            err.to_string().contains(">"),
+            "the error should name the operator, got: {err}"
+        );
+        assert!(parse_cypher("MATCH (n:Person) WHERE n.age < 25 RETURN n.name").is_err());
+        // Equality still parses.
+        assert!(parse_cypher("MATCH (n:Person) WHERE n.age = 25 RETURN n.name").is_ok());
+    }
+
+    /// GRP-3: user identifiers starting with `__` are reserved for the
+    /// executor's positional internal bindings.
+    #[test]
+    fn double_underscore_variables_are_reserved() {
+        let err = parse_cypher("MATCH (__x) RETURN __x").unwrap_err();
+        assert!(
+            err.to_string().contains("__"),
+            "the error should name the reserved prefix, got: {err}"
+        );
+    }
+
+    /// GRP-4: trailing tokens after the parsed statement were silently
+    /// ignored — LIMIT, SKIP, ORDER BY and DELETE after a complete statement
+    /// all vanished.
+    #[test]
+    fn trailing_tokens_after_a_statement_are_rejected() {
+        for q in [
+            "MATCH (n:Person) RETURN n LIMIT 5",
+            "MATCH (n:Person) RETURN n SKIP 2",
+            "MATCH (n:Person) RETURN n ORDER BY n.name",
+            "MATCH (n:Person) RETURN n DELETE n",
+        ] {
+            assert!(
+                parse_cypher(q).is_err(),
+                "trailing tokens were silently ignored: {q}"
+            );
+        }
+        // A clean statement still parses.
+        assert!(parse_cypher("MATCH (n:Person) RETURN n").is_ok());
+    }
+
+    /// GRP-10: string escapes were never unescaped — the scanner skipped the
+    /// escaped char but sliced the source verbatim, backslash included, so
+    /// `'O\'Brien'` became a 9-char string.
+    #[test]
+    fn string_escapes_are_unescaped() {
+        let toks = tokenize(r"'O\'Brien'").unwrap();
+        match &toks[0] {
+            Token::StringLit(s) => assert_eq!(
+                s, "O'Brien",
+                "expected the 8-char unescaped literal, got {s:?}"
+            ),
+            other => panic!("expected a string literal, got {other:?}"),
+        }
+        let toks = tokenize(r#""a\tb\n""#).unwrap();
+        match &toks[0] {
+            Token::StringLit(s) => {
+                assert_eq!(s, "a\tb\n", "escape sequences should decode, got {s:?}")
+            }
+            other => panic!("expected a string literal, got {other:?}"),
+        }
+    }
 }
 
 // ============================================================================

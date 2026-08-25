@@ -152,6 +152,83 @@ async fn test_create_sequence_and_nextval() {
     assert_eq!(scalar(&results[0]), &Value::Int64(2));
 }
 
+// ======================================================================
+// CAT-8: NEXTVAL overflow wrapped to i64::MIN (unchecked +=), descending
+// sequences never checked MINVALUE, and CYCLE was silently accepted at
+// CREATE and ALTER while doing nothing.
+// ======================================================================
+
+#[tokio::test]
+async fn nextval_overflow_errors_instead_of_wrapping() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE SEQUENCE cat8big INCREMENT BY 9223372036854775807 START WITH 1",
+    )
+    .await;
+    let r = exec(&ex, "SELECT NEXTVAL('cat8big')").await;
+    assert_eq!(*scalar(&r[0]), Value::Int64(1));
+    let err = ex
+        .execute("SELECT NEXTVAL('cat8big')")
+        .await
+        .expect_err("stepping past i64::MAX must error, not wrap to i64::MIN");
+    assert!(err.to_string().contains("reached max value"), "got: {err}");
+}
+
+#[tokio::test]
+async fn descending_sequence_enforces_minvalue() {
+    let ex = test_executor();
+    // INCREMENT BY -1 arrives at CREATE as UnaryOp(Minus, 1) —
+    // `sequence_option_to_i64` used to drop it, silently leaving the
+    // default +1 increment (the wave-6 workaround was to ALTER after
+    // CREATE, whose token parser handles the sign). INCREMENT must lead:
+    // sqlparser 0.61 parses sequence options once each in a fixed order.
+    exec(
+        &ex,
+        "CREATE SEQUENCE cat8desc INCREMENT BY -1 MINVALUE 1 START WITH 4",
+    )
+    .await;
+    let r = exec(&ex, "SELECT NEXTVAL('cat8desc')").await;
+    assert_eq!(*scalar(&r[0]), Value::Int64(4));
+    let r = exec(&ex, "SELECT NEXTVAL('cat8desc')").await;
+    assert_eq!(*scalar(&r[0]), Value::Int64(3));
+    let r = exec(&ex, "SELECT NEXTVAL('cat8desc')").await;
+    assert_eq!(*scalar(&r[0]), Value::Int64(2));
+    let r = exec(&ex, "SELECT NEXTVAL('cat8desc')").await;
+    assert_eq!(*scalar(&r[0]), Value::Int64(1));
+    let err = ex.execute("SELECT NEXTVAL('cat8desc')").await.expect_err(
+        "descending sequence must stop at MINVALUE — pre-fix it \
+                     continued into 0, -1, ...",
+    );
+    assert!(err.to_string().contains("reached min value"), "got: {err}");
+}
+
+#[tokio::test]
+async fn cycle_option_is_refused_loudly() {
+    let ex = test_executor();
+    let err = ex
+        .execute("CREATE SEQUENCE cat8c CYCLE")
+        .await
+        .expect_err("CYCLE was accepted-and-ignored; refuse until wraparound exists");
+    assert!(
+        err.to_string().to_uppercase().contains("CYCLE"),
+        "got: {err}"
+    );
+    // NO CYCLE is the default and must stay accepted.
+    exec(&ex, "CREATE SEQUENCE cat8nc NO CYCLE").await;
+
+    exec(&ex, "CREATE SEQUENCE cat8d START WITH 1").await;
+    let err = ex
+        .execute("ALTER SEQUENCE cat8d CYCLE")
+        .await
+        .expect_err("ALTER SEQUENCE ... CYCLE was silently dropped by the token loop");
+    assert!(
+        err.to_string().to_uppercase().contains("CYCLE"),
+        "got: {err}"
+    );
+    exec(&ex, "ALTER SEQUENCE cat8d NOCYCLE").await;
+}
+
 // ALTER TABLE tests
 // ======================================================================
 
@@ -1350,3 +1427,110 @@ async fn test_alter_table_add_constraint_nonexistent_column() {
 }
 
 // ======================================================================
+
+/// CREATE OR REPLACE VIEW must drop the OLD view's dependency edges: a view
+/// repointed away from table `a` used to keep blocking DROP TABLE a forever
+/// (stale edge), while the new edge to `b` was added on top.
+#[tokio::test]
+async fn or_replace_view_drops_stale_view_deps() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE a (x INT)").await;
+    exec(&ex, "CREATE TABLE b (y INT)").await;
+    exec(&ex, "CREATE VIEW v AS SELECT * FROM a").await;
+    exec(&ex, "CREATE OR REPLACE VIEW v AS SELECT * FROM b").await;
+
+    // The stale edge to `a` must be gone: dropping `a` succeeds.
+    ex.execute("DROP TABLE a")
+        .await
+        .expect("stale a->v edge must be gone");
+
+    // The live edge to `b` must remain: dropping `b` is refused.
+    let res = ex.execute("DROP TABLE b").await;
+    assert!(
+        res.is_err(),
+        "DROP TABLE b must be refused while v depends on it"
+    );
+}
+
+// ======================================================================
+// CAT-7: ADD COLUMN backfill evaluated the DEFAULT once and cloned it into
+// every row — `DEFAULT gen_random_uuid()` gave every existing row the SAME
+// uuid. INSERT-time defaults are per-row (eval_column_default); the backfill
+// must be too.
+// ======================================================================
+
+#[tokio::test]
+async fn add_column_volatile_default_backfills_per_row() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE cat7 (id INT)").await;
+    exec(&ex, "INSERT INTO cat7 VALUES (1), (2), (3)").await;
+
+    exec(
+        &ex,
+        "ALTER TABLE cat7 ADD COLUMN u TEXT DEFAULT gen_random_uuid()",
+    )
+    .await;
+    let r = exec(&ex, "SELECT COUNT(DISTINCT u) FROM cat7").await;
+    assert_eq!(
+        *scalar(&r[0]),
+        Value::Int64(3),
+        "a volatile DEFAULT must be evaluated per row — pre-fix every row \
+         shared one uuid"
+    );
+
+    // Constant defaults still backfill (and stay constant).
+    exec(&ex, "ALTER TABLE cat7 ADD COLUMN c INT DEFAULT 7").await;
+    let r = exec(&ex, "SELECT COUNT(DISTINCT c) FROM cat7").await;
+    assert_eq!(*scalar(&r[0]), Value::Int64(1));
+    let r = exec(&ex, "SELECT c FROM cat7 WHERE id = 2").await;
+    assert_eq!(*scalar(&r[0]), Value::Int32(7));
+}
+
+// ======================================================================
+// CAT-9: FK validation scanned the BASE engine for the parent — a parent
+// created WITH (engine='columnar'|'mergetree'|'lsm') lives in its per-table
+// engine, so the scan saw an empty table and every child write failed FK
+// validation despite the parent row existing.
+// ======================================================================
+
+async fn fk_engine_parent_fixture(ex: &Executor, engine: &str) {
+    let create_parent =
+        format!("CREATE TABLE cat9parent (id INT PRIMARY KEY) WITH (engine='{engine}')");
+    exec(ex, &create_parent).await;
+    exec(
+        ex,
+        "CREATE TABLE cat9child (id INT, pid INT REFERENCES cat9parent(id))",
+    )
+    .await;
+    exec(ex, "INSERT INTO cat9parent VALUES (1), (2)").await;
+}
+
+#[tokio::test]
+async fn fk_to_columnar_parent_validates() {
+    let ex = test_executor();
+    fk_engine_parent_fixture(&ex, "columnar").await;
+    exec(&ex, "INSERT INTO cat9child VALUES (10, 1)").await;
+    let err = ex
+        .execute("INSERT INTO cat9child VALUES (11, 99)")
+        .await
+        .expect_err("FK against a columnar parent must still reject missing values");
+    assert!(
+        err.to_string().to_lowercase().contains("foreign key"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn fk_to_mergetree_parent_validates() {
+    let ex = test_executor();
+    fk_engine_parent_fixture(&ex, "mergetree").await;
+    exec(&ex, "INSERT INTO cat9child VALUES (10, 2)").await;
+    let err = ex
+        .execute("INSERT INTO cat9child VALUES (11, 99)")
+        .await
+        .expect_err("FK against a mergetree parent must still reject missing values");
+    assert!(
+        err.to_string().to_lowercase().contains("foreign key"),
+        "got: {err}"
+    );
+}

@@ -201,6 +201,19 @@ impl Default for ChunkStore {
 }
 
 impl ChunkStore {
+    /// Whether the segment tier has bytes flushed but not yet fsynced.
+    pub fn segments_dirty(&self) -> bool {
+        self.disk.as_ref().is_some_and(SegmentStore::is_dirty)
+    }
+
+    /// Fsync the segment tier (no-op in memory-only mode).
+    pub fn sync_segments(&self) -> std::io::Result<()> {
+        match &self.disk {
+            Some(d) => d.sync(),
+            None => Ok(()),
+        }
+    }
+
     /// RAM-only chunk store (unbounded cache, no disk tier).
     pub fn new() -> Self {
         Self {
@@ -553,6 +566,19 @@ impl BlobStore {
     /// Whether the WAL has appends no completed fsync covers yet.
     pub fn wal_is_dirty(&self) -> bool {
         self.wal.as_ref().is_some_and(|w| w.is_dirty())
+    }
+
+    /// Whether the payload segment tier has bytes not yet fsynced. The commit
+    /// boundary must clear this BEFORE fsyncing the WAL: a durable manifest
+    /// referencing page-cached chunk data is an acknowledged blob a power cut
+    /// erases.
+    pub fn segments_dirty(&self) -> bool {
+        self.chunks.segments_dirty()
+    }
+
+    /// Fsync the payload segment tier (no-op in memory-only mode).
+    pub fn sync_segments(&self) -> std::io::Result<()> {
+        self.chunks.sync_segments()
     }
 
     /// Group-commit fsync the WAL, so every appended blob mutation is durable

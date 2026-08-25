@@ -1242,9 +1242,11 @@ impl Executor {
                             if col.is_empty() {
                                 return Ok(Value::Null);
                             }
-                            return Ok(Value::Float64(
-                                simd::sum_i64(&col) as f64 / col.len() as f64,
-                            ));
+                            // Checked like SUM's arm above: sum_i64 wraps by
+                            // design; overflow must error, not average garbage.
+                            return simd::sum_i64_checked(&col)
+                                .map(|sum| Value::Float64(sum as f64 / col.len() as f64))
+                                .ok_or_else(|| ExecError::Runtime("integer out of range".into()));
                         }
                         Some(Value::Float64(_)) => {
                             let col = extract_f64_indexed(col_idx);
@@ -1262,6 +1264,12 @@ impl Executor {
                     return Ok(Value::Null);
                 }
                 let mut sum: f64 = 0.0;
+                // Integers accumulate in checked i64 (mirroring the SIMD arm
+                // above): routing them through f64 rounds near-i64::MAX
+                // inputs before the divide and silently returns a wrong
+                // average instead of the SIMD arm's "integer out of range".
+                let mut int_sum: i64 = 0;
+                let mut int_overflow = false;
                 let mut numeric_sum = Decimal::ZERO;
                 let mut numeric = false;
                 let mut non_numeric = false;
@@ -1270,10 +1278,18 @@ impl Executor {
                     match val {
                         Value::Int32(n) => {
                             non_numeric = true;
+                            int_sum = int_sum.checked_add(n as i64).unwrap_or_else(|| {
+                                int_overflow = true;
+                                i64::MAX
+                            });
                             sum += n as f64;
                         }
                         Value::Int64(n) => {
                             non_numeric = true;
+                            int_sum = int_sum.checked_add(n).unwrap_or_else(|| {
+                                int_overflow = true;
+                                i64::MAX
+                            });
                             sum += n as f64;
                         }
                         Value::Float64(n) => {
@@ -1290,6 +1306,9 @@ impl Executor {
                         }
                         _ => return Err(ExecError::Unsupported("AVG on non-numeric".into())),
                     }
+                }
+                if int_overflow {
+                    return Err(ExecError::Runtime("integer out of range".into()));
                 }
                 if numeric {
                     if non_numeric {
@@ -1894,37 +1913,43 @@ impl Executor {
                         }
                     }
                     "FIRST_VALUE" => {
-                        let first_row = members[0].1;
+                        // The FRAME's first row, not the partition's — the
+                        // frame bounds computed above are what SUM/AVG/COUNT
+                        // honor, and the value functions must agree.
+                        let first_row = members[frame_start].1;
                         arg_expr
                             .map(|e| self.eval_row_expr(e, first_row, col_meta))
                             .transpose()?
                             .unwrap_or(Value::Null)
                     }
                     "LAST_VALUE" => {
-                        let last_row = members[partition_size - 1].1;
+                        let last_row = members[frame_end].1;
                         arg_expr
                             .map(|e| self.eval_row_expr(e, last_row, col_meta))
                             .transpose()?
                             .unwrap_or(Value::Null)
                     }
                     "NTH_VALUE" => {
-                        // NTH_VALUE(expr, n) — get value at position n in partition
+                        // NTH_VALUE(expr, n): the n-th row of the window FRAME
+                        // (1-based from frame_start), not of the partition.
+                        // Non-positive or beyond-frame n yields NULL (PG).
                         let n = if let Some(second_arg) = self.get_fn_arg(func, 1) {
                             self.eval_row_expr(&second_arg, row, col_meta)
                                 .ok()
                                 .and_then(|v| value_to_i64(&v).ok())
-                                .unwrap_or(1) as usize
+                                .unwrap_or(1)
                         } else {
                             1
                         };
-                        if n > 0 && n <= partition_size {
-                            let nth_row = members[n - 1].1;
-                            arg_expr
+                        let frame_len = (frame_end - frame_start + 1) as i64;
+                        let nth_row = (n >= 1 && n <= frame_len)
+                            .then(|| members[frame_start + (n - 1) as usize].1);
+                        match nth_row {
+                            Some(nth_row) => arg_expr
                                 .map(|e| self.eval_row_expr(e, nth_row, col_meta))
                                 .transpose()?
-                                .unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
                         }
                     }
                     "PERCENT_RANK" => {

@@ -40,6 +40,10 @@ const ROWS_PER_RUN: u64 = 40;
 /// exercises the boundary during schema setup, early steady state, and deep
 /// steady state respectively.
 const SKIPS: &[u64] = &[0, 3, 12];
+/// KV cold-tier section: keys under a 1 MiB hot budget (parent-set env), so
+/// most spill to the cold LsmTree and the checkpoint's SSTable write is what
+/// makes them durable.
+const KV_KEYS: i64 = 20;
 
 fn marker_for(id: i64) -> i64 {
     id.wrapping_mul(2_654_435_761) % 1_000_003
@@ -111,6 +115,74 @@ fn child_main(dir: &str) -> ! {
     }
     // Never reached when a crashpoint is armed and reachable.
     std::process::exit(0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Child: KV cold-tier section — spill keys past eviction, checkpoint, abort
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// STO-2 kv-cold arm: KV keys spill past the (1 MiB, parent-set) hot budget
+/// into the cold LsmTree, then `KvStore::checkpoint` must put every evicted
+/// key on disk BEFORE truncating the WAL that covers them. The child claims a
+/// key as KV_DURABLE only after checkpoint + sync succeed, then aborts —
+/// power-loss equivalent for everything except the OS page cache; the fsync
+/// half is proven by `lsm.sst_write` in probe_io_faults and the lsm.rs unit
+/// regressions.
+fn kv_child_main(dir: &str) -> ! {
+    use nucleus::embedded::Database;
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let db = match Database::durable_mvcc(Path::new(dir)) {
+        Ok(d) => d,
+        Err(_) => std::process::exit(11),
+    };
+    let rt = tokio::runtime::Runtime::new().expect("child rt");
+    let pad = "k".repeat(64 * 1024);
+    let mut acked: Vec<i64> = Vec::new();
+    for i in 0..KV_KEYS {
+        let sql = format!("SELECT KV_SET('kvk{i}', '{pad}')");
+        if rt.block_on(db.execute(&sql)).is_ok() {
+            acked.push(i);
+        }
+    }
+    if db.executor().kv_store().checkpoint().is_err() {
+        std::process::exit(12);
+    }
+    if db.sync().is_err() {
+        std::process::exit(13);
+    }
+    for i in &acked {
+        println!("KV_DURABLE {i}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+    // Kill -9 equivalent: no unwinding, no Drop, no flush.
+    std::process::abort();
+}
+
+/// Reopen and read back which KV cold-tier keys are present.
+fn recover_kv_cold(dir: &Path) -> Result<Vec<i64>, String> {
+    use nucleus::embedded::Database;
+    let db = Database::durable_mvcc(dir).map_err(|e| format!("reopen: {e:?}"))?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let mut present = Vec::new();
+    for i in 0..KV_KEYS {
+        let sql = format!("SELECT KV_GET('kvk{i}')");
+        let res = rt
+            .block_on(db.execute(&sql))
+            .map_err(|e| format!("query: {e:?}"))?;
+        let got = res.into_iter().any(|r| match r {
+            ExecResult::Select { rows, .. } => rows
+                .first()
+                .and_then(|row| row.first())
+                .is_some_and(|v| !matches!(v, Value::Null)),
+            _ => false,
+        });
+        if got {
+            present.push(i);
+        }
+    }
+    Ok(present)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +299,9 @@ fn main() {
     if raw.len() >= 3 && raw[1] == "--child" {
         child_main(&raw[2]);
     }
+    if raw.len() >= 3 && raw[1] == "--kv-child" {
+        kv_child_main(&raw[2]);
+    }
 
     let only: Option<&str> = raw
         .iter()
@@ -319,6 +394,53 @@ fn main() {
             findings.extend(check_recovery(&dir, last_durable, &label));
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    // ── KV cold-tier checkpoint durability (STO-2): every key the child
+    //    claimed durable across a checkpoint + abort must read back. ──
+    {
+        let kv_dir = root.join("kv_cold_section");
+        let _ = std::fs::remove_dir_all(&kv_dir);
+        let _ = std::fs::create_dir_all(&kv_dir);
+        let out = Command::new(&exe)
+            .arg("--kv-child")
+            .arg(kv_dir.to_str().unwrap())
+            .env("NUCLEUS_KV_MAX_HOT_MB", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn kv child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let kv_durable: Vec<i64> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("KV_DURABLE "))
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if kv_durable.is_empty() {
+            findings.push(Finding(
+                "kv-cold: child acknowledged no keys across the checkpoint (aborted \
+                 early or the checkpoint failed)"
+                    .into(),
+            ));
+        } else {
+            match recover_kv_cold(&kv_dir) {
+                Ok(present) => {
+                    let got: std::collections::HashSet<i64> = present.into_iter().collect();
+                    for id in &kv_durable {
+                        if !got.contains(id) {
+                            findings.push(Finding(format!(
+                                "kv-cold: KV_DURABLE key kvk{id} missing after checkpoint + \
+                                 abort — the WAL was truncated past a key whose durable copy \
+                                 did not exist (STO-2)"
+                            )));
+                            break;
+                        }
+                    }
+                }
+                Err(e) => findings.push(Finding(format!("kv-cold: recovery FAILED: {e}"))),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&kv_dir);
     }
 
     let _ = std::fs::remove_dir_all(&root);

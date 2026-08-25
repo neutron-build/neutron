@@ -441,7 +441,9 @@ impl TieredDocumentStore {
         }
         self.hot.clear();
         self.hot_count = 0;
-        cold.force_flush();
+        if let Err(e) = cold.force_flush() {
+            tracing::error!("document cold tier flush failed: {e}");
+        }
     }
 
     // ---- Internal helpers ----

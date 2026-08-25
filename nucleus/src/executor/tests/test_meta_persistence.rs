@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::super::Executor;
+use super::super::{ExecResult, Executor};
 use super::{exec, rows, scalar};
 use crate::catalog::Catalog;
 use crate::storage::persistence::CatalogPersistence;
@@ -279,6 +279,35 @@ async fn test_trigger_survives_restart() {
         // but rows are gone (MemoryEngine). Verify the trigger doesn't panic on INSERT.
         exec(&ex, "INSERT INTO data VALUES (42)").await;
         // Just verify no crash — trigger body is stored procedures; actual firing is best-effort.
+    }
+}
+
+/// DROP TRIGGER must persist: the definition lives in meta.json, and a DROP
+/// that never triggers the persist block is undone by the next restart — the
+/// dropped trigger comes back and fires.
+#[tokio::test]
+async fn test_drop_trigger_persists_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE data (val INT)").await;
+        exec(
+            &ex,
+            "CREATE TRIGGER trg_drop_me AFTER INSERT ON data FOR EACH ROW EXECUTE FUNCTION noop()",
+        )
+        .await;
+        exec(&ex, "DROP TRIGGER trg_drop_me").await;
+    }
+
+    {
+        // The engine has no SHOW TRIGGERS surface; inspect meta.json directly —
+        // that is what boot reinstalls triggers from.
+        let meta = std::fs::read_to_string(dir.path().join("meta.json")).unwrap_or_default();
+        assert!(
+            !meta.contains("trg_drop_me"),
+            "dropped trigger still in meta.json (will resurrect on restart): {meta}"
+        );
     }
 }
 
@@ -606,25 +635,23 @@ async fn vector_index_changes_survive_restart() {
 /// S35 F1b (delete half): a post-reopen DELETE must remove the RIGHT vector
 /// from the WAL's node-id space, not a physical row position.
 ///
-/// The node->PK registry is deliberately not persisted, so it is empty after
-/// every reopen. The old path resolved the tombstone id through it and fell
-/// back to the scan position — a different id space. Worse, one post-reopen
-/// INSERT makes the registry non-empty (it holds only the new row), which
-/// flips `incremental_maintenance_eligible` to true, so the delete takes the
-/// fast path with a PARTIAL registry: the real node stays live and the
-/// position it tombstoned can belong to a different row's vector.
+/// The pk -> node registry persists now (snapshot section + pk-carrying delta
+/// records), so it is authoritative across a reopen and the delete resolves
+/// the real node. Before that, the registry was empty after every reopen; the
+/// old path resolved the tombstone id through it and fell back to the scan
+/// position — a different id space — and one post-reopen INSERT made the
+/// registry non-empty (it held only the new row), flipping
+/// `incremental_maintenance_eligible` to true, so the delete took the fast
+/// path with a PARTIAL registry: the real node stayed live and the position
+/// it tombstoned could belong to a different row's vector.
 ///
 /// Node ids equal scan positions only while no row was ever deleted, which is
 /// why the fixture interposes an insert before the delete: after inserting
-/// pk 9 (node 0 — colliding with pk 1's recovered node 0), deleting pk 1
-/// tombstones node 0 and leaves four of the five live vectors indexed.
+/// pk 9, deleting pk 1 must tombstone pk 1's node — four of the five
+/// pre-reopen vectors plus pk 9's node stay live, five in all.
 /// Asserted through `hnsw_index_live_ids` because a SQL KNN query falls back
 /// to a base-table scan and masks index loss entirely.
 #[tokio::test]
-#[ignore = "F1b remainder: a post-reopen delete cannot resolve pk -> node because the PK \
-            registry is not persisted. The unsafe half is fixed (the delete no longer tombstones \
-            an unrelated node), but making the delete actually take effect needs a design \
-            decision -- persist the registry, or rebuild it on reopen. See _internal/HANDOFF.md."]
 async fn post_reopen_delete_removes_the_right_vector_from_the_wal() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -641,8 +668,11 @@ async fn post_reopen_delete_removes_the_right_vector_from_the_wal() {
     }
     {
         let ex = open_executor(dir.path()).await;
-        // The insert makes the (empty, stale) registry non-empty without
-        // making it authoritative — the exact state the old gate missed.
+        // The insert before the delete is the trap the old gate missed: with
+        // an unpersisted registry it made the (stale, near-empty) registry
+        // non-empty without making it authoritative. With the registry
+        // persisted, it simply proves a post-reopen insert and delete resolve
+        // through RECOVERED state, not fresh state.
         exec(&ex, "INSERT INTO f1bd VALUES (9, VECTOR('[9,0,0,0]'))").await;
         exec(&ex, "DELETE FROM f1bd WHERE id = 1").await;
     }
@@ -775,4 +805,198 @@ async fn role_password_deadline_survives_restart() {
             "control: a role with no deadline must still authenticate"
         );
     }
+}
+
+/// CREATE SCHEMA must persist: the set was executor-resident only, so
+/// schemas silently vanished on restart and logical dumps taken before vs
+/// after a restart differed.
+#[tokio::test]
+async fn test_create_schema_persists_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE SCHEMA analytics").await;
+        let dump = ex.dump_logical().await.unwrap();
+        assert!(
+            dump.contains("CREATE SCHEMA analytics"),
+            "dump before restart should carry the schema"
+        );
+    }
+
+    {
+        let ex = open_executor(dir.path()).await;
+        let dump = ex.dump_logical().await.unwrap();
+        assert!(
+            dump.contains("CREATE SCHEMA analytics"),
+            "schema vanished across restart; CREATE SCHEMA is not persisted"
+        );
+    }
+
+    // meta.json carries the name (and older, pre-schemas-key files still
+    // load — the serde default covers them).
+    let meta_path = dir.path().join("meta.json");
+    let meta = std::fs::read_to_string(&meta_path).unwrap();
+    assert!(
+        meta.contains("analytics"),
+        "meta.json must carry the schema name"
+    );
+}
+
+/// BACKUP FORCE detection used `to_uppercase().ends_with(" FORCE")` and then
+/// byte-sliced the ORIGINAL by a fixed 6 — safe only while uppercasing never
+/// changes byte length. For a path containing characters whose uppercase form
+/// is longer (e.g. ß → SS), the slice lands at the wrong offset — mid-UTF-8
+/// panics or a silently mangled destination. FORCE must be matched as a
+/// trailing whitespace-separated token of the original text.
+#[tokio::test]
+async fn backup_force_detection_does_not_depend_on_uppercase_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(&ex, "CREATE TABLE bk (id INT)").await;
+    exec(&ex, "INSERT INTO bk VALUES (1)").await;
+
+    // Destination OUTSIDE the data directory. `straße` uppercases to
+    // `STRASSE` (one byte longer) — with the old fixed-offset slice this
+    // statement sliced mid-UTF-8 and panicked.
+    let out_dir = tempfile::tempdir().unwrap();
+    let dest = out_dir.path().join("straße");
+    let sql = format!("BACKUP DATABASE TO {} FORCE", dest.display());
+    let res = ex.execute(&sql).await.expect("backup must succeed");
+    match &res[0] {
+        ExecResult::Select { rows, .. } => match &rows[0][0] {
+            Value::Text(got) => assert_eq!(
+                got,
+                &dest.display().to_string(),
+                "destination must be the full non-ASCII path"
+            ),
+            other => panic!("expected destination text, got {other:?}"),
+        },
+        other => panic!("expected select, got {other:?}"),
+    }
+    assert!(dest.is_dir(), "backup lands at the full path");
+}
+
+/// A QUOTED destination whose last word is "Force" is a path, not a flag:
+/// the trailing quote keeps it from ever matching the FORCE token.
+#[tokio::test]
+async fn backup_quoted_destination_ending_in_force_is_a_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(&ex, "CREATE TABLE bk2 (id INT)").await;
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let guard_file = out_dir.path().join("dest My");
+    std::fs::write(&guard_file, b"pre-existing data").unwrap();
+    let dest = out_dir.path().join("dest My Force");
+    let sql = format!("BACKUP DATABASE TO '{}'", dest.display());
+    let res = ex.execute(&sql).await.expect("backup must succeed");
+    match &res[0] {
+        ExecResult::Select { rows, .. } => match &rows[0][0] {
+            Value::Text(got) => assert_eq!(
+                got,
+                &dest.display().to_string(),
+                "quoted destination must arrive whole, never Force-truncated"
+            ),
+            other => panic!("expected destination text, got {other:?}"),
+        },
+        other => panic!("expected select, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&guard_file).unwrap(),
+        b"pre-existing data",
+        "the truncated-path file must be untouched"
+    );
+}
+
+// ======================================================================
+// CAT-3: sequence DDL durability. ALTER SEQUENCE returned through the raw
+// extension dispatch before the is_ddl persist block (a restart reverted
+// it), DROP SEQUENCE removed the entry from meta.json but never rewrote
+// sequences.json — whose entries the loader re-inserts unconditionally at
+// boot (a dropped sequence resurrected), and bare RESTART rewound to
+// MINVALUE instead of START because SequenceDef never kept `start`.
+// ======================================================================
+
+#[tokio::test]
+async fn alter_sequence_restart_with_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE SEQUENCE cat3a START WITH 10").await;
+        let r = exec(&ex, "SELECT NEXTVAL('cat3a')").await;
+        assert_eq!(*scalar(&r[0]), Value::Int64(10));
+        exec(&ex, "ALTER SEQUENCE cat3a RESTART WITH 50").await;
+    }
+    let ex = open_executor(dir.path()).await;
+    let r = exec(&ex, "SELECT NEXTVAL('cat3a')").await;
+    assert_eq!(
+        *scalar(&r[0]),
+        Value::Int64(50),
+        "ALTER SEQUENCE must be durable — pre-fix the reopen reverted it and \
+         nextval reissued 11"
+    );
+}
+
+#[tokio::test]
+async fn drop_sequence_stays_dropped_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE SEQUENCE cat3b").await;
+        let r = exec(&ex, "SELECT NEXTVAL('cat3b')").await;
+        assert_eq!(*scalar(&r[0]), Value::Int64(1));
+        exec(&ex, "DROP SEQUENCE cat3b").await;
+    }
+    let ex = open_executor(dir.path()).await;
+    let err = ex
+        .execute("SELECT NEXTVAL('cat3b')")
+        .await
+        .expect_err("a dropped sequence must not resurrect from sequences.json");
+    assert!(err.to_string().contains("does not exist"), "got: {err}");
+}
+
+#[tokio::test]
+async fn bare_restart_uses_start_not_minvalue() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE SEQUENCE cat3c START WITH 100").await;
+        exec(&ex, "ALTER SEQUENCE cat3c RESTART").await;
+        let r = exec(&ex, "SELECT NEXTVAL('cat3c')").await;
+        assert_eq!(
+            *scalar(&r[0]),
+            Value::Int64(100),
+            "bare RESTART must rewind to START (PG), not MINVALUE — pre-fix: 1"
+        );
+    }
+    let ex = open_executor(dir.path()).await;
+    let r = exec(&ex, "SELECT NEXTVAL('cat3c')").await;
+    assert_eq!(*scalar(&r[0]), Value::Int64(101));
+}
+
+#[tokio::test]
+async fn old_format_sequences_json_without_start_loads_with_minvalue() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE SEQUENCE cat3d MINVALUE 5 START WITH 5").await;
+        let r = exec(&ex, "SELECT NEXTVAL('cat3d')").await;
+        assert_eq!(*scalar(&r[0]), Value::Int64(5));
+    }
+    // Rewrite sequences.json in the PRE-upgrade shape: no "start" key.
+    let seq_path = dir.path().join("sequences.json");
+    std::fs::write(
+        &seq_path,
+        r#"[{"name":"cat3d","current":4,"increment":1,"min_value":5,"max_value":9223372036854775807}]"#,
+    )
+    .unwrap();
+    let ex = open_executor(dir.path()).await;
+    exec(&ex, "ALTER SEQUENCE cat3d RESTART").await;
+    let r = exec(&ex, "SELECT NEXTVAL('cat3d')").await;
+    assert_eq!(
+        *scalar(&r[0]),
+        Value::Int64(5),
+        "start must fall back to min_value for pre-upgrade sequences.json"
+    );
 }

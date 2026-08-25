@@ -28,6 +28,11 @@ const TAG_UPDATE: u8 = 0x05;
 const TAG_BEGIN: u8 = 0x10;
 const TAG_COMMIT: u8 = 0x11;
 const TAG_ABORT: u8 = 0x12;
+/// S63 marker: the coordinating (cross-model) transaction id that committed
+/// alongside this WAL's own txn id. A separate record rather than a field on
+/// `Commit` so the pre-S63 `Commit` byte layout is untouched — addition-only
+/// compatibility, the same rule every specialty WAL follows.
+const TAG_XACT_COMMIT: u8 = 0x13;
 const TAG_CHECKPOINT: u8 = 0x20;
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -75,6 +80,14 @@ pub enum MvccWalRecord {
     Abort {
         txn_id: u64,
     },
+    /// S63: cross-model transaction `xact` committed. Written next to the
+    /// `Commit` of the SQL transaction it coordinated, and rewritten by
+    /// `compact` so the marker set survives log reclaim — the specialty-WAL
+    /// recovery filter needs it for as long as any tagged specialty record
+    /// can still be in a replay tail.
+    XactCommit {
+        xact: u64,
+    },
     Checkpoint,
 }
 
@@ -83,6 +96,10 @@ pub enum MvccWalRecord {
 pub struct MvccWalState {
     /// Recovered tables: table_name → (columns, rows).
     pub tables: HashMap<String, RecoveredTable>,
+    /// Coordinating transaction ids (S63) whose commit markers survived in
+    /// this log. `compact` rewrites them into the baseline so the set cannot
+    /// be erased by routine reclamation.
+    pub committed_xacts: std::collections::HashSet<u64>,
 }
 
 /// A recovered table with its schema and committed rows.
@@ -197,10 +214,16 @@ impl MvccWal {
         self.sync.is_dirty()
     }
 
-    /// Log a COMMIT and immediately fsync.
-    pub fn log_commit(&self, txn_id: u64) -> io::Result<()> {
+    /// Log a COMMIT and immediately fsync. When the committing transaction
+    /// coordinated specialty models (S63), `xact` also writes a durable
+    /// `XactCommit` marker under the same fsync, so a crash between the two
+    /// records cannot split "SQL committed" from "specialty writes keepable".
+    pub fn log_commit(&self, txn_id: u64, xact: Option<u64>) -> io::Result<()> {
         crate::storage::crashpoint::reach("wal.before_commit_record");
         self.log(&MvccWalRecord::Commit { txn_id })?;
+        if let Some(xact) = xact {
+            self.log(&MvccWalRecord::XactCommit { xact })?;
+        }
         let r = self.sync();
         crate::storage::crashpoint::reach("wal.after_commit_record");
         r
@@ -274,6 +297,16 @@ impl MvccWal {
                         },
                     )?;
                 }
+            }
+            // The baseline above carries rows as auto-commits, so every Commit
+            // record — and with it every `XactCommit` marker — would vanish
+            // from the log. The marker set must survive: compaction runs on
+            // every reopen, so without this a committed cross-model
+            // transaction's specialty records would lose their only durable
+            // commit proof on the SECOND restart and the S63 recovery filter
+            // would discard them.
+            for xact in &state.committed_xacts {
+                write_framed(&mut w, &MvccWalRecord::XactCommit { xact: *xact })?;
             }
             w.flush()?;
             // Dying here must be survivable: the live WAL is still intact and
@@ -368,6 +401,10 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
         MvccWalRecord::Abort { txn_id } => {
             buf.push(TAG_ABORT);
             write_u64(&mut buf, *txn_id);
+        }
+        MvccWalRecord::XactCommit { xact } => {
+            buf.push(TAG_XACT_COMMIT);
+            write_u64(&mut buf, *xact);
         }
         MvccWalRecord::Checkpoint => {
             buf.push(TAG_CHECKPOINT);
@@ -513,6 +550,7 @@ fn replay(data: &[u8]) -> MvccWalState {
     // Phase 2: Identify committed transactions
     let mut committed: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut aborted: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut committed_xacts: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for rec in &records {
         match rec {
             MvccWalRecord::Commit { txn_id } => {
@@ -520,6 +558,9 @@ fn replay(data: &[u8]) -> MvccWalState {
             }
             MvccWalRecord::Abort { txn_id } => {
                 aborted.insert(*txn_id);
+            }
+            MvccWalRecord::XactCommit { xact } => {
+                committed_xacts.insert(*xact);
             }
             _ => {}
         }
@@ -611,7 +652,10 @@ fn replay(data: &[u8]) -> MvccWalState {
         })
         .collect();
 
-    MvccWalState { tables }
+    MvccWalState {
+        tables,
+        committed_xacts,
+    }
 }
 
 fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
@@ -683,6 +727,10 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let txn_id = read_u64_val(data, &mut pos)?;
             Some(MvccWalRecord::Abort { txn_id })
         }
+        TAG_XACT_COMMIT => {
+            let xact = read_u64_val(data, &mut pos)?;
+            Some(MvccWalRecord::XactCommit { xact })
+        }
         TAG_CHECKPOINT => Some(MvccWalRecord::Checkpoint),
         _ => None,
     }
@@ -726,7 +774,7 @@ mod tests {
                 row: vec![Value::Int64(2), Value::Text("Bob".into())],
             })
             .unwrap();
-            wal.log_commit(1).unwrap();
+            wal.log_commit(1, None).unwrap();
             drop(wal);
         }
 
@@ -813,7 +861,7 @@ mod tests {
                 row: vec![Value::Int32(99)],
             })
             .unwrap();
-            wal.log_commit(1).unwrap();
+            wal.log_commit(1, None).unwrap();
             drop(wal);
         }
 
@@ -861,6 +909,78 @@ mod tests {
 
         let (_wal2, state) = MvccWal::open(dir.path()).unwrap();
         assert!(!state.tables.contains_key("temp"));
+    }
+}
+
+// ── S63: coordinating-transaction markers survive reclaim ─────────────────
+
+#[cfg(test)]
+mod xact_marker_tests {
+    use super::*;
+
+    /// A commit's XactCommit marker is recovered into the committed set.
+    #[test]
+    fn xact_marker_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+            })
+            .unwrap();
+            wal.log_commit(7, Some(42)).unwrap();
+        }
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert!(
+            state.committed_xacts.contains(&42),
+            "the coordinating id must be recovered alongside the commit"
+        );
+    }
+
+    /// Compaction runs on EVERY reopen and rewrites the log as txn-0
+    /// auto-commits, which would erase every Commit — and with them every
+    /// XactCommit marker. The markers must be rewritten into the baseline or
+    /// the second restart loses the only proof those transactions committed
+    /// (and the S6 filter discards their specialty records).
+    #[test]
+    fn xact_markers_survive_compaction_across_two_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = MvccWal::open(dir.path()).unwrap();
+            wal.log(&MvccWalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("x".into(), DataType::Int64)],
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
+            wal.log(&MvccWalRecord::Insert {
+                table: "t".into(),
+                txn_id: 1,
+                version_idx: 0,
+                row: vec![Value::Int64(5)],
+            })
+            .unwrap();
+            wal.log_commit(1, Some(9)).unwrap();
+            drop(wal);
+        }
+        // Reopen 1: replay, then compact (the with_wal sequence).
+        let (wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert!(state.committed_xacts.contains(&9));
+        wal.compact(&state).unwrap();
+        drop(wal);
+        // Reopen 2: the compacted baseline must still answer for xact 9.
+        let (_wal, state) = MvccWal::open(dir.path()).unwrap();
+        assert!(
+            state.committed_xacts.contains(&9),
+            "compaction erased the XactCommit marker: the second restart would \
+             discard a committed transaction's specialty records"
+        );
+        assert_eq!(
+            state.tables.get("t").map(|t| t.rows.len()),
+            Some(1),
+            "the baseline rows are unchanged by marker preservation"
+        );
     }
 }
 

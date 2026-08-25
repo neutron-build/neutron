@@ -275,11 +275,19 @@ pub type Row = Vec<Value>;
 // Helper functions
 // ============================================================================
 
+/// PostgreSQL date range, astronomical year numbering:
+/// 4713 BC (year -4712) through 5874897 AD.
+pub const MIN_DATE_YEAR: i32 = -4712;
+pub const MAX_DATE_YEAR: i32 = 5_874_897;
+
 /// Convert days since 2000-01-01 to (year, month, day).
 ///
 /// Uses the Meeus algorithm (Gregorian calendar from Julian Day Number).
 pub fn days_to_ymd(days: i32) -> (i32, u32, u32) {
-    let jdn = days + 2451545; // Convert to Julian Day Number (2000-01-01 = JDN 2451545)
+    // i64 intermediates: `4 * a + 3` exceeds i32 for years past ~1.46M —
+    // inside the legal PG date range the parse boundary now admits
+    // (MAX_DATE_YEAR), so the round-trip has to survive it (WIR-9).
+    let jdn = days as i64 + 2451545; // Convert to Julian Day Number (2000-01-01 = JDN 2451545)
     let a = jdn + 32044;
     let b = (4 * a + 3) / 146097;
     let c = a - (146097 * b) / 4;
@@ -290,7 +298,7 @@ pub fn days_to_ymd(days: i32) -> (i32, u32, u32) {
     let day = e - (153 * m + 2) / 5 + 1;
     let month = m + 3 - 12 * (m / 10);
     let year = 100 * b + d - 4800 + m / 10;
-    (year, month as u32, day as u32)
+    (year as i32, month as u32, day as u32)
 }
 
 /// Convert (year, month, day) to days since 2000-01-01.
@@ -302,9 +310,12 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
     } else {
         (year + 4799, (month + 13) as i32)
     };
+    // i64 intermediates: at MAX_DATE_YEAR the running sum passes ~2,147,537,000
+    // — above i32::MAX mid-expression even though the final result fits i32.
+    let (y, m) = (y as i64, m as i64);
     let century = y / 100;
-    let jdn = y * 365 - 32167 + y / 4 - century + century / 4 + 7834 * m / 256 + day as i32;
-    jdn - 2451545 // subtract J2000 epoch
+    let jdn = y * 365 - 32167 + y / 4 - century + century / 4 + 7834 * m / 256 + day as i64;
+    (jdn - 2451545) as i32 // subtract J2000 epoch
 }
 
 /// PostgreSQL float8 text form: shortest round-trip digits, positional
@@ -360,6 +371,13 @@ pub fn parse_date(value: &str) -> Result<i32, String> {
         .parse::<u32>()
         .map_err(|_| format!("invalid date value: {value}"))?;
     if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return Err(format!("date field value out of range: {value}"));
+    }
+    // The year bound is what keeps ymd_to_days inside i32: even though the
+    // final day count fits through PG's full range, the input has no other
+    // guard and 9999999-year inputs used to reach the arithmetic and
+    // overflow it.
+    if !(MIN_DATE_YEAR..=MAX_DATE_YEAR).contains(&year) {
         return Err(format!("date field value out of range: {value}"));
     }
     Ok(ymd_to_days(year, month, day))
@@ -650,8 +668,21 @@ impl Value {
             | (Value::Uuid(_), DataType::Uuid)
             | (Value::Bytea(_), DataType::Bytea)
             | (Value::Array(_), DataType::Array(_))
-            | (Value::Vector(_), DataType::Vector(_))
             | (Value::Interval { .. }, DataType::Interval) => Ok(self.clone()),
+            // Vector is NOT an identity cast: a VECTOR(n) column rejects any
+            // other length. Downstream consumers (HNSW clamps, IVF used to
+            // assert) assume uniform dims, so a mismatched value stored here
+            // is silent wrong answers or a panic later.
+            (Value::Vector(v), DataType::Vector(n)) => {
+                if v.len() == *n {
+                    Ok(self.clone())
+                } else {
+                    Err(format!(
+                        "vector dimension mismatch: column is VECTOR({n}), value has {} dims",
+                        v.len()
+                    ))
+                }
+            }
             // Bool conversions
             (Value::Bool(b), DataType::Int32) => Ok(Value::Int32(if *b { 1 } else { 0 })),
             (Value::Bool(b), DataType::Int64) => Ok(Value::Int64(if *b { 1 } else { 0 })),
@@ -727,16 +758,47 @@ impl Value {
             // (COPY text format, or a plain string literal) must become a real
             // Vector; storing the Text would leave the column physically mixed
             // and invisible to every vector index.
-            (Value::Text(s), DataType::Vector(_)) => parse_vector_text(s).map(Value::Vector),
+            (Value::Text(s), DataType::Vector(n)) => parse_vector_text(s).and_then(|v| {
+                if v.len() == *n {
+                    Ok(Value::Vector(v))
+                } else {
+                    Err(format!(
+                        "vector dimension mismatch: column is VECTOR({n}), literal has {} dims",
+                        v.len()
+                    ))
+                }
+            }),
             // Numeric conversions
-            (Value::Numeric(s), DataType::Int32) => s
-                .parse::<i32>()
+            // NUMERIC→int rounds half-away-from-zero, matching SQL CAST
+            // (eval_cast) and PG: plain parsing rejected '1.5' where
+            // CAST('1.5' AS INT) = 2, so ALTER COLUMN TYPE aborted on values
+            // SQL casts fine.
+            (Value::Numeric(s), DataType::Int32) => parse_numeric(s)
+                .ok()
+                .and_then(|d| {
+                    d.round_dp_with_strategy(
+                        0,
+                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                    )
+                    .to_string()
+                    .parse::<i32>()
+                    .ok()
+                })
                 .map(Value::Int32)
-                .map_err(|e| e.to_string()),
-            (Value::Numeric(s), DataType::Int64) => s
-                .parse::<i64>()
+                .ok_or_else(|| "integer out of range".to_string()),
+            (Value::Numeric(s), DataType::Int64) => parse_numeric(s)
+                .ok()
+                .and_then(|d| {
+                    d.round_dp_with_strategy(
+                        0,
+                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                    )
+                    .to_string()
+                    .parse::<i64>()
+                    .ok()
+                })
                 .map(Value::Int64)
-                .map_err(|e| e.to_string()),
+                .ok_or_else(|| "integer out of range".to_string()),
             (Value::Numeric(s), DataType::Float64) => s
                 .parse::<f64>()
                 .map(Value::Float64)
@@ -1059,12 +1121,19 @@ impl Ord for Value {
                     microseconds: bus,
                 },
             ) => {
-                // Convert to total microseconds for comparison (approximate)
-                let a_total =
-                    *am as i64 * 30 * 86400 * 1_000_000 + *ad as i64 * 86400 * 1_000_000 + aus;
-                let b_total =
-                    *bm as i64 * 30 * 86400 * 1_000_000 + *bd as i64 * 86400 * 1_000_000 + bus;
-                a_total.cmp(&b_total)
+                // Lexicographic (months, days, microseconds): overflow-free
+                // for every i32/i64 field value. The previous
+                // total-microseconds fold (`months * 30 * 86400 * 1e6`)
+                // overflowed i64 at ~3.56M months — a debug panic inside
+                // `Ord`, an inverted ordering in release — and it called
+                // `1 month` Equal to `30 days` while the field-wise
+                // `PartialEq` and `Hash` above said not-equal, which is the
+                // exact `cmp == Equal` + `eq == false` direction that
+                // corrupts BTreeMap/BinaryHeap. Mirrored by
+                // `executor::helpers::compare_values`; keep them identical.
+                am.cmp(bm)
+                    .then_with(|| ad.cmp(bd))
+                    .then_with(|| aus.cmp(bus))
             }
             // Cross-type numeric comparisons: coerce to common type
             (Value::Int32(a), Value::Float64(b)) => {
@@ -1295,6 +1364,73 @@ mod tests {
         assert_eq!(days, 0);
         let (y, m, d) = days_to_ymd(0);
         assert_eq!((y, m, d), (2000, 1, 1));
+    }
+
+    // ── Interval ordering (WIR-5) ─────────────────────────────────────
+
+    fn interval(months: i32, days: i32, microseconds: i64) -> Value {
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        }
+    }
+
+    #[test]
+    fn interval_ord_huge_components_no_overflow() {
+        // 4M months × the old 30-day fold per month overflows i64 at ~3.56M
+        // months: a debug panic inside `Ord`, an inverted ordering in
+        // release. The days component overflows even earlier.
+        let a = interval(4_000_000, 0, 0);
+        let b = interval(3_999_999, 0, 0);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Greater);
+        let c = interval(0, i32::MAX, 0);
+        let d = interval(0, i32::MAX - 1, 0);
+        assert_eq!(c.cmp(&d), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn interval_ord_agrees_with_partial_eq() {
+        // `cmp == Equal` must imply `eq == true` (the BTreeMap/BinaryHeap
+        // invariant this file documents). The old 30-day fold called
+        // 1 month Equal to 30 days while `PartialEq` compared field-wise.
+        let one_month = interval(1, 0, 0);
+        let thirty_days = interval(0, 30, 0);
+        assert_ne!(one_month.cmp(&thirty_days), std::cmp::Ordering::Equal);
+        assert_eq!(one_month.cmp(&one_month.clone()), std::cmp::Ordering::Equal);
+        // Component priority: months, then days, then microseconds.
+        assert_eq!(
+            interval(0, 1, 0).cmp(&interval(0, 0, 86_400_000_000)),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    // ── Date year bounds (WIR-9) ──────────────────────────────────────
+
+    #[test]
+    fn parse_date_rejects_years_outside_pg_range() {
+        // 9,999,999 years: the i32 intermediates of ymd_to_days overflow
+        // long before any range check ran.
+        let err = parse_date("9999999-01-01").unwrap_err();
+        assert!(err.contains("date field value out of range"), "got: {err}");
+        // Negative text years cannot split into 3 parts (the leading '-'
+        // adds an empty field), so they are rejected by shape; the point
+        // here is that no path reaches the overflowing arithmetic.
+        assert!(parse_date("-99999-01-01").is_err());
+    }
+
+    #[test]
+    fn parse_date_boundaries_round_trip() {
+        // PostgreSQL's upper date boundary. It already overflows the i32
+        // running sum mid-expression even though the final day count fits
+        // i32. (The lower boundary, 4712 BC, has no negative-year TEXT
+        // spelling — like PG, which writes it as '4712-01-01 BC' — so its
+        // round-trip is numeric.)
+        let days = parse_date("5874897-01-01").expect("upper boundary must parse");
+        assert_eq!(days_to_ymd(days), (5_874_897, 1, 1));
+
+        let days = ymd_to_days(-4712, 1, 1);
+        assert_eq!(days_to_ymd(days), (-4712, 1, 1));
     }
 
     #[test]
@@ -1731,5 +1867,45 @@ mod tests {
                 prop_assert!(result.is_ok(), "cast to Text failed for {:?}", v);
             }
         }
+    }
+
+    /// CAT-10: NUMERIC→int casts rounded half-away-from-zero, matching SQL
+    /// CAST (eval_cast) and PG — plain parsing rejected "1.5" where
+    /// CAST('1.5' AS INT) = 2, so ALTER COLUMN TYPE aborted on values SQL
+    /// casts fine.
+    #[test]
+    fn numeric_to_int_cast_rounds_like_sql_cast() {
+        assert_eq!(
+            Value::Numeric("1.5".into()).cast(&DataType::Int32).unwrap(),
+            Value::Int32(2)
+        );
+        assert_eq!(
+            Value::Numeric("-1.5".into())
+                .cast(&DataType::Int32)
+                .unwrap(),
+            Value::Int32(-2)
+        );
+        assert_eq!(
+            Value::Numeric("1.2e3".into())
+                .cast(&DataType::Int64)
+                .unwrap(),
+            Value::Int64(1200)
+        );
+        assert_eq!(
+            Value::Numeric("1.4".into()).cast(&DataType::Int32).unwrap(),
+            Value::Int32(1)
+        );
+        assert!(Value::Numeric("abc".into()).cast(&DataType::Int32).is_err());
+        assert!(
+            Value::Numeric("99999999999".into())
+                .cast(&DataType::Int32)
+                .is_err()
+        );
+        assert_eq!(
+            Value::Numeric("99999999999".into())
+                .cast(&DataType::Int64)
+                .unwrap(),
+            Value::Int64(99999999999)
+        );
     }
 }

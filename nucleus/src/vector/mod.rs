@@ -426,6 +426,26 @@ impl Ord for MaxCandidate {
 /// footer predates the section, and anything else trailing is corruption.
 const TOMBSTONE_SECTION_TAG: u32 = 0x5453_4E48; // "HNST"
 
+/// Tag introducing the optional PK-registry section that follows the
+/// tombstone section. Same versioning rationale as the tombstone tag: a blob
+/// that ends at the tombstones predates the registry and reads as
+/// registry-absent, and only this one further tag is accepted after it.
+const REGISTRY_SECTION_TAG: u32 = 0x5253_4E48; // "HNSR"
+
+/// The minimal persisted form of the executor's PK registry, carried inside
+/// the serialized HNSW blob so it is covered by the snapshot CRC. Only the
+/// ground truth is stored — `node_to_pk` is derivable by inverting
+/// `pk_to_node`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistrySection {
+    /// pk (bit-cast to u64) -> current live node id.
+    pub pk_to_node: std::collections::HashMap<u64, u64>,
+    /// Next node id to allocate — monotonic, never reused.
+    pub next_node: u64,
+    /// Nodes tombstoned since the last rebuild, for the compaction trigger.
+    pub tombstones: u64,
+}
+
 /// HNSW (Hierarchical Navigable Small World) index.
 #[derive(Clone)]
 pub struct HnswIndex {
@@ -914,14 +934,16 @@ impl HnswIndex {
     /// One past the highest node id this index has ever used, counting
     /// tombstoned ids.
     ///
-    /// A reopened index carries node ids but no `PkRegistry` -- the registry is
-    /// deliberately not persisted -- so the registry's allocator has to be told
-    /// where the recovered graph already reaches. Starting it at zero made the
-    /// first post-reopen insert allocate an id the recovered graph was already
-    /// using, and `insert` overwrites in place: one acknowledged vector lost per
-    /// collision, silently, with the row still present in the base table.
+    /// A reopened index carries node ids that may outrun the persisted
+    /// registry's allocator (delta records logged after the checkpoint hold
+    /// ids the checkpoint-time registry never saw), so recovery seeds
+    /// `next_node` from this floor and never below it. Starting at zero made
+    /// the first post-reopen insert allocate an id the recovered graph was
+    /// already using, and `insert` overwrites in place: one acknowledged
+    /// vector lost per collision, silently, with the row still present in the
+    /// base table.
     ///
-    /// Tombstoned ids count. They are persisted now, so handing one back to a
+    /// Tombstoned ids count. They are persisted, so handing one back to a
     /// new vector would file it under a standing tombstone and make it
     /// invisible to search the moment it was written.
     pub fn next_free_node_id(&self) -> u64 {
@@ -940,6 +962,12 @@ impl HnswIndex {
     /// Number of indexed vectors (including deleted).
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Number of tombstoned ids (ids never shift, so this is the drift signal
+    /// between positional ids and a live scan).
+    pub fn tombstone_count(&self) -> usize {
+        self.deleted.len()
     }
 
     /// Ids of live (inserted, not tombstoned) vectors. `len` counts
@@ -990,7 +1018,10 @@ impl std::fmt::Debug for HnswIndex {
 /// Each node: [id u64][dim u32][f32 * dim][num_layers u32][ for each layer: [num_neighbors u32][u64 * num_neighbors] ]
 impl HnswIndex {
     /// Serialize the HNSW index to bytes.
-    pub fn serialize(&self) -> Vec<u8> {
+    ///
+    /// `registry` is the PK-keyed maintenance registry to persist alongside
+    /// the graph (`None` for a blob without one — the pre-F1b shape).
+    pub fn serialize(&self, registry: Option<&RegistrySection>) -> Vec<u8> {
         let mut buf = Vec::new();
         // Header
         buf.push(match self.config.metric {
@@ -1037,11 +1068,40 @@ impl HnswIndex {
             buf.extend_from_slice(&id.to_le_bytes());
         }
 
+        // PK registry, appended behind its own tag by the same reasoning as
+        // the tombstones above: a blob that ends at the tombstones predates
+        // the section and decodes as registry-absent (an empty registry),
+        // which is what it meant. Entries sorted by pk so the encoding is
+        // deterministic for a given map.
+        if let Some(reg) = registry {
+            buf.extend_from_slice(&REGISTRY_SECTION_TAG.to_le_bytes());
+            buf.extend_from_slice(&reg.next_node.to_le_bytes());
+            buf.extend_from_slice(&reg.tombstones.to_le_bytes());
+            buf.extend_from_slice(&(reg.pk_to_node.len() as u32).to_le_bytes());
+            let mut entries: Vec<(u64, u64)> =
+                reg.pk_to_node.iter().map(|(&p, &n)| (p, n)).collect();
+            entries.sort_unstable();
+            for (pk, node) in entries {
+                buf.extend_from_slice(&pk.to_le_bytes());
+                buf.extend_from_slice(&node.to_le_bytes());
+            }
+        }
+
         buf
     }
 
-    /// Deserialize an HNSW index from bytes.
+    /// Deserialize an HNSW index from bytes, discarding any persisted PK
+    /// registry. See [`Self::deserialize_with_registry`].
     pub fn deserialize(data: &[u8]) -> Result<Self, String> {
+        Ok(Self::deserialize_with_registry(data)?.0)
+    }
+
+    /// Deserialize an HNSW index and the PK registry persisted inside its
+    /// blob, when there is one (`None` for blobs written before the registry
+    /// section existed — an empty registry, which is faithful).
+    pub fn deserialize_with_registry(
+        data: &[u8],
+    ) -> Result<(Self, Option<RegistrySection>), String> {
         let mut pos = 0;
         if data.len() < 13 {
             return Err("data too short for HNSW header".into());
@@ -1209,6 +1269,7 @@ impl HnswIndex {
         // them would silently misparse a live index, which is a worse failure
         // than the resurrection bug this section fixes.
         let mut deleted = HashSet::new();
+        let mut registry: Option<RegistrySection> = None;
         if pos < data.len() {
             if data.len() - pos < 8 {
                 return Err(
@@ -1248,20 +1309,96 @@ impl HnswIndex {
                 ));
                 pos += 8;
             }
-            if pos != data.len() {
-                return Err("trailing bytes after the tombstone section".into());
+
+            // PK registry: the one section allowed to follow the tombstones.
+            // A blob that ended above predates it and stays registry-absent.
+            if pos < data.len() {
+                if data.len() - pos < 4 {
+                    return Err(
+                        "trailing bytes after the tombstone section are too short for a \
+                         registry section tag"
+                            .into(),
+                    );
+                }
+                let tag = u32::from_le_bytes(
+                    data[pos..pos + 4]
+                        .try_into()
+                        .map_err(|_| "truncated registry section tag")?,
+                );
+                if tag != REGISTRY_SECTION_TAG {
+                    return Err(
+                        "trailing bytes after the tombstone section do not carry the \
+                         registry section tag"
+                            .into(),
+                    );
+                }
+                pos += 4;
+                if data.len() - pos < 20 {
+                    return Err("truncated registry section header".into());
+                }
+                let next_node = u64::from_le_bytes(
+                    data[pos..pos + 8]
+                        .try_into()
+                        .map_err(|_| "truncated registry next_node")?,
+                );
+                pos += 8;
+                let tombstone_count = u64::from_le_bytes(
+                    data[pos..pos + 8]
+                        .try_into()
+                        .map_err(|_| "truncated registry tombstone count")?,
+                );
+                pos += 8;
+                let num_entries = u32::from_le_bytes(
+                    data[pos..pos + 4]
+                        .try_into()
+                        .map_err(|_| "truncated registry entry count")?,
+                ) as usize;
+                pos += 4;
+                // Same bound as every other count above: each entry costs 16
+                // bytes, and an unbounded `with_capacity` fed by file data
+                // aborts the process on Linux.
+                if num_entries > (data.len() - pos) / 16 {
+                    return Err("registry entry count exceeds remaining data".into());
+                }
+                let mut pk_to_node = std::collections::HashMap::with_capacity(num_entries);
+                for _ in 0..num_entries {
+                    let pk = u64::from_le_bytes(
+                        data[pos..pos + 8]
+                            .try_into()
+                            .map_err(|_| "truncated registry pk".to_string())?,
+                    );
+                    pos += 8;
+                    let node = u64::from_le_bytes(
+                        data[pos..pos + 8]
+                            .try_into()
+                            .map_err(|_| "truncated registry node".to_string())?,
+                    );
+                    pos += 8;
+                    pk_to_node.insert(pk, node);
+                }
+                registry = Some(RegistrySection {
+                    pk_to_node,
+                    next_node,
+                    tombstones: tombstone_count,
+                });
+                if pos != data.len() {
+                    return Err("trailing bytes after the registry section".into());
+                }
             }
         }
 
         let ml = 1.0 / (config.m as f64).ln();
-        Ok(Self {
-            config,
-            nodes,
-            max_layer,
-            entry_point,
-            ml,
-            deleted,
-        })
+        Ok((
+            Self {
+                config,
+                nodes,
+                max_layer,
+                entry_point,
+                ml,
+                deleted,
+            },
+            registry,
+        ))
     }
 }
 
@@ -1317,15 +1454,37 @@ impl IvfFlatIndex {
     /// Computes `nlist` centroids from the provided training vectors. After
     /// training, vectors can be added with [`add`].
     ///
-    /// Panics if `vectors` is empty or contains vectors with wrong dimension.
+    /// Wrong-dimension training vectors are skipped with an error log rather
+    /// than panicking (F-019 pattern: malformed data must not take the server
+    /// down). If nothing usable remains, the index is left untrained.
     pub fn train(&mut self, vectors: &[Vec<f32>]) {
-        assert!(!vectors.is_empty(), "training set must not be empty");
-        for v in vectors {
-            assert_eq!(
-                v.len(),
-                self.dimension,
-                "training vector dimension mismatch"
+        // Owned copies: the body below consumes `vectors` both as
+        // `iter().take(k).cloned()` (annotated Vec<Vec<f32>>) and as
+        // `iter().enumerate()` (v: &Vec<f32>) — a Vec<&Vec<f32>> breaks both.
+        let vectors: Vec<Vec<f32>> = vectors
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| {
+                let ok = v.len() == self.dimension;
+                if !ok {
+                    tracing::error!(
+                        target: "nucleus::vector",
+                        "IVFFlat train: skipping vector {i} with dimension {} != {}",
+                        v.len(),
+                        self.dimension
+                    );
+                }
+                ok
+            })
+            .map(|(_, v)| v.clone())
+            .collect();
+        if vectors.is_empty() {
+            tracing::error!(
+                target: "nucleus::vector",
+                "IVFFlat train: no training vector has dimension {}; leaving index untrained",
+                self.dimension
             );
+            return;
         }
 
         let k = self.nlist.min(vectors.len());
@@ -1380,12 +1539,26 @@ impl IvfFlatIndex {
     /// Add a vector to the index. The index must be trained first.
     ///
     /// The vector is assigned to the nearest centroid's inverted list.
+    /// Dimension mismatch or an untrained index logs and skips (the row stays
+    /// in the table, unindexed) rather than panicking the server — a panic
+    /// here is a DoS reachable from plain SQL.
     pub fn add(&mut self, id: usize, vector: Vec<f32>) {
-        assert_eq!(vector.len(), self.dimension, "vector dimension mismatch");
-        assert!(
-            !self.centroids.is_empty(),
-            "index must be trained before adding vectors"
-        );
+        if vector.len() != self.dimension {
+            tracing::error!(
+                target: "nucleus::vector",
+                "IVFFlat add: vector dimension {} != index dimension {} (id {id} skipped)",
+                vector.len(),
+                self.dimension
+            );
+            return;
+        }
+        if self.centroids.is_empty() {
+            tracing::error!(
+                target: "nucleus::vector",
+                "IVFFlat add: index is not trained (id {id} skipped)"
+            );
+            return;
+        }
 
         let cluster = self.nearest_centroid(&vector, &self.centroids);
         self.inverted_lists[cluster].push((id, vector));
@@ -1449,7 +1622,17 @@ impl IvfFlatIndex {
     where
         F: Fn(usize) -> bool,
     {
-        assert_eq!(query.len(), self.dimension, "query dimension mismatch");
+        // Same guard as `search` (F-019): a dimension mismatch must not panic
+        // the server. Log and return no results.
+        if query.len() != self.dimension {
+            tracing::error!(
+                target: "nucleus::vector",
+                "IVFFlat search_filtered: query dimension {} != index dimension {}",
+                query.len(),
+                self.dimension
+            );
+            return Vec::new();
+        }
         if self.centroids.is_empty() {
             return Vec::new();
         }
@@ -1505,6 +1688,17 @@ impl IvfFlatIndex {
     /// Number of vectors stored in the index.
     pub fn len(&self) -> usize {
         self.inverted_lists.iter().map(|l| l.len()).sum()
+    }
+
+    /// Number of tombstoned ids (ids never shift, so this is the drift signal
+    /// between positional ids and a live scan).
+    pub fn tombstone_count(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// The distance metric this index was built with.
+    pub fn metric(&self) -> DistanceMetric {
+        self.metric
     }
 
     /// Whether the index is empty.
@@ -2160,7 +2354,7 @@ mod tests {
         index.insert(2, Vector::new(vec![0.0, 1.0, 0.0]));
         index.insert(3, Vector::new(vec![0.5, 0.5, 0.0]));
 
-        let data = index.serialize();
+        let data = index.serialize(None);
         let restored = HnswIndex::deserialize(&data).unwrap();
 
         assert_eq!(restored.len(), 3);
@@ -2179,7 +2373,7 @@ mod tests {
     fn hnsw_serialize_empty_index() {
         let config = HnswConfig::default();
         let index = HnswIndex::new(config);
-        let data = index.serialize();
+        let data = index.serialize(None);
         let restored = HnswIndex::deserialize(&data).unwrap();
         assert!(restored.is_empty());
     }
@@ -2200,7 +2394,7 @@ mod tests {
         index.insert(1, Vector::new(vec![1.0, 0.0]).normalize());
         index.insert(2, Vector::new(vec![0.0, 1.0]).normalize());
 
-        let data = index.serialize();
+        let data = index.serialize(None);
         let restored = HnswIndex::deserialize(&data).unwrap();
         assert_eq!(restored.config.metric, DistanceMetric::Cosine);
         assert_eq!(restored.len(), 2);
@@ -2569,7 +2763,7 @@ mod tests {
         index.mark_deleted(17);
         assert_eq!(index.live_ids().len(), 22, "fixture must hold 22 live ids");
 
-        let round = HnswIndex::deserialize(&index.serialize())
+        let round = HnswIndex::deserialize(&index.serialize(None))
             .expect("a round-trip of a tombstoned index must parse");
         assert_eq!(
             round.live_ids(),
@@ -2630,7 +2824,7 @@ mod tests {
         };
         let mut index = HnswIndex::new(config);
         index.insert(1, Vector::new(vec![1.0, 0.0, 0.0, 0.0]));
-        let mut data = index.serialize();
+        let mut data = index.serialize(None);
         data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 
         let err = HnswIndex::deserialize(&data)
@@ -2638,6 +2832,92 @@ mod tests {
         assert!(
             err.contains("trailing"),
             "the error should name the trailing section, got: {err}"
+        );
+    }
+
+    /// F1b: a PK registry serialized inside the blob round-trips — the map,
+    /// the allocator floor, and the compaction counter all survive.
+    #[test]
+    fn a_pk_registry_round_trips_inside_the_blob() {
+        let mut index = HnswIndex::new(HnswConfig::default());
+        index.insert(0, Vector::new(vec![1.0, 0.0, 0.0, 0.0]));
+        index.insert(5, Vector::new(vec![0.0, 1.0, 0.0, 0.0]));
+        index.mark_deleted(0);
+
+        let mut registry = RegistrySection::default();
+        registry.pk_to_node.insert(1, 0);
+        registry.pk_to_node.insert(2, 5);
+        registry.next_node = 6;
+        registry.tombstones = 3;
+
+        let data = index.serialize(Some(&registry));
+        let (_, recovered) = HnswIndex::deserialize_with_registry(&data)
+            .expect("a blob with a registry section must parse");
+        let recovered =
+            recovered.expect("the blob carried a registry section, so one must come back");
+        assert_eq!(recovered.pk_to_node.get(&1), Some(&0));
+        assert_eq!(recovered.pk_to_node.get(&2), Some(&5));
+        assert_eq!(recovered.next_node, 6);
+        assert_eq!(recovered.tombstones, 3);
+    }
+
+    /// F1b: a blob written without a registry section (every blob predating
+    /// it, and every `serialize(None)` caller) decodes as registry-absent —
+    /// faithful, because those bytes carry no registry to recover.
+    #[test]
+    fn a_blob_without_a_registry_section_decodes_as_registry_absent() {
+        let mut index = HnswIndex::new(HnswConfig::default());
+        index.insert(1, Vector::new(vec![1.0, 0.0, 0.0, 0.0]));
+
+        let data = index.serialize(None);
+        let (_, registry) = HnswIndex::deserialize_with_registry(&data)
+            .expect("a registry-less blob is the old format and must still load");
+        assert!(
+            registry.is_none(),
+            "no registry section was written, so none may be invented"
+        );
+    }
+
+    /// F1b: trailing bytes after the tombstone section that do not carry the
+    /// registry tag stay corruption. The parser accepts exactly one more
+    /// KNOWN tag there, not anything.
+    #[test]
+    fn unknown_trailing_bytes_after_the_tombstone_section_are_refused() {
+        let mut index = HnswIndex::new(HnswConfig::default());
+        index.insert(1, Vector::new(vec![1.0, 0.0, 0.0, 0.0]));
+        index.mark_deleted(1);
+
+        let mut data = index.serialize(None);
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+
+        let err = HnswIndex::deserialize(&data).expect_err(
+            "trailing bytes after the tombstones without the registry tag must be refused",
+        );
+        assert!(
+            err.contains("registry section tag"),
+            "the error should name the registry section, got: {err}"
+        );
+    }
+
+    /// F1b: the entry count is bounded against the bytes actually present, so
+    /// a corrupted count from a file can never feed a huge allocation.
+    #[test]
+    fn a_registry_entry_count_beyond_the_data_is_refused() {
+        let mut index = HnswIndex::new(HnswConfig::default());
+        index.insert(1, Vector::new(vec![1.0, 0.0, 0.0, 0.0]));
+
+        let mut data = index.serialize(None);
+        data.extend_from_slice(&REGISTRY_SECTION_TAG.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // next_node
+        data.extend_from_slice(&0u64.to_le_bytes()); // tombstones
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // entry count
+        // ...and then no entries at all.
+
+        let err = HnswIndex::deserialize(&data)
+            .expect_err("an entry count larger than the remaining bytes is corruption");
+        assert!(
+            err.contains("exceeds remaining data"),
+            "the error should name the bound, got: {err}"
         );
     }
 

@@ -136,3 +136,140 @@ async fn masking_ddl_works_over_the_wire() {
         "the refusal must reach the client with its reason; got: {message}"
     );
 }
+
+/// SEC-2: masking DDL committed on one connection must reach a second
+/// connection's reads, and must survive a restart. In-txn CREATE used to
+/// stage into `security_pending` and COMMIT silently discarded it (masking
+/// never set `policy_dirty`); autocommit CREATE mutated the live policy set
+/// but never persisted, so a restart lost every mask.
+#[tokio::test]
+async fn masking_ddl_publishes_at_commit_and_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    {
+        let server = start(tmp.path()).await;
+        let admin = connect(server.port).await;
+        admin
+            .simple_query("CREATE TABLE people (id INT PRIMARY KEY, ssn TEXT)")
+            .await
+            .expect("create table");
+        admin
+            .simple_query("INSERT INTO people VALUES (1, '123-45-6789')")
+            .await
+            .expect("insert");
+        admin
+            .simple_query("CREATE ROLE analyst LOGIN PASSWORD 'p'")
+            .await
+            .expect("create role");
+        admin
+            .simple_query("GRANT SELECT ON people TO analyst")
+            .await
+            .expect("grant");
+
+        // A second connection reads through the committed policy set.
+        let reader = connect(server.port).await;
+        reader
+            .simple_query("SET ROLE analyst")
+            .await
+            .expect("set role");
+        let raw = reader
+            .simple_query("SELECT ssn FROM people")
+            .await
+            .expect("select");
+        let value = raw
+            .into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                _ => None,
+            })
+            .next()
+            .expect("one row");
+        assert_eq!(value, "123-45-6789", "control: unmasked baseline");
+
+        // Transactional CREATE over the wire: staged on the DDL connection,
+        // invisible to the reader until COMMIT.
+        let ddl = connect(server.port).await;
+        ddl.simple_query("BEGIN").await.expect("begin");
+        ddl.simple_query("CREATE MASKING POLICY ON people (ssn) TO analyst USING REDACT '***'")
+            .await
+            .expect("in-txn CREATE MASKING POLICY");
+
+        let pre = reader
+            .simple_query("SELECT ssn FROM people")
+            .await
+            .expect("select pre-commit");
+        let value = pre
+            .into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                _ => None,
+            })
+            .next()
+            .expect("one row");
+        assert_eq!(
+            value, "123-45-6789",
+            "an uncommitted mask leaked to another connection"
+        );
+
+        ddl.simple_query("COMMIT").await.expect("commit");
+
+        let post = reader
+            .simple_query("SELECT ssn FROM people")
+            .await
+            .expect("select post-commit");
+        let value = post
+            .into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                _ => None,
+            })
+            .next()
+            .expect("one row");
+        assert_eq!(
+            value, "***",
+            "COMMIT did not publish the mask to other connections"
+        );
+    }
+
+    // Restart on a crash-copy of the directory: the autocommit-persisted
+    // policy must still be listed and still mask a non-superuser read.
+    let crashed = tempfile::tempdir().unwrap();
+    copy_dir(tmp.path(), crashed.path());
+    {
+        let server = start(crashed.path()).await;
+        let reader = connect(server.port).await;
+        reader
+            .simple_query("SET ROLE analyst")
+            .await
+            .expect("set role");
+        let got = reader
+            .simple_query("SELECT ssn FROM people")
+            .await
+            .expect("select after restart");
+        let value = got
+            .into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                _ => None,
+            })
+            .next()
+            .expect("one row");
+        assert_eq!(
+            value, "***",
+            "the masking policy did not survive the restart"
+        );
+    }
+}
+
+fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create dst");
+    for entry in std::fs::read_dir(src).expect("read src") {
+        let entry = entry.expect("entry");
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_dir(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).expect("copy file");
+        }
+    }
+}

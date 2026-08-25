@@ -480,3 +480,71 @@ async fn xgroup_create_fails_when_its_wal_record_cannot_be_written() {
     let served = text(&ex, "SELECT STREAM_XREADGROUP('gw', 'g', 'c', 10)").await;
     assert!(served.contains("\"1\""), "{served}");
 }
+
+/// S31-15 completion: `STREAM_XACK` discarded its WAL error with `let _ =`
+/// — the last stream arm to do so. Under a failing append the entry left the
+/// PEL in memory, the client was told the ack succeeded, and no record ever
+/// reached the log — so a restart resurrected to the pending list an entry
+/// the consumer had already been told was acknowledged.
+#[tokio::test]
+async fn xack_fails_the_statement_when_its_wal_record_cannot_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_id;
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "SELECT STREAM_XADD('xa', 'n', '1')").await;
+        exec(&ex, "SELECT STREAM_XADD('xa', 'n', '2')").await;
+        exec(&ex, "SELECT STREAM_XGROUP_CREATE('xa', 'g', 0)").await;
+        let delivered = text(&ex, "SELECT STREAM_XREADGROUP('xa', 'g', 'worker', 10)").await;
+        first_id = delivered
+            .split("\"id\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("XREADGROUP returns ids")
+            .to_string();
+
+        ex.streams_wal()
+            .expect("the executor opened a streams WAL")
+            .set_fail_appends(true);
+        let err = ex
+            .execute(&format!("SELECT STREAM_XACK('xa', 'g', '{first_id}')"))
+            .await
+            .expect_err("an XACK whose WAL append failed must not be acknowledged");
+        assert!(
+            err.to_string().contains("STREAM_XACK could not log"),
+            "the error must name the failure, got {err}"
+        );
+
+        // The failed statement removed nothing: the PEL still holds both
+        // delivered entries.
+        let pending = {
+            let streams = ex.streams.read();
+            streams["xa"].xpending("g")
+        };
+        assert_eq!(
+            pending,
+            vec![("worker".to_string(), 2usize)],
+            "a rejected XACK must leave the pending list untouched"
+        );
+
+        ex.streams_wal().unwrap().set_fail_appends(false);
+        // Without the fault the same ack succeeds.
+        let acked = exec(&ex, &format!("SELECT STREAM_XACK('xa', 'g', '{first_id}')")).await;
+        assert_eq!(scalar(&acked[0]), &Value::Int64(1));
+    }
+
+    // Across a reopen the successful ack's record replays, so only the
+    // unacknowledged entry is pending. Under the old swallow the faulted
+    // ack's removal existed only in memory and both entries came back.
+    let ex = open_executor(dir.path()).await;
+    let pending = {
+        let streams = ex.streams.read();
+        streams["xa"].xpending("g")
+    };
+    assert_eq!(
+        pending,
+        vec![("worker".to_string(), 1usize)],
+        "the acknowledged entry must not return to the PEL after a restart"
+    );
+}

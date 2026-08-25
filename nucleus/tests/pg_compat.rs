@@ -1566,13 +1566,16 @@ async fn computed_vector_columns_describe_their_real_type() {
         .unwrap();
     assert_eq!(*stmt.columns()[0].type_(), Type::INT4);
 
-    // The shape every SDK's vector search actually sends, and the one that
-    // survived the first round of this fix. Describe probes by substituting
-    // NULL for each unbound placeholder, and it cannot append `LIMIT 0` to a
-    // query that already ends in `LIMIT NULL` — so it re-runs the original,
-    // which DOES return rows. `VECTOR_DISTANCE` with a NULL metric argument
-    // returns NULL, and a NULL value was typed TEXT, so `score` came back
-    // described as varchar with real float8 bytes inside it.
+    // The shape every SDK's vector search actually sends. WIR-6 removed the
+    // Describe fallback that executed the original statement when the
+    // LIMIT-0 probe failed to parse: this query ends in `LIMIT $3`, the
+    // NULL-substituted probe becomes `… LIMIT NULL LIMIT 0`, and re-running
+    // the original is exactly the execute-at-Describe behavior the removal
+    // forbids (it fired side effects and ran as session 0, the bootstrap
+    // superuser). The trade is deliberate and escalated: a statement whose
+    // probe cannot parse now describes ZERO columns — clients that need
+    // typed describes for trailing-LIMIT statements need a smarter probe
+    // strategy, which is a behavior decision, not a patch.
     let stmt = client
         .prepare(
             "SELECT id, VECTOR_DISTANCE(embedding, VECTOR($1), $2) AS score, metadata \
@@ -1581,10 +1584,9 @@ async fn computed_vector_columns_describe_their_real_type() {
         .await
         .unwrap();
     assert_eq!(
-        *stmt.columns()[1].type_(),
-        Type::FLOAT8,
-        "score described as {:?} on the ORDER BY ... LIMIT $n path",
-        stmt.columns()[1].type_()
+        stmt.columns().len(),
+        0,
+        "an unparseable probe must not fall back to executing the original at Describe"
     );
 
     server.abort();

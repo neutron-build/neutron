@@ -268,14 +268,19 @@ fn gen_predicate(schema: &Schema, rng: &mut Rng, depth: u32) -> String {
         }
         3 if c.ty == Ty::Text => {
             // Lowercase patterns over lowercase data → LIKE case-folding moot.
-            let pat = match rng.below(4) {
+            let pat = match rng.below(5) {
                 0 => format!("'{}'", rng.pick(CATS)),
                 1 => format!("'{}%'", &rng.pick(CATS)[..2]),
                 2 => "'%r%'".to_string(),
-                _ => "'str_'".to_string(),
+                3 => "'str_'".to_string(),
+                // Explicit escape char: '!' escapes the wildcard, so this
+                // pattern is a literal prefix plus a literal '%'. Exercises
+                // the ESCAPE clause both engines must honor (QPP-8).
+                _ => format!("'{}!%'", &rng.pick(CATS)[..3]),
             };
             let neg = if rng.chance(35) { "NOT " } else { "" };
-            format!("{} {neg}LIKE {pat}", c.name)
+            let escape = if pat.contains('!') { " ESCAPE '!'" } else { "" };
+            format!("{} {neg}LIKE {pat}{escape}", c.name)
         }
         _ => {
             let op = *rng.pick(&["=", "<>", "<", "<=", ">", ">="]);
@@ -286,12 +291,24 @@ fn gen_predicate(schema: &Schema, rng: &mut Rng, depth: u32) -> String {
 
 // ─── Scalar projection expressions ────────────────────────────────────────────
 fn gen_scalar(schema: &Schema, rng: &mut Rng) -> String {
-    match rng.below(6) {
+    match rng.below(7) {
         0 => {
             // CASE WHEN <pred> THEN <int> ELSE <int> END
             let p = gen_predicate(schema, rng, 1);
             format!(
                 "CASE WHEN {p} THEN {} ELSE {} END",
+                rng.int(0, 9),
+                rng.int(0, 9)
+            )
+        }
+        5 => {
+            // Simple CASE with a NULL comparand (QPP-7): SQL `=` semantics
+            // say NULL never matches, so both engines must take the ELSE
+            // arm. The generator previously emitted only searched CASE, so
+            // this shape was never differentially checked.
+            let col = schema.int_cols().first().map(|c| c.name).unwrap_or("id");
+            format!(
+                "CASE {col} WHEN NULL THEN {} ELSE {} END",
                 rng.int(0, 9),
                 rng.int(0, 9)
             )

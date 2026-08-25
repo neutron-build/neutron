@@ -198,6 +198,88 @@ async fn specialty_store_writes_are_refused_while_degraded() {
     assert_eq!(scalar(&r[0]), &Value::Text("v".to_string()));
 }
 
+/// EXE-8: extension commands dispatch on raw text and return before
+/// `execute_statement_inner`, so they never met the statement-level gate —
+/// on a degraded server ALTER SEQUENCE still persisted sequences.json and
+/// BACKUP still wrote files while INSERT was refused 53100. Mutating
+/// extensions must be refused with the same error; read-only and
+/// session-local extensions must keep working.
+#[tokio::test]
+async fn extension_commands_are_gated_while_degraded() {
+    let (ex, service) = degradable_executor();
+    seed(&ex).await;
+    exec(&ex, "CREATE SEQUENCE seq8").await;
+    exec(&ex, "ANALYZE t").await;
+    exec(&ex, "CREATE PROCEDURE p8() LANGUAGE sql AS 'SELECT 1'").await;
+
+    service.enter_read_only(DegradeReason::DiskWatermark, "only 1.20% free on /data");
+
+    for sql in [
+        "ALTER SEQUENCE seq8 RESTART WITH 5",
+        "CREATE MASKING POLICY p8m ON t FOR COLUMN v USING 'REDACTED'",
+        "DROP MASKING POLICY p8m",
+        "BACKUP DATABASE TO '/tmp/nucleus-exe8-test-backup'",
+        "CACHE_SET('k8', 'v8')",
+        "CACHE_DEL('k8')",
+        "CACHE_TTL('k8', 60)",
+        "REFRESH MATERIALIZED VIEW nope",
+        "DROP MATERIALIZED VIEW nope",
+        "CREATE MODEL m8 FROM '/tmp/nucleus-exe8-test.onnx'",
+        "DROP MODEL m8",
+        "CREATE PROCEDURE p8b() LANGUAGE sql AS 'SELECT 1'",
+        "DROP PROCEDURE p8",
+        // CALL has no raw arm; the parser routes it and Statement::Call is
+        // classified mutating (a procedure body can be any SQL).
+        "CALL p8()",
+    ] {
+        let err = ex
+            .execute(sql)
+            .await
+            .expect_err(&format!("{sql} must be refused while degraded"));
+        assert!(
+            matches!(err, ExecError::DiskFull(_)),
+            "{sql}: expected DiskFull, got {err:?}"
+        );
+        assert_eq!(sqlstate(&err), "53100", "{sql}");
+    }
+    // No file side effect from the refused BACKUP.
+    assert!(
+        !std::path::Path::new("/tmp/nucleus-exe8-test-backup").exists(),
+        "the refused BACKUP still wrote files"
+    );
+
+    // Read-only extensions keep working while degraded.
+    for sql in [
+        "SHOW MODELS",
+        "SHOW PROCEDURES",
+        "SHOW MASKING POLICIES",
+        "SHOW MEMORY",
+        "SHOW BRANCHES",
+        "SHOW TABLE STATS t",
+        "CACHE_GET('missing8')",
+        "CACHE_STATS",
+        "MEMORY PRESSURE",
+    ] {
+        let r = ex.execute(sql).await;
+        assert!(r.is_ok(), "{sql} must keep working while degraded: {r:?}");
+    }
+    // Session-local subscription commands must not be classified as writes
+    // (they may error for other reasons — an unknown id — just not 53100).
+    for sql in ["FETCH SUBSCRIPTION 999", "UNSUBSCRIBE 999"] {
+        if let Err(e) = ex.execute(sql).await {
+            assert!(
+                !matches!(e, ExecError::DiskFull(_)),
+                "{sql} is session-local and must not be refused as a write"
+            );
+        }
+    }
+
+    // Mirror: on a healthy server the mutating arms run again.
+    service.resume();
+    assert!(ex.execute("CACHE_SET('k8', 'v8')").await.is_ok());
+    assert!(ex.execute("CACHE_DEL('k8')").await.is_ok());
+}
+
 /// The OLTP fast path bypasses `execute_statement`; it needs its own gate.
 #[tokio::test]
 async fn sql_oltp_fast_path_is_gated_too() {

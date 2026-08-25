@@ -132,6 +132,7 @@ pub(crate) mod copy;
 mod cross_model;
 mod ddl;
 mod dml;
+pub(crate) mod enlistment;
 mod expr;
 mod helpers;
 mod join;
@@ -369,6 +370,11 @@ pub struct Executor {
     /// Sessions override via `SET synchronous_commit = on|off`.
     sync_commit_default: AtomicBool,
     triggers: RwLock<Vec<TriggerDef>>,
+    /// Serializes row-level trigger firings across sessions: the `_new`/`_old`
+    /// row-binding tables live in the engine-global namespace, so two
+    /// concurrent firings would interleave rows into (and teardown-drop) the
+    /// same tables.
+    trigger_binding_lock: tokio::sync::Mutex<()>,
     roles: RwLock<HashMap<String, RoleDef>>,
     pubsub: RwLock<crate::pubsub::PubSubHub>,
     /// Stored functions and procedures (server-wide, not per-session).
@@ -462,6 +468,20 @@ pub struct Executor {
     sessions: parking_lot::RwLock<HashMap<u64, Arc<Session>>>,
     /// Counter for generating unique session IDs.
     next_session_id: AtomicU64,
+    /// Coordinator transaction-id counter (S63): minted at BEGIN, never
+    /// derived from the SQL engine's own `next_txn_id` (minted at COMMIT, and
+    /// reusable across restarts after segment pruning). Seeded at open above
+    /// every id a surviving WAL record could reference — see
+    /// `executor::enlistment`.
+    next_xact_id: AtomicU64,
+    /// S7 reclaim horizon: the WAL LSN of the last completed
+    /// specialty-checkpoint pass. Initialized to 1 — "nothing has been
+    /// folded, protect every segment" — so a freshly opened process cannot
+    /// prune COMMIT records for specialty writes it has not yet folded into
+    /// snapshots; the first completed pass moves it forward. The checkpoint
+    /// arm pins retention here so SQL segment pruning cannot outrun the
+    /// specialty snapshots the S6 filter's completeness depends on.
+    specialty_horizon: AtomicU64,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
     /// In-memory key-value store for KV SQL functions (kv_get, kv_set, kv_del, etc.).
@@ -527,6 +547,11 @@ pub struct Executor {
     service: Arc<crate::ops::ServiceState>,
     /// Current subquery nesting depth (safety limit against stack overflow).
     query_depth: AtomicU32,
+    /// Current CALL / UDF-body recursion depth (safety limit against stack
+    /// overflow). `query_depth` is only incremented by subquery sites, so
+    /// the CALL→body→execute and UDF→body→execute cycles used to recurse
+    /// without bound — two statements could abort the whole process.
+    call_depth: AtomicU32,
     /// Global prepared statement cache: SQL text → Arc<PreparedStmt>.
     /// Shared across all sessions — when a session PREPAREs a statement,
     /// the parsed AST is cached here. Other sessions with an identical SQL
@@ -791,6 +816,15 @@ fn reject_unsupported_row_locks(query: &ast::Query) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// RAII decrement for [`Executor::enter_call`] — releases the recursion
+/// slot on every exit path, including `?` early-returns and panics.
+struct CallDepthGuard<'a>(&'a AtomicU32);
+impl Drop for CallDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl Executor {
     pub fn new(catalog: Arc<Catalog>, storage: Arc<dyn StorageEngine>) -> Self {
         // Create default superuser role
@@ -833,6 +867,7 @@ impl Executor {
             views: RwLock::new(HashMap::new()),
             sequences: parking_lot::RwLock::new(HashMap::new()),
             triggers: RwLock::new(Vec::new()),
+            trigger_binding_lock: tokio::sync::Mutex::new(()),
             roles: RwLock::new(roles),
             pubsub: RwLock::new(crate::pubsub::PubSubHub::new(1024)),
             functions: parking_lot::RwLock::new(HashMap::new()),
@@ -896,6 +931,8 @@ impl Executor {
             follower_read_mgr: None,
             sessions: parking_lot::RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            next_xact_id: AtomicU64::new(1),
+            specialty_horizon: AtomicU64::new(1),
             default_session: Arc::new(Session::new()),
             kv_store: Arc::new(crate::kv::KvStore::new()),
             columnar_store: parking_lot::RwLock::new(crate::columnar::ColumnarStore::new()),
@@ -944,6 +981,7 @@ impl Executor {
             )),
             service: Arc::new(crate::ops::ServiceState::new()),
             query_depth: AtomicU32::new(0),
+            call_depth: AtomicU32::new(0),
             global_prepared_cache: parking_lot::RwLock::new(GlobalPreparedCache::new(4096)),
             uncorrelated_subquery_cache: parking_lot::RwLock::new(HashMap::new()),
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
@@ -1021,14 +1059,22 @@ impl Executor {
 
         // Open durable multi-model stores when a data directory is provided
         if let Some(dir) = data_dir {
+            // The coordinating-id committed set, recovered with the SQL
+            // engine (which ran before this executor was constructed — that
+            // ordering is what lets the specialty replay filters discard
+            // records whose transaction never committed, S63). Every tagged
+            // log opened below replays against it.
+            let committed_xacts = exec.storage.committed_xacts();
             // KV store: WAL + cold tier
             #[cfg(feature = "server")]
             {
                 let kv_dir = dir.join("kv");
                 std::fs::create_dir_all(&kv_dir).ok();
-                if let Some(kv) =
-                    Self::open_durable("KV", &kv_dir, crate::kv::KvStore::open(&kv_dir))
-                {
+                if let Some(kv) = Self::open_durable(
+                    "KV",
+                    &kv_dir,
+                    crate::kv::KvStore::open_with_committed(&kv_dir, &committed_xacts),
+                ) {
                     exec.kv_store = Arc::new(kv);
                 }
             }
@@ -1105,15 +1151,24 @@ impl Executor {
                     let (table_name, column_name, pk_col_name) =
                         meta.get(&index_name).cloned().unwrap_or_default();
                     let pk_column = (!pk_col_name.is_empty()).then_some(pk_col_name);
-                    // The maps are not persisted, so they stay empty until the
-                    // first rebuild after reopen and resolve brute-forces in the
-                    // meantime. The ALLOCATOR is a different matter: it must
-                    // start above every id the recovered graph already holds, or
-                    // the first post-reopen insert silently overwrites a
-                    // recovered node in place.
-                    let registry = PkRegistry {
-                        next_node: recovered.hnsw.next_free_node_id(),
-                        ..PkRegistry::default()
+                    // The registry persists now (F1b): the snapshot section
+                    // plus the pk-carrying delta records recover it. The
+                    // ALLOCATOR still needs the graph's floor as a hard
+                    // minimum — delta ids the checkpoint-time registry never
+                    // saw (tombstoned ones included: reissuing one would file
+                    // a new vector under a standing tombstone) — so the
+                    // persisted `next_node` can raise it but never lower it.
+                    let node_floor = recovered.hnsw.next_free_node_id();
+                    let registry = match recovered.registry {
+                        Some(section) => {
+                            let mut r = PkRegistry::from_section(section);
+                            r.next_node = r.next_node.max(node_floor);
+                            r
+                        }
+                        None => PkRegistry {
+                            next_node: node_floor,
+                            ..PkRegistry::default()
+                        },
                     };
                     exec.vector_indexes.write().insert(
                         index_name,
@@ -1175,18 +1230,36 @@ impl Executor {
                 *exec.columnar_store.write() = col;
             }
 
-            // Streams: WAL-backed crash-recovery
+            // Streams: WAL-backed crash-recovery. The committed set comes
+            // from storage recovery, which ran before this executor was
+            // constructed — that ordering is what lets the streams replay
+            // filter discard records whose transaction never committed (S63).
             let streams_dir = dir.join("streams");
             std::fs::create_dir_all(&streams_dir).ok();
+            let mut xact_floor = exec
+                .kv_store()
+                .wal_max_xact_id()
+                .max(committed_xacts.iter().copied().max().unwrap_or(0));
             if let Some((wal, state)) = Self::open_durable(
                 "Streams",
                 &streams_dir,
-                crate::pubsub::streams_wal::StreamsWal::open(&streams_dir),
+                crate::pubsub::streams_wal::StreamsWal::open(&streams_dir, &committed_xacts),
             ) {
                 let rebuilt = crate::pubsub::streams_wal::rebuild_streams(&state);
                 *exec.streams.write() = rebuilt;
                 exec.streams_wal = Some(wal);
+                xact_floor = xact_floor.max(state.max_xact_id);
             }
+            // Seed the XactId counter above every id a surviving record
+            // could reference: tagged KV and streams records, and COMMIT-
+            // record bodies. All sources are needed — any one alone is
+            // lowerable by reclaim (segment pruning, log compaction) — and
+            // together they are exactly the ids a future filter decision
+            // can consult. This runs even when a tagged log failed to open
+            // (its records are lost with it, but the surviving ones still
+            // pin the floor). See `executor::enlistment`.
+            exec.next_xact_id
+                .store(xact_floor + 1, std::sync::atomic::Ordering::SeqCst);
 
             // CDC log: WAL-backed crash-recovery
             #[cfg(feature = "server")]
@@ -1442,6 +1515,7 @@ impl Executor {
                     "increment": seq.increment,
                     "min_value": seq.min_value,
                     "max_value": seq.max_value,
+                    "start": seq.start,
                 })
             })
             .collect();
@@ -1584,6 +1658,12 @@ impl Executor {
             // Snapshot includes the plpgsql seed, so overwrite is lossless.
             *self.extensions.write() = loaded.extensions;
         }
+        if !loaded.schemas.is_empty() {
+            self.schemas
+                .try_write()
+                .map_err(|_| Self::meta_lock_contended("schemas"))?
+                .extend(loaded.schemas);
+        }
         {
             let mut security = self.security.write();
             security.rls = loaded.rls;
@@ -1724,6 +1804,9 @@ impl Executor {
                     let increment = item["increment"].as_i64().unwrap_or(1);
                     let min_value = item["min_value"].as_i64().unwrap_or(i64::MIN);
                     let max_value = item["max_value"].as_i64().unwrap_or(i64::MAX);
+                    // Pre-upgrade files carry no START; MINVALUE is the
+                    // closest semantic default (PG derives START from it).
+                    let start = item["start"].as_i64().unwrap_or(min_value);
                     seqs.insert(
                         name,
                         parking_lot::Mutex::new(SequenceDef {
@@ -1731,6 +1814,7 @@ impl Executor {
                             increment,
                             min_value,
                             max_value,
+                            start,
                         }),
                     );
                 }
@@ -1805,8 +1889,20 @@ impl Executor {
                     let nlist = (vectors.len() as f64).sqrt().ceil() as usize;
                     let nlist = nlist.max(1);
                     let nprobe = (nlist / 4).max(1);
-                    let mut ivf =
-                        vector::IvfFlatIndex::new(dims, nlist, nprobe, vector::DistanceMetric::L2);
+                    // The metric the index was created with lives in the
+                    // catalog options; rebuilding with L2 hardcoded would
+                    // silently serve a non-L2 index in L2 order after a
+                    // restart.
+                    let metric = idx
+                        .options
+                        .get("metric")
+                        .map(|m| match m.as_str() {
+                            "cosine" => vector::DistanceMetric::Cosine,
+                            "inner" => vector::DistanceMetric::InnerProduct,
+                            _ => vector::DistanceMetric::L2,
+                        })
+                        .unwrap_or(vector::DistanceMetric::L2);
+                    let mut ivf = vector::IvfFlatIndex::new(dims, nlist, nprobe, metric);
                     if !vectors.is_empty() {
                         ivf.train(&vectors);
                         for (row_id, row) in rows.iter().enumerate() {
@@ -2470,9 +2566,12 @@ impl Executor {
             ExecError::Unsupported("CREATE PROCEDURE: unclosed parameter list".into())
         })?;
         let params_str = &rest[1..close_paren];
+        // Each param is `name TYPE` — keep only the name so `$name`
+        // substitution in the body can match it (the type used to ride
+        // along in the key, making every named placeholder unresolvable).
         let param_names: Vec<String> = params_str
             .split(',')
-            .map(|p| p.trim().to_lowercase())
+            .map(|p| p.split_whitespace().next().unwrap_or("").to_lowercase())
             .filter(|p| !p.is_empty())
             .collect();
 
@@ -2488,12 +2587,11 @@ impl Executor {
             ));
         };
 
-        // Strip wrapping quotes from body
-        let body = body_start
-            .trim_matches('\'')
-            .trim_matches('"')
-            .trim()
-            .to_string();
+        // Strip one layer of quoting and collapse doubled quotes — the same
+        // semantics as CREATE FUNCTION (helpers::strip_dollar_quotes). The
+        // old trim_matches stripped ALL edge quotes and never collapsed
+        // `''`, so `'SELECT ''hi'''` stored as broken SQL.
+        let body = strip_dollar_quotes(body_start);
 
         self.procedure_engine.write().register_sql(
             &proc_name,
@@ -2506,178 +2604,6 @@ impl Executor {
             tag: "CREATE PROCEDURE".into(),
             rows_affected: 0,
         })
-    }
-
-    /// Execute a `CALL <proc_name>([args...])` statement.
-    ///
-    /// For SQL procedures: performs parameter substitution and executes the resulting SQL.
-    /// For built-in procedures: executes directly and returns the result.
-    pub(super) async fn execute_call_procedure(&self, sql: &str) -> Result<ExecResult, ExecError> {
-        use crate::procedures::{ProcResult, ProcValue};
-
-        let trimmed = sql.trim().trim_end_matches(';');
-        let upper_trimmed = trimmed.to_uppercase();
-        let rest = if upper_trimmed.starts_with("CALL ") {
-            &trimmed[5..]
-        } else {
-            trimmed
-        };
-
-        // Parse: proc_name([args...])
-        let (proc_name, rest) = if let Some(paren_pos) = rest.find('(') {
-            (rest[..paren_pos].trim().to_lowercase(), &rest[paren_pos..])
-        } else {
-            (rest.trim().to_lowercase(), "()")
-        };
-
-        let close_paren = rest.rfind(')').unwrap_or(rest.len().saturating_sub(1));
-        let args_str = rest[1..close_paren].trim();
-
-        // Parse positional arguments (simple CSV of literals)
-        let proc_args: Vec<ProcValue> = if args_str.is_empty() {
-            Vec::new()
-        } else {
-            args_str
-                .split(',')
-                .map(|s| {
-                    let s = s.trim();
-                    if s == "NULL" || s == "null" {
-                        ProcValue::Null
-                    } else if let Ok(i) = s.parse::<i64>() {
-                        ProcValue::Int(i)
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        ProcValue::Float(f)
-                    } else if s == "true" || s == "TRUE" {
-                        ProcValue::Bool(true)
-                    } else if s == "false" || s == "FALSE" {
-                        ProcValue::Bool(false)
-                    } else {
-                        // Strip quotes for string literals
-                        ProcValue::Text(s.trim_matches('\'').trim_matches('"').to_string())
-                    }
-                })
-                .collect()
-        };
-
-        let proc_result = {
-            let mut eng = self.procedure_engine.write();
-            eng.execute(&proc_name, &proc_args)
-        };
-
-        match proc_result {
-            ProcResult::Ok(ProcValue::Text(sql_body)) => {
-                // SQL procedures return their substituted body as ProcValue::Text.
-                // Builtin procedures may also return a plain Text result (e.g., version strings).
-                // Distinguish them: only try to execute text that starts with a SQL keyword.
-                let is_sql = {
-                    let u = sql_body.trim_start().to_ascii_uppercase();
-                    [
-                        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "WITH",
-                        "CALL", "EXPLAIN", "TRUNCATE",
-                    ]
-                    .iter()
-                    .any(|kw| u.starts_with(kw))
-                };
-                if is_sql {
-                    let results = self.execute(&sql_body).await?;
-                    Ok(results.into_iter().next().unwrap_or(ExecResult::Command {
-                        tag: format!("CALL {proc_name}"),
-                        rows_affected: 0,
-                    }))
-                } else {
-                    // Plain string result from a built-in procedure — return as a data row.
-                    Ok(ExecResult::Select {
-                        columns: vec![("result".into(), DataType::Text)],
-                        rows: vec![vec![Value::Text(sql_body)]],
-                    })
-                }
-            }
-            ProcResult::Ok(value) => {
-                let sql_val = match &value {
-                    ProcValue::Null => Value::Null,
-                    ProcValue::Bool(b) => Value::Bool(*b),
-                    ProcValue::Int(i) => Value::Int64(*i),
-                    ProcValue::Float(f) => Value::Float64(*f),
-                    ProcValue::Text(s) => Value::Text(s.clone()),
-                    ProcValue::Bytes(b) => Value::Bytea(b.clone()),
-                    ProcValue::Array(a) => Value::Text(format!("{a:?}")),
-                    ProcValue::Map(m) => Value::Text(format!("{m:?}")),
-                };
-                Ok(ExecResult::Select {
-                    columns: vec![("result".into(), DataType::Text)],
-                    rows: vec![vec![sql_val]],
-                })
-            }
-            ProcResult::Rows(rows) => {
-                let result_rows: Vec<Row> = rows
-                    .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .map(|v| match v {
-                                ProcValue::Null => Value::Null,
-                                ProcValue::Bool(b) => Value::Bool(b),
-                                ProcValue::Int(i) => Value::Int64(i),
-                                ProcValue::Float(f) => Value::Float64(f),
-                                ProcValue::Text(s) => Value::Text(s),
-                                ProcValue::Bytes(b) => Value::Bytea(b),
-                                ProcValue::Array(a) => Value::Text(format!("{a:?}")),
-                                ProcValue::Map(m) => Value::Text(format!("{m:?}")),
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let ncols = result_rows.first().map(|r| r.len()).unwrap_or(1);
-                let columns = (0..ncols)
-                    .map(|i| (format!("col{i}"), DataType::Text))
-                    .collect();
-                Ok(ExecResult::Select {
-                    columns,
-                    rows: result_rows,
-                })
-            }
-            ProcResult::Error(e) if e.contains("not found") => {
-                // Built-in procedure engine doesn't know this name.
-                // Fall back to user-defined functions registered via CREATE FUNCTION.
-                let func_def = self.functions.read().get(&proc_name).cloned();
-                if let Some(func_def) = func_def {
-                    // Re-evaluate args as Value from the already-parsed proc_args.
-                    let args: Vec<Value> = proc_args
-                        .iter()
-                        .map(|v| match v {
-                            crate::procedures::ProcValue::Null => Value::Null,
-                            crate::procedures::ProcValue::Bool(b) => Value::Bool(*b),
-                            crate::procedures::ProcValue::Int(i) => Value::Int64(*i),
-                            crate::procedures::ProcValue::Float(f) => Value::Float64(*f),
-                            crate::procedures::ProcValue::Text(s) => Value::Text(s.clone()),
-                            crate::procedures::ProcValue::Bytes(b) => Value::Bytea(b.clone()),
-                            _ => Value::Null,
-                        })
-                        .collect();
-                    let mut positional = Vec::with_capacity(func_def.params.len());
-                    let mut named = HashMap::new();
-                    for (i, (param_name, _)) in func_def.params.iter().enumerate() {
-                        let replacement = if let Some(val) = args.get(i) {
-                            sql_replacement_for_value(val)
-                        } else {
-                            "NULL".to_string()
-                        };
-                        positional.push(replacement.clone());
-                        if !param_name.is_empty() {
-                            named.insert(param_name.clone(), replacement);
-                        }
-                    }
-                    let body = substitute_sql_placeholders(&func_def.body, &positional, &named);
-                    let results = self.execute(&body).await?;
-                    Ok(results.into_iter().next().unwrap_or(ExecResult::Command {
-                        tag: format!("CALL {proc_name}"),
-                        rows_affected: 0,
-                    }))
-                } else {
-                    Err(ExecError::Runtime(format!("CALL {proc_name}: {e}")))
-                }
-            }
-            ProcResult::Error(e) => Err(ExecError::Runtime(format!("CALL {proc_name}: {e}"))),
-        }
     }
 
     /// Maximum allowed subquery nesting depth (prevents stack overflow).
@@ -2694,6 +2620,80 @@ impl Executor {
             )));
         }
         Ok(())
+    }
+
+    /// Maximum allowed CALL / UDF-body recursion depth.
+    const MAX_CALL_DEPTH: u32 = 32;
+
+    /// Minimum stack headroom required to enter another CALL / UDF-body
+    /// recursion level. A depth cap alone cannot protect debug builds, where
+    /// each recursion level costs hundreds of KB of poll frames — the stack
+    /// can run out before any sane fixed depth is reached. The budget must
+    /// exceed one level's worst-case frame cost (the UDF cycle's
+    /// sync_block_on nesting measures ~700 KB in debug) so the check fires
+    /// BETWEEN levels, not after the page. This mirrors PG's
+    /// max_stack_depth: measure the real headroom, error before the guard
+    /// page. (The check itself is unix+server only — wasm builds keep the
+    /// plain depth cap.)
+    #[cfg_attr(not(all(unix, feature = "server")), allow(dead_code))]
+    const MIN_CALL_STACK_HEADROOM: usize = 1024 * 1024;
+
+    /// Remaining stack bytes on the current thread, or None where the
+    /// platform (or build) does not expose it.
+    #[cfg(all(unix, feature = "server"))]
+    fn stack_headroom_bytes() -> Option<usize> {
+        // The address of a local approximates the current stack pointer.
+        let probe = 0u8;
+        let sp = &probe as *const u8 as usize;
+        unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                let top = libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize;
+                let size = libc::pthread_get_stacksize_np(libc::pthread_self());
+                Some(sp.saturating_sub(top.saturating_sub(size)))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+                if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+                    return None;
+                }
+                let mut base = std::ptr::null_mut();
+                let mut size = 0usize;
+                if libc::pthread_attr_getstack(&attr, &mut base, &mut size) != 0 {
+                    return None;
+                }
+                Some(sp.saturating_sub(base as usize))
+            }
+        }
+    }
+
+    /// Enter one CALL / UDF-body recursion level, returning an RAII guard
+    /// that decrements on drop (so `?`-returns unwind correctly). The
+    /// CALL→body→execute and UDF→body→execute cycles recurse through
+    /// Box::pin'd futures with no other bound — without this guard two
+    /// statements (`CREATE PROCEDURE p() ... 'CALL p()'; CALL p();`) abort
+    /// the whole process with a stack overflow.
+    fn enter_call(&self) -> Result<CallDepthGuard<'_>, ExecError> {
+        let depth = self.call_depth.fetch_add(1, Ordering::Relaxed);
+        let fail = |depth: u32| {
+            self.call_depth.fetch_sub(1, Ordering::Relaxed);
+            Err(ExecError::Runtime(format!(
+                "procedure/function call depth exceeded limit of {depth}"
+            )))
+        };
+        if depth >= Self::MAX_CALL_DEPTH {
+            return fail(Self::MAX_CALL_DEPTH);
+        }
+        #[cfg(all(unix, feature = "server"))]
+        {
+            if Self::stack_headroom_bytes()
+                .is_some_and(|headroom| headroom < Self::MIN_CALL_STACK_HEADROOM)
+            {
+                return fail(Self::MAX_CALL_DEPTH);
+            }
+        }
+        Ok(CallDepthGuard(&self.call_depth))
     }
 
     /// Estimate memory consumption of a row (rough, fast).
@@ -4081,6 +4081,8 @@ impl Executor {
         };
         let functions_snap: HashMap<String, FunctionDef> = self.functions.read().clone();
         let extensions_snap: HashMap<String, ExtensionDef> = self.extensions.read().clone();
+        let schemas_snap: std::collections::HashSet<String> =
+            self.schemas.read().await.iter().cloned().collect();
         let security_snap = self.security.read().clone_policy_state();
         // Now take async locks.
         let meta_pers = meta_persistence::MetaPersistence::alongside_catalog(path);
@@ -4097,6 +4099,7 @@ impl Executor {
                 &roles,
                 &functions_snap,
                 &extensions_snap,
+                &schemas_snap,
                 &security_snap,
             )
             .map_err(|e| ExecError::Runtime(format!("metadata persistence failed: {e}")))?;
@@ -4311,6 +4314,15 @@ impl Executor {
         }
         {
             let s = self.blob_store.read();
+            // Payload before the log that references it (BLO-1): the blob WAL
+            // is fsynced at this boundary, and a durable manifest referencing
+            // page-cached chunk bytes is an acknowledged blob a power cut
+            // erases. Both syncs under ONE read-lock acquisition: blob writers
+            // take the write lock, so no append can slip between syncing the
+            // segments and syncing the WAL that names them.
+            if s.segments_dirty() {
+                s.sync_segments().map_err(io_err)?;
+            }
             if s.wal_is_dirty() {
                 s.wal_group_sync().map_err(io_err)?;
             }
@@ -4484,6 +4496,63 @@ impl Executor {
     /// Checkpoint the streams WAL: writes a snapshot of the current stream
     /// state and truncates the WAL file to just that snapshot.
     ///
+    /// Whether any session has an open transaction that enlisted a specialty
+    /// model — the S7 checkpoint gate. Specialty checkpoints fold
+    /// apply-at-DML in-memory state into a snapshot record, and a snapshot
+    /// carries no transaction id, so a checkpoint during an open enlisted
+    /// transaction bakes uncommitted state into a form the S6 recovery filter
+    /// cannot see. `enlisted` rather than merely "a transaction is open", so
+    /// a SQL-only transaction never blocks a specialty checkpoint.
+    ///
+    /// The idle-in-transaction sweep is the starvation bound: an abandoned
+    /// enlisted transaction suppresses specialty checkpoints (and, via the
+    /// retention horizon, SQL segment pruning) only until the sweep rolls it
+    /// back.
+    pub fn any_open_enlisted_txn(&self) -> bool {
+        self.sessions.read().values().any(|s| {
+            s.cross_model
+                .lock()
+                .as_ref()
+                .is_some_and(|cm| !cm.enlisted.is_empty())
+        }) || self
+            .default_session
+            .cross_model
+            .lock()
+            .as_ref()
+            .is_some_and(|cm| !cm.enlisted.is_empty())
+    }
+
+    /// The WAL LSN horizon of the last completed specialty-checkpoint pass
+    /// (S7): everything a specialty log held at or after this LSN may not
+    /// have been folded into a snapshot yet, so the SQL side must not prune
+    /// the COMMIT records that vouch for those transactions — the S6 filter
+    /// discards a tagged record whose commit body was reclaimed, which would
+    /// turn a routine prune into loss of acknowledged writes.
+    ///
+    /// Starts at 1 ("nothing folded, protect everything") and moves forward
+    /// with each completed specialty pass; truncation held at 1 prunes
+    /// nothing, so a fresh process destroys nothing before its first pass.
+    pub fn specialty_checkpoint_horizon(&self) -> u64 {
+        self.specialty_horizon
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that a specialty-checkpoint pass completed at `lsn` (S7). The
+    /// pass folded everything committed below `lsn` into its snapshots, so
+    /// `lsn` becomes the new reclaim horizon.
+    pub fn note_specialty_checkpoint_pass(&self, lsn: u64) {
+        self.specialty_horizon
+            .fetch_max(lsn, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The next coordinating id `BEGIN` will mint (test/introspection hook).
+    /// The monotonicity proof needs to observe the counter without spending
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn next_xact_id_probe(&self) -> u64 {
+        self.next_xact_id.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// `STREAM_XADD` logs to this WAL unconditionally on every call (see
     /// `scalar_fns.rs`) with no consumer required — same unbounded-growth
     /// shape as the CDC WAL this mirrors (`checkpoint_cdc_wal`). Called from
@@ -4516,6 +4585,13 @@ impl Executor {
         // stay live while they serialize; vector writes take the write lock and
         // block briefly, matching the other subsystem checkpoints.
         let indexes = self.vector_indexes.read();
+        // Persisted registries borrow from these owned sections, so they must
+        // outlive the snapshot map below.
+        let sections: HashMap<String, vector::RegistrySection> = indexes
+            .iter()
+            .filter(|(_, entry)| matches!(entry.kind, VectorIndexKind::Hnsw(_)))
+            .map(|(name, entry)| (name.clone(), entry.registry.to_section()))
+            .collect();
         let mut snapshots: HashMap<String, vector::wal::IndexSnapshot<'_>> = HashMap::new();
         for (name, entry) in indexes.iter() {
             if let VectorIndexKind::Hnsw(hnsw) = &entry.kind {
@@ -4527,6 +4603,7 @@ impl Executor {
                         metric: vector::metric_to_u8(hnsw.metric()),
                         m: hnsw.m() as u32,
                         ef: hnsw.ef_search() as u32,
+                        registry: sections.get(name),
                     },
                 );
             }
@@ -5077,18 +5154,32 @@ impl Executor {
                 }
                 // Coerce each literal to its target column's declared type
                 // so pgx SimpleProtocol text-literal inserts land in the
-                // column's native representation. Fall back to the original
-                // value on cast failure — the storage layer will reject
-                // type-incompatible inserts with a clearer error than ours.
-                let row: Vec<Value> = values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        v.to_value()
-                            .cast(&table_def.columns[i].data_type)
-                            .unwrap_or_else(|_| v.to_value())
-                    })
-                    .collect();
+                // column's native representation. A literal that cannot be
+                // cast is an ERROR, not a silent Text store — a
+                // constraint-free INT column must never durably hold 'abc'
+                // behind a successful INSERT tag. NULL literals pass through
+                // (all fast-path-eligible columns are nullable).
+                let row: Vec<Value> = {
+                    let mut row: Vec<Value> = Vec::with_capacity(values.len());
+                    for (i, v) in values.iter().enumerate() {
+                        let lit = v.to_value();
+                        let cast = if matches!(lit, Value::Null) {
+                            Ok(lit)
+                        } else {
+                            lit.cast(&table_def.columns[i].data_type)
+                        };
+                        match cast {
+                            Ok(cast) => row.push(cast),
+                            Err(e) => {
+                                return Some(Err(ExecError::Runtime(format!(
+                                    "invalid input syntax for column \"{}\" of type {}: {e}",
+                                    table_def.columns[i].name, table_def.columns[i].data_type
+                                ))));
+                            }
+                        }
+                    }
+                    row
+                };
                 let storage = self.storage_for(table);
                 match storage.insert(table, row).await {
                     Ok(()) => {
@@ -5365,7 +5456,17 @@ impl Executor {
                 return self.execute_statements_dispatch(sql, statements).await;
             }
 
+            // Extension commands return from this block before the parsed
+            // path's per-statement recompute — do it here so revocations
+            // take effect on these arms too (a demoted superuser's session
+            // used its stale bypass_rls to read RLS-table stats).
+            self.recompute_session_context(&self.current_session());
+
             let upper = trimmed.to_ascii_uppercase();
+            // EXE-8: the raw arms below return before the parsed path's
+            // per-statement admission gate — classify them here, after the
+            // recompute so a refusal is attributed to the correct principal.
+            self.admit_extension(&upper)?;
             #[cfg(feature = "server")]
             if upper.starts_with("SUBSCRIBE ") {
                 if self.any_rls_active() {
@@ -5394,10 +5495,14 @@ impl Executor {
             // to declare a policy over the wire existed, so masking was
             // reachable only from Rust — i.e. only from the test suite.
             if upper.starts_with("CREATE MASKING POLICY") {
-                return Ok(vec![self.execute_create_masking_policy(trimmed)?]);
+                let r = self.execute_create_masking_policy(trimmed)?;
+                self.finalize_masking_ddl().await?;
+                return Ok(vec![r]);
             }
             if upper.starts_with("DROP MASKING POLICY") {
-                return Ok(vec![self.execute_drop_masking_policy(trimmed)?]);
+                let r = self.execute_drop_masking_policy(trimmed)?;
+                self.finalize_masking_ddl().await?;
+                return Ok(vec![r]);
             }
             if upper == "SHOW MASKING POLICIES" || upper == "SHOW MASKING POLICIES;" {
                 return Ok(vec![self.execute_show_masking_policies()?]);
@@ -5409,7 +5514,17 @@ impl Executor {
                 return Ok(vec![self.execute_memory_pressure().await]);
             }
             if upper.starts_with("ALTER SEQUENCE ") {
-                return Ok(vec![self.execute_alter_sequence_raw(trimmed)?]);
+                let result = self.execute_alter_sequence_raw(trimmed)?;
+                // The raw arm returns before the is_ddl persist block;
+                // without this, a restart reverts the ALTER from
+                // sequences.json/meta.json.
+                self.persist_sequences_sync().map_err(|e| {
+                    ExecError::Runtime(format!(
+                        "ALTER SEQUENCE: new state could not be made durable ({e}); \
+                         a restart would revert it"
+                    ))
+                })?;
+                return Ok(vec![result]);
             }
             if upper.starts_with("CACHE_SET ") || upper.starts_with("CACHE_SET(") {
                 return Ok(vec![self.execute_cache_set(trimmed)?]);
@@ -5439,9 +5554,21 @@ impl Executor {
                 let rest = trimmed["BACKUP DATABASE TO ".len()..]
                     .trim()
                     .trim_end_matches(';');
-                let force = rest.to_uppercase().ends_with(" FORCE");
+                // FORCE is a trailing whitespace-separated TOKEN in the
+                // original text — matching it on the uppercased copy and
+                // byte-slicing the original mangled any quoted destination
+                // whose last word happened to be "Force" (silent truncation
+                // WITH force-overwrite semantics).
+                let force = rest
+                    .split_whitespace()
+                    .last()
+                    .is_some_and(|last| last.eq_ignore_ascii_case("FORCE"));
                 let path_part = if force {
-                    rest[..rest.len() - " FORCE".len()].trim()
+                    // Cut at the last whitespace before the trailing FORCE
+                    // token in the ORIGINAL string.
+                    rest.rfind(|c: char| c.is_whitespace())
+                        .map(|i| rest[..i].trim_end())
+                        .unwrap_or(rest)
                 } else {
                     rest
                 };
@@ -5502,6 +5629,9 @@ impl Executor {
             }
             // DROP MODEL <name> — unregister a loaded model.
             if upper.starts_with("DROP MODEL ") {
+                // The model registry is shared engine state — dropping a
+                // model is a privileged destructive mutation.
+                self.require_security_admin("drop models")?;
                 let model_name = trimmed[11..].trim().trim_end_matches(';').to_string();
                 self.model_registry.write().unregister(&model_name);
                 return Ok(vec![ExecResult::Command {
@@ -5583,10 +5713,10 @@ impl Executor {
                     rows,
                 }]);
             }
-            // CALL <proc_name>([args...]) — invoke a stored procedure.
-            if upper.starts_with("CALL ") {
-                return Ok(vec![self.execute_call_procedure(trimmed).await?]);
-            }
+            // CALL statements go through the real parser and the
+            // Statement::Call arm (execute_call) — the raw-text intercept
+            // this replaced panicked on `CALL (`, split argument literals on
+            // commas, and executed builtin output that looked like SQL.
             // SHOW BRANCHES — list all db_branch_* branches.
             if upper.starts_with("SHOW BRANCHES") {
                 let mgr = self.branch_manager.read();
@@ -5878,6 +6008,8 @@ impl Executor {
                 | Statement::CreateFunction(_)
                 | Statement::DropFunction(_)
                 | Statement::CreateTrigger(_)
+                | Statement::DropTrigger(_)
+                | Statement::CreateSchema { .. }
                 | Statement::CreatePolicy(_)
                 | Statement::DropPolicy(_)
                 | Statement::AlterPolicy(_)
@@ -6172,6 +6304,14 @@ impl Executor {
                 let view_name = create_view.name.to_string();
                 if create_view.or_replace {
                     self.views.write().await.remove(&view_name);
+                    // Also retire the OLD view's dependency edges — the new
+                    // query's edges are added on top below, and a stale edge
+                    // used to block DROP TABLE on a table the view no longer
+                    // references, forever.
+                    let mut deps = self.view_deps.write();
+                    for dep_names in deps.values_mut() {
+                        dep_names.remove(&view_name);
+                    }
                 }
                 self.execute_create_view(view_name, *create_view.query, create_view.columns)
                     .await
@@ -6764,6 +6904,50 @@ impl Executor {
         }
         let (entry, pk_col) = found?;
 
+        // VEC-1: the metric argument must agree with the index's metric. An
+        // absent args[2] means L2 — the same default scalar_fns
+        // VECTOR_DISTANCE applies. A mismatch declines the scan and the exact
+        // scalar sort runs, which computes the requested metric correctly;
+        // serving it in the index's metric instead would silently return the
+        // wrong rows.
+        let index_metric = match &entry.kind {
+            VectorIndexKind::Hnsw(h) => h.metric(),
+            VectorIndexKind::IvfFlat(i) => i.metric(),
+        };
+        let requested_metric = match func_args.get(2) {
+            Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))) => {
+                let empty_row = Vec::new();
+                match self.eval_row_expr(e, &empty_row, &[]) {
+                    Ok(Value::Text(s)) => match s.to_lowercase().as_str() {
+                        // Same spellings scalar_fns.rs accepts.
+                        "l2" | "euclidean" => Some(vector::DistanceMetric::L2),
+                        "cosine" => Some(vector::DistanceMetric::Cosine),
+                        "inner" | "ip" | "dot" => Some(vector::DistanceMetric::InnerProduct),
+                        // Unknown spelling: decline; the scalar path raises
+                        // the proper "unknown distance metric" error.
+                        _ => return None,
+                    },
+                    Ok(Value::Null) | Err(_) => return None,
+                    _ => return None,
+                }
+            }
+            _ => None,
+        };
+        if requested_metric.unwrap_or(vector::DistanceMetric::L2) != index_metric {
+            return None;
+        }
+
+        // VEC-3: the query vector must match the column's declared dimension.
+        // Decline on mismatch: the exact path's VECTOR_DISTANCE eval raises
+        // the proper "vector dimensions must match" error (or the storage
+        // layer does), where the index path would rank over a clamped prefix.
+        if let Some(cm) = col_meta.iter().find(|c| c.name == col_name)
+            && let crate::types::DataType::Vector(n) = &cm.dtype
+            && query_vec.len() != *n
+        {
+            return None;
+        }
+
         // PK-keyed HNSW resolves search results (node ids) to rows through the
         // registry. If the registry is empty (right after a reopen, before the
         // first rebuild repopulates it), fall back to the exact brute-force scan.
@@ -6819,45 +7003,37 @@ impl Executor {
                 VectorIndexKind::IvfFlat(_) => return None,
             }
         } else {
-            // Positional resolution (IvfFlat, or HNSW without an integer PK).
-            let valid_row_ids: std::collections::HashSet<u64> = (0..rows.len() as u64).collect();
-            match &entry.kind {
-                VectorIndexKind::Hnsw(hnsw) => {
-                    if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
-                        let flt = |id: u64| valid_row_ids.contains(&id);
-                        match ef_override {
-                            Some(ef) => hnsw.search_filtered_ef(&query, k, ef, flt),
-                            None => hnsw.search_filtered(&query, k, flt),
-                        }
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect()
-                    } else {
-                        match ef_override {
-                            Some(ef) => hnsw.search_ef(&query, k, ef),
-                            None => hnsw.search(&query, k),
-                        }
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect()
-                    }
-                }
-                VectorIndexKind::IvfFlat(ivf) => {
-                    if valid_row_ids.len() < rows.len() || valid_row_ids.len() < ivf.len() {
-                        ivf.search_filtered(&query_vec, k, |id| {
-                            valid_row_ids.contains(&(id as u64))
-                        })
-                        .into_iter()
-                        .map(|(id, _)| id as u64)
-                        .collect()
-                    } else {
-                        ivf.search(&query_vec, k)
-                            .into_iter()
-                            .map(|(id, _)| id as u64)
-                            .collect()
-                    }
-                }
+            // VEC-2: positional resolution (IvfFlat, or HNSW without an
+            // integer PK). Positional node ids are offsets into the table's
+            // full, unfiltered scan at build time; they are only interpretable
+            // when `rows` IS that scan — zero tombstones (a DELETE leaves the
+            // live count short of len; an UPDATE grows len past the row count)
+            // and no filtering (`rows` is post-WHERE). Anything else and
+            // `rows.get(id)` resolves surviving ids to the WRONG row while
+            // `id < rows.len()` permanently hides the highest live nodes —
+            // decline and run the exact sort.
+            let (index_len, tombstones) = match &entry.kind {
+                VectorIndexKind::Hnsw(h) => (h.len(), h.tombstone_count()),
+                VectorIndexKind::IvfFlat(i) => (i.len(), i.tombstone_count()),
+            };
+            if tombstones > 0 || rows.len() != index_len {
+                return None;
             }
+            let result_ids: Vec<u64> = match &entry.kind {
+                VectorIndexKind::Hnsw(hnsw) => match ef_override {
+                    Some(ef) => hnsw.search_ef(&query, k, ef),
+                    None => hnsw.search(&query, k),
+                }
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+                VectorIndexKind::IvfFlat(ivf) => ivf
+                    .search(&query_vec, k)
+                    .into_iter()
+                    .map(|(id, _)| id as u64)
+                    .collect(),
+            };
+            result_ids
         };
 
         // Reorder rows into proximity order. PK path: node id -> pk -> row.
@@ -6997,9 +7173,10 @@ impl Executor {
                 if !matches!(e.kind, VectorIndexKind::Hnsw(_)) {
                     return false;
                 }
-                // Post-reopen the registry is empty (not persisted). Fall through
-                // to a full rebuild, which repopulates it and rebuilds the graph
-                // on a fresh node id space.
+                // An empty registry (a positional index, or a log written
+                // before registry persistence) cannot resolve pk -> node, so
+                // fall through to a full rebuild, which repopulates it and
+                // rebuilds the graph on a fresh node id space.
                 if e.pk_column.is_some() && e.registry.is_empty() {
                     return false;
                 }
@@ -7032,7 +7209,7 @@ impl Executor {
         let pk = pk_col.and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
         // Collect WAL log entries to write after releasing the lock
-        let mut wal_inserts: Vec<(String, u64, Vec<f32>)> = Vec::new();
+        let mut wal_inserts: Vec<(String, u64, Vec<f32>, Option<u64>)> = Vec::new();
         for (idx_name, entry) in indexes.iter_mut() {
             if entry.table_name != table_name {
                 continue;
@@ -7067,7 +7244,11 @@ impl Executor {
             match &mut entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => {
                     hnsw.insert(node, vector::Vector::new(v.clone()));
-                    wal_inserts.push((idx_name.clone(), node, v.clone()));
+                    // The pk rides in the record's metadata so replay can
+                    // rebuild the registry from deltas (F1b); only a PK-keyed
+                    // HNSW allocates through the registry, so only it carries
+                    // one.
+                    wal_inserts.push((idx_name.clone(), node, v.clone(), pk.filter(|_| pk_keyed)));
                 }
                 VectorIndexKind::IvfFlat(ivf) => {
                     if ivf.is_trained() {
@@ -7077,8 +7258,25 @@ impl Executor {
             }
         }
         drop(indexes);
-        for (idx_name, row_id, v) in wal_inserts {
-            self.wal_log_vector_insert(&idx_name, row_id, &v)?;
+        for (idx_name, row_id, v, pk) in wal_inserts {
+            if let Err(e) = self.wal_log_vector_insert(&idx_name, row_id, &v, pk) {
+                // A failed append fails the statement, and the in-memory
+                // insert is rolled back to match the WAL — which never
+                // recorded this node. Left live, memory diverges from what
+                // recovery would produce, and the next vector checkpoint
+                // snapshots live memory, laundering the rejected vector into
+                // the durable log (NU-048).
+                let mut indexes = self.vector_indexes.write();
+                if let Some(entry) = indexes.get_mut(&idx_name) {
+                    if let Some(p) = pk {
+                        entry.registry.remove(p);
+                    }
+                    if let VectorIndexKind::Hnsw(hnsw) = &mut entry.kind {
+                        hnsw.mark_deleted(row_id);
+                    }
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -7130,14 +7328,19 @@ impl Executor {
         index_name: &str,
         id: u64,
         vector: &[f32],
+        pk: Option<u64>,
     ) -> Result<(), ExecError> {
         if let Some(ref wal) = self.vector_wal {
-            wal.log_insert(index_name, id, vector, "").map_err(|e| {
-                ExecError::Runtime(format!(
-                    "vector index {index_name}: row {id} was indexed in memory but its WAL \
-                     append failed ({e}); it would not survive a restart"
-                ))
-            })?;
+            // The pk (decimal u64) rides in the record's metadata so replay
+            // can rebuild the pk -> node registry from delta records.
+            let metadata = pk.map(|p| p.to_string()).unwrap_or_default();
+            wal.log_insert(index_name, id, vector, &metadata)
+                .map_err(|e| {
+                    ExecError::Runtime(format!(
+                        "vector index {index_name}: row {id} was indexed in memory but its WAL \
+                         append failed ({e}); it would not survive a restart"
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -7462,7 +7665,7 @@ impl Executor {
         new_row: Option<&Row>,
         col_meta: &[ColMeta],
         row_level: bool,
-    ) {
+    ) -> Result<(), ExecError> {
         let triggers = self.triggers.read().await;
         let matching: Vec<_> = triggers
             .iter()
@@ -7477,7 +7680,7 @@ impl Executor {
         drop(triggers);
 
         if matching.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Convert ColMeta to the (String, DataType) format used by table_columns
@@ -7486,26 +7689,58 @@ impl Executor {
             .map(|cm| (cm.name.clone(), cm.dtype.clone()))
             .collect();
 
-        // Create temporary _new / _old tables for row binding (best-effort setup)
+        // Row bindings stage in engine-global tables literally named
+        // `_new`/`_old`. Serialize firings so concurrent sessions cannot
+        // interleave rows into the same names, never touch a pre-existing
+        // table bearing the name, and only drop what this firing created —
+        // the previous unconditional create/insert/drop silently inserted
+        // trigger rows into (and then DROPPED) a user's real `_new` table.
+        let _binding = self.trigger_binding_lock.lock().await;
+        let mut created_new = false;
+        let mut created_old = false;
         if let Some(row) = new_row {
-            if let Err(e) = self.storage.create_table("_new").await {
-                eprintln!("trigger: failed to create _new table: {e}");
+            if self.catalog.get_table("_new").await.is_some() {
+                return Err(ExecError::Runtime(
+                    "reserved trigger binding table '_new' is occupied by a user table".into(),
+                ));
             }
-            if let Err(e) = self.storage.insert("_new", row.clone()).await {
-                eprintln!("trigger: failed to insert into _new table: {e}");
+            match self.storage.create_table("_new").await {
+                Ok(()) => created_new = true,
+                // Staging failures stay non-fatal (pre-existing behavior):
+                // the body cannot reference the binding, but the DML itself
+                // is not wrong. Only a NAME CONFLICT is fatal — that is the
+                // case where continuing would corrupt user data.
+                Err(e) => eprintln!("trigger: failed to create _new table: {e}"),
             }
-            self.table_columns
-                .write()
-                .insert("_new".to_string(), cols.clone());
+            if created_new {
+                if let Err(e) = self.storage.insert("_new", row.clone()).await {
+                    eprintln!("trigger: failed to insert into _new table: {e}");
+                }
+                self.table_columns
+                    .write()
+                    .insert("_new".to_string(), cols.clone());
+            }
         }
         if let Some(row) = old_row {
-            if let Err(e) = self.storage.create_table("_old").await {
-                eprintln!("trigger: failed to create _old table: {e}");
+            if self.catalog.get_table("_old").await.is_some() {
+                if created_new {
+                    let _ = self.storage.drop_table("_new").await;
+                    self.table_columns.write().remove("_new");
+                }
+                return Err(ExecError::Runtime(
+                    "reserved trigger binding table '_old' is occupied by a user table".into(),
+                ));
             }
-            if let Err(e) = self.storage.insert("_old", row.clone()).await {
-                eprintln!("trigger: failed to insert into _old table: {e}");
+            match self.storage.create_table("_old").await {
+                Ok(()) => created_old = true,
+                Err(e) => eprintln!("trigger: failed to create _old table: {e}"),
             }
-            self.table_columns.write().insert("_old".to_string(), cols);
+            if created_old {
+                if let Err(e) = self.storage.insert("_old", row.clone()).await {
+                    eprintln!("trigger: failed to insert into _old table: {e}");
+                }
+                self.table_columns.write().insert("_old".to_string(), cols);
+            }
         }
 
         for trigger in matching {
@@ -7514,19 +7749,20 @@ impl Executor {
             }
         }
 
-        // Clean up temp tables (best-effort teardown)
-        if new_row.is_some() {
+        // Clean up exactly what this firing created.
+        if created_new {
             if let Err(e) = self.storage.drop_table("_new").await {
                 eprintln!("trigger: failed to drop _new table: {e}");
             }
             self.table_columns.write().remove("_new");
         }
-        if old_row.is_some() {
+        if created_old {
             if let Err(e) = self.storage.drop_table("_old").await {
                 eprintln!("trigger: failed to drop _old table: {e}");
             }
             self.table_columns.write().remove("_old");
         }
+        Ok(())
     }
     // ========================================================================
     // SUBSCRIBE / UNSUBSCRIBE — reactive query subscriptions (Tier 1.9)
@@ -7537,8 +7773,16 @@ impl Executor {
     #[cfg(feature = "server")]
     async fn execute_subscribe(&self, sql: &str) -> Result<ExecResult, ExecError> {
         // Extract the query from SUBSCRIBE '...' or SUBSCRIBE SELECT ...
+        // Dispatch matched case-insensitively; the strip must too, or the
+        // whole prefix stays in the "query" and the subscription watches
+        // zero tables — a sub id that can never fire.
         let query = sql.trim();
-        let query = query.strip_prefix("SUBSCRIBE").unwrap_or(query).trim();
+        let query = if Self::starts_with_ci(query, "SUBSCRIBE") {
+            &query["SUBSCRIBE".len()..]
+        } else {
+            query
+        }
+        .trim();
         // Only strip matching outer single quotes
         let query = if query.starts_with('\'') && query.ends_with('\'') && query.len() >= 2 {
             &query[1..query.len() - 1]

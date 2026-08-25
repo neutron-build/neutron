@@ -214,6 +214,11 @@ impl KNearestNeighbors {
                 got: input.len(),
             });
         }
+        if input.iter().any(|v| !v.is_finite()) {
+            return Err(InferenceError::InvalidInput(
+                "KNN input contains non-finite values (NaN/inf)".into(),
+            ));
+        }
 
         // Collect unique labels and assign indices.
         let mut label_set: Vec<String> = Vec::new();
@@ -229,7 +234,7 @@ impl KNearestNeighbors {
             .iter()
             .map(|(v, l)| (Self::l2_sq(input, v), l.as_str()))
             .collect();
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         // Majority vote among the k nearest.
         let mut votes: HashMap<&str, usize> = HashMap::new();
@@ -264,13 +269,18 @@ impl KNearestNeighbors {
                 got: input.len(),
             });
         }
+        if input.iter().any(|v| !v.is_finite()) {
+            return Err(InferenceError::InvalidInput(
+                "KNN input contains non-finite values (NaN/inf)".into(),
+            ));
+        }
 
         let mut dists: Vec<(f32, &str)> = self
             .vectors
             .iter()
             .map(|(v, l)| (Self::l2_sq(input, v), l.as_str()))
             .collect();
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut votes: HashMap<&str, usize> = HashMap::new();
         for (_, lbl) in dists.iter().take(self.k) {
@@ -1122,5 +1132,38 @@ mod tests {
         assert_eq!(meta.output_dims, vec![1]);
         assert!(!meta.description.is_empty());
         assert!(meta.created_at > 0);
+    }
+    // QPP-6: non-finite inputs must be rejected, not panic the comparator
+    // (NaN distances make partial_cmp return None and the unwrap aborts the
+    // connection).
+    #[test]
+    fn test_knn_rejects_non_finite_input() {
+        let knn = KNearestNeighbors::new(
+            vec![
+                (vec![0.0, 0.0], "a".to_string()),
+                (vec![1.0, 1.0], "b".to_string()),
+            ],
+            1,
+        );
+        for bad in [
+            vec![f32::NAN, 1.0],
+            vec![f32::INFINITY, 0.0],
+            vec![0.0, f32::NEG_INFINITY],
+        ] {
+            match knn.predict(&bad) {
+                Err(InferenceError::InvalidInput(m)) => {
+                    assert!(m.contains("non-finite"), "unexpected message: {m}")
+                }
+                other => panic!("predict({bad:?}) must reject non-finite input, got {other:?}"),
+            }
+            match knn.classify(&bad) {
+                Err(InferenceError::InvalidInput(m)) => {
+                    assert!(m.contains("non-finite"), "unexpected message: {m}")
+                }
+                other => panic!("classify({bad:?}) must reject non-finite input, got {other:?}"),
+            }
+        }
+        // Finite inputs still work.
+        assert_eq!(knn.classify(&[0.1, 0.1]).unwrap(), "a");
     }
 }

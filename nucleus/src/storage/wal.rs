@@ -180,6 +180,13 @@ pub struct WalRecord {
     pub page_id: u32,
     /// Full page image (only for PAGE_WRITE records).
     pub page_image: Option<Box<PageBuf>>,
+    /// Control-record body (only for control records that carry one).
+    ///
+    /// A COMMIT record written since S63 carries `[xact_id u64][enlisted u16]`
+    /// so recovery can rebuild the committed-transaction-id set the specialty
+    /// WAL recovery filter needs. `None` is every pre-S63 control record (all
+    /// bodies were zero-length) and every ABORT/CHECKPOINT record.
+    pub control_body: Option<Vec<u8>>,
 }
 
 // ============================================================================
@@ -229,7 +236,9 @@ pub trait WalBackend: Send + Sync {
         self.sync()
     }
     /// Log a COMMIT record for the given transaction. Returns the assigned LSN.
-    fn log_commit(&self, _txn_id: u64) -> std::io::Result<u64> {
+    /// `body` is the optional S63 enlistment payload — see
+    /// [`WalRecord::control_body`]; `None` writes the classic zero-body record.
+    fn log_commit(&self, _txn_id: u64, _body: Option<&[u8]>) -> std::io::Result<u64> {
         Ok(0)
     }
     /// Log an ABORT record for the given transaction. Returns the assigned LSN.
@@ -470,18 +479,18 @@ impl Wal {
     }
 
     /// Log a commit record.
-    pub fn log_commit(&self, txn_id: u64) -> std::io::Result<u64> {
-        self.log_control(RECORD_COMMIT, txn_id)
+    pub fn log_commit(&self, txn_id: u64, body: Option<&[u8]>) -> std::io::Result<u64> {
+        self.log_control(RECORD_COMMIT, txn_id, body)
     }
 
     /// Log an abort record.
     pub fn log_abort(&self, txn_id: u64) -> std::io::Result<u64> {
-        self.log_control(RECORD_ABORT, txn_id)
+        self.log_control(RECORD_ABORT, txn_id, None)
     }
 
     /// Log a checkpoint record.
     pub fn log_checkpoint(&self) -> std::io::Result<u64> {
-        self.log_control(RECORD_CHECKPOINT, 0)
+        self.log_control(RECORD_CHECKPOINT, 0, None)
     }
 
     /// Force WAL to disk using the configured sync mode.
@@ -563,8 +572,8 @@ impl WalBackend for Wal {
         Wal::group_sync(self)
     }
 
-    fn log_commit(&self, txn_id: u64) -> std::io::Result<u64> {
-        Wal::log_commit(self, txn_id)
+    fn log_commit(&self, txn_id: u64, body: Option<&[u8]>) -> std::io::Result<u64> {
+        Wal::log_commit(self, txn_id, body)
     }
 
     fn log_abort(&self, txn_id: u64) -> std::io::Result<u64> {
@@ -587,24 +596,46 @@ impl WalBackend for Wal {
 
 impl Wal {
     // Internal: write a control record (commit/abort/checkpoint).
-    fn log_control(&self, record_type: u8, txn_id: u64) -> std::io::Result<u64> {
+    //
+    // `body` extends the record past the fixed header; the CRC covers the
+    // header fields plus the body, so an S63 commit record's enlistment
+    // payload is checksummed like every other byte. Only RECORD_COMMIT is
+    // ever written with a body today.
+    fn log_control(
+        &self,
+        record_type: u8,
+        txn_id: u64,
+        body: Option<&[u8]>,
+    ) -> std::io::Result<u64> {
         let mut writer = self.writer.lock();
         // LSN allocated under the writer lock — see log_page_write.
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
 
-        let record_len = CONTROL_RECORD_SIZE as u32;
+        let body_len = body.map_or(0, |b| b.len());
+        let record_len = (CONTROL_RECORD_SIZE + body_len) as u32;
         writer.write_all(&record_len.to_le_bytes())?;
         writer.write_all(&lsn.to_le_bytes())?;
         writer.write_all(&txn_id.to_le_bytes())?;
         writer.write_all(&[record_type])?;
         writer.write_all(&0u32.to_le_bytes())?; // page_id = 0 (not applicable)
+        if let Some(b) = body {
+            writer.write_all(b)?;
+        }
 
-        // CRC over the header fields — stack array avoids heap allocation
+        // CRC over the header fields (and body, when present) — stack array
+        // avoids heap allocation for the bodyless case
         let mut crc_buf = [0u8; 17]; // lsn(8) + txn_id(8) + record_type(1)
         crc_buf[..8].copy_from_slice(&lsn.to_le_bytes());
         crc_buf[8..16].copy_from_slice(&txn_id.to_le_bytes());
         crc_buf[16] = record_type;
-        let crc = crc32c::crc32c(&crc_buf);
+        let crc = match body {
+            Some(b) => {
+                let mut c = crc32c::crc32c(&crc_buf);
+                c = crc32c::crc32c_append(c, b);
+                c
+            }
+            None => crc32c::crc32c(&crc_buf),
+        };
         writer.write_all(&crc.to_le_bytes())?;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
@@ -787,6 +818,20 @@ fn scan_inner(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64, TailState)> 
             None
         };
 
+        // Control records may carry a body past the fixed header (S63 commit
+        // records carry the enlistment payload). `record_len` counts every
+        // byte on disk including the 4-byte length prefix, so whatever it
+        // names beyond header + image + CRC is the body. A pre-S63 record
+        // names nothing, which reads back as `None`.
+        let control_body = if !carries_page_image(record_type) && record_len > CONTROL_RECORD_SIZE {
+            let body_len = record_len - CONTROL_RECORD_SIZE;
+            let mut body = vec![0u8; body_len];
+            file.read_exact(body.as_mut())?;
+            Some(body)
+        } else {
+            None
+        };
+
         // Read and validate CRC
         let mut crc_buf = [0u8; 4];
         file.read_exact(&mut crc_buf)?;
@@ -820,12 +865,20 @@ fn scan_inner(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64, TailState)> 
                 }
             }
         } else {
-            // For control records, CRC is over header fields — stack array avoids heap alloc
+            // For control records, CRC is over header fields plus any body —
+            // stack array avoids heap alloc for the bodyless case
             let mut crc_data = [0u8; 17];
             crc_data[..8].copy_from_slice(&lsn_buf);
             crc_data[8..16].copy_from_slice(&txn_buf);
             crc_data[16] = record_type;
-            let computed = crc32c::crc32c(&crc_data);
+            let computed = match &control_body {
+                Some(body) => {
+                    let mut c = crc32c::crc32c(&crc_data);
+                    c = crc32c::crc32c_append(c, body);
+                    c
+                }
+                None => crc32c::crc32c(&crc_data),
+            };
             if computed != stored_crc {
                 // Stop rather than skip. A control record carries transaction
                 // state; continuing past one means replaying records whose
@@ -856,6 +909,7 @@ fn scan_inner(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64, TailState)> 
             record_type,
             page_id,
             page_image,
+            control_body,
         });
 
         pos += record_len as u64;
@@ -1105,18 +1159,18 @@ impl SegmentedWal {
     }
 
     /// Log a commit record.
-    pub fn log_commit(&self, txn_id: u64) -> std::io::Result<u64> {
-        self.log_control(RECORD_COMMIT, txn_id)
+    pub fn log_commit(&self, txn_id: u64, body: Option<&[u8]>) -> std::io::Result<u64> {
+        self.log_control(RECORD_COMMIT, txn_id, body)
     }
 
     /// Log an abort record.
     pub fn log_abort(&self, txn_id: u64) -> std::io::Result<u64> {
-        self.log_control(RECORD_ABORT, txn_id)
+        self.log_control(RECORD_ABORT, txn_id, None)
     }
 
     /// Log a checkpoint record and update the checkpoint LSN.
     pub fn log_checkpoint(&self) -> std::io::Result<u64> {
-        let lsn = self.log_control(RECORD_CHECKPOINT, 0)?;
+        let lsn = self.log_control(RECORD_CHECKPOINT, 0, None)?;
         self.checkpoint_lsn.store(lsn, Ordering::SeqCst);
         Ok(lsn)
     }
@@ -1370,24 +1424,41 @@ impl SegmentedWal {
         Ok(all_records)
     }
 
-    // Internal: write a control record.
-    fn log_control(&self, record_type: u8, txn_id: u64) -> std::io::Result<u64> {
+    // Internal: write a control record. `body` mirrors [`Wal::log_control`]:
+    // only RECORD_COMMIT carries one, and the CRC covers it.
+    fn log_control(
+        &self,
+        record_type: u8,
+        txn_id: u64,
+        body: Option<&[u8]>,
+    ) -> std::io::Result<u64> {
         let mut active = self.active.lock();
         // LSN allocated under the segment lock — see Wal::log_page_write.
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
 
-        let record_len = CONTROL_RECORD_SIZE as u32;
+        let body_len = body.map_or(0, |b| b.len());
+        let record_len = (CONTROL_RECORD_SIZE + body_len) as u32;
         active.writer.write_all(&record_len.to_le_bytes())?;
         active.writer.write_all(&lsn.to_le_bytes())?;
         active.writer.write_all(&txn_id.to_le_bytes())?;
         active.writer.write_all(&[record_type])?;
         active.writer.write_all(&0u32.to_le_bytes())?;
+        if let Some(b) = body {
+            active.writer.write_all(b)?;
+        }
 
         let mut crc_buf = [0u8; 17];
         crc_buf[..8].copy_from_slice(&lsn.to_le_bytes());
         crc_buf[8..16].copy_from_slice(&txn_id.to_le_bytes());
         crc_buf[16] = record_type;
-        let crc = crc32c::crc32c(&crc_buf);
+        let crc = match body {
+            Some(b) => {
+                let mut c = crc32c::crc32c(&crc_buf);
+                c = crc32c::crc32c_append(c, b);
+                c
+            }
+            None => crc32c::crc32c(&crc_buf),
+        };
         active.writer.write_all(&crc.to_le_bytes())?;
 
         active.bytes_written += record_len as u64;
@@ -1487,8 +1558,8 @@ impl WalBackend for SegmentedWal {
         SegmentedWal::group_sync(self)
     }
 
-    fn log_commit(&self, txn_id: u64) -> std::io::Result<u64> {
-        SegmentedWal::log_commit(self, txn_id)
+    fn log_commit(&self, txn_id: u64, body: Option<&[u8]>) -> std::io::Result<u64> {
+        SegmentedWal::log_commit(self, txn_id, body)
     }
 
     fn log_abort(&self, txn_id: u64) -> std::io::Result<u64> {
@@ -1964,6 +2035,82 @@ pub(crate) fn list_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
 mod tests {
     use super::*;
 
+    // ── S63 commit-record bodies ─────────────────────────────────────────
+
+    /// A COMMIT record with an enlistment body round-trips on the single-file
+    /// backend: the body is recovered, and it is inside the CRC.
+    #[test]
+    fn commit_record_body_roundtrips_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("body.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            let body = [0xEEu8; 10];
+            wal.log_commit(7, Some(&body)).unwrap();
+            // A pre-S63 commit beside it: zero body.
+            wal.log_commit(8, None).unwrap();
+            wal.sync().unwrap();
+        }
+        let records = read_wal_records(&wal_path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record_type, RECORD_COMMIT);
+        assert_eq!(
+            records[0].control_body.as_deref(),
+            Some(&[0xEEu8; 10][..]),
+            "the enlistment body must survive the round trip"
+        );
+        assert_eq!(
+            records[1].control_body, None,
+            "a zero-body commit record reads back as no-body (pre-S63 shape)"
+        );
+    }
+
+    /// Same proof on the segmented backend — the served configuration.
+    #[test]
+    fn commit_record_body_roundtrips_segmented() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("body.wal.d");
+        {
+            let wal =
+                SegmentedWal::open_with_sync_mode(&wal_dir, 1024 * 1024, SyncMode::Fsync).unwrap();
+            let body = [0xABu8; 10];
+            wal.log_commit(3, Some(&body)).unwrap();
+            wal.log_commit(4, None).unwrap();
+            wal.sync().unwrap();
+        }
+        let records = read_wal_dir_records(&wal_dir).unwrap();
+        assert_eq!(records.len(), 2, "both commits parse");
+        assert_eq!(
+            records[0].control_body.as_deref(),
+            Some(&[0xABu8; 10][..]),
+            "the body must survive the segment round trip"
+        );
+        assert_eq!(records[1].control_body, None);
+    }
+
+    /// The body is checksummed: a flipped body byte must fail the CRC rather
+    /// than silently corrupting the committed-xact set the S63 filter keys on.
+    /// The body sits after the 25-byte header; the CRC is the last 4 bytes.
+    #[test]
+    fn a_corrupted_commit_body_fails_its_crc() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("corrupt-body.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(9, Some(&[0x11u8; 10])).unwrap();
+            wal.sync().unwrap();
+        }
+        let mut data = std::fs::read(&wal_path).unwrap();
+        data[RECORD_HEADER_SIZE] ^= 0xFF; // first body byte
+        std::fs::write(&wal_path, data).unwrap();
+
+        let scan = scan_wal(&wal_path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            scan.records.is_empty() && scan.valid_end == 0,
+            "a corrupt body must fail the CRC, not parse as a different body"
+        );
+    }
+
     // ── Undo records (CAMPAIGN-02) ──────────────────────────────────────
 
     #[test]
@@ -2039,7 +2186,7 @@ mod tests {
 
         let page = [42u8; PAGE_SIZE];
         let lsn1 = wal.log_page_write(1, 10, &page).unwrap();
-        let lsn2 = wal.log_commit(1).unwrap();
+        let lsn2 = wal.log_commit(1, None).unwrap();
         wal.sync().unwrap();
 
         assert_eq!(lsn1, 1);
@@ -2062,8 +2209,8 @@ mod tests {
         let wal_path = dir.path().join("torn.wal");
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(1).unwrap();
-            wal.log_commit(2).unwrap();
+            wal.log_commit(1, None).unwrap();
+            wal.log_commit(2, None).unwrap();
             wal.sync().unwrap();
         }
         // Simulate a crash mid-append: valid length prefix, torn payload.
@@ -2081,7 +2228,7 @@ mod tests {
         // and replay recovers every record with no CRC corruption.
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(3).unwrap();
+            wal.log_commit(3, None).unwrap();
             wal.sync().unwrap();
         }
         let records = read_wal_records(&wal_path).unwrap();
@@ -2093,7 +2240,7 @@ mod tests {
         // And it stays clean across further restarts (the fixed-LSN symptom).
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(4).unwrap();
+            wal.log_commit(4, None).unwrap();
             wal.sync().unwrap();
         }
         assert_eq!(read_wal_records(&wal_path).unwrap().len(), 4);
@@ -2105,13 +2252,13 @@ mod tests {
         let wal_path = dir.path().join("reopen.wal");
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(1).unwrap();
-            wal.log_commit(2).unwrap();
+            wal.log_commit(1, None).unwrap();
+            wal.log_commit(2, None).unwrap();
             wal.sync().unwrap();
         }
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(3).unwrap();
+            wal.log_commit(3, None).unwrap();
             wal.sync().unwrap();
         }
         let records = read_wal_records(&wal_path).unwrap();
@@ -2130,9 +2277,9 @@ mod tests {
         let wal_path = dir.path().join("corrupt.wal");
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(1).unwrap();
-            wal.log_commit(2).unwrap();
-            wal.log_commit(3).unwrap();
+            wal.log_commit(1, None).unwrap();
+            wal.log_commit(2, None).unwrap();
+            wal.log_commit(3, None).unwrap();
             wal.sync().unwrap();
         }
 
@@ -2174,8 +2321,8 @@ mod tests {
         let wal_path = dir.path().join("torn.wal");
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(1).unwrap();
-            wal.log_commit(2).unwrap();
+            wal.log_commit(1, None).unwrap();
+            wal.log_commit(2, None).unwrap();
             wal.sync().unwrap();
         }
         // A record whose declared length overruns the file: crash mid-append.
@@ -2205,9 +2352,9 @@ mod tests {
         let wal_path = dir.path().join("quarantine.wal");
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(1).unwrap();
-            wal.log_commit(2).unwrap();
-            wal.log_commit(3).unwrap();
+            wal.log_commit(1, None).unwrap();
+            wal.log_commit(2, None).unwrap();
+            wal.log_commit(3, None).unwrap();
             wal.sync().unwrap();
         }
         // Corrupt the SECOND record, leaving a third after it.
@@ -2229,7 +2376,7 @@ mod tests {
         // zero under a message that read like routine tail repair.
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(4).unwrap();
+            wal.log_commit(4, None).unwrap();
             wal.sync().unwrap();
         }
         let records = read_wal_records(&wal_path).unwrap();
@@ -2304,8 +2451,8 @@ mod tests {
 
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.log_commit(1).unwrap();
-            wal.log_commit(2).unwrap();
+            wal.log_commit(1, None).unwrap();
+            wal.log_commit(2, None).unwrap();
             wal.sync().unwrap();
         }
 
@@ -2324,7 +2471,7 @@ mod tests {
         let page = [0u8; PAGE_SIZE];
 
         let lsn1 = wal.log_page_write(1, 0, &page).unwrap();
-        let lsn2 = wal.log_commit(1).unwrap();
+        let lsn2 = wal.log_commit(1, None).unwrap();
         wal.sync().unwrap();
 
         assert_eq!(lsn1, 1);
@@ -2516,9 +2663,9 @@ mod tests {
 
         {
             let wal = SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
-            wal.log_commit(1).unwrap();
-            wal.log_commit(2).unwrap();
-            wal.log_commit(3).unwrap();
+            wal.log_commit(1, None).unwrap();
+            wal.log_commit(2, None).unwrap();
+            wal.log_commit(3, None).unwrap();
             wal.sync().unwrap();
         }
 
@@ -2580,7 +2727,7 @@ mod tests {
             let wal_path = dir.path().join("prop_commit.wal");
             let wal = Wal::open(&wal_path).unwrap();
 
-            let lsn = wal.log_commit(txn_id).unwrap();
+            let lsn = wal.log_commit(txn_id, None).unwrap();
             wal.sync().unwrap();
 
             let records = read_wal_records(&wal_path).unwrap();
@@ -2634,7 +2781,7 @@ mod tests {
                 let rt = record_types[i];
                 let lsn = match rt {
                     0 => wal.log_page_write(txn, pid, &page).unwrap(),
-                    1 => wal.log_commit(txn).unwrap(),
+                    1 => wal.log_commit(txn, None).unwrap(),
                     2 => wal.log_abort(txn).unwrap(),
                     _ => wal.log_checkpoint().unwrap(),
                 };
@@ -2680,7 +2827,7 @@ mod tests {
 
             let mut lsns = Vec::with_capacity(num_records);
             for i in 0..num_records {
-                let lsn = wal.log_commit(i as u64).unwrap();
+                let lsn = wal.log_commit(i as u64, None).unwrap();
                 lsns.push(lsn);
             }
             wal.sync().unwrap();
@@ -3141,7 +3288,7 @@ mod archive_tests {
         let page = [3u8; PAGE_SIZE];
         for txn in 1..=18u64 {
             wal.log_page_write(txn, txn as u32, &page).unwrap();
-            wal.log_commit(txn).unwrap();
+            wal.log_commit(txn, None).unwrap();
         }
         wal.sync().unwrap();
         wal.archive_active().unwrap();
@@ -3271,7 +3418,7 @@ mod archive_tests {
 
         let page = [7u8; PAGE_SIZE];
         wal.log_page_write(1, 1, &page).unwrap();
-        wal.log_commit(1).unwrap();
+        wal.log_commit(1, None).unwrap();
         wal.sync().unwrap();
 
         assert!(

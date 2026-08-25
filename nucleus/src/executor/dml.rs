@@ -352,7 +352,7 @@ impl Executor {
                 &col_meta,
                 false,
             )
-            .await;
+            .await?;
         }
 
         let mut count = 0;
@@ -414,7 +414,7 @@ impl Executor {
                     &col_meta,
                     true,
                 )
-                .await;
+                .await?;
             }
 
             // Enforce NOT NULL, CHECK, FK, and enum constraints (hard-fail even with ON CONFLICT)
@@ -742,7 +742,7 @@ impl Executor {
                 &col_meta,
                 true,
             )
-            .await;
+            .await?;
         }
 
         // Fire AFTER INSERT statement-level triggers
@@ -756,7 +756,7 @@ impl Executor {
                 &col_meta,
                 false,
             )
-            .await;
+            .await?;
         }
 
         // ── Write-time materialized view refresh ────────────────────────────
@@ -1268,8 +1268,12 @@ impl Executor {
                     )));
                 }
 
-                // Scan the referenced table to see if the values exist
-                let ref_rows = self.storage.scan(ref_table).await?;
+                // Scan the referenced table to see if the values exist. The
+                // parent may live in a per-table engine (WITH (engine=...));
+                // the base engine's scan sees an empty table and every child
+                // write would fail FK validation. Route like every other
+                // table access.
+                let ref_rows = self.storage_for(ref_table).scan(ref_table).await?;
                 let found = ref_rows.iter().any(|ref_row| {
                     ref_col_indices
                         .iter()
@@ -2361,7 +2365,7 @@ impl Executor {
                 &col_meta,
                 false,
             )
-            .await;
+            .await?;
         }
 
         let mut updates = Vec::new();
@@ -2403,7 +2407,7 @@ impl Executor {
                         &col_meta,
                         true,
                     )
-                    .await;
+                    .await?;
                 }
 
                 self.enforce_rls_new_row(
@@ -2637,7 +2641,7 @@ impl Executor {
                 &col_meta,
                 true,
             )
-            .await;
+            .await?;
         }
 
         // Fire AFTER UPDATE statement-level triggers
@@ -2651,7 +2655,7 @@ impl Executor {
                 &col_meta,
                 false,
             )
-            .await;
+            .await?;
         }
 
         // Notify reactive subscribers with real before/after row data
@@ -2776,7 +2780,7 @@ impl Executor {
                 &col_meta,
                 false,
             )
-            .await;
+            .await?;
         }
 
         let mut positions = Vec::new();
@@ -2802,7 +2806,7 @@ impl Executor {
                         &col_meta,
                         true,
                     )
-                    .await;
+                    .await?;
                 }
 
                 if let Some(ref returning_items) = delete.returning {
@@ -2926,7 +2930,7 @@ impl Executor {
                         &col_meta,
                         true,
                     )
-                    .await;
+                    .await?;
                 }
             }
 
@@ -2940,7 +2944,7 @@ impl Executor {
                 &col_meta,
                 false,
             )
-            .await;
+            .await?;
         }
 
         // Notify reactive subscribers with real deleted row data

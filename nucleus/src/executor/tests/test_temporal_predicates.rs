@@ -291,3 +291,44 @@ async fn test_non_matching_temporal_windows_stay_empty() {
         );
     }
 }
+
+/// Interval↔interval predicates. `compare_values` had no `(Interval,
+/// Interval)` arm, so `iv = INTERVAL '1 day'` silently matched nothing while
+/// `Ord for Value` ordered intervals fine — the same projection/WHERE
+/// divergence shape this file exists for (WIR-5).
+#[tokio::test]
+async fn test_interval_predicates() {
+    let ex = test_executor();
+
+    let r = exec(
+        &ex,
+        "SELECT INTERVAL '1 day' = INTERVAL '1 day', INTERVAL '1 day' < INTERVAL '2 days', \
+         INTERVAL '1 month' > INTERVAL '30 days'",
+    )
+    .await;
+    assert_eq!(
+        rows(&r[0])[0],
+        vec![Value::Bool(true), Value::Bool(true), Value::Bool(true),],
+        "interval comparisons must compare, not silently answer false"
+    );
+
+    exec(
+        &ex,
+        "CREATE TABLE shifts (id INT PRIMARY KEY, len INTERVAL)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO shifts VALUES (1, INTERVAL '1 day'), (2, INTERVAL '2 days')",
+    )
+    .await;
+    assert_eq!(
+        count(&ex, "SELECT id FROM shifts WHERE len = INTERVAL '1 day'").await,
+        1,
+        "equality predicate on an interval column matched nothing"
+    );
+    assert_eq!(
+        count(&ex, "SELECT id FROM shifts WHERE len < INTERVAL '2 days'").await,
+        1
+    );
+}

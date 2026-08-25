@@ -54,8 +54,13 @@ impl Executor {
         // Arm per-session cross-model tracking. Before-images are captured
         // lazily, at this session's first write to each store, so a SQL-only
         // transaction no longer deep-clones every specialty store (including
-        // every HNSW graph) just to open.
-        *sess.cross_model.lock() = Some(CrossModelTxn::new());
+        // every HNSW graph) just to open. The coordinator id is minted here,
+        // at BEGIN — not at COMMIT — because specialty records written during
+        // the transaction must be able to carry it (S63).
+        let xid = self
+            .next_xact_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *sess.cross_model.lock() = Some(CrossModelTxn::new(xid));
         txn.security_snapshot = Some(self.security.read().clone_policy_state());
         txn.security_pending = None;
         txn.security_savepoints.clear();
@@ -139,6 +144,32 @@ impl Executor {
                     self.bump_policy_gen();
                     return Err(error);
                 }
+            }
+        }
+
+        // S63: an enlisted transaction's COMMIT must durably vouch for its
+        // coordinating id, or recovery discards its specialty records. On an
+        // MVCC engine the marker rides the real COMMIT record; on anything
+        // else (bare DiskEngine) no commit record exists at all, so the
+        // engine writes a standalone one. Both happen BEFORE the commit is
+        // acknowledged, so a crash in between leaves the discard direction:
+        // no marker, no specialty writes — atomic by absence.
+        //
+        // The crashpoint just below lands between the transaction's
+        // specialty records (already appended and flushed by the statements
+        // that made them) and this marker: the discard half of the S63 proof.
+        crate::storage::crashpoint::reach("crossmodel.before_commit_record");
+        let enlistment_body = sess
+            .cross_model
+            .lock()
+            .as_ref()
+            .filter(|cm| !cm.enlisted.is_empty())
+            .map(|cm| super::enlistment::encode_xact_body(cm.xid, &cm.enlisted));
+        if let Some(body) = enlistment_body {
+            if self.storage.supports_mvcc() {
+                self.storage.set_pending_enlistment(body);
+            } else {
+                self.storage.log_xact_commit(&body)?;
             }
         }
 
@@ -298,13 +329,19 @@ impl Executor {
             }
             txn.engine_savepoints.push((name.to_string(), level));
         }
-        let security_snapshot = txn
-            .security_pending
-            .as_ref()
-            .map(|security| security.clone_policy_state())
-            .unwrap_or_else(|| self.security.read().clone_policy_state());
-        txn.security_savepoints
-            .push((name.to_string(), security_snapshot));
+        // Record the security STAGING state (not a catalog clone): restoring
+        // this pair at ROLLBACK TO is what keeps a transaction that never
+        // touched policy from publishing an old catalog over other sessions'
+        // committed policy DDL at COMMIT.
+        let sp = super::session::SecuritySavepoint {
+            name: name.to_string(),
+            pending: txn
+                .security_pending
+                .as_ref()
+                .map(|security| security.clone_policy_state()),
+            policy_dirty: txn.policy_dirty,
+        };
+        txn.security_savepoints.push(sp);
 
         // Open a cross-model level for this savepoint. Its before-images are
         // captured lazily at the first write after this point, so a savepoint
@@ -338,7 +375,11 @@ impl Executor {
         if let Some(pos) = txn.engine_savepoints.iter().rposition(|(n, _)| n == name) {
             txn.engine_savepoints.truncate(pos);
         }
-        if let Some(pos) = txn.security_savepoints.iter().rposition(|(n, _)| n == name) {
+        if let Some(pos) = txn
+            .security_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        {
             txn.security_savepoints.truncate(pos);
         }
         // Releasing keeps the writes; every level below already recorded them,
@@ -394,16 +435,25 @@ impl Executor {
             }
         };
 
-        let security_pos = txn
+        let sp_pos = txn
             .security_savepoints
             .iter()
-            .rposition(|(n, _)| n == name)
+            .rposition(|sp| sp.name == name)
             .ok_or_else(|| ExecError::Unsupported(format!("savepoint {name} does not exist")))?;
-        let security_snapshot = txn.security_savepoints[security_pos].1.clone_policy_state();
-        txn.security_pending = Some(security_snapshot);
-        self.bump_policy_gen();
-        txn.security_savepoints.truncate(security_pos + 1);
-        txn.policy_dirty = true;
+        // Restore the (pending, policy_dirty) pair as of the savepoint. If
+        // neither changed since, this is a full no-op: nothing staged, no gen
+        // bump, and COMMIT publishes nothing — other sessions' committed
+        // policy DDL survives.
+        let sp = &txn.security_savepoints[sp_pos];
+        let changed = txn.policy_dirty || sp.policy_dirty;
+        let pending = sp.pending.as_ref().map(|s| s.clone_policy_state());
+        let dirty = sp.policy_dirty;
+        txn.security_pending = pending;
+        txn.policy_dirty = dirty;
+        if changed {
+            self.bump_policy_gen();
+        }
+        txn.security_savepoints.truncate(sp_pos + 1);
         let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
         drop(txn);
 

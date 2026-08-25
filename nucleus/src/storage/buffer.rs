@@ -603,10 +603,17 @@ impl BufferPool {
     /// The caller must sync the WAL after this before acknowledging the
     /// commit: a COMMIT record that is not durable is one recovery will not
     /// see, and it will undo the transaction the client was told succeeded.
-    /// Returns the LSN of the control record, or 0 when no WAL is configured.
-    pub fn end_page_txn(&self, txn_id: u64, committed: bool) -> Result<u64, BufferError> {
+    /// `commit_body` is the optional S63 enlistment payload carried inside the
+    /// COMMIT record (`None` for plain SQL transactions). Returns the LSN of
+    /// the control record, or 0 when no WAL is configured.
+    pub fn end_page_txn(
+        &self,
+        txn_id: u64,
+        committed: bool,
+        commit_body: Option<&[u8]>,
+    ) -> Result<u64, BufferError> {
         let result = match self.wal {
-            Some(ref wal) if committed => wal.log_commit(txn_id),
+            Some(ref wal) if committed => wal.log_commit(txn_id, commit_body),
             Some(ref wal) => wal.log_abort(txn_id),
             None => Ok(0),
         };
@@ -1306,7 +1313,7 @@ impl BufferPool {
     }
 
     /// Flush up to `max_pages` dirty pages from the tracked set.
-    /// Returns the number actually flushed.
+    /// Returns the number actually flushed (WAL-logged and written).
     pub fn flush_dirty_batch(&self, max_pages: usize) -> usize {
         let to_flush: Vec<u32> = {
             let mut set = self.dirty_set.lock();
@@ -1323,6 +1330,13 @@ impl BufferPool {
             && let Err(e) = wal.sync()
         {
             tracing::error!("WAL sync failed before data page flush: {e}");
+            // Nothing was written, so the frames must go back to the tracked
+            // set — leaving them dirty-but-untracked hid them from every
+            // dirty_set-driven flusher until a full flush_all.
+            let mut set = self.dirty_set.lock();
+            for &id in &to_flush {
+                set.insert(id);
+            }
             return 0; // Do NOT write data pages if WAL is not durable
         }
 
@@ -1338,19 +1352,46 @@ impl BufferPool {
                     && desc.is_dirty.load(Ordering::Acquire)
                 {
                     let data = self.frame_data_mut(*frame_id);
-                    if let Some(ref wal) = self.wal
-                        && let Ok(lsn) = self.log_flush(wal.as_ref(), page_id, data)
-                    {
-                        page::set_page_lsn(data, lsn);
+                    // WAL first, no exceptions — every other flush site in
+                    // this file propagates this error. A page whose current
+                    // image has no WAL record must not reach the data file:
+                    // recovery's wal_lsn > disk_lsn test would accept those
+                    // unlogged bytes forever.
+                    let logged = match self.wal.as_ref() {
+                        Some(wal) => match self.log_flush(wal.as_ref(), page_id, data) {
+                            Ok(lsn) => {
+                                page::set_page_lsn(data, lsn);
+                                true
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "WAL append failed for page {page_id}; keeping frame dirty: {e}"
+                                );
+                                false
+                            }
+                        },
+                        None => true,
+                    };
+                    if !logged {
+                        self.dirty_set.lock().insert(*frame_id);
+                        continue;
                     }
                     page::write_checksum(data);
-                    if self.disk.write_page(page_id, data).is_ok() {
-                        desc.is_dirty.store(false, Ordering::Release);
-                        self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
+                    match self.disk.write_page(page_id, data) {
+                        Ok(()) => {
+                            desc.is_dirty.store(false, Ordering::Release);
+                            self.stats.dirty_pages.fetch_sub(1, Ordering::Relaxed);
+                            flushed += 1;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "data page write failed for page {page_id}; keeping frame dirty: {e}"
+                            );
+                            self.dirty_set.lock().insert(*frame_id);
+                        }
                     }
                 }
             }
-            flushed += 1;
         }
 
         // Write-ahead: records minted above must be durable before the pages
@@ -1359,8 +1400,10 @@ impl BufferPool {
             && let Some(ref wal) = self.wal
             && let Err(e) = wal.sync()
         {
-            tracing::error!("WAL sync failed before flushing {flushed} pages: {e}");
-            return 0;
+            // The pages ARE written — reporting zero would pretend they
+            // weren't. Log and keep the count; the next flush_all surfaces
+            // the WAL fault.
+            tracing::error!("WAL sync failed after flushing {flushed} pages: {e}");
         }
 
         // Sync data pages to stable storage so they survive power failure.
@@ -1388,10 +1431,11 @@ impl BufferPool {
         }
     }
 
-    /// Log a COMMIT record to the WAL for the given transaction ID.
-    pub fn wal_log_commit(&self, txn_id: u64) -> Result<u64, BufferError> {
+    /// Log a COMMIT record to the WAL for the given transaction ID. `body` is
+    /// the optional S63 enlistment payload; see [`WalRecord::control_body`].
+    pub fn wal_log_commit(&self, txn_id: u64, body: Option<&[u8]>) -> Result<u64, BufferError> {
         match self.wal.as_ref() {
-            Some(wal) => wal.log_commit(txn_id).map_err(BufferError::Io),
+            Some(wal) => wal.log_commit(txn_id, body).map_err(BufferError::Io),
             None => Ok(0),
         }
     }
@@ -1870,12 +1914,49 @@ mod dirty_tracking_tests {
         assert_eq!(pool.dirty_page_count(), 1);
     }
 
+    /// A WAL backend whose `log_page_write` fails on demand. `sync` keeps
+    /// succeeding so the failure being exercised is exactly the WAL APPEND
+    /// that must gate the data-page write.
+    struct FailWal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl super::super::wal::WalBackend for FailWal {
+        fn log_page_write(
+            &self,
+            _txn_id: u64,
+            _page_id: u32,
+            _page_image: &PageBuf,
+        ) -> std::io::Result<u64> {
+            if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                Err(std::io::Error::other("injected WAL append failure"))
+            } else {
+                Ok(1)
+            }
+        }
+        fn log_page_undo(
+            &self,
+            _txn_id: u64,
+            _page_id: u32,
+            _before_image: &PageBuf,
+        ) -> std::io::Result<u64> {
+            Ok(0)
+        }
+        fn sync(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn bump_next_lsn(&self, _min_next: u64) {}
+    }
+
+    fn dirty_pages(pool: &BufferPool, n: usize) {
+        for _ in 0..n {
+            let (_, fid) = pool.new_page().unwrap();
+            pool.unpin(fid);
+        }
+    }
+
     #[test]
     fn flush_dirty_batch_partial() {
         let (pool, _dir) = make_pool(16);
-        for i in 0..10u32 {
-            pool.dirty_set.lock().insert(i);
-        }
+        dirty_pages(&pool, 10);
         assert_eq!(pool.dirty_page_count(), 10);
         let flushed = pool.flush_dirty_batch(3);
         assert_eq!(flushed, 3);
@@ -1893,11 +1974,42 @@ mod dirty_tracking_tests {
     #[test]
     fn flush_dirty_batch_all() {
         let (pool, _dir) = make_pool(16);
-        for i in 0..5u32 {
-            pool.dirty_set.lock().insert(i);
-        }
+        dirty_pages(&pool, 5);
         let flushed = pool.flush_dirty_batch(100);
         assert_eq!(flushed, 5);
+        assert_eq!(pool.dirty_page_count(), 0);
+    }
+
+    /// STO-5: a WAL-append failure must keep the page out of the data file
+    /// and the frame in the dirty set — writing it with a stale LSN and no
+    /// WAL record is how unlogged bytes reached the data file and were then
+    /// accepted by recovery forever.
+    #[test]
+    fn flush_dirty_batch_skips_and_retries_on_wal_append_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let disk = DiskManager::open(&db_path).unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pool = BufferPool::new(disk, Some(Box::new(FailWal(flag.clone()))), 16, 0);
+        dirty_pages(&pool, 3);
+        assert_eq!(pool.dirty_page_count(), 3);
+
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        let flushed = pool.flush_dirty_batch(100);
+        assert_eq!(
+            flushed, 0,
+            "pages whose WAL record could not be appended must not be counted as flushed"
+        );
+        assert_eq!(
+            pool.dirty_page_count(),
+            3,
+            "frames must stay dirty-tracked when the WAL append fails, or no \
+             dirty_set-driven flusher ever retries them"
+        );
+
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        let flushed = pool.flush_dirty_batch(100);
+        assert_eq!(flushed, 3);
         assert_eq!(pool.dirty_page_count(), 0);
     }
 

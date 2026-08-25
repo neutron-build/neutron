@@ -41,7 +41,7 @@ cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 
 cargo run --release --features server --bin probe_engines
 cargo run --release --features server --bin probe_index_coherence
 cargo run --release --features server --bin probe_streams_oracle -- --iterations 120
-cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30 --skip-section vector --skip-section catalog
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30 --skip-section catalog
 cargo run --release --features "server rusqlite" --bin probe_io_faults
 cargo run --release --features "server rusqlite" --bin probe_blob
 cargo run --release --features server --bin probe_sessions
@@ -54,20 +54,22 @@ change to `storage/tuple.rs` — including one that looks like a pure
 refactor. `probe_ddl_recreate` opens all five engines, so run it after any
 change to DDL registration or to a `StorageEngine` implementation.
 
-**`probe_recover_engines` does not currently pass, and that is not your
-change.** Its `vector` and `catalog` sections report divergences for two live
-findings S35 uncovered - unserialized HNSW tombstones, and the embedded
-builder never loading `meta.json`. Both are described under "What the S35
-probes found immediately" below, and each divergence line names its own
-mechanism. The `datalog` section IS clean and must stay clean.
+**`probe_recover_engines`'s `catalog` section does not currently pass, and
+that is not your change.** It reports divergences for one live finding S35
+uncovered - the embedded builder never loading `meta.json` - described under
+"What the S35 probes found immediately" below; each divergence line names its
+own mechanism. The `datalog` and `vector` sections ARE clean and must stay
+clean (the vector section's two original findings - unserialized HNSW
+tombstones, unpersisted PK registry - were fixed in F1a/F1b, and its
+holdout was removed 2026-08-22).
 
-The gate line above therefore holds those two sections out with
+The gate line above therefore holds the `catalog` section out with
 `--skip-section`, and so does `scripts/probe.sh` (which CI runs). That is a
 deliberate, expiring holdout, not a mute: the probe prints a SKIPPED line for
-each held-out section on every run and reports them as `SKIPPED` rather than
+each held-out section on every run and reports it as `SKIPPED` rather than
 `0 divergence(s)` in the summary, so a green run can never be mistaken for
-full coverage. **Remove the flags when F1 and F2 are fixed** — `probe.sh`
-carries a hard expiry of 2026-09-30.
+full coverage. **Remove the flag when F2 is fixed** — `probe.sh` carries a
+hard expiry of 2026-09-30.
 
 To see the findings, just drop the flags:
 
@@ -233,31 +235,35 @@ is destroyed: a duplicate `CREATE VIEW` and a duplicate `CREATE ROLE` both
 succeed where PostgreSQL raises `relation already exists`, so a client written
 against PostgreSQL never sees the error it handles.
 
-The first two findings remain open:
+The first finding is FIXED; the second remains open:
 
-**1. Vector WAL recovery is not faithful — in both directions.** The `vector`
-section of `probe_recover_engines` reports a recovered HNSW live-vector count
-that disagrees with the acknowledged set on most iterations, sometimes larger
-(deletes resurrecting) and sometimes smaller (live vectors lost; one iteration
-recovered 9 of 16). Two mechanisms, both read at source level:
+**1. Vector WAL recovery is not faithful — in both directions. (FIXED.)** The
+`vector` section of `probe_recover_engines` used to report a recovered HNSW
+live-vector count that disagreed with the acknowledged set on most
+iterations, sometimes larger (deletes resurrecting) and sometimes smaller
+(live vectors lost; one iteration recovered 9 of 16). Two mechanisms, both
+read at source level:
 
-- `HnswIndex::serialize` (`vector/mod.rs`) writes nodes but **not the
+- `HnswIndex::serialize` (`vector/mod.rs`) wrote nodes but **not the
   `deleted` tombstone set**, and `VectorWal::checkpoint`
-  (`vector/wal.rs:248`) snapshots through it — so every tombstone standing at
-  checkpoint time is silently dropped and the deleted vector resurrects on
-  the next reopen. The existing unit test (`test_hnsw_pk_keyed_recovery…`)
-  asserts through a SQL KNN query, which falls back to a base-table scan and
-  masks it.
-- `remove_from_vector_indexes` (`executor/mod.rs:6599-6608`) resolves the
-  tombstone id through the PK registry — which is deliberately not persisted
-  and empty after every reopen — so a post-reopen delete falls back to
+  (`vector/wal.rs`) snapshots through it — so every tombstone standing at
+  checkpoint time was silently dropped and the deleted vector resurrected on
+  the next reopen. Fixed by appending a tagged tombstone section after the
+  footer: a blob that ends at the footer predates it and reads as an empty
+  set, which is what it meant.
+- `remove_from_vector_indexes` (`executor/mod.rs`) resolves the
+  tombstone id through the PK registry — which was deliberately not persisted
+  and empty after every reopen — so a post-reopen delete fell back to
   tombstoning the **physical row position**, a different id space than the
-  WAL's node ids. The real node stays live in the WAL; a row position that
-  collides with a live node id deletes the wrong vector.
+  WAL's node ids. Fixed (F1b, 2026-08-22) by persisting the registry: the
+  checkpoint snapshot carries it as a second tagged section inside the
+  CRC-covered HNSW blob, delta INSERT records carry the pk in their metadata
+  field, and replay rebuilds the map from both. Recovery seeds the registry's
+  allocator at `max(persisted next_node, hnsw.next_free_node_id())` so delta
+  ids beyond the checkpoint can never be reissued.
 
-The insert-only, single-reopen shape is faithful (the negative control runs
-there and is clean), which is why the unit tests pass. The section stays red
-until the tombstone set is serialized and the registry question is settled.
+The section now runs clean in the gate (its holdout was removed), and its
+negative control still discriminates.
 
 **2. The embedded `Database` builder never loads `meta.json`.** Only
 `main.rs:1191` calls `load_meta_checked`; `DatabaseBuilder::build`
@@ -355,7 +361,12 @@ first:
 Note on the io-fault fault points: `datalog.wal_append` and `vector.wal_append`
 were added to `ALL_IO_POINTS` for this, so the existing matrix sweeps them
 with every kind and skip — a failed append must surface as a statement error,
-and only acknowledged mutations may survive the reopen.
+and only acknowledged mutations may survive the reopen. `lsm.sst_write` (the
+KV cold tier's SSTable writes) joined them for the same reason: a failed cold
+flush must fail the `KvStore` checkpoint rather than let it truncate the WAL
+past keys whose only copy is still in RAM, and the KV section asserts every
+acknowledged key survives the reopen through whichever copy is durable
+(STO-1/2 class).
 
 ### `--table-engine` and what it found immediately
 
@@ -430,11 +441,12 @@ crashes, hangs, and self-inconsistency rather than wrong answers.
 | Binary | What it does |
 |---|---|
 | `probe_crash_subprocess` | Real `SIGKILL` of a child at a random instant. The honest crash test. |
-| `probe_crash_points` | Deterministic crash-point matrix (M3) — systematic where the above is random. |
+| `probe_crash_points` | Deterministic crash-point matrix (M3) — systematic where the above is random. Plus a dedicated kv-cold arm: KV keys spill past the hot budget into the cold LsmTree, a checkpoint acks them, the child aborts, and every acked key must read back from disk rather than from the WAL the checkpoint truncated (STO-2). |
 | `probe_txn_atomicity` | **Is a user transaction atomic across a crash on the paged engine the server runs?** |
 | `probe_crossmodel_commit_order` | Crash-injection proof for cross-model commit ordering (R3). |
+| `probe_crossmodel_atomicity` | **Is a SQL+streams transaction atomic across a crash before its COMMIT record (S63)?** Dies at `crossmodel.before_commit_record` and asserts the XADD and the INSERT are both gone; the committed and autocommit directions assert survival on the same reopen. |
 | `probe_durability_torn` | Torn-write / power-loss approximation. |
-| `probe_io_faults` | Disk-full, fsync failure, permission loss — and, since S35, `datalog.wal_append` / `vector.wal_append` fault points whose failed appends must fail the statement (NU-013/NU-048 class). Carries `--negative-control`. |
+| `probe_io_faults` | Disk-full, fsync failure, permission loss — and, since S35, `datalog.wal_append` / `vector.wal_append` fault points whose failed appends must fail the statement (NU-013/NU-048 class). Since the STO-1/2 pass it also drives a KV cold-tier section under `lsm.sst_write`: eviction-spilled keys, a checkpoint under the fault, and acknowledged-key survival on reopen. Carries `--negative-control`. |
 | `probe_recover` | WAL recovery round-trip. |
 | `probe_raft_crash` | Raft persistent state across reopen. |
 | `probe_distributed` | Raft consensus invariants in simulation. |

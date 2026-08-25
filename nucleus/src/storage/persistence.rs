@@ -602,7 +602,10 @@ impl WalStorageEngine {
 
     /// Commit a transaction: log commit record and sync WAL.
     pub fn commit(&self, txn_id: u64) -> Result<u64, PersistenceError> {
-        let lsn = self.wal.log_commit(txn_id).map_err(PersistenceError::Io)?;
+        let lsn = self
+            .wal
+            .log_commit(txn_id, None)
+            .map_err(PersistenceError::Io)?;
         self.wal.sync().map_err(PersistenceError::Io)?;
         Ok(lsn)
     }

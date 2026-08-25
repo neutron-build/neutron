@@ -875,6 +875,44 @@ async fn stext(ex: &Executor, sql: &str) -> String {
     }
 }
 
+/// S31-15: duplicate field names in one XADD are a client error at the write
+/// surface, but entries written before that check (or replayed from a log
+/// that predates it) still carry both pairs — the RESP render preserves
+/// them, like Redis — and a JSON object cannot carry duplicate keys, so the
+/// SQL render collapses them deterministically LAST-WINS. This pins the
+/// read-side contract so a future change to it is a decision, not an
+/// accident. The entry is seeded directly into the stream map because no
+/// write surface will produce it any more.
+#[tokio::test]
+async fn stream_duplicate_field_rendering_is_deterministic() {
+    let ex = test_executor();
+    {
+        let mut streams = ex.streams.write();
+        streams.entry("dupf".to_string()).or_default().xadd_with_id(
+            crate::pubsub::StreamEntryId::new(1, 0),
+            vec![
+                ("f".to_string(), "a".to_string()),
+                ("f".to_string(), "b".to_string()),
+            ],
+        );
+    }
+
+    // JSON object render: last value wins, deterministically.
+    let rendered = stext(&ex, "SELECT STREAM_XRANGE('dupf', 0, 9999999999999, 10)").await;
+    assert!(
+        rendered.contains(r#""f":"b""#),
+        "duplicate fields must render last-wins, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains(r#""f":"a""#),
+        "the collapsed first value must not also appear: {rendered}"
+    );
+
+    // The RESP path (flat array) preserves both pairs, Redis-style.
+    let resp_count = stext(&ex, "SELECT STREAM_XLEN('dupf')").await;
+    assert_eq!(resp_count, "1");
+}
+
 /// A stream written inside an aborted transaction must not keep the write.
 ///
 /// Streams were one of the models a transaction could write and never roll

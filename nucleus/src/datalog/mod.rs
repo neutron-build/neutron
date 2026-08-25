@@ -196,7 +196,20 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     "Unterminated string literal starting at position {start}"
                 ));
             }
-            let s: String = chars[start..i].iter().collect();
+            // Unescape only \\ \" \' — the exact sequences `format_fact_arg`
+            // emits — so a checkpointed quoted constant re-parses to the same
+            // string. Everything else (\n etc.) stays verbatim, as before.
+            let mut s = String::with_capacity(i - start);
+            let mut j = start;
+            while j < i {
+                if chars[j] == '\\' && j + 1 < i && matches!(chars[j + 1], '\\' | '"' | '\'') {
+                    s.push(chars[j + 1]);
+                    j += 2;
+                } else {
+                    s.push(chars[j]);
+                    j += 1;
+                }
+            }
             tokens.push(Token::StringLit(s));
             i += 1; // skip closing quote
             continue;
@@ -585,12 +598,21 @@ impl DatalogStore {
         self.derived.clear();
     }
 
-    /// Add a rule to the store.
-    pub fn add_rule(&mut self, rule: Rule) {
+    /// Add a rule to the store. Rejects rules that would poison evaluation
+    /// for every other predicate: unsafe negation here, and unstratifiable
+    /// programs (negation/aggregation cycles) via `stratify` over the
+    /// proposed ruleset — one bad rule pair used to silently empty every
+    /// derived predicate store-wide.
+    pub fn add_rule(&mut self, rule: Rule) -> Result<(), String> {
+        check_rule_safety(&rule)?;
+        let mut proposed = self.rules.clone();
+        proposed.push(rule.clone());
+        stratify(&proposed)?;
         self.txn_added_rules.push(rule.clone());
         self.rules.push(rule);
         // Invalidate derived facts
         self.derived.clear();
+        Ok(())
     }
 
     /// Remove all facts for a given predicate.
@@ -712,6 +734,41 @@ fn rule_has_aggregates(rule: &Rule) -> bool {
     rule.head.args.iter().any(|t| matches!(t, Term::Agg(_)))
 }
 
+/// Datalog safety: every variable in a negated literal must occur in some
+/// positive body literal of the same rule. An unbound variable cannot be
+/// grounded for the negation check, and the evaluator's lenient fallback
+/// treated the literal as satisfied for every candidate — over-deriving the
+/// head — so the rule is rejected at registration instead.
+fn check_rule_safety(rule: &Rule) -> Result<(), String> {
+    let positive_vars: HashSet<&str> = rule
+        .body
+        .iter()
+        .filter(|l| !l.negated)
+        .flat_map(|l| l.args.iter())
+        .filter_map(|t| match t {
+            Term::Var(v) => Some(v.as_str()),
+            _ => None,
+        })
+        .collect();
+    for lit in &rule.body {
+        if !lit.negated {
+            continue;
+        }
+        for term in &lit.args {
+            if let Term::Var(v) = term
+                && !positive_vars.contains(v.as_str())
+            {
+                return Err(format!(
+                    "unsafe negation: variable '{v}' in negated literal \
+                     '\\+ {}(..)' does not occur in any positive body literal",
+                    lit.predicate
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Merge two binding maps. Returns None if there is a conflict.
 fn merge_bindings(
     a: &HashMap<String, String>,
@@ -779,9 +836,10 @@ fn join_body(
                         let pred_facts = all_facts.get(&lit.predicate);
                         !pred_facts.is_some_and(|fs| fs.contains(&ground))
                     } else {
-                        // If we can't fully ground the negated literal, keep it
-                        // (safety: Datalog requires all vars in negated literals
-                        // to appear in positive literals)
+                        // Unreachable through `add_rule`-validated rules
+                        // (check_rule_safety rejects unbound negated
+                        // variables); kept as a non-panicking fallback for
+                        // directly constructed Rules.
                         true
                     }
                 });
@@ -820,113 +878,109 @@ fn join_body(
     all_results
 }
 
-/// Stratify rules by negation dependencies.
+#[derive(Clone, Copy, PartialEq)]
+enum EdgeKind {
+    Positive,
+    Negation,
+    Aggregate,
+}
+
+/// Stratify rules by their full dependency graph.
 ///
-/// Rules are grouped into strata such that if rule R uses `\+ p(...)` in its
-/// body, then all rules defining `p` are in a lower stratum than R.
+/// Positive:    s(head) >= s(body)      (equality allowed — the semi-naive
+///                                       fixpoint resolves mutual recursion
+///                                       within a stratum)
+/// Negation and aggregate consumers:
+///              s(head) >= s(body) + 1  (strict; the body relation must be
+///                                       complete before the rule fires)
+/// A strict edge participating in a cycle is rejected up front.
+///
+/// The old DFS assigned strata from negation dependencies ONLY, so a rule
+/// positively consuming a higher-stratum predicate landed in a lower stratum,
+/// was evaluated before its input existed, and was never retried.
 fn stratify(rules: &[Rule]) -> Result<Vec<Vec<usize>>, String> {
     if rules.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Build dependency graph: head_pred -> set of predicates it depends on negatively
-    let mut pred_to_rules: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, rule) in rules.iter().enumerate() {
-        pred_to_rules
-            .entry(rule.head.predicate.clone())
-            .or_default()
-            .push(i);
-    }
-
-    // Collect all predicates that appear as rule heads
     let head_preds: HashSet<String> = rules.iter().map(|r| r.head.predicate.clone()).collect();
+    let agg_heads: HashSet<String> = rules
+        .iter()
+        .filter(|r| rule_has_aggregates(r))
+        .map(|r| r.head.predicate.clone())
+        .collect();
 
-    // Build a dependency graph for stratification
-    // Edge (A, B) means predicate A negatively depends on predicate B
-    let mut neg_deps: HashMap<String, HashSet<String>> = HashMap::new();
+    // One edge per rule body literal whose predicate is itself a rule head.
+    // EDB predicates impose no ordering.
+    let mut edges: Vec<(String, String, EdgeKind)> = Vec::new();
     let mut all_deps: HashMap<String, HashSet<String>> = HashMap::new();
-
     for rule in rules {
-        let head_pred = &rule.head.predicate;
         for lit in &rule.body {
-            if lit.negated && head_preds.contains(&lit.predicate) {
-                neg_deps
-                    .entry(head_pred.clone())
-                    .or_default()
-                    .insert(lit.predicate.clone());
+            if !head_preds.contains(&lit.predicate) {
+                continue;
             }
-            if head_preds.contains(&lit.predicate) {
-                all_deps
-                    .entry(head_pred.clone())
-                    .or_default()
-                    .insert(lit.predicate.clone());
-            }
+            let kind = if lit.negated {
+                EdgeKind::Negation
+            } else if agg_heads.contains(&lit.predicate) {
+                EdgeKind::Aggregate
+            } else {
+                EdgeKind::Positive
+            };
+            edges.push((rule.head.predicate.clone(), lit.predicate.clone(), kind));
+            all_deps
+                .entry(rule.head.predicate.clone())
+                .or_default()
+                .insert(lit.predicate.clone());
         }
     }
 
-    // Check for negation cycles
-    // A negation cycle exists if predicate A negatively depends on B and B
-    // (transitively) depends on A
-    for (pred, neg_targets) in &neg_deps {
-        for target in neg_targets {
-            if can_reach(target, pred, &all_deps) {
-                return Err(format!(
-                    "Negation cycle detected between '{pred}' and '{target}' — \
-                     program is not stratifiable"
-                ));
+    // Reject non-stratifiable programs: any strict edge whose target can
+    // reach its head through ANY dependency closes a cycle through negation
+    // or aggregation. (Supersedes the old neg_deps-only check.)
+    for (head, body, kind) in &edges {
+        if *kind == EdgeKind::Positive {
+            continue;
+        }
+        if body == head || can_reach(body, head, &all_deps) {
+            let what = if *kind == EdgeKind::Negation {
+                "Negation"
+            } else {
+                "Aggregation"
+            };
+            return Err(format!(
+                "{what} cycle detected between '{head}' and '{body}' — \
+                 program is not stratifiable"
+            ));
+        }
+    }
+
+    // Minimal stratum assignment by relaxation to fixpoint. Strict cycles
+    // are excluded above, so values are bounded by the number of head
+    // predicates and this terminates; predicates in the same positive SCC
+    // converge to the same stratum.
+    let mut stratum_of: HashMap<String, usize> =
+        head_preds.iter().cloned().map(|p| (p, 0)).collect();
+    loop {
+        let mut changed = false;
+        for (head, body, kind) in &edges {
+            let need = stratum_of[body] + if *kind == EdgeKind::Positive { 0 } else { 1 };
+            if need > stratum_of[head] {
+                stratum_of.insert(head.clone(), need);
+                changed = true;
             }
         }
-    }
-
-    // Assign strata using topological sort on negation dependencies
-    let mut stratum_of: HashMap<String, usize> = HashMap::new();
-    for pred in &head_preds {
-        if !stratum_of.contains_key(pred) {
-            assign_stratum(pred, &neg_deps, &mut stratum_of, &mut HashSet::new());
+        if !changed {
+            break;
         }
     }
 
-    // Group rule indices by stratum
     let max_stratum = stratum_of.values().copied().max().unwrap_or(0);
     let mut strata = vec![Vec::new(); max_stratum + 1];
     for (i, rule) in rules.iter().enumerate() {
-        let s = stratum_of.get(&rule.head.predicate).copied().unwrap_or(0);
-        strata[s].push(i);
+        strata[stratum_of[&rule.head.predicate]].push(i);
     }
-
-    // Remove empty strata
     strata.retain(|s| !s.is_empty());
-
     Ok(strata)
-}
-
-/// Assign a stratum number to a predicate based on its negation dependencies.
-fn assign_stratum(
-    pred: &str,
-    neg_deps: &HashMap<String, HashSet<String>>,
-    stratum_of: &mut HashMap<String, usize>,
-    visiting: &mut HashSet<String>,
-) -> usize {
-    if let Some(&s) = stratum_of.get(pred) {
-        return s;
-    }
-
-    visiting.insert(pred.to_string());
-
-    let mut s = 0;
-    if let Some(deps) = neg_deps.get(pred) {
-        for dep in deps {
-            if visiting.contains(dep) {
-                continue; // Already being processed (cycle handled separately)
-            }
-            let dep_stratum = assign_stratum(dep, neg_deps, stratum_of, visiting);
-            s = s.max(dep_stratum + 1);
-        }
-    }
-
-    visiting.remove(pred);
-    stratum_of.insert(pred.to_string(), s);
-    s
 }
 
 /// Check if `from` can reach `to` in the dependency graph (BFS).
@@ -1089,18 +1143,19 @@ fn evaluate_aggregate_rule(
 impl DatalogStore {
     /// Run the semi-naive evaluation algorithm to compute all derived facts.
     ///
-    /// 1. Stratify rules by negation dependency
+    /// 1. Stratify rules by the full dependency graph
     /// 2. For each stratum, run semi-naive fixed-point iteration
     /// 3. Aggregate rules are evaluated after fixpoint reaches convergence
     /// 4. Derived facts are stored in `self.derived`
-    pub fn evaluate(&mut self) {
+    ///
+    /// Errors on unstratifiable programs instead of silently returning an
+    /// empty derived set — a poisoned store used to answer base facts as if
+    /// nothing was wrong.
+    pub fn evaluate(&mut self) -> Result<(), String> {
         self.derived.clear();
 
         let rules = self.rules.clone();
-        let strata = match stratify(&rules) {
-            Ok(s) => s,
-            Err(_) => return, // Unstratifiable program — skip evaluation
-        };
+        let strata = stratify(&rules)?;
 
         // Count total facts for parallelism threshold check
         let total_facts: usize = self.facts.values().map(|s| s.len()).sum();
@@ -1396,12 +1451,13 @@ impl DatalogStore {
                 }
             }
         }
+        Ok(())
     }
 
     /// Query the store: evaluate all rules, then return tuples matching the
     /// given literal pattern.
-    pub fn query(&mut self, literal: &Literal) -> Vec<Vec<String>> {
-        self.evaluate();
+    pub fn query(&mut self, literal: &Literal) -> Result<Vec<Vec<String>>, String> {
+        self.evaluate()?;
 
         let all = self.all_facts(&literal.predicate);
         let mut results = Vec::new();
@@ -1414,7 +1470,7 @@ impl DatalogStore {
 
         // Sort for deterministic output
         results.sort();
-        results
+        Ok(results)
     }
 }
 
@@ -1445,7 +1501,7 @@ impl DatalogStore {
             Statement::Rule(rule) => {
                 let pred = rule.head.predicate.clone();
                 let arity = rule.head.args.len();
-                self.add_rule(rule);
+                self.add_rule(rule)?;
                 Ok(format!("RULE {pred}/{arity}"))
             }
             Statement::Fact(_) => Err("Expected a rule, got a fact".into()),
@@ -1457,7 +1513,18 @@ impl DatalogStore {
     /// Returns a JSON array of result tuples.
     pub fn sql_query(&mut self, input: &str) -> Result<String, String> {
         let literal = parse_literal_str(input)?;
-        let results = self.query(&literal);
+        // The negation flag used to be parsed and then ignored — the query
+        // returned exactly the tuples the user asked to EXCLUDE. Evaluating a
+        // complement needs a domain declaration, so reject instead.
+        if literal.negated {
+            return Err(
+                "negated literals are not supported in queries — query the positive \
+                 predicate instead (evaluating a complement requires a domain \
+                 declaration)"
+                    .into(),
+            );
+        }
+        let results = self.query(&literal)?;
 
         // Build JSON output
         let json_rows: Vec<String> = results
@@ -1602,6 +1669,14 @@ pub struct DatalogWalState {
 pub struct DatalogWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no recovery reads.
+    /// Set when a checkpoint replaced the log but its reopen failed; cleared
+    /// by the next successful reattach. See `reattach_if_stranded`.
+    stranded: std::sync::atomic::AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
+    #[cfg(test)]
+    fail_reopen_once: std::sync::atomic::AtomicBool,
 }
 
 impl DatalogWal {
@@ -1627,6 +1702,9 @@ impl DatalogWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                stranded: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
@@ -1663,7 +1741,15 @@ impl DatalogWal {
         let mut fact_texts = Vec::new();
         for (pred, tuples) in &store.facts {
             for tuple in tuples {
-                let text = format!("{}({}).", pred, tuple.join(", "));
+                let text = format!(
+                    "{}({}).",
+                    pred,
+                    tuple
+                        .iter()
+                        .map(|a| format_fact_arg(a))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 fact_texts.push(text);
             }
         }
@@ -1721,9 +1807,64 @@ impl DatalogWal {
         {
             let _ = d.sync_all();
         }
-        // Re-open in append mode for future writes
-        let file = OpenOptions::new().append(true).open(&self.path)?;
+        // Re-open in append mode for future writes. The rename above already
+        // unlinked the inode `guard` wraps, so a failure here must mark the
+        // writer stranded: appends reattach (or fail loudly), never write
+        // through a handle no future recovery reads.
+        #[cfg(test)]
+        let injected: Option<io::Error> = self
+            .fail_reopen_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .then(|| io::Error::other("injected datalog WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<io::Error> = None;
+        let file = match injected {
+            Some(e) => {
+                self.stranded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
+            None => match OpenOptions::new().append(true).open(&self.path) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.stranded
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(e);
+                }
+            },
+        };
         *guard = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly instead of
+    /// acknowledging a write to a dead inode.
+    fn reattach_if_stranded(&self, w: &mut BufWriter<File>) -> io::Result<()> {
+        if !self.stranded.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "datalog WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1742,8 +1883,45 @@ impl DatalogWal {
         buf.extend_from_slice(data);
 
         let mut w = self.writer.lock();
+        self.reattach_if_stranded(&mut w)?;
         w.write_all(&buf)?;
         w.flush()
+    }
+}
+
+/// True when `s` re-parses as a bare Atom token (lowercase or `_` start).
+fn is_bare_atom(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True when `s` re-parses as a Number token. The leading-`.` form (`.5`)
+/// is not matched — the quoted fallback round-trips it identically.
+fn is_bare_number(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let parts: Vec<&str> = body.splitn(2, '.').collect();
+    !parts.is_empty()
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Serialize one fact/rule constant so `parse_single_statement` reproduces it
+/// exactly. The checkpoint REGENERATES Datalog text from parsed args, so any
+/// argument that is not a bare atom or number must be quoted — or it either
+/// fails to re-parse (fact silently dropped by replay's `if let Ok`) or
+/// re-parses with a different arity (fact silently corrupted). Order matters:
+/// bare, then either-quote wrap, then escape.
+fn format_fact_arg(s: &str) -> String {
+    if is_bare_atom(s) || is_bare_number(s) {
+        s.to_string()
+    } else if !s.contains('"') && !s.contains('\\') {
+        format!("\"{s}\"")
+    } else if !s.contains('\'') && !s.contains('\\') {
+        format!("'{s}'")
+    } else {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 
@@ -1761,7 +1939,7 @@ fn format_literal(lit: &Literal) -> String {
         .args
         .iter()
         .map(|t| match t {
-            Term::Const(c) => c.clone(),
+            Term::Const(c) => format_fact_arg(c),
             Term::Var(v) => v.clone(),
             Term::Agg(agg) => match agg {
                 AggFunc::Count => "count()".to_string(),
@@ -1926,10 +2104,14 @@ pub fn restore_from_wal(state: DatalogWalState) -> DatalogStore {
         store.assert_fact(&pred, args);
     }
 
-    // Restore rules
+    // Restore rules. A legacy WAL may carry a rule the registration checks
+    // now reject (unsafe negation, unstratifiable pair): warn-skip it rather
+    // than abort recovery over one entry.
     for rule_text in state.rules {
-        if let Ok(Statement::Rule(rule)) = parse_single_statement(&rule_text) {
-            store.add_rule(rule);
+        if let Ok(Statement::Rule(rule)) = parse_single_statement(&rule_text)
+            && let Err(e) = store.add_rule(rule)
+        {
+            tracing::warn!("restored rule rejected by validation, skipping: {e}");
         }
     }
 
@@ -2130,46 +2312,50 @@ mod tests {
         store.assert_fact("parent", vec!["charlie".into(), "dave".into()]);
 
         // ancestor(X, Y) :- parent(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "ancestor".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "parent".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-
-        // ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "ancestor".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "ancestor".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
                     predicate: "parent".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+
+        // ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z).
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "ancestor".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "ancestor".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "parent".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
         let query = Literal {
             predicate: "ancestor".into(),
             args: vec![Term::Const("alice".into()), Term::Var("Who".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
 
         // alice -> bob, alice -> charlie, alice -> dave
         assert_eq!(results.len(), 3);
@@ -2189,46 +2375,50 @@ mod tests {
         store.assert_fact("edge", vec!["d".into(), "e".into()]);
 
         // path(X, Y) :- edge(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "edge".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-
-        // path(X, Z) :- edge(X, Y), path(Y, Z).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
-                    predicate: "edge".into(),
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "path".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
+                    predicate: "edge".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+
+        // path(X, Z) :- edge(X, Y), path(Y, Z).
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "path".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "edge".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "path".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
         let query = Literal {
             predicate: "path".into(),
             args: vec![Term::Const("a".into()), Term::Var("X".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
         assert_eq!(results.len(), 4); // b, c, d, e
     }
 
@@ -2242,67 +2432,73 @@ mod tests {
         store.assert_fact("succ", vec!["3".into(), "4".into()]);
 
         // even(X) :- base_even(X).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "even".into(),
-                args: vec![Term::Var("X".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "base_even".into(),
-                args: vec![Term::Var("X".into())],
-                negated: false,
-            }],
-        });
-
-        // odd(Y) :- even(X), succ(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "odd".into(),
-                args: vec![Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "even".into(),
                     args: vec![Term::Var("X".into())],
                     negated: false,
                 },
-                Literal {
-                    predicate: "succ".into(),
-                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                    negated: false,
-                },
-            ],
-        });
-
-        // even(Y) :- odd(X), succ(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "even".into(),
-                args: vec![Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
-                    predicate: "odd".into(),
+                body: vec![Literal {
+                    predicate: "base_even".into(),
                     args: vec![Term::Var("X".into())],
                     negated: false,
-                },
-                Literal {
-                    predicate: "succ".into(),
-                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                }],
+            })
+            .unwrap();
+
+        // odd(Y) :- even(X), succ(X, Y).
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "odd".into(),
+                    args: vec![Term::Var("Y".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "even".into(),
+                        args: vec![Term::Var("X".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "succ".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
+
+        // even(Y) :- odd(X), succ(X, Y).
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "even".into(),
+                    args: vec![Term::Var("Y".into())],
+                    negated: false,
+                },
+                body: vec![
+                    Literal {
+                        predicate: "odd".into(),
+                        args: vec![Term::Var("X".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "succ".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
         let query_even = Literal {
             predicate: "even".into(),
             args: vec![Term::Var("X".into())],
             negated: false,
         };
-        let results = store.query(&query_even);
+        let results = store.query(&query_even).unwrap();
         let evens: HashSet<&str> = results.iter().map(|r| r[0].as_str()).collect();
         assert!(evens.contains("0"));
         assert!(evens.contains("2"));
@@ -2321,37 +2517,39 @@ mod tests {
         store.assert_fact("likes", vec!["bob".into(), "charlie".into()]);
 
         // dislikes(X, Y) :- person(X), person(Y), \+ likes(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "dislikes".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
-                    predicate: "person".into(),
-                    args: vec![Term::Var("X".into())],
-                    negated: false,
-                },
-                Literal {
-                    predicate: "person".into(),
-                    args: vec![Term::Var("Y".into())],
-                    negated: false,
-                },
-                Literal {
-                    predicate: "likes".into(),
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "dislikes".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                    negated: true,
+                    negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "person".into(),
+                        args: vec![Term::Var("X".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "person".into(),
+                        args: vec![Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "likes".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: true,
+                    },
+                ],
+            })
+            .unwrap();
 
         let query = Literal {
             predicate: "dislikes".into(),
             args: vec![Term::Const("alice".into()), Term::Var("Y".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
         // alice likes bob, so dislikes alice/charlie and alice/alice
         let targets: HashSet<&str> = results.iter().map(|r| r[1].as_str()).collect();
         assert!(targets.contains("alice")); // self-dislike (alice doesn't like alice)
@@ -2366,46 +2564,50 @@ mod tests {
         store.assert_fact("edge", vec!["b".into(), "c".into()]);
 
         // reach(X, Y) :- edge(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "reach".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "edge".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-
-        // reach(X, Z) :- reach(X, Y), reach(Y, Z).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "reach".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "reach".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
+                    predicate: "edge".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+
+        // reach(X, Z) :- reach(X, Y), reach(Y, Z).
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "reach".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "reach".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "reach".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
         let query = Literal {
             predicate: "reach".into(),
             args: vec![Term::Var("X".into()), Term::Var("Y".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
         // edges: a->b, b->c; transitive: a->c
         assert_eq!(results.len(), 3); // (a,b), (b,c), (a,c)
     }
@@ -2419,46 +2621,50 @@ mod tests {
         store.assert_fact("edge", vec!["c".into(), "a".into()]);
 
         // reach(X, Y) :- edge(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "reach".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "edge".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-
-        // reach(X, Z) :- reach(X, Y), edge(Y, Z).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "reach".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "reach".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
                     predicate: "edge".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+
+        // reach(X, Z) :- reach(X, Y), edge(Y, Z).
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "reach".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "reach".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "edge".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
         let query = Literal {
             predicate: "reach".into(),
             args: vec![Term::Var("X".into()), Term::Var("Y".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
         // 3 nodes, each can reach all 3 (including self via cycle) = 9
         // But a->a, b->b, c->c only via going around, which is valid
         assert_eq!(results.len(), 9);
@@ -2481,29 +2687,31 @@ mod tests {
         );
 
         // in_dept(Name, Dept) :- employee(Name, Dept, Salary).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "in_dept".into(),
-                args: vec![Term::Var("Name".into()), Term::Var("Dept".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "employee".into(),
-                args: vec![
-                    Term::Var("Name".into()),
-                    Term::Var("Dept".into()),
-                    Term::Var("Salary".into()),
-                ],
-                negated: false,
-            }],
-        });
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "in_dept".into(),
+                    args: vec![Term::Var("Name".into()), Term::Var("Dept".into())],
+                    negated: false,
+                },
+                body: vec![Literal {
+                    predicate: "employee".into(),
+                    args: vec![
+                        Term::Var("Name".into()),
+                        Term::Var("Dept".into()),
+                        Term::Var("Salary".into()),
+                    ],
+                    negated: false,
+                }],
+            })
+            .unwrap();
 
         let query = Literal {
             predicate: "in_dept".into(),
             args: vec![Term::Var("N".into()), Term::Const("engineering".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -2517,39 +2725,43 @@ mod tests {
         }
 
         // path(X, Y) :- edge(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "edge".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-
-        // path(X, Z) :- edge(X, Y), path(Y, Z).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
-                    predicate: "edge".into(),
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "path".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
+                    predicate: "edge".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+
+        // path(X, Z) :- edge(X, Y), path(Y, Z).
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "path".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "edge".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "path".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
         // Query just from n0 — should reach all 100 nodes
         let query = Literal {
@@ -2557,7 +2769,7 @@ mod tests {
             args: vec![Term::Const("n0".into()), Term::Var("X".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
         assert_eq!(results.len(), 100); // n0 -> n1..n100
     }
 
@@ -2571,7 +2783,7 @@ mod tests {
             args: vec![Term::Const("eve".into()), Term::Var("X".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
         assert!(results.is_empty());
     }
 
@@ -2585,46 +2797,50 @@ mod tests {
         store.assert_fact("edge", vec!["a".into(), "c".into()]); // shortcut
 
         // tc(X, Y) :- edge(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "tc".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "edge".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-
-        // tc(X, Z) :- tc(X, Y), tc(Y, Z).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "tc".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "tc".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
+                    predicate: "edge".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+
+        // tc(X, Z) :- tc(X, Y), tc(Y, Z).
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "tc".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "tc".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "tc".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
         let query = Literal {
             predicate: "tc".into(),
             args: vec![Term::Var("X".into()), Term::Var("Y".into())],
             negated: false,
         };
-        let results = store.query(&query);
+        let results = store.query(&query).unwrap();
 
         // Expected TC: (a,b), (b,c), (c,d), (a,c), (a,d), (b,d)
         assert_eq!(results.len(), 6);
@@ -2877,18 +3093,20 @@ mod tests {
         let mut store = DatalogStore::new();
         store.assert_fact("parent", vec!["alice".into(), "bob".into()]);
         store.assert_fact("parent", vec!["bob".into(), "charlie".into()]);
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "ancestor".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "parent".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "ancestor".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                },
+                body: vec![Literal {
+                    predicate: "parent".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
 
         // Checkpoint
         wal.checkpoint(&store).unwrap();
@@ -2930,11 +3148,13 @@ mod tests {
             .sql_rule("dept_count(Dept, count()) :- employee(Name, Dept, Sal)")
             .unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "dept_count".into(),
-            args: vec![Term::Var("D".into()), Term::Var("C".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "dept_count".into(),
+                args: vec![Term::Var("D".into()), Term::Var("C".into())],
+                negated: false,
+            })
+            .unwrap();
         assert_eq!(results.len(), 2);
         let map: HashMap<&str, &str> = results
             .iter()
@@ -2965,11 +3185,13 @@ mod tests {
             .sql_rule("dept_salary(Dept, sum(Sal)) :- employee(Name, Dept, Sal)")
             .unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "dept_salary".into(),
-            args: vec![Term::Var("D".into()), Term::Var("S".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "dept_salary".into(),
+                args: vec![Term::Var("D".into()), Term::Var("S".into())],
+                negated: false,
+            })
+            .unwrap();
         assert_eq!(results.len(), 2);
         let map: HashMap<&str, &str> = results
             .iter()
@@ -2999,11 +3221,13 @@ mod tests {
             .sql_rule("dept_min(Dept, min(Sal)) :- employee(Name, Dept, Sal)")
             .unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "dept_min".into(),
-            args: vec![Term::Var("D".into()), Term::Var("M".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "dept_min".into(),
+                args: vec![Term::Var("D".into()), Term::Var("M".into())],
+                negated: false,
+            })
+            .unwrap();
         let map: HashMap<&str, &str> = results
             .iter()
             .map(|r| (r[0].as_str(), r[1].as_str()))
@@ -3032,11 +3256,13 @@ mod tests {
             .sql_rule("dept_max(Dept, max(Sal)) :- employee(Name, Dept, Sal)")
             .unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "dept_max".into(),
-            args: vec![Term::Var("D".into()), Term::Var("M".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "dept_max".into(),
+                args: vec![Term::Var("D".into()), Term::Var("M".into())],
+                negated: false,
+            })
+            .unwrap();
         let map: HashMap<&str, &str> = results
             .iter()
             .map(|r| (r[0].as_str(), r[1].as_str()))
@@ -3056,11 +3282,13 @@ mod tests {
         // total(count()) :- item(_).
         store.sql_rule("total(count()) :- item(X)").unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "total".into(),
-            args: vec![Term::Var("N".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "total".into(),
+                args: vec![Term::Var("N".into())],
+                negated: false,
+            })
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0][0], "3");
     }
@@ -3074,11 +3302,13 @@ mod tests {
 
         store.sql_rule("total_val(sum(V)) :- val(K, V)").unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "total_val".into(),
-            args: vec![Term::Var("S".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "total_val".into(),
+                args: vec![Term::Var("S".into())],
+                negated: false,
+            })
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0][0], "8");
     }
@@ -3131,11 +3361,13 @@ mod tests {
             .sql_rule("child_count(Parent, count()) :- child_of(Parent, Child)")
             .unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "child_count".into(),
-            args: vec![Term::Var("P".into()), Term::Var("N".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "child_count".into(),
+                args: vec![Term::Var("P".into()), Term::Var("N".into())],
+                negated: false,
+            })
+            .unwrap();
         let map: HashMap<&str, &str> = results
             .iter()
             .map(|r| (r[0].as_str(), r[1].as_str()))
@@ -3160,11 +3392,13 @@ mod tests {
             .sql_rule("sale_total(Cat, sum(Amt)) :- sale(Cat, Amt)")
             .unwrap();
 
-        let count_results = store.query(&Literal {
-            predicate: "sale_count".into(),
-            args: vec![Term::Var("C".into()), Term::Var("N".into())],
-            negated: false,
-        });
+        let count_results = store
+            .query(&Literal {
+                predicate: "sale_count".into(),
+                args: vec![Term::Var("C".into()), Term::Var("N".into())],
+                negated: false,
+            })
+            .unwrap();
         let count_map: HashMap<&str, &str> = count_results
             .iter()
             .map(|r| (r[0].as_str(), r[1].as_str()))
@@ -3172,11 +3406,13 @@ mod tests {
         assert_eq!(count_map["electronics"], "2");
         assert_eq!(count_map["clothing"], "1");
 
-        let total_results = store.query(&Literal {
-            predicate: "sale_total".into(),
-            args: vec![Term::Var("C".into()), Term::Var("T".into())],
-            negated: false,
-        });
+        let total_results = store
+            .query(&Literal {
+                predicate: "sale_total".into(),
+                args: vec![Term::Var("C".into()), Term::Var("T".into())],
+                negated: false,
+            })
+            .unwrap();
         let total_map: HashMap<&str, &str> = total_results
             .iter()
             .map(|r| (r[0].as_str(), r[1].as_str()))
@@ -3191,11 +3427,13 @@ mod tests {
         let mut store = DatalogStore::new();
         store.sql_rule("total(count()) :- item(X)").unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "total".into(),
-            args: vec![Term::Var("N".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "total".into(),
+                args: vec![Term::Var("N".into())],
+                negated: false,
+            })
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -3211,44 +3449,50 @@ mod tests {
 
         // Two rules in same stratum = eligible for parallelism
         // path(X, Y) :- edge(X, Y).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "edge".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-        // path(X, Z) :- edge(X, Y), path(Y, Z).
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
-                    predicate: "edge".into(),
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "path".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
+                    predicate: "edge".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+        // path(X, Z) :- edge(X, Y), path(Y, Z).
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "path".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "edge".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "path".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "path".into(),
-            args: vec![Term::Const("n0".into()), Term::Var("X".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "path".into(),
+                args: vec![Term::Const("n0".into()), Term::Var("X".into())],
+                negated: false,
+            })
+            .unwrap();
         // n0 can reach n1..n200
         assert_eq!(results.len(), 200);
     }
@@ -3262,44 +3506,52 @@ mod tests {
         }
 
         // doubled(K, V) :- data(K, V).
-        store.add_rule(Rule {
-            head: Literal {
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "doubled".into(),
+                    args: vec![Term::Var("K".into()), Term::Var("V".into())],
+                    negated: false,
+                },
+                body: vec![Literal {
+                    predicate: "data".into(),
+                    args: vec![Term::Var("K".into()), Term::Var("V".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+        // mirrored(V, K) :- data(K, V).
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "mirrored".into(),
+                    args: vec![Term::Var("V".into()), Term::Var("K".into())],
+                    negated: false,
+                },
+                body: vec![Literal {
+                    predicate: "data".into(),
+                    args: vec![Term::Var("K".into()), Term::Var("V".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+
+        let r1 = store
+            .query(&Literal {
                 predicate: "doubled".into(),
                 args: vec![Term::Var("K".into()), Term::Var("V".into())],
                 negated: false,
-            },
-            body: vec![Literal {
-                predicate: "data".into(),
-                args: vec![Term::Var("K".into()), Term::Var("V".into())],
-                negated: false,
-            }],
-        });
-        // mirrored(V, K) :- data(K, V).
-        store.add_rule(Rule {
-            head: Literal {
+            })
+            .unwrap();
+        assert_eq!(r1.len(), 150);
+
+        let r2 = store
+            .query(&Literal {
                 predicate: "mirrored".into(),
                 args: vec![Term::Var("V".into()), Term::Var("K".into())],
                 negated: false,
-            },
-            body: vec![Literal {
-                predicate: "data".into(),
-                args: vec![Term::Var("K".into()), Term::Var("V".into())],
-                negated: false,
-            }],
-        });
-
-        let r1 = store.query(&Literal {
-            predicate: "doubled".into(),
-            args: vec![Term::Var("K".into()), Term::Var("V".into())],
-            negated: false,
-        });
-        assert_eq!(r1.len(), 150);
-
-        let r2 = store.query(&Literal {
-            predicate: "mirrored".into(),
-            args: vec![Term::Var("V".into()), Term::Var("K".into())],
-            negated: false,
-        });
+            })
+            .unwrap();
         assert_eq!(r2.len(), 150);
     }
 
@@ -3316,44 +3568,50 @@ mod tests {
             }
 
             // connected(X, Y) :- link(X, Y).
-            store.add_rule(Rule {
-                head: Literal {
-                    predicate: "connected".into(),
-                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                    negated: false,
-                },
-                body: vec![Literal {
-                    predicate: "link".into(),
-                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                    negated: false,
-                }],
-            });
-            // connected(X, Z) :- connected(X, Y), link(Y, Z).
-            store.add_rule(Rule {
-                head: Literal {
-                    predicate: "connected".into(),
-                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                    negated: false,
-                },
-                body: vec![
-                    Literal {
+            store
+                .add_rule(Rule {
+                    head: Literal {
                         predicate: "connected".into(),
                         args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                         negated: false,
                     },
-                    Literal {
+                    body: vec![Literal {
                         predicate: "link".into(),
-                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    }],
+                })
+                .unwrap();
+            // connected(X, Z) :- connected(X, Y), link(Y, Z).
+            store
+                .add_rule(Rule {
+                    head: Literal {
+                        predicate: "connected".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                         negated: false,
                     },
-                ],
-            });
+                    body: vec![
+                        Literal {
+                            predicate: "connected".into(),
+                            args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                            negated: false,
+                        },
+                        Literal {
+                            predicate: "link".into(),
+                            args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                            negated: false,
+                        },
+                    ],
+                })
+                .unwrap();
 
-            let results = store.query(&Literal {
-                predicate: "connected".into(),
-                args: vec![Term::Const("n0".into()), Term::Var("X".into())],
-                negated: false,
-            });
+            let results = store
+                .query(&Literal {
+                    predicate: "connected".into(),
+                    args: vec![Term::Const("n0".into()), Term::Var("X".into())],
+                    negated: false,
+                })
+                .unwrap();
             assert_eq!(results.len(), 119); // n0 -> n1..n119
         }
     }
@@ -3366,43 +3624,286 @@ mod tests {
             store.assert_fact("edge", vec![format!("n{i}"), format!("n{}", i + 1)]);
         }
 
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            },
-            body: vec![Literal {
-                predicate: "edge".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Y".into())],
-                negated: false,
-            }],
-        });
-        store.add_rule(Rule {
-            head: Literal {
-                predicate: "path".into(),
-                args: vec![Term::Var("X".into()), Term::Var("Z".into())],
-                negated: false,
-            },
-            body: vec![
-                Literal {
-                    predicate: "edge".into(),
+        store
+            .add_rule(Rule {
+                head: Literal {
+                    predicate: "path".into(),
                     args: vec![Term::Var("X".into()), Term::Var("Y".into())],
                     negated: false,
                 },
-                Literal {
+                body: vec![Literal {
+                    predicate: "edge".into(),
+                    args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                    negated: false,
+                }],
+            })
+            .unwrap();
+        store
+            .add_rule(Rule {
+                head: Literal {
                     predicate: "path".into(),
-                    args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                    args: vec![Term::Var("X".into()), Term::Var("Z".into())],
                     negated: false,
                 },
-            ],
-        });
+                body: vec![
+                    Literal {
+                        predicate: "edge".into(),
+                        args: vec![Term::Var("X".into()), Term::Var("Y".into())],
+                        negated: false,
+                    },
+                    Literal {
+                        predicate: "path".into(),
+                        args: vec![Term::Var("Y".into()), Term::Var("Z".into())],
+                        negated: false,
+                    },
+                ],
+            })
+            .unwrap();
 
-        let results = store.query(&Literal {
-            predicate: "path".into(),
-            args: vec![Term::Const("n0".into()), Term::Var("X".into())],
-            negated: false,
-        });
+        let results = store
+            .query(&Literal {
+                predicate: "path".into(),
+                args: vec![Term::Const("n0".into()), Term::Var("X".into())],
+                negated: false,
+            })
+            .unwrap();
         assert_eq!(results.len(), 10); // n0 -> n1..n10
+    }
+
+    // ─── GDL regression tests ───────────────────────────────────────────────
+
+    /// GDL-1: strata must be assigned over the FULL dependency graph. A rule
+    /// positively consuming a higher-stratum (negation-defined) predicate used
+    /// to land in a LOWER stratum, evaluated before its input existed, and was
+    /// never retried — `uses` stayed empty forever while `unreach` answered fine.
+    #[test]
+    fn test_positive_consumer_sees_higher_stratum_results() {
+        let mut store = DatalogStore::new();
+        store.sql_assert("edge(a, b).").unwrap();
+        store.sql_assert("edge(b, c).").unwrap();
+        store.sql_rule("path(X, Y) :- edge(X, Y).").unwrap();
+        store
+            .sql_rule("unreach(X, Y) :- edge(X, Y), \\+ path(Y, X).")
+            .unwrap();
+        store.sql_rule("uses(X) :- unreach(X, Y).").unwrap();
+
+        // Control: the negation-defined predicate itself derives.
+        let unreach = store.sql_query("unreach(A, B)").unwrap();
+        assert_eq!(unreach, "[[\"a\", \"b\"], [\"b\", \"c\"]]");
+
+        // The positive consumer of a higher-stratum predicate must see them.
+        let uses = store.sql_query("uses(X)").unwrap();
+        assert_eq!(uses, "[[\"a\"], [\"b\"]]", "consumer ran before its input");
+    }
+
+    /// GDL-2: a normal rule consuming an aggregate predicate must run in a
+    /// LATER stratum. Aggregates used to run once after the stratum fixpoint
+    /// with consumers already evaluated — `big` was forever empty while
+    /// `cnt` answered fine.
+    #[test]
+    fn test_aggregate_consumer_rule() {
+        let mut store = DatalogStore::new();
+        store.sql_assert("emp(d1, 10).").unwrap();
+        store.sql_assert("emp(d1, 20).").unwrap();
+        store.sql_assert("emp(d2, 30).").unwrap();
+        store.sql_rule("cnt(D, count()) :- emp(D, S).").unwrap();
+        store.sql_rule("big(D) :- cnt(D, N).").unwrap();
+
+        let cnt = store.sql_query("cnt(D, N)").unwrap();
+        assert_eq!(cnt, "[[\"d1\", \"2\"], [\"d2\", \"1\"]]");
+
+        let big = store.sql_query("big(D)").unwrap();
+        assert_eq!(
+            big, "[[\"d1\"], [\"d2\"]]",
+            "aggregate consumer saw nothing"
+        );
+    }
+
+    /// GDL-2: aggregate-of-aggregate. The single pre-aggregate `all_facts`
+    /// snapshot meant aggregate rule 2 evaluated against a world without
+    /// aggregate rule 1's output.
+    #[test]
+    fn test_aggregate_of_aggregate() {
+        let mut store = DatalogStore::new();
+        store.sql_assert("emp(d1, 10).").unwrap();
+        store.sql_assert("emp(d1, 20).").unwrap();
+        store.sql_assert("emp(d2, 30).").unwrap();
+        store.sql_rule("cnt(D, count()) :- emp(D, S).").unwrap();
+        store.sql_rule("total(sum(N)) :- cnt(D, N).").unwrap();
+
+        let total = store.sql_query("total(T)").unwrap();
+        assert_eq!(total, "[[\"3\"]]", "the stale snapshot summed an empty set");
+    }
+
+    /// GDL-5: an unstratifiable pair must be rejected at registration — one
+    /// bad rule pair used to silently disable ALL rule evaluation store-wide
+    /// (every derived predicate answered empty, no error anywhere).
+    #[test]
+    fn test_unstratifiable_program_rejected_not_swallowed() {
+        let mut store = DatalogStore::new();
+        store.sql_assert("node(a).").unwrap();
+        store.sql_assert("node(b).").unwrap();
+        store
+            .sql_rule("reach(X, Y) :- edge(X, Y), \\+ blocked(Y).")
+            .unwrap();
+
+        // Completes the negation cycle: edge ← ¬reach ← edge.
+        let err = store
+            .sql_rule("edge(X, Y) :- node(X), node(Y), \\+ reach(X, Y).")
+            .expect_err("negation cycle must be rejected at registration");
+        assert!(err.contains("stratifiable"), "unexpected error: {err}");
+
+        // Blast radius: a fresh, safe rule still evaluates afterwards.
+        store.sql_assert("leaf(l).").unwrap();
+        store.sql_rule("isleaf(X) :- leaf(X).").unwrap();
+        let out = store.sql_query("isleaf(X)").unwrap();
+        assert_eq!(out, "[[\"l\"]]");
+
+        // Hand-poisoned store (a legacy WAL could write exactly this): query
+        // must surface the error, not return base facts as if fine.
+        store.rules.push(Rule {
+            head: Literal {
+                predicate: "p".into(),
+                args: vec![Term::Var("X".into())],
+                negated: false,
+            },
+            body: vec![Literal {
+                predicate: "p".into(),
+                args: vec![Term::Var("X".into())],
+                negated: true,
+            }],
+        });
+        let err = store
+            .sql_query("node(A)")
+            .expect_err("poisoned program must error, not answer");
+        assert!(err.contains("stratifiable"), "unexpected error: {err}");
+    }
+
+    /// GDL-6: unsafe negation (a variable appearing ONLY in a negated
+    /// literal) used to be silently treated as satisfied for every candidate,
+    /// over-deriving the head.
+    #[test]
+    fn test_unsafe_negation_rejected() {
+        let mut store = DatalogStore::new();
+        store.sql_assert("q(a).").unwrap();
+        store.sql_assert("r(a, z).").unwrap();
+
+        let err = store
+            .sql_rule("p(X) :- q(X), \\+ r(X, Y).")
+            .expect_err("unsafe negation must be rejected at registration");
+        assert!(err.contains("unsafe negation"), "unexpected error: {err}");
+
+        // The store was not poisoned: p is simply absent.
+        let out = store.sql_query("p(X)").unwrap();
+        assert_eq!(out, "[]");
+        // And a safe variant still works.
+        store.sql_rule("safe(X) :- q(X), \\+ r(X, z).").unwrap();
+        let out = store.sql_query("safe(X)").unwrap();
+        assert_eq!(out, "[]", "r(a,z) exists, so no q row passes");
+    }
+
+    /// GDL-9: a negated literal in a QUERY returned exactly the tuples the
+    /// user asked to EXCLUDE — the negation flag was parsed and then ignored.
+    #[test]
+    fn test_query_rejects_negated_literal() {
+        let mut store = DatalogStore::new();
+        store.sql_assert("likes(alice, bob).").unwrap();
+
+        let err = store
+            .sql_query("\\+ likes(alice, bob)")
+            .expect_err("negated query literal must be rejected");
+        assert!(err.contains("negated"), "unexpected error: {err}");
+
+        let ok = store.sql_query("likes(alice, bob)").unwrap();
+        assert_eq!(ok, "[[\"alice\", \"bob\"]]");
+    }
+
+    /// GDL-3: checkpoint re-serializes facts from parsed args. Any argument
+    /// that is not a bare lowercase atom or number either failed to re-parse
+    /// (fact silently DROPPED on replay) or re-parsed with a different arity
+    /// (fact silently corrupted).
+    #[test]
+    fn test_wal_checkpoint_quoted_facts_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = DatalogWal::open(dir.path()).unwrap();
+            let mut store = DatalogStore::new();
+            store.sql_assert("city(\"New York\", 8.4).").unwrap();
+            store.sql_assert("tag(\"a, b\").").unwrap();
+            store.sql_assert("note(\"it's here\").").unwrap();
+            store
+                .sql_assert("edge_case(\"both ' and \\\" quotes\").")
+                .unwrap();
+            store.sql_assert("plain(bare_atom_2, 42, 8.4).").unwrap();
+            store.sql_rule("ny(P) :- city(\"New York\", P).").unwrap();
+            wal.checkpoint(&store).unwrap();
+        }
+
+        let (_wal2, state2) = DatalogWal::open(dir.path()).unwrap();
+        let mut store2 = restore_from_wal(state2);
+
+        let city = store2.sql_query("city(N, P)").unwrap();
+        assert_eq!(
+            city, "[[\"New York\", \"8.4\"]]",
+            "quoted fact was dropped/corrupted"
+        );
+
+        let tag = store2.sql_query("tag(X)").unwrap();
+        assert_eq!(
+            tag, "[[\"a, b\"]]",
+            "comma inside a quoted arg re-parsed as 2 args"
+        );
+
+        let note = store2.sql_query("note(X)").unwrap();
+        assert_eq!(note, "[[\"it's here\"]]");
+
+        let both = store2.sql_query("edge_case(X)").unwrap();
+        assert_eq!(both, "[[\"both ' and \\\" quotes\"]]");
+
+        let plain = store2.sql_query("plain(A, B, C)").unwrap();
+        assert_eq!(plain, "[[\"bare_atom_2\", \"42\", \"8.4\"]]");
+
+        // A rule with a quoted const round-trips and still evaluates.
+        let ny = store2.sql_query("ny(P)").unwrap();
+        assert_eq!(ny, "[[\"8.4\"]]", "rule with a quoted const was dropped");
+    }
+
+    /// PART 0 (datalog stranded writer): a checkpoint whose reopen fails must
+    /// not leave the writer appending into the unlinked inode the rename
+    /// displaced — those appends report success while no recovery can read
+    /// them. Same shape as the wave-3 fixes in the other WALs.
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = DatalogWal::open(dir.path()).unwrap();
+            wal.log_assert("parent(alice, bob).").unwrap();
+            let mut store = DatalogStore::new();
+            store.assert_fact("parent", vec!["alice".into(), "bob".into()]);
+            wal.fail_reopen_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wal.checkpoint(&store)
+                .expect_err("the injected reopen failure must fail the checkpoint");
+            wal.log_assert("parent(bob, charlie).")
+                .expect("a later append must reattach, not strand");
+        }
+        let (_, state) = DatalogWal::open(dir.path()).unwrap();
+        let mut sorted: Vec<_> = state.facts.into_iter().collect();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                (
+                    "parent".to_string(),
+                    vec!["alice".to_string(), "bob".to_string()]
+                ),
+                (
+                    "parent".to_string(),
+                    vec!["bob".to_string(), "charlie".to_string()]
+                ),
+            ],
+            "the post-checkpoint-failure append went to the unlinked inode: it \
+             returned Ok and no recovery can ever read it"
+        );
     }
 }

@@ -20,4 +20,6 @@ http = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 dirs = { workspace = true }
-nucleus = { path = "../../../nucleus", optional = true }
+# Key stays `nucleus` so `use nucleus::` keeps working; the engine's package
+# name is `nucleusdb` (bare `nucleus` is unavailable on crates.io).
+nucleus = { package = "nucleusdb", path = "../../../nucleus", optional = true }

@@ -406,8 +406,32 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
             .await
         {
             Ok(rows) if rows.len() != 1 => {
+                // Discriminate the 0-row lookup before reporting it (see
+                // _internal/PROBE_SOAK_CI_INVESTIGATION.md §6.2). The point
+                // path (index_lookup_inner) rechecks each fetched row's
+                // serialized key against the probe; the range path
+                // (index_lookup_range_inner) seeks the SAME B-tree but
+                // returns the entry's row verbatim; `id + 0` defeats the
+                // index and reads the heap. So:
+                //   point=0 range=1        -> entry present, recheck dropped it
+                //   point=0 range=0 seq=1  -> entry lost from the B-tree
+                //   point=0 range=0 seq=0  -> row itself missing (heap loss)
+                let range = db
+                    .query(&format!(
+                        "SELECT id FROM soak WHERE id >= {rid} AND id <= {rid}"
+                    ))
+                    .await
+                    .ok()
+                    .map(|r| r.len().to_string())
+                    .unwrap_or_else(|| "err".into());
+                let seq = db
+                    .query(&format!("SELECT id FROM soak WHERE id + 0 = {rid}"))
+                    .await
+                    .ok()
+                    .map(|r| r.len().to_string())
+                    .unwrap_or_else(|| "err".into());
                 fails.push(format!(
-                    "pk id={rid} returned {} rows (expected 1)",
+                    "pk id={rid} returned {} rows (expected 1); same-key range-scan rows={range}, seq-scan rows={seq}",
                     rows.len()
                 ));
             }

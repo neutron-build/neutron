@@ -44,6 +44,9 @@ impl Executor {
     /// Loads an ONNX model file and registers it in the model registry.
     /// Only available when compiled with `--features onnx`.
     pub(super) fn execute_create_model(&self, sql: &str) -> Result<ExecResult, ExecError> {
+        // The model registry is shared engine state and CREATE MODEL reads
+        // an arbitrary filesystem path — both are superuser territory.
+        self.require_security_admin("create models")?;
         // Parse: CREATE MODEL <name> FROM '<path>'
         let trimmed = sql.trim().trim_end_matches(';');
         let upper = trimmed.to_uppercase();
@@ -81,25 +84,42 @@ impl Executor {
             ));
         }
 
-        // Validate path to prevent directory traversal attacks
-        let canonical = std::path::Path::new(&path);
+        // Containment: the model file must live inside the data directory.
+        // The previous check canonicalized the path and then searched the
+        // RESOLVED string for ".." — canonicalize resolves traversal, so the
+        // condition was unreachable and every absolute path passed (an
+        // existence oracle plus out-of-directory registration).
         if path.contains("..") {
             return Err(ExecError::Unsupported(
                 "CREATE MODEL path must not contain '..' (directory traversal)".into(),
             ));
         }
-        // Reject absolute paths outside data directory for safety
-        if canonical.is_absolute() {
-            // Allow absolute paths only if they don't traverse upward
-            if let Ok(resolved) = std::fs::canonicalize(&path) {
-                let resolved_str = resolved.to_string_lossy();
-                if resolved_str.contains("..") {
-                    return Err(ExecError::Unsupported(
-                        "CREATE MODEL resolved path contains directory traversal".into(),
-                    ));
-                }
-            }
+        let data_dir = self.data_dir.clone().or_else(|| {
+            self.catalog_path
+                .as_ref()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        });
+        let Some(data_dir) = data_dir else {
+            return Err(ExecError::PermissionDenied(
+                "CREATE MODEL requires a disk-backed instance (no data directory)".into(),
+            ));
+        };
+        let data_dir_canon = std::fs::canonicalize(&data_dir)
+            .map_err(|e| ExecError::PermissionDenied(format!("data directory unavailable: {e}")))?;
+        let candidate = if std::path::Path::new(&path).is_absolute() {
+            std::path::PathBuf::from(&path)
+        } else {
+            data_dir.join(&path)
+        };
+        let resolved = std::fs::canonicalize(&candidate).map_err(|e| {
+            ExecError::PermissionDenied(format!("CREATE MODEL path not usable: {e}"))
+        })?;
+        if !resolved.starts_with(&data_dir_canon) {
+            return Err(ExecError::PermissionDenied(
+                "CREATE MODEL path must stay inside the data directory".into(),
+            ));
         }
+        let path = resolved.to_string_lossy().into_owned();
 
         #[cfg(feature = "onnx")]
         {

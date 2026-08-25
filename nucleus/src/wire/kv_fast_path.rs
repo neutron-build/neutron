@@ -227,21 +227,27 @@ fn parse_quoted_string(s: &str) -> Option<(String, &str)> {
         return None;
     }
 
-    let mut result = String::new();
+    let mut result: Vec<u8> = Vec::new();
     let mut i = 1; // skip opening quote
 
     while i < bytes.len() {
         if bytes[i] == b'\'' {
             // Check for escaped quote ('')
             if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                result.push('\'');
+                result.push(b'\'');
                 i += 2;
             } else {
-                // End of string
-                return Some((result, &s[i + 1..]));
+                // End of string. Collect bytes and decode UTF-8 once:
+                // pushing `bytes[i] as char` mangles multi-byte sequences
+                // into Latin-1 ('Zoë' stored as "ZoÃ«"). Splits happen only
+                // at ASCII quotes, so this is valid UTF-8; on any failure,
+                // decline the fast path (`None`) and let the real parser
+                // handle the query.
+                let arg = String::from_utf8(result).ok()?;
+                return Some((arg, &s[i + 1..]));
             }
         } else {
-            result.push(bytes[i] as char);
+            result.push(bytes[i]);
             i += 1;
         }
     }
@@ -541,19 +547,23 @@ fn parse_identifier(s: &str) -> Option<(String, &str)> {
 
     // Double-quoted identifier
     if bytes[0] == b'"' {
-        let mut name = String::new();
+        // Byte accumulation + one UTF-8 decode at the end, for the same
+        // reason as `parse_quoted_string`: `bytes[i] as char` mangles
+        // multi-byte sequences into Latin-1.
+        let mut name: Vec<u8> = Vec::new();
         let mut i = 1;
         while i < bytes.len() {
             if bytes[i] == b'"' {
                 // Escaped double-quote ""
                 if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    name.push('"');
+                    name.push(b'"');
                     i += 2;
                 } else {
-                    return Some((name, &s[i + 1..]));
+                    let ident = String::from_utf8(name).ok()?;
+                    return Some((ident, &s[i + 1..]));
                 }
             } else {
-                name.push(bytes[i] as char);
+                name.push(bytes[i]);
                 i += 1;
             }
         }
@@ -787,6 +797,62 @@ mod tests {
         assert_eq!(
             cmd,
             KvCommand::Set("key's".to_string(), "val'ue".to_string(), None)
+        );
+    }
+
+    // ── UTF-8 must survive the fast path (WIR-4) ────────────────────────
+
+    #[test]
+    fn kv_fast_path_preserves_utf8() {
+        // Pushing `bytes[i] as char` mojibakes every multi-byte sequence
+        // into Latin-1 ('Zoë' -> "ZoÃ«"), durably corrupting stored values.
+        let cmd = try_parse_kv("SELECT kv_set('k', 'Zoë')").unwrap();
+        assert_eq!(
+            cmd,
+            KvCommand::Set("k".to_string(), "Zoë".to_string(), None)
+        );
+
+        let cmd = try_parse_kv("SELECT kv_get('café')").unwrap();
+        assert_eq!(cmd, KvCommand::Get("café".to_string()));
+
+        // Escapes and multi-byte in the same literal.
+        let cmd = try_parse_kv("SELECT kv_get('it''s café')").unwrap();
+        assert_eq!(cmd, KvCommand::Get("it's café".to_string()));
+    }
+
+    #[test]
+    fn sql_fast_path_preserves_utf8_literals() {
+        let cmd = try_parse_sql_fast_path("INSERT INTO t VALUES ('café')").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::SimpleInsert {
+                table: "t".to_string(),
+                values: vec![SqlLiteral::Text("café".to_string())],
+            }
+        );
+
+        let cmd = try_parse_sql_fast_path("UPDATE t SET note = 'Zoë' WHERE id = 1").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointUpdate {
+                table: "t".to_string(),
+                assignments: vec![("note".to_string(), SqlLiteral::Text("Zoë".to_string()))],
+                where_col: "id".to_string(),
+                where_val: SqlLiteral::Integer(1),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fast_path_preserves_utf8_identifiers() {
+        let cmd = try_parse_sql_fast_path("SELECT * FROM \"Täble\" WHERE id = 1").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointSelect {
+                table: "Täble".to_string(),
+                where_col: "id".to_string(),
+                where_val: SqlLiteral::Integer(1),
+            }
         );
     }
 

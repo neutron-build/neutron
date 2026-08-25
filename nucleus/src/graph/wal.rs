@@ -106,6 +106,15 @@ pub struct GraphWal {
     writer: Mutex<BufWriter<File>>,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: crate::storage::wal_util::WalSync,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no future recovery
+    /// reads while `group_sync`/`is_dirty` report healthy. Set when a
+    /// checkpoint replaced the log but its reopen failed; cleared by the next
+    /// successful reattach (or checkpoint reopen). See `reattach_if_stranded`.
+    stranded: std::sync::atomic::AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
+    #[cfg(test)]
+    fail_reopen_once: std::sync::atomic::AtomicBool,
 }
 
 impl GraphWal {
@@ -129,6 +138,9 @@ impl GraphWal {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
+                stranded: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
@@ -270,8 +282,37 @@ impl GraphWal {
         let mut w = self.writer.lock();
         w.flush()?;
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
-        let file = OpenOptions::new().append(true).open(&self.path)?;
+        // The reopen is the hazardous half: the rename above already unlinked
+        // the inode `w` holds, so a failure here leaves the writer pointing at
+        // a file no future recovery reads.
+        #[cfg(test)]
+        let injected: Option<io::Error> = self
+            .fail_reopen_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .then(|| io::Error::other("injected graph WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<io::Error> = None;
+        let file = if let Some(e) = injected {
+            Err(e)
+        } else if let Some(e) = crate::storage::crashpoint::io_fault("graph.wal_reopen") {
+            Err(e)
+        } else {
+            OpenOptions::new().append(true).open(&self.path)
+        };
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                // The rename already happened, so the handle in `w` is now an
+                // unlinked inode. Mark the writer stranded: appends must
+                // reattach (or fail loudly), never write through it.
+                self.stranded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
+        };
         *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
         // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
         let mark = self.syncer.on_append();
         self.syncer.mark_synced(mark);
@@ -303,9 +344,42 @@ impl GraphWal {
 
     fn append_raw(&self, data: &[u8]) -> io::Result<()> {
         let mut w = self.writer.lock();
+        self.reattach_if_stranded(&mut w)?;
         w.write_all(data)?;
         w.flush()?;
         self.syncer.on_append();
+        Ok(())
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly instead of
+    /// letting it acknowledge a write to a dead inode.
+    fn reattach_if_stranded(&self, w: &mut BufWriter<File>) -> io::Result<()> {
+        if !self.stranded.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("graph.wal_reopen") {
+            return Err(e);
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "graph WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -928,6 +1002,43 @@ mod tests {
             st.nodes[&42].properties.get("idx"),
             Some(&PropValue::Int(42))
         );
+    }
+
+    /// S31-14: a checkpoint whose reopen fails must not leave the writer
+    /// appending into the unlinked inode the rename displaced. Those appends
+    /// report success while no future recovery can ever read them, so an
+    /// acknowledged node silently vanishes at restart. The discriminator is
+    /// durability: the post-failure append must land in the replaced file.
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = GraphWal::open(dir.path()).unwrap();
+            wal.log_add_node(1, &["N".into()], &Properties::new())
+                .unwrap();
+            let nodes = [(1u64, vec!["N".to_string()], Properties::new())];
+            let node_refs: Vec<_> = nodes.iter().map(|(id, l, p)| (id, l, p)).collect();
+            wal.fail_reopen_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wal.checkpoint(&GraphSnapshot {
+                nodes: node_refs,
+                edges: vec![],
+                next_node_id: 2,
+                next_edge_id: 1,
+                node_indexes: vec![],
+            })
+            .expect_err("the injected reopen failure must fail the checkpoint");
+            wal.log_add_node(2, &["N".into()], &Properties::new())
+                .expect("a later append must reattach, not strand");
+        }
+        let (_, st) = GraphWal::open(dir.path()).unwrap();
+        assert_eq!(
+            st.nodes.len(),
+            2,
+            "the post-checkpoint-failure append went to the unlinked inode: it \
+             returned Ok and no recovery can ever read it"
+        );
+        assert_eq!(st.next_node_id, 3);
     }
 
     #[test]

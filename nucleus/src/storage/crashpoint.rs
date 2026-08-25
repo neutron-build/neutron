@@ -78,6 +78,14 @@ pub const ALL_POINTS: &[&str] = &[
     // here must leave an orphaned specialty write, never a durable SQL row
     // referencing a specialty write that was never made durable.
     "commit.after_specialty_before_sql",
+    // S63: inside COMMIT of an enlisted transaction, after every specialty
+    // record of the transaction has been appended and flushed to its own WAL,
+    // BEFORE the SQL COMMIT record (with the coordinating id in its body) is
+    // written. A crash exactly here is the discard half of the filter's
+    // proof: the specialty records survive in the page cache, nothing vouches
+    // for their transaction, and recovery must discard them — alongside the
+    // SQL rows of the same transaction, which recovery undoes as a loser.
+    "crossmodel.before_commit_record",
 ];
 
 /// Raft durability boundaries, kept separate from [`ALL_POINTS`] because a SQL
@@ -144,6 +152,30 @@ pub const ALL_IO_POINTS: &[&str] = &[
     // whose durable record had failed. Arming this must make the statement
     // fail, and only what was acknowledged may survive a restart.
     "streams.wal_append",
+    // Checkpoint reopens. `atomic_replace_wal` has already renamed the new
+    // snapshot over the live path when these fire, so the writer the WAL holds
+    // is an unlinked inode: appends to it "succeed" into a file no future
+    // recovery reads, while `group_sync`/`is_dirty` report healthy. Arming
+    // these must make every subsequent append fail until the writer is
+    // re-attached to the replaced file (S31-14).
+    "streams.wal_reopen",
+    "vector.wal_reopen",
+    "kv.wal_reopen",
+    "collections.wal_reopen",
+    "graph.wal_reopen",
+    "geo.wal_reopen",
+    "cdc.wal_reopen",
+    "fts.wal_reopen",
+    "columnar.wal_reopen",
+    "doc.wal_reopen",
+    "ts.wal_reopen",
+    // The KV cold tier's SSTable writes (STO-1/2). A failed write here used
+    // to be eprintln-swallowed while compaction deleted the input files and
+    // `KvStore::checkpoint` truncated the WAL past keys whose only copy was
+    // the never-fsynced table — the whole cold tier lost with an error
+    // nowhere. Arming this must fail the flush (and the checkpoint that
+    // drains it); only acknowledged keys may survive a restart.
+    "lsm.sst_write",
 ];
 
 fn io_armed() -> Option<&'static str> {

@@ -52,7 +52,6 @@ fn key_to_id(key: &[u8]) -> u64 {
 struct Posting {
     doc_id: u64,
     positions: Vec<usize>,
-    term_frequency: f64,
 }
 
 /// Lightweight in-memory inverted index for BM25 search.
@@ -97,12 +96,10 @@ impl MemIndex {
         }
 
         for (term, positions) in term_positions {
-            let tf = positions.len() as f64 / doc_length.max(1) as f64;
-            self.postings.entry(term).or_default().push(Posting {
-                doc_id,
-                positions,
-                term_frequency: tf,
-            });
+            self.postings
+                .entry(term)
+                .or_default()
+                .push(Posting { doc_id, positions });
         }
     }
 
@@ -143,7 +140,10 @@ impl MemIndex {
 
                 for posting in postings {
                     let dl = *self.doc_lengths.get(&posting.doc_id).unwrap_or(&1) as f64;
-                    let tf = posting.term_frequency;
+                    // Raw term count, as the in-memory engine uses: the
+                    // saturation formula expects tf = count, and a normalized
+                    // ratio here under-weights frequent terms by ~doc_length.
+                    let tf = posting.positions.len() as f64;
                     let tf_norm = (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * dl / avgdl));
                     let score = idf * tf_norm;
                     *scores.entry(posting.doc_id).or_default() += score;
@@ -270,10 +270,16 @@ impl DiskBackedFtsStore {
             lsm.put(key, value);
         }
 
-        // Build inverted index entry.
+        // Build inverted index entry. `MemIndex::add_document` replaces an
+        // existing doc_id, so the live-document counter must only move for
+        // documents that were not already present.
         {
             let mut idx = self.index.write();
+            let existed = idx.doc_lengths.contains_key(&doc_id);
             idx.add_document(doc_id, content);
+            if !existed {
+                self.count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
         }
 
         // Cache the document.
@@ -305,8 +311,6 @@ impl DiskBackedFtsStore {
                 break;
             }
         }
-
-        self.count.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Search for documents matching the query. Returns `(doc_id, score)` pairs
@@ -396,7 +400,9 @@ impl DiskBackedFtsStore {
     /// Flush the LsmTree memtable to disk.
     pub fn flush_cache(&self) {
         let mut lsm = self.doc_lsm.lock();
-        lsm.force_flush();
+        if let Err(e) = lsm.force_flush() {
+            tracing::error!("full-text cold tier flush failed: {e}");
+        }
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
@@ -471,6 +477,54 @@ mod tests {
         // Search should return empty after removal.
         let results = store.search("searchable unique", 10);
         assert!(results.is_empty());
+    }
+
+    /// VEC-7: the tiered store's BM25 must rank a high-term-frequency
+    /// document the way the in-memory engine does. The tiered Posting stored
+    /// a NORMALIZED term frequency (count/doc_length) but fed it into the
+    /// raw-count saturation formula — a ~doc_length-fold underweight that
+    /// flips the top document.
+    #[test]
+    fn tiered_ranking_matches_the_in_memory_engine() {
+        let mut mem = crate::fts::InvertedIndex::new();
+        let disk = DiskBackedFtsStore::new(100);
+        let docs: Vec<(u64, &str)> = vec![
+            (
+                1,
+                "alpha alpha alpha alpha alpha alpha alpha alpha alpha beta",
+            ),
+            (2, "alpha"),
+        ];
+        for (id, text) in &docs {
+            mem.add_document(*id, text);
+            disk.add_document(*id, text);
+        }
+        let mem_top = mem.search("alpha", 1);
+        let disk_top = disk.search("alpha", 1);
+        assert_eq!(mem_top.len(), 1);
+        assert_eq!(
+            disk_top.first().map(|(id, _)| *id),
+            mem_top.first().map(|(id, _)| *id),
+            "the tiered store ranked a different top document than the \
+             in-memory engine: normalized tf fed into a raw-count formula"
+        );
+    }
+
+    /// VEC-7: re-adding an existing doc_id replaces the document; it must not
+    /// inflate the live-document count.
+    #[test]
+    fn re_adding_a_document_does_not_inflate_the_count() {
+        let store = DiskBackedFtsStore::new(100);
+        store.add_document(7, "first text");
+        for i in 0..5 {
+            store.add_document(7, &format!("replacement text {i}"));
+        }
+        assert_eq!(
+            store.document_count(),
+            1,
+            "five re-adds of one doc_id inflated the count — every re-add was \
+             counted as a new document"
+        );
     }
 
     // ── Test 4: cache eviction ──────────────────────────────────────────

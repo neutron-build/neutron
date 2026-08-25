@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
-use super::{DistanceMetric, HnswConfig, HnswIndex, Vector};
+use super::{DistanceMetric, HnswConfig, HnswIndex, RegistrySection, Vector};
 
 // ─── Entry type tags ──────────────────────────────────────────────────────────
 
@@ -69,6 +69,10 @@ pub struct RecoveredIndex {
     pub m: u32,
     /// HNSW ef_search parameter.
     pub ef: u32,
+    /// The PK registry recovered from the snapshot section plus pk-carrying
+    /// delta records, when either existed (`None` for logs that predate
+    /// registry persistence — an empty registry, which is faithful).
+    pub registry: Option<RegistrySection>,
 }
 
 /// State recovered from replaying the WAL.
@@ -84,6 +88,30 @@ pub struct VectorWal {
     writer: Mutex<BufWriter<File>>,
     /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
     syncer: crate::storage::wal_util::WalSync,
+    /// The writer holds an inode a checkpoint's rename displaced: it is
+    /// unlinked, so appends to it "succeed" into a file no recovery reads
+    /// while `group_sync`/`is_dirty` report healthy. Set when a checkpoint
+    /// replaced the log but its reopen failed; cleared by the next successful
+    /// reattach (or checkpoint reopen). See `reattach_if_stranded`.
+    stranded: std::sync::atomic::AtomicBool,
+    /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
+    #[cfg(test)]
+    fail_reopen_once: std::sync::atomic::AtomicBool,
+    /// Test-only append fault switch; see `append`.
+    #[cfg(test)]
+    fail_appends: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl VectorWal {
+    /// Make every subsequent `append` fail with ENOSPC. The `NUCLEUS_IOFAULT`
+    /// machinery reads its environment through a `OnceLock` initialised by
+    /// whichever call site runs first, so it cannot be armed from inside a
+    /// shared test binary — only from a freshly spawned process.
+    pub fn set_fail_appends(&self, on: bool) {
+        self.fail_appends
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl VectorWal {
@@ -119,6 +147,11 @@ impl VectorWal {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
+                stranded: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_appends: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
@@ -150,6 +183,62 @@ impl VectorWal {
         self.path.parent().unwrap_or(Path::new("."))
     }
 
+    /// Append one complete record; the single reattach point for a writer
+    /// stranded by a failed checkpoint reopen, and the single place the
+    /// `vector.wal_append` fault is checked (NU-048: a failed append must
+    /// fail the statement, never be printed-and-acknowledged).
+    fn append(&self, buf: &[u8]) -> io::Result<()> {
+        if let Some(e) = crate::storage::crashpoint::io_fault("vector.wal_append") {
+            return Err(e);
+        }
+        // In-process arming for unit tests; see `set_fail_appends`.
+        #[cfg(test)]
+        if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected vector WAL append failure",
+            ));
+        }
+        let mut w = self.writer.lock();
+        self.reattach_if_stranded(&mut w)?;
+        w.write_all(buf)?;
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
+    }
+
+    /// Re-point the writer at the live log file after a checkpoint replaced
+    /// the file but could not reopen it. While stranded, `writer` holds an
+    /// UNLINKED inode — appends to it succeed into a file no future recovery
+    /// reads — so this runs before every append: a successful reopen recovers
+    /// the writer, and a failed one fails the append loudly instead of
+    /// letting it acknowledge a write to a dead inode.
+    fn reattach_if_stranded(&self, w: &mut BufWriter<File>) -> io::Result<()> {
+        if !self.stranded.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(e) = crate::storage::crashpoint::io_fault("vector.wal_reopen") {
+            return Err(e);
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "vector WAL writer is stranded: a checkpoint replaced {} but its \
+                         reopen failed; refusing to append to the unlinked old file ({e})",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// Log a CREATE INDEX operation.
     pub fn log_create_index(
         &self,
@@ -168,14 +257,15 @@ impl VectorWal {
         buf.push(metric);
         buf.extend_from_slice(&m.to_le_bytes());
         buf.extend_from_slice(&ef.to_le_bytes());
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.append(&buf)
     }
 
     /// Log a vector insertion.
+    ///
+    /// `metadata` carries the row's primary key (as a decimal u64 string) for
+    /// PK-keyed HNSW indexes, so replay can rebuild the pk -> node registry
+    /// from delta records; empty for positional indexes and records written
+    /// before the registry was persisted.
     ///
     /// The `vector.wal_append` fault point makes NU-048 testable from outside:
     /// a failed append here must fail the originating DML statement, never be
@@ -187,9 +277,6 @@ impl VectorWal {
         vector: &[f32],
         metadata: &str,
     ) -> io::Result<()> {
-        if let Some(e) = crate::storage::crashpoint::io_fault("vector.wal_append") {
-            return Err(e);
-        }
         let mut buf = Vec::new();
         let nb = name.as_bytes();
         buf.push(TAG_INSERT_VEC);
@@ -203,31 +290,20 @@ impl VectorWal {
         let mb = metadata.as_bytes();
         buf.extend_from_slice(&(mb.len() as u32).to_le_bytes());
         buf.extend_from_slice(mb);
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.append(&buf)
     }
 
     /// Log a vector deletion (soft-delete in HNSW). Same fault point as
     /// `log_insert`: a deleted vector resurrecting across restart is the
     /// other half of NU-048.
     pub fn log_delete(&self, name: &str, id: u64) -> io::Result<()> {
-        if let Some(e) = crate::storage::crashpoint::io_fault("vector.wal_append") {
-            return Err(e);
-        }
         let mut buf = Vec::new();
         let nb = name.as_bytes();
         buf.push(TAG_DELETE_VEC);
         buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
         buf.extend_from_slice(nb);
         buf.extend_from_slice(&id.to_le_bytes());
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        self.syncer.on_append();
-        Ok(())
+        self.append(&buf)
     }
 
     /// Write the complete current state of all HNSW indexes as a single
@@ -245,7 +321,7 @@ impl VectorWal {
             payload.push(snap.metric);
             payload.extend_from_slice(&snap.m.to_le_bytes());
             payload.extend_from_slice(&snap.ef.to_le_bytes());
-            let serialized = snap.hnsw.serialize();
+            let serialized = snap.hnsw.serialize(snap.registry);
             payload.extend_from_slice(&(serialized.len() as u32).to_le_bytes());
             payload.extend_from_slice(&crc32c::crc32c(&serialized).to_le_bytes());
             payload.extend_from_slice(&serialized);
@@ -263,8 +339,37 @@ impl VectorWal {
         let mut w = self.writer.lock();
         w.flush()?;
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
-        let file = OpenOptions::new().append(true).open(&self.path)?;
+        // The reopen is the hazardous half: the rename above already unlinked
+        // the inode `w` holds, so a failure here leaves the writer pointing at
+        // a file no future recovery reads.
+        #[cfg(test)]
+        let injected: Option<io::Error> = self
+            .fail_reopen_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .then(|| io::Error::other("injected vector WAL reopen failure"));
+        #[cfg(not(test))]
+        let injected: Option<io::Error> = None;
+        let file = if let Some(e) = injected {
+            Err(e)
+        } else if let Some(e) = crate::storage::crashpoint::io_fault("vector.wal_reopen") {
+            Err(e)
+        } else {
+            OpenOptions::new().append(true).open(&self.path)
+        };
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                // The rename already happened, so the handle in `w` is now an
+                // unlinked inode. Mark the writer stranded: appends must
+                // reattach (or fail loudly), never write through it.
+                self.stranded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
+        };
         *w = BufWriter::new(file);
+        self.stranded
+            .store(false, std::sync::atomic::Ordering::Release);
         // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
         let mark = self.syncer.on_append();
         self.syncer.mark_synced(mark);
@@ -279,6 +384,8 @@ pub struct IndexSnapshot<'a> {
     pub metric: u8,
     pub m: u32,
     pub ef: u32,
+    /// PK registry persisted inside the HNSW blob (CRC-covered with it).
+    pub registry: Option<&'a RegistrySection>,
 }
 
 // ─── Replay ───────────────────────────────────────────────────────────────────
@@ -291,10 +398,21 @@ struct ReplayIndex {
     ef: u32,
     /// Full HNSW index from the last snapshot (if any).
     hnsw: Option<HnswIndex>,
-    /// Delta inserts after the last snapshot: (id, vector).
-    delta_inserts: Vec<(u64, Vec<f32>)>,
+    /// Delta inserts after the last snapshot: (id, vector, pk).
+    delta_inserts: Vec<(u64, Vec<f32>, Option<u64>)>,
     /// Delta deletes after the last snapshot.
     delta_deletes: Vec<u64>,
+    /// PK registry recovered so far: the snapshot's section (if any) with
+    /// pk-carrying delta records applied on top. Deleted nodes are un-mapped
+    /// as their DELETE records replay, so the result matches what the live
+    /// registry held at the moment the log stopped.
+    registry: RegistrySection,
+    /// Reverse of `registry.pk_to_node`, maintained only during replay.
+    node_to_pk: HashMap<u64, u64>,
+    /// Whether any registry source existed (snapshot section or pk-carrying
+    /// delta) — distinguishes a recovered registry from an old log that never
+    /// carried one.
+    has_registry: bool,
 }
 
 /// Replay all entries in `data` to reconstruct vector index state.
@@ -346,6 +464,9 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                         hnsw: None,
                         delta_inserts: Vec::new(),
                         delta_deletes: Vec::new(),
+                        registry: RegistrySection::default(),
+                        node_to_pk: HashMap::new(),
+                        has_registry: false,
                     },
                 );
             }
@@ -369,7 +490,10 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                     floats.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
                     pos += 4;
                 }
-                // Read metadata (skip it — stored for forward compat only)
+                // Read metadata. For PK-keyed indexes it carries the row's
+                // primary key as a decimal u64 string (empty for old records
+                // and positional indexes), so replay can rebuild the pk ->
+                // node registry from delta records.
                 let Some(meta_len) = read_u32(data, &mut pos) else {
                     break;
                 };
@@ -377,10 +501,14 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                 if pos + meta_len > data.len() {
                     break;
                 }
-                pos += meta_len; // skip metadata bytes
+                let meta = &data[pos..pos + meta_len];
+                pos += meta_len;
+                let pk = std::str::from_utf8(meta)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok());
 
                 if let Some(idx) = indexes.get_mut(&name) {
-                    idx.delta_inserts.push((id, floats));
+                    idx.delta_inserts.push((id, floats, pk));
                 }
             }
             TAG_DELETE_VEC => {
@@ -483,17 +611,23 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                     // carries a blob (`IndexSnapshot::hnsw` is `&HnswIndex`, not
                     // an Option), so a failure to deserialize one is always
                     // corruption and never an empty index.
-                    let hnsw = match HnswIndex::deserialize(blob) {
-                        Ok(h) => Some(h),
-                        Err(e) => {
-                            corruption = Some(format!(
-                                "HNSW snapshot for index '{name}' ({blob_len} bytes) did not \
-                                 deserialize: {e}"
-                            ));
-                            ok = false;
-                            break;
-                        }
-                    };
+                    let (hnsw_index, registry_section) =
+                        match HnswIndex::deserialize_with_registry(blob) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                corruption = Some(format!(
+                                    "HNSW snapshot for index '{name}' ({blob_len} bytes) did not \
+                                     deserialize: {e}"
+                                ));
+                                ok = false;
+                                break;
+                            }
+                        };
+                    let node_to_pk = registry_section
+                        .as_ref()
+                        .map(|r| r.pk_to_node.iter().map(|(&p, &n)| (n, p)).collect())
+                        .unwrap_or_default();
+                    let has_registry = registry_section.is_some();
 
                     indexes.insert(
                         name,
@@ -502,7 +636,10 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                             metric,
                             m,
                             ef,
-                            hnsw,
+                            registry: registry_section.unwrap_or_default(),
+                            node_to_pk,
+                            has_registry,
+                            hnsw: Some(hnsw_index),
                             delta_inserts: Vec::new(),
                             delta_deletes: Vec::new(),
                         },
@@ -521,7 +658,7 @@ fn replay(data: &[u8]) -> ReplayOutcome {
 
     // Build final state: apply deltas on top of snapshots.
     let mut result = HashMap::new();
-    for (name, ri) in indexes {
+    for (name, mut ri) in indexes {
         let metric_enum = match ri.metric {
             0 => DistanceMetric::L2,
             1 => DistanceMetric::Cosine,
@@ -544,13 +681,32 @@ fn replay(data: &[u8]) -> ReplayOutcome {
         };
 
         // Apply delta inserts.
-        for (id, floats) in ri.delta_inserts {
+        for (id, floats, pk) in ri.delta_inserts {
             hnsw.insert(id, Vector::new(floats));
+            if let Some(pk) = pk {
+                // Mirror the live `PkRegistry::upsert`: a pk re-inserted
+                // without an intervening DELETE record tombstoned its old
+                // node at write time, so count it here too.
+                if let Some(old) = ri.registry.pk_to_node.insert(pk, id) {
+                    ri.node_to_pk.remove(&old);
+                    ri.registry.tombstones += 1;
+                }
+                ri.node_to_pk.insert(id, pk);
+                ri.has_registry = true;
+            }
+            // Delta records replayed after a snapshot can hold node ids the
+            // checkpoint-time registry never allocated; the floor follows
+            // every id seen, pk-carrying or not.
+            ri.registry.next_node = ri.registry.next_node.max(id + 1);
         }
 
         // Apply delta deletes.
         for id in ri.delta_deletes {
             hnsw.mark_deleted(id);
+            if let Some(pk) = ri.node_to_pk.remove(&id) {
+                ri.registry.pk_to_node.remove(&pk);
+                ri.registry.tombstones += 1;
+            }
         }
 
         result.insert(
@@ -561,6 +717,7 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                 metric: ri.metric,
                 m: ri.m,
                 ef: ri.ef,
+                registry: ri.has_registry.then_some(ri.registry),
             },
         );
     }
@@ -644,6 +801,7 @@ mod tests {
                 metric: 0,
                 m: 8,
                 ef: 50,
+                registry: None,
             },
         );
         wal.checkpoint(&snaps).unwrap();
@@ -712,6 +870,129 @@ mod tests {
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
+    }
+
+    /// S31-14: same class as the streams test — a checkpoint reopen failure
+    /// must not leave later inserts acknowledged into an unlinked inode. The
+    /// discriminator is durability: the post-failure insert must land in the
+    /// replaced file (snapshot 3 + one delta = 4 on recovery).
+    #[test]
+    fn a_failed_checkpoint_reopen_does_not_strand_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = VectorWal::open(dir.path()).unwrap();
+            wal.log_create_index("idx", 4, 0, 8, 50).unwrap();
+            let idx = make_index(3, 4, DistanceMetric::L2);
+            let mut snaps = HashMap::new();
+            snaps.insert(
+                "idx".to_string(),
+                IndexSnapshot {
+                    hnsw: &idx,
+                    dims: 4,
+                    metric: 0,
+                    m: 8,
+                    ef: 50,
+                    registry: None,
+                },
+            );
+            wal.fail_reopen_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            wal.checkpoint(&snaps)
+                .expect_err("the injected reopen failure must fail the checkpoint");
+            wal.log_insert("idx", 99, &[9.0, 9.0, 9.0, 9.0], "")
+                .expect("a later append must reattach, not strand");
+        }
+        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        assert_eq!(
+            st.indexes["idx"].hnsw.len(),
+            4,
+            "the post-checkpoint-failure insert went to the unlinked inode: it \
+             returned Ok and no recovery can ever read it"
+        );
+    }
+
+    /// F1b: the pk -> node registry survives a reopen built purely from delta
+    /// records — no checkpoint ever ran, so the snapshot section cannot be the
+    /// carrier; the pk rides in the INSERT records' metadata field. Without
+    /// it, the first post-reopen delete of a pre-restart row cannot resolve
+    /// its node and silently declines.
+    #[test]
+    fn pk_registry_rebuilds_from_pk_carrying_delta_records() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = VectorWal::open(dir.path()).unwrap();
+            wal.log_create_index("idx", 4, 0, 8, 50).unwrap();
+            wal.log_insert("idx", 0, &[1.0, 0.0, 0.0, 0.0], "7")
+                .unwrap();
+            wal.log_insert("idx", 1, &[0.0, 1.0, 0.0, 0.0], "8")
+                .unwrap();
+            wal.log_delete("idx", 0).unwrap();
+        }
+        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        let registry = st.indexes["idx"]
+            .registry
+            .as_ref()
+            .expect("pk-carrying delta records must recover a registry");
+        assert_eq!(registry.pk_to_node.get(&8), Some(&1));
+        assert!(
+            !registry.pk_to_node.contains_key(&7),
+            "the deleted node's mapping must not survive"
+        );
+        assert_eq!(registry.tombstones, 1);
+        assert!(
+            registry.next_node >= 2,
+            "the allocator floor follows ids seen"
+        );
+    }
+
+    /// F1b: a registry checkpointed into a snapshot merges with the pk-carrying
+    /// deltas logged after it, and the recovered `next_node` can never sit
+    /// below an id those deltas hold.
+    #[test]
+    fn a_snapshotted_registry_merges_with_later_pk_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = VectorWal::open(dir.path()).unwrap();
+            wal.log_create_index("idx", 4, 0, 8, 50).unwrap();
+            let idx = make_index(2, 4, DistanceMetric::L2);
+            let mut registry = RegistrySection::default();
+            registry.pk_to_node.insert(1, 0);
+            registry.pk_to_node.insert(2, 1);
+            registry.next_node = 2;
+            let mut snaps = HashMap::new();
+            snaps.insert(
+                "idx".to_string(),
+                IndexSnapshot {
+                    hnsw: &idx,
+                    dims: 4,
+                    metric: 0,
+                    m: 8,
+                    ef: 50,
+                    registry: Some(&registry),
+                },
+            );
+            wal.checkpoint(&snaps).unwrap();
+            // Delta after the snapshot: a fresh node the checkpoint-time
+            // registry never allocated, logged with its pk.
+            wal.log_insert("idx", 9, &[9.0, 9.0, 9.0, 9.0], "3")
+                .unwrap();
+            wal.log_delete("idx", 0).unwrap();
+        }
+        let (_w, st) = VectorWal::open(dir.path()).unwrap();
+        let registry = st.indexes["idx"]
+            .registry
+            .as_ref()
+            .expect("the snapshot carried a registry section");
+        assert_eq!(registry.pk_to_node.get(&2), Some(&1), "snapshot half");
+        assert_eq!(registry.pk_to_node.get(&3), Some(&9), "delta half");
+        assert!(
+            !registry.pk_to_node.contains_key(&1),
+            "the delta delete of node 0 must un-map pk 1"
+        );
+        assert!(
+            registry.next_node >= 10,
+            "next_node must cover delta ids beyond the snapshot's registry"
+        );
     }
 
     // ── Test 1: Insert 50 vectors, reopen, search returns same results ──────
@@ -824,6 +1105,7 @@ mod tests {
                     metric: 0,
                     m: 8,
                     ef: 50,
+                    registry: None,
                 },
             );
             wal.checkpoint(&snaps).unwrap();
@@ -926,6 +1208,7 @@ mod tests {
                     metric: 0,
                     m: 8,
                     ef: 50,
+                    registry: None,
                 },
             );
             wal.checkpoint(&snaps).unwrap();
@@ -982,6 +1265,7 @@ mod tests {
                     metric: 0,
                     m: 16,
                     ef: 50,
+                    registry: None,
                 },
             );
             wal.checkpoint(&snaps).unwrap();
@@ -1026,6 +1310,7 @@ mod tests {
                     metric: 0,
                     m: 8,
                     ef: 50,
+                    registry: None,
                 },
             );
             wal.checkpoint(&snaps).unwrap();
@@ -1056,7 +1341,7 @@ mod tests {
     fn a_pre_checksum_snapshot_still_opens() {
         let dir = tempfile::tempdir().unwrap();
         let idx = make_index(24, 8, DistanceMetric::L2);
-        let blob = idx.serialize();
+        let blob = idx.serialize(None);
 
         // TAG_SNAPSHOT (0x04): count, name, dims, metric, m, ef, blob_len, blob
         // — no CRC field between blob_len and blob.
@@ -1106,6 +1391,7 @@ mod tests {
                 metric: 0,
                 m: 8,
                 ef: 50,
+                registry: None,
             },
         );
         wal.checkpoint(&snaps).unwrap();
@@ -1154,6 +1440,7 @@ mod tests {
                 metric: 0,
                 m: 8,
                 ef: 50,
+                registry: None,
             },
         );
         wal.checkpoint(&snaps).unwrap();

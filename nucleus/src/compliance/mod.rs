@@ -517,7 +517,10 @@ impl DeletionCascade {
 
         steps.push(DeletionStep {
             table: table.to_string(),
-            condition: format!("{id_column} = '{id_value}'"),
+            // The value is user data interpolated into SQL text for the
+            // plan's consumer — double the quotes so an apostrophe-bearing
+            // value stays one literal rather than breaking the condition.
+            condition: format!("{id_column} = '{}'", id_value.replace('\'', "''")),
             cascade_from,
         });
     }

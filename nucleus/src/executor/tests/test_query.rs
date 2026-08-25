@@ -2032,3 +2032,201 @@ async fn group_by_ordinal_names_the_output_column() {
     let r = exec(&ex, "SELECT count(*) FROM aggg GROUP BY 1 + 0").await;
     assert_eq!(rows(&r[0]).len(), 1);
 }
+
+// ======================================================================
+// QPP regressions — aggregate/window/expression correctness
+// ======================================================================
+
+/// QPP-4: AVG(int) used the wrapping SIMD sum while SUM correctly errors.
+/// Two rows near i64::MAX/2 must error for BOTH aggregates.
+///
+/// AST path (`plan_execution = off`); the two-conjunct WHERE declines the
+/// plan path AND the columnar O(1) fast-aggregate short-circuit, so
+/// eval_aggregate_fn's SIMD arm — the fixed site — is what runs. The plan
+/// path's `compute_aggregate` fallback and the columnar fast path's f64
+/// SUM/AVG are separate pre-existing overflow hazards tracked independently.
+#[tokio::test]
+async fn test_avg_int_overflow_errors_like_sum() {
+    let ex = test_executor();
+    exec(&ex, "SET plan_execution = off").await;
+    exec(&ex, "CREATE TABLE ovf (v BIGINT)").await;
+    exec(&ex, "INSERT INTO ovf VALUES (9223372036854775806)").await;
+    exec(&ex, "INSERT INTO ovf VALUES (9223372036854775806)").await;
+    let sum = ex
+        .execute("SELECT SUM(v) FROM ovf WHERE v > 0 AND v < 9223372036854775807")
+        .await;
+    assert!(sum.is_err(), "SUM must error on i64 overflow: {sum:?}");
+    let avg = ex
+        .execute("SELECT AVG(v) FROM ovf WHERE v > 0 AND v < 9223372036854775807")
+        .await;
+    assert!(
+        avg.is_err(),
+        "AVG must error on i64 overflow too, not average garbage: {avg:?}"
+    );
+}
+
+/// QPP-5: FIRST_VALUE/LAST_VALUE/NTH_VALUE must honor the computed frame —
+/// `LAST_VALUE(v) OVER (ORDER BY id)` is the current row (default frame ends
+/// at CURRENT ROW), not the partition's last row.
+#[tokio::test]
+async fn test_window_value_functions_honor_frame() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE wvf (id INT, v INT)").await;
+    for (id, v) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+        exec(&ex, &format!("INSERT INTO wvf VALUES ({id}, {v})")).await;
+    }
+
+    // Default frame with ORDER BY = RANGE UNBOUNDED PRECEDING..CURRENT ROW:
+    // LAST_VALUE is the current row.
+    let r = exec(&ex, "SELECT id, LAST_VALUE(v) OVER (ORDER BY id) FROM wvf").await;
+    let got: Vec<(i32, i32)> = rows(&r[0])
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Int32(a), Value::Int32(b)) => (*a, *b),
+            other => panic!("expected ints, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+        "LAST_VALUE with the default frame must be each row's own value"
+    );
+
+    // FIRST_VALUE over a 1-preceding..1-following frame: from id 2 on it is
+    // the PREVIOUS row's v.
+    let r = exec(
+        &ex,
+        "SELECT id, FIRST_VALUE(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM wvf",
+    )
+    .await;
+    let got: Vec<i32> = rows(&r[0])
+        .iter()
+        .map(|row| match &row[1] {
+            Value::Int32(b) => *b,
+            other => panic!("expected int, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![10, 10, 20, 30]);
+
+    // NTH_VALUE(v, 2) over 1 PRECEDING..CURRENT ROW: rank 1 has a 1-row
+    // frame (NULL); for every later row the 2nd frame member is that row
+    // itself (previous + current).
+    let r = exec(
+        &ex,
+        "SELECT id, NTH_VALUE(v, 2) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wvf",
+    )
+    .await;
+    let got: Vec<Value> = rows(&r[0]).iter().map(|row| row[1].clone()).collect();
+    assert_eq!(
+        got,
+        vec![
+            Value::Null,
+            Value::Int32(20),
+            Value::Int32(30),
+            Value::Int32(40)
+        ]
+    );
+}
+
+/// QPP-7: simple-CASE `WHEN NULL` must never match — SQL `=` semantics, on
+/// both the AST and the plan path.
+#[tokio::test]
+async fn test_simple_case_null_never_matches() {
+    for plan in [true, false] {
+        let ex = test_executor();
+        if !plan {
+            exec(&ex, "SET plan_execution = off").await;
+        }
+        let r = exec(&ex, "SELECT CASE NULL WHEN NULL THEN 1 ELSE 2 END").await;
+        assert_eq!(*scalar(&r[0]), Value::Int32(2), "plan={plan}");
+
+        let r = exec(
+            &ex,
+            "SELECT CASE x WHEN NULL THEN 'match' ELSE 'nomatch' END FROM (SELECT 1 AS x) t",
+        )
+        .await;
+        assert_eq!(*scalar(&r[0]), Value::Text("nomatch".into()), "plan={plan}");
+
+        // Positive control: a real value still matches.
+        let r = exec(
+            &ex,
+            "SELECT CASE x WHEN 1 THEN 'match' ELSE 'nomatch' END FROM (SELECT 1 AS x) t",
+        )
+        .await;
+        assert_eq!(*scalar(&r[0]), Value::Text("match".into()), "plan={plan}");
+    }
+}
+
+/// QPP-8: `LIKE ... ESCAPE '<c>'` must honor the escape on the AST path —
+/// both paths must agree.
+#[tokio::test]
+async fn test_like_escape_char_ast_path() {
+    for plan in [true, false] {
+        let ex = test_executor();
+        if !plan {
+            exec(&ex, "SET plan_execution = off").await;
+        }
+        let a = exec(&ex, "SELECT 'a%b' LIKE 'a!%b' ESCAPE '!'").await;
+        assert_eq!(*scalar(&a[0]), Value::Bool(true), "plan={plan}");
+        let b = exec(&ex, "SELECT 'axb' LIKE 'a!%b' ESCAPE '!'").await;
+        assert_eq!(*scalar(&b[0]), Value::Bool(false), "plan={plan}");
+        // Default backslash escape control.
+        let c = exec(&ex, "SELECT 'a%b' LIKE 'a\\%b'").await;
+        assert_eq!(*scalar(&c[0]), Value::Bool(true), "plan={plan}");
+        // ESCAPE '' disables escaping: '!' is an ordinary literal.
+        let d = exec(&ex, "SELECT 'a!b' LIKE 'a!b' ESCAPE ''").await;
+        assert_eq!(*scalar(&d[0]), Value::Bool(true), "plan={plan}");
+    }
+}
+
+/// QPP-9: `SUBSTRING('abc' FROM -1)` must clip to the string start, not wrap
+/// through `as usize` to a huge skip and return ''. The comma form is the
+/// correct reference.
+#[tokio::test]
+async fn test_substring_from_negative_start() {
+    for plan in [true, false] {
+        let ex = test_executor();
+        if !plan {
+            exec(&ex, "SET plan_execution = off").await;
+        }
+        let cases: [(&str, &str); 4] = [
+            ("SUBSTRING('abc' FROM -1)", "abc"),
+            ("SUBSTRING('abc' FROM 0 FOR 2)", "a"),
+            ("SUBSTRING('abc' FROM 2)", "bc"),
+            ("SUBSTRING('abc' FROM 2 FOR 10)", "bc"),
+        ];
+        for (sql, want) in cases {
+            let r = exec(&ex, &format!("SELECT {sql}")).await;
+            assert_eq!(
+                *scalar(&r[0]),
+                Value::Text(want.into()),
+                "{sql} (plan={plan})"
+            );
+        }
+        // The comma form agrees on the same inputs.
+        let r = exec(&ex, "SELECT SUBSTRING('abc', -1, 10)").await;
+        assert_eq!(*scalar(&r[0]), Value::Text("abc".into()));
+    }
+}
+
+/// QPP-10: `POSITION(sub IN str)` must report CHARACTER positions (PG), not
+/// byte offsets — and agree with strpos() on multibyte text.
+///
+/// One executor per statement: the AST-parse cache substitutes extracted
+/// literals on a shape hit, and its extractor mangles non-ASCII (the WIR-4
+/// `bytes[i] as char` family — tracked separately), which would pollute this
+/// test with mojibake unrelated to the character-index contract.
+#[tokio::test]
+async fn test_position_reports_character_index() {
+    for (sql, want) in [
+        ("SELECT POSITION('f' IN 'überf')", Value::Int32(5)),
+        ("SELECT strpos('überf', 'f')", Value::Int32(5)),
+        // CJK: each char is 3 bytes; 界 is the 4th character.
+        ("SELECT POSITION('界' IN '你好世界')", Value::Int32(4)),
+        ("SELECT POSITION('zz' IN 'abc')", Value::Int32(0)),
+    ] {
+        let ex = test_executor();
+        let r = exec(&ex, sql).await;
+        assert_eq!(*scalar(&r[0]), want, "{sql}");
+    }
+}

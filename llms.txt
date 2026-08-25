@@ -26,7 +26,7 @@
 ## Projects
 
 ### nucleus/ — Nucleus Database Engine
-Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vector, Graph, TimeSeries, Document, Full-Text Search, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub. PostgreSQL wire protocol compatible. MVCC isolation, WAL crash recovery. Developer preview — durability differs sharply by model (see nucleus/DURABILITY.md and nucleus/docs/MODEL_SEMANTICS.md; Datalog has no durable store, and distributed/Raft mode is incomplete and unsupported).
+Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vector, Graph, TimeSeries, Document, Full-Text Search, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub. PostgreSQL wire protocol compatible. MVCC isolation, WAL crash recovery. Developer preview — durability differs sharply by model (see nucleus/DURABILITY.md and nucleus/docs/MODEL_SEMANTICS.md; Datalog facts and rules are durable but rollback compensation is missing — a rolled-back DATALOG_ASSERT can return on replay, and distributed/Raft mode is incomplete and unsupported).
 - Entry: `nucleus/src/`
 - Tests: `cargo test --lib` in `nucleus/`
 - Key SQL functions: `kv_get/set`, `ts_insert/range`, `doc_insert/query`, `columnar_insert`, `VECTOR_DISTANCE()`
@@ -79,7 +79,7 @@ ML and scientific computing library. Typed Nucleus client for all 14 models. Ext
 ### zig/ — Neutron Zig (Systems Library)
 4-layer systems library (wire -> HAL -> protocols -> app). Nucleus client for all 14 models. JWT auth, compression, SSE, cache. Comptime-typed row decoding, fixed-capacity connection pool (heap-backed). Layer 0 is zero-allocation. Requires Zig 0.15.2.
 - Entry: `zig/`
-- Tests: `zig build test` in `zig/` (309 tests, verified on 0.15.2)
+- Tests: `zig build test` in `zig/` (328 tests, verified on 0.15.2)
 
 ### modelica/ — Neutron Modelica (Physics Simulation)
 Physics simulation framework. FMI 2.0/3.0 model exchange, Kirchhoff's law solver (MNA), Julia bridge via DifferentialEquations.jl. Python-based tooling.

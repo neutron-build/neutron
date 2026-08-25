@@ -287,7 +287,9 @@ impl DiskBackedVectorStore {
     pub fn flush_cache(&self) {
         // Ensure LsmTree memtable is flushed to SSTable.
         let mut lsm = self.lsm.lock();
-        lsm.force_flush();
+        if let Err(e) = lsm.force_flush() {
+            tracing::error!("vector cold tier flush failed: {e}");
+        }
     }
 
     // ── Private helpers ─────────────────────────────────────────────────

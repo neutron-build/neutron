@@ -16,7 +16,7 @@
 //!
 //! ### SSTable file format
 //! ```text
-//! Magic:    4 bytes  "LSMS"
+//! Magic:    4 bytes  "LSM2" (v2) or "LSMS" (v1)
 //! Level:    1 byte   u8
 //! Seq:      8 bytes  u64 LE
 //! n_entries 4 bytes  u32 LE
@@ -26,13 +26,26 @@
 //!   kind:      1 byte  0 = tombstone, 1 = value
 //!   val_len:   4 bytes u32 LE  (only when kind==1)
 //!   val_bytes: val_len bytes   (only when kind==1)
+//!   crc32c:    4 bytes u32 LE  (v2 only; covers key_len..end-of-value)
 //! ```
+//!
+//! v1 files (`LSMS`, no checksums) are still loaded but never written: the
+//! cold tier was the only durable format in the engine with no integrity
+//! check of its own until v2.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// v1 SSTable magic (`LSMS`): no per-entry checksums. Still loaded; never
+/// written.
+const SST_MAGIC_V1: &[u8; 4] = b"LSMS";
+/// v2 SSTable magic: every entry carries a CRC32C trailer over
+/// key_len..end-of-value. The cold tier was the only durable format in the
+/// engine with no integrity check of its own.
+const SST_MAGIC_V2: &[u8; 4] = b"LSM2";
 
 // ============================================================================
 // Configuration
@@ -169,6 +182,9 @@ pub struct SSTable {
     pub size_bytes: usize,
     /// Backing file, once written. `None` means every value is `Mem`.
     path: Option<PathBuf>,
+    /// Whether the backing file carries per-entry CRC32C trailers (v2).
+    /// v1 tables load unchecked; reads through them cannot detect bitrot.
+    checksummed: bool,
 }
 
 impl SSTable {
@@ -201,6 +217,7 @@ impl SSTable {
             seq,
             size_bytes,
             path: None,
+            checksummed: true,
         }
     }
 
@@ -215,7 +232,7 @@ impl SSTable {
             .index
             .binary_search_by_key(&key, |(k, _)| k.as_slice())
             .ok()?;
-        Some(self.read_value(&self.index[idx].1))
+        Some(self.read_value(key, &self.index[idx].1))
     }
 
     /// Read one value, from memory or from the backing file.
@@ -225,7 +242,7 @@ impl SSTable {
     /// inside a point lookup, and the caller cannot distinguish a missing file
     /// from a deleted key in any case. Callers that need to know a file is gone
     /// should be checking the file, not a key.
-    fn read_value(&self, loc: &ValueLoc) -> Option<Vec<u8>> {
+    fn read_value(&self, key: &[u8], loc: &ValueLoc) -> Option<Vec<u8>> {
         match loc {
             ValueLoc::Tombstone => None,
             ValueLoc::Mem(bytes) => Some(bytes.clone()),
@@ -235,6 +252,32 @@ impl SSTable {
                 file.seek(SeekFrom::Start(*offset)).ok()?;
                 let mut buf = vec![0u8; *len as usize];
                 file.read_exact(&mut buf).ok()?;
+                if self.checksummed {
+                    let mut trailer = [0u8; 4];
+                    if file.read_exact(&mut trailer).is_err() {
+                        return None;
+                    }
+                    // Must match the writer byte-for-byte: the CRC covers the
+                    // full buffered entry key_len || key || kind || val_len ||
+                    // val — the key_len prefix is part of the authenticated
+                    // bytes and was missing from an earlier draft of this
+                    // reader.
+                    let mut crc = crc32c::crc32c(&(key.len() as u32).to_le_bytes());
+                    crc = crc32c::crc32c_append(crc, key);
+                    crc = crc32c::crc32c_append(crc, &[1u8]); // kind
+                    crc = crc32c::crc32c_append(crc, &len.to_le_bytes());
+                    crc = crc32c::crc32c_append(crc, &buf);
+                    if u32::from_le_bytes(trailer) != crc {
+                        // Same floor as a failed read (None = missing): the
+                        // alternative is panicking inside a point lookup.
+                        // Unlike before, the loss is now VISIBLE.
+                        tracing::error!(
+                            "SSTable value checksum mismatch at {} offset {offset}",
+                            path.display()
+                        );
+                        return None;
+                    }
+                }
                 Some(buf)
             }
         }
@@ -275,7 +318,7 @@ impl SSTable {
     pub fn entries(&self) -> impl Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + '_ {
         self.index
             .iter()
-            .map(move |(k, loc)| (k.clone(), self.read_value(loc)))
+            .map(move |(k, loc)| (k.clone(), self.read_value(k, loc)))
     }
 
     /// Keys in sorted order, without touching the backing file.
@@ -303,6 +346,10 @@ pub struct LsmTree {
     pub compaction_count: u64,
     /// Directory for SSTable files. `None` = in-memory only.
     disk_dir: Option<PathBuf>,
+    /// An SSTable write failed since the last time anyone asked (threshold
+    /// flush inside `put`/`delete` has no error channel). Drained by
+    /// [`LsmTree::take_write_error`], mirroring `KvWal`.
+    write_failed: bool,
 }
 
 impl LsmTree {
@@ -316,6 +363,7 @@ impl LsmTree {
             flush_count: 0,
             compaction_count: 0,
             disk_dir: None,
+            write_failed: false,
         }
     }
 
@@ -334,6 +382,7 @@ impl LsmTree {
             flush_count: 0,
             compaction_count: 0,
             disk_dir: Some(dir.to_path_buf()),
+            write_failed: false,
         };
         tree.load_from_dir(dir)?;
         Ok(tree)
@@ -349,55 +398,6 @@ impl LsmTree {
         self.disk_dir
             .as_ref()
             .map(|d| d.join(Self::sst_filename(level, seq)))
-    }
-
-    /// Write an SSTable to disk and repoint it at the file.
-    ///
-    /// Streams rather than building the whole table in a buffer first, and
-    /// records each value's offset so the table can drop its resident copies:
-    /// after this returns, the run costs keys plus offsets in memory instead of
-    /// keys plus data.
-    fn write_sst_to_disk(&self, sst: &mut SSTable) -> io::Result<()> {
-        let Some(path) = self.sst_path(sst.level, sst.seq) else {
-            return Ok(());
-        };
-        let file = File::create(&path)?;
-        let mut w = io::BufWriter::new(file);
-        let mut pos: u64 = 0;
-        let write = |w: &mut io::BufWriter<File>, bytes: &[u8], pos: &mut u64| -> io::Result<()> {
-            w.write_all(bytes)?;
-            *pos += bytes.len() as u64;
-            Ok(())
-        };
-
-        write(&mut w, b"LSMS", &mut pos)?;
-        write(&mut w, &[sst.level as u8], &mut pos)?;
-        write(&mut w, &sst.seq.to_le_bytes(), &mut pos)?;
-        write(&mut w, &(sst.len() as u32).to_le_bytes(), &mut pos)?;
-
-        let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(sst.len());
-        for (k, v) in sst.entries() {
-            write(&mut w, &(k.len() as u32).to_le_bytes(), &mut pos)?;
-            write(&mut w, &k, &mut pos)?;
-            match v {
-                None => {
-                    write(&mut w, &[0u8], &mut pos)?;
-                    offsets.push((0, 0));
-                }
-                Some(val) => {
-                    write(&mut w, &[1u8], &mut pos)?;
-                    write(&mut w, &(val.len() as u32).to_le_bytes(), &mut pos)?;
-                    // Payload begins here — this is what a later read seeks to.
-                    offsets.push((pos, val.len() as u32));
-                    write(&mut w, &val, &mut pos)?;
-                }
-            }
-        }
-        w.flush()?;
-        drop(w);
-
-        sst.attach_file(path, &offsets);
-        Ok(())
     }
 
     fn delete_sst_from_disk(&self, level: usize, seq: u64) {
@@ -427,8 +427,11 @@ impl LsmTree {
                     }
                     self.levels[level].push(sst);
                 }
-                Err(_) => {
-                    // Skip corrupt files (best-effort recovery).
+                Err(e) => {
+                    // Still best-effort (one unreadable file must not make
+                    // the whole store unopenable), but no longer silent: a
+                    // skipped file is data the operator must know vanished.
+                    tracing::error!("LSM: skipping unloadable SSTable {}: {e}", path.display());
                 }
             }
         }
@@ -443,7 +446,7 @@ impl LsmTree {
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.memtable.insert(key, Some(value));
         if self.memtable.len() >= self.config.memtable_flush_threshold {
-            self.flush_memtable();
+            self.flush_on_threshold();
         }
     }
 
@@ -451,8 +454,26 @@ impl LsmTree {
     pub fn delete(&mut self, key: Vec<u8>) {
         self.memtable.insert(key, None);
         if self.memtable.len() >= self.config.memtable_flush_threshold {
-            self.flush_memtable();
+            self.flush_on_threshold();
         }
+    }
+
+    /// Threshold-triggered flush inside the write path. `put`/`delete` have
+    /// no error channel (every consumer is a cold-tier spill), so the
+    /// failure is recorded on the flag the checkpoint drains — continuing
+    /// silently is how a full disk used to eat the cold tier.
+    fn flush_on_threshold(&mut self) {
+        if let Err(e) = self.flush_memtable() {
+            tracing::error!("LSM: threshold flush failed: {e}");
+            self.write_failed = true;
+        }
+    }
+
+    /// Take the write-failure flag, clearing it. Edge-triggered, mirroring
+    /// [`crate::storage::kv_wal::KvWal::take_write_error`]: the caller that
+    /// drains it is the one that must report it.
+    pub fn take_write_error(&mut self) -> bool {
+        std::mem::replace(&mut self.write_failed, false)
     }
 
     /// Point lookup: checks memtable first, then SSTables from newest to oldest.
@@ -473,22 +494,42 @@ impl LsmTree {
     }
 
     /// Flush the memtable to a new SSTable at level 0.
-    pub fn flush_memtable(&mut self) {
+    ///
+    /// On write error the table still enters the in-memory levels with its
+    /// values resident, so reads keep working — but nothing may be compacted
+    /// on top of it, and the caller learns the flush is not durable.
+    pub fn flush_memtable(&mut self) -> io::Result<()> {
+        // Retry tables left resident by an earlier failed flush BEFORE taking
+        // the memtable: a checkpoint that succeeds below must not truncate the
+        // WAL while an older RAM-only table still holds keys whose WAL records
+        // it is about to drop.
+        self.flush_unwritten()?;
         if self.memtable.is_empty() {
-            return;
+            return Ok(());
         }
         let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> =
             std::mem::take(&mut self.memtable).into_iter().collect();
         let seq = self.next_seq;
         self.next_seq += 1;
         let mut sst = SSTable::from_sorted(entries, 0, seq, self.config.bloom_bits_per_key);
-        // Write to disk before adding to in-memory levels (WAL semantics). This
-        // also releases the resident values into file offsets.
-        if let Err(e) = self.write_sst_to_disk(&mut sst) {
-            eprintln!(
+        if let Some(ref dir) = self.disk_dir
+            && let Err(e) = write_sst_to_disk(dir, &mut sst)
+        {
+            // The partial file must not outlive the attempt: on restart it
+            // would parse as a shorter table with this seq and shadow the
+            // intact lower-seq tables holding the same keys.
+            self.delete_sst_from_disk(sst.level, sst.seq);
+            tracing::error!(
                 "LSM: failed to write SSTable L{}/seq{} to disk: {e}",
-                sst.level, sst.seq
+                sst.level,
+                sst.seq
             );
+            if !self.levels.is_empty() {
+                self.levels[0].push(sst);
+            }
+            // Returning before maybe_compact: compacting an unwritten table
+            // is exactly how the inputs' files used to get deleted.
+            return Err(e);
         }
         if !self.levels.is_empty() {
             self.levels[0].push(sst);
@@ -496,16 +537,39 @@ impl LsmTree {
         self.flush_count += 1;
 
         // Check if level 0 needs compaction.
-        self.maybe_compact(0);
+        self.maybe_compact(0)
+    }
+
+    /// Write any table still holding resident values because its disk write
+    /// failed (path is None). No-op for in-memory trees.
+    fn flush_unwritten(&mut self) -> io::Result<()> {
+        let Some(dir) = self.disk_dir.clone() else {
+            return Ok(());
+        };
+        for level in &mut self.levels {
+            for sst in level.iter_mut() {
+                if sst.path.is_none()
+                    && let Err(e) = write_sst_to_disk(&dir, sst)
+                {
+                    // Same partial-file rule as flush_memtable. Cannot call
+                    // self.delete_sst_from_disk here (self.levels is mutably
+                    // borrowed), so remove via the cloned dir.
+                    let _ =
+                        std::fs::remove_file(dir.join(LsmTree::sst_filename(sst.level, sst.seq)));
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Trigger compaction at the given level if it exceeds the threshold.
-    fn maybe_compact(&mut self, level: usize) {
+    fn maybe_compact(&mut self, level: usize) -> io::Result<()> {
         if level + 1 >= self.levels.len() {
-            return; // Can't compact beyond max level.
+            return Ok(()); // Can't compact beyond max level.
         }
         if self.levels[level].len() <= self.config.level_max_sstables {
-            return; // Not enough SSTables to compact.
+            return Ok(()); // Not enough SSTables to compact.
         }
 
         // Collect level+seq of all SSTables we are about to consume so we can
@@ -550,12 +614,22 @@ impl LsmTree {
         let seq = self.next_seq;
         self.next_seq += 1;
         let mut sst = SSTable::from_sorted(entries, level + 1, seq, self.config.bloom_bits_per_key);
-        // Write merged SSTable to disk first, then delete superseded files.
-        if let Err(e) = self.write_sst_to_disk(&mut sst) {
-            eprintln!(
+        // Only a durable write earns the right to delete the superseded
+        // inputs. On failure the inputs stay on disk, the merged table stays
+        // resident (reads keep working), and the partial output file is
+        // removed so a restart cannot load a truncated table that shadows
+        // its own inputs.
+        if let Some(ref dir) = self.disk_dir
+            && let Err(e) = write_sst_to_disk(dir, &mut sst)
+        {
+            self.delete_sst_from_disk(sst.level, sst.seq);
+            tracing::error!(
                 "LSM: failed to write compacted SSTable L{}/seq{} to disk: {e}",
-                sst.level, sst.seq
+                sst.level,
+                sst.seq
             );
+            self.levels[level + 1].push(sst);
+            return Err(e);
         }
         self.levels[level + 1].push(sst);
         self.compaction_count += 1;
@@ -566,16 +640,19 @@ impl LsmTree {
         }
 
         // Recurse: the next level might now need compaction too.
-        self.maybe_compact(level + 1);
+        self.maybe_compact(level + 1)
     }
 
     /// Force compaction at a specific level.
-    pub fn compact(&mut self, level: usize) {
+    pub fn compact(&mut self, level: usize) -> io::Result<()> {
         if level + 1 < self.levels.len() && !self.levels[level].is_empty() {
             let saved_threshold = self.config.level_max_sstables;
             self.config.level_max_sstables = 0; // Force compaction.
-            self.maybe_compact(level);
+            let r = self.maybe_compact(level);
             self.config.level_max_sstables = saved_threshold;
+            r
+        } else {
+            Ok(())
         }
     }
 
@@ -609,6 +686,33 @@ impl LsmTree {
             .collect()
     }
 
+    /// Largest 8-byte little-endian u64 key in the tree (memtable + all
+    /// SSTables; tombstones included — a tombstoned key still reserves its
+    /// id). Returns None when the tree holds no 8-byte keys. Reads keys
+    /// only; value bytes are never touched.
+    pub fn max_u64_le_key(&self) -> Option<u64> {
+        let mut max: Option<u64> = None;
+        let consider = |key: &[u8], max: &mut Option<u64>| {
+            if let Ok(bytes) = <[u8; 8]>::try_from(key) {
+                let id = u64::from_le_bytes(bytes);
+                if max.is_none_or(|m| id > m) {
+                    *max = Some(id);
+                }
+            }
+        };
+        for key in self.memtable.keys() {
+            consider(key, &mut max);
+        }
+        for level in &self.levels {
+            for sst in level {
+                for key in sst.keys() {
+                    consider(key, &mut max);
+                }
+            }
+        }
+        max
+    }
+
     /// Total number of SSTables across all levels.
     pub fn sstable_count(&self) -> usize {
         self.levels.iter().map(|l| l.len()).sum()
@@ -629,14 +733,111 @@ impl LsmTree {
     }
 
     /// Force-flush the memtable to level 0 (used before shutdown / snapshot).
-    pub fn force_flush(&mut self) {
-        self.flush_memtable();
+    pub fn force_flush(&mut self) -> io::Result<()> {
+        self.flush_memtable()
     }
 }
 
 // ============================================================================
 // SSTable file I/O
 // ============================================================================
+
+/// Test-only: fail the next SSTable write INTO THIS DIRECTORY, to exercise
+/// the heal/preserve paths without a full disk. `lsm.sst_write` covers the
+/// same path out-of-process. Keyed by directory so the injection is
+/// test-local: a process-global flag once leaked into a parallel test that
+/// never asked for it (`loaded_sstable_holds_offsets_not_values` consumed
+/// another test's injection and unwrapped the injected Err).
+#[cfg(test)]
+static FAIL_NEXT_SST_WRITE_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test-only: arm [`FAIL_NEXT_SST_WRITE_DIR`] for `dir`.
+#[cfg(test)]
+pub(crate) fn fail_next_sst_write(dir: &Path) {
+    *FAIL_NEXT_SST_WRITE_DIR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(dir.to_path_buf());
+}
+
+/// Write an SSTable to disk and repoint it at the file.
+///
+/// Streams rather than building the whole table in a buffer first, and
+/// records each value's offset so the table can drop its resident copies:
+/// after this returns, the run costs keys plus offsets in memory instead of
+/// keys plus data.
+///
+/// A free function (not a method) because the heal pass in
+/// `flush_unwritten` iterates `self.levels` mutably while writing.
+fn write_sst_to_disk(dir: &Path, sst: &mut SSTable) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let mut armed = FAIL_NEXT_SST_WRITE_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if armed.as_deref() == Some(dir) {
+            *armed = None;
+            return Err(io::Error::other("injected SSTable write failure"));
+        }
+    }
+    if let Some(e) = crate::storage::crashpoint::io_fault("lsm.sst_write") {
+        return Err(e);
+    }
+    let path = dir.join(LsmTree::sst_filename(sst.level, sst.seq));
+    let file = File::create(&path)?;
+    let mut w = io::BufWriter::new(file);
+    let mut pos: u64 = 0;
+    let write = |w: &mut io::BufWriter<File>, bytes: &[u8], pos: &mut u64| -> io::Result<()> {
+        w.write_all(bytes)?;
+        *pos += bytes.len() as u64;
+        Ok(())
+    };
+
+    write(&mut w, SST_MAGIC_V2, &mut pos)?;
+    write(&mut w, &[sst.level as u8], &mut pos)?;
+    write(&mut w, &sst.seq.to_le_bytes(), &mut pos)?;
+    write(&mut w, &(sst.len() as u32).to_le_bytes(), &mut pos)?;
+
+    let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(sst.len());
+    for (k, v) in sst.entries() {
+        // Entry body: key_len | key | kind | (val_len | val). Buffered so the
+        // CRC32C trailer covers exactly the entry bytes.
+        let mut entry = Vec::with_capacity(k.len() + v.as_ref().map_or(0, Vec::len) + 9);
+        entry.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        entry.extend_from_slice(&k);
+        match v {
+            None => {
+                entry.push(0u8);
+                // Placeholder keeps `attach_file`'s index↔offsets zip aligned
+                // (ignored for tombstones), matching the v1 writer.
+                offsets.push((0, 0));
+            }
+            Some(val) => {
+                entry.push(1u8);
+                entry.extend_from_slice(&(val.len() as u32).to_le_bytes());
+                // Payload begins after this entry's val_len field.
+                offsets.push((pos + entry.len() as u64, val.len() as u32));
+                entry.extend_from_slice(&val);
+            }
+        }
+        let crc = crc32c::crc32c(&entry);
+        write(&mut w, &entry, &mut pos)?;
+        write(&mut w, &crc.to_le_bytes(), &mut pos)?;
+    }
+    w.flush()?;
+    // Durable, not just in the page cache: every consumer treats an `.sst`
+    // file as the last copy of its keys once a WAL checkpoint has truncated
+    // past them.
+    w.get_ref().sync_all()?;
+    drop(w);
+    // The directory entry must survive too, or the crash loses the file name
+    // even though the bytes were fsynced (same rationale as mvcc_wal).
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+
+    sst.attach_file(path, &offsets);
+    Ok(())
+}
 
 /// Read and parse an SSTable file.
 /// Load an SSTable's index without reading its values.
@@ -656,12 +857,16 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     pos += 4;
-    if &magic != b"LSMS" {
+    let checksummed = if &magic == SST_MAGIC_V2 {
+        true
+    } else if &magic == SST_MAGIC_V1 {
+        false
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "bad SSTable magic",
         ));
-    }
+    };
 
     let mut one = [0u8; 1];
     r.read_exact(&mut one)?;
@@ -702,7 +907,7 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
     let mut bloom = BloomFilter::new(n.max(1), 10);
     let mut size_bytes = 0usize;
 
-    for _ in 0..n {
+    for entry_idx in 0..n {
         r.read_exact(&mut four)?;
         pos += 4;
         let key_len = u32::from_le_bytes(four) as usize;
@@ -721,13 +926,38 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
         pos += 1;
         let kind = one[0];
 
+        // v2 folds the entry's CRC as it streams; v1 has nothing to verify.
+        let mut crc = if checksummed {
+            crc32c::crc32c(&four)
+        } else {
+            0
+        };
+        if checksummed {
+            crc = crc32c::crc32c_append(crc, &key);
+            crc = crc32c::crc32c_append(crc, &[kind]);
+        }
+
         let loc = if kind == 1 {
             r.read_exact(&mut four)?;
             pos += 4;
             let val_len = u32::from_le_bytes(four);
             let offset = pos;
-            // Skip the payload rather than read it — this is the whole point.
-            io::copy(&mut r.by_ref().take(val_len as u64), &mut io::sink())?;
+            if checksummed {
+                crc = crc32c::crc32c_append(crc, &four);
+                // Verify while streaming without materializing the payload:
+                // chunk into a scratch buffer and fold into the CRC.
+                let mut remaining = val_len as u64;
+                let mut scratch = vec![0u8; 64 * 1024];
+                while remaining > 0 {
+                    let take = remaining.min(scratch.len() as u64) as usize;
+                    r.read_exact(&mut scratch[..take])?;
+                    crc = crc32c::crc32c_append(crc, &scratch[..take]);
+                    remaining -= take as u64;
+                }
+            } else {
+                // Skip the payload rather than read it — this is the whole point.
+                io::copy(&mut r.by_ref().take(val_len as u64), &mut io::sink())?;
+            }
             pos += val_len as u64;
             size_bytes += val_len as usize;
             ValueLoc::Disk {
@@ -737,6 +967,21 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
         } else {
             ValueLoc::Tombstone
         };
+
+        if checksummed {
+            let mut trailer = [0u8; 4];
+            r.read_exact(&mut trailer)?;
+            pos += 4;
+            if u32::from_le_bytes(trailer) != crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "SSTable entry {entry_idx} checksum mismatch in {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
 
         bloom.insert(&key);
         size_bytes += key.len();
@@ -750,6 +995,7 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
         seq,
         size_bytes,
         path: Some(path.to_path_buf()),
+        checksummed,
     })
 }
 
@@ -782,7 +1028,7 @@ mod tests {
         for i in 0..8 {
             tree.put(format!("k{i}").into_bytes(), big.clone());
         }
-        tree.force_flush();
+        tree.force_flush().unwrap();
         drop(tree);
 
         let reopened = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
@@ -817,7 +1063,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
         tree.put(b"a".to_vec(), vec![b'z'; 128 * 1024]);
-        tree.force_flush();
+        tree.force_flush().unwrap();
 
         let mem_held: usize = tree
             .levels
@@ -1004,7 +1250,7 @@ mod tests {
         }
         assert!(tree.sstable_count() >= 2);
         let before = tree.compaction_count;
-        tree.compact(0);
+        tree.compact(0).unwrap();
         assert!(tree.compaction_count > before);
     }
 
@@ -1033,7 +1279,7 @@ mod tests {
             for i in 0..10u8 {
                 tree.put(vec![i], vec![i * 2]);
             }
-            tree.force_flush(); // Write memtable to SSTable file.
+            tree.force_flush().unwrap(); // Write memtable to SSTable file.
         }
 
         // Reopen — should recover all 10 entries.
@@ -1069,7 +1315,7 @@ mod tests {
             }
             assert!(tree.compaction_count >= 1);
             // Flush memtable so remaining entries reach disk.
-            tree.force_flush();
+            tree.force_flush().unwrap();
         }
 
         // After reopen, all data should still be accessible.
@@ -1132,5 +1378,173 @@ mod tests {
         assert_eq!(e[0].0, b"aaa".to_vec());
         assert_eq!(e[0].1, Some(b"AAA".to_vec()));
         assert_eq!(e[1].1, None); // tombstone
+    }
+
+    // ─── Durability regressions (STO-1 / STO-2) ────────────────────────────────
+
+    /// STO-1: a failed merged write must not delete the input SSTables.
+    /// Pre-fix, `maybe_compact` swallowed the write error and unlinked its
+    /// inputs regardless, leaving the merged data RAM-only — silent total
+    /// cold-tier loss on restart. Witnessed failing (via a read-only victim
+    /// file at the merged output path) before the fix landed.
+    #[test]
+    fn compaction_failure_keeps_input_sstables() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            memtable_flush_threshold: 3,
+            level_max_sstables: 10,
+            max_levels: 2,
+            bloom_bits_per_key: 10,
+        };
+        {
+            let mut tree = LsmTree::open(cfg.clone(), dir.path()).unwrap();
+            for i in 0..20u8 {
+                tree.put(vec![i], vec![i]);
+            }
+            tree.force_flush().unwrap();
+            assert!(tree.sstable_count() >= 2);
+            fail_next_sst_write(dir.path());
+            tree.compact(0)
+                .expect_err("the injected write failure must fail the compaction");
+            // Reads keep working through the resident merged table.
+            for i in 0..20u8 {
+                assert_eq!(tree.get(&[i]), Some(vec![i]));
+            }
+        }
+        let tree = LsmTree::open(cfg, dir.path()).unwrap();
+        for i in 0..20u8 {
+            assert_eq!(
+                tree.get(&[i]),
+                Some(vec![i]),
+                "key {i} lost after a failed compaction write"
+            );
+        }
+        assert!(
+            tree.sstable_count() >= 2,
+            "the input SSTables must still be on disk"
+        );
+    }
+
+    /// STO-1: a failed flush leaves the table resident; the next flush must
+    /// heal it (`flush_unwritten`) so a later checkpoint cannot truncate the
+    /// WAL while an older RAM-only table still holds its keys.
+    #[test]
+    fn flush_failure_heals_on_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            memtable_flush_threshold: 1000,
+            ..small_config()
+        };
+        {
+            let mut tree = LsmTree::open(cfg.clone(), dir.path()).unwrap();
+            for i in 0..10u8 {
+                tree.put(vec![i], vec![i]);
+            }
+            fail_next_sst_write(dir.path());
+            tree.force_flush()
+                .expect_err("the injected write failure must fail the flush");
+            // The table is RAM-only but reads keep working.
+            for i in 0..10u8 {
+                assert_eq!(tree.get(&[i]), Some(vec![i]));
+            }
+            // The fault is one-shot; the next flush heals the unwritten table.
+            tree.force_flush().unwrap();
+            for i in 0..10u8 {
+                assert_eq!(tree.get(&[i]), Some(vec![i]));
+            }
+        }
+        let tree = LsmTree::open(cfg, dir.path()).unwrap();
+        for i in 0..10u8 {
+            assert_eq!(
+                tree.get(&[i]),
+                Some(vec![i]),
+                "key {i} must be on disk after the healing flush"
+            );
+        }
+    }
+
+    /// STO-2 checksum gap: a bit-flipped value payload must not load clean,
+    /// and a v2 table read through the tree must refuse the corrupted value.
+    /// Witnessed failing before the fix (v1 files carried no checksums).
+    #[test]
+    fn sst_checksum_detects_bitrot() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_path;
+        {
+            let mut tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
+            tree.put(b"aaa".to_vec(), b"AAA".to_vec());
+            tree.put(b"bbb".to_vec(), b"BBB".to_vec());
+            tree.force_flush().unwrap();
+            sst_path = tree
+                .levels
+                .iter()
+                .flatten()
+                .next()
+                .unwrap()
+                .path
+                .clone()
+                .unwrap();
+        }
+        // (a) the loader rejects the file outright.
+        let bytes = std::fs::read(&sst_path).unwrap();
+        let mut corrupted = bytes.clone();
+        // Flip one byte inside the first value payload: header 17, key_len 4,
+        // key 3, kind 1, val_len 4 => payload starts at 29.
+        corrupted[29] ^= 0xFF;
+        let corrupt_path = dir.path().join("corrupt.sst");
+        std::fs::write(&corrupt_path, &corrupted).unwrap();
+        let err = load_sst_file(&corrupt_path)
+            .expect_err("a bit-flipped value payload must not load clean");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // (b) an already-loaded table refuses the corrupted read.
+        let tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
+        std::fs::write(&sst_path, &corrupted).unwrap();
+        assert_eq!(
+            tree.get(b"aaa"),
+            None,
+            "a checksum-mismatched value must read as missing, not garbage"
+        );
+        assert_eq!(
+            tree.get(b"bbb"),
+            Some(b"BBB".to_vec()),
+            "an intact sibling entry is still served"
+        );
+    }
+
+    /// v1 (`LSMS`) files predate the checksum format and must keep loading.
+    #[test]
+    fn v1_sst_files_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![
+            (b"aaa".to_vec(), Some(b"AAA".to_vec())),
+            (b"bbb".to_vec(), None), // tombstone
+        ];
+        let sst = SSTable::from_sorted(entries, 2, 42, 10);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"LSMS");
+        buf.push(sst.level as u8);
+        buf.extend_from_slice(&sst.seq.to_le_bytes());
+        buf.extend_from_slice(&(sst.len() as u32).to_le_bytes());
+        for (k, v) in sst.entries() {
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&k);
+            match v {
+                None => buf.push(0),
+                Some(val) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&val);
+                }
+            }
+        }
+        let path = dir.path().join("v1.sst");
+        std::fs::write(&path, &buf).unwrap();
+        let recovered = load_sst_file(&path).unwrap();
+        assert_eq!(recovered.level, 2);
+        assert_eq!(recovered.seq, 42);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered.get(b"aaa"), Some(Some(b"AAA".to_vec())));
+        assert_eq!(recovered.get(b"bbb"), Some(None));
     }
 }

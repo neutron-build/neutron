@@ -24,10 +24,10 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 319688; Source Rust files: 282; Top-level modules: 52.
-- Declared unit tests: 4459; Declared integration tests: 413; Ignored tests: 51.
+- Source LOC: 335957; Source Rust files: 302; Top-level modules: 53.
+- Declared unit tests: 4683; Declared integration tests: 447; Ignored tests: 53.
   These are static declarations, not executed-test claims.
-- The most recent full library run executed 4,190 passing tests, 0 failing.
+- The most recent full library run executed 4,622 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
   state-machine/runtime scaffolding, trusted SCRAM identities, role assumption, and RLS enforcement

@@ -484,7 +484,11 @@ impl PgClient {
     async fn read_message(&mut self) -> Result<(u8, Vec<u8>), CliError> {
         let tag = self.reader.read_u8().await?;
         let len = self.reader.read_i32().await?;
-        if len < 4 {
+        /// Upper bound for one wire message the CLI will buffer
+        /// (RowDescription / DataRow payloads are far below this; ErrorResponse
+        /// never approaches it).
+        const MAX_MESSAGE_BYTES: i32 = 64 * 1024 * 1024;
+        if !(4..=MAX_MESSAGE_BYTES).contains(&len) {
             return Err(CliError::ProtocolError(format!(
                 "invalid message length {len} for tag '{}'",
                 tag as char,
@@ -519,6 +523,15 @@ impl PgClient {
             return Err(CliError::ProtocolError("RowDescription too short".into()));
         }
         let field_count = i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
+        // Each field needs at least a NUL byte plus 18 fixed bytes; a count
+        // beyond that cannot fit and used to push `pos` past the buffer,
+        // panicking on the next slice.
+        const FIELD_FIXED: usize = 18;
+        if 2 + field_count * (1 + FIELD_FIXED) > payload.len() {
+            return Err(CliError::ProtocolError(
+                "RowDescription field count exceeds payload".into(),
+            ));
+        }
         let mut columns = Vec::with_capacity(field_count);
         let mut pos = 2;
 
@@ -528,12 +541,22 @@ impl PgClient {
             while pos < payload.len() && payload[pos] != 0 {
                 pos += 1;
             }
+            if pos >= payload.len() {
+                return Err(CliError::ProtocolError(
+                    "RowDescription truncated in field name".into(),
+                ));
+            }
             let name = String::from_utf8_lossy(&payload[name_start..pos]).to_string();
             pos += 1; // skip null terminator
 
             // Skip the fixed-size fields: table OID(4) + col attr(2) + type OID(4)
             //                            + type size(2) + type mod(4) + format(2) = 18
-            pos += 18;
+            if pos + FIELD_FIXED > payload.len() {
+                return Err(CliError::ProtocolError(
+                    "RowDescription truncated in field metadata".into(),
+                ));
+            }
+            pos += FIELD_FIXED;
 
             columns.push(name);
         }
@@ -872,5 +895,46 @@ mod tests {
 
         let row = PgClient::parse_data_row(&payload).unwrap();
         assert_eq!(row, vec!["hello".to_string(), "NULL".to_string()]);
+    }
+}
+
+// --- RowDescription bounds tests (PRC-10) ------------------------------------
+
+#[cfg(test)]
+mod rowdesc_tests {
+    #[test]
+    fn truncated_name_errors_rather_than_panics() {
+        // count=1, name runs to EOF without a NUL — the old parser sliced
+        // past the end and panicked.
+        let payload = [0x00u8, 0x01, b'c', b'o', b'l'];
+        assert!(super::PgClient::parse_row_description(&payload).is_err());
+    }
+
+    #[test]
+    fn truncated_fixed_fields_error_rather_than_panics() {
+        // name + NUL but only 5 of the 18 fixed bytes.
+        let mut payload = vec![0x00u8, 0x01];
+        payload.extend_from_slice(b"col\0");
+        payload.extend_from_slice(&[0u8; 5]);
+        assert!(super::PgClient::parse_row_description(&payload).is_err());
+    }
+
+    #[test]
+    fn wellformed_single_field_parses() {
+        let mut payload = vec![0x00u8, 0x01];
+        payload.extend_from_slice(b"col\0");
+        payload.extend_from_slice(&[0u8; 18]);
+        let cols = super::PgClient::parse_row_description(&payload).unwrap();
+        assert_eq!(cols, vec!["col".to_string()]);
+    }
+
+    #[test]
+    fn absurd_field_count_errors_rather_than_allocating() {
+        // count = 4096 fields but the payload holds one — must error, not
+        // pre-commit a giant capacity or scan past the buffer.
+        let mut payload = vec![0x10u8, 0x00];
+        payload.extend_from_slice(b"c\0");
+        payload.extend_from_slice(&[0u8; 18]);
+        assert!(super::PgClient::parse_row_description(&payload).is_err());
     }
 }

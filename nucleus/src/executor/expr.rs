@@ -77,6 +77,18 @@ impl FilterResult {
 // so it works correctly with Rayon parallel evaluation.
 // ---------------------------------------------------------------------------
 
+/// Aggregate names `eval_row_expr`'s Function arm refuses BEFORE evaluating.
+///
+/// Shared with `eval_const_expr`, which routes these straight to
+/// `eval_scalar_fn` instead of probing with a real evaluation — see the
+/// double-evaluation comment on that arm.
+fn fn_is_refused_aggregate(func: &ast::Function) -> bool {
+    matches!(
+        func.name.to_string().to_uppercase().as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+    )
+}
+
 const MAX_EXPR_DEPTH: u32 = 256;
 
 thread_local! {
@@ -198,15 +210,32 @@ impl Executor {
                 self.eval_cast(val, data_type)
             }
             Expr::Function(func) => {
-                // Evaluate scalar function in constant context (no row)
+                // Evaluate scalar function in constant context (no row) —
+                // EXACTLY ONCE.
+                //
+                // This arm used to read
+                // `eval_row_expr(..).or_else(|_| eval_scalar_fn(..))`. Since
+                // eval_row_expr's Function arm delegates straight to
+                // eval_scalar_fn for every non-aggregate name, the retry
+                // re-ran the SAME function with the SAME arguments whenever
+                // the first evaluation failed: the first error was discarded,
+                // the statement's side effects happened twice, and the client
+                // saw only the second attempt's error (a failing
+                // STREAM_XADD consumed two entry ids, `<ms>-0` then `<ms>-1`,
+                // for one statement, over both wire protocols). The only
+                // failure the retry could genuinely rescue is the aggregate
+                // refusal below, which happens BEFORE any evaluation — so
+                // route aggregates to eval_scalar_fn by name and let every
+                // other function's first — and only — evaluation stand,
+                // success or error.
                 let empty_row: Row = Vec::new();
                 let empty_meta: Vec<ColMeta> = Vec::new();
-                self.eval_row_expr(expr, &empty_row, &empty_meta)
-                    .or_else(|_| {
-                        // If row_expr fails (e.g. needs row context), try as const
-                        let fname = func.name.to_string().to_uppercase();
-                        self.eval_scalar_fn(&fname, func, &empty_row, &empty_meta)
-                    })
+                if fn_is_refused_aggregate(func) {
+                    let fname = func.name.to_string().to_uppercase();
+                    self.eval_scalar_fn(&fname, func, &empty_row, &empty_meta)
+                } else {
+                    self.eval_row_expr(expr, &empty_row, &empty_meta)
+                }
             }
             // Delegate special expressions (Trim, Substring, Ceil, Floor, Position, Overlay,
             // TypedString) to eval_row_expr with empty context
@@ -1187,7 +1216,7 @@ impl Executor {
             Expr::Function(func) => {
                 let fname = func.name.to_string().to_uppercase();
                 // Don't handle aggregates here -- they're handled in eval_aggregate_expr
-                if matches!(fname.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                if fn_is_refused_aggregate(func) {
                     return Err(ExecError::Unsupported(format!(
                         "aggregate function {fname} outside of aggregate context"
                     )));
@@ -1198,6 +1227,7 @@ impl Executor {
                 negated,
                 expr,
                 pattern,
+                escape_char,
                 ..
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
@@ -1205,7 +1235,14 @@ impl Executor {
                 match (&val, &pat) {
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     (Value::Text(s), Value::Text(p)) => {
-                        let matched = like_match(s, p);
+                        // Same escape resolution as the plan path
+                        // (eval_expr_plan): explicit ESCAPE '<c>' wins, PG's
+                        // default backslash otherwise, ESCAPE '' disables.
+                        let esc = match escape_char.as_ref() {
+                            Some(ast::Value::SingleQuotedString(s)) => s.chars().next(),
+                            _ => Some('\\'),
+                        };
+                        let matched = Self::sql_like_match(s, p, esc, false);
                         Ok(Value::Bool(if *negated { !matched } else { matched }))
                     }
                     _ => Ok(Value::Bool(false)),
@@ -1215,6 +1252,7 @@ impl Executor {
                 negated,
                 expr,
                 pattern,
+                escape_char,
                 ..
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
@@ -1222,7 +1260,11 @@ impl Executor {
                 match (&val, &pat) {
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     (Value::Text(s), Value::Text(p)) => {
-                        let matched = like_match(&s.to_lowercase(), &p.to_lowercase());
+                        let esc = match escape_char.as_ref() {
+                            Some(ast::Value::SingleQuotedString(s)) => s.chars().next(),
+                            _ => Some('\\'),
+                        };
+                        let matched = Self::sql_like_match(s, p, esc, true);
                         Ok(Value::Bool(if *negated { !matched } else { matched }))
                     }
                     _ => Ok(Value::Bool(false)),
@@ -1239,7 +1281,14 @@ impl Executor {
                     let op_val = self.eval_row_expr(op, row, col_meta)?;
                     for case_when in conditions {
                         let cond_val = self.eval_row_expr(&case_when.condition, row, col_meta)?;
-                        if compare_values(&op_val, &cond_val) == Some(Ordering::Equal) {
+                        // `=` semantics: NULL never matches, not even NULL
+                        // (PG: CASE NULL WHEN NULL THEN 1 ELSE 2 END = 2).
+                        // compare_values maps (Null,Null) to Equal for
+                        // ordering purposes, so exclude NULLs explicitly.
+                        if !matches!(op_val, Value::Null)
+                            && !matches!(cond_val, Value::Null)
+                            && compare_values(&op_val, &cond_val) == Some(Ordering::Equal)
+                        {
                             return self.eval_row_expr(&case_when.result, row, col_meta);
                         }
                     }
@@ -1304,23 +1353,28 @@ impl Executor {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
                 match val {
                     Value::Text(s) => {
-                        let from = if let Some(f) = substring_from {
+                        // Signed-space index math, mirroring the SUBSTRING
+                        // scalar function: a negative start must clip to the
+                        // string beginning, not wrap through `as usize` to a
+                        // huge skip offset. Positions before 1 are clipped
+                        // but still count toward the length window.
+                        let chars: Vec<char> = s.chars().collect();
+                        let n = chars.len() as i64;
+                        let start0 = if let Some(f) = substring_from {
                             let v = self.eval_row_expr(f, row, col_meta)?;
-                            value_to_i64(&v).unwrap_or(1) as usize
+                            value_to_i64(&v).unwrap_or(1).saturating_sub(1) // 0-indexed, may be < 0
                         } else {
-                            1
+                            0
                         };
-                        // SQL SUBSTRING is 1-based
-                        let start = if from > 0 { from - 1 } else { 0 };
-                        // Use skip/take on char iterator — avoids Vec<char> allocation
-                        let result: String = if let Some(f) = substring_for {
+                        let end0 = if let Some(f) = substring_for {
                             let v = self.eval_row_expr(f, row, col_meta)?;
-                            let len = value_to_i64(&v).unwrap_or(0) as usize;
-                            s.chars().skip(start).take(len).collect()
+                            start0.saturating_add(value_to_i64(&v).unwrap_or(0)) // exclusive end
                         } else {
-                            s.chars().skip(start).collect()
+                            n
                         };
-                        Ok(Value::Text(result))
+                        let start = start0.clamp(0, n) as usize;
+                        let end = (end0.clamp(0, n).max(start as i64)) as usize;
+                        Ok(Value::Text(chars[start..end].iter().collect()))
                     }
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("SUBSTRING on non-text".into())),
@@ -1351,8 +1405,11 @@ impl Executor {
                 let haystack = self.eval_row_expr(r#in, row, col_meta)?;
                 match (&needle, &haystack) {
                     (Value::Text(n), Value::Text(h)) => {
-                        let pos = h.find(n.as_str()).map(|i| i + 1).unwrap_or(0);
-                        Ok(Value::Int32(pos as i32))
+                        // 1-based CHARACTER index — same contract as the
+                        // POSITION()/strpos() scalar functions (PG reports
+                        // character positions for multibyte text).
+                        let pos = super::scalar_fns::char_index_of(h, n);
+                        Ok(Value::Int32(pos))
                     }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     _ => Ok(Value::Int32(0)),

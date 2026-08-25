@@ -497,6 +497,48 @@ fn check_enum(errors: &mut Vec<String>, setting: &str, value: &str, allowed: &[&
     }
 }
 
+/// Parse a NUCLEUS_* env value, recording a warning (not an error) when it
+/// is set but unparseable — consistent with the module's stance that a typo
+/// must not be the reason a database will not boot, but must not be
+/// invisible either. The configured default survives; the operator finds
+/// out at startup.
+fn parsed_env<T: std::str::FromStr>(
+    warnings: &mut Vec<String>,
+    name: &str,
+    raw: &str,
+) -> Option<T> {
+    match raw.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            warnings.push(format!(
+                "{name}={raw:?} is not a valid value; keeping the configured default"
+            ));
+            None
+        }
+    }
+}
+
+/// Booleans accept TRUE/FALSE (any case) and 1/0 — `bool::from_str` is
+/// lowercase-only, which silently flipped systemd-normalized `TRUE` into
+/// "keep default" (e.g. metrics disabled despite
+/// NUCLEUS_METRICS_ENABLED=TRUE).
+fn parsed_env_bool(warnings: &mut Vec<String>, name: &str, raw: &str) -> Option<bool> {
+    match raw.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        other => match other.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => {
+                warnings.push(format!(
+                    "{name}={raw:?} is not a boolean (true/false/1/0); keeping the configured default"
+                ));
+                None
+            }
+        },
+    }
+}
+
 impl NucleusConfig {
     /// Load config from a TOML file, then overlay environment variables.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -508,7 +550,11 @@ impl NucleusConfig {
             std::fs::read_to_string(path).map_err(|e| ConfigError::IoError(e.to_string()))?;
 
         let mut config = Self::from_toml(&contents)?;
-        config.apply_env_overrides();
+        for warning in config.apply_env_overrides() {
+            // No subscriber in tests / library use: the return value is the
+            // record there. On the server, the operator sees it at startup.
+            tracing::warn!("config: {warning}");
+        }
         Ok(config)
     }
 
@@ -520,18 +566,27 @@ impl NucleusConfig {
     /// Apply environment variable overrides.
     ///
     /// Pattern: `NUCLEUS_SECTION_KEY` (e.g., `NUCLEUS_SERVER_PORT=5433`).
-    pub fn apply_env_overrides(&mut self) {
+    ///
+    /// A variable that is SET but unparseable keeps the configured default
+    /// and is reported in the returned warnings — a typo must not be the
+    /// reason a database will not boot, but it must not be invisible either.
+    /// (String/enum-valued variables already fail loudly in [`Self::validate`]
+    ///'s enum check; this closes the numeric/boolean asymmetry.)
+    pub fn apply_env_overrides(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
         // server
         if let Ok(v) = env::var("NUCLEUS_SERVER_HOST") {
             self.server.host = v;
         }
         if let Ok(v) = env::var("NUCLEUS_SERVER_PORT")
-            && let Ok(p) = v.parse::<u16>()
+            && let Some(p) = parsed_env::<u16>(&mut warnings, "NUCLEUS_SERVER_PORT", &v)
         {
             self.server.port = p;
         }
         if let Ok(v) = env::var("NUCLEUS_SERVER_MAX_CONNECTIONS")
-            && let Ok(n) = v.parse::<usize>()
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_SERVER_MAX_CONNECTIONS", &v)
         {
             self.server.max_connections = n;
         }
@@ -541,14 +596,14 @@ impl NucleusConfig {
             self.storage.data_dir = v;
         }
         if let Ok(v) = env::var("NUCLEUS_STORAGE_MEMORY_MODE")
-            && let Ok(b) = v.parse::<bool>()
+            && let Some(b) = parsed_env_bool(&mut warnings, "NUCLEUS_STORAGE_MEMORY_MODE", &v)
         {
             self.storage.memory_mode = b;
         }
 
         // wal
         if let Ok(v) = env::var("NUCLEUS_WAL_ENABLED")
-            && let Ok(b) = v.parse::<bool>()
+            && let Some(b) = parsed_env_bool(&mut warnings, "NUCLEUS_WAL_ENABLED", &v)
         {
             self.wal.enabled = b;
         }
@@ -558,12 +613,12 @@ impl NucleusConfig {
 
         // metrics
         if let Ok(v) = env::var("NUCLEUS_METRICS_ENABLED")
-            && let Ok(b) = v.parse::<bool>()
+            && let Some(b) = parsed_env_bool(&mut warnings, "NUCLEUS_METRICS_ENABLED", &v)
         {
             self.metrics.enabled = b;
         }
         if let Ok(v) = env::var("NUCLEUS_METRICS_PORT")
-            && let Ok(p) = v.parse::<u16>()
+            && let Some(p) = parsed_env::<u16>(&mut warnings, "NUCLEUS_METRICS_PORT", &v)
         {
             self.metrics.port = p;
         }
@@ -575,39 +630,40 @@ impl NucleusConfig {
 
         // cache
         if let Ok(v) = env::var("NUCLEUS_CACHE_ENABLED")
-            && let Ok(b) = v.parse::<bool>()
+            && let Some(b) = parsed_env_bool(&mut warnings, "NUCLEUS_CACHE_ENABLED", &v)
         {
             self.cache.enabled = b;
         }
         if let Ok(v) = env::var("NUCLEUS_CACHE_MAX_MEMORY_MB")
-            && let Ok(n) = v.parse::<usize>()
+            && let Some(n) = parsed_env::<usize>(&mut warnings, "NUCLEUS_CACHE_MAX_MEMORY_MB", &v)
         {
             self.cache.max_memory_mb = n;
         }
         if let Ok(v) = env::var("NUCLEUS_CACHE_DEFAULT_TTL_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) = parsed_env::<u64>(&mut warnings, "NUCLEUS_CACHE_DEFAULT_TTL_SECS", &v)
         {
             self.cache.default_ttl_secs = n;
         }
 
         // pool
         if let Ok(v) = env::var("NUCLEUS_POOL_MIN_IDLE")
-            && let Ok(n) = v.parse::<usize>()
+            && let Some(n) = parsed_env::<usize>(&mut warnings, "NUCLEUS_POOL_MIN_IDLE", &v)
         {
             self.pool.min_idle = n;
         }
         if let Ok(v) = env::var("NUCLEUS_POOL_MAX_IDLE_TIME_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) = parsed_env::<u64>(&mut warnings, "NUCLEUS_POOL_MAX_IDLE_TIME_SECS", &v)
         {
             self.pool.max_idle_time_secs = n;
         }
         if let Ok(v) = env::var("NUCLEUS_POOL_MAX_LIFETIME_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) = parsed_env::<u64>(&mut warnings, "NUCLEUS_POOL_MAX_LIFETIME_SECS", &v)
         {
             self.pool.max_lifetime_secs = n;
         }
         if let Ok(v) = env::var("NUCLEUS_POOL_ACQUIRE_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) =
+                parsed_env::<u64>(&mut warnings, "NUCLEUS_POOL_ACQUIRE_TIMEOUT_SECS", &v)
         {
             self.pool.acquire_timeout_secs = n;
         }
@@ -620,7 +676,8 @@ impl NucleusConfig {
             self.replication.primary_host = Some(v);
         }
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_PRIMARY_PORT")
-            && let Ok(p) = v.parse::<u16>()
+            && let Some(p) =
+                parsed_env::<u16>(&mut warnings, "NUCLEUS_REPLICATION_PRIMARY_PORT", &v)
         {
             self.replication.primary_port = Some(p);
         }
@@ -628,66 +685,72 @@ impl NucleusConfig {
             self.replication.sync_mode = v;
         }
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_FAILOVER_TIMEOUT_MS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) =
+                parsed_env::<u64>(&mut warnings, "NUCLEUS_REPLICATION_FAILOVER_TIMEOUT_MS", &v)
         {
             self.replication.failover_timeout_ms = n;
         }
 
         // storage (additional)
         if let Ok(v) = env::var("NUCLEUS_STORAGE_BUFFER_POOL_SIZE_MB")
-            && let Ok(n) = v.parse::<usize>()
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_STORAGE_BUFFER_POOL_SIZE_MB", &v)
         {
             self.storage.buffer_pool_size_mb = n;
         }
         if let Ok(v) = env::var("NUCLEUS_STORAGE_USE_DIRECT_IO")
-            && let Ok(b) = v.parse::<bool>()
+            && let Some(b) = parsed_env_bool(&mut warnings, "NUCLEUS_STORAGE_USE_DIRECT_IO", &v)
         {
             self.storage.use_direct_io = b;
         }
         if let Ok(v) = env::var("NUCLEUS_DISK_CHECK_INTERVAL_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) =
+                parsed_env::<u64>(&mut warnings, "NUCLEUS_DISK_CHECK_INTERVAL_SECS", &v)
         {
             self.storage.disk_check_interval_secs = n;
         }
         if let Ok(v) = env::var("NUCLEUS_DISK_WARN_FREE_PCT")
-            && let Ok(n) = v.parse::<f64>()
+            && let Some(n) = parsed_env::<f64>(&mut warnings, "NUCLEUS_DISK_WARN_FREE_PCT", &v)
         {
             self.storage.disk_warn_free_pct = n;
         }
         if let Ok(v) = env::var("NUCLEUS_DISK_READONLY_FREE_PCT")
-            && let Ok(n) = v.parse::<f64>()
+            && let Some(n) = parsed_env::<f64>(&mut warnings, "NUCLEUS_DISK_READONLY_FREE_PCT", &v)
         {
             self.storage.disk_readonly_free_pct = n;
         }
         if let Ok(v) = env::var("NUCLEUS_DISK_MIN_FREE_MB")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) = parsed_env::<u64>(&mut warnings, "NUCLEUS_DISK_MIN_FREE_MB", &v)
         {
             self.storage.disk_min_free_mb = n;
         }
         if let Ok(v) = env::var("NUCLEUS_DISK_RESUME_FREE_PCT")
-            && let Ok(n) = v.parse::<f64>()
+            && let Some(n) = parsed_env::<f64>(&mut warnings, "NUCLEUS_DISK_RESUME_FREE_PCT", &v)
         {
             self.storage.disk_resume_free_pct = n;
         }
 
         // wal (additional)
         if let Ok(v) = env::var("NUCLEUS_WAL_SEGMENT_SIZE_MB")
-            && let Ok(n) = v.parse::<usize>()
+            && let Some(n) = parsed_env::<usize>(&mut warnings, "NUCLEUS_WAL_SEGMENT_SIZE_MB", &v)
         {
             self.wal.segment_size_mb = n;
         }
         if let Ok(v) = env::var("NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) =
+                parsed_env::<u64>(&mut warnings, "NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS", &v)
         {
             self.wal.checkpoint_interval_secs = n;
         }
         if let Ok(v) = env::var("NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) =
+                parsed_env::<u64>(&mut warnings, "NUCLEUS_WAL_ARCHIVE_TIMEOUT_SECS", &v)
         {
             self.wal.archive_timeout_secs = n;
         }
         if let Ok(v) = env::var("NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) =
+                parsed_env::<u64>(&mut warnings, "NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US", &v)
         {
             self.wal.group_commit_interval_us = n;
         }
@@ -697,12 +760,13 @@ impl NucleusConfig {
 
         // server (additional)
         if let Ok(v) = env::var("NUCLEUS_SERVER_IDLE_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>()
+            && let Some(n) =
+                parsed_env::<u64>(&mut warnings, "NUCLEUS_SERVER_IDLE_TIMEOUT_SECS", &v)
         {
             self.server.idle_timeout_secs = n;
         }
         if let Ok(v) = env::var("NUCLEUS_MAX_MEMORY_MB")
-            && let Ok(n) = v.parse::<usize>()
+            && let Some(n) = parsed_env::<usize>(&mut warnings, "NUCLEUS_MAX_MEMORY_MB", &v)
         {
             self.server.max_memory_mb = n;
         }
@@ -719,6 +783,8 @@ impl NucleusConfig {
         if let Ok(v) = env::var("NUCLEUS_METRICS_ENDPOINT") {
             self.metrics.endpoint = v;
         }
+
+        warnings
     }
 
     /// Merge CLI arguments into the config, overriding any TOML / env values.
@@ -1255,6 +1321,59 @@ port = 5555
             env::remove_var("NUCLEUS_METRICS_PORT");
             env::remove_var("NUCLEUS_CACHE_ENABLED");
             env::remove_var("NUCLEUS_CACHE_MAX_MEMORY_MB");
+        }
+    }
+
+    /// Booleans accept TRUE/FALSE in any case plus 1/0 — `bool::from_str` is
+    /// lowercase-only, which silently flipped systemd-normalized `TRUE` into
+    /// "keep default" (e.g. metrics stayed disabled despite
+    /// NUCLEUS_METRICS_ENABLED=TRUE).
+    #[test]
+    fn env_booleans_are_case_insensitive_and_accept_1_0() {
+        let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); disjoint keys from other env tests.
+        unsafe {
+            env::set_var("NUCLEUS_METRICS_ENABLED", "TRUE");
+            env::set_var("NUCLEUS_WAL_ENABLED", "0");
+        }
+        let warnings = cfg.apply_env_overrides();
+        assert!(cfg.metrics.enabled, "TRUE must enable metrics");
+        assert!(!cfg.wal.enabled, "0 must disable the WAL");
+        assert!(
+            warnings.is_empty(),
+            "valid boolean spellings must not warn: {warnings:?}"
+        );
+        // SAFETY: test-only cleanup.
+        unsafe {
+            env::remove_var("NUCLEUS_METRICS_ENABLED");
+            env::remove_var("NUCLEUS_WAL_ENABLED");
+        }
+    }
+
+    /// A set-but-unparseable value keeps the configured default AND says so —
+    /// invisible fallback is how a typo'd setting leaves a limit unenforced.
+    #[test]
+    fn unparseable_env_values_warn_and_keep_defaults() {
+        let mut cfg = NucleusConfig::default();
+        let default_port = cfg.server.port;
+        let default_max_conn = cfg.server.max_connections;
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); disjoint keys from other env tests.
+        unsafe {
+            // "1OO0" with a letter O, not "1000".
+            env::set_var("NUCLEUS_SERVER_MAX_CONNECTIONS", "1OO0");
+        }
+        let warnings = cfg.apply_env_overrides();
+        assert_eq!(cfg.server.max_connections, default_max_conn);
+        assert_eq!(cfg.server.port, default_port);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("NUCLEUS_SERVER_MAX_CONNECTIONS") && w.contains("1OO0")),
+            "the warning must name the variable and the raw value; got {warnings:?}"
+        );
+        // SAFETY: test-only cleanup.
+        unsafe {
+            env::remove_var("NUCLEUS_SERVER_MAX_CONNECTIONS");
         }
     }
 

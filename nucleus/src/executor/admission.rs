@@ -199,6 +199,72 @@ impl Executor {
         }
         Ok(())
     }
+
+    /// Raw-text admission gate for the extension dispatch block (EXE-8).
+    ///
+    /// Extension commands are matched on raw text and return before
+    /// `execute_statement_inner`, so they never met the statement-level
+    /// gate: on a degraded (read-only) server, ALTER SEQUENCE kept
+    /// persisting sequences.json and BACKUP kept writing files while
+    /// INSERT was refused 53100. This shim classifies the raw text with
+    /// the same prefixes the dispatch block matches: read-only and
+    /// session-local extensions are admitted, mutating ones are refused
+    /// through the standard admission error, and text matching NO
+    /// extension arm is left to the parsed path, where
+    /// [`Self::admit_statement`] remains the (fail-closed) gate. CALL no
+    /// longer has a raw arm — the parser routes it and `Statement::Call`
+    /// is already classified mutating.
+    pub(super) fn admit_extension(&self, upper: &str) -> Result<(), ExecError> {
+        if !self.service.is_read_only() {
+            return Ok(());
+        }
+        let cmd = upper.trim_end().trim_end_matches(';').trim_end();
+        // Reads and session-local commands. FETCH SUBSCRIPTION/UNSUBSCRIBE
+        // only touch this session's subscription state; MEMORY PRESSURE is
+        // advisory and writes nothing durable.
+        let admitted = cmd.starts_with("SHOW TABLE STATS ")
+            || cmd.starts_with("SHOW MODELS")
+            || cmd.starts_with("SHOW PROCEDURES")
+            || cmd.starts_with("SHOW MASKING POLICIES")
+            || cmd.starts_with("SHOW MEMORY")
+            || cmd.starts_with("SHOW BRANCHES")
+            || cmd.starts_with("CACHE_GET ")
+            || cmd.starts_with("CACHE_GET(")
+            || cmd == "CACHE_STATS"
+            || cmd == "CACHE_STATS()"
+            || cmd == "MEMORY PRESSURE"
+            || cmd.starts_with("FETCH SUBSCRIPTION ")
+            || cmd.starts_with("UNSUBSCRIBE ");
+        if admitted {
+            return Ok(());
+        }
+        let mutating: [(&str, &str); 18] = [
+            ("CREATE MASKING POLICY", "CREATE MASKING POLICY"),
+            ("DROP MASKING POLICY", "DROP MASKING POLICY"),
+            ("ALTER SEQUENCE ", "ALTER SEQUENCE"),
+            ("CACHE_SET ", "CACHE_SET"),
+            ("CACHE_SET(", "CACHE_SET"),
+            ("CACHE_DEL ", "CACHE_DEL"),
+            ("CACHE_DEL(", "CACHE_DEL"),
+            ("CACHE_TTL ", "CACHE_TTL"),
+            ("CACHE_TTL(", "CACHE_TTL"),
+            ("BACKUP DATABASE TO ", "BACKUP"),
+            ("REFRESH MATERIALIZED VIEW ", "REFRESH MATERIALIZED VIEW"),
+            ("DROP MATERIALIZED VIEW ", "DROP MATERIALIZED VIEW"),
+            ("CREATE MODEL ", "CREATE MODEL"),
+            ("DROP MODEL ", "DROP MODEL"),
+            ("CREATE PROCEDURE ", "CREATE PROCEDURE"),
+            ("CREATE OR REPLACE PROCEDURE ", "CREATE PROCEDURE"),
+            ("DROP PROCEDURE ", "DROP PROCEDURE"),
+            ("SUBSCRIBE ", "SUBSCRIBE"),
+        ];
+        for (prefix, label) in mutating {
+            if cmd.starts_with(prefix) {
+                return self.service.admit_write(label);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

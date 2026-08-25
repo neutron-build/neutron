@@ -598,6 +598,27 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::TimestampTz(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
         (Value::Timestamp(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
         (Value::TimestampTz(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+        // Interval: lexicographic (months, days, microseconds) — must mirror
+        // `Ord for Value` exactly; a divergence between the two comparators
+        // previously made the same predicate disagree between projection and
+        // WHERE. Without this arm every interval predicate silently
+        // evaluated to false (`None`).
+        (
+            Value::Interval {
+                months: am,
+                days: ad,
+                microseconds: aus,
+            },
+            Value::Interval {
+                months: bm,
+                days: bd,
+                microseconds: bus,
+            },
+        ) => Some(
+            am.cmp(bm)
+                .then_with(|| ad.cmp(bd))
+                .then_with(|| aus.cmp(bus)),
+        ),
         (Value::Numeric(a), Value::Numeric(b)) => crate::types::parse_numeric(a)
             .ok()?
             .partial_cmp(&crate::types::parse_numeric(b).ok()?),
@@ -1016,10 +1037,11 @@ pub(super) fn json_escape(s: &str) -> String {
 }
 
 pub(super) fn sanitize_sql_text_literal(value: &str) -> String {
-    value
-        .replace('\0', "")
-        .replace('\\', "\\\\")
-        .replace('\'', "''")
+    // PostgreSqlDialect is standard-conforming: a backslash inside '...' is a
+    // LITERAL character, so doubling it here corrupted every Windows path and
+    // regex passed as an argument. Injection safety comes from quote-doubling
+    // alone (same policy as the wire parameter path).
+    value.replace('\0', "").replace('\'', "''")
 }
 
 pub(super) fn sql_replacement_for_value(value: &Value) -> String {
@@ -1035,138 +1057,15 @@ pub(super) fn sql_replacement_for_value(value: &Value) -> String {
 }
 
 /// Substitute positional (`$1`) and named (`$name`) placeholders in SQL text.
-/// Performs a single pass over the original SQL to avoid recursive substitution.
+/// Thin wrapper over the one shared scanner in `crate::sql` — the two
+/// hand-copied scanners this replaces each grew the same Latin-1 mojibake
+/// bug (PRC-3 / WIR-4 family) and drifted apart.
 pub(super) fn substitute_sql_placeholders(
     sql: &str,
     positional: &[String],
     named: &HashMap<String, String>,
 ) -> String {
-    let mut out = String::with_capacity(sql.len() + 32);
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while i < bytes.len() {
-        if in_line_comment {
-            out.push(bytes[i] as char);
-            if bytes[i] == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_block_comment {
-            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                out.push('*');
-                out.push('/');
-                in_block_comment = false;
-                i += 2;
-            } else {
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-            continue;
-        }
-        if in_single {
-            out.push(bytes[i] as char);
-            if bytes[i] == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    out.push('\'');
-                    i += 2;
-                } else {
-                    in_single = false;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if in_double {
-            out.push(bytes[i] as char);
-            if bytes[i] == b'"' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    out.push('"');
-                    i += 2;
-                } else {
-                    in_double = false;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            out.push('-');
-            out.push('-');
-            in_line_comment = true;
-            i += 2;
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            out.push('/');
-            out.push('*');
-            in_block_comment = true;
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'\'' {
-            out.push('\'');
-            in_single = true;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'"' {
-            out.push('"');
-            in_double = true;
-            i += 1;
-            continue;
-        }
-
-        if bytes[i] == b'$' {
-            let start = i;
-            i += 1;
-            if i < bytes.len() && bytes[i].is_ascii_digit() {
-                let mut idx = 0usize;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    idx = idx * 10 + (bytes[i] - b'0') as usize;
-                    i += 1;
-                }
-                if idx > 0 && idx <= positional.len() {
-                    out.push_str(&positional[idx - 1]);
-                } else {
-                    out.push_str(&sql[start..i]);
-                }
-                continue;
-            }
-            if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-                let ident_start = i;
-                i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let ident = &sql[ident_start..i];
-                if let Some(repl) = named.get(ident) {
-                    out.push_str(repl);
-                } else {
-                    out.push_str(&sql[start..i]);
-                }
-                continue;
-            }
-            out.push('$');
-            continue;
-        }
-
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-
-    out
+    crate::sql::substitute_sql_placeholders(sql, positional, named)
 }
 
 /// Parse an aggregate specification like "SUM(amount)" → ("SUM", "amount").
@@ -1588,16 +1487,24 @@ pub(super) fn eval_temporal_arithmetic(
 }
 
 /// Compute an aggregate function over rows.
-pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]) -> Value {
+///
+/// Integer SUM is checked like the AST path (`simd::sum_i64_checked`):
+/// overflow is an "integer out of range" ERROR, never a debug panic or a
+/// wrapped release value.
+pub(super) fn compute_aggregate(
+    func: &str,
+    col_idx: Option<usize>,
+    rows: &[Row],
+) -> Result<Value, ExecError> {
     match func {
         // COUNT(*) counts rows; COUNT(col) counts non-NULL values of col.
         "COUNT" => match col_idx {
-            None => Value::Int64(rows.len() as i64),
-            Some(col) => Value::Int64(
+            None => Ok(Value::Int64(rows.len() as i64)),
+            Some(col) => Ok(Value::Int64(
                 rows.iter()
                     .filter(|r| r.get(col).is_some_and(|v| *v != Value::Null))
                     .count() as i64,
-            ),
+            )),
         },
         "SUM" => {
             let col = col_idx.unwrap_or(0);
@@ -1605,16 +1512,23 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
             let mut float_sum = 0.0f64;
             let mut has_value = false;
             let mut has_float = false;
+            let mut overflow = false;
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
                         Value::Int32(n) => {
-                            int_sum += *n as i64;
+                            int_sum = int_sum.checked_add(*n as i64).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             float_sum += *n as f64;
                             has_value = true;
                         }
                         Value::Int64(n) => {
-                            int_sum += *n;
+                            int_sum = int_sum.checked_add(*n).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             float_sum += *n as f64;
                             has_value = true;
                         }
@@ -1630,30 +1544,47 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
             // SQL standard: SUM of all-NULL input is NULL, not 0.
             // Preserve integer type when all inputs are integer.
             if !has_value {
-                Value::Null
+                Ok(Value::Null)
             } else if has_float {
-                Value::Float64(float_sum)
+                Ok(Value::Float64(float_sum))
+            } else if overflow {
+                Err(ExecError::Runtime("integer out of range".into()))
             } else {
-                Value::Int64(int_sum)
+                Ok(Value::Int64(int_sum))
             }
         }
         "AVG" => {
+            // Checked like the AST path's SIMD arm: the integer sum is
+            // accumulated in checked i64 (overflow → "integer out of range",
+            // the same error the AST path returns), never through f64 where
+            // near-i64::MAX inputs round before the divide and the average
+            // is silently wrong.
             let col = col_idx.unwrap_or(0);
-            let mut sum = 0.0f64;
+            let mut int_sum = 0i64;
+            let mut float_sum = 0.0f64;
+            let mut has_float = false;
             let mut count = 0usize;
+            let mut overflow = false;
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
                         Value::Int32(n) => {
-                            sum += *n as f64;
+                            int_sum = int_sum.checked_add(*n as i64).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             count += 1;
                         }
                         Value::Int64(n) => {
-                            sum += *n as f64;
+                            int_sum = int_sum.checked_add(*n).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             count += 1;
                         }
                         Value::Float64(f) => {
-                            sum += f;
+                            float_sum += f;
+                            has_float = true;
                             count += 1;
                         }
                         Value::Null => {}
@@ -1662,9 +1593,13 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
                 }
             }
             if count == 0 {
-                Value::Null
+                Ok(Value::Null)
+            } else if overflow {
+                Err(ExecError::Runtime("integer out of range".into()))
+            } else if has_float {
+                Ok(Value::Float64((float_sum + int_sum as f64) / count as f64))
             } else {
-                Value::Float64(sum / count as f64)
+                Ok(Value::Float64(int_sum as f64 / count as f64))
             }
         }
         "MIN" => {
@@ -1682,7 +1617,7 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
                     });
                 }
             }
-            min.unwrap_or(Value::Null)
+            Ok(min.unwrap_or(Value::Null))
         }
         "MAX" => {
             let col = col_idx.unwrap_or(0);
@@ -1699,24 +1634,28 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
                     });
                 }
             }
-            max.unwrap_or(Value::Null)
+            Ok(max.unwrap_or(Value::Null))
         }
-        _ => Value::Null,
+        _ => Ok(Value::Null),
     }
 }
 
 /// Compute an aggregate function over borrowed row references.
 /// Same logic as `compute_aggregate` but avoids requiring owned rows.
-pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &[&Row]) -> Value {
+pub(super) fn compute_aggregate_refs(
+    func: &str,
+    col_idx: Option<usize>,
+    rows: &[&Row],
+) -> Result<Value, ExecError> {
     match func {
         // COUNT(*) counts rows; COUNT(col) counts non-NULL values of col.
         "COUNT" => match col_idx {
-            None => Value::Int64(rows.len() as i64),
-            Some(col) => Value::Int64(
+            None => Ok(Value::Int64(rows.len() as i64)),
+            Some(col) => Ok(Value::Int64(
                 rows.iter()
                     .filter(|r| r.get(col).is_some_and(|v| *v != Value::Null))
                     .count() as i64,
-            ),
+            )),
         },
         "SUM" => {
             let col = col_idx.unwrap_or(0);
@@ -1724,16 +1663,23 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
             let mut float_sum = 0.0f64;
             let mut has_value = false;
             let mut has_float = false;
+            let mut overflow = false;
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
                         Value::Int32(n) => {
-                            int_sum += *n as i64;
+                            int_sum = int_sum.checked_add(*n as i64).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             float_sum += *n as f64;
                             has_value = true;
                         }
                         Value::Int64(n) => {
-                            int_sum += *n;
+                            int_sum = int_sum.checked_add(*n).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             float_sum += *n as f64;
                             has_value = true;
                         }
@@ -1747,30 +1693,47 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
                 }
             }
             if !has_value {
-                Value::Null
+                Ok(Value::Null)
             } else if has_float {
-                Value::Float64(float_sum)
+                Ok(Value::Float64(float_sum))
+            } else if overflow {
+                Err(ExecError::Runtime("integer out of range".into()))
             } else {
-                Value::Int64(int_sum)
+                Ok(Value::Int64(int_sum))
             }
         }
         "AVG" => {
+            // Checked like the AST path's SIMD arm: the integer sum is
+            // accumulated in checked i64 (overflow → "integer out of range",
+            // the same error the AST path returns), never through f64 where
+            // near-i64::MAX inputs round before the divide and the average
+            // is silently wrong.
             let col = col_idx.unwrap_or(0);
-            let mut sum = 0.0f64;
+            let mut int_sum = 0i64;
+            let mut float_sum = 0.0f64;
+            let mut has_float = false;
             let mut count = 0usize;
+            let mut overflow = false;
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
                         Value::Int32(n) => {
-                            sum += *n as f64;
+                            int_sum = int_sum.checked_add(*n as i64).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             count += 1;
                         }
                         Value::Int64(n) => {
-                            sum += *n as f64;
+                            int_sum = int_sum.checked_add(*n).unwrap_or_else(|| {
+                                overflow = true;
+                                i64::MAX
+                            });
                             count += 1;
                         }
                         Value::Float64(f) => {
-                            sum += f;
+                            float_sum += f;
+                            has_float = true;
                             count += 1;
                         }
                         Value::Null => {}
@@ -1779,9 +1742,13 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
                 }
             }
             if count == 0 {
-                Value::Null
+                Ok(Value::Null)
+            } else if overflow {
+                Err(ExecError::Runtime("integer out of range".into()))
+            } else if has_float {
+                Ok(Value::Float64((float_sum + int_sum as f64) / count as f64))
             } else {
-                Value::Float64(sum / count as f64)
+                Ok(Value::Float64(int_sum as f64 / count as f64))
             }
         }
         "MIN" => {
@@ -1799,7 +1766,7 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
                     });
                 }
             }
-            min.unwrap_or(Value::Null)
+            Ok(min.unwrap_or(Value::Null))
         }
         "MAX" => {
             let col = col_idx.unwrap_or(0);
@@ -1816,9 +1783,9 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
                     });
                 }
             }
-            max.unwrap_or(Value::Null)
+            Ok(max.unwrap_or(Value::Null))
         }
-        _ => Value::Null,
+        _ => Ok(Value::Null),
     }
 }
 
@@ -2432,72 +2399,6 @@ pub(super) fn json_to_sparse_vec(val: &Value) -> Result<crate::sparse::SparseVec
             "sparse vector must be JSON object or text".into(),
         )),
     }
-}
-
-/// SQL LIKE pattern matching (supports % and _) using O(n*m) DP to prevent ReDoS.
-pub(super) fn like_match(text: &str, pattern: &str) -> bool {
-    let t: Vec<char> = text.chars().collect();
-    // Pre-tokenize the pattern honoring the default backslash escape: `\%`,
-    // `\_`, `\\` become literal characters (Wildcard::Literal), so
-    // `LIKE 'a\%b'` matches the literal string "a%b" (the raw DP treated `\`
-    // as an ordinary char and never matched).
-    enum Tok {
-        Percent,
-        Underscore,
-        Literal(char),
-    }
-    let pc: Vec<char> = pattern.chars().collect();
-    let mut p: Vec<Tok> = Vec::with_capacity(pc.len());
-    let mut i = 0;
-    while i < pc.len() {
-        match pc[i] {
-            '\\' if i + 1 < pc.len() => {
-                p.push(Tok::Literal(pc[i + 1]));
-                i += 2;
-            }
-            '%' => {
-                p.push(Tok::Percent);
-                i += 1;
-            }
-            '_' => {
-                p.push(Tok::Underscore);
-                i += 1;
-            }
-            c => {
-                p.push(Tok::Literal(c));
-                i += 1;
-            }
-        }
-    }
-    let m = p.len();
-
-    // dp[j] = true means pattern[0..j] matches text[0..i] (updated per row)
-    let mut dp = vec![false; m + 1];
-    dp[0] = true;
-    // Initialize: leading '%' toks match empty text
-    for j in 0..m {
-        if matches!(p[j], Tok::Percent) {
-            dp[j + 1] = dp[j];
-        } else {
-            break;
-        }
-    }
-
-    for &tc in &t {
-        let mut prev = dp[0]; // dp_prev[0] (previous row, col 0)
-        dp[0] = false; // text[0..i+1] never matches empty pattern
-        for j in 0..m {
-            let old = dp[j + 1]; // save dp_prev[j+1] before overwrite
-            dp[j + 1] = match p[j] {
-                Tok::Percent => old || dp[j],
-                Tok::Underscore => prev,
-                Tok::Literal(c) => prev && tc == c,
-            };
-            prev = old;
-        }
-    }
-
-    dp[m]
 }
 
 /// Format a unix timestamp as ISO-8601.

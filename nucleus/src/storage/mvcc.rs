@@ -874,6 +874,13 @@ pub struct MvccStorageAdapter {
     /// exists for) stay on the fast path: inserts only ever ADD version_map
     /// entries, and publish precedes reservation release.
     mutated_tables: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Coordinating transaction ids recovered from the WAL at open (S63), for
+    /// the specialty-WAL recovery filter. Snapshot at open is enough: it is
+    /// read once, when the executor opens those specialty logs.
+    committed_xacts: std::sync::Arc<std::collections::HashSet<u64>>,
+    /// Staged S63 markers (session id → coordinating id), consumed by that
+    /// session's `commit_txn`. See `set_pending_enlistment`.
+    pending_enlistment: parking_lot::RwLock<HashMap<u64, u64>>,
     /// Optional WAL for crash-safe durability.
     #[cfg(feature = "server")]
     wal: Option<Arc<MvccWal>>,
@@ -967,6 +974,8 @@ impl MvccStorageAdapter {
             rewrites_active: std::sync::atomic::AtomicUsize::new(0),
             writes_active: std::sync::atomic::AtomicUsize::new(0),
             mutated_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            committed_xacts: std::sync::Arc::new(std::collections::HashSet::new()),
+            pending_enlistment: parking_lot::RwLock::new(HashMap::new()),
             #[cfg(feature = "server")]
             wal: None,
         }
@@ -1021,6 +1030,8 @@ impl MvccStorageAdapter {
                 rewrites_active: std::sync::atomic::AtomicUsize::new(0),
                 writes_active: std::sync::atomic::AtomicUsize::new(0),
                 mutated_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+                committed_xacts: std::sync::Arc::new(state.committed_xacts),
+                pending_enlistment: parking_lot::RwLock::new(HashMap::new()),
                 wal: Some(Arc::new(wal)),
             },
             recovered_schemas,
@@ -1289,10 +1300,12 @@ impl MvccStorageAdapter {
     }
 
     /// Log a COMMIT and fsync (no-op if WAL is disabled or server feature is off).
+    /// `xact` is the optional S63 coordinating-transaction id, marker-written
+    /// under the same fsync as the COMMIT record.
     #[cfg(feature = "server")]
-    fn wal_log_commit(&self, txn_id: u64) -> Result<(), StorageError> {
+    fn wal_log_commit(&self, txn_id: u64, xact: Option<u64>) -> Result<(), StorageError> {
         if let Some(ref wal) = self.wal {
-            wal.log_commit(txn_id)
+            wal.log_commit(txn_id, xact)
                 .map_err(|e| StorageError::Io(format!("WAL commit: {e}")))?;
         }
         Ok(())
@@ -1493,13 +1506,14 @@ macro_rules! wal_log {
 }
 
 macro_rules! wal_log_commit {
-    ($self:expr, $txn_id:expr) => {{
+    ($self:expr, $txn_id:expr, $xact:expr) => {{
         #[cfg(feature = "server")]
         {
-            $self.wal_log_commit($txn_id)
+            $self.wal_log_commit($txn_id, $xact)
         }
         #[cfg(not(feature = "server"))]
         {
+            let _ = $xact;
             Ok::<(), StorageError>(())
         }
     }};
@@ -2437,6 +2451,26 @@ impl StorageEngine for MvccStorageAdapter {
         *self.mvcc_session().next_isolation.write() = iso;
     }
 
+    fn set_pending_enlistment(&self, body: [u8; 10]) {
+        // The body is `[xact_id u64][enlisted u16]`; the marker record carries
+        // only the id.
+        let xact = u64::from_le_bytes([
+            body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+        ]);
+        if xact == 0 {
+            return;
+        }
+        #[cfg(feature = "server")]
+        let id = super::STORAGE_SESSION_ID.try_with(|&id| id).unwrap_or(0);
+        #[cfg(not(feature = "server"))]
+        let id = super::get_storage_session_id();
+        self.pending_enlistment.write().insert(id, xact);
+    }
+
+    fn committed_xacts(&self) -> std::sync::Arc<std::collections::HashSet<u64>> {
+        std::sync::Arc::clone(&self.committed_xacts)
+    }
+
     async fn begin_txn(&self) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
         let mut lock = sess.session_txn.write();
@@ -2531,7 +2565,14 @@ impl StorageEngine for MvccStorageAdapter {
             // Committed: release in-flight unique reservations (the committed rows
             // now hold their keys via the committed-live check + rebuilt index).
             self.engine.release_unique(commit_txn_id);
-            wal_log_commit!(self, commit_txn_id)?;
+            // This session's staged S63 marker, if its transaction enlisted a
+            // specialty model: written beside the COMMIT record under the same
+            // fsync. Taken (not peeked) so a failed commit cannot leak it into
+            // a later transaction's marker.
+            let xact = super::current_storage_session()
+                .and_then(|id| self.pending_enlistment.write().remove(&id))
+                .or_else(|| self.pending_enlistment.write().remove(&0));
+            wal_log_commit!(self, commit_txn_id, xact)?;
         }
         sess.savepoints.write().clear();
         Ok(())
@@ -2539,6 +2580,14 @@ impl StorageEngine for MvccStorageAdapter {
 
     async fn abort_txn(&self) -> Result<(), StorageError> {
         let sess = self.mvcc_session();
+        // An aborted transaction's staged S63 marker dies with it: leaving it
+        // behind would brand the NEXT transaction's commit record with an id
+        // whose specialty records were just rolled back — the filter would
+        // resurrect them.
+        if let Some(id) = super::current_storage_session() {
+            self.pending_enlistment.write().remove(&id);
+        }
+        self.pending_enlistment.write().remove(&0);
         let mut lock = sess.session_txn.write();
         if let Some(ref mut txn) = *lock {
             wal_log!(self, MvccWalRecord::Abort { txn_id: txn.id })?;

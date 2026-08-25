@@ -36,6 +36,49 @@ use super::{ExecError, ExecResult, Executor};
 use crate::types::{DataType, Value};
 
 impl Executor {
+    /// Masking DDL has no sqlparser AST, so it never reaches
+    /// `execute_statement_inner`'s `is_policy_ddl`/`is_ddl` classification —
+    /// those matches are over `Statement` variants and this DDL is dispatched
+    /// by raw prefix. Do not "complete" that classification by adding dead
+    /// match arms; this method is the raw arm's equivalent of the is_ddl
+    /// publish/persist block: inside a transaction, mark the staged catalog
+    /// dirty so COMMIT publishes and persists it (savepoints already snapshot
+    /// `security_pending`, so ROLLBACK TO SAVEPOINT works too); in autocommit,
+    /// persist now, restoring the prior policy state on failure — the same
+    /// contract the is_ddl block gives every other DDL statement.
+    pub(super) async fn finalize_masking_ddl(&self) -> Result<(), ExecError> {
+        let session = self.current_session();
+        let mut txn = session.txn_state.write().await;
+        if txn.active {
+            txn.policy_dirty = true; // COMMIT publishes + persists
+            return Ok(());
+        }
+        drop(txn);
+        #[cfg(feature = "server")]
+        {
+            let before = self.security.read().clone_policy_state();
+            self.plan_cache.write().clear();
+            self.ast_cache.write().clear();
+            self.query_cache_invalidate_all();
+            if let Err(e) = self
+                .storage
+                .flush_schema()
+                .await
+                .map_err(ExecError::Storage)
+            {
+                *self.security.write() = before;
+                self.bump_policy_gen();
+                return Err(e);
+            }
+            if let Err(e) = self.persist_catalog().await {
+                *self.security.write() = before;
+                self.bump_policy_gen();
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// `CREATE MASKING POLICY ON <table> (<column>) TO <role> USING <rule>`
     pub(super) fn execute_create_masking_policy(&self, raw: &str) -> Result<ExecResult, ExecError> {
         self.require_security_admin("create masking policies")?;

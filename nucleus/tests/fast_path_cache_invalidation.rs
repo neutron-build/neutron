@@ -113,3 +113,65 @@ async fn simple_insert_invalidates_cached_select() {
         r[0][0]
     );
 }
+
+// ── CAT-12: SimpleInsert coerced each literal with
+// `.cast(...).unwrap_or_else(|_| v.to_value())` — a text literal that could
+// not be cast into the typed column was stored VERBATIM, so `INSERT INTO t
+// VALUES ('abc')` into an INT column durably held Text('abc') behind a
+// successful INSERT tag. ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn simple_insert_uncastable_literal_is_an_error() {
+    let ex = fresh().await;
+    exec(&ex, "CREATE TABLE fp_cast (id BIGINT, v TEXT)").await;
+
+    let cmd = SqlFastPathCommand::SimpleInsert {
+        table: "fp_cast".into(),
+        values: vec![SqlLiteral::Text("abc".into()), SqlLiteral::Text("x".into())],
+    };
+    let err = ex
+        .execute_sql_fast_path(0, &cmd)
+        .await
+        .expect("fast path should handle this shape")
+        .expect_err("an uncastable literal must be an error, not a silent Text store");
+    assert!(
+        err.to_string().contains("invalid input syntax"),
+        "got: {err}"
+    );
+
+    let r = rows(&ex, "SELECT COUNT(*) FROM fp_cast").await;
+    assert!(
+        matches!(&r[0][0], Value::Int64(0) | Value::Int32(0)),
+        "the refused insert must leave zero rows: {:?}",
+        r[0][0]
+    );
+}
+
+#[tokio::test]
+async fn simple_insert_castable_text_and_null_land_typed() {
+    let ex = fresh().await;
+    exec(&ex, "CREATE TABLE fp_cast2 (id BIGINT, v TEXT)").await;
+
+    let cmd = SqlFastPathCommand::SimpleInsert {
+        table: "fp_cast2".into(),
+        values: vec![SqlLiteral::Text("5".into()), SqlLiteral::Text("x".into())],
+    };
+    ex.execute_sql_fast_path(0, &cmd)
+        .await
+        .expect("fast path should handle this shape")
+        .expect("insert should succeed");
+    // '5' must land as an integer, not Text("5").
+    let r = rows(&ex, "SELECT id + 1 FROM fp_cast2").await;
+    assert!(matches!(&r[0][0], Value::Int64(6) | Value::Int32(6)));
+
+    let cmd = SqlFastPathCommand::SimpleInsert {
+        table: "fp_cast2".into(),
+        values: vec![SqlLiteral::Null, SqlLiteral::Text("y".into())],
+    };
+    ex.execute_sql_fast_path(0, &cmd)
+        .await
+        .expect("fast path should handle this shape")
+        .expect("insert should succeed");
+    let r = rows(&ex, "SELECT COUNT(*) FROM fp_cast2 WHERE id IS NULL").await;
+    assert!(matches!(&r[0][0], Value::Int64(1) | Value::Int32(1)));
+}
