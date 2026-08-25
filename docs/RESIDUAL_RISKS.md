@@ -27,8 +27,8 @@ the other twelve models.**
 Nucleus has fourteen data models. SQL writes go through the page WAL with a
 commit record. The other thirteen each own an append log.
 
-For **streams and KV strings**, the fix is implemented end to end: every
-enlisted write is tagged with the coordinating transaction id, the
+For **streams, KV strings, and documents**, the fix is implemented end to
+end: every enlisted write is tagged with the coordinating transaction id, the
 commit record is CRC-covered on both WAL backends and survives compaction,
 specialty checkpoints are ordered before the SQL checkpoint with a retention
 pin, and recovery discards tagged records whose transaction never committed —
@@ -38,15 +38,14 @@ record leaves both writes or neither, and rollback retracts what the
 transaction appended. Pinned by `probe_crossmodel_commit_order` and
 `probe_crossmodel_atomicity`.
 
-The remaining twelve models — document, FTS, vector, graph, timeseries,
-geo, columnar, datalog, CDC, blob, collections-KV, pub/sub — still append with
-no notion of the transaction that produced a record. A transaction that writes
-a row and a document and crashes between the two fsyncs can leave one without
-the other, and rolling it back does not retract what its specialty writes
-appended.
+The remaining models — FTS, vector, graph, timeseries, geo, columnar,
+datalog, CDC, blob, collections-KV, pub/sub — still append with no notion of
+the transaction that produced a record. A transaction that writes a row and a
+document and crashes between the two fsyncs can leave one without the other,
+and rolling it back does not retract what its specialty writes appended.
 
 **If this matters to you:** keep cross-model writes idempotent, or confine a
-transaction to SQL, streams, and KV strings.
+transaction to SQL, streams, KV strings, and documents.
 
 ## 2. Two index paths read the whole table and then narrow the answer
 
