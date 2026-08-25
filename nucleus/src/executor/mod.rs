@@ -325,6 +325,11 @@ impl ExecResult {
     }
 }
 
+/// How many consecutive specialty-checkpoint skips before one WAL-growth
+/// WARN is emitted (S7 mitigation). At the default 300 s checkpoint interval
+/// this is roughly one warning per 50 minutes of a held gate.
+const SKIP_WARN_EVERY: u64 = 10;
+
 /// The executor holds shared catalog/storage state and per-session state.
 ///
 /// Session-specific state (transactions, cursors, prepared statements, settings)
@@ -482,6 +487,13 @@ pub struct Executor {
     /// arm pins retention here so SQL segment pruning cannot outrun the
     /// specialty snapshots the S6 filter's completeness depends on.
     specialty_horizon: AtomicU64,
+    /// Consecutive specialty-checkpoint passes skipped because an enlisted
+    /// transaction was open (S7). Every WAL-growth WARN_EVERY-th consecutive
+    /// skip emits the WAL-growth warning; a completed pass resets the run.
+    specialty_checkpoint_skips: AtomicU64,
+    /// How many WAL-growth warnings have been emitted (test hook: the warn
+    /// itself goes to tracing, which tests cannot read).
+    specialty_checkpoint_warns: AtomicU64,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
     /// In-memory key-value store for KV SQL functions (kv_get, kv_set, kv_del, etc.).
@@ -933,6 +945,8 @@ impl Executor {
             next_session_id: AtomicU64::new(1),
             next_xact_id: AtomicU64::new(1),
             specialty_horizon: AtomicU64::new(1),
+            specialty_checkpoint_skips: AtomicU64::new(0),
+            specialty_checkpoint_warns: AtomicU64::new(0),
             default_session: Arc::new(Session::new()),
             kv_store: Arc::new(crate::kv::KvStore::new()),
             columnar_store: parking_lot::RwLock::new(crate::columnar::ColumnarStore::new()),
@@ -1091,13 +1105,15 @@ impl Executor {
                 *exec.doc_store.write() = doc;
             }
 
-            // Graph store: WAL + cold tier
+            // Graph store: WAL + cold tier. The committed set filters the
+            // graph.wal replay the same way it filters kv.wal and doc.wal
+            // (S63).
             let graph_dir = dir.join("graph");
             std::fs::create_dir_all(&graph_dir).ok();
             if let Some(graph) = Self::open_durable(
                 "Graph",
                 &graph_dir,
-                crate::graph::GraphStore::open(&graph_dir),
+                crate::graph::GraphStore::open_with_committed(&graph_dir, &committed_xacts),
             ) {
                 *exec.graph_store.write() = graph;
             }
@@ -1241,6 +1257,7 @@ impl Executor {
                 .kv_store()
                 .wal_max_xact_id()
                 .max(exec.doc_store().read().wal_max_xact_id())
+                .max(exec.graph_store().read().wal_max_xact_id())
                 .max(committed_xacts.iter().copied().max().unwrap_or(0));
             if let Some((wal, state)) = Self::open_durable(
                 "Streams",
@@ -1253,11 +1270,11 @@ impl Executor {
                 xact_floor = xact_floor.max(state.max_xact_id);
             }
             // Seed the XactId counter above every id a surviving record
-            // could reference: tagged KV, doc and streams records, and
-            // COMMIT-record bodies. All sources are needed — any one alone
-            // is lowerable by reclaim (segment pruning, log compaction) —
-            // and together they are exactly the ids a future filter
-            // decision can consult. This runs even when a tagged log
+            // could reference: tagged KV, doc, graph and streams records,
+            // and COMMIT-record bodies. All sources are needed — any one
+            // alone is lowerable by reclaim (segment pruning, log
+            // compaction) — and together they are exactly the ids a future
+            // filter decision can consult. This runs even when a tagged log
             // failed to open (its records are lost with it, but the
             // surviving ones still pin the floor). See
             // `executor::enlistment`.
@@ -4546,6 +4563,88 @@ impl Executor {
     pub fn note_specialty_checkpoint_pass(&self, lsn: u64) {
         self.specialty_horizon
             .fetch_max(lsn, std::sync::atomic::Ordering::AcqRel);
+        // A completed pass also ends any skip run: the next warning, if
+        // there is one, must be about a NEW hold, not the one just released.
+        self.specialty_checkpoint_skips
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The coordinating ids of every open enlisted transaction, ascending.
+    /// Names the transactions holding WAL truncation in the skip warning
+    /// below.
+    pub fn open_enlisted_xids(&self) -> Vec<u64> {
+        let mut xids: Vec<u64> = self
+            .sessions
+            .read()
+            .values()
+            .filter_map(|s| {
+                s.cross_model
+                    .lock()
+                    .as_ref()
+                    .filter(|cm| !cm.enlisted.is_empty())
+                    .map(|cm| cm.xid)
+            })
+            .collect();
+        if let Some(cm) = self
+            .default_session
+            .cross_model
+            .lock()
+            .as_ref()
+            .filter(|cm| !cm.enlisted.is_empty())
+        {
+            xids.push(cm.xid);
+        }
+        xids.sort_unstable();
+        xids.dedup();
+        xids
+    }
+
+    /// A specialty-checkpoint pass was skipped because an enlisted
+    /// transaction was open (S7). WAL-growth mitigation: while the skip run
+    /// lasts the specialty logs keep every write (the S6 filter's
+    /// completeness depends on the tail surviving), so a transaction left
+    /// open indefinitely grows them without bound. Every
+    /// [`SKIP_WARN_EVERY`]-th consecutive skip emits one WARN naming the
+    /// open ids and the configured remedy; a completed pass resets the run.
+    /// Warning rather than force-checkpointing is the conservative half of
+    /// the escalated policy — force-sweeping under an open transaction
+    /// would bake uncommitted state into snapshots.
+    pub fn note_specialty_checkpoint_skip(&self, idle_txn_timeout_secs: u64) {
+        let skips = self
+            .specialty_checkpoint_skips
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        if !skips.is_multiple_of(SKIP_WARN_EVERY) {
+            return;
+        }
+        self.specialty_checkpoint_warns
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let xids = self.open_enlisted_xids();
+        tracing::warn!(
+            target: "nucleus::checkpoint",
+            "specialty WALs have not been checkpointed for {skips} passes: enlisted \
+             transaction(s) {xids:?} hold the S7 gate open. The logs grow one record \
+             per write until those transactions end or are swept. Remedy: end the \
+             transactions, or lower idle_in_transaction_timeout_secs (currently \
+             {idle_txn_timeout_secs}s; 0 disables the sweep)"
+        );
+    }
+
+    /// Test hook for [`note_specialty_checkpoint_skip`]: the warn goes to
+    /// tracing, which tests cannot observe, so the count is observable
+    /// instead.
+    #[cfg(test)]
+    pub(crate) fn specialty_checkpoint_warns(&self) -> u64 {
+        self.specialty_checkpoint_warns
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test hook companion: how many consecutive specialty-checkpoint
+    /// passes the skip run counts.
+    #[cfg(test)]
+    pub(crate) fn specialty_checkpoint_skips(&self) -> u64 {
+        self.specialty_checkpoint_skips
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The next coordinating id `BEGIN` will mint (test/introspection hook).
@@ -4876,8 +4975,9 @@ impl Executor {
             .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
         let result = {
             let mut gs = self.graph_store.write();
-            self.cross_model_before_graph(&gs);
+            let xact = self.cross_model_before_graph(&gs);
             gs.clear_touched();
+            gs.set_xact_tag(xact);
             let outcome = execute_cypher(&mut gs, &parsed)
                 .map_err(|e| ExecError::Unsupported(format!("Cypher execution error: {e:?}")));
             let touched = gs.take_touched();

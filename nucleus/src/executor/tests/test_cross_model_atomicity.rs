@@ -1,6 +1,7 @@
 //! S63 slice 1: cross-model atomicity between SQL and Streams, slice 2
-//! between SQL and the KV strings WAL (`kv.wal`), and slice 3 between SQL
-//! and the document WAL (`doc.wal`).
+//! between SQL and the KV strings WAL (`kv.wal`), slice 3 between SQL
+//! and the document WAL (`doc.wal`), and slice 4 between SQL and the
+//! property-graph WAL (`graph.wal`).
 //!
 //! The mechanism under test, end to end: every streams/KV WAL record written
 //! inside an explicit transaction is tagged with that transaction's
@@ -742,4 +743,299 @@ async fn doc_tagged_ids_do_not_reuse_when_only_doc_wal_holds_the_floor() {
     // Run 3: the live document survives, the abandoned one stays dead.
     let (ex, _engine) = open_segmented(dir.path()).await;
     assert!(doc_get(&ex, 1).await.unwrap().contains("committed-later"));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// S63 slice 4: the property-graph WAL (graph.wal)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// GRAPH_ADD_NODE as the assigned node id.
+async fn graph_add_node(ex: &Executor, label: &str) -> i64 {
+    let r = exec(ex, &format!("SELECT GRAPH_ADD_NODE('{label}')")).await;
+    match scalar(&r[0]) {
+        Value::Int64(id) => *id,
+        other => panic!("GRAPH_ADD_NODE({label}) returned {other:?}"),
+    }
+}
+
+/// Count the nodes carrying `label`, via GRAPH_QUERY's JSON result.
+async fn graph_count(ex: &Executor, label: &str) -> i64 {
+    let r = exec(
+        ex,
+        &format!("SELECT GRAPH_QUERY('MATCH (n:{label}) RETURN COUNT(*)')"),
+    )
+    .await;
+    let json = text_of(r.into_iter().next().unwrap());
+    let v: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("GRAPH_QUERY returned unparseable {json:?}: {e}"));
+    v["rows"][0][0]
+        .as_i64()
+        .or_else(|| v["rows"][0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("no count in {json:?}"))
+}
+
+/// The S63 discard direction for the graph, no crash injection needed:
+/// dropping the executor mid-transaction is the durable equivalent of dying
+/// before the COMMIT record — the graph.wal record was flushed by its
+/// statement, and nothing vouches for its id. No compensation runs (the
+/// transaction is abandoned, not rolled back), so the only thing standing
+/// between the flushed tagged record and recovery is the filter. The
+/// committed transaction's node in the SAME log survives — the
+/// both-directions proof.
+#[tokio::test]
+async fn uncommitted_graph_write_is_discarded_and_committed_kept_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+        // Committed: SQL row + graph node, both tagged with the txn's id,
+        // vouched for by the COMMIT record body.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (1, 'kept')").await;
+        graph_add_node(&ex, "Kept").await;
+        exec(&ex, "COMMIT").await;
+        // Abandoned: record flushed to graph.wal, COMMIT never happens. No
+        // rollback compensation runs — the filter alone must discard it.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (2, 'lost')").await;
+        graph_add_node(&ex, "Lost").await;
+        // no COMMIT, no ROLLBACK — drop(ex) below abandons it
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        graph_count(&ex, "Kept").await,
+        1,
+        "the committed transaction's graph write is vouched for and must survive"
+    );
+    assert_eq!(
+        graph_count(&ex, "Lost").await,
+        0,
+        "the abandoned transaction's graph record was flushed to graph.wal and \
+         must be discarded by the filter, not replayed"
+    );
+    let rows = exec(&ex, "SELECT v FROM t ORDER BY id").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the abandoned transaction's SQL row is gone too"
+    );
+    assert_eq!(scalar(&rows[0]), &Value::Text("kept".into()));
+}
+
+/// Autocommit GRAPH_ADD_NODEs carry XACT_AUTOCOMMIT (0) and never need a
+/// commit record — their durability point is the graph log's own fsync.
+#[tokio::test]
+async fn autocommit_graph_write_survives_reopen_without_a_commit_record() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        graph_add_node(&ex, "Auto").await;
+        graph_add_node(&ex, "Auto").await;
+        assert_eq!(graph_count(&ex, "Auto").await, 2);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        graph_count(&ex, "Auto").await,
+        2,
+        "autocommit records carry id 0 and must never be filtered"
+    );
+}
+
+/// A rolled-back transaction's tagged graph records are discarded by the
+/// filter on replay. The rollback's compensating records ALSO handle this
+/// (double protection, deliberately kept — see D4), so the outcome here is
+/// asserted rather than discriminated; the filter-only discriminator is the
+/// abandoned-transaction test above, where no compensation ever runs.
+#[tokio::test]
+async fn rolled_back_graph_writes_are_gone_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        let base = graph_add_node(&ex, "RbBase").await;
+        exec(&ex, "BEGIN").await;
+        graph_add_node(&ex, "RbNew").await;
+        exec(&ex, &format!("SELECT GRAPH_DELETE_NODE({base})")).await;
+        exec(&ex, "ROLLBACK").await;
+        assert_eq!(graph_count(&ex, "RbBase").await, 1);
+        assert_eq!(graph_count(&ex, "RbNew").await, 0);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        graph_count(&ex, "RbNew").await,
+        0,
+        "the rolled-back transaction's node must not resurrect on reopen"
+    );
+    assert_eq!(
+        graph_count(&ex, "RbBase").await,
+        1,
+        "the deleted node's before-image must be what replay restores"
+    );
+}
+
+/// The graph half of the id-monotonicity proof (S1a/D2): after a run whose
+/// only surviving tagged record lives in graph.wal — no COMMIT bodies (the
+/// abandoned transaction never wrote one), nothing in kv.wal, doc.wal or
+/// streams.wal — a reopened executor must still mint ids ABOVE the id that
+/// record carries.
+///
+/// This is the resurrection case the seed exists to prevent: an abandoned
+/// record tagged 1 is on disk and unreferenced. If the counter restarted at
+/// 1, the NEXT committed transaction would carry id 1, its COMMIT body
+/// would vouch for id 1, and replay would resurrect the abandoned node as a
+/// side effect of keeping the live one. The seed's graph scan is what holds
+/// the floor here — no other source has anything to contribute.
+#[tokio::test]
+async fn graph_tagged_ids_do_not_reuse_when_only_graph_wal_holds_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Run 1: an abandoned transaction tags a graph record with id 1.
+    // Nothing commits, so no COMMIT body exists anywhere afterwards.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "BEGIN").await;
+        graph_add_node(&ex, "Abandoned").await;
+        // abandon — no COMMIT, no ROLLBACK, no compensation
+    }
+
+    // Run 2: reopen. The committed set is empty and the other tagged logs
+    // hold nothing; only graph.wal's max tagged id (1) can hold the floor
+    // above 1.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        assert_eq!(
+            graph_count(&ex, "Abandoned").await,
+            0,
+            "the abandoned record must be discarded on replay"
+        );
+        let next = ex.next_xact_id_probe();
+        assert!(
+            next > 1,
+            "id reuse: the next minted id is {next}, but graph.wal still holds \
+             a tagged record carrying id 1 — a fresh transaction with that id \
+             would resurrect it"
+        );
+        // Prove the resurrection the seed prevents: commit a NEW graph
+        // write. Its id is above 1, so vouching for it must not vouch for
+        // the abandoned record.
+        exec(&ex, "BEGIN").await;
+        graph_add_node(&ex, "Live").await;
+        exec(&ex, "COMMIT").await;
+    }
+
+    // Run 3: the live node survives, the abandoned one stays dead.
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(graph_count(&ex, "Live").await, 1);
+    assert_eq!(
+        graph_count(&ex, "Abandoned").await,
+        0,
+        "the committed id must not vouch for the stale tagged record"
+    );
+}
+
+/// The S63 discard direction through a crash before the COMMIT record —
+/// the same shape as the abandoned-transaction test, but crossing the real
+/// process boundary via the probe's crashpoint (the executor-level twin is
+/// `probe_crossmodel_atomicity`'s graph scenarios).
+///
+/// Slices 1-3 proved the gate; this asserts graph joins it: an enlisted
+/// transaction holding the gate open is visible to `any_open_enlisted_txn`
+/// and names its xid for the skip warning.
+#[tokio::test]
+async fn graph_enlistment_trips_the_s7_gate_and_names_the_xid() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _engine) = open_segmented(dir.path()).await;
+
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "CREATE TABLE gate_t (id INTEGER)").await;
+    assert!(
+        !ex.any_open_enlisted_txn(),
+        "a SQL-only transaction must not block a specialty checkpoint"
+    );
+    graph_add_node(&ex, "Gate").await;
+    assert!(
+        ex.any_open_enlisted_txn(),
+        "enlisting graph must trip the gate"
+    );
+    let xids = ex.open_enlisted_xids();
+    assert_eq!(
+        xids.len(),
+        1,
+        "exactly the enlisting transaction, got {xids:?}"
+    );
+    exec(&ex, "ROLLBACK").await;
+    assert!(!ex.any_open_enlisted_txn(), "ROLLBACK releases the gate");
+    assert!(
+        ex.open_enlisted_xids().is_empty(),
+        "no enlisted transaction outlives its ROLLBACK"
+    );
+}
+
+/// The WAL-growth mitigation (S7): an open enlisted transaction holds
+/// specialty checkpoints off, and the logs it pins grow one record per
+/// write. The conservative remedy is a WARN once every SKIP_WARN_EVERY
+/// consecutive skipped passes, naming the open xids — never a force-sweep,
+/// which would bake uncommitted state into a snapshot.
+#[tokio::test]
+async fn held_gate_warns_once_per_ten_skipped_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _engine) = open_segmented(dir.path()).await;
+
+    // A SQL-only transaction never trips the gate, so its skips are not
+    // the enlisted kind; hold a real enlisted one open.
+    exec(&ex, "BEGIN").await;
+    graph_add_node(&ex, "Holder").await;
+    assert!(ex.any_open_enlisted_txn());
+    assert_eq!(ex.open_enlisted_xids(), vec![1]);
+
+    // Nine skipped passes: the warning must not fire yet.
+    for _ in 0..9 {
+        ex.note_specialty_checkpoint_skip(60);
+    }
+    assert_eq!(
+        ex.specialty_checkpoint_warns(),
+        0,
+        "the warn is once per ten skips, not per skip"
+    );
+    // The tenth fires exactly once, and names the holder.
+    ex.note_specialty_checkpoint_skip(60);
+    assert_eq!(ex.specialty_checkpoint_warns(), 1);
+    assert_eq!(ex.specialty_checkpoint_skips(), 10);
+
+    // Ten more: the run continues, so the warn repeats on the twentieth.
+    for _ in 0..9 {
+        ex.note_specialty_checkpoint_skip(60);
+    }
+    assert_eq!(ex.specialty_checkpoint_warns(), 1);
+    ex.note_specialty_checkpoint_skip(60);
+    assert_eq!(ex.specialty_checkpoint_warns(), 2);
+
+    // A completed pass ends the run: the warn cadence restarts, so nine
+    // post-reset skips fire nothing and the tenth warns again.
+    ex.note_specialty_checkpoint_pass(1);
+    for _ in 0..9 {
+        ex.note_specialty_checkpoint_skip(60);
+    }
+    assert_eq!(
+        ex.specialty_checkpoint_warns(),
+        2,
+        "a completed pass resets the skip run: nine fresh skips warn nothing"
+    );
+    ex.note_specialty_checkpoint_skip(60);
+    assert_eq!(ex.specialty_checkpoint_warns(), 3);
+    ex.note_specialty_checkpoint_skip(60);
+    assert_eq!(
+        ex.specialty_checkpoint_warns(),
+        3,
+        "the eleventh skip of the run warns nothing — once per ten, not more"
+    );
+
+    // Ending the transaction releases the gate, and the xid list empties.
+    exec(&ex, "ROLLBACK").await;
+    assert!(ex.open_enlisted_xids().is_empty());
 }

@@ -1867,6 +1867,13 @@ async fn cmd_start(cfg: StartConfig) {
                             tracing::debug!(
                                 "specialty checkpoint skipped: enlisted transaction open"
                             );
+                            // WAL-growth mitigation (S7): the skip run is
+                            // bounded only by the idle-in-transaction sweep;
+                            // surface it periodically rather than letting the
+                            // logs grow silently for the life of a stuck
+                            // transaction.
+                            executor_for_workers
+                                .note_specialty_checkpoint_skip(idle_txn_timeout_secs);
                         } else {
                             if let Some(ref engine) = disk_for_workers {
                                 horizon = engine.current_wal_lsn();

@@ -170,15 +170,30 @@ impl Executor {
     // `*_before` captures the lazy before-image while the caller holds the
     // store's write guard; `*_after` merges the write-set the store recorded.
 
-    pub(super) fn cross_model_before_graph(&self, store: &crate::graph::GraphStore) {
+    /// Record that this transaction is about to write the graph store,
+    /// capturing the before-image on first use, and return the coordinating
+    /// id the WAL records for that write must carry (S63): the transaction's
+    /// `xid` inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    /// Folding the enlistment into the touch means one lock acquisition
+    /// covers both, and a write path cannot drift between capturing the
+    /// before-image and tagging its records. Must be called *before* the
+    /// mutation, while the caller holds the store's write guard (it takes
+    /// `&store`, not a clone, exactly so it cannot be called any later).
+    /// The caller brackets the batch with `set_xact_tag`/`take_touched` on
+    /// the store so every WAL record the batch writes carries the id.
+    pub(super) fn cross_model_before_graph(&self, store: &crate::graph::GraphStore) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Graph);
         for_each_level!(cm, lvl, {
             if lvl.graph.is_none() {
                 lvl.graph = Some(store.txn_snapshot());
             }
         });
+        cm.xid
     }
 
     pub(super) fn cross_model_after_graph(&self, touched: GraphTouched) {

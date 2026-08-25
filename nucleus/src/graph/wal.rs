@@ -20,6 +20,20 @@
 //! SNAPSHOT:   [0x10] [full graph binary dump — all nodes + all edges + index defs]
 //! ```
 //!
+//! ## Transaction-tagged records (S63)
+//!
+//! Tags `0x08`-`0x0E` are the `_XACT` twins of the seven mutation records,
+//! each carrying the coordinating transaction id (`u64 LE`) between the tag
+//! and the twin's body. Replay keeps a tagged record only if its id is
+//! `XACT_AUTOCOMMIT` (0 — written outside any explicit transaction, whose
+//! durability point is this log's own fsync) or appears in the committed set
+//! recovered from the SQL side; everything else was written inside a
+//! transaction that never committed and is discarded — absence of a commit
+//! record means discard, always. The untagged tags keep their
+//! keep-unconditionally meaning, so pre-S63 logs replay unchanged. A
+//! SNAPSHOT is committed by construction (the S7 checkpoint gate keeps one
+//! from folding an open transaction's writes) and always replays.
+//!
 //! ## What is and is not persisted for property indexes
 //!
 //! Only the *definition* `(label, property)` is logged. The index contents are
@@ -31,12 +45,14 @@
 //! A SNAPSHOT resets all state. After `checkpoint()` the file is truncated to a
 //! single SNAPSHOT entry so the log stays small.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
+
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 
 use super::{EdgeId, NodeId, PropValue, Properties};
 
@@ -49,6 +65,21 @@ const TAG_DEL_EDGE: u8 = 0x04;
 const TAG_SET_PROP: u8 = 0x05;
 const TAG_ADD_INDEX: u8 = 0x06;
 const TAG_DEL_INDEX: u8 = 0x07;
+/// S63: ADD_NODE carrying the coordinating transaction id. Body after the id
+/// is byte-identical to [`TAG_ADD_NODE`]'s record.
+const TAG_ADD_NODE_XACT: u8 = 0x08;
+/// S63: ADD_EDGE carrying the coordinating transaction id.
+const TAG_ADD_EDGE_XACT: u8 = 0x09;
+/// S63: DEL_NODE carrying the coordinating transaction id.
+const TAG_DEL_NODE_XACT: u8 = 0x0A;
+/// S63: DEL_EDGE carrying the coordinating transaction id.
+const TAG_DEL_EDGE_XACT: u8 = 0x0B;
+/// S63: SET_PROP carrying the coordinating transaction id.
+const TAG_SET_PROP_XACT: u8 = 0x0C;
+/// S63: ADD_INDEX carrying the coordinating transaction id.
+const TAG_ADD_INDEX_XACT: u8 = 0x0D;
+/// S63: DEL_INDEX carrying the coordinating transaction id.
+const TAG_DEL_INDEX_XACT: u8 = 0x0E;
 const TAG_SNAPSHOT: u8 = 0x10;
 
 // PropValue wire tags
@@ -88,6 +119,13 @@ pub struct GraphWalState {
     /// Node property index definitions `(label, property)`. Contents are not
     /// persisted — the store rebuilds each index from the recovered nodes.
     pub node_indexes: BTreeSet<(String, String)>,
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded. Seeds the XactId
+    /// high-water mark at executor construction (S63): a reopened process
+    /// must never mint an id that a surviving tagged record already carries,
+    /// or the recovery filter could resurrect stale records by matching a
+    /// fresh transaction against them.
+    pub max_xact_id: u64,
 }
 
 /// A snapshot of the current graph suitable for checkpointing.
@@ -112,33 +150,52 @@ pub struct GraphWal {
     /// checkpoint replaced the log but its reopen failed; cleared by the next
     /// successful reattach (or checkpoint reopen). See `reattach_if_stranded`.
     stranded: std::sync::atomic::AtomicBool,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
     #[cfg(test)]
     fail_reopen_once: std::sync::atomic::AtomicBool,
 }
 
 impl GraphWal {
-    /// Open or create the WAL file in `dir`.
+    /// Open or create the WAL file in `dir`, replaying with an EMPTY
+    /// committed set so every tagged record keeps — the pre-S63 contract.
+    /// The executor opens through [`GraphWal::open_with_committed`] instead,
+    /// passing the coordinating transaction ids the SQL side durably
+    /// committed so the S63 replay filter can discard the rest.
     ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
-    /// state is empty. Corrupt trailing bytes are silently ignored (best-effort
-    /// recovery).
+    /// state is empty. Corrupt trailing bytes are silently ignored
+    /// (best-effort recovery).
     pub fn open(dir: &Path) -> io::Result<(Self, GraphWalState)> {
+        Self::open_with_committed(dir, &HashSet::new())
+    }
+
+    /// Open or create the WAL file in `dir` whose replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &HashSet<u64>,
+    ) -> io::Result<(Self, GraphWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("graph.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data)
+            replay(&data, committed)
         } else {
             GraphWalState::default()
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let max_xact_id = state.max_xact_id;
         Ok((
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: crate::storage::wal_util::WalSync::new(),
                 stranded: std::sync::atomic::AtomicBool::new(false),
+                max_xact_id,
                 #[cfg(test)]
                 fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
             },
@@ -146,15 +203,28 @@ impl GraphWal {
         ))
     }
 
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    pub fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
+    }
+
     /// Log an ADD_NODE operation.
+    ///
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction,
+    /// `Some(id)` inside one, `None` to write the legacy untagged record
+    /// (kept unconditionally on replay — the pre-S63 compatibility rule).
     pub fn log_add_node(
         &self,
+        xact: Option<u64>,
         id: NodeId,
         labels: &[String],
         props: &Properties,
     ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(TAG_ADD_NODE);
+        push_tag(&mut buf, xact, TAG_ADD_NODE, TAG_ADD_NODE_XACT);
         buf.extend_from_slice(&id.to_le_bytes());
         encode_labels(labels, &mut buf);
         encode_props(props, &mut buf);
@@ -162,8 +232,11 @@ impl GraphWal {
     }
 
     /// Log an ADD_EDGE operation.
+    ///
+    /// `xact` mirrors [`GraphWal::log_add_node`].
     pub fn log_add_edge(
         &self,
+        xact: Option<u64>,
         id: EdgeId,
         src: NodeId,
         dst: NodeId,
@@ -171,7 +244,7 @@ impl GraphWal {
         props: &Properties,
     ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(TAG_ADD_EDGE);
+        push_tag(&mut buf, xact, TAG_ADD_EDGE, TAG_ADD_EDGE_XACT);
         buf.extend_from_slice(&id.to_le_bytes());
         buf.extend_from_slice(&src.to_le_bytes());
         buf.extend_from_slice(&dst.to_le_bytes());
@@ -181,33 +254,39 @@ impl GraphWal {
     }
 
     /// Log a DEL_NODE operation.
-    pub fn log_del_node(&self, id: NodeId) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`GraphWal::log_add_node`].
+    pub fn log_del_node(&self, xact: Option<u64>, id: NodeId) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(TAG_DEL_NODE);
+        push_tag(&mut buf, xact, TAG_DEL_NODE, TAG_DEL_NODE_XACT);
         buf.extend_from_slice(&id.to_le_bytes());
         self.append_raw(&buf)
     }
 
     /// Log a DEL_EDGE operation.
-    pub fn log_del_edge(&self, id: EdgeId) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`GraphWal::log_add_node`].
+    pub fn log_del_edge(&self, xact: Option<u64>, id: EdgeId) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(TAG_DEL_EDGE);
+        push_tag(&mut buf, xact, TAG_DEL_EDGE, TAG_DEL_EDGE_XACT);
         buf.extend_from_slice(&id.to_le_bytes());
         self.append_raw(&buf)
     }
 
     /// Log a SET_PROP operation.
     ///
-    /// `target` is `0` for node, `1` for edge.
+    /// `target` is `0` for node, `1` for edge. `xact` mirrors
+    /// [`GraphWal::log_add_node`].
     pub fn log_set_prop(
         &self,
+        xact: Option<u64>,
         target: u8,
         id: u64,
         key: &str,
         value: &PropValue,
     ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(TAG_SET_PROP);
+        push_tag(&mut buf, xact, TAG_SET_PROP, TAG_SET_PROP_XACT);
         buf.push(target);
         buf.extend_from_slice(&id.to_le_bytes());
         encode_str(key, &mut buf);
@@ -216,18 +295,32 @@ impl GraphWal {
     }
 
     /// Log the creation of a node property index definition.
-    pub fn log_add_node_index(&self, label: &str, property: &str) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`GraphWal::log_add_node`].
+    pub fn log_add_node_index(
+        &self,
+        xact: Option<u64>,
+        label: &str,
+        property: &str,
+    ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(TAG_ADD_INDEX);
+        push_tag(&mut buf, xact, TAG_ADD_INDEX, TAG_ADD_INDEX_XACT);
         encode_str(label, &mut buf);
         encode_str(property, &mut buf);
         self.append_raw(&buf)
     }
 
     /// Log the removal of a node property index definition.
-    pub fn log_drop_node_index(&self, label: &str, property: &str) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`GraphWal::log_add_node`].
+    pub fn log_drop_node_index(
+        &self,
+        xact: Option<u64>,
+        label: &str,
+        property: &str,
+    ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(TAG_DEL_INDEX);
+        push_tag(&mut buf, xact, TAG_DEL_INDEX, TAG_DEL_INDEX_XACT);
         encode_str(label, &mut buf);
         encode_str(property, &mut buf);
         self.append_raw(&buf)
@@ -386,6 +479,18 @@ impl GraphWal {
 
 // ─── Binary encoding helpers ────────────────────────────────────────────────
 
+/// Emit the tag for one record: the `_XACT` twin plus the id when `xact` is
+/// `Some`, the legacy untagged tag when `None`.
+fn push_tag(buf: &mut Vec<u8>, xact: Option<u64>, plain: u8, xact_tagged: u8) {
+    match xact {
+        Some(x) => {
+            buf.push(xact_tagged);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        None => buf.push(plain),
+    }
+}
+
 fn encode_str(s: &str, buf: &mut Vec<u8>) {
     let b = s.as_bytes();
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -435,16 +540,49 @@ fn encode_props(props: &Properties, buf: &mut Vec<u8>) {
 ///
 /// SNAPSHOT entries reset all state to their embedded snapshot, so only the
 /// *last* SNAPSHOT (and subsequent incremental entries) matter in practice.
-fn replay(data: &[u8]) -> GraphWalState {
+///
+/// `committed` is the set of coordinating transaction ids that durably
+/// committed on the SQL side (S63). A tagged record whose id is neither
+/// `XACT_AUTOCOMMIT` nor in it was written inside a transaction that never
+/// committed, and is discarded — its body is still parsed past, because
+/// nothing length-frames these records and the next one must be found.
+fn replay(data: &[u8], committed: &HashSet<u64>) -> GraphWalState {
     let mut state = GraphWalState::default();
     let mut pos = 0usize;
+    let mut max_xact_id: u64 = 0;
 
     while pos < data.len() {
         let Some(&tag) = data.get(pos) else { break };
         pos += 1;
 
+        // The tagged records parse their id, then share the body parse with
+        // the untagged twin. `keep_tagged` is the S63 filter in one
+        // expression: an autocommit record is durable by its own fsync, a
+        // committed id was vouched for by a durable COMMIT record, anything
+        // else never happened. Parsing continues either way — the record
+        // must be fully consumed to find the next one, since nothing
+        // length-frames these. Ids feed `max_xact_id` whether kept or
+        // discarded, so the caller can seed the XactId high-water mark.
+        let mut keep_tagged = true;
+        if matches!(
+            tag,
+            TAG_ADD_NODE_XACT
+                | TAG_ADD_EDGE_XACT
+                | TAG_DEL_NODE_XACT
+                | TAG_DEL_EDGE_XACT
+                | TAG_SET_PROP_XACT
+                | TAG_ADD_INDEX_XACT
+                | TAG_DEL_INDEX_XACT
+        ) {
+            let Some(xact) = read_u64(data, &mut pos) else {
+                break;
+            };
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
+
         match tag {
-            TAG_ADD_NODE => {
+            TAG_ADD_NODE | TAG_ADD_NODE_XACT => {
                 let Some(id) = read_u64(data, &mut pos) else {
                     break;
                 };
@@ -454,19 +592,21 @@ fn replay(data: &[u8]) -> GraphWalState {
                 let Some(props) = decode_props(data, &mut pos) else {
                     break;
                 };
-                if id >= state.next_node_id {
-                    state.next_node_id = id + 1;
-                }
-                state.nodes.insert(
-                    id,
-                    WalNode {
+                if keep_tagged {
+                    if id >= state.next_node_id {
+                        state.next_node_id = id + 1;
+                    }
+                    state.nodes.insert(
                         id,
-                        labels,
-                        properties: props,
-                    },
-                );
+                        WalNode {
+                            id,
+                            labels,
+                            properties: props,
+                        },
+                    );
+                }
             }
-            TAG_ADD_EDGE => {
+            TAG_ADD_EDGE | TAG_ADD_EDGE_XACT => {
                 let Some(id) = read_u64(data, &mut pos) else {
                     break;
                 };
@@ -482,35 +622,41 @@ fn replay(data: &[u8]) -> GraphWalState {
                 let Some(props) = decode_props(data, &mut pos) else {
                     break;
                 };
-                if id >= state.next_edge_id {
-                    state.next_edge_id = id + 1;
-                }
-                state.edges.insert(
-                    id,
-                    WalEdge {
+                if keep_tagged {
+                    if id >= state.next_edge_id {
+                        state.next_edge_id = id + 1;
+                    }
+                    state.edges.insert(
                         id,
-                        from: src,
-                        to: dst,
-                        edge_type: etype,
-                        properties: props,
-                    },
-                );
+                        WalEdge {
+                            id,
+                            from: src,
+                            to: dst,
+                            edge_type: etype,
+                            properties: props,
+                        },
+                    );
+                }
             }
-            TAG_DEL_NODE => {
+            TAG_DEL_NODE | TAG_DEL_NODE_XACT => {
                 let Some(id) = read_u64(data, &mut pos) else {
                     break;
                 };
-                state.nodes.remove(&id);
-                // Cascade: remove edges referencing this node.
-                state.edges.retain(|_, e| e.from != id && e.to != id);
+                if keep_tagged {
+                    state.nodes.remove(&id);
+                    // Cascade: remove edges referencing this node.
+                    state.edges.retain(|_, e| e.from != id && e.to != id);
+                }
             }
-            TAG_DEL_EDGE => {
+            TAG_DEL_EDGE | TAG_DEL_EDGE_XACT => {
                 let Some(id) = read_u64(data, &mut pos) else {
                     break;
                 };
-                state.edges.remove(&id);
+                if keep_tagged {
+                    state.edges.remove(&id);
+                }
             }
-            TAG_SET_PROP => {
+            TAG_SET_PROP | TAG_SET_PROP_XACT => {
                 let Some(&target_byte) = data.get(pos) else {
                     break;
                 };
@@ -524,31 +670,37 @@ fn replay(data: &[u8]) -> GraphWalState {
                 let Some(val) = decode_prop_value(data, &mut pos) else {
                     break;
                 };
-                if target_byte == 0 {
-                    if let Some(node) = state.nodes.get_mut(&id) {
-                        node.properties.insert(key, val);
+                if keep_tagged {
+                    if target_byte == 0 {
+                        if let Some(node) = state.nodes.get_mut(&id) {
+                            node.properties.insert(key, val);
+                        }
+                    } else if let Some(edge) = state.edges.get_mut(&id) {
+                        edge.properties.insert(key, val);
                     }
-                } else if let Some(edge) = state.edges.get_mut(&id) {
-                    edge.properties.insert(key, val);
                 }
             }
-            TAG_ADD_INDEX => {
+            TAG_ADD_INDEX | TAG_ADD_INDEX_XACT => {
                 let Some(label) = decode_string(data, &mut pos) else {
                     break;
                 };
                 let Some(property) = decode_string(data, &mut pos) else {
                     break;
                 };
-                state.node_indexes.insert((label, property));
+                if keep_tagged {
+                    state.node_indexes.insert((label, property));
+                }
             }
-            TAG_DEL_INDEX => {
+            TAG_DEL_INDEX | TAG_DEL_INDEX_XACT => {
                 let Some(label) = decode_string(data, &mut pos) else {
                     break;
                 };
                 let Some(property) = decode_string(data, &mut pos) else {
                     break;
                 };
-                state.node_indexes.remove(&(label, property));
+                if keep_tagged {
+                    state.node_indexes.remove(&(label, property));
+                }
             }
             TAG_SNAPSHOT => {
                 let Some(payload_len) = read_u32(data, &mut pos) else {
@@ -583,6 +735,7 @@ fn replay(data: &[u8]) -> GraphWalState {
         }
     }
 
+    state.max_xact_id = max_xact_id;
     state
 }
 
@@ -647,6 +800,9 @@ fn decode_snapshot(data: &[u8]) -> Option<GraphWalState> {
         next_node_id,
         next_edge_id,
         node_indexes,
+        // A snapshot is written from live state and carries no tags; the
+        // running max over the log's tagged records is folded in by `replay`.
+        max_xact_id: 0,
     })
 }
 
@@ -750,13 +906,186 @@ mod tests {
             .collect()
     }
 
+    // ── S63: the recovery filter ──────────────────────────────────────────
+
+    /// One log exercising every filter decision at once: legacy and
+    /// autocommit records keep, committed ids keep, unknown ids discard —
+    /// and a discarded record in the MIDDLE does not stop the records after
+    /// it (they are parsed past, not abandoned).
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let mut buf = Vec::new();
+        // Legacy untagged ADD_NODE (pre-S63 log): keep unconditionally.
+        buf.push(TAG_ADD_NODE);
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        encode_labels(&["Legacy".into()], &mut buf);
+        encode_props(&Properties::new(), &mut buf);
+        let tagged_node = |buf: &mut Vec<u8>, xact: u64, id: u64, label: &str| {
+            let mut rec = Vec::new();
+            push_tag(&mut rec, Some(xact), TAG_ADD_NODE, TAG_ADD_NODE_XACT);
+            rec.extend_from_slice(&id.to_le_bytes());
+            encode_labels(&[label.to_string()], &mut rec);
+            encode_props(&Properties::new(), &mut rec);
+            buf.extend_from_slice(&rec);
+        };
+        // Tagged autocommit (0): keep.
+        tagged_node(&mut buf, XACT_AUTOCOMMIT, 2, "Auto");
+        tagged_node(&mut buf, 7, 3, "Committed");
+        tagged_node(&mut buf, 8, 4, "NeverCommitted"); // discarded, mid-log
+        tagged_node(&mut buf, 9, 5, "CommittedLate");
+
+        let committed: HashSet<u64> = [7u64, 9u64].into_iter().collect();
+        let state = replay(&buf, &committed);
+        assert_eq!(
+            state.max_xact_id, 9,
+            "discarded records still feed the floor"
+        );
+        let mut labels: Vec<&str> = state.nodes.values().map(|n| n.labels[0].as_str()).collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            vec!["Auto", "Committed", "CommittedLate", "Legacy"],
+            "id 8 never committed; its record must be discarded, not replayed"
+        );
+    }
+
+    /// DEL_NODE, DEL_EDGE, SET_PROP and the index twins filter the same way:
+    /// an uncommitted transaction's delete, property change and index DDL
+    /// must not reach the state that survived it.
+    #[test]
+    fn tagged_deletes_props_and_indexes_filter_on_the_committed_set() {
+        let mut buf = Vec::new();
+        // Autocommit base state: two nodes, one edge, one index def.
+        let node = |buf: &mut Vec<u8>, id: u64| {
+            let mut rec = Vec::new();
+            push_tag(
+                &mut rec,
+                Some(XACT_AUTOCOMMIT),
+                TAG_ADD_NODE,
+                TAG_ADD_NODE_XACT,
+            );
+            rec.extend_from_slice(&id.to_le_bytes());
+            encode_labels(&["N".into()], &mut rec);
+            encode_props(&Properties::new(), &mut rec);
+            buf.extend_from_slice(&rec);
+        };
+        node(&mut buf, 1);
+        node(&mut buf, 2);
+        let mut edge = Vec::new();
+        push_tag(
+            &mut edge,
+            Some(XACT_AUTOCOMMIT),
+            TAG_ADD_EDGE,
+            TAG_ADD_EDGE_XACT,
+        );
+        edge.extend_from_slice(&1u64.to_le_bytes());
+        edge.extend_from_slice(&1u64.to_le_bytes());
+        edge.extend_from_slice(&2u64.to_le_bytes());
+        encode_str("LINK", &mut edge);
+        encode_props(&Properties::new(), &mut edge);
+        buf.extend_from_slice(&edge);
+        let mut idx = Vec::new();
+        push_tag(
+            &mut idx,
+            Some(XACT_AUTOCOMMIT),
+            TAG_ADD_INDEX,
+            TAG_ADD_INDEX_XACT,
+        );
+        encode_str("N", &mut idx);
+        encode_str("k", &mut idx);
+        buf.extend_from_slice(&idx);
+
+        // Abandoned transaction (id 5): deletes node 1, drops the index, and
+        // sets a marker property on node 2. None of it may reach recovery.
+        let mut del = Vec::new();
+        push_tag(&mut del, Some(5), TAG_DEL_NODE, TAG_DEL_NODE_XACT);
+        del.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&del);
+        let mut drop_idx = Vec::new();
+        push_tag(&mut drop_idx, Some(5), TAG_DEL_INDEX, TAG_DEL_INDEX_XACT);
+        encode_str("N", &mut drop_idx);
+        encode_str("k", &mut drop_idx);
+        buf.extend_from_slice(&drop_idx);
+        let mut setp = Vec::new();
+        push_tag(&mut setp, Some(5), TAG_SET_PROP, TAG_SET_PROP_XACT);
+        setp.push(0u8);
+        setp.extend_from_slice(&2u64.to_le_bytes());
+        encode_str("touched", &mut setp);
+        encode_prop_value(&PropValue::Bool(true), &mut setp);
+        buf.extend_from_slice(&setp);
+
+        let state = replay(&buf, &HashSet::new());
+        assert_eq!(
+            state.nodes.len(),
+            2,
+            "the abandoned DEL_NODE must not cascade away a surviving node"
+        );
+        assert_eq!(
+            state.edges.len(),
+            1,
+            "the abandoned DEL_NODE's cascade must not drop the edge either"
+        );
+        assert!(
+            !state.nodes[&2].properties.contains_key("touched"),
+            "the abandoned SET_PROP must be discarded"
+        );
+        assert_eq!(
+            state.node_indexes.len(),
+            1,
+            "the abandoned index drop must be discarded"
+        );
+        assert_eq!(state.max_xact_id, 5);
+    }
+
+    /// A truncation inside a tagged record is a torn tail exactly as for the
+    /// untagged ones: replay keeps the clean prefix and abandons the partial
+    /// record at its boundary.
+    #[test]
+    fn torn_tagged_record_keeps_the_clean_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.wal");
+        {
+            let (wal, _) = GraphWal::open(dir.path()).unwrap();
+            wal.log_add_node(Some(XACT_AUTOCOMMIT), 1, &["A".into()], &Properties::new())
+                .unwrap();
+            wal.log_add_node(Some(3), 2, &["B".into()], &Properties::new())
+                .unwrap();
+        }
+        let full = std::fs::read(&path).unwrap();
+        // Cut somewhere inside the second record.
+        let first_len = {
+            let mut probe = Vec::new();
+            push_tag(
+                &mut probe,
+                Some(XACT_AUTOCOMMIT),
+                TAG_ADD_NODE,
+                TAG_ADD_NODE_XACT,
+            );
+            probe.extend_from_slice(&1u64.to_le_bytes());
+            encode_labels(&["A".into()], &mut probe);
+            encode_props(&Properties::new(), &mut probe);
+            probe.len()
+        };
+        let cut = first_len + 6;
+        let state = replay(&full[..cut], &[3u64].into_iter().collect());
+        assert!(
+            state.nodes.contains_key(&1),
+            "the complete record before the cut must replay"
+        );
+        assert!(
+            !state.nodes.contains_key(&2),
+            "the partial record must be abandoned, not half-applied"
+        );
+    }
+
     #[test]
     fn group_sync_marks_clean() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
         assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
         let props = make_props(&[("name", PropValue::Text("Alice".into()))]);
-        wal.log_add_node(1, &["Person".into()], &props).unwrap();
+        wal.log_add_node(None, 1, &["Person".into()], &props)
+            .unwrap();
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
@@ -774,11 +1103,13 @@ mod tests {
             ("name", PropValue::Text("Alice".into())),
             ("age", PropValue::Int(30)),
         ]);
-        wal.log_add_node(1, &["Person".into()], &props1).unwrap();
+        wal.log_add_node(None, 1, &["Person".into()], &props1)
+            .unwrap();
         let props2 = make_props(&[("name", PropValue::Text("Bob".into()))]);
-        wal.log_add_node(2, &["Person".into()], &props2).unwrap();
+        wal.log_add_node(None, 2, &["Person".into()], &props2)
+            .unwrap();
         let eprops = make_props(&[("since", PropValue::Int(2020))]);
-        wal.log_add_edge(1, 1, 2, "KNOWS", &eprops).unwrap();
+        wal.log_add_edge(None, 1, 1, 2, "KNOWS", &eprops).unwrap();
         drop(wal);
 
         // Reopen and verify.
@@ -803,16 +1134,16 @@ mod tests {
     fn test_delete_node_cascade_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &["A".into()], &Properties::new())
+        wal.log_add_node(None, 1, &["A".into()], &Properties::new())
             .unwrap();
-        wal.log_add_node(2, &["B".into()], &Properties::new())
+        wal.log_add_node(None, 2, &["B".into()], &Properties::new())
             .unwrap();
-        wal.log_add_edge(1, 1, 2, "LINK", &Properties::new())
+        wal.log_add_edge(None, 1, 1, 2, "LINK", &Properties::new())
             .unwrap();
-        wal.log_add_edge(2, 2, 1, "LINK", &Properties::new())
+        wal.log_add_edge(None, 2, 2, 1, "LINK", &Properties::new())
             .unwrap();
         // Delete node 1 — should cascade edges 1 and 2.
-        wal.log_del_node(1).unwrap();
+        wal.log_del_node(None, 1).unwrap();
         drop(wal);
 
         let (_wal2, state) = GraphWal::open(dir.path()).unwrap();
@@ -832,7 +1163,7 @@ mod tests {
             ("b", PropValue::Bool(true)),
             ("n", PropValue::Null),
         ]);
-        wal.log_add_node(1, &[], &p).unwrap();
+        wal.log_add_node(None, 1, &[], &p).unwrap();
         drop(wal);
 
         let (_, st) = GraphWal::open(dir.path()).unwrap();
@@ -851,11 +1182,16 @@ mod tests {
     fn test_label_index_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &["Person".into(), "Employee".into()], &Properties::new())
+        wal.log_add_node(
+            None,
+            1,
+            &["Person".into(), "Employee".into()],
+            &Properties::new(),
+        )
+        .unwrap();
+        wal.log_add_node(None, 2, &["Person".into()], &Properties::new())
             .unwrap();
-        wal.log_add_node(2, &["Person".into()], &Properties::new())
-            .unwrap();
-        wal.log_add_node(3, &["Company".into()], &Properties::new())
+        wal.log_add_node(None, 3, &["Company".into()], &Properties::new())
             .unwrap();
         drop(wal);
 
@@ -878,12 +1214,15 @@ mod tests {
     fn test_adjacency_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &[], &Properties::new()).unwrap();
-        wal.log_add_node(2, &[], &Properties::new()).unwrap();
-        wal.log_add_node(3, &[], &Properties::new()).unwrap();
-        wal.log_add_edge(1, 1, 2, "A", &Properties::new()).unwrap();
-        wal.log_add_edge(2, 1, 3, "B", &Properties::new()).unwrap();
-        wal.log_add_edge(3, 2, 3, "C", &Properties::new()).unwrap();
+        wal.log_add_node(None, 1, &[], &Properties::new()).unwrap();
+        wal.log_add_node(None, 2, &[], &Properties::new()).unwrap();
+        wal.log_add_node(None, 3, &[], &Properties::new()).unwrap();
+        wal.log_add_edge(None, 1, 1, 2, "A", &Properties::new())
+            .unwrap();
+        wal.log_add_edge(None, 2, 1, 3, "B", &Properties::new())
+            .unwrap();
+        wal.log_add_edge(None, 3, 2, 3, "C", &Properties::new())
+            .unwrap();
         drop(wal);
 
         let (_, st) = GraphWal::open(dir.path()).unwrap();
@@ -909,9 +1248,9 @@ mod tests {
         // Write two valid entries then corrupt trailing bytes.
         {
             let (wal, _) = GraphWal::open(dir.path()).unwrap();
-            wal.log_add_node(1, &["X".into()], &Properties::new())
+            wal.log_add_node(None, 1, &["X".into()], &Properties::new())
                 .unwrap();
-            wal.log_add_node(2, &["Y".into()], &Properties::new())
+            wal.log_add_node(None, 2, &["Y".into()], &Properties::new())
                 .unwrap();
             drop(wal);
         }
@@ -950,6 +1289,7 @@ mod tests {
         // Create 150 nodes and 149 chain edges.
         for i in 1..=150u64 {
             wal.log_add_node(
+                None,
                 i,
                 &["N".into()],
                 &make_props(&[("idx", PropValue::Int(i as i64))]),
@@ -957,7 +1297,7 @@ mod tests {
             .unwrap();
         }
         for i in 1..150u64 {
-            wal.log_add_edge(i, i, i + 1, "NEXT", &Properties::new())
+            wal.log_add_edge(None, i, i, i + 1, "NEXT", &Properties::new())
                 .unwrap();
         }
 
@@ -1014,7 +1354,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (wal, _) = GraphWal::open(dir.path()).unwrap();
-            wal.log_add_node(1, &["N".into()], &Properties::new())
+            wal.log_add_node(None, 1, &["N".into()], &Properties::new())
                 .unwrap();
             let nodes = [(1u64, vec!["N".to_string()], Properties::new())];
             let node_refs: Vec<_> = nodes.iter().map(|(id, l, p)| (id, l, p)).collect();
@@ -1028,7 +1368,7 @@ mod tests {
                 node_indexes: vec![],
             })
             .expect_err("the injected reopen failure must fail the checkpoint");
-            wal.log_add_node(2, &["N".into()], &Properties::new())
+            wal.log_add_node(None, 2, &["N".into()], &Properties::new())
                 .expect("a later append must reattach, not strand");
         }
         let (_, st) = GraphWal::open(dir.path()).unwrap();
@@ -1045,10 +1385,11 @@ mod tests {
     fn test_property_updates_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &[], &make_props(&[("x", PropValue::Int(1))]))
+        wal.log_add_node(None, 1, &[], &make_props(&[("x", PropValue::Int(1))]))
             .unwrap();
-        wal.log_set_prop(0, 1, "x", &PropValue::Int(99)).unwrap();
-        wal.log_set_prop(0, 1, "new_key", &PropValue::Text("hello".into()))
+        wal.log_set_prop(None, 0, 1, "x", &PropValue::Int(99))
+            .unwrap();
+        wal.log_set_prop(None, 0, 1, "new_key", &PropValue::Text("hello".into()))
             .unwrap();
         drop(wal);
 
@@ -1065,11 +1406,13 @@ mod tests {
     fn test_delete_edge_only() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &[], &Properties::new()).unwrap();
-        wal.log_add_node(2, &[], &Properties::new()).unwrap();
-        wal.log_add_edge(1, 1, 2, "X", &Properties::new()).unwrap();
-        wal.log_add_edge(2, 2, 1, "Y", &Properties::new()).unwrap();
-        wal.log_del_edge(1).unwrap();
+        wal.log_add_node(None, 1, &[], &Properties::new()).unwrap();
+        wal.log_add_node(None, 2, &[], &Properties::new()).unwrap();
+        wal.log_add_edge(None, 1, 1, 2, "X", &Properties::new())
+            .unwrap();
+        wal.log_add_edge(None, 2, 2, 1, "Y", &Properties::new())
+            .unwrap();
+        wal.log_del_edge(None, 1).unwrap();
         drop(wal);
 
         let (_, st) = GraphWal::open(dir.path()).unwrap();
@@ -1083,9 +1426,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
 
-        wal.log_add_node(1, &["A".into()], &Properties::new())
+        wal.log_add_node(None, 1, &["A".into()], &Properties::new())
             .unwrap();
-        wal.log_add_node(2, &["B".into()], &Properties::new())
+        wal.log_add_node(None, 2, &["B".into()], &Properties::new())
             .unwrap();
 
         // Checkpoint with 2 nodes.
@@ -1104,9 +1447,9 @@ mod tests {
         .unwrap();
 
         // Add more after checkpoint.
-        wal.log_add_node(3, &["C".into()], &Properties::new())
+        wal.log_add_node(None, 3, &["C".into()], &Properties::new())
             .unwrap();
-        wal.log_add_edge(1, 1, 3, "LINK", &Properties::new())
+        wal.log_add_edge(None, 1, 1, 3, "LINK", &Properties::new())
             .unwrap();
         drop(wal);
 

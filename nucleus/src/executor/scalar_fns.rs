@@ -3017,8 +3017,9 @@ impl Executor {
                     .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
                 let result = {
                     let mut gs = self.graph_store.write();
-                    self.cross_model_before_graph(&gs);
+                    let xact = self.cross_model_before_graph(&gs);
                     gs.clear_touched();
+                    gs.set_xact_tag(xact);
                     let outcome = execute_cypher(&mut gs, &parsed).map_err(|e| {
                         ExecError::Unsupported(format!("Cypher execution error: {e:?}"))
                     });
@@ -5354,8 +5355,9 @@ impl Executor {
                 })?;
                 let result = {
                     let mut gs = self.graph_store.write();
-                    self.cross_model_before_graph(&gs);
+                    let xact = self.cross_model_before_graph(&gs);
                     gs.clear_touched();
+                    gs.set_xact_tag(xact);
                     let outcome = execute_cypher(&mut gs, &stmt).map_err(|e| {
                         ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}"))
                     });
@@ -5414,8 +5416,9 @@ impl Executor {
                 };
                 let id = {
                     let mut gs = self.graph_store.write();
-                    self.cross_model_before_graph(&gs);
+                    let xact = self.cross_model_before_graph(&gs);
                     gs.clear_touched();
+                    gs.set_xact_tag(xact);
                     let id = gs.create_node(vec![label], props);
                     let touched = gs.take_touched();
                     drop(gs);
@@ -5453,8 +5456,9 @@ impl Executor {
                 };
                 let created = {
                     let mut gs = self.graph_store.write();
-                    self.cross_model_before_graph(&gs);
+                    let xact = self.cross_model_before_graph(&gs);
                     gs.clear_touched();
+                    gs.set_xact_tag(xact);
                     let created = gs.create_edge(from, to, edge_type, props);
                     let touched = gs.take_touched();
                     drop(gs);
@@ -5476,8 +5480,9 @@ impl Executor {
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_NODE")?;
                 let mut gs = self.graph_store.write();
-                self.cross_model_before_graph(&gs);
+                let xact = self.cross_model_before_graph(&gs);
                 gs.clear_touched();
+                gs.set_xact_tag(xact);
                 let removed = gs.delete_node(id);
                 let touched = gs.take_touched();
                 drop(gs);
@@ -5494,8 +5499,9 @@ impl Executor {
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_EDGE")?;
                 let mut gs = self.graph_store.write();
-                self.cross_model_before_graph(&gs);
+                let xact = self.cross_model_before_graph(&gs);
                 gs.clear_touched();
+                gs.set_xact_tag(xact);
                 let removed = gs.delete_edge(id);
                 let touched = gs.take_touched();
                 drop(gs);

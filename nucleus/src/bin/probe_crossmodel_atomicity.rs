@@ -1,15 +1,16 @@
 //! Crash proof for cross-model atomicity (S63): SQL + Streams (slice 1),
-//! SQL + the KV strings WAL (slice 2), and SQL + the document WAL (slice 3).
+//! SQL + the KV strings WAL (slice 2), SQL + the document WAL (slice 3), and
+//! SQL + the property-graph WAL (slice 4).
 //!
 //! The claim under test is the discard half of Option D: a transaction that
 //! spans the SQL engine and a specialty model is atomic across a crash in the
 //! window between its specialty records and its SQL COMMIT record. The child
-//! runs `BEGIN; INSERT (SQL); STREAM_XADD / KV_SET / DOC_INSERT; COMMIT` and
-//! dies at `crossmodel.before_commit_record` — after the specialty record was
-//! flushed to the WAL, before the COMMIT record (with the coordinating id in
-//! its body) exists. Recovery must discard BOTH halves: the specialty write
-//! because no commit record vouches for its id, the INSERT because it is a
-//! loser.
+//! runs `BEGIN; INSERT (SQL); STREAM_XADD / KV_SET / DOC_INSERT /
+//! GRAPH_ADD_NODE; COMMIT` and dies at `crossmodel.before_commit_record` —
+//! after the specialty record was flushed to the WAL, before the COMMIT
+//! record (with the coordinating id in its body) exists. Recovery must
+//! discard BOTH halves: the specialty write because no commit record vouches
+//! for its id, the INSERT because it is a loser.
 //!
 //! The converse is asserted in the same run: a transaction that completes its
 //! COMMIT, plus an autocommit specialty write beside it, must survive the
@@ -80,7 +81,8 @@ fn scalar_i64(res: &[ExecResult], sql: &str) -> Result<i64, String> {
 /// - "commit" lets the streams transaction finish, then adds an autocommit
 ///   XADD;
 /// - "kv_crash"/"kv_commit" are the KV_SET twins of the same two shapes;
-/// - "doc_crash"/"doc_commit" are the DOC_INSERT twins.
+/// - "doc_crash"/"doc_commit" are the DOC_INSERT twins;
+/// - "graph_crash"/"graph_commit" are the GRAPH_ADD_NODE twins.
 fn child_main(dir: &str, mode: &str) -> ! {
     std::panic::set_hook(Box::new(|_| {}));
     let rt = tokio::runtime::Runtime::new().expect("child rt");
@@ -112,6 +114,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            "graph_crash" | "graph_commit" => {
+                step("SELECT GRAPH_ADD_NODE('Txn')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             _ => {
                 step("SELECT STREAM_XADD('s', 'kind', 'txn')")
                     .await
@@ -134,6 +141,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
             }
             "doc_commit" => {
                 step("SELECT DOC_INSERT('{\"kind\": \"auto\"}')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "graph_commit" => {
+                step("SELECT GRAPH_ADD_NODE('Auto')")
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -269,6 +281,50 @@ async fn execute(ex: &Executor, sql: &str) -> Result<Vec<ExecResult>, String> {
     ex.execute(sql).await.map_err(|e| e.to_string())
 }
 
+/// The graph twin of `recover_and_check`: `expect` maps labels to the node
+/// count that must have recovered; labels mapped through `absent` are
+/// asserted at zero.
+fn recover_and_check_graph(
+    dir: &Path,
+    expect_rows: i64,
+    expect: &[(&str, i64)],
+) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let ex = build_executor(dir)?;
+    let rows = rt.block_on(execute(&ex, "SELECT COUNT(*) FROM t"))?;
+    let rows = scalar_i64(&rows, "COUNT(*)")?;
+    if rows != expect_rows {
+        return Err(format!(
+            "SQL rows: expected {expect_rows}, recovered {rows}"
+        ));
+    }
+    for (label, want) in expect {
+        let res = rt.block_on(execute(
+            &ex,
+            &format!("SELECT GRAPH_QUERY('MATCH (n:{label}) RETURN COUNT(*)')"),
+        ))?;
+        let json = match res.first() {
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Text(v)) => v.clone(),
+                other => return Err(format!("GRAPH_QUERY({label}) returned {other:?}")),
+            },
+            other => return Err(format!("GRAPH_QUERY({label}) returned {other:?}")),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| format!("GRAPH_QUERY({label}) unparseable {json:?}: {e}"))?;
+        let got = v["rows"][0][0]
+            .as_i64()
+            .or_else(|| v["rows"][0][0].as_str().and_then(|s| s.parse().ok()))
+            .ok_or_else(|| format!("no count in {json:?}"))?;
+        if got != *want {
+            return Err(format!(
+                "GRAPH_QUERY({label}): expected {want} nodes, recovered {got}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     if raw.len() >= 4 && raw[1] == "--child" {
@@ -279,7 +335,7 @@ fn main() {
     let root: PathBuf =
         std::env::temp_dir().join(format!("nucleus-xmodel-s63-{}", std::process::id()));
 
-    println!("== cross-model atomicity crash proof (S63 slices 1+2+3) ==");
+    println!("== cross-model atomicity crash proof (S63 slices 1+2+3+4) ==");
     println!("point: {POINT}\n");
 
     let mut findings: Vec<String> = Vec::new();
@@ -337,6 +393,20 @@ fn main() {
             check: Box::new(|dir| recover_and_check_doc(dir, 1, &[(1, "txn"), (2, "auto")])),
             pass_msg: "commit direction: committed txn (row + tagged DOC_INSERT) and \
                  autocommit DOC_INSERT all survive reopen",
+        },
+        Scenario {
+            mode: "graph_crash",
+            label: "graph",
+            check: Box::new(|dir| recover_and_check_graph(dir, 0, &[("Txn", 0), ("Auto", 0)])),
+            pass_msg: "crash before the commit record -> SQL row gone AND graph.wal's \
+                 tagged record discarded (atomic discard)",
+        },
+        Scenario {
+            mode: "graph_commit",
+            label: "graph",
+            check: Box::new(|dir| recover_and_check_graph(dir, 1, &[("Txn", 1), ("Auto", 1)])),
+            pass_msg: "commit direction: committed txn (row + tagged GRAPH_ADD_NODE) and \
+                 autocommit GRAPH_ADD_NODE all survive reopen",
         },
     ];
 

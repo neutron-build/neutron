@@ -17,6 +17,8 @@ pub mod wal;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
+
 // ============================================================================
 // Graph types
 // ============================================================================
@@ -140,6 +142,13 @@ pub struct GraphStore {
     /// clears this before a mutating call and drains it afterwards, under the
     /// same write guard, so the record is attributed to exactly one session.
     txn_touched: GraphTouched,
+    /// The coordinating transaction id every WAL record from the next
+    /// mutation batch is tagged with (S63). `XACT_AUTOCOMMIT` outside an
+    /// explicit transaction; the executor sets the open transaction's id
+    /// after `clear_touched`, and `take_touched` resets it — the same pair
+    /// that brackets `txn_touched`, so the tag can never outlive the batch
+    /// it was set for.
+    xact_tag: u64,
     /// Node property indexes, keyed by `(label, property)`.
     ///
     /// Explicitly created (`CREATE INDEX ON :Label(prop)`), never automatic:
@@ -172,6 +181,7 @@ impl GraphStore {
             hot_node_ids: HashSet::new(),
             max_hot_nodes: usize::MAX,
             txn_touched: GraphTouched::default(),
+            xact_tag: XACT_AUTOCOMMIT,
             node_prop_indexes: BTreeMap::new(),
         }
     }
@@ -185,8 +195,21 @@ impl GraphStore {
         self.txn_touched.edges.clear();
     }
 
+    /// Tag every WAL record from the mutation batch that follows with `xact`
+    /// (S63): inside an explicit transaction that is the transaction's
+    /// coordinating id, so replay discards the records when its transaction
+    /// never commits. Must be paired with [`Self::take_touched`], which
+    /// resets the tag back to `XACT_AUTOCOMMIT`.
+    pub fn set_xact_tag(&mut self, xact: u64) {
+        self.xact_tag = xact;
+    }
+
     /// Take the entities mutated since the last [`Self::clear_touched`].
+    /// Also resets the S63 tag to `XACT_AUTOCOMMIT`: the bracketing pair
+    /// (`clear_touched` → `take_touched`) delimits the batch the tag was set
+    /// for, so no later write can inherit a finished transaction's id.
     pub fn take_touched(&mut self) -> GraphTouched {
+        self.xact_tag = XACT_AUTOCOMMIT;
         std::mem::take(&mut self.txn_touched)
     }
 
@@ -195,8 +218,25 @@ impl GraphStore {
     /// On first call this creates the WAL file. On subsequent calls the WAL
     /// is replayed to restore the full graph state (nodes, edges, adjacency
     /// lists, label index, ID counters).
+    ///
+    /// Replays with an EMPTY committed set, so every tagged record keeps —
+    /// the pre-S63 contract. The executor opens through
+    /// [`GraphStore::open_with_committed`] instead, passing the coordinating
+    /// transaction ids the SQL side durably committed so the S63 replay
+    /// filter can discard the rest.
     pub fn open(dir: &std::path::Path) -> std::io::Result<Self> {
-        let (graph_wal, state) = wal::GraphWal::open(dir)?;
+        Self::open_with_committed(dir, &HashSet::new())
+    }
+
+    /// Open a durable graph store whose `graph.wal` replay is filtered by
+    /// the S63 committed set: a tagged record whose coordinating transaction
+    /// id is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside
+    /// a transaction that never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &std::path::Path,
+        committed: &HashSet<u64>,
+    ) -> std::io::Result<Self> {
+        let (graph_wal, state) = wal::GraphWal::open_with_committed(dir, committed)?;
 
         // Open cold LsmTree tier for property overflow
         let cold_dir = dir.join("graph_cold");
@@ -413,7 +453,7 @@ impl GraphStore {
             return false;
         }
         if let Some(ref w) = self.wal {
-            let _ = w.log_add_node_index(label, property);
+            let _ = w.log_add_node_index(Some(self.xact_tag), label, property);
         }
         self.node_prop_indexes
             .insert(key, PropertyIndex::new(label, property));
@@ -449,7 +489,7 @@ impl GraphStore {
             return false;
         }
         if let Some(ref w) = self.wal {
-            let _ = w.log_drop_node_index(label, property);
+            let _ = w.log_drop_node_index(Some(self.xact_tag), label, property);
         }
         true
     }
@@ -503,7 +543,7 @@ impl GraphStore {
 
         // WAL: log before mutation.
         if let Some(ref w) = self.wal {
-            let _ = w.log_add_node(id, &labels, &properties);
+            let _ = w.log_add_node(Some(self.xact_tag), id, &labels, &properties);
         }
 
         for label in &labels {
@@ -572,7 +612,7 @@ impl GraphStore {
     pub fn delete_node(&mut self, id: NodeId) -> bool {
         // WAL: log before mutation.
         if let Some(ref w) = self.wal {
-            let _ = w.log_del_node(id);
+            let _ = w.log_del_node(Some(self.xact_tag), id);
         }
 
         let node = match self.nodes.remove(&id) {
@@ -684,7 +724,7 @@ impl GraphStore {
 
         // WAL: log before mutation.
         if let Some(ref w) = self.wal {
-            let _ = w.log_add_edge(id, from, to, &edge_type, &properties);
+            let _ = w.log_add_edge(Some(self.xact_tag), id, from, to, &edge_type, &properties);
         }
 
         self.type_index
@@ -741,7 +781,7 @@ impl GraphStore {
     pub fn delete_edge(&mut self, id: EdgeId) -> bool {
         // WAL: log before mutation.
         if let Some(ref w) = self.wal {
-            let _ = w.log_del_edge(id);
+            let _ = w.log_del_edge(Some(self.xact_tag), id);
         }
 
         let edge = match self.edges.remove(&id) {
@@ -789,7 +829,7 @@ impl GraphStore {
     /// Set (or overwrite) a property on a node.
     pub fn set_node_property(&mut self, id: NodeId, key: String, value: PropValue) -> bool {
         if let Some(ref w) = self.wal {
-            let _ = w.log_set_prop(0, id, &key, &value);
+            let _ = w.log_set_prop(Some(self.xact_tag), 0, id, &key, &value);
         }
         let Some(node) = self.nodes.get(&id) else {
             return false;
@@ -816,7 +856,7 @@ impl GraphStore {
     /// Set (or overwrite) a property on an edge.
     pub fn set_edge_property(&mut self, id: EdgeId, key: String, value: PropValue) -> bool {
         if let Some(ref w) = self.wal {
-            let _ = w.log_set_prop(1, id, &key, &value);
+            let _ = w.log_set_prop(Some(self.xact_tag), 1, id, &key, &value);
         }
         if let Some(edge) = self.edges.get_mut(&id) {
             edge.properties.insert(key, value);
@@ -874,6 +914,14 @@ impl GraphStore {
         }
     }
 
+    /// The highest coordinating transaction id this store's `graph.wal`
+    /// recovered (S63) — 0 with no WAL. Seeds the executor's XactId counter
+    /// so a reopened process never mints an id a surviving tagged record
+    /// already carries.
+    pub fn wal_max_xact_id(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |wal| wal.max_xact_id())
+    }
+
     /// Capture full graph state for transaction rollback.
     pub fn txn_snapshot(&self) -> GraphTxnSnapshot {
         GraphTxnSnapshot {
@@ -897,9 +945,17 @@ impl GraphStore {
     /// compensating record, so a crash after ROLLBACK does not resurrect the
     /// rolled-back writes on replay.
     ///
+    /// The compensating records are tagged `XACT_AUTOCOMMIT` (D4): the
+    /// transaction being rolled back never committed, so its own id would
+    /// have the filter DISCARD the restore — the exact opposite of what
+    /// compensation exists to achieve. Autocommit records keep by their own
+    /// fsync, which is the right durability point for state the server has
+    /// already reverted in memory.
+    ///
     /// The id counters are deliberately left where they are (never rewound):
     /// rewinding them would hand out ids another session may already be using.
     pub fn txn_restore_scoped(&mut self, snap: &GraphTxnSnapshot, touched: &GraphTouched) {
+        self.xact_tag = XACT_AUTOCOMMIT;
         // Detach every touched edge from the live graph first so node
         // restoration sees clean adjacency.
         for eid in &touched.edges {
@@ -914,14 +970,14 @@ impl GraphStore {
             if let Some(node) = snap.nodes.get(nid) {
                 self.reattach_node(node.clone());
             } else if let Some(ref w) = self.wal {
-                let _ = w.log_del_node(*nid);
+                let _ = w.log_del_node(Some(XACT_AUTOCOMMIT), *nid);
             }
         }
         for eid in &touched.edges {
             if let Some(edge) = snap.edges.get(eid) {
                 self.reattach_edge(edge.clone());
             } else if let Some(ref w) = self.wal {
-                let _ = w.log_del_edge(*eid);
+                let _ = w.log_del_edge(Some(XACT_AUTOCOMMIT), *eid);
             }
         }
         // The restore itself is not a client mutation.
@@ -972,7 +1028,12 @@ impl GraphStore {
     /// compensating WAL record.
     fn reattach_node(&mut self, node: Node) {
         if let Some(ref w) = self.wal {
-            let _ = w.log_add_node(node.id, &node.labels, &node.properties);
+            let _ = w.log_add_node(
+                Some(XACT_AUTOCOMMIT),
+                node.id,
+                &node.labels,
+                &node.properties,
+            );
         }
         for label in &node.labels {
             self.label_index
@@ -993,6 +1054,7 @@ impl GraphStore {
     fn reattach_edge(&mut self, edge: Edge) {
         if let Some(ref w) = self.wal {
             let _ = w.log_add_edge(
+                Some(XACT_AUTOCOMMIT),
                 edge.id,
                 edge.from,
                 edge.to,
