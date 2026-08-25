@@ -531,7 +531,17 @@ pub fn apply_replacing_dedup(table: &str, batches: Vec<ColumnBatch>) -> Vec<Colu
         Some(b) => b,
         None => return batches,
     };
-    let sorted = sort_batch_by_keys(&combined, &pk_names);
+    // A key that resolves to no column cannot group rows; collapsing on it
+    // would merge unrelated rows. Hand the physical batches back untouched
+    // instead — over-reporting is recoverable, silently deleting rows is not.
+    let Some(sorted) = sort_batch_by_keys(&combined, &pk_names) else {
+        tracing::error!(
+            table = %table,
+            "replacing dedup skipped: ORDER BY key does not resolve against the \
+             stored batch; SELECT will see superseded versions"
+        );
+        return batches;
+    };
     let deduped = merge_replacing(&sorted, &pk_names, version_name.as_deref());
     vec![deduped]
 }
@@ -615,19 +625,30 @@ fn concat_dedup_batches(batches: &[ColumnBatch]) -> Option<ColumnBatch> {
 }
 
 /// Sort a batch's rows by the supplied key column names.
-fn sort_batch_by_keys(batch: &ColumnBatch, keys: &[String]) -> ColumnBatch {
+///
+/// `None` when any key does not name a column in the batch. That case used to
+/// be a `debug_assert!`, which is compiled OUT of a release build: in release
+/// the missing column made `compare_column_values` fall through to `Equal`,
+/// every row compared equal on that key, and the caller then collapsed rows
+/// that were never duplicates — for a single-key table, the whole table to one
+/// row. A dedup that cannot resolve its own key must not run at all, so the
+/// failure is returned rather than asserted, and the caller keeps the input
+/// unchanged.
+fn sort_batch_by_keys(batch: &ColumnBatch, keys: &[String]) -> Option<ColumnBatch> {
     let row_count = batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
     if row_count <= 1 || keys.is_empty() {
-        return batch.clone();
+        return Some(batch.clone());
     }
-    // Keys are stringified column indices ("0","1",…) per the columnar naming
-    // convention, so every key must resolve to a real column. A missing column
-    // would make compare_column_values fall through to Equal and silently
-    // mis-sort — surface that as a bug in debug rather than degrade silently.
-    debug_assert!(
-        keys.iter().all(|k| batch.column(k).is_some()),
-        "sort key column not found in batch (keys={keys:?})"
-    );
+    if let Some(missing) = keys.iter().find(|k| batch.column(k).is_none()) {
+        tracing::error!(
+            missing_key = %missing,
+            keys = ?keys,
+            columns = ?batch.columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "replacing dedup: sort key names no column in the batch; skipping dedup \
+             rather than mis-grouping rows"
+        );
+        return None;
+    }
     let mut indices: Vec<usize> = (0..row_count).collect();
     indices.sort_by(|&a, &b| {
         for k in keys {
@@ -644,7 +665,7 @@ fn sort_batch_by_keys(batch: &ColumnBatch, keys: &[String]) -> ColumnBatch {
         .iter()
         .map(|(name, col)| (name.clone(), reorder_column(col, &indices)))
         .collect();
-    ColumnBatch::new(new_columns)
+    Some(ColumnBatch::new(new_columns))
 }
 
 // ============================================================================
@@ -974,6 +995,21 @@ impl ColumnarStore {
         mt.set_table_name(table);
         if let Some(ref tx) = self.merge_task_tx {
             mt.set_background_merger(tx.clone());
+        }
+        // Adopt any rows already sitting in the plain-table slot.
+        //
+        // `batches_all` prefers the MergeTree once one exists, so registering a
+        // MergeTree over a table that already holds plain batches would make
+        // those rows unreadable. That is exactly what happens on restart:
+        // `ColumnarStorageEngine::open` replays the WAL into plain batches
+        // (it has no way to know the table's engine), and the engine
+        // registration follows afterwards. Move them in instead.
+        if let Some(existing) = self.tables.get_mut(table)
+            && !existing.is_empty()
+        {
+            for batch in std::mem::take(existing) {
+                mt.insert(batch);
+            }
         }
         self.merge_trees.insert(table.to_string(), mt);
     }
@@ -3966,6 +4002,34 @@ fn merge_replacing(
 ) -> ColumnBatch {
     let row_count = batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
     if row_count <= 1 || primary_key.is_empty() {
+        return batch.clone();
+    }
+    // Every key must name a real column. `compare_column_values` answers Equal
+    // for a column it cannot find, so an unresolvable key silently declares all
+    // rows duplicates of each other.
+    if let Some(missing) = primary_key.iter().find(|k| batch.column(k).is_none()) {
+        tracing::error!(
+            missing_key = %missing,
+            columns = ?batch.columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "replacing merge: ORDER BY key names no column in the part; leaving \
+             rows un-collapsed rather than merging unrelated ones"
+        );
+        return batch.clone();
+    }
+    // The version column decides WHICH row survives. `version_value_at` answers
+    // 0 for a column it cannot find, which silently degrades newest-wins to
+    // "whichever row this merge happened to leave last" — and `merge_parts`
+    // folds parts smallest-first, so that order is arbitrary. Collapsing on a
+    // version it cannot read destroys the current row, so it must not.
+    if let Some(vcol) = version_column
+        && batch.column(vcol).is_none()
+    {
+        tracing::error!(
+            version_column = %vcol,
+            columns = ?batch.columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "replacing merge: version column names no column in the part; leaving \
+             rows un-collapsed rather than keeping an arbitrary version"
+        );
         return batch.clone();
     }
 
@@ -7567,5 +7631,149 @@ mod tests {
         if let Some(ColumnData::Int64(vers)) = batches[0].column("ver") {
             assert_eq!(vers, &[Some(2), Some(1)]);
         }
+    }
+
+    // ================================================================
+    // Guards against the two ways replacing dedup used to go silently
+    // wrong. Both hinge on the fact that executor-built batches name
+    // their columns BY POSITION ("0", "1", …) while the merge strategy
+    // carried column NAMES — so the lookups missed, and both
+    // `compare_column_values` and `version_value_at` answer a miss with a
+    // value ("Equal", "0") rather than a failure.
+    // ================================================================
+
+    /// A part whose columns are named positionally, as everything the
+    /// executor writes is.
+    fn positional_part(ids: &[i64], versions: &[i64], values: &[i64]) -> ColumnBatch {
+        ColumnBatch::new(vec![
+            (
+                "0".into(),
+                ColumnData::Int64(ids.iter().map(|v| Some(*v)).collect()),
+            ),
+            (
+                "1".into(),
+                ColumnData::Int64(versions.iter().map(|v| Some(*v)).collect()),
+            ),
+            (
+                "2".into(),
+                ColumnData::Int64(values.iter().map(|v| Some(*v)).collect()),
+            ),
+        ])
+    }
+
+    fn int_col(batch: &ColumnBatch, name: &str) -> Vec<i64> {
+        match batch.column(name) {
+            Some(ColumnData::Int64(v)) => v.iter().map(|x| x.unwrap_or(0)).collect(),
+            other => panic!("expected Int64 column {name}, got {other:?}"),
+        }
+    }
+
+    /// The physical merge must keep the HIGHEST version, not whichever row
+    /// the fold happened to leave last.
+    ///
+    /// `merge_parts` folds parts smallest-first, so "last" is a function of
+    /// part sizes, not of version or of write order. With the version column
+    /// unresolvable this test kept the value from v1 — the live report of
+    /// `1@v500, 8@v1000, 8@v2000` collapsing to `1`.
+    #[test]
+    fn replacing_merge_keeps_highest_version_with_positional_columns() {
+        let strategy = MergeStrategy::Replacing {
+            version_column: Some("1".into()),
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["0".into()], strategy);
+        mt.max_parts = 100;
+        // Three parts of DIFFERENT sizes, deliberately not in version order.
+        mt.insert(positional_part(&[1, 1], &[2000, 1000], &[20, 10]));
+        mt.insert(positional_part(&[1], &[500], &[5]));
+        mt.optimize();
+
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].row_count, 1, "one row per key");
+        assert_eq!(int_col(&batches[0], "1"), vec![2000], "highest version wins");
+        assert_eq!(int_col(&batches[0], "2"), vec![20], "and its value");
+    }
+
+    /// A version column that names no column in the part must leave the rows
+    /// alone. Collapsing on a version it cannot read keeps an arbitrary row
+    /// and destroys the current one — irrecoverable, unlike a duplicate.
+    #[test]
+    fn replacing_merge_refuses_to_collapse_on_an_unresolvable_version_column() {
+        let strategy = MergeStrategy::Replacing {
+            // The pre-fix spelling: a NAME, against positional batches.
+            version_column: Some("version".into()),
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["0".into()], strategy);
+        mt.max_parts = 100;
+        mt.insert(positional_part(&[1, 1], &[2000, 1000], &[20, 10]));
+        mt.insert(positional_part(&[1], &[500], &[5]));
+        mt.optimize();
+
+        let rows: usize = mt.scan_all().iter().map(|b| b.row_count).sum();
+        assert_eq!(
+            rows, 3,
+            "no version column means no safe winner: keep every row and let \
+             read-time dedup answer"
+        );
+    }
+
+    /// `sort_batch_by_keys` used to guard this with `debug_assert!`, which a
+    /// release build compiles out — and in release the missing column made
+    /// every row compare Equal on that key, so a single-key table collapsed
+    /// to ONE row. It must decline instead. This test runs the same in debug
+    /// and release, which is the whole point.
+    #[test]
+    fn dedup_declines_when_the_sort_key_names_no_column() {
+        let batch = positional_part(&[1, 2, 3], &[1, 1, 1], &[10, 20, 30]);
+        assert!(
+            sort_batch_by_keys(&batch, &["7".into()]).is_none(),
+            "an unresolvable sort key must be reported, not treated as a \
+             column in which every row is equal"
+        );
+        // And the real key still sorts.
+        let sorted = sort_batch_by_keys(&batch, &["0".into()]).expect("resolvable key");
+        assert_eq!(sorted.row_count, 3);
+    }
+
+    /// The same guard one level up: `apply_replacing_dedup` hands the physical
+    /// batches back rather than collapsing three distinct keys into one.
+    #[test]
+    fn apply_replacing_dedup_declines_when_the_key_does_not_resolve() {
+        register_replacing_table("dedup_guard_tbl", vec![9], Some(1));
+        let batches = vec![positional_part(&[1, 2, 3], &[1, 1, 1], &[10, 20, 30])];
+        let out = apply_replacing_dedup("dedup_guard_tbl", batches);
+        let rows: usize = out.iter().map(|b| b.row_count).sum();
+        unregister_replacing_table("dedup_guard_tbl");
+        assert_eq!(rows, 3, "three distinct keys must survive");
+    }
+
+    /// Registering a MergeTree over a table that already holds plain batches
+    /// must adopt those rows, not orphan them.
+    ///
+    /// `batches_all` prefers the MergeTree once one exists, and
+    /// `ColumnarStorageEngine::open` replays a WAL into plain batches before
+    /// anything knows the table's engine — so restoring the engine
+    /// registration at boot made every recovered row unreadable.
+    #[test]
+    fn registering_a_merge_tree_adopts_rows_already_in_the_plain_table() {
+        let mut store = ColumnarStore::new();
+        store.create_table("adopt_tbl");
+        store.append("adopt_tbl", positional_part(&[1, 2], &[1, 1], &[10, 20]));
+        assert_eq!(store.row_count("adopt_tbl"), 2);
+
+        store.create_merge_tree_table_with_strategy(
+            "adopt_tbl",
+            vec!["0".into()],
+            MergeStrategy::Replacing {
+                version_column: Some("1".into()),
+            },
+        );
+
+        assert!(store.is_merge_tree("adopt_tbl"));
+        assert_eq!(
+            store.row_count("adopt_tbl"),
+            2,
+            "the rows written before the engine was registered must still be there"
+        );
     }
 }

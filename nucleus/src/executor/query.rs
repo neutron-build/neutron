@@ -1027,6 +1027,24 @@ impl Executor {
         }
     }
 
+    /// Whether the EXECUTOR has to collapse `replacing_mergetree` versions for
+    /// `table` itself, because the engine serving it does not.
+    ///
+    /// Only the columnar engine collapses them. That was invisible for as long
+    /// as a replacing table was always served by one — but a table created
+    /// before per-table engine routing existed has its rows in the default
+    /// engine, and boot reconciliation deliberately leaves them there rather
+    /// than pointing reads at an empty columnar engine (see
+    /// `restore_table_engines`). The default engine's `scan()` now collapses
+    /// too; what this flag additionally rules out is every read shape that
+    /// cannot be collapsed correctly afterwards — a pushed-down LIMIT, a
+    /// projection that drops the key or version column, and the index access
+    /// paths, which address physical rows.
+    pub(super) fn needs_executor_replacing_dedup(&self, table: &str) -> bool {
+        crate::columnar::replacing_config(table).is_some()
+            && !self.storage_for(table).dedups_replacing()
+    }
+
     /// Plan a single table scan with optional WHERE predicate.
     pub(super) async fn plan_table_scan(
         &self,
@@ -1043,6 +1061,29 @@ impl Executor {
         };
 
         let table_def = self.get_table(&table_name).await?;
+
+        // A `replacing_mergetree` table whose serving engine does not collapse
+        // superseded versions must be read sequentially. Every index access path
+        // below addresses PHYSICAL rows, and a superseded version can satisfy a
+        // predicate its successor does not — deduping just the index hits would
+        // then hand back the stale row as its group's winner. The sequential
+        // path collapses the whole table before anything looks at it.
+        if self.needs_executor_replacing_dedup(&table_name) {
+            let query_planner = planner::QueryPlanner::new(
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.stats_store),
+            );
+            let costed = query_planner.plan_scan_unified(&table_name, &[]).await;
+            return Ok(planner::PlanNode::SeqScan {
+                table: table_name,
+                estimated_rows: costed.estimated_rows(),
+                estimated_cost: costed.total_cost(),
+                filter: where_clause.as_ref().map(|e| e.to_string()),
+                filter_expr: where_clause.clone(),
+                scan_limit: None,
+                projection: None,
+            });
+        }
 
         // JSONB containment has a dedicated GIN access path. Keep the full
         // predicate in the plan so execution can recheck candidates (GIN may
@@ -3122,6 +3163,13 @@ impl Executor {
                         })
                         .collect();
                     let storage = self.storage_for(table);
+                    // A replacing table this engine does not collapse has to be
+                    // read whole and collapsed before anything else touches the
+                    // rows: an index probe and a fused equality scan return
+                    // physical rows, a projection can drop the key or version
+                    // column the collapse needs, and a pushed-down LIMIT
+                    // truncates the table before the duplicates are removed.
+                    let collapse_replacing = self.needs_executor_replacing_dedup(table);
 
                     // Use pre-parsed expr if available, otherwise fall back to parsing
                     let resolved_expr = filter_expr.as_ref().cloned().or_else(|| {
@@ -3138,7 +3186,8 @@ impl Executor {
                     // `findMany`/`WHERE id = ANY($1)` compiles to) as the one
                     // everyday query guaranteed never to use its index. Probe
                     // the index once per distinct value instead: O(k log n).
-                    if let Some(ref expr) = resolved_expr
+                    if !collapse_replacing
+                        && let Some(ref expr) = resolved_expr
                         && let Some((rows, examined)) =
                             self.try_in_list_index_probe(table, expr, &meta).await
                     {
@@ -3156,7 +3205,8 @@ impl Executor {
                     // engine's fast_scan_where_eq (fused scan+filter with
                     // MVCC visibility fast-path). This avoids materializing
                     // all rows then filtering — only matching rows are cloned.
-                    if let Some(ref expr) = resolved_expr
+                    if !collapse_replacing
+                        && let Some(ref expr) = resolved_expr
                         && let Some((col_name, _)) = planner::is_equality_predicate(expr)
                         && let Some(col_idx) = meta
                             .iter()
@@ -3188,7 +3238,8 @@ impl Executor {
                     // The planner pushed the set of columns this query actually
                     // touches — output columns plus filter columns — so read
                     // only those. `scan_projected` skips decoding the rest.
-                    if let Some(proj_indices) = projection
+                    if !collapse_replacing
+                        && let Some(proj_indices) = projection
                         && let Some(proj_meta) = proj_indices
                             .iter()
                             .map(|&idx| meta.get(idx).cloned())
@@ -3258,10 +3309,13 @@ impl Executor {
                         return Ok((proj_meta, rows));
                     }
 
-                    let mut rows = if let Some(lim) = scan_limit {
-                        storage.scan_limit(table, *lim).await?
-                    } else {
-                        storage.scan(table).await?
+                    let mut rows = match scan_limit {
+                        // A LIMIT below the scan truncates the table before its
+                        // superseded versions are removed, so the answer is
+                        // short by however many duplicates fell inside the
+                        // window. Read it whole instead.
+                        Some(lim) if !collapse_replacing => storage.scan_limit(table, *lim).await?,
+                        _ => storage.scan(table).await?,
                     };
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
                     self.metrics
@@ -3283,7 +3337,12 @@ impl Executor {
                             rows,
                             &expr,
                             &meta,
-                            scan_limit.is_none().then_some(meta.as_slice()),
+                            // Granule statistics are addressed by SCAN POSITION,
+                            // and a collapse renumbers the rows — so a collapsed
+                            // scan must not be pruned positionally, for the same
+                            // reason a truncated one must not.
+                            (scan_limit.is_none() && !collapse_replacing)
+                                .then_some(meta.as_slice()),
                         )?;
                     }
                     Ok((meta, rows))

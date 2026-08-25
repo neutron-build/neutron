@@ -58,6 +58,62 @@ half old-stem and half new-stem is worse than either, because which rows a
 query finds then depends on when they were written. Non-English indexes are
 unaffected; the other language stemmers did not change.
 
+## 1c. ReplacingMergeTree tables: aggregates will change value
+
+**Applies to any upgrade from v0.1.8 or earlier, on any database holding a
+`replacing_mergetree` table.**
+
+Before this fix, a table's `WITH (engine = …)` declaration was durable only in
+the `engines.json` sidecar, which was added part-way through the product's life.
+A table created before it had no durable record of its engine at all, nothing
+re-registered it at boot, and read-time dedup was therefore skipped — silently.
+Every `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX` and `GROUP BY` over such a table
+counted **every superseded version**. On the instance this was found on, a
+window whose raw events proved 72 pageviews reported 158.
+
+`CREATE TABLE IF NOT EXISTS … WITH (engine = …)` on an already-existing table
+was also a no-op, so a migration could not repair one either.
+
+### What happens on the first boot after the upgrade
+
+Nothing is required of you. Two automatic paths repair it:
+
+- Boot reconciliation recovers any `engines.json` declaration into `catalog.json`
+  (which is now the durable record) and registers read-time dedup for it.
+- `CREATE TABLE IF NOT EXISTS … WITH (engine = …)` now **adopts** the declaration
+  for an existing table, so any application that re-runs its migrations on start
+  repairs its own tables. This is the path that fixes a table with no
+  `engines.json` entry at all.
+
+Adoption is metadata only. **No rows are moved, rewritten or deleted.**
+
+### What to expect
+
+1. **Aggregates return smaller, correct numbers**, and `SELECT *` returns fewer
+   rows — one per ORDER BY key. Anything baselined against the old numbers
+   (dashboards, alert thresholds) shows a step change. Re-baseline them.
+2. **`FINAL` is now a statement error** rather than a silently ignored table
+   alias. Grep your queries for it before upgrading. Nucleus collapses replacing
+   tables on every read, so the modifier has nothing to select — remove it.
+   A quoted `AS "FINAL"` alias is still an alias.
+3. **Two new WARN lines matter on first boot:**
+   - `declared engine has no per-table storage on disk — the table's rows are in
+     the default engine and are left there`. Correct and deliberate: the table
+     predates per-table engine routing, so its rows are in the heap. Reads are
+     collapsed for it, but the aggregate fast paths and the pushed-down LIMIT
+     and projection are disabled, so **large scans of that table get slower**.
+     To undo that, rebuild the table onto the columnar engine: create it afresh
+     `WITH (engine='replacing_mergetree') ORDER BY (…)` under a new name,
+     `INSERT … SELECT` across, then rename. There is no in-place migration, on
+     purpose — moving a multi-gigabyte table between engines during boot is not
+     something to do unasked.
+   - `ORDER BY names a column the table does not have`. The declaration is
+     wrong and dedup is **not** registered for that table. Fix the schema.
+4. **Rollback stays a binary swap.** `catalog.json` gains a serde-defaulted
+   `table_engines` array that an older binary ignores. Rolling back to v0.1.8
+   reverts to the over-reporting behaviour; it does not corrupt anything.
+5. **Do not hand-edit `engines.json`.** It is now a cache of `catalog.json`.
+
 ## 1a. Container images: check who owns the data directory
 
 **Applies to every upgrade crossing v0.1.1 → v0.1.2 or later.** Skip only if

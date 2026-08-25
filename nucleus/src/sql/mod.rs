@@ -263,6 +263,59 @@ impl Visitor for ExprDepthVisitor {
     }
 }
 
+/// Catches the ClickHouse `FROM <table> FINAL` modifier, which the PostgreSQL
+/// dialect parses as a bare table ALIAS spelled `FINAL`.
+struct FinalModifierVisitor {
+    table: Option<String>,
+}
+
+impl Visitor for FinalModifierVisitor {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, factor: &ast::TableFactor) -> ControlFlow<Self::Break> {
+        if let ast::TableFactor::Table {
+            name,
+            alias: Some(alias),
+            ..
+        } = factor
+            // A QUOTED alias is an alias: `AS "FINAL"` names a relation and has
+            // nothing to do with ClickHouse. Only the bare word is the modifier.
+            && alias.name.quote_style.is_none()
+            && alias.columns.is_empty()
+            && alias.name.value.eq_ignore_ascii_case("final")
+        {
+            self.table = Some(object_name_key(name));
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Reject `SELECT ... FROM <table> FINAL`.
+///
+/// The PostgreSQL dialect has no FINAL, so `FROM stats_hourly FINAL` parses as
+/// a table aliased `FINAL` — the modifier was accepted and then completely
+/// ignored. Against a live table holding superseded versions that returned
+/// 158 where the raw events proved 72: byte-identical to the query without it.
+/// Someone porting ClickHouse SQL has no way to notice.
+///
+/// Rejecting rather than implementing is deliberate. Nucleus collapses a
+/// `replacing_mergetree` table on EVERY read, which is the thing ClickHouse's
+/// FINAL exists to ask for — so there is no behaviour left for it to select,
+/// and a keyword that means "do what already happens" is a keyword that will
+/// silently mean nothing again the next time a read path is added. The error
+/// says so.
+fn check_final_modifier(stmts: &[ast::Statement]) -> Result<(), ParseError> {
+    for stmt in stmts {
+        let mut visitor = FinalModifierVisitor { table: None };
+        let _ = stmt.visit(&mut visitor);
+        if let Some(table) = visitor.table {
+            return Err(ParseError::FinalNotSupported(table));
+        }
+    }
+    Ok(())
+}
+
 /// Reject statements whose expression tree nests deeper than
 /// `MAX_AST_EXPR_DEPTH`. See that constant for why the pre-parse scan is not
 /// enough on its own.
@@ -302,6 +355,9 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     // chains) build an arbitrarily deep tree that the scan above cannot see.
     // Reject before any recursive walk of the tree happens.
     check_ast_depth(&stmts)?;
+
+    // `FROM t FINAL` parses as an alias here and used to be silently discarded.
+    check_final_modifier(&stmts)?;
 
     Ok(stmts)
 }
@@ -647,6 +703,12 @@ pub enum ParseError {
     StatementTooComplex(usize),
     #[error("statement too complex: expression nesting exceeds maximum of {0}")]
     ExpressionTooDeep(usize),
+    #[error(
+        "FINAL is not supported (table '{0}'). Nucleus collapses replacing_mergetree \
+         tables on every read, so FINAL has nothing to select — remove it. If you \
+         meant to alias the table, quote it: AS \"FINAL\"."
+    )]
+    FinalNotSupported(String),
 }
 
 // ============================================================================

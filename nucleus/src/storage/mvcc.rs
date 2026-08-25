@@ -1779,7 +1779,7 @@ impl StorageEngine for MvccStorageAdapter {
         if auto {
             self.auto_commit(_txn_id);
         }
-        Ok(rows)
+        Ok(crate::storage::collapse_replacing_scan(table, rows))
     }
 
     /// Same visibility and SIREAD accounting as `scan`, but each visible
@@ -1931,6 +1931,9 @@ impl StorageEngine for MvccStorageAdapter {
         key_col: usize,
         val_col: Option<usize>,
     ) -> Option<Vec<(Value, i64, Option<f64>)>> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         // See `serializable_txn_active`: a serializable read must be visible to
         // the conflict graph, and this path records no SIREAD.
         if self.serializable_txn_active() {
@@ -2013,6 +2016,9 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(f64, usize)> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         // See `serializable_txn_active`: a serializable read must be visible to
         // the conflict graph, and this path records no SIREAD.
         if self.serializable_txn_active() {
@@ -2069,6 +2075,9 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<usize> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         // See `serializable_txn_active` — declining keeps the read visible to
         // SSI by forcing the caller onto a SIREAD-recording path.
         if self.serializable_txn_active() {
@@ -2106,6 +2115,9 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(Vec<Row>, usize)> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let (txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
@@ -2160,6 +2172,9 @@ impl StorageEngine for MvccStorageAdapter {
         desc: bool,
         k: usize,
     ) -> Option<Vec<Row>> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         // See `serializable_txn_active` — declining keeps the read visible to
         // SSI by forcing the caller onto a SIREAD-recording path.
         if self.serializable_txn_active() {
@@ -2278,6 +2293,9 @@ impl StorageEngine for MvccStorageAdapter {
         low: &Value,
         high: &Value,
     ) -> Option<Vec<Row>> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let (txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
@@ -2992,6 +3010,9 @@ impl StorageEngine for MvccStorageAdapter {
     /// During an active explicit transaction the count reflects the last commit,
     /// not mid-txn inserts/deletes (those are accounted for at COMMIT).
     fn fast_count_all(&self, table: &str) -> Option<usize> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         // See `serializable_txn_active` — declining keeps the read visible to
         // SSI by forcing the caller onto a SIREAD-recording path.
         if self.serializable_txn_active() {

@@ -85,6 +85,44 @@ pub fn get_storage_session_id() -> u64 {
     STORAGE_SESSION_ID_CELL.with(|c| c.get())
 }
 
+/// True when an aggregate fast path must decline `table`.
+///
+/// The fast paths (`fast_count_all`, `fast_sum_f64`, `fast_group_by`, …) read
+/// PHYSICAL rows. For a `replacing_mergetree` table that is every superseded
+/// version, so a `COUNT(*)`/`SUM(...)` answered this way over-reports — which is
+/// exactly the shape of the live analytics double-count: 158 where the raw
+/// events proved 72. The columnar engine's own fast paths collapse versions
+/// first and so do not consult this; every other engine must, because a table
+/// created before per-table engine routing existed keeps its rows in the
+/// default engine and boot reconciliation deliberately leaves them there.
+///
+/// Declining is always safe: the executor falls back to the scan path, which
+/// applies the dedup.
+pub fn fast_path_blocked_by_replacing(table: &str) -> bool {
+    crate::columnar::replacing_config(table).is_some()
+}
+
+/// Collapse superseded `replacing_mergetree` versions in a FULL-scan result.
+///
+/// A no-op for every table that is not registered as a replacing table, which
+/// is all of them but a handful. Engines that store physical rows call this at
+/// the end of `scan()` — the logical read — and leave `scan_physical()`,
+/// `scan_where_eq_positions()` and the index-position paths untouched, because
+/// UPDATE/DELETE address rows by physical identity and must see every version.
+///
+/// This lives at the engine boundary rather than in the executor because
+/// `scan()` has many callers and only one meaning: "the rows of this table".
+/// The columnar engine has always answered it that way; the others answered
+/// with every superseded version, which is only invisible for as long as a
+/// replacing table is always served by the columnar engine — and a table
+/// created before per-table engine routing existed is not.
+pub fn collapse_replacing_scan(table: &str, rows: Vec<Row>) -> Vec<Row> {
+    match crate::columnar::replacing_config(table) {
+        Some(cfg) => crate::columnar::dedup_replacing_rows(rows, &cfg),
+        None => rows,
+    }
+}
+
 /// The current session, or `None` when it cannot be determined.
 ///
 /// `None` means "unknown", NOT "no session", and callers must treat it that
@@ -227,6 +265,21 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(feature = "server")]
     fn as_columnar(&self) -> Option<&columnar_engine::ColumnarStorageEngine> {
         None
+    }
+
+    /// Whether this engine collapses `replacing_mergetree` versions on its own
+    /// read paths. See [`fast_path_blocked_by_replacing`].
+    ///
+    /// Only the columnar engine does. That was fine for as long as a
+    /// `replacing_mergetree` table was always served by one — but a table
+    /// created before per-table engine routing existed has its rows in the
+    /// DEFAULT engine, and boot reconciliation deliberately leaves them there
+    /// rather than pointing reads at an empty columnar engine. For those, the
+    /// executor applies the dedup instead, and the aggregate fast paths (which
+    /// count PHYSICAL rows) must decline. See
+    /// `Executor::needs_executor_replacing_dedup`.
+    fn dedups_replacing(&self) -> bool {
+        false
     }
 
     async fn create_table(&self, table: &str) -> Result<(), StorageError>;
@@ -1106,7 +1159,7 @@ impl StorageEngine for MemoryEngine {
         let rows = tables
             .get(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
-        Ok(rows.clone())
+        Ok(collapse_replacing_scan(table, rows.clone()))
     }
 
     /// Narrow each row as it is copied out of the table. The default
@@ -1351,11 +1404,17 @@ impl StorageEngine for MemoryEngine {
     // `None` just means "engine can't answer quickly right now".
 
     fn fast_count_all(&self, table: &str) -> Option<usize> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         guard.get(table).map(|rows| rows.len())
     }
 
     fn fast_sum_f64(&self, table: &str, col_idx: usize) -> Option<(f64, usize)> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         let mut sum = 0.0f64;
@@ -1389,6 +1448,9 @@ impl StorageEngine for MemoryEngine {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<usize> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         let count = rows
@@ -1405,6 +1467,9 @@ impl StorageEngine for MemoryEngine {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(f64, usize)> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         let mut sum = 0.0f64;
@@ -1435,6 +1500,9 @@ impl StorageEngine for MemoryEngine {
     }
 
     fn fast_min_f64(&self, table: &str, col_idx: usize) -> Option<f64> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         let mut min_val: Option<f64> = None;
@@ -1457,6 +1525,9 @@ impl StorageEngine for MemoryEngine {
     }
 
     fn fast_max_f64(&self, table: &str, col_idx: usize) -> Option<f64> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         let mut max_val: Option<f64> = None;
@@ -1484,6 +1555,9 @@ impl StorageEngine for MemoryEngine {
         key_col: usize,
         val_col: Option<usize>,
     ) -> Option<Vec<(Value, i64, Option<f64>)>> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         // Accumulate per-group: (count, sum, non_null_count)
@@ -1530,6 +1604,9 @@ impl StorageEngine for MemoryEngine {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(Vec<Row>, usize)> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         // Every row in the table is examined by the scan; the returned vec holds
@@ -1550,6 +1627,9 @@ impl StorageEngine for MemoryEngine {
         low: &Value,
         high: &Value,
     ) -> Option<Vec<Row>> {
+        if fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
         Some(

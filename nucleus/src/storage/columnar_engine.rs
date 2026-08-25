@@ -1028,6 +1028,10 @@ impl StorageEngine for ColumnarStorageEngine {
         Ok(())
     }
 
+    fn dedups_replacing(&self) -> bool {
+        true
+    }
+
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
         self.flush_write_buffer(table);
         let store = self.store.read();

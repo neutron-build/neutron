@@ -120,6 +120,34 @@ impl Executor {
     /// existed. Table rename was already handled (`rename_override_engine`);
     /// column rename was not.
     pub(super) fn rename_engine_meta_column(&self, table: &str, old: &str, new: &str) {
+        let swap = |slot: &mut String| {
+            if slot == old {
+                *slot = new.to_string();
+                return true;
+            }
+            false
+        };
+        // The catalog first: it is the durable record and boot reconciliation
+        // reads it before the sidecar. Only the sidecar was rewritten before,
+        // and a memory-mode database has no sidecar at all.
+        if let Some(mut spec) = self.catalog.table_engine(table) {
+            let mut changed = false;
+            for column in &mut spec.order_by {
+                changed |= swap(column);
+            }
+            for column in &mut spec.sum_columns {
+                changed |= swap(column);
+            }
+            for column in &mut spec.count_columns {
+                changed |= swap(column);
+            }
+            if let Some(version) = spec.version_column.as_mut() {
+                changed |= swap(version);
+            }
+            if changed {
+                self.catalog.set_table_engine(table, spec);
+            }
+        }
         if self.data_dir.is_none() {
             return;
         }
@@ -128,13 +156,6 @@ impl Executor {
             return;
         };
         let mut changed = false;
-        let swap = |slot: &mut String| {
-            if slot == old {
-                *slot = new.to_string();
-                return true;
-            }
-            false
-        };
         for column in &mut meta.order_by {
             changed |= swap(column);
         }
@@ -153,6 +174,20 @@ impl Executor {
     }
 
     pub(super) fn record_table_engine(&self, table: &str, meta: TableEngineMeta) {
+        // The CATALOG is the durable record; `engines.json` is a cache of it.
+        // Writing the catalog first (and unconditionally — a memory-mode
+        // database has no data dir but still has a catalog) is what makes an
+        // engine declaration survive a restart at all.
+        self.catalog.set_table_engine(
+            table,
+            crate::catalog::TableEngineSpec {
+                engine: meta.engine.clone(),
+                order_by: meta.order_by.clone(),
+                version_column: meta.version_column.clone(),
+                sum_columns: meta.sum_columns.clone(),
+                count_columns: meta.count_columns.clone(),
+            },
+        );
         if self.data_dir.is_none() {
             return;
         }
@@ -161,7 +196,168 @@ impl Executor {
         self.save_engines_meta(&metas);
     }
 
+    /// Translate a merge strategy's column NAMES into the positional names that
+    /// executor-built column batches actually carry ("0", "1", …).
+    ///
+    /// `rows_to_batch` names columns by position, and `ZoneMap`,
+    /// `merge_sorted_batches` and `merge_replacing` all look columns up BY NAME.
+    /// The ORDER BY key was already being translated at CREATE TABLE; the
+    /// version column was not, so `merge_replacing` looked up a column called
+    /// `version` in a batch whose columns are called `0`…`n`, found nothing,
+    /// read every row's version as 0, and kept whichever row the merge happened
+    /// to leave last — and `merge_parts` folds parts smallest-first, so that is
+    /// arbitrary. A version column that does not resolve is left as-is rather
+    /// than dropped: `merge_replacing` now refuses to collapse on a version it
+    /// cannot read, which is the safe answer.
+    fn positional_strategy(
+        strategy: &crate::columnar::MergeStrategy,
+        def: &TableDef,
+    ) -> crate::columnar::MergeStrategy {
+        use crate::columnar::MergeStrategy;
+        let pos = |name: &String| {
+            def.column_index(name)
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| name.clone())
+        };
+        match strategy {
+            MergeStrategy::Default => MergeStrategy::Default,
+            MergeStrategy::Replacing { version_column } => MergeStrategy::Replacing {
+                version_column: version_column.as_ref().map(&pos),
+            },
+            MergeStrategy::Aggregating {
+                group_columns,
+                sum_columns,
+                count_columns,
+            } => MergeStrategy::Aggregating {
+                group_columns: group_columns.iter().map(&pos).collect(),
+                sum_columns: sum_columns.iter().map(&pos).collect(),
+                count_columns: count_columns.iter().map(&pos).collect(),
+            },
+        }
+    }
+
+    /// The merge strategy a declaration asks for, by column NAME.
+    fn strategy_for(spec: &crate::catalog::TableEngineSpec) -> crate::columnar::MergeStrategy {
+        use crate::columnar::MergeStrategy;
+        match spec.engine.as_str() {
+            "replacing_mergetree" => MergeStrategy::Replacing {
+                version_column: spec.version_column.clone(),
+            },
+            "aggregating_mergetree" => MergeStrategy::Aggregating {
+                group_columns: spec.order_by.clone(),
+                sum_columns: spec.sum_columns.clone(),
+                count_columns: spec.count_columns.clone(),
+            },
+            _ => MergeStrategy::Default,
+        }
+    }
+
+    /// Wire a table's declared engine into everything that consults it at run
+    /// time: the process-global replacing-dedup registry, and (when the table is
+    /// served by a columnar engine) that engine's MergeTree sort key and merge
+    /// strategy.
+    ///
+    /// Called from three places that used to each do a different subset of this:
+    /// CREATE TABLE, `CREATE TABLE IF NOT EXISTS` adoption, and boot
+    /// reconciliation. Boot reconciliation in particular registered the MergeTree
+    /// on the executor's SHARED columnar store — a store that never serves these
+    /// tables — so after every restart the table that actually holds the rows had
+    /// no sort key and no merge strategy, and its superseded versions were never
+    /// physically collapsed again.
+    pub(super) fn register_engine_runtime(
+        &self,
+        table: &str,
+        spec: &crate::catalog::TableEngineSpec,
+        def: &TableDef,
+        serving: Option<&Arc<dyn StorageEngine>>,
+    ) {
+        if spec.is_replacing() {
+            let pk_idx: Vec<usize> = spec
+                .order_by
+                .iter()
+                .filter_map(|name| {
+                    def.columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                })
+                .collect();
+            if pk_idx.len() != spec.order_by.len() {
+                tracing::error!(
+                    table = %table,
+                    order_by = ?spec.order_by,
+                    "replacing_mergetree: ORDER BY names a column the table does not \
+                     have; read-time dedup is NOT registered and SELECT will see \
+                     every superseded version"
+                );
+            }
+            let ver_idx = spec.version_column.as_ref().and_then(|name| {
+                def.columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(name))
+            });
+            if let Some(name) = spec.version_column.as_ref()
+                && ver_idx.is_none()
+            {
+                tracing::error!(
+                    table = %table,
+                    version_column = %name,
+                    "replacing_mergetree: version column does not exist; dedup falls \
+                     back to last-write-wins"
+                );
+            }
+            // Versions are ordered numerically. A non-numeric (e.g. TEXT)
+            // version column is parsed best-effort, but ordering is only
+            // reliable for an integer/float type — warn so the schema can be
+            // fixed.
+            if let (Some(name), Some(idx)) = (spec.version_column.as_ref(), ver_idx)
+                && !matches!(
+                    def.columns[idx].data_type,
+                    DataType::Int32 | DataType::Int64 | DataType::Float64
+                )
+            {
+                tracing::warn!(
+                    "ReplacingMergeTree table '{table}': version column '{name}' has \
+                     non-numeric type {}; newest-wins dedup orders by parsed numeric \
+                     value and may be unreliable. Use INTEGER/BIGINT for the version \
+                     column.",
+                    def.columns[idx].data_type
+                );
+            }
+            crate::columnar::register_replacing_table(table, pk_idx, ver_idx);
+        }
+        if !spec.is_merge_tree() {
+            return;
+        }
+        let positional_key: Vec<String> = spec
+            .order_by
+            .iter()
+            .filter_map(|name| def.column_index(name).map(|i| i.to_string()))
+            .collect();
+        if positional_key.len() != spec.order_by.len() {
+            tracing::warn!(
+                table = %table,
+                order_by = ?spec.order_by,
+                "ORDER BY names a column the table does not have; the sort key is not \
+                 in effect"
+            );
+            return;
+        }
+        #[cfg(feature = "server")]
+        if let Some(engine) = serving
+            && let Some(col) = engine.as_columnar()
+        {
+            col.register_merge_tree(
+                table,
+                positional_key,
+                Self::positional_strategy(&Self::strategy_for(spec), def),
+            );
+        }
+        #[cfg(not(feature = "server"))]
+        let _ = serving;
+    }
+
     pub(super) fn remove_table_engine_meta(&self, table: &str) {
+        self.catalog.remove_table_engine(table);
         if self.data_dir.is_none() {
             return;
         }
@@ -232,19 +428,108 @@ impl Executor {
         Arc::new(crate::storage::LsmStorageEngine::new())
     }
 
-    /// Re-register per-table engines recorded in engines.json. Called once at
-    /// boot (after the catalog is loaded): reopens each engine's WAL-backed
-    /// storage, restores replacing-dedup configs, and re-creates the shared
-    /// columnar store's MergeTree registration (which reopens its on-disk
-    /// state when present).
+    /// Reconcile every table's declared storage engine with what is actually
+    /// registered in this process. Called once at boot, after the catalog is
+    /// loaded.
+    ///
+    /// The declaration is read from the CATALOG first and the `engines.json`
+    /// sidecar second, and whichever source is missing an entry is backfilled
+    /// from the other. That asymmetry is the whole point: `engines.json` was
+    /// added part-way through the product's life, so every table created before
+    /// it has no entry there — and nothing else recorded the engine. On the live
+    /// observe instance (Nucleus v0.1.8) the file listed exactly ONE of about
+    /// sixty tables. For the other fifty-nine, `replacing_config()` returned
+    /// `None` at every boot, read-time dedup was silently skipped, and every
+    /// aggregate summed every superseded version — a window whose raw events
+    /// proved 72 pageviews reported 158.
+    ///
+    /// Storage ROUTING is deliberately not repaired the same way. A legacy table
+    /// whose rows were written through the default heap engine still has them
+    /// there; pointing reads at a freshly opened (and therefore empty) per-table
+    /// columnar engine would turn a table that over-counts into a table that
+    /// reads as empty. So a per-table engine is adopted only when its directory
+    /// already exists. Everything else keeps the engine it has, and the
+    /// executor applies replacing dedup on its behalf.
     #[cfg(feature = "server")]
     pub async fn restore_table_engines(&self) {
-        let metas = self.load_engines_meta();
-        if metas.is_empty() {
+        use crate::catalog::TableEngineSpec;
+
+        let sidecar = self.load_engines_meta();
+        let mut specs: HashMap<String, TableEngineSpec> = self
+            .catalog
+            .table_engines()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        // Backfill the catalog from the sidecar for tables that predate the
+        // catalog field. This is the self-heal for an upgraded instance: it
+        // needs no operator action and runs before anything reads a table.
+        let mut recovered_from_sidecar = 0usize;
+        for (table, meta) in &sidecar {
+            if !specs.contains_key(table) {
+                let spec = TableEngineSpec {
+                    engine: meta.engine.clone(),
+                    order_by: meta.order_by.clone(),
+                    version_column: meta.version_column.clone(),
+                    sum_columns: meta.sum_columns.clone(),
+                    count_columns: meta.count_columns.clone(),
+                };
+                self.catalog.set_table_engine(table, spec.clone());
+                specs.insert(table.clone(), spec);
+                recovered_from_sidecar += 1;
+            }
+        }
+        if recovered_from_sidecar > 0 {
+            tracing::info!(
+                "recovered {recovered_from_sidecar} table engine declaration(s) from \
+                 engines.json into the catalog"
+            );
+        }
+        if specs.is_empty() {
             return;
         }
-        for (table, meta) in metas {
-            if meta.engine == "lsm" {
+        // And backfill the sidecar from the catalog, so an operator reading
+        // engines.json sees the same set the engine is using.
+        let mut sidecar_out = sidecar.clone();
+        let mut sidecar_changed = false;
+        for (table, spec) in &specs {
+            if !sidecar_out.contains_key(table) {
+                sidecar_out.insert(
+                    table.clone(),
+                    TableEngineMeta {
+                        engine: spec.engine.clone(),
+                        order_by: spec.order_by.clone(),
+                        version_column: spec.version_column.clone(),
+                        sum_columns: spec.sum_columns.clone(),
+                        count_columns: spec.count_columns.clone(),
+                    },
+                );
+                sidecar_changed = true;
+            }
+        }
+        if sidecar_changed && self.data_dir.is_some() {
+            self.save_engines_meta(&sidecar_out);
+        }
+
+        let mut tables: Vec<String> = specs.keys().cloned().collect();
+        tables.sort();
+        for table in tables {
+            let spec = specs[&table].clone();
+            let Some(def) = self.catalog.get_table(&table).await else {
+                tracing::warn!(
+                    "engine declaration names table '{table}' but the catalog has no \
+                     such table; ignoring"
+                );
+                continue;
+            };
+            if spec.engine == "lsm" {
+                if !self.table_engine_dir_exists(&table) {
+                    tracing::warn!(
+                        table = %table,
+                        "declared engine 'lsm' has no on-disk storage; the table's rows \
+                         live in the default engine and it is left there"
+                    );
+                    continue;
+                }
                 let engine = self.open_lsm_engine(&table);
                 if let Err(error) = engine.create_table(&table).await {
                     tracing::warn!("restore LSM engine '{table}': create_table failed: {error}");
@@ -253,60 +538,64 @@ impl Executor {
                 self.table_engines.write().insert(table, engine);
                 continue;
             }
-            let eng = self.open_columnar_engine(&table);
-            if let Err(e) = eng.create_table(&table).await {
-                tracing::warn!("restore engine '{table}': create_table failed: {e}");
-            }
-            if let Some(def) = self.catalog.get_table(&table).await {
-                let col_info: Vec<(String, DataType)> = def
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.clone(), c.data_type.clone()))
-                    .collect();
-                eng.store_table_schema(&table, &col_info);
-                self.table_columns.write().insert(table.clone(), col_info);
-                if meta.engine == "replacing_mergetree" {
-                    let pk_idx: Vec<usize> = meta
-                        .order_by
-                        .iter()
-                        .filter_map(|name| {
-                            def.columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(name))
-                        })
-                        .collect();
-                    let ver_idx = meta.version_column.as_ref().and_then(|name| {
-                        def.columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(name))
-                    });
-                    crate::columnar::register_replacing_table(&table, pk_idx, ver_idx);
+
+            let col_info: Vec<(String, DataType)> = def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type.clone()))
+                .collect();
+            self.table_columns
+                .write()
+                .insert(table.clone(), col_info.clone());
+
+            // Adopt the per-table columnar engine only when its storage already
+            // exists. A declaration recovered for a legacy table has no such
+            // directory: its rows are in the default engine, and routing reads
+            // to an empty one would lose the table.
+            let serving: Option<Arc<dyn StorageEngine>> = if self.table_engine_dir_exists(&table) {
+                let eng = self.open_columnar_engine(&table);
+                if let Err(e) = eng.create_table(&table).await {
+                    tracing::warn!("restore engine '{table}': create_table failed: {e}");
                 }
+                eng.store_table_schema(&table, &col_info);
+                let dynamic: Arc<dyn StorageEngine> = eng;
+                self.table_engines
+                    .write()
+                    .insert(table.clone(), dynamic.clone());
+                Some(dynamic)
             } else {
                 tracing::warn!(
-                    "engines.json lists table '{table}' but the catalog has no such table"
+                    table = %table,
+                    engine = %spec.engine,
+                    "declared engine has no per-table storage on disk — the table's rows \
+                     are in the default engine and are left there. Read-time semantics \
+                     (replacing dedup) are still applied; physical merges are not."
                 );
-            }
-            if meta.engine != "columnar" {
-                use crate::columnar::MergeStrategy;
-                let strategy = match meta.engine.as_str() {
-                    "replacing_mergetree" => MergeStrategy::Replacing {
-                        version_column: meta.version_column.clone(),
-                    },
-                    "aggregating_mergetree" => MergeStrategy::Aggregating {
-                        group_columns: meta.order_by.clone(),
-                        sum_columns: meta.sum_columns.clone(),
-                        count_columns: meta.count_columns.clone(),
-                    },
-                    _ => MergeStrategy::Default,
-                };
+                None
+            };
+
+            self.register_engine_runtime(&table, &spec, &def, serving.as_ref());
+            if spec.is_merge_tree() {
+                // Also re-create the executor's own store entry, as CREATE
+                // TABLE does. It does not serve these tables' reads, but it
+                // reopens `<data_dir>/mergetree/<table>` — so skipping it would
+                // hide anything an older build wrote there.
                 self.columnar_store
                     .write()
-                    .create_merge_tree_table_with_strategy(&table, meta.order_by.clone(), strategy);
+                    .create_merge_tree_table_with_strategy(
+                        &table,
+                        spec.order_by.clone(),
+                        Self::strategy_for(&spec),
+                    );
             }
-            tracing::info!("restored '{}' engine for table '{table}'", meta.engine);
-            self.table_engines.write().insert(table, eng);
+            tracing::info!("restored '{}' engine for table '{table}'", spec.engine);
         }
+    }
+
+    /// Whether a per-table engine's storage directory already exists — i.e.
+    /// whether this table's rows were ever written through one.
+    fn table_engine_dir_exists(&self, table: &str) -> bool {
+        self.table_engine_dir(table).is_some_and(|d| d.exists())
     }
 
     /// Rebuild the storage-engine B-tree indexes the catalog says exist.
@@ -472,8 +761,22 @@ impl Executor {
         // Route the new name to the new engine and persist the sidecar.
         self.table_engines
             .write()
-            .insert(new.to_string(), new_engine);
+            .insert(new.to_string(), new_engine.clone());
+        let spec = crate::catalog::TableEngineSpec {
+            engine: meta.engine.clone(),
+            order_by: meta.order_by.clone(),
+            version_column: meta.version_column.clone(),
+            sum_columns: meta.sum_columns.clone(),
+            count_columns: meta.count_columns.clone(),
+        };
         self.record_table_engine(new, meta);
+        // Register the sort key and merge strategy on the engine that now
+        // SERVES the table. Only the executor's shared store was registered
+        // above, and that store does not serve these tables' reads — the same
+        // omission that left every restored MergeTree without a merge strategy.
+        if let Some(def) = self.catalog.get_table(new).await {
+            self.register_engine_runtime(new, &spec, &def, Some(&new_engine));
+        }
 
         // Tear down the old side completely (mirrors DROP cleanup).
         if let Err(e) = old_engine.drop_table(old).await {
@@ -953,147 +1256,55 @@ impl Executor {
                 };
                 tbl_storage.create_table(&table_name).await?;
 
-                // If this is a MergeTree table, also create it in the columnar store
-                // with the ORDER BY columns as the primary key.
-                if is_mergetree {
-                    use crate::columnar::MergeStrategy;
-                    let strategy = match engine_name.as_deref() {
-                        Some("replacing_mergetree") => {
-                            // Version column: prefer `WITH (version_column='v')`,
-                            // fall back to the ClickHouse `ReplacingMergeTree(v)`
-                            // parenthesized argument.
-                            let version_col = Self::extract_string_option(
-                                &create.table_options,
-                                "version_column",
-                            )
-                            .or_else(|| Self::extract_engine_paren_arg(&create.table_options));
-                            // Register read-time dedup so SELECT collapses
-                            // superseded versions. We resolve ORDER BY column
-                            // names + version column to scan-order indices
-                            // using the freshly-built TableDef. The registry
-                            // is consulted by `ColumnarStore::batches_all_for_select`
-                            // and the SELECT-side fast paths.
-                            let pk_idx: Vec<usize> = order_by_cols
-                                .iter()
-                                .filter_map(|name| {
-                                    table_def
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(name))
-                                })
-                                .collect();
-                            let ver_idx = version_col.as_ref().and_then(|name| {
-                                table_def
-                                    .columns
-                                    .iter()
-                                    .position(|c| c.name.eq_ignore_ascii_case(name))
-                            });
-                            // ReplacingMergeTree orders versions numerically. A
-                            // non-numeric (e.g. TEXT) version column is parsed
-                            // best-effort, but ordering is only reliable for an
-                            // integer/float type — warn so the schema can be fixed.
-                            if let (Some(name), Some(idx)) = (version_col.as_ref(), ver_idx) {
-                                let dt = &table_def.columns[idx].data_type;
-                                if !matches!(
-                                    dt,
-                                    crate::types::DataType::Int32
-                                        | crate::types::DataType::Int64
-                                        | crate::types::DataType::Float64
-                                ) {
-                                    tracing::warn!(
-                                        "ReplacingMergeTree table '{table_name}': version column \
-                                         '{name}' has non-numeric type {dt}; newest-wins dedup \
-                                         orders by parsed numeric value and may be unreliable. \
-                                         Use INTEGER/BIGINT for the version column."
-                                    );
-                                }
-                            }
-                            crate::columnar::register_replacing_table(&table_name, pk_idx, ver_idx);
-                            MergeStrategy::Replacing {
-                                version_column: version_col,
-                            }
-                        }
-                        Some("aggregating_mergetree") => {
-                            let sum_cols =
-                                Self::extract_csv_option(&create.table_options, "sum_columns");
-                            let count_cols =
-                                Self::extract_csv_option(&create.table_options, "count_columns");
-                            MergeStrategy::Aggregating {
-                                group_columns: order_by_cols.clone(),
-                                sum_columns: sum_cols,
-                                count_columns: count_cols,
-                            }
-                        }
-                        _ => MergeStrategy::Default,
-                    };
-                    // Register the sort key on the PER-TABLE engine — the one
-                    // that serves this table's reads. Registering only on the
-                    // executor's `columnar_store` left it in a store nothing
-                    // scans, which is why a declared ORDER BY pruned nothing.
-                    //
-                    // The key is translated from column NAMES to the positional
-                    // names the columnar batches actually carry. `rows_to_batch`
-                    // names columns "0", "1", … by their position in the row,
-                    // and `ZoneMap`, `sort_by_pk` and `merge_sorted_batches` all
-                    // look columns up by name — so a key of `ts` matched nothing
-                    // and the sort silently did not happen. Translating here
-                    // keeps the batch naming (which is also the on-disk format,
-                    // and which `merge_sorted_batches` uses to align batches
-                    // across parts) untouched.
-                    let positional_key: Vec<String> = order_by_cols
-                        .iter()
-                        .filter_map(|name| table_def.column_index(name).map(|i| i.to_string()))
-                        .collect();
-                    #[cfg(feature = "server")]
-                    if positional_key.len() == order_by_cols.len()
-                        && let Some(eng) = self.table_engines.read().get(&table_name)
-                        && let Some(col) = eng.as_columnar()
-                    {
-                        col.register_merge_tree(
-                            &table_name,
-                            positional_key.clone(),
-                            strategy.clone(),
-                        );
-                    }
-                    if positional_key.len() != order_by_cols.len() {
-                        tracing::warn!(
-                            "table '{table_name}': ORDER BY ({}) names a column the table does \
-                             not have; the sort key is not in effect",
-                            order_by_cols.join(", ")
-                        );
-                    }
-                    self.columnar_store
-                        .write()
-                        .create_merge_tree_table_with_strategy(
-                            &table_name,
-                            order_by_cols.clone(),
-                            strategy,
-                        );
-                }
-                // Persist the engine override so it survives restarts
-                // (restore_table_engines re-registers from engines.json at boot).
+                // The declared engine, as one value. It is recorded in the
+                // CATALOG (the durable record), mirrored into `engines.json`
+                // (what an operator reads), and registered with the read-time
+                // dedup registry and the serving engine's MergeTree. All three
+                // used to be done separately here, and boot reconciliation did
+                // a different subset — which is how a restart could leave a
+                // `replacing_mergetree` table with no dedup and no merge
+                // strategy at all.
                 if is_mergetree || matches!(engine_name.as_deref(), Some("columnar") | Some("lsm"))
                 {
+                    let spec = crate::catalog::TableEngineSpec {
+                        engine: engine_name.clone().unwrap_or_default(),
+                        order_by: order_by_cols.clone(),
+                        version_column: Self::extract_string_option(
+                            &create.table_options,
+                            "version_column",
+                        )
+                        .or_else(|| Self::extract_engine_paren_arg(&create.table_options)),
+                        sum_columns: Self::extract_csv_option(&create.table_options, "sum_columns"),
+                        count_columns: Self::extract_csv_option(
+                            &create.table_options,
+                            "count_columns",
+                        ),
+                    };
                     self.record_table_engine(
                         &table_name,
                         TableEngineMeta {
-                            engine: engine_name.clone().unwrap_or_default(),
-                            order_by: order_by_cols.clone(),
-                            version_column: Self::extract_string_option(
-                                &create.table_options,
-                                "version_column",
-                            )
-                            .or_else(|| Self::extract_engine_paren_arg(&create.table_options)),
-                            sum_columns: Self::extract_csv_option(
-                                &create.table_options,
-                                "sum_columns",
-                            ),
-                            count_columns: Self::extract_csv_option(
-                                &create.table_options,
-                                "count_columns",
-                            ),
+                            engine: spec.engine.clone(),
+                            order_by: spec.order_by.clone(),
+                            version_column: spec.version_column.clone(),
+                            sum_columns: spec.sum_columns.clone(),
+                            count_columns: spec.count_columns.clone(),
                         },
                     );
+                    let serving = self.table_engines.read().get(&table_name).cloned();
+                    self.register_engine_runtime(&table_name, &spec, &table_def, serving.as_ref());
+                    if spec.is_merge_tree() {
+                        // The executor's own columnar store also tracks the
+                        // table. It does not serve these tables' reads (the
+                        // per-table engine does), but several planner paths ask
+                        // it whether a table is a MergeTree.
+                        self.columnar_store
+                            .write()
+                            .create_merge_tree_table_with_strategy(
+                                &table_name,
+                                spec.order_by.clone(),
+                                Self::strategy_for(&spec),
+                            );
+                    }
                 }
                 // Cache column metadata for sync index scan path
                 let col_info: Vec<(String, DataType)> = table_def
@@ -1115,32 +1326,93 @@ impl Executor {
                 })
             }
             Err(_e) if create.if_not_exists => {
-                // Table already exists, so IF NOT EXISTS succeeds without
-                // reconciling anything — PostgreSQL behaves the same way.
+                // The table already exists, so its COLUMNS are left alone —
+                // PostgreSQL behaves the same way.
                 //
-                // But PostgreSQL has no per-table storage engine, and here the
-                // silence is load-bearing: a migration that ADDS
-                // `WITH (engine = 'mergetree') ORDER BY (...)` to a table
-                // created before that clause existed reports success and
-                // changes nothing, forever. Observe's `spans` table reached
-                // production that way — the schema asks for time-ordered
-                // storage, the engine registry has no entry for it, and every
-                // time-range query full-scans. Say so rather than let a
-                // migration quietly mean nothing.
+                // Its declared ENGINE is a different matter. PostgreSQL has no
+                // per-table storage engine, and here the silence was
+                // load-bearing: a migration that ADDS
+                // `WITH (engine = 'replacing_mergetree') ORDER BY (...)` to a
+                // table created before that clause existed reported success and
+                // changed nothing, forever. Observe's `spans` table reached
+                // production that way, and so did every rollup table on the live
+                // instance — which is why they were still summing superseded
+                // versions two months later. A re-run migration is the one place
+                // an upgraded database re-states what its tables are supposed to
+                // be, so this now ADOPTS the declaration.
+                //
+                // Adoption is metadata only: read-time semantics, the sort key
+                // and the durable record. Rows are never moved between engines,
+                // so a table whose data is in the default engine stays there.
                 if let Some(requested) = Self::extract_engine_option(&create.table_options) {
-                    let existing = self
-                        .load_engines_meta()
-                        .get(&table_name)
-                        .map(|m| m.engine.clone());
-                    if existing.as_deref() != Some(requested.as_str()) {
-                        tracing::warn!(
-                            table = %table_name,
-                            requested_engine = %requested,
-                            existing_engine = existing.as_deref().unwrap_or("default"),
-                            "CREATE TABLE IF NOT EXISTS skipped an existing table whose storage \
-                             engine differs from the one requested; the engine and any ORDER BY \
-                             key were NOT applied. Recreate the table or migrate it explicitly."
-                        );
+                    let existing = self.catalog.table_engine(&table_name);
+                    let spec = crate::catalog::TableEngineSpec {
+                        engine: requested.clone(),
+                        order_by: Self::extract_order_by_columns(&create.order_by),
+                        version_column: Self::extract_string_option(
+                            &create.table_options,
+                            "version_column",
+                        )
+                        .or_else(|| Self::extract_engine_paren_arg(&create.table_options)),
+                        sum_columns: Self::extract_csv_option(&create.table_options, "sum_columns"),
+                        count_columns: Self::extract_csv_option(
+                            &create.table_options,
+                            "count_columns",
+                        ),
+                    };
+                    if existing.as_ref() != Some(&spec) {
+                        match self.catalog.get_table(&table_name).await {
+                            Some(def) => {
+                                self.record_table_engine(
+                                    &table_name,
+                                    TableEngineMeta {
+                                        engine: spec.engine.clone(),
+                                        order_by: spec.order_by.clone(),
+                                        version_column: spec.version_column.clone(),
+                                        sum_columns: spec.sum_columns.clone(),
+                                        count_columns: spec.count_columns.clone(),
+                                    },
+                                );
+                                let serving =
+                                    self.table_engines.read().get(&table_name).cloned();
+                                self.register_engine_runtime(
+                                    &table_name,
+                                    &spec,
+                                    &def,
+                                    serving.as_ref(),
+                                );
+                                tracing::info!(
+                                    table = %table_name,
+                                    requested_engine = %requested,
+                                    previous_engine = existing
+                                        .as_ref()
+                                        .map(|s| s.engine.as_str())
+                                        .unwrap_or("default"),
+                                    "CREATE TABLE IF NOT EXISTS adopted the declared storage \
+                                     engine for an existing table (metadata only; no rows were \
+                                     moved)"
+                                );
+                                if serving.is_none() {
+                                    tracing::warn!(
+                                        table = %table_name,
+                                        "the table's rows are in the default engine, so physical \
+                                         merges will not run for it; reads still collapse \
+                                         superseded versions"
+                                    );
+                                }
+                                if let Err(e) = self.persist_catalog().await {
+                                    tracing::warn!(
+                                        "adopted engine for '{table_name}' but the catalog \
+                                         could not be persisted: {e}"
+                                    );
+                                }
+                            }
+                            None => tracing::warn!(
+                                table = %table_name,
+                                "CREATE TABLE IF NOT EXISTS could not adopt the declared engine: \
+                                 the catalog has no such table"
+                            ),
+                        }
                     }
                 }
                 Ok(ExecResult::Command {

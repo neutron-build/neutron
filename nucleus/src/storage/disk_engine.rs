@@ -2689,7 +2689,7 @@ impl StorageEngine for DiskEngine {
         }
 
         crate::bench_hooks::record_tuples_examined(examined);
-        Ok(rows)
+        Ok(crate::storage::collapse_replacing_scan(table, rows))
     }
 
     /// Early-exit LIMIT scan: read pages in scan order and stop the moment
@@ -2864,6 +2864,9 @@ impl StorageEngine for DiskEngine {
     }
 
     fn fast_count_all(&self, table: &str) -> Option<usize> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         let pages = self.table_pages(table).ok()?;
         let mut count = 0;
         for &page_id in &pages {

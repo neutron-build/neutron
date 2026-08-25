@@ -23,6 +23,46 @@ pub enum FkAction {
     SetDefault,
 }
 
+/// A table's declared storage engine, as written in `WITH (engine = '…')`.
+///
+/// This lives in the CATALOG, which is the durable source of truth for schema.
+/// It used to live only in the `engines.json` sidecar, which was added part-way
+/// through the product's life — so every table created before it had no durable
+/// record of its engine at all. On the next restart nothing re-registered them:
+/// a `replacing_mergetree` table came back as an ordinary heap table, read-time
+/// dedup was silently skipped, and every aggregate summed every superseded
+/// version. `engines.json` is still written (it is what an operator can read),
+/// but it is now a cache of this, not the record.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TableEngineSpec {
+    /// `columnar` | `lsm` | `mergetree` | `replacing_mergetree` |
+    /// `aggregating_mergetree`.
+    pub engine: String,
+    /// Declared ORDER BY key, by column name.
+    pub order_by: Vec<String>,
+    /// `replacing_mergetree` version column, by name.
+    pub version_column: Option<String>,
+    /// `aggregating_mergetree` summed columns, by name.
+    pub sum_columns: Vec<String>,
+    /// `aggregating_mergetree` counted columns, by name.
+    pub count_columns: Vec<String>,
+}
+
+impl TableEngineSpec {
+    /// True for the MergeTree family, which is what carries an ORDER BY key.
+    pub fn is_merge_tree(&self) -> bool {
+        matches!(
+            self.engine.as_str(),
+            "mergetree" | "replacing_mergetree" | "aggregating_mergetree"
+        )
+    }
+
+    /// True when reads of this table must collapse superseded versions.
+    pub fn is_replacing(&self) -> bool {
+        self.engine == "replacing_mergetree"
+    }
+}
+
 /// Column definition in a table.
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
@@ -243,6 +283,12 @@ pub struct IndexDef {
 pub struct Catalog {
     tables: RwLock<HashMap<String, Arc<TableDef>>>,
     indexes: RwLock<HashMap<String, Arc<IndexDef>>>,
+    /// table_name → storage-engine declaration, for the tables that carry one
+    /// (`WITH (engine = '…')`). See [`TableEngineSpec`].
+    ///
+    /// `parking_lot`, not `tokio`, deliberately: boot reconciliation and the
+    /// columnar read paths consult this from sync contexts.
+    table_engines: parking_lot::RwLock<HashMap<String, TableEngineSpec>>,
     /// User-defined enum types: type_name → ordered list of label strings.
     enum_types: RwLock<HashMap<String, Vec<String>>>,
 
@@ -275,6 +321,7 @@ impl Catalog {
         Self {
             tables: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
+            table_engines: parking_lot::RwLock::new(HashMap::new()),
             enum_types: RwLock::new(HashMap::new()),
             catalog_epoch: AtomicU64::new(0),
             next_table_epoch: AtomicU64::new(1),
@@ -350,11 +397,37 @@ impl Catalog {
         tables.get(name).cloned()
     }
 
+    /// Record (or replace) a table's declared storage engine.
+    pub fn set_table_engine(&self, table: &str, spec: TableEngineSpec) {
+        self.table_engines.write().insert(table.to_string(), spec);
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The declared storage engine for `table`, if it has one.
+    pub fn table_engine(&self, table: &str) -> Option<TableEngineSpec> {
+        self.table_engines.read().get(table).cloned()
+    }
+
+    /// Every table that declares a storage engine, as `(name, spec)`.
+    pub fn table_engines(&self) -> Vec<(String, TableEngineSpec)> {
+        self.table_engines
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Forget a table's engine declaration (DROP TABLE).
+    pub fn remove_table_engine(&self, table: &str) {
+        self.table_engines.write().remove(table);
+    }
+
     pub async fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
         let mut tables = self.tables.write().await;
         if tables.remove(name).is_none() {
             return Err(CatalogError::TableNotFound(name.to_string()));
         }
+        self.table_engines.write().remove(name);
         // Also drop every index that belonged to this table.
         let mut indexes = self.indexes.write().await;
         indexes.retain(|_, idx| idx.table_name != name);
@@ -400,6 +473,12 @@ impl Catalog {
         new_def.name = new_name.to_string();
         let arc_new = Arc::new(new_def);
         tables.insert(new_name.to_string(), Arc::clone(&arc_new));
+        {
+            let mut engines = self.table_engines.write();
+            if let Some(spec) = engines.remove(old_name) {
+                engines.insert(new_name.to_string(), spec);
+            }
+        }
 
         // Update index references
         let mut indexes = self.indexes.write().await;

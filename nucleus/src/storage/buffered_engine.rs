@@ -670,12 +670,13 @@ impl StorageEngine for BufferedDiskEngine {
         if !self.is_in_txn() {
             return self.inner.scan(table).await;
         }
-        Ok(self
+        let rows: Vec<Row> = self
             .overlay_tagged(table, 0)
             .await?
             .into_iter()
             .map(|(_, row)| row)
-            .collect())
+            .collect();
+        Ok(crate::storage::collapse_replacing_scan(table, rows))
     }
 
     /// Delegate the projected read to the disk engine underneath.
@@ -787,6 +788,9 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     fn fast_count_all(&self, table: &str) -> Option<usize> {
+        if crate::storage::fast_path_blocked_by_replacing(table) {
+            return None;
+        }
         // See `index_lookup_sync` — a serializable transaction cannot take
         // its lock from a sync path, so decline and let the async path run.
         if !self.sync_fastpath_allowed() {

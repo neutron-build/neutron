@@ -406,7 +406,7 @@ impl StorageEngine for LsmStorageEngine {
             .into_iter()
             .filter_map(|(_, v)| decode_row(&v))
             .collect();
-        Ok(rows)
+        Ok(crate::storage::collapse_replacing_scan(table, rows))
     }
 
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {

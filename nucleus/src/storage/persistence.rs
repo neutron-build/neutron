@@ -124,11 +124,34 @@ struct IndexDefSer {
     options: Option<std::collections::HashMap<String, String>>,
 }
 
+/// Serializable representation of a table's declared storage engine.
+///
+/// Absent in every catalog file written before this existed, which is precisely
+/// the case boot reconciliation has to cope with — see
+/// [`crate::catalog::TableEngineSpec`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TableEngineSer {
+    table: String,
+    engine: String,
+    #[serde(default)]
+    order_by: Vec<String>,
+    #[serde(default)]
+    version_column: Option<String>,
+    #[serde(default)]
+    sum_columns: Vec<String>,
+    #[serde(default)]
+    count_columns: Vec<String>,
+}
+
 /// The full catalog snapshot, serializable to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CatalogSnapshot {
     tables: Vec<TableDefSer>,
     indexes: Vec<IndexDefSer>,
+    /// Per-table storage-engine declarations. Absent in older files → empty,
+    /// which boot reconciliation then repairs from `engines.json` when it can.
+    #[serde(default)]
+    table_engines: Vec<TableEngineSer>,
     /// High-water mark of the per-table epoch allocator (T0.3). Persisted so a
     /// table recreated after a restart draws a strictly higher generation id
     /// than any predecessor. Absent in pre-v2 files → 0, then re-derived from
@@ -347,6 +370,23 @@ impl CatalogPersistence {
                     },
                 })
                 .collect(),
+            table_engines: {
+                let mut specs: Vec<TableEngineSer> = catalog
+                    .table_engines()
+                    .into_iter()
+                    .map(|(table, spec)| TableEngineSer {
+                        table,
+                        engine: spec.engine,
+                        order_by: spec.order_by,
+                        version_column: spec.version_column,
+                        sum_columns: spec.sum_columns,
+                        count_columns: spec.count_columns,
+                    })
+                    .collect();
+                // Stable order so the file does not churn between saves.
+                specs.sort_by(|a, b| a.table.cmp(&b.table));
+                specs
+            },
             next_table_epoch: catalog.peek_next_table_epoch(),
         };
 
@@ -422,6 +462,19 @@ impl CatalogPersistence {
         let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
         catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
 
+        for e in &snapshot.table_engines {
+            catalog.set_table_engine(
+                &e.table,
+                crate::catalog::TableEngineSpec {
+                    engine: e.engine.clone(),
+                    order_by: e.order_by.clone(),
+                    version_column: e.version_column.clone(),
+                    sum_columns: e.sum_columns.clone(),
+                    count_columns: e.count_columns.clone(),
+                },
+            );
+        }
+
         for i in &snapshot.indexes {
             let index_def = IndexDef {
                 name: i.name.clone(),
@@ -495,6 +548,19 @@ impl CatalogPersistence {
         // (defends against a pre-v2 file that has table epochs but no counter).
         let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
         catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
+
+        for e in &snapshot.table_engines {
+            catalog.set_table_engine(
+                &e.table,
+                crate::catalog::TableEngineSpec {
+                    engine: e.engine.clone(),
+                    order_by: e.order_by.clone(),
+                    version_column: e.version_column.clone(),
+                    sum_columns: e.sum_columns.clone(),
+                    count_columns: e.count_columns.clone(),
+                },
+            );
+        }
 
         // Load indexes
         for i in &snapshot.indexes {

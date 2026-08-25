@@ -24,10 +24,15 @@ use crate::types::Value;
 /// disk, then reconcile the per-table engines.
 async fn open_executor(dir: &Path) -> Executor {
     let catalog = Arc::new(Catalog::new());
+    let catalog_path = dir.join("catalog.json");
+    crate::storage::persistence::CatalogPersistence::new(&catalog_path)
+        .load_catalog(&catalog)
+        .await
+        .unwrap();
     let db_path = dir.join("nucleus.db");
     let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(engine);
-    let ex = Executor::new_with_persistence(catalog, storage, None, Some(dir));
+    let ex = Executor::new_with_persistence(catalog, storage, Some(catalog_path), Some(dir));
     ex.restore_table_engines().await;
     ex
 }
@@ -192,4 +197,121 @@ async fn final_modifier_is_rejected_rather_than_silently_ignored() {
     // A quoted alias that happens to spell the word is still just an alias.
     let ok = ex.execute("SELECT COUNT(*) FROM rep_final AS \"FINAL\"").await;
     assert!(ok.is_ok(), "a quoted alias must keep working: {ok:?}");
+}
+
+/// The exact shape of the live observe instance: the rows are in the DEFAULT
+/// engine (the table predates per-table engine routing), the sidecar is empty,
+/// and the table is declared `replacing_mergetree`. Every read must collapse.
+///
+/// This is the case a naive repair gets catastrophically wrong: registering the
+/// declaration and then routing reads at a freshly opened per-table columnar
+/// engine turns a table that over-counts into a table that reads as empty.
+#[tokio::test]
+async fn legacy_rows_in_the_default_engine_still_collapse_on_every_read() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            "CREATE TABLE rep_legacy (k BIGINT, v BIGINT, version BIGINT)",
+        )
+        .await;
+        // Two versions of key 1, one of key 2. Raw SUM(v) = 55; collapsed = 45.
+        exec(&ex, "INSERT INTO rep_legacy VALUES (1, 10, 1)").await;
+        exec(&ex, "INSERT INTO rep_legacy VALUES (1, 40, 4)").await;
+        exec(&ex, "INSERT INTO rep_legacy VALUES (2, 5, 1)").await;
+        // The migration that declares the engine.
+        exec(
+            &ex,
+            "CREATE TABLE IF NOT EXISTS rep_legacy (k BIGINT, v BIGINT, version BIGINT) \
+             WITH (engine='replacing_mergetree', version_column='version') \
+             ORDER BY (k)",
+        )
+        .await;
+    }
+    let ex = open_executor(dir.path()).await;
+
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT SUM(v) FROM rep_legacy").await[0]),
+        45,
+        "SUM over the whole table"
+    );
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT COUNT(*) FROM rep_legacy").await[0]),
+        2,
+        "COUNT(*) must not be answered from the engine's physical row count"
+    );
+    assert_eq!(
+        count_of(&exec(&ex, "SELECT k, v FROM rep_legacy").await[0]),
+        2,
+        "SELECT *"
+    );
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT SUM(v) FROM rep_legacy WHERE k = 1").await[0]),
+        40,
+        "an equality predicate on the key must not resurrect the superseded row"
+    );
+    assert_eq!(
+        count_of(&exec(&ex, "SELECT k FROM rep_legacy LIMIT 5").await[0]),
+        2,
+        "a LIMIT must not be pushed below the collapse"
+    );
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT MAX(v) FROM rep_legacy").await[0]),
+        40,
+        "MAX over the collapsed rows"
+    );
+    // GROUP BY over the key: one row per key, holding the winning value.
+    let grouped = exec(&ex, "SELECT k, SUM(v) FROM rep_legacy GROUP BY k").await;
+    assert_eq!(count_of(&grouped[0]), 2, "one group per key");
+}
+
+/// The v0.1.8 upgrade path in the other direction: `engines.json` has the entry
+/// (the table was created after the sidecar shipped) but the catalog does not,
+/// because the catalog field is new. Boot must recover the declaration into the
+/// catalog so it survives even if the sidecar is later lost.
+#[tokio::test]
+async fn boot_recovers_the_declaration_from_the_sidecar_into_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            "CREATE TABLE rep_sidecar (k BIGINT, v BIGINT, version BIGINT) \
+             WITH (engine='replacing_mergetree', version_column='version') \
+             ORDER BY (k)",
+        )
+        .await;
+        exec(&ex, "INSERT INTO rep_sidecar VALUES (1, 10, 1)").await;
+        exec(&ex, "INSERT INTO rep_sidecar VALUES (1, 40, 4)").await;
+        ex.checkpoint_table_engines().await;
+    }
+    // Age the CATALOG back: strip the engine declarations it now records,
+    // leaving only engines.json — a database written by v0.1.8.
+    strip_catalog_engines(dir.path());
+
+    let ex = open_executor(dir.path()).await;
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT SUM(v) FROM rep_sidecar").await[0]),
+        40
+    );
+    assert!(
+        ex.catalog().table_engine("rep_sidecar").is_some(),
+        "the declaration must have been recovered into the catalog"
+    );
+}
+
+/// Rewrite `catalog.json` with the `table_engines` array removed, reproducing a
+/// catalog written before that field existed.
+fn strip_catalog_engines(dir: &Path) {
+    let path = dir.join("catalog.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        json.get("table_engines")
+            .is_some_and(|v| !v.as_array().unwrap().is_empty()),
+        "the catalog should be recording engine declarations by now"
+    );
+    json.as_object_mut().unwrap().remove("table_engines");
+    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 }
