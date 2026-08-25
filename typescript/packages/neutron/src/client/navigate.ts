@@ -195,7 +195,10 @@ export function matchRoute(pathname: string, routes: string[]): string | null {
     
     const hasWildcard = routeSegments.includes("*");
     if (!hasWildcard && routeSegments.length !== pathSegments.length) continue;
-    if (hasWildcard && pathSegments.length < routeSegments.length - 1) continue;
+    // The server trie requires at least one segment after the wildcard
+    // (router.ts skips empty wildcard values); zero-remainder paths must
+    // not match here either.
+    if (hasWildcard && pathSegments.length < routeSegments.length) continue;
 
     let matches = true;
     for (let i = 0; i < routeSegments.length; i++) {
@@ -221,23 +224,35 @@ export function matchRoute(pathname: string, routes: string[]): string | null {
   return null;
 }
 
+function safeDecodeSegment(segment: string | undefined): string {
+  if (segment === undefined) return "";
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 export function extractParams(routePattern: string, pathname: string): Record<string, string> {
   const params: Record<string, string> = {};
   const routeSegments = routePattern.split("/").filter(Boolean);
   const pathSegments = pathname.split("/").filter(Boolean);
-  
+
   for (let i = 0; i < routeSegments.length; i++) {
     const routeSeg = routeSegments[i];
     const pathSeg = pathSegments[i];
-    
+
     if (routeSeg.startsWith(":")) {
-      params[routeSeg.slice(1)] = pathSeg;
+      // The server decodes the request path before routing, so params arrive
+      // decoded; the client must decode too or useParams differs pre/post
+      // hydration for percent-encoded segments.
+      params[routeSeg.slice(1)] = safeDecodeSegment(pathSeg);
     } else if (routeSeg === "*") {
-      params["*"] = pathSegments.slice(i).join("/");
+      params["*"] = pathSegments.slice(i).map(safeDecodeSegment).join("/");
       break;
     }
   }
-  
+
   return params;
 }
 

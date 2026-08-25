@@ -93,23 +93,29 @@ defmodule Nucleus.Models.Graph do
     with :ok <- Nucleus.Client.require_nucleus(client, "Graph.neighbors") do
       dir = Atom.to_string(direction)
 
+      # GRAPH_NEIGHBORS's only Ok arm is Value::Text("[...]") — an unknown
+      # node answers "[]", never NULL — and the wire column is TEXT, so only
+      # binaries arrive; anything unexpected raises.
       case Nucleus.Client.query(client, "SELECT GRAPH_NEIGHBORS($1, $2)", [node_id, dir]) do
         {:ok, %{rows: [[json]]}} when is_binary(json) -> {:ok, Jason.decode!(json)}
-        {:ok, %{rows: [[list]]}} when is_list(list) -> {:ok, list}
-        {:ok, %{rows: []}} -> {:ok, []}
         {:error, _} = error -> error
       end
     end
   end
 
-  @doc "Finds the shortest path between two nodes."
+  @doc """
+  Finds the shortest path between two nodes.
+
+  A NULL cell means no path exists — the engine's second Ok arm answers
+  `Value::Null` there even though the wire column is declared TEXT (the
+  LINDEX precedent), so it is handled explicitly instead of raising.
+  """
   @spec shortest_path(client(), integer(), integer()) :: {:ok, list()} | {:error, term()}
   def shortest_path(client, from_id, to_id) do
     with :ok <- Nucleus.Client.require_nucleus(client, "Graph.shortest_path") do
       case Nucleus.Client.query(client, "SELECT GRAPH_SHORTEST_PATH($1, $2)", [from_id, to_id]) do
+        {:ok, %{rows: [[nil]]}} -> {:ok, []}
         {:ok, %{rows: [[json]]}} when is_binary(json) -> {:ok, Jason.decode!(json)}
-        {:ok, %{rows: [[list]]}} when is_list(list) -> {:ok, list}
-        {:ok, %{rows: []}} -> {:ok, []}
         {:error, _} = error -> error
       end
     end

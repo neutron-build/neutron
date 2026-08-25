@@ -496,3 +496,155 @@ describe("EmbeddedTransport", () => {
     assert.equal(affected, 3);
   });
 });
+
+// =========================================================================
+// PgTransactionTransport — pooled-client release on failed COMMIT/ROLLBACK
+// =========================================================================
+//
+// The pool is max: 8. Before the try/finally, a failed COMMIT or ROLLBACK
+// never released its client — 8 failed commits permanently deadlocked the
+// app. beginTransaction DID release on error; the asymmetry was the miss.
+// These are the first behavioral tests for the Pg transaction transport
+// (previously only an instanceof check existed).
+
+import { PgTransactionTransport } from "./index.js";
+
+interface FakeClientLog {
+  queries: string[];
+  releases: Array<Error | undefined>;
+}
+
+function makeFakeClient(failOn?: string): { client: any; log: FakeClientLog } {
+  const log: FakeClientLog = { queries: [], releases: [] };
+  const client = {
+    async query(sql: string) {
+      log.queries.push(sql);
+      if (sql === failOn) throw new Error(`${sql} failed (connection died)`);
+      return { rows: [], rowCount: 0 };
+    },
+    release(err?: Error) {
+      log.releases.push(err);
+    },
+  };
+  return { client, log };
+}
+
+describe("PgTransactionTransport pooled-client release", () => {
+  it("releases the client (with the error) when COMMIT fails", async () => {
+    const { client, log } = makeFakeClient("COMMIT");
+    const tx = new PgTransactionTransport(client);
+
+    await assert.rejects(tx.commit(), /COMMIT failed/);
+    assert.equal(log.releases.length, 1, "client must be released exactly once");
+    assert.ok(log.releases[0] instanceof Error, "failed COMMIT must release(err) so the pool destroys the connection");
+
+    // The transport is finished; further use fails loudly, not by leaking.
+    await assert.rejects(tx.query("SELECT 1"), /already finished/);
+  });
+
+  it("releases the client (with the error) when ROLLBACK fails", async () => {
+    const { client, log } = makeFakeClient("ROLLBACK");
+    const tx = new PgTransactionTransport(client);
+
+    await assert.rejects(tx.rollback(), /ROLLBACK failed/);
+    assert.equal(log.releases.length, 1);
+    assert.ok(log.releases[0] instanceof Error);
+  });
+
+  it("releases the client cleanly on successful COMMIT", async () => {
+    const { client, log } = makeFakeClient();
+    const tx = new PgTransactionTransport(client);
+
+    await tx.commit();
+    assert.equal(log.releases.length, 1);
+    assert.equal(log.releases[0], undefined);
+  });
+
+  it("eight failed commits do not exhaust the pool (every client released)", async () => {
+    // The deadlock shape: pool max is 8. Each failed transaction must hand
+    // its client back, so the ninth connect() still succeeds.
+    const released: Array<Error | undefined> = [];
+    let live = 0;
+    let peak = 0;
+    const pool = {
+      async connect() {
+        live += 1;
+        peak = Math.max(peak, live);
+        return {
+          async query(sql: string) {
+            if (sql === "COMMIT") throw new Error("commit failed");
+            return { rows: [], rowCount: 0 };
+          },
+          release(err?: Error) {
+            released.push(err);
+            live -= 1;
+          },
+        };
+      },
+    };
+    for (let i = 0; i < 9; i++) {
+      const client = await pool.connect();
+      const tx = new PgTransactionTransport(client);
+      await assert.rejects(tx.commit(), /commit failed/);
+    }
+    assert.equal(released.length, 9, "all nine failed commits released their client");
+    assert.equal(live, 0, "no client stays checked out");
+    assert.ok(peak <= 1, "clients are not held across transactions");
+  });
+});
+
+// =========================================================================
+// PgTransport — lazy pool creation
+// =========================================================================
+//
+// getPool() used to be check-then-await-then-assign: two concurrent first
+// queries both saw `pool === null`, both awaited loadPg(), and both
+// constructed a Pool — the loser was orphaned and its connections never
+// .end()ed. The memoization must be synchronous (assign the promise before
+// the first await).
+
+describe("PgTransport lazy pool creation", () => {
+  it("constructs exactly one pool for concurrent first queries", async () => {
+    // Patch the shared pg module exports (CJS exports object is mutable; the
+    // transport resolves `import('pg')` lazily, so nothing has cached a Pool
+    // constructor before this point in the process).
+    const mod = (await import("pg")) as unknown as { default?: Record<string, unknown> };
+    const pgExports = (mod.default ?? (mod as unknown as Record<string, unknown>)) as {
+      Pool?: unknown;
+    };
+    const RealPool = pgExports.Pool;
+    let constructed = 0;
+    let ended = 0;
+    class CountingPool {
+      constructor(_cfg: unknown) {
+        constructed++;
+        return {
+          on: () => {},
+          query: async () => ({ rows: [{ result: 1 }], rowCount: 1 }),
+          end: async () => {
+            ended++;
+          },
+          connect: async () => {
+            throw new Error("connect not used by this test");
+          },
+        };
+      }
+    }
+    pgExports.Pool = CountingPool;
+    try {
+      const transport = new PgTransport("postgres://nucleus@localhost:5432/nucleus");
+      const [a, b] = await Promise.all([
+        transport.query("SELECT 1 AS a"),
+        transport.query("SELECT 2 AS b"),
+      ]);
+      assert.equal(a.rows.length, 1);
+      assert.equal(b.rows.length, 1);
+      assert.equal(constructed, 1, "concurrent first queries must share one pool (no orphan)");
+
+      await transport.close();
+      assert.equal(ended, 1, "close() ends the pool");
+    } finally {
+      pgExports.Pool = RealPool;
+    }
+  });
+});

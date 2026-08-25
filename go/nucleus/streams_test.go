@@ -3,11 +3,13 @@ package nucleus
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestStreamEntryStruct(t *testing.T) {
@@ -278,6 +280,89 @@ func TestStreamXReadGroup(t *testing.T) {
 	}
 	if entries[0].Fields["task"] != "process" {
 		t.Errorf("Fields = %v", entries[0].Fields)
+	}
+}
+
+func TestStreamXReadGroupNOGROUPSurfaces(t *testing.T) {
+	// Nucleus v0.1.8 answers XREADGROUP on a missing group with a statement
+	// error (SQLSTATE 22000) instead of an empty result. The error must
+	// surface, not read as "caught up".
+	q := &mockCDCQuerier{
+		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return &mockCDCRow{scanFn: func(dest ...any) error {
+				return &pgconn.PgError{
+					Code:    "22000",
+					Message: "NOGROUP No such consumer group 'workers' for stream 'events'",
+				}
+			}}
+		},
+	}
+
+	s := &StreamModel{pool: q, client: nucleusClient()}
+	entries, err := s.XReadGroup(context.Background(), "events", "workers", "w1", 10)
+	if err == nil {
+		t.Fatal("expected NOGROUP error, got nil")
+	}
+	if entries != nil {
+		t.Errorf("entries = %v, want nil", entries)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("error does not wrap *pgconn.PgError: %v", err)
+	}
+	if !strings.Contains(pgErr.Message, "NOGROUP") {
+		t.Errorf("message = %q, want NOGROUP mention", pgErr.Message)
+	}
+}
+
+func TestStreamXReadGroupEmptyDeliveryIsJSONEmptyArray(t *testing.T) {
+	// An empty delivery is "[]", not "": "" is no longer a possible
+	// XREADGROUP result and is not mapped to an empty batch.
+	q := &mockCDCQuerier{
+		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return &mockCDCRow{scanFn: func(dest ...any) error {
+				*(dest[0].(*string)) = "[]"
+				return nil
+			}}
+		},
+	}
+
+	s := &StreamModel{pool: q, client: nucleusClient()}
+	entries, err := s.XReadGroup(context.Background(), "events", "workers", "w1", 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("entries len = %d, want 0", len(entries))
+	}
+}
+
+func TestStreamXGroupCreateBUSYGROUPSurfaces(t *testing.T) {
+	// Nucleus v0.1.8 answers XGROUP_CREATE on an existing group with a
+	// statement error (SQLSTATE 23000) instead of silently resetting the
+	// cursor. The error must surface.
+	q := &mockCDCQuerier{
+		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return &mockCDCRow{scanFn: func(dest ...any) error {
+				return &pgconn.PgError{
+					Code:    "23000",
+					Message: "BUSYGROUP Consumer Group name already exists",
+				}
+			}}
+		},
+	}
+
+	s := &StreamModel{pool: q, client: nucleusClient()}
+	_, err := s.XGroupCreate(context.Background(), "events", "workers", 0)
+	if err == nil {
+		t.Fatal("expected BUSYGROUP error, got nil")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("error does not wrap *pgconn.PgError: %v", err)
+	}
+	if !strings.Contains(pgErr.Message, "BUSYGROUP") {
+		t.Errorf("message = %q, want BUSYGROUP mention", pgErr.Message)
 	}
 }
 

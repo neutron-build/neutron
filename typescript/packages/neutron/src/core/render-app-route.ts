@@ -39,7 +39,7 @@ import type {
   HeadersArgs,
   ErrorBoundaryProps,
 } from "./types.js";
-import type { NeutronLoaderCacheStore } from "../server/cache-store.js";
+import { normalizeCachePathname, type NeutronLoaderCacheStore } from "../server/cache-store.js";
 
 const TEXT_ENCODER = new TextEncoder();
 type StreamRenderFn = (element: preact.VNode) => ReadableStream<Uint8Array> & {
@@ -177,8 +177,21 @@ function buildLoaderDataCacheKey(
   params: Record<string, string>
 ): string {
   const url = new URL(request.url);
+  // The key must be in the same canonical form `deleteByPath` invalidates by:
+  // decoded, trailing slash stripped. Keying the raw request path made
+  // `/a%20b` and `/foo/` entries invisible to mutation invalidation.
+  // Unnormalizable paths fall back to the raw spelling (cacheable, same as
+  // before — they were never invalidatable anyway).
+  const canonicalPath = normalizeCachePathname(url.pathname) ?? url.pathname;
   const encodedParams = stableEncodeParams(params);
-  return `${url.pathname}::${url.search}::${routeId}::${encodedParams}`;
+  // Loaders may personalize on Accept-Language (Cookie/Authorization-bearing
+  // requests are excluded from caching entirely by
+  // isLoaderDataCacheableRequest, but other headers are not). Without the
+  // header in the key, one locale's loader output is served to everyone
+  // under loaderMaxAge — the same reason an HTTP cache emits
+  // `Vary: Accept-Language`.
+  const acceptLanguage = request.headers.get("accept-language") ?? "";
+  return `${canonicalPath}::${url.search}::${routeId}::${encodedParams}::${acceptLanguage}`;
 }
 
 async function readCachedLoaderData(

@@ -78,25 +78,28 @@ async function createNucleusDrizzle(
   // Optionally create the Nucleus multi-model client.
   // This uses `@neutron-build/nucleus` which may not be installed in every project.
   let nucleus: unknown | null = null;
+  type NucleusFactory = (config: { url: string }) => {
+    use: (plugin: unknown) => unknown;
+    connect: () => Promise<unknown>;
+  };
+  let createNucleusClient: NucleusFactory | undefined;
   try {
-    const nucleusModule = await lazyImport<{
-      createClient?: (config: { url: string }) => {
-        use: (plugin: unknown) => unknown;
-        connect: () => Promise<unknown>;
-      };
-    }>(
+    const nucleusModule = await lazyImport<{ createClient?: NucleusFactory }>(
       "@neutron-build/nucleus",
       "@neutron-build/nucleus is optional for multi-model features"
     );
-
-    if (nucleusModule.createClient) {
-      nucleus = await nucleusModule.createClient({
-        url: profile.connectionString,
-      }).connect();
-    }
+    createNucleusClient = nucleusModule.createClient;
   } catch {
-    // @neutron-build/nucleus not installed — Drizzle-only mode is fine.
+    // Only the import belongs in the try: a missing module legitimately means
+    // Drizzle-only mode. A failed connect() (server down, auth rejected) must
+    // surface — swallowing it here silently degraded Nucleus profiles to
+    // `nucleus: null` with no error and no log.
     nucleus = null;
+  }
+  if (createNucleusClient) {
+    nucleus = await createNucleusClient({
+      url: profile.connectionString,
+    }).connect();
   }
 
   return {

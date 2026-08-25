@@ -232,3 +232,102 @@ test("objectSchema omits an empty required list", () => {
   assert.ok(objectSchema().properties, "the properties key must exist or clients see no arguments object");
   assert.equal("required" in objectSchema(), false, "an empty required list must be omitted, not sent as []");
 });
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Settle-or-fail wrapper: a hang is a failing test, not a slow one. */
+function withDeadline<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
+/** A pull-driven body that never ends — memory pressure only if the reader drains it. */
+function endlessBody(chunkBytes = 64 * 1024): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    async pull(controller) {
+      // Yield between chunks: a purely synchronous pull loop starves timers,
+      // which would turn a hang into a frozen event loop. The try/catch keeps
+      // a post-cancel enqueue from surfacing as an unhandled rejection.
+      await delay(0);
+      try {
+        controller.enqueue(new Uint8Array(chunkBytes));
+      } catch {
+        // canceled mid-pull
+      }
+    },
+  });
+}
+
+/** Headers arrive immediately; the body drips one small chunk forever. */
+function drippingBody(chunk: string, intervalMs: number): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    async pull(controller) {
+      await delay(intervalMs);
+      try {
+        controller.enqueue(encoder.encode(chunk));
+      } catch {
+        // canceled mid-pull
+      }
+    },
+  });
+}
+
+test("the request body limit bounds the read, not just the check afterwards", async () => {
+  const { server } = fixture({ name: "owner" });
+  const request = new Request("http://mcp.test/api/mcp", {
+    method: "POST",
+    headers: { authorization: "Bearer tok" },
+    body: endlessBody(),
+    // undici requires duplex for stream bodies; the TS lib here predates it.
+    duplex: "half",
+  } as RequestInit);
+  const response = await withDeadline(
+    server.handler(request),
+    2000,
+    "handler did not settle — it is draining an endless body",
+  );
+  const body = (await response.json()) as { error?: { code: number; message: string } };
+  assert.equal(body.error?.code, -32700);
+  assert.match(body.error?.message ?? "", /too large/);
+});
+
+test("the response body limit bounds the read, not just the check afterwards", async () => {
+  const client = createMcpClient({
+    endpoint: "http://mcp.test/api/mcp",
+    fetch: (async () =>
+      new Response(endlessBody(), { headers: { "content-type": "application/json" } })) as typeof globalThis.fetch,
+  });
+  await assert.rejects(
+    () =>
+      withDeadline(
+        client.callTool("read_thing"),
+        2000,
+        "client did not settle — it is draining an endless response",
+      ),
+    /too large/,
+  );
+});
+
+test("the per-call timeout covers the response body, not only the headers", async () => {
+  const client = createMcpClient({
+    endpoint: "http://mcp.test/api/mcp",
+    timeoutMs: 100,
+    fetch: (async () =>
+      new Response(drippingBody("{}", 50), { headers: { "content-type": "application/json" } })) as typeof globalThis.fetch,
+  });
+  await assert.rejects(
+    () =>
+      withDeadline(
+        client.callTool("read_thing"),
+        2000,
+        "client did not settle — the body read has no deadline",
+      ),
+    (err: unknown) => {
+      assert.match((err as Error).message, /timed out|abort/i);
+      return true;
+    },
+  );
+});

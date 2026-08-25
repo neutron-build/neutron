@@ -215,53 +215,63 @@ class DocumentModelImpl implements DocumentModel {
     return (await this.transport.fetchval<number>(sql, args)) ?? 0;
   }
 
+  /**
+   * Compare two field values for sorting. Numbers compare numerically —
+   * `String()` comparison would sort 10 before 9. Everything else compares
+   * as strings, as before.
+   */
+  private static compareValues(va: unknown, vb: unknown): number {
+    if (typeof va === 'number' && typeof vb === 'number') {
+      return va - vb;
+    }
+    return String(va ?? '').localeCompare(String(vb ?? ''));
+  }
+
+  /** Shared post-processing for find/findTyped: sort, skip, limit, project. */
+  private static applyFindOptions<T extends Record<string, unknown>>(results: T[], opts: DocFindOptions): T[] {
+    if (opts.sortField) {
+      const field = opts.sortField;
+      const asc = opts.sortAsc ?? true;
+      results.sort((a, b) => {
+        const cmp = DocumentModelImpl.compareValues(a[field], b[field]);
+        return asc ? cmp : -cmp;
+      });
+    }
+
+    let out = results;
+    if (opts.skip && opts.skip > 0) {
+      out = out.slice(opts.skip);
+    }
+    if (opts.limit && opts.limit > 0) {
+      out = out.slice(0, opts.limit);
+    }
+    if (opts.fields && opts.fields.length > 0) {
+      const keep = new Set(opts.fields);
+      out = out.map((doc) => {
+        const projected: Record<string, unknown> = {};
+        for (const f of keep) {
+          if (f in doc) projected[f] = doc[f];
+        }
+        return projected as T;
+      });
+    }
+    return out;
+  }
+
   async find(
     collection: string,
     filter: Record<string, unknown>,
     opts: DocFindOptions = {},
   ): Promise<Record<string, unknown>[]> {
     const ids = await this.queryDocsIn(collection, filter);
-    let results: Record<string, unknown>[] = [];
+    const results: Record<string, unknown>[] = [];
 
     for (const id of ids) {
       const doc = await this.getIn(collection, id);
       if (doc) results.push(doc);
     }
 
-    // Sort
-    if (opts.sortField) {
-      const field = opts.sortField;
-      const asc = opts.sortAsc ?? true;
-      results.sort((a, b) => {
-        const va = String(a[field] ?? '');
-        const vb = String(b[field] ?? '');
-        return asc ? va.localeCompare(vb) : vb.localeCompare(va);
-      });
-    }
-
-    // Skip
-    if (opts.skip && opts.skip > 0) {
-      results = results.slice(opts.skip);
-    }
-
-    // Limit
-    if (opts.limit && opts.limit > 0) {
-      results = results.slice(0, opts.limit);
-    }
-
-    // Projection
-    if (opts.fields && opts.fields.length > 0) {
-      const keep = new Set(opts.fields);
-      results = results.map((doc) => {
-        const projected: Record<string, unknown> = {};
-        for (const f of keep) {
-          if (f in doc) projected[f] = doc[f];
-        }
-        return projected;
-      });
-    }
-
-    return results;
+    return DocumentModelImpl.applyFindOptions(results, opts);
   }
 
   async findTyped<T>(
@@ -270,17 +280,14 @@ class DocumentModelImpl implements DocumentModel {
     opts: DocFindOptions = {},
   ): Promise<T[]> {
     const ids = await this.queryDocsIn(collection, filter);
-    let results: T[] = [];
+    const results: Record<string, unknown>[] = [];
 
     for (const id of ids) {
       const item = await this.getTypedIn<T>(collection, id);
-      if (item !== null) results.push(item);
+      if (item !== null) results.push(item as Record<string, unknown>);
     }
 
-    if (opts.skip && opts.skip > 0) results = results.slice(opts.skip);
-    if (opts.limit && opts.limit > 0) results = results.slice(0, opts.limit);
-
-    return results;
+    return DocumentModelImpl.applyFindOptions(results, opts) as T[];
   }
 
   async findOne(

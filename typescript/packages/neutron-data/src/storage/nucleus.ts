@@ -52,6 +52,9 @@ export class NucleusStorageDriver implements StorageDriver {
     return {
       key,
       body: result.data,
+      // The blob model returns the stored metadata; dropping it made a
+      // put-then-get lose the content type (the S3 driver round-trips it).
+      contentType: readContentType(result.meta),
     };
   }
 
@@ -65,4 +68,12 @@ export class NucleusStorageDriver implements StorageDriver {
  */
 export function createNucleusStorageDriver(options: NucleusStorageDriverOptions): NucleusStorageDriver {
   return new NucleusStorageDriver(options);
+}
+
+function readContentType(meta: unknown): string | undefined {
+  if (meta && typeof meta === "object" && "contentType" in meta) {
+    const value = (meta as { contentType?: unknown }).contentType;
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
 }

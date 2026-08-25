@@ -30,4 +30,18 @@ describe("highlightCode", () => {
     expect(html).toContain("&lt;b&gt;");
     expect(html).not.toContain("<b>&</b>");
   });
+
+  it("escapes the language before interpolating it into the class attribute", async () => {
+    const html = await highlightCode("x", 'nope" onclick="alert(1)');
+    // The fence info-string is untrusted; it must not break out of the
+    // class attribute in the fallback path.
+    expect(html).toContain("language-nope&quot;");
+    expect(html).not.toContain('onclick="alert');
+  });
+
+  it("loads a second theme after the first (per-theme highlighters)", async () => {
+    await highlightCode("const x = 1;", "js", "github-dark");
+    const html = await highlightCode("const x = 1;", "js", "github-light");
+    expect(html).toContain("const");
+  });
 });

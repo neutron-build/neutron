@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const router_mod = @import("router.zig");
+const http_parser = @import("../layer0/http/parser.zig");
 
 pub const Route = router_mod.Route;
 pub const Method = router_mod.Method;
@@ -157,7 +158,7 @@ pub fn docsHandler(comptime spec_path: []const u8) router_mod.HandlerFn {
             ++ spec_path ++
                 \\",dom_id:"#swagger-ui"})</script></body></html>
             ;
-            const headers = [_]router_mod.Header{
+            const headers = [_]http_parser.Header{
                 .{ .name = "Content-Type", .value = "text/html" },
             };
             try ctx.respond(200, &headers, html);
@@ -214,6 +215,17 @@ test "generateStructSchema" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"name\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"active\"") != null);
+}
+
+// docsHandler was never referenced by any test or example, so it silently
+// did not compile (it referenced router_mod.Header, which does not exist)
+// until the conformance app (S41). Referencing both handlers forces their
+// full analysis.
+test "specHandler and docsHandler analyze as handlers" {
+    const s = specHandler("{}");
+    try std.testing.expect(@intFromPtr(s) != 0);
+    const d = docsHandler("/openapi.json");
+    try std.testing.expect(@intFromPtr(d) != 0);
 }
 
 fn dummyHandler(_: *router_mod.RequestContext) anyerror!void {}

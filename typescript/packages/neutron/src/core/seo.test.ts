@@ -124,4 +124,29 @@ describe("seo utilities", () => {
     const links = Array.isArray(merged?.link) ? merged?.link : [merged?.link];
     expect(links?.length).toBe(2);
   });
+
+  it("sanitizes attribute names in renderMetaTags (no attribute injection)", () => {
+    const html = renderMetaTags([
+      {
+        tag: "link",
+        attrs: {
+          rel: "icon",
+          'href="/evil" onclick="alert(1)': "payload",
+        } as Record<string, string>,
+      },
+    ]);
+    expect(html).not.toContain('onclick="');
+    expect(html).not.toContain('href="/evil"');
+  });
+
+  it("drops event-handler attribute names in renderMetaTags", () => {
+    const html = renderMetaTags([
+      {
+        tag: "link",
+        attrs: { rel: "icon", href: "/ok", onload: "alert(1)" } as Record<string, string>,
+      },
+    ]);
+    expect(html).not.toContain("onload");
+    expect(html).toContain('rel="icon"');
+  });
 });

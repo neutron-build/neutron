@@ -168,6 +168,22 @@ class MockTxTransport implements TransactionTransport {
 // Helpers for features
 // =========================================================================
 
+/** MockTransport variant that serves distinct documents per id (DOC_GET). */
+class DocStoreTransport extends MockTransport {
+  docs = new Map<string, string>();
+  ids: number[] = [];
+
+  override async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
+    if (sql.startsWith("SELECT DOC_GET")) {
+      return (this.docs.get(String(params[1])) ?? null) as T;
+    }
+    if (sql.startsWith("SELECT DOC_QUERY")) {
+      return this.ids.join(",") as unknown as T;
+    }
+    return super.fetchval<T>(sql, params);
+  }
+}
+
 function nucleusFeatures(): NucleusFeatures {
   return {
     isNucleus: true,
@@ -601,6 +617,15 @@ describe("withKV plugin", () => {
     assert.equal(result, true);
   });
 
+  it("setNX prepends namespace like its siblings", async () => {
+    transport.onFetchval("SELECT KV_SETNX", true);
+    await kv.setNX("key", "value", { namespace: "cache", ttl: 30 });
+    const call = transport.calls[0];
+    const params = call.args[1] as unknown[];
+    assert.ok(params.includes("cache:key"));
+    assert.ok(params.includes(30));
+  });
+
   it("delete sends KV_DEL SQL", async () => {
     transport.onFetchval("SELECT KV_DEL", true);
     const result = await kv.delete("key");
@@ -799,6 +824,37 @@ describe("withDocument plugin", () => {
   it("throws on PostgreSQL", async () => {
     const pgDoc = withDocument.init(transport, pgFeatures()).document;
     await assert.rejects(() => pgDoc.insert("coll", {}), NucleusFeatureError);
+  });
+
+  it("find sorts numeric fields numerically, not lexicographically", async () => {
+    const docTransport = new DocStoreTransport();
+    docTransport.ids = [1, 2, 3];
+    docTransport.docs.set("1", JSON.stringify({ title: "a", count: 10 }));
+    docTransport.docs.set("2", JSON.stringify({ title: "b", count: 9 }));
+    docTransport.docs.set("3", JSON.stringify({ title: "c", count: 2 }));
+    const docStore = withDocument.init(docTransport, nucleusFeatures()).document;
+
+    const out = await docStore.find("posts", {}, { sortField: "count" });
+    assert.deepEqual(
+      out.map((d) => d.count),
+      [2, 9, 10],
+    );
+  });
+
+  it("findTyped honors sortField, sortAsc and fields", async () => {
+    const docTransport = new DocStoreTransport();
+    docTransport.ids = [1, 2, 3];
+    docTransport.docs.set("1", JSON.stringify({ title: "a", count: 10 }));
+    docTransport.docs.set("2", JSON.stringify({ title: "b", count: 9 }));
+    docTransport.docs.set("3", JSON.stringify({ title: "c", count: 2 }));
+    const docStore = withDocument.init(docTransport, nucleusFeatures()).document;
+
+    const out = await docStore.findTyped<{ count: number }>("posts", {}, {
+      sortField: "count",
+      sortAsc: false,
+      fields: ["count"],
+    });
+    assert.deepEqual(out, [{ count: 10 }, { count: 9 }, { count: 2 }]);
   });
 });
 
@@ -1011,6 +1067,17 @@ describe("withBlob plugin", () => {
     assert.equal(params[1], "abcdef");
   });
 
+  it("put rejects non-hex string data at write time", async () => {
+    // fromHex validates on read; without write-side validation, garbage
+    // written now throws confusingly on every later read.
+    await assert.rejects(() => blob.put("bucket", "key", "zzzz"), /Invalid hex/);
+    assert.equal(transport.calls.length, 0);
+  });
+
+  it("put rejects odd-length string data at write time", async () => {
+    await assert.rejects(() => blob.put("bucket", "key", "abc"), /Invalid hex/);
+  });
+
   it("put stores metadata tags", async () => {
     await blob.put("bucket", "key", "aa", { metadata: { env: "prod" } });
     // Should have 2 calls: BLOB_STORE + BLOB_TAG
@@ -1114,6 +1181,33 @@ describe("withTimeSeries plugin", () => {
 // Streams plugin
 // ---------------------------------------------------------------------------
 
+/** Transport whose fetchval/query reject with a driver-style error. */
+class RejectingTransport implements Transport {
+  constructor(private readonly error: unknown) {}
+
+  async query<T>(): Promise<QueryResult<T>> {
+    throw this.error;
+  }
+
+  async execute(): Promise<number> {
+    throw this.error;
+  }
+
+  async fetchval<T>(): Promise<T | null> {
+    throw this.error;
+  }
+
+  async beginTransaction(): Promise<TransactionTransport> {
+    throw this.error;
+  }
+
+  async close(): Promise<void> {}
+
+  async ping(): Promise<void> {
+    throw this.error;
+  }
+}
+
 describe("withStreams plugin", () => {
   let transport: MockTransport;
   let streams: ReturnType<typeof withStreams.init>["streams"];
@@ -1152,6 +1246,68 @@ describe("withStreams plugin", () => {
     transport.onFetchval("SELECT STREAM_XGROUP_CREATE", true);
     const result = await streams.xgroupCreate("mystream", "grp", 0);
     assert.equal(result, true);
+  });
+
+  it("xreadGroup returns [] when caught up (payload is \"[]\")", async () => {
+    transport.onFetchval("SELECT STREAM_XREADGROUP", "[]");
+    const entries = await streams.xreadGroup("mystream", "grp", "c1", 10);
+    assert.deepEqual(entries, []);
+  });
+
+  it("xreadGroup surfaces NOGROUP for a missing group (pg error, SQLSTATE 22000)", async () => {
+    const nogroup = Object.assign(
+      new Error("NOGROUP No such consumer group 'grp' for stream 'mystream'"),
+      { code: "22000" },
+    );
+    const failing = new RejectingTransport(nogroup);
+    const s = withStreams.init(failing, nucleusFeatures()).streams;
+    await assert.rejects(() => s.xreadGroup("mystream", "grp", "c1", 10), (err: unknown) => {
+      assert.match((err as Error).message, /NOGROUP/);
+      assert.equal((err as { code?: string }).code, "22000");
+      return true;
+    });
+  });
+
+  it("xreadGroup rejects an empty payload instead of reading it as caught-up", async () => {
+    // Since Nucleus v0.1.8 a caught-up success carries "[]", never "".
+    // An empty payload is a contract violation — swallowing it as [] is how
+    // a vanished group silently skips every unprocessed entry.
+    transport.onFetchval("SELECT STREAM_XREADGROUP", "");
+    await assert.rejects(() => streams.xreadGroup("mystream", "grp", "c1", 10), NucleusQueryError);
+  });
+
+  it("xgroupCreate surfaces BUSYGROUP for an existing group (SQLSTATE 23000)", async () => {
+    const busy = Object.assign(
+      new Error("BUSYGROUP Consumer Group name already exists"),
+      { code: "23000" },
+    );
+    const failing = new RejectingTransport(busy);
+    const s = withStreams.init(failing, nucleusFeatures()).streams;
+    await assert.rejects(() => s.xgroupCreate("mystream", "grp", 0), (err: unknown) => {
+      assert.match((err as Error).message, /BUSYGROUP/);
+      assert.equal((err as { code?: string }).code, "23000");
+      return true;
+    });
+  });
+
+  it("xadd surfaces engine failures (rejected WAL write)", async () => {
+    const err = Object.assign(
+      new Error("STREAM_XADD could not log entry 5-0 for stream 'mystream': No space left on device"),
+      { code: "53100" },
+    );
+    const failing = new RejectingTransport(err);
+    const s = withStreams.init(failing, nucleusFeatures()).streams;
+    await assert.rejects(() => s.xadd("mystream", { a: "b" }), /STREAM_XADD/);
+  });
+
+  it("xrange maps an empty payload to [] (missing stream legitimately answers \"\")", async () => {
+    transport.onFetchval("SELECT STREAM_XRANGE", "");
+    assert.deepEqual(await streams.xrange("missing", 0, 10000, 10), []);
+  });
+
+  it("xread maps an empty payload to [] (missing stream legitimately answers \"\")", async () => {
+    transport.onFetchval("SELECT STREAM_XREAD", "");
+    assert.deepEqual(await streams.xread("missing", 0, 10), []);
   });
 
   it("throws on PostgreSQL", async () => {

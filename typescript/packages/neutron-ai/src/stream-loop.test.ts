@@ -170,3 +170,38 @@ test("resuming a suspended run streams the held tool result first", async () => 
   ]);
   assert.equal(await resumed.text, "done");
 });
+
+test("an abandoned stream settles result promises instead of hanging", async () => {
+  const { model } = scriptedStreamModel([
+    [
+      { type: "text-delta", text: "partial output" },
+      { type: "finish", finishReason: "stop", usage: usage(2, 2) },
+    ],
+  ]);
+  const result = streamText({ model, prompt: "go" });
+
+  for await (const _part of result.textStream) {
+    break; // abandon after the first delta
+  }
+
+  // Pre-fix witness: the promise never settled at all — race a deadline so
+  // the failure mode is a fast assertion, not a hung test process.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"hang">((resolve) => {
+    timer = setTimeout(() => resolve("hang"), 500);
+  });
+  const outcome = await Promise.race([
+    result.text.then(
+      () => "settled" as const,
+      () => "settled" as const,
+    ),
+    deadline,
+  ]);
+  clearTimeout(timer);
+  assert.notEqual(
+    outcome,
+    "hang",
+    "result.text must settle after the stream is abandoned; it used to hang forever",
+  );
+  await assert.rejects(result.text, /abandoned/);
+});

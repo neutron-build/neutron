@@ -57,3 +57,25 @@ test("emits a trailing event missing its final delimiter", async () => {
   const events = await collect(streamFromChunks(["data: tail"]));
   assert.deepEqual(events, [{ data: "tail" }]);
 });
+
+test("an early exit cancels the body instead of abandoning it", async () => {
+  // A consumer that stops at a terminal event (message_stop, [DONE]) must not
+  // leave the provider connection streaming into the void until GC. Release
+  // alone leaves the underlying stream unread-but-open.
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(encoder.encode("data: chunk\n\n"));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  for await (const _event of parseSSE(body)) {
+    break; // terminal event seen — stop reading
+  }
+
+  assert.equal(cancelled, true, "the generator must cancel the body on early exit");
+});

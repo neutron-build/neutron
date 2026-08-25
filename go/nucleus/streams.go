@@ -113,11 +113,10 @@ func (s *StreamModel) XReadGroup(ctx context.Context, stream, group, consumer st
 	err := s.pool.QueryRow(ctx, "SELECT STREAM_XREADGROUP($1, $2, $3, $4)",
 		stream, group, consumer, count).Scan(&raw)
 	if err != nil {
+		// A missing group (or stream) answers NOGROUP as a statement error
+		// since Nucleus v0.1.8 and surfaces here; it must not read as an
+		// empty batch, which is what "caught up" looks like.
 		return nil, wrapErr("stream xreadgroup", err)
-	}
-	// The engine returns an empty string for a missing stream
-	if raw == "" {
-		return nil, nil
 	}
 	var entries []StreamEntry
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {

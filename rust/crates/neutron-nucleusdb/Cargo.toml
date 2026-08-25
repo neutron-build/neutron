@@ -1,5 +1,8 @@
 [package]
-name = "neutron-nucleus"
+# Named after its dependency, like every neutron-* integration crate. The
+# database's Cargo artifact is `nucleusdb` (bare `nucleus` is taken on
+# crates.io by an unrelated 2020 crate), so this crate is neutron-nucleusdb.
+name = "neutron-nucleusdb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

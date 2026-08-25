@@ -111,6 +111,47 @@ export function validateEndpoint(raw: string): string {
   return trimmed.replace(/\/+$/, "");
 }
 
+/**
+ * Read a stream to text, stopping at `limit` bytes. The bound must bound the
+ * read itself: `await response.text()` buffers the whole body first, so a check
+ * placed after it does nothing about memory. Content-length is checked before
+ * reading when present; chunked bodies are capped mid-stream. On `signal` abort
+ * the reader is canceled, which stops the read loop even when the body came
+ * from an injected fetch that ignores the signal.
+ */
+async function readTextWithLimit(
+  body: ReadableStream<Uint8Array> | null,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<{ text: string; oversize: boolean; aborted: boolean }> {
+  if (!body) return { text: "", oversize: false, aborted: false };
+  const reader = body.getReader();
+  let aborted = false;
+  const onAbort = () => {
+    aborted = true;
+    void reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const decoder = new TextDecoder();
+  let text = "";
+  let seen = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      seen += value.byteLength;
+      if (seen > limit) {
+        await reader.cancel().catch(() => {});
+        return { text: "", oversize: true, aborted: false };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return { text: text + decoder.decode(), oversize: false, aborted };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 export function createMcpClient(options: McpClientOptions): McpClient {
   const endpoint = options.endpoint.replace(/\/+$/, "");
   const doFetch = options.fetch ?? globalThis.fetch;
@@ -120,56 +161,94 @@ export function createMcpClient(options: McpClientOptions): McpClient {
 
   async function call(method: string, params: unknown): Promise<unknown> {
     const controller = new AbortController();
+    // One deadline for the whole call — headers AND body. Clearing the timer
+    // when the headers arrive would let a slow-dripping body hang the call
+    // past timeoutMs, so it stays armed until everything settles.
+    const deadlineAt = Date.now() + timeoutMs;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
     try {
-      response = await doFetch(endpoint, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json",
-          // Both the header and the initialize parameter are offered because
-          // servers disagree about which they read, and sending both costs
-          // nothing.
-          "mcp-protocol-version": protocol,
-          ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-          ...(options.headers ?? {}),
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method, params }),
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`calling ${method}: ${message}`);
+      let response: Response;
+      try {
+        response = await doFetch(endpoint, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json",
+            // Both the header and the initialize parameter are offered because
+            // servers disagree about which they read, and sending both costs
+            // nothing.
+            "mcp-protocol-version": protocol,
+            ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+            ...(options.headers ?? {}),
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method, params }),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`calling ${method}: ${message}`);
+      }
+
+      if (response.status === 401) {
+        throw new Error(`calling ${method}: the server rejected this client's credential`);
+      }
+      if (response.status === 202) {
+        // The server treated this as a notification. Nothing is coming back.
+        return undefined;
+      }
+      if (!response.ok) {
+        throw new Error(`calling ${method}: server returned ${response.status} ${response.statusText}`);
+      }
+
+      const declared = Number(response.headers.get("content-length") ?? Number.NaN);
+      if (declared > MAX_RESPONSE_BODY) {
+        throw new Error(`calling ${method}: response too large`);
+      }
+      const read = readTextWithLimit(response.body, MAX_RESPONSE_BODY, controller.signal);
+      let body: Awaited<typeof read>;
+      let bodyTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        body = await Promise.race([
+          read,
+          new Promise<never>((_, reject) => {
+            bodyTimer = setTimeout(
+              () => reject(new Error(`calling ${method}: response body read timed out after ${timeoutMs}ms`)),
+              Math.max(deadlineAt - Date.now(), 0),
+            );
+          }),
+        ]);
+      } catch (err) {
+        // The race can reject before the call-wide abort timer fires; abort
+        // here so the reader inside readTextWithLimit is canceled and the
+        // abandoned read stops instead of draining in the background.
+        controller.abort();
+        throw err;
+      } finally {
+        if (bodyTimer !== undefined) clearTimeout(bodyTimer);
+      }
+      if (body.oversize) {
+        throw new Error(`calling ${method}: response too large`);
+      }
+      if (body.aborted) {
+        // The abort timer fired while the read loop was mid-flight: the cancel
+        // resolves pending reads as "done", so translate that back into the
+        // timeout it actually was.
+        throw new Error(`calling ${method}: response body read timed out after ${timeoutMs}ms`);
+      }
+      const text = body.text;
+      let parsed: { result?: unknown; error?: RpcError };
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new Error(`calling ${method}: unreadable response`);
+      }
+      if (parsed.error) {
+        throw new Error(`calling ${method}: ${parsed.error.message} (code ${parsed.error.code})`);
+      }
+      return parsed.result;
     } finally {
       clearTimeout(timer);
     }
-
-    if (response.status === 401) {
-      throw new Error(`calling ${method}: the server rejected this client's credential`);
-    }
-    if (response.status === 202) {
-      // The server treated this as a notification. Nothing is coming back.
-      return undefined;
-    }
-    if (!response.ok) {
-      throw new Error(`calling ${method}: server returned ${response.status} ${response.statusText}`);
-    }
-
-    const text = await response.text();
-    if (text.length > MAX_RESPONSE_BODY) {
-      throw new Error(`calling ${method}: response too large`);
-    }
-    let body: { result?: unknown; error?: RpcError };
-    try {
-      body = JSON.parse(text);
-    } catch {
-      throw new Error(`calling ${method}: unreadable response`);
-    }
-    if (body.error) {
-      throw new Error(`calling ${method}: ${body.error.message} (code ${body.error.code})`);
-    }
-    return body.result;
   }
 
   const client: McpClient = {

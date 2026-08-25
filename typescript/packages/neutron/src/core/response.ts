@@ -1,3 +1,5 @@
+import { escapeHtml } from "./escape.js";
+
 /**
  * Validates that a URL is safe for redirection (relative or same-origin).
  *
@@ -225,14 +227,6 @@ function notFoundDocument(message: string): string {
 </head>
 <body><main><h1>404</h1><p>${escapeHtml(content)}</p></main></body>
 </html>`;
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 export function isResponse(value: unknown): value is Response {

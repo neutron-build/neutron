@@ -464,6 +464,12 @@ async function loadContentConfig(rootDir: string): Promise<CollectionConfigMap |
     config[name] = {
       type: candidate.type ?? "content",
       schema: candidate.schema as z.ZodType<unknown>,
+      // Preserve every optional flag (sanitize above all: dropping it
+      // silently disabled sanitization for collections declared untrusted).
+      sanitize: candidate.sanitize,
+      live: candidate.live,
+      loader: candidate.loader,
+      cacheTtl: candidate.cacheTtl,
     };
   }
 
@@ -1037,7 +1043,28 @@ function toErrorMessage(error: unknown): string {
   return String(error);
 }
 
+// The fingerprint walk stats the config plus every content file. Without a
+// memo, every getCollection() call — i.e. every SSR request — re-ran it:
+// O(N) stat() syscalls per request on large collections. Memoized per root
+// for a short window: change detection still happens within the TTL, and a
+// genuine reload (force) does not consult the store cache anyway.
+const FINGERPRINT_MEMO_TTL_MS = 1_000;
+const fingerprintMemo = new Map<string, { value: string; expiresAt: number }>();
+
 async function computeContentFingerprint(rootDir: string): Promise<string> {
+  const cached = fingerprintMemo.get(rootDir);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+  const value = await walkContentFingerprint(rootDir);
+  fingerprintMemo.set(rootDir, {
+    value,
+    expiresAt: Date.now() + FINGERPRINT_MEMO_TTL_MS,
+  });
+  return value;
+}
+
+async function walkContentFingerprint(rootDir: string): Promise<string> {
   const parts: string[] = [];
   const configPath = await resolveContentConfigPath(rootDir);
   if (configPath && fs.existsSync(configPath)) {

@@ -57,18 +57,13 @@ defmodule Nucleus.Models.Datalog do
   @spec query(client(), String.t()) :: {:ok, [[String.t()]]} | {:error, term()}
   def query(client, query_str) do
     with :ok <- Nucleus.Client.require_nucleus(client, "Datalog.query") do
+      # DATALOG_QUERY answers Value::Text on its only Ok arm, and sql_query
+      # always formats a "[...]" array — an empty result answers "[]", never
+      # NULL — and the wire column is TEXT, so Postgrex always delivers a
+      # binary; any other shape raises rather than collapsing into {:ok, []}.
       case Nucleus.Client.query(client, "SELECT DATALOG_QUERY($1)", [query_str]) do
-        {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
-          case Jason.decode(raw) do
-            {:ok, rows} when is_list(rows) -> {:ok, rows}
-            _ -> {:ok, []}
-          end
-
-        {:ok, _} ->
-          {:ok, []}
-
-        {:error, _} = error ->
-          error
+        {:ok, %{rows: [[raw]]}} when is_binary(raw) -> {:ok, decode_rows(raw)}
+        {:error, _} = error -> error
       end
     end
   end
@@ -96,6 +91,17 @@ defmodule Nucleus.Models.Datalog do
         {:ok, %{rows: [[val]]}} -> {:ok, val}
         {:error, _} = error -> error
       end
+    end
+  end
+
+  # --- Internal ---
+
+  # The payload is always a JSON array of result tuples, so one that does not
+  # decode to a JSON array is a contract violation and raises.
+  defp decode_rows(raw) do
+    case Jason.decode!(raw) do
+      rows when is_list(rows) -> rows
+      other -> raise ArgumentError, "expected a JSON array payload, got: #{inspect(other)}"
     end
   end
 end

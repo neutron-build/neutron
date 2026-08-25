@@ -162,7 +162,7 @@ mod tests {
     /// Minimal tempdir helper — avoids pulling in the `tempfile` crate here.
     fn tempdir() -> TempDir {
         let path = std::env::temp_dir().join(format!(
-            "neutron-nucleus-test-{}",
+            "neutron-nucleusdb-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -192,7 +192,7 @@ function isSameOrigin(request: Request): boolean {
  * Augment the context type to include csrfToken
  */
 declare module "../core/types.js" {
-  interface RouteContext {
+  interface AppContext {
     /**
      * CSRF token for the current request
      * Available when using csrfMiddleware

@@ -28,7 +28,6 @@
     "ci:workspace:snapshot": "node ./scripts/workspace-graph-check.mjs --write",
     "ci:render-guards": "node ./scripts/render-guards.mjs",
     "ci:render-guards:snapshot": "node ./scripts/render-guards.mjs --write",
-    "ci:mirror-sync": "node ./scripts/check-mirror-sync.mjs",
     "ci:bench:smoke": "pnpm --dir benchmarks run compare:quick",
     "ci:bench:full": "pnpm --dir benchmarks run compare:full",
     "ci:bench:canonical": "pnpm --dir benchmarks run compare:canonical",

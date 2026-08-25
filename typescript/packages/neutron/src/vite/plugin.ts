@@ -500,6 +500,27 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             },
           });
         } catch (err) {
+          // A middleware that throws a Response is a documented short-circuit
+          // (the denial path of requireOrganization()/requirePermissions()).
+          // Production finalizes it as-is (server/index.ts catch-all); dev
+          // must answer with the same status and body, not 500 via next(err).
+          if (err instanceof Response) {
+            res.statusCode = err.status;
+            err.headers.forEach((value, key) => {
+              res.setHeader(key, value);
+            });
+            if (err.body) {
+              const reader = err.body.getReader();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                res.write(Buffer.from(value));
+              }
+            }
+            res.end();
+            return;
+          }
+
           console.error("SSR Error:", err);
 
           // Send enriched error to dev toolbar + overlay

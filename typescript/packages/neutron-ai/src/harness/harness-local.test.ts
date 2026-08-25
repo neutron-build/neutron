@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { z } from "zod";
 
 import type { AdapterCallOptions, AdapterStreamPart, ModelAdapter } from "../adapter.js";
@@ -177,4 +177,66 @@ test("running without prompt or session throws", () => {
   const { model } = scriptedStreamModel([]);
   const agent = localAgent({ model });
   assert.throws(() => agent.run({}));
+});
+
+test("an abandoned run settles the result promise instead of hanging", async () => {
+  // A consumer that breaks out of `events` abandons the generator at a yield;
+  // without a finally, #resultDeferred stays pending forever — `await
+  // run.result` hung with no error and no timeout (#drain no-ops because
+  // #consumed is already true). Same class as the stream-text fix.
+  const { model } = scriptedStreamModel([
+    [
+      { type: "text-delta", text: "part " },
+      { type: "finish", finishReason: "stop", usage: usage(5, 2) },
+    ],
+  ]);
+  const agent = localAgent({ model });
+  const run = agent.run({ prompt: "go" });
+
+  for await (const _event of run.events) {
+    break; // abandon after the first event
+  }
+
+  const outcome = await Promise.race([
+    run.result.then(
+      () => "settled",
+      (err: unknown) => {
+        assert.match(err instanceof Error ? err.message : String(err), /abandoned/);
+        return "settled";
+      },
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("hang"), 500)),
+  ]);
+  assert.notEqual(
+    outcome,
+    "hang",
+    "run.result must settle after abandonment; it used to hang forever",
+  );
+});
+
+test("the caller's abort listener is removed when the run settles", async () => {
+  // One listener per run, never removed: a caller that starts many runs off
+  // one long-lived AbortSignal accumulates listeners for the process lifetime.
+  const { model } = scriptedStreamModel([
+    [
+      { type: "text-delta", text: "done" },
+      { type: "finish", finishReason: "stop", usage: usage(5, 2) },
+    ],
+  ]);
+  const controller = new AbortController();
+  const removeSpy = mock.method(controller.signal, "removeEventListener");
+
+  const agent = localAgent({ model });
+  const run = agent.run({ prompt: "go", abortSignal: controller.signal });
+  const result = await run.result;
+  assert.equal(result.status, "completed");
+  // The generator's finally runs a microtask after the result resolves
+  // (yield* awaits the inner async generator's return).
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    removeSpy.mock.callCount(),
+    1,
+    "the harness must remove its abort listener once the run settles",
+  );
 });

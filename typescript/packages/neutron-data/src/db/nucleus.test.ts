@@ -167,13 +167,13 @@ test("NucleusCacheClient.del delegates to kv.delete", async () => {
   assert.equal(calls[0], "cache:expired");
 });
 
-test("NucleusCacheClient.incr delegates to kv.incr and sets expire", async () => {
+test("NucleusCacheClient.incr delegates to kv.incr and sets expire on the creating increment", async () => {
   const calls: Array<{ method: string; args: unknown[] }> = [];
   const mockKV = {
     get: async () => null,
     set: async () => { /* noop */ },
     delete: async () => true,
-    incr: async (key: string) => { calls.push({ method: "incr", args: [key] }); return 5; },
+    incr: async (key: string) => { calls.push({ method: "incr", args: [key] }); return 1; },
     expire: async (key: string, seconds: number) => {
       calls.push({ method: "expire", args: [key, seconds] });
       return true;
@@ -182,7 +182,7 @@ test("NucleusCacheClient.incr delegates to kv.incr and sets expire", async () =>
 
   const cache = new NucleusCacheClient({ kv: mockKV });
   const val = await cache.incr("counter", 60);
-  assert.equal(val, 5);
+  assert.equal(val, 1);
   assert.equal(calls.length, 2);
   assert.equal(calls[0].method, "incr");
   assert.equal(calls[1].method, "expire");

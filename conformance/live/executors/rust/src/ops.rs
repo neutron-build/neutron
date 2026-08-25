@@ -1,6 +1,6 @@
 //! Op dispatch: one arm per op in the spec's vocabulary.
 //!
-//! Every arm goes through the real `neutron-nucleus` model API. Where the spec
+//! Every arm goes through the real `neutron-nucleusdb` model API. Where the spec
 //! asks for something the Rust client has no surface for, the arm returns
 //! `NoMapping` rather than reaching for raw SQL — an executor that works around
 //! a missing method reports the ENGINE working and hides that the SDK does not.
@@ -8,10 +8,10 @@
 use std::collections::HashMap;
 
 use base64::Engine as _;
-use neutron_nucleus::models::graph::Direction;
-use neutron_nucleus::models::timeseries::AggregateFn;
-use neutron_nucleus::models::vector::DistanceMetric;
-use neutron_nucleus::{NucleusClient, NucleusConfig};
+use neutron_nucleusdb::models::graph::Direction;
+use neutron_nucleusdb::models::timeseries::AggregateFn;
+use neutron_nucleusdb::models::vector::DistanceMetric;
+use neutron_nucleusdb::{NucleusClient, NucleusConfig};
 use serde_json::{json, Value};
 
 use crate::{config_from_url, NoMapping, StepError, StepResult, TS_BASE_MS};
@@ -626,7 +626,7 @@ pub async fn call(client: &NucleusClient, url: &str, op: &str, args: &[Value]) -
     }
 }
 
-fn entries(e: Vec<neutron_nucleus::models::streams::StreamEntry>) -> Value {
+fn entries(e: Vec<neutron_nucleusdb::models::streams::StreamEntry>) -> Value {
     Value::Array(
         e.into_iter()
             .map(|x| json!({"id": x.id, "fields": x.fields}))

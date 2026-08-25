@@ -32,6 +32,13 @@ const PY_APP = path.join(CONF, "adapters/python/conformance_app.py");
 const TS_APP = path.join(CONF, "adapters/typescript/conformance_app.mjs");
 const TS_DIST = path.join(REPO, "typescript/packages/neutron/dist/server/index.js");
 const EX_APP = path.join(CONF, "adapters/elixir/conformance_app.exs");
+const ZIG_APP = path.join(CONF, "adapters/zig");
+const ZIG_PREFIX = path.join(CONF, ".build/conf-zig");
+const ZIG_BIN = path.join(ZIG_PREFIX, "bin", "conformance-app");
+// The SDK pins Zig 0.15 (build.zig.zon documents why): plain `zig` on PATH
+// may be 0.16, which cannot compile the SDK. Prefer the brew keg, else
+// whatever `zig` resolves to — same resolution as live/executors/zig/run.sh.
+const ZIG_PINNED = "/opt/homebrew/opt/zig@0.15/bin/zig";
 
 function pythonBin() {
   for (const c of ["python3", "python"]) {
@@ -44,6 +51,21 @@ function pythonBin() {
 function pythonDepsOk(py) {
   const r = spawnSync(py, ["-c", "import starlette, pydantic, uvicorn"], { stdio: "ignore" });
   return r.error == null && r.status === 0;
+}
+
+// Resolve a Zig 0.15.x toolchain: the pinned brew keg when present, else
+// `zig` on PATH — but only if it is actually 0.15.x. Returns null when no
+// usable toolchain exists, with the reason.
+function zig15() {
+  const candidates = [ZIG_PINNED, "zig"];
+  for (const bin of candidates) {
+    const r = spawnSync(bin, ["version"], { encoding: "utf8" });
+    if (r.error != null || r.status !== 0) continue;
+    const v = (r.stdout || "").trim();
+    if (v.startsWith("0.15.")) return { bin, version: v };
+    return { bin: null, version: v };
+  }
+  return { bin: null, version: null };
 }
 
 export const SDKS = [
@@ -139,6 +161,36 @@ export const SDKS = [
       if (!have("elixir")) return "elixir toolchain not found";
       if (!have("mix")) return "mix not found";
       return null;
+    },
+  },
+  {
+    name: "zig",
+    portEnv: "NEUTRON_PORT",
+    hostEnv: "NEUTRON_HOST",
+    build() {
+      const { bin } = zig15();
+      const r = spawnSync(
+        bin,
+        [
+          "build",
+          "--cache-dir", path.join(CONF, ".build/zig-cache"),
+          "--global-cache-dir", path.join(CONF, ".build/zig-global-cache"),
+          "-p", ZIG_PREFIX,
+        ],
+        { stdio: "inherit", cwd: ZIG_APP },
+      );
+      if (r.status !== 0) throw new Error("zig build failed");
+    },
+    cmd() {
+      return { command: ZIG_BIN, args: [] };
+    },
+    available() {
+      const { bin, version } = zig15();
+      if (bin) return null;
+      if (version) {
+        return `zig ${version} found, but the SDK pins 0.15.x (0.16 cannot compile it; see zig/build.zig.zon)`;
+      }
+      return "zig 0.15.x toolchain not found (expected /opt/homebrew/opt/zig@0.15/bin/zig or zig on PATH)";
     },
   },
 ];

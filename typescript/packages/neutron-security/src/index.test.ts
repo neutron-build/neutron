@@ -430,7 +430,10 @@ describe("getCsrfTokenFromContext", () => {
   });
 
   it("returns null when value is not a string", () => {
-    assert.equal(getCsrfTokenFromContext({ csrfToken: 42 }), null);
+    // Cast: core's csrf middleware augments AppContext with
+    // `csrfToken?: string`, but the runtime guard must still tolerate
+    // non-strings from untyped context writers.
+    assert.equal(getCsrfTokenFromContext({ csrfToken: 42 as unknown as string }), null);
   });
 });
 
@@ -506,6 +509,50 @@ describe("createRateLimitMiddleware", () => {
     const remaining = parseInt(response.headers.get("RateLimit-Remaining")!, 10);
     assert.ok(remaining >= 8 && remaining <= 9);
     assert.ok(response.headers.get("RateLimit-Reset"));
+  });
+
+  it("keys the default bucket by trusted client IP, not one global bucket", async () => {
+    // resolveClientIp used to be called with NO options: trustProxy always
+    // defaulted false, the IP was always null, and every visitor shared the
+    // single "anonymous" bucket — one abusive client 429'd the entire site,
+    // and there was no way to opt into proxy trust from the middleware.
+    const mw = createRateLimitMiddleware({
+      capacity: 1,
+      refillPerSecond: 0.0001,
+      trustProxy: true,
+    });
+
+    const requestFrom = (ip: string): Request =>
+      new Request("https://example.com/api", {
+        headers: { "x-forwarded-for": ip },
+      });
+
+    // Client A spends its own bucket.
+    const a1 = await mw(requestFrom("203.0.113.1"), {}, async () => OK_RESPONSE());
+    assert.equal(a1.status, 200);
+    const a2 = await mw(requestFrom("203.0.113.1"), {}, async () => OK_RESPONSE());
+    assert.equal(a2.status, 429);
+
+    // Client B on another IP has its OWN bucket — the site is not down for B.
+    const b1 = await mw(requestFrom("198.51.100.7"), {}, async () => OK_RESPONSE());
+    assert.equal(b1.status, 200);
+  });
+
+  it("falls back to the shared anonymous bucket when no client IP is trusted", async () => {
+    const mw = createRateLimitMiddleware({
+      capacity: 1,
+      refillPerSecond: 0.0001,
+    });
+
+    const request = new Request("https://example.com/api");
+    const first = await mw(request, {}, async () => OK_RESPONSE());
+    const second = await mw(request, {}, async () => OK_RESPONSE());
+
+    // Without trustProxy there is no per-client signal in a standard
+    // Request; the shared bucket remains (opt into trustProxy or a key fn
+    // for per-client isolation).
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 429);
   });
 
   it("supports custom deny status", async () => {

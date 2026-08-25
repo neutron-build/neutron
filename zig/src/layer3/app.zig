@@ -57,9 +57,12 @@ pub fn App(comptime Routes: type, comptime middlewareFn: ?fn (comptime router_mo
             // Log startup
             std.log.info("Neutron listening on {s}:{d}", .{ self.config.host, server.getPort() });
 
-            // Serve loop
+            // Serve on the app-owned instance. The SIGTERM/SIGINT handler
+            // shuts down `self.server` — serving on the local copy meant
+            // the signal flipped a flag the loop never polled, and the
+            // process ignored SIGTERM until SIGKILL.
             const handler = getHandler();
-            server.serve(handler) catch |err| {
+            self.server.?.serve(handler) catch |err| {
                 if (self.lifecycle.isShutdownRequested()) {
                     // Expected — shutdown was requested
                 } else {
@@ -70,7 +73,7 @@ pub fn App(comptime Routes: type, comptime middlewareFn: ?fn (comptime router_mo
             // Graceful shutdown: run OnStop hooks in reverse order
             self.lifecycle.runStopHooks();
 
-            server.deinit();
+            self.server.?.deinit();
             self.server = null;
         }
 
@@ -294,6 +297,65 @@ test "healthJson: plain postgres is still connected-health" {
     var buf: [128]u8 = undefined;
     const json = try healthJson(.connected, "16.0", &buf);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"nucleus\":\"connected\"") != null);
+}
+
+// FRAMEWORK_CONTRACT §8, driven through the REAL run() path. run() used to
+// serve on a local HttpServer while the signal handler shut down the copy
+// stored in self.server, so SIGTERM never stopped the serving loop — the
+// process ignored graceful shutdown until SIGKILL. The in-place test above
+// could not catch this: it installs the handlers directly, without run().
+test "App.run serves real requests and exits on SIGTERM (FRAMEWORK_CONTRACT §8)" {
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/", .handler = &dummyHandler },
+    };
+    const R = router_mod.Router(&routes);
+    const MyApp = App(R, null);
+    var app = MyApp.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer MyApp.restoreDefaultSignalHandlers();
+
+    const serve_thread = try std.Thread.spawn(.{}, struct {
+        fn run(a: *MyApp) void {
+            a.run() catch {};
+        }
+    }.run, .{&app});
+
+    // Wait for the listener to come up.
+    var spins: usize = 0;
+    while (app.server == null and spins < 1000) : (spins += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(app.server != null);
+    const port = app.server.?.getPort();
+
+    // Prove it serves: one real request over loopback. dummyHandler does
+    // not respond, so the server's fallback answers — any HTTP status line
+    // means the serve loop dispatched a connection.
+    {
+        const conn = try std.net.tcpConnectToAddress(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+        defer conn.close();
+        try conn.writeAll("GET / HTTP/1.1\r\nHost: test\r\n\r\n");
+        var buf: [256]u8 = undefined;
+        const n = try conn.read(&buf);
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "HTTP/1.1") != null);
+    }
+
+    // SIGTERM must end run() (which clears self.server). Without the fix
+    // the flag lands on a struct the loop never reads and this times out.
+    try std.posix.raise(std.posix.SIG.TERM);
+    var exited = false;
+    spins = 0;
+    while (spins < 3000) : (spins += 1) {
+        if (app.server == null) {
+            exited = true;
+            break;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(exited);
+    // Detach, not join: on the broken path join() would hang the suite
+    // forever; the process tears down test threads at exit anyway.
+    serve_thread.detach();
+    try std.testing.expect(app.lifecycle.isShutdownRequested());
 }
 
 fn dummyHandler(_: *http_server_mod.RequestContext) anyerror!void {}

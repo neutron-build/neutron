@@ -1,4 +1,4 @@
-//! Error type for neutron-nucleus.
+//! Error type for neutron-nucleusdb.
 
 use std::fmt;
 

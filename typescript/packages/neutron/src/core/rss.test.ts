@@ -20,6 +20,23 @@ describe("buildRssFeed", () => {
     expect(xml).not.toContain("]]><script>");
     expect(xml).toContain("]]]]><![CDATA[>");
   });
+
+  it("escapes an unparseable pubDate instead of emitting it raw", () => {
+    const xml = buildRssFeed({
+      title: "Feed",
+      description: "d",
+      link: "https://example.com",
+      items: [
+        {
+          title: "Post",
+          link: "https://example.com/p",
+          pubDate: "Tue, <script>alert(1)</script> definitely-not-a-date",
+        },
+      ],
+    });
+    expect(xml).not.toContain("<pubDate>Tue, <script>");
+    expect(xml).toContain("&lt;script&gt;");
+  });
 });
 
 describe("renderAttrs", () => {

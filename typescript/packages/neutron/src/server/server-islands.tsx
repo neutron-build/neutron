@@ -18,6 +18,8 @@ export interface ServerIslandProps {
 interface RegisteredIsland {
   render: () => Promise<ComponentChildren>;
   createdAt: number;
+  /** Per-render capability token; only the owning page's HTML carries it. */
+  token: string;
 }
 
 const ISLAND_ENTRY_TTL_MS = 5 * 60 * 1000;
@@ -34,6 +36,23 @@ function generateIslandId(userProvidedId?: string): string {
 }
 
 /**
+ * Per-render capability token. The registry is module-global, so the island
+ * URL alone must not be enough to fetch a visitor's SSR data: the full
+ * capability is URL + token, and the token exists only inside the page HTML
+ * that registered the island (128 bits, so a leaked id stays useless).
+ */
+function generateIslandToken(): string {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function isValidIslandToken(provided: string | undefined, expected: string): boolean {
+  if (!provided) return false;
+  const providedDigest = crypto.createHash("sha256").update(provided).digest();
+  const expectedDigest = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(providedDigest, expectedDigest);
+}
+
+/**
  * Server Island Component
  * On server: Returns fallback + script to fetch real content
  * On client: Just renders children
@@ -46,13 +65,14 @@ export function ServerIsland({ children, fallback, id }: ServerIslandProps) {
 
   // Server-side: render fallback + fetch script
   const islandId = generateIslandId(id);
+  const islandToken = generateIslandToken();
   const islandIdJson = JSON.stringify(islandId);
   const islandEndpointJson = JSON.stringify(
-    `/__neutron_island/${encodeURIComponent(islandId)}`
+    `/__neutron_island/${encodeURIComponent(islandId)}?t=${islandToken}`
   );
 
   // Register component for later rendering
-  registerIsland(islandId, async () => children);
+  registerIsland(islandId, async () => children, islandToken);
 
   return (
     <>
@@ -122,12 +142,20 @@ export function isRegisteredIsland(islandId: string): boolean {
 /**
  * Server Island route handler
  * Should be mounted at /__neutron_island/:id
+ *
+ * The optional token authenticates the fetch against the render that
+ * registered the island; without it (or with a wrong one) the island is
+ * indistinguishable from nonexistent — a cross-visitor requester holding
+ * only the URL gets a 404, never the data.
  */
-export async function handleIslandRequest(islandId: string): Promise<string | null> {
+export async function handleIslandRequest(
+  islandId: string,
+  token?: string
+): Promise<string | null> {
   pruneIslandRegistry();
 
   const entry = islandRegistry.get(islandId);
-  if (!entry) {
+  if (!entry || !isValidIslandToken(token, entry.token)) {
     return null;
   }
 
@@ -144,12 +172,14 @@ export async function handleIslandRequest(islandId: string): Promise<string | nu
 
 function registerIsland(
   islandId: string,
-  render: () => Promise<ComponentChildren>
+  render: () => Promise<ComponentChildren>,
+  token: string
 ): void {
   pruneIslandRegistry();
   islandRegistry.set(islandId, {
     render,
     createdAt: Date.now(),
+    token,
   });
 }
 

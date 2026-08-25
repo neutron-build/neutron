@@ -7,7 +7,7 @@ members = [
     "crates/neutron-grpc",
     "crates/neutron-graphql",
     "crates/neutron-jobs",
-    "crates/neutron-nucleus",
+    "crates/neutron-nucleusdb",
     "crates/neutron-inference",
     "crates/neutron-rpc",
     "crates/neutron-config",

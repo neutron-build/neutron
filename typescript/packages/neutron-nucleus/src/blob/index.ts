@@ -62,7 +62,17 @@ export interface BlobModel {
 // ---------------------------------------------------------------------------
 
 function toHex(data: Uint8Array | string): string {
-  if (typeof data === 'string') return data;
+  if (typeof data === 'string') {
+    // Validate at write time with the same rule fromHex applies on read,
+    // so garbage fails here instead of on every later get().
+    if (data.length % 2 !== 0) {
+      throw new Error('Invalid hex string: odd length');
+    }
+    if (!/^[0-9a-fA-F]*$/.test(data)) {
+      throw new Error('Invalid hex string: contains non-hex characters');
+    }
+    return data;
+  }
   return Array.from(data)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');

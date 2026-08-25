@@ -8,6 +8,7 @@ import tempfile
 from contextlib import asynccontextmanager
 
 import pytest
+from asyncpg.exceptions import DataError, IntegrityConstraintViolationError
 
 from neutron.error import AppError
 from neutron.nucleus._exec import Executor
@@ -934,6 +935,50 @@ class TestStreams:
         assert len(entries) == 1
 
     @pytest.mark.asyncio
+    async def test_xreadgroup_nogroup_propagates(self, mock_conn, nucleus_features):
+        # Nucleus v0.1.8 answers XREADGROUP on a missing group with a
+        # statement error (SQLSTATE 22000 -> asyncpg DataError) instead of an
+        # empty result. The error must propagate, not read as "caught up".
+        mock_conn.fetchval.side_effect = DataError(
+            "NOGROUP No such consumer group 'workers' for stream 'events'"
+        )
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        with pytest.raises(DataError) as exc_info:
+            await sm.xreadgroup("events", "workers", "w1", count=10)
+        assert "NOGROUP" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_xreadgroup_empty_payload_raises(self, mock_conn, nucleus_features):
+        # "" is not a possible XREADGROUP result anymore: an empty delivery
+        # is "[]" and a missing group raises NOGROUP. An empty payload is a
+        # contract violation, not an empty batch.
+        mock_conn.fetchval.return_value = ""
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        with pytest.raises(ValueError):
+            await sm.xreadgroup("events", "workers", "w1", count=10)
+
+    @pytest.mark.asyncio
+    async def test_xreadgroup_empty_delivery(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = "[]"
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        assert await sm.xreadgroup("events", "workers", "w1", count=10) == []
+
+    @pytest.mark.asyncio
+    async def test_xgroup_create_busygroup_propagates(
+        self, mock_conn, nucleus_features
+    ):
+        # Nucleus v0.1.8 answers XGROUP_CREATE on an existing group with a
+        # statement error (SQLSTATE 23000) instead of silently resetting the
+        # cursor. The error must propagate.
+        mock_conn.fetchval.side_effect = IntegrityConstraintViolationError(
+            "BUSYGROUP Consumer Group name already exists"
+        )
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        with pytest.raises(IntegrityConstraintViolationError) as exc_info:
+            await sm.xgroup_create("events", "workers", 0)
+        assert "BUSYGROUP" in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_xack(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = True
         sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
@@ -968,7 +1013,16 @@ class TestStreamEntryParsing:
         assert entries[0].fields.get("action") == "login"
 
     def test_parse_invalid_json(self):
-        assert _parse_stream_entries("bad-json{{") == []
+        # A malformed payload is a contract violation, not "no entries" —
+        # same idiom as _parse_group_entries.
+        with pytest.raises(ValueError):
+            _parse_stream_entries("bad-json{{")
+
+    def test_parse_non_array_payload_propagates(self):
+        # Valid JSON that is not an array used to be swallowed to [] by a
+        # TypeError catch; now it propagates like any decode failure.
+        with pytest.raises(TypeError):
+            _parse_stream_entries("42")
 
     def test_stream_entry_model(self):
         entry = StreamEntry(id="100-0", fields={"key": "value"})

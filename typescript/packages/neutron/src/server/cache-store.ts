@@ -60,6 +60,10 @@ export function createMemoryAppCacheStore(
         cache.delete(key);
         return null;
       }
+      // LRU: a read refreshes recency so eviction below removes the
+      // least-recently-used entry, not the first-inserted one.
+      cache.delete(key);
+      cache.set(key, entry);
       return entry;
     },
     async set(key, entry) {
@@ -110,6 +114,9 @@ export function createMemoryLoaderCacheStore(
         cache.delete(key);
         return null;
       }
+      // LRU: a read refreshes recency (see the app cache store above).
+      cache.delete(key);
+      cache.set(key, entry);
       return entry;
     },
     async set(key, entry) {
@@ -147,7 +154,16 @@ function resolveMaxEntries(value: number | undefined, fallback: number): number 
   return Math.floor(value!);
 }
 
-function normalizeCachePathname(pathname: string): string | null {
+/**
+ * Canonical cache-path form: decoded, no trailing slash, `/`-rooted, `..`-free.
+ * Both `deleteByPath` invalidation and loader-cache key construction must use
+ * this — keys written from the raw (percent-encoded, trailing-slash) request
+ * path are invisible to invalidation and survive until their TTL.
+ *
+ * Returns null when the path cannot be safely normalized (undecodable, not
+ * rooted, contains `..`).
+ */
+export function normalizeCachePathname(pathname: string): string | null {
   let decoded: string;
   try {
     decoded = decodeURIComponent(pathname || "/");

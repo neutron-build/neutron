@@ -60,16 +60,7 @@ function parseBuildArgs(argv: string[]): BuildArgs {
   return { preset, cloudflareMode };
 }
 
-// -- build.ts: resolvePath ---------------------------------------------------
-
-function resolvePath(pattern: string, params: Record<string, string>): string {
-  let resolved = pattern;
-  for (const [key, value] of Object.entries(params)) {
-    resolved = resolved.replace(`[${key}]`, value);
-    resolved = resolved.replace(`:${key}`, value);
-  }
-  return resolved;
-}
+// -- build.ts: resolvePath — now imported from ./commands/static-paths.js --
 
 // -- build.ts: escapeHtml ----------------------------------------------------
 
@@ -878,6 +869,50 @@ describe("config file candidates", () => {
 
   it("includes all four extensions", () => {
     assert.equal(CONFIG_CANDIDATES.length, 4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Static build path traversal — imported from source, not mirrored.
+//
+// getStaticPaths params are untrusted (a CMS can return any slug) and are
+// substituted verbatim into the output-path join. The guard below is what the
+// static writer applies before every param-derived write; these tests exercise
+// the real module (split out of build.ts, which imports vite at load time).
+// ---------------------------------------------------------------------------
+
+import { resolvePath, isUnsafeResolvedPath } from "./commands/static-paths.js";
+
+describe("static build path traversal (getStaticPaths params)", () => {
+  it("flags a named param carrying parent-directory traversal", () => {
+    const resolved = resolvePath("/blog/[slug]", { slug: "../../evil" });
+    assert.equal(resolved, "/blog/../../evil");
+    assert.equal(isUnsafeResolvedPath(resolved), true);
+  });
+
+  it("flags a splat param carrying traversal", () => {
+    const resolved = resolvePath("/docs/*", { "*": "a/../../../etc/passwd" });
+    assert.equal(isUnsafeResolvedPath(resolved), true);
+  });
+
+  it("flags backslash traversal (Windows separator form)", () => {
+    assert.equal(isUnsafeResolvedPath("/blog/..\\evil"), true);
+  });
+
+  it("flags non-absolute resolved paths", () => {
+    assert.equal(isUnsafeResolvedPath("blog/hello"), true);
+  });
+
+  it("allows normal slugs and multi-segment splats", () => {
+    assert.equal(isUnsafeResolvedPath(resolvePath("/blog/[slug]", { slug: "hello" })), false);
+    assert.equal(isUnsafeResolvedPath(resolvePath("/docs/*", { "*": "a/b/c" })), false);
+    assert.equal(isUnsafeResolvedPath(resolvePath("/", {})), false);
+  });
+
+  it("allows legal dot-containing slugs the runtime guard would reject", () => {
+    // Segment-precise: "a..b" and "v1.2..3" are legal path segments, not "..".
+    assert.equal(isUnsafeResolvedPath("/a..b"), false);
+    assert.equal(isUnsafeResolvedPath("/v1.2..3/x"), false);
   });
 });
 

@@ -15,6 +15,11 @@ import type {
 export { claudeCode } from "./claude-code.js";
 export type { ClaudeCodeSettings, SpawnedProcess, SpawnFn } from "./claude-code.js";
 
+/** Rejection reason for the result promise when the consumer abandons the run. */
+const ABANDONED_RUN = new AIError(
+  problemFromStatus(400, "The run was abandoned before completion; the result promise cannot be fulfilled."),
+);
+
 /**
  * The agent-agnostic harness boundary: one interface that an in-process
  * agent (localAgent, on this SDK's own loop), a CLI agent (claudeCode),
@@ -107,12 +112,13 @@ class LocalAgentRun implements AgentRun {
   #consumed = false;
   #abort = new AbortController();
   #resultDeferred = deferred<AgentResult>();
+  #onCallerAbort = () => this.#abort.abort();
 
   constructor(agent: LocalAgentOptions, options: AgentRunOptions, sessions: Map<string, Message[]>) {
     this.#agent = agent;
     this.#options = options;
     this.#sessions = sessions;
-    options.abortSignal?.addEventListener("abort", () => this.#abort.abort());
+    options.abortSignal?.addEventListener("abort", this.#onCallerAbort);
   }
 
   #start(): AsyncGenerator<AgentEvent, void, undefined> {
@@ -123,7 +129,21 @@ class LocalAgentRun implements AgentRun {
     return this.#iterate();
   }
 
+  // The abandonment guard lives OUTSIDE the body: the `session` event yields
+  // before the inner try, and a consumer that breaks on that first event
+  // would otherwise return through no finally at all.
   async *#iterate(): AsyncGenerator<AgentEvent, void, undefined> {
+    try {
+      yield* this.#iterateBody();
+    } finally {
+      // Every exit path (completion, error, abandonment) lands here: drop
+      // the caller's abort listener instead of leaking one per run.
+      this.#options.abortSignal?.removeEventListener("abort", this.#onCallerAbort);
+      this.#resultDeferred.reject(ABANDONED_RUN);
+    }
+  }
+
+  async *#iterateBody(): AsyncGenerator<AgentEvent, void, undefined> {
     const sessionId = this.#options.sessionId ?? crypto.randomUUID();
     yield { type: "session", sessionId };
 

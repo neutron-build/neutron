@@ -140,6 +140,34 @@ function errorResult(message: string): ToolResult {
   return { content: textContent(message), isError: true };
 }
 
+/**
+ * Read a stream to text, stopping at `limit` bytes. The bound must bound the
+ * read itself: `await request.text()` buffers the whole body first, so a check
+ * placed after it does nothing about memory. Content-length is checked before
+ * reading when present; chunked bodies are capped mid-stream.
+ */
+async function readTextWithLimit(
+  body: ReadableStream<Uint8Array> | null,
+  limit: number,
+): Promise<{ text: string; oversize: boolean }> {
+  if (!body) return { text: "", oversize: false };
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let seen = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    seen += value.byteLength;
+    if (seen > limit) {
+      await reader.cancel().catch(() => {});
+      return { text: "", oversize: true };
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return { text: text + decoder.decode(), oversize: false };
+}
+
 export function createMcpServer(options: McpServerOptions): McpServer {
   const order: string[] = [];
   const tools = new Map<string, McpTool>();
@@ -180,10 +208,15 @@ export function createMcpServer(options: McpServerOptions): McpServer {
         });
       }
 
-      const raw = await request.text();
-      if (raw.length > MAX_REQUEST_BODY) {
+      const declaredLength = Number(request.headers.get("content-length") ?? Number.NaN);
+      if (declaredLength > MAX_REQUEST_BODY) {
         return rpcErrorResponse(null, RPC_PARSE_ERROR, "request body too large");
       }
+      const read = await readTextWithLimit(request.body, MAX_REQUEST_BODY);
+      if (read.oversize) {
+        return rpcErrorResponse(null, RPC_PARSE_ERROR, "request body too large");
+      }
+      const raw = read.text;
 
       let rpc: RpcRequest;
       try {

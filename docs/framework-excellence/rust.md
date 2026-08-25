@@ -29,7 +29,7 @@ Five foundations are missing or broken:
    not just gesture at.
 3. **Built-in failures bypass `AppError`** (extractor rejections emit plain-text
    `(400, "Invalid JSON")` etc.), so the framework violates its own RFC 7807 contract.
-4. **The Nucleus client is plaintext-only** (`neutron-nucleus/src/pool.rs:182` —
+4. **The Nucleus client is plaintext-only** (`neutron-nucleusdb/src/pool.rs:182` —
    `tokio_postgres::connect(&cs, NoTls)`). This makes the headline claim "any Postgres client
    works / strictest correctness" **provably false**: it cannot connect to any TLS-required
    Postgres (Neon, Supabase, RDS-with-SSL, most managed PG) and ships credentials + all data in
@@ -90,7 +90,7 @@ Independently shippable, low-risk, and unblock the conformance suite.
 
 ### P0.0 — TLS-capable Nucleus connections (promoted; the thesis depends on it)
 
-- **File:** `rust/crates/neutron-nucleus/src/pool.rs:8` (`use ... NoTls`), `:182`
+- **File:** `rust/crates/neutron-nucleusdb/src/pool.rs:8` (`use ... NoTls`), `:182`
   (`tokio_postgres::connect(&cs, NoTls)`), plus the connection-string parser.
 - **Bug:** Plaintext-only. Cannot reach any `sslmode=require` server; transmits credentials and
   all rows in cleartext. Directly contradicts "any Postgres client works."
@@ -201,7 +201,7 @@ Independently shippable, low-risk, and unblock the conformance suite.
 
 ### P0.5 — KV collection reads must not split on `,` / `=` (client-side fix only)
 
-- **File:** `rust/crates/neutron-nucleus/src/models/kv.rs:215, 299-300, 354, 409, 429`
+- **File:** `rust/crates/neutron-nucleusdb/src/models/kv.rs:215, 299-300, 354, 409, 429`
   (`lrange`/`hgetall`/`smembers`/`zrange`/`zrangebyscore`).
 - **Bug (confirmed):** `raw.split(',')` and `split_once('=')` corrupt any value containing `,` or
   `=`. Ported cross-SDK bug.
@@ -599,7 +599,7 @@ Independently shippable, low-risk, and unblock the conformance suite.
 
 ### P2.5 — Real Nucleus/Postgres integration tier (testcontainers)
 
-- **Files:** new `rust/crates/neutron-nucleus/tests/integration_kv.rs` (+ models);
+- **Files:** new `rust/crates/neutron-nucleusdb/tests/integration_kv.rs` (+ models);
   `dev-dependencies`: `testcontainers`.
 - **Design:** Spin up Nucleus *and* stock Postgres in Docker; run every model's round-trip —
   especially the P0.5 corruption cases (`,`, `=`, newline, unicode) — and the **P0.0 TLS cases**

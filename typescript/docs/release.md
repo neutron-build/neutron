@@ -20,7 +20,7 @@ Equivalent expanded checklist:
 
 1. `pnpm run ci:naming`
 2. `pnpm -r build`
-3. `pnpm --dir ../packages/neutron test` (run framework tests from the Neutron TypeScript package directory)
+3. `pnpm --dir packages/neutron test` (run framework tests from the Neutron TypeScript package directory)
 4. `pnpm run ci:runtime-compat`
 5. `pnpm run ci:deploy-presets`
 6. `pnpm run ci:bench:smoke`

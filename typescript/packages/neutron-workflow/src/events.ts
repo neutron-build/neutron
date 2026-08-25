@@ -22,6 +22,20 @@
 
 export const WIRE_FORMAT_VERSION = 1;
 
+/**
+ * External events append from outside a live pass (deliverEvent,
+ * completeSleep, cancelRun) and can land mid-pass. A pass allocates seqs
+ * densely from its own counter, so an external append computing max+1 from a
+ * fresh load wrote the SAME seq as the pass's next append — and load()'s
+ * dedupe (first writer wins, for lease races) silently deleted one of two
+ * DIFFERENT events, bricking the next replay with NondeterminismError. The
+ * fix is a partition: pass events stay dense below this base (2^40 — no run
+ * log ever reaches a trillion events, and legacy dense logs resume unchanged
+ * since their seqs all sort below it), external events allocate at or above
+ * it. Neither writer can ever take the other's seq.
+ */
+export const EXTERNAL_SEQ_BASE = 2 ** 40;
+
 export type WorkflowEventType =
   | "run-started"
   | "step-completed"

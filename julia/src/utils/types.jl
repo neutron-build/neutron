@@ -27,16 +27,25 @@ _float(result)::Union{Float64, Nothing} = begin
     v === nothing ? nothing : Float64(v)
 end
 
-# Split a comma-separated string into a vector, returning empty vector for missing/empty.
-# Only for functions that still comma-join (e.g. PUBSUB_CHANNELS) — the KV collection
-# functions return JSON arrays; use _json_strings for those.
+# Split a comma-separated string into a vector. Only for functions that still
+# comma-join (e.g. PUBSUB_CHANNELS) — the KV collection functions return JSON
+# arrays; use _json_strings for those.
+#
+# PUBSUB_CHANNELS's only Ok arm is Value::Text(chans.join(",")), so the
+# reachable empty case is "" — never NULL — and missing/nothing is a contract
+# violation.
 function _split_csv(raw)::Vector{String}
-    (ismissing(raw) || raw === nothing || isempty(raw)) && return String[]
+    (ismissing(raw) || raw === nothing) &&
+        error("PUBSUB_CHANNELS returned NULL; success is always comma-joined Text")
+    isempty(raw) && return String[]
     return split(raw, ",")
 end
 
-# Parse a JSON array of strings, returning empty vector for missing/empty.
+# Parse a JSON array of strings (KV_LRANGE / KV_SMEMBERS). Their scalar_fns
+# arms answer Value::Text on every success path — an empty collection arrives
+# as "[]", which JSON3.read maps to an empty vector — so a NULL cell is a
+# contract violation, not an empty result.
 function _json_strings(raw)::Vector{String}
-    (ismissing(raw) || raw === nothing || isempty(raw)) && return String[]
+    ismissing(raw) && error("KV_LRANGE/KV_SMEMBERS returned NULL; success is always a JSON array")
     return JSON3.read(raw, Vector{String})
 end

@@ -179,6 +179,20 @@ test("HTTP errors map to problem details with the provider message", async () =>
   );
 });
 
+test("a stream that ends without finish_reason or [DONE] is truncation, not success", async () => {
+  // The adapter used to manufacture a finish event after the SSE loop that
+  // the provider never sent — a dropped connection read as completion.
+  const { impl } = mockFetch(() =>
+    sseResponse([{ choices: [{ delta: { content: "partial answ" } }] }]),
+  );
+  const openai = createOpenAI({ apiKey: "test-key", fetch: impl });
+  const result = streamText({ model: openai("gpt-4o"), prompt: "hi", maxRetries: 0 });
+  await assert.rejects(
+    result.text,
+    (error: unknown) => error instanceof AIError && /truncat/i.test(error.message),
+  );
+});
+
 test("automatic caching surfaces cached tokens (OpenAI details field and DeepSeek's)", async () => {
   const withDetails = {
     ...GENERATE_FIXTURE,

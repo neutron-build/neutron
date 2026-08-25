@@ -90,3 +90,37 @@ test("a stream with no structured output rejects", async () => {
     (error: unknown) => error instanceof AIError && error.problem.status === 500,
   );
 });
+
+test("an abandoned stream settles the object promise instead of hanging", async () => {
+  const { model } = scriptedStreamModel([
+    { type: "tool-input-start", toolCallId: "c1", toolName: "json" },
+    { type: "tool-input-delta", toolCallId: "c1", delta: '{"title":"Neu' },
+    { type: "tool-input-delta", toolCallId: "c1", delta: 'tron"}' },
+    { type: "tool-call", toolCallId: "c1", toolName: "json", input: { title: "Neutron" } },
+    { type: "finish", finishReason: "tool-calls", usage },
+  ]);
+  const result = streamObject({
+    model,
+    prompt: "review",
+    schema: z.object({ title: z.string() }),
+  });
+
+  for await (const _partial of result.partialObjectStream) {
+    break; // abandon after the first partial
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"hang">((resolve) => {
+    timer = setTimeout(() => resolve("hang"), 500);
+  });
+  const outcome = await Promise.race([
+    result.object.then(
+      () => "settled" as const,
+      () => "settled" as const,
+    ),
+    deadline,
+  ]);
+  clearTimeout(timer);
+  assert.notEqual(outcome, "hang", "result.object must settle after abandonment; it used to hang forever");
+  await assert.rejects(result.object, /abandoned/);
+});

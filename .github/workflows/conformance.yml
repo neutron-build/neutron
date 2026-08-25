@@ -9,6 +9,7 @@ on:
       - "python/**"
       - "rust/**"
       - "elixir/**"
+      - "zig/**"
       - "typescript/packages/neutron/**"
       - "FRAMEWORK_CONTRACT.md"
       - ".github/workflows/conformance.yml"
@@ -19,6 +20,7 @@ on:
       - "python/**"
       - "rust/**"
       - "elixir/**"
+      - "zig/**"
       - "typescript/packages/neutron/**"
       - "FRAMEWORK_CONTRACT.md"
       - ".github/workflows/conformance.yml"
@@ -27,14 +29,14 @@ on:
 
 jobs:
   conformance:
-    name: contract matrix (go × rust × python × ts × elixir)
+    name: contract matrix (go × rust × python × ts × elixir × zig)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # Each SDK's runner descriptor skips gracefully when its toolchain is
       # absent (never fails), so the gate stays green even if one setup breaks —
-      # it only goes red on a real contract FAIL. We provision all four.
+      # it only goes red on a real contract FAIL. We provision all six.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -66,6 +68,16 @@ jobs:
         with:
           elixir-version: "1.17"
           otp-version: "27"
+
+      - name: Set up Zig
+        # Exact tagged release, matching zig/build.zig.zon's pin. The SDK and
+        # its adapter do not compile on 0.16 (std API removals), and a range
+        # like 0.15.* could silently move to a 0.15.x the SDK has never seen.
+        # The runner's zig descriptor resolves the toolchain from PATH; without
+        # this step --strict fails on a registered-but-absent SDK.
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.2"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4

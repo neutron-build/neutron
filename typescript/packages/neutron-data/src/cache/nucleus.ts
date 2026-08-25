@@ -66,7 +66,9 @@ export class NucleusCacheClient implements CacheClient {
   async incr(key: string, ttlSec?: number): Promise<number> {
     const k = this.key(key);
     const next = await this.kv.incr(k);
-    if (ttlSec && ttlSec > 0) {
+    // TTL anchored at creation, matching RedisCacheClient (expire on the
+    // creating increment only — later increments must not extend it).
+    if (typeof ttlSec === "number" && ttlSec > 0 && next === 1) {
       await this.kv.expire(k, ttlSec);
     }
     return next;

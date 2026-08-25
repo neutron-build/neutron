@@ -25,7 +25,7 @@ Initial release.
 
 ### Satellite Crates
 
-- `neutron-nucleus` — Nucleus database client with typed model APIs
+- `neutron-nucleusdb` — Nucleus database client with typed model APIs
 - `neutron-jobs` — Background job queue with cron scheduling
 - `neutron-storage` — S3/R2/GCS object storage client with SigV4 signing
 - `neutron-oauth` — OAuth2/OIDC with PKCE

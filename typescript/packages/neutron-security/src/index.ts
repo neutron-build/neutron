@@ -36,7 +36,7 @@ export interface TrustedProxyOptions {
   trustedHops?: number;
 }
 
-export interface RateLimitMiddlewareOptions {
+export interface RateLimitMiddlewareOptions extends TrustedProxyOptions {
   capacity: number;
   refillPerSecond?: number;
   tokensPerRequest?: number;
@@ -210,9 +210,16 @@ export function createRateLimitMiddleware(
   let handledRequests = 0;
 
   return async (request, context, next) => {
+    // Without a key fn, bucket per client IP. The proxy options MUST flow
+    // through: calling resolveClientIp(request) bare always returned null
+    // (trustProxy defaults false), collapsing every visitor into one global
+    // "anonymous" bucket — one abusive client 429'd the whole site. With no
+    // trusted IP there is no per-client signal in a standard Request, so the
+    // shared bucket is the honest fallback; opt into trustProxy behind a
+    // proxy, or supply a key fn.
     const key = options.key
       ? await options.key(request, context)
-      : resolveClientIp(request) || "anonymous";
+      : resolveClientIp(request, options) || "anonymous";
     const now = Date.now();
     handledRequests += 1;
     if (handledRequests % cleanupEvery === 0 || buckets.size > maxBuckets) {

@@ -399,6 +399,11 @@ export async function createServer(
   const loaderDataCacheStore =
     cache?.loader || createMemoryLoaderCacheStore();
   const appInFlightRequests = new Map<string, Promise<Response>>();
+  // Background cache fills in progress, by app-cache key. A reader that
+  // misses must join the fill rather than race it — otherwise a request
+  // arriving right behind the first one re-renders (and reports MISS) while
+  // the entry is a few microseconds from landing.
+  const appPendingStores = new Map<string, Promise<void>>();
 
   if (hasAppRoutes && !ssrServer) {
     console.warn(
@@ -577,7 +582,7 @@ export async function createServer(
 
   app.get("/__neutron_island/:id", async (c) => {
     const islandId = c.req.param("id");
-    const html = await handleIslandRequest(islandId);
+    const html = await handleIslandRequest(islandId, c.req.query("t"));
     if (html === null) {
       return c.text("Not Found", 404);
     }
@@ -820,6 +825,10 @@ export async function createServer(
           : null;
 
       if (appCacheKey && (method === "GET" || method === "HEAD")) {
+        const pendingStore = appPendingStores.get(appCacheKey);
+        if (pendingStore) {
+          await pendingStore;
+        }
         const hit = await readCachedAppResponse(
           appResponseCacheStore,
           appCacheKey,
@@ -859,12 +868,22 @@ export async function createServer(
             hooks,
             globalMiddleware
           );
-          await maybeStoreAppResponse(
+          // Fill the cache in the background. Awaiting the full body drain
+          // here would hold the response until its last byte — streaming
+          // defeated on exactly the popular pages caching targets. The fill
+          // is tracked so a concurrent reader joins it instead of racing it.
+          const store = maybeStoreAppResponse(
             appResponseCacheStore,
             appCacheKey,
             response,
             appCacheMaxAge
-          );
+          ).catch(() => {});
+          appPendingStores.set(appCacheKey, store);
+          void store.then(() => {
+            if (appPendingStores.get(appCacheKey) === store) {
+              appPendingStores.delete(appCacheKey);
+            }
+          });
           return response;
         })();
 
@@ -925,6 +944,14 @@ export async function createServer(
       // — answers as RFC 7807 (FRAMEWORK_CONTRACT.md §2), not a bare 500.
       if (isProblemError(error)) {
         return finalize(error.toResponse(requestTrace.pathname));
+      }
+      // A thrown Response is a documented middleware short-circuit — and the
+      // denial path of the framework's own requireOrganization()/
+      // requirePermissions() (enterprise-auth). Loaders and actions get
+      // `instanceof Response` treatment in render-app-route; middleware
+      // throws land here and must answer as themselves, not as a 500.
+      if (error instanceof Response) {
+        return finalize(error);
       }
       return finalize(new Response("Internal Server Error", { status: 500 }));
     }
@@ -1138,7 +1165,8 @@ function loadRouteModule(
   return pending;
 }
 
-function normalizePathname(pathname: string): string | null {
+/** Normalize a request pathname for matching/caching. Exported for tests. */
+export function normalizePathname(pathname: string): string | null {
   let decoded: string;
   try {
     decoded = decodeURIComponent(pathname || "/");
@@ -1146,7 +1174,9 @@ function normalizePathname(pathname: string): string | null {
     return null;
   }
 
-  if (!decoded.startsWith("/") || decoded.includes("..")) {
+  // Traversal is a whole segment equal to "..", not a substring: `/a..b`
+  // and `/v1.2..3` are legal paths, `/a/../b` is not.
+  if (!decoded.startsWith("/") || decoded.split("/").includes("..")) {
     return null;
   }
 
@@ -1575,18 +1605,10 @@ async function createSsrServer(
 
 
 function getClientEntryScriptSrc(distDir: string): string | null {
-  const assetsDir = path.join(distDir, "assets");
-  if (fs.existsSync(assetsDir)) {
-    const entryCandidates = fs
-      .readdirSync(assetsDir)
-      .filter((name) => name.startsWith("index-") && name.endsWith(".js"))
-      .sort();
-
-    if (entryCandidates.length > 0) {
-      return `/assets/${entryCandidates[entryCandidates.length - 1]}`;
-    }
-  }
-
+  // The build's own metadata is authoritative: it names the exact chunk that
+  // hydrates. The filename scan below is a last-resort heuristic, and sorting
+  // `index-*.js` lexicographically picks index-9 over index-10 — so it must
+  // not run when the metadata exists.
   const metadataPath = path.join(distDir, ".neutron-client-entry.json");
   if (fs.existsSync(metadataPath)) {
     try {
@@ -1597,7 +1619,19 @@ function getClientEntryScriptSrc(distDir: string): string | null {
         return metadata.src;
       }
     } catch {
-      // Ignore malformed metadata and fall back to index.html parsing.
+      // Ignore malformed metadata and fall through to the scan.
+    }
+  }
+
+  const assetsDir = path.join(distDir, "assets");
+  if (fs.existsSync(assetsDir)) {
+    const entryCandidates = fs
+      .readdirSync(assetsDir)
+      .filter((name) => name.startsWith("index-") && name.endsWith(".js"))
+      .sort();
+
+    if (entryCandidates.length > 0) {
+      return `/assets/${entryCandidates[entryCandidates.length - 1]}`;
     }
   }
 

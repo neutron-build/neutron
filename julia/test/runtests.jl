@@ -76,13 +76,16 @@ end
 end
 
 @testset "KV collection result parsing (engine JSON formats)" begin
-    # KV_LRANGE / KV_SMEMBERS: JSON array of strings
+    # KV_LRANGE / KV_SMEMBERS: JSON array of strings. Their scalar_fns arms
+    # answer Value::Text on every success path — an empty collection arrives
+    # as "[]" — so a NULL cell is a contract violation, not an empty vector.
     @test NeutronJulia._json_strings("[\"a\",\"b\"]") == ["a", "b"]
     @test NeutronJulia._json_strings("[\"has,comma\",\"b\"]") == ["has,comma", "b"]
     @test NeutronJulia._json_strings("[]") == String[]
-    @test NeutronJulia._json_strings(missing) == String[]
+    @test_throws ErrorException NeutronJulia._json_strings(missing)
 
     # KV_ZRANGE / KV_ZRANGEBYSCORE: JSON array of [member, score] pairs.
+    # Same Text-only contract: "[]" is the empty case, NULL is a violation.
     #
     # Members only. This asserted ["a:1.5", "b:2.0"] — the joined form — so the
     # test and the implementation shared one wrong assumption and the test
@@ -93,11 +96,53 @@ end
     @test NeutronJulia._zentries("[[\"a:b\",1.0]]") == ["a:b"]
     @test NeutronJulia._zentries_scored("[[\"a:b\",1.0]]") == [("a:b", 1.0)]
     @test NeutronJulia._zentries("[]") == String[]
-    @test NeutronJulia._zentries(missing) == String[]
+    @test_throws ErrorException NeutronJulia._zentries(missing)
+    @test_throws ErrorException NeutronJulia._zentries_scored(missing)
 
-    # PUBSUB_CHANNELS still comma-joins
+    # KV_HGETALL: JSON array of [field, value] pairs — Text-only as well.
+    @test NeutronJulia._hash_pairs("[[\"f\",\"v\"],[\"g\",\"w\"]]") ==
+        Dict("f" => "v", "g" => "w")
+    @test NeutronJulia._hash_pairs("[]") == Dict{String,String}()
+    @test_throws ErrorException NeutronJulia._hash_pairs(missing)
+
+    # PUBSUB_CHANNELS still comma-joins. Its only Ok arm is
+    # Value::Text(chans.join(",")), so an empty channel list arrives as ""
+    # — never NULL — and missing is a contract violation.
     @test NeutronJulia._split_csv("ch1,ch2") == ["ch1", "ch2"]
-    @test NeutronJulia._split_csv(missing) == String[]
+    @test NeutronJulia._split_csv("") == String[]
+    @test_throws ErrorException NeutronJulia._split_csv(missing)
+end
+
+@testset "Streams payload parsing (engine contract)" begin
+    # A missing stream answers "" — an empty TEXT cell, which LibPQ delivers
+    # as an empty String, not missing. NULL never occurs on these paths.
+    @test NeutronJulia._stream_entries("", "STREAM_XRANGE") == Dict{String,Any}[]
+    @test NeutronJulia._stream_entries("", "STREAM_XREAD") == Dict{String,Any}[]
+
+    entries = NeutronJulia._stream_entries(
+        "[{\"id\":\"100-0\",\"fields\":{\"action\":\"login\"}}]", "STREAM_XRANGE")
+    @test entries isa Vector{Dict{String,Any}}
+    @test entries[1]["id"] == "100-0"
+    @test entries[1]["fields"]["action"] == "login"
+
+    # STREAM_XADD always answers an entry id on success; errors are statement
+    # errors LibPQ raises, so a NULL cell is a contract violation.
+    @test NeutronJulia._entry_id("400-0") == "400-0"
+
+    @test_throws ErrorException NeutronJulia._stream_entries(missing, "STREAM_XRANGE")
+    @test_throws ErrorException NeutronJulia._entry_id(missing)
+
+    # STREAM_XREADGROUP: its only Ok arm is Value::Text(stream_entries_to_json)
+    # — "[]" when caught up — and a missing group is a NOGROUP statement error
+    # LibPQ raises, so NULL and "" are both contract violations.
+    @test NeutronJulia._group_entries("[]") == Dict{String,Any}[]
+    group_entries = NeutronJulia._group_entries(
+        "[{\"id\":\"100-0\",\"fields\":{\"action\":\"login\"}}]")
+    @test group_entries isa Vector{Dict{String,Any}}
+    @test group_entries[1]["id"] == "100-0"
+    @test group_entries[1]["fields"]["action"] == "login"
+    @test_throws ErrorException NeutronJulia._group_entries(missing)
+    @test_throws ErrorException NeutronJulia._group_entries("")
 end
 
 @testset "Value types" begin

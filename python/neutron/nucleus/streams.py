@@ -97,12 +97,18 @@ class StreamsModel:
         consumer: str,
         count: int = 10,
     ) -> list[StreamEntry]:
-        """Read and claim entries for a consumer group."""
+        """Read and claim entries for a consumer group.
+
+        A missing group (or stream) answers ``NOGROUP`` as a statement error
+        since Nucleus v0.1.8 — the asyncpg error from ``fetchval`` propagates
+        — and an empty delivery is ``"[]"``. An empty payload is a contract
+        violation, not "caught up".
+        """
         self._require()
         raw = await self._exec.fetchval(
             "SELECT STREAM_XREADGROUP($1, $2, $3, $4)", stream, group, consumer, count
         )
-        return _parse_stream_entries(raw)
+        return _parse_group_entries(raw)
 
     async def xack(self, stream: str, group: str, entry_id: str) -> bool:
         """Acknowledge a processed entry by the id ``xadd`` returned.
@@ -123,21 +129,43 @@ class StreamsModel:
         )
 
 
+def _map_stream_entries(data: Any) -> list[StreamEntry]:
+    entries: list[StreamEntry] = []
+    for item in data:
+        if isinstance(item, dict):
+            entry_id = str(item.get("id", ""))
+            raw_fields = item.get("fields")
+            if isinstance(raw_fields, dict):
+                fields = raw_fields
+            else:  # legacy flat shape: fields at the top level
+                fields = {k: v for k, v in item.items() if k != "id"}
+            entries.append(StreamEntry(id=entry_id, fields=fields))
+    return entries
+
+
 def _parse_stream_entries(raw: str | None) -> list[StreamEntry]:
+    # "" is the engine's answer for a missing stream (XRANGE/XREAD return an
+    # empty Text payload, never NULL or an error). Anything that fails JSON
+    # parsing is a contract violation and raises, like _parse_group_entries.
     if not raw:
         return []
     try:
         data = json.loads(raw)
-        entries: list[StreamEntry] = []
-        for item in data:
-            if isinstance(item, dict):
-                entry_id = str(item.get("id", ""))
-                raw_fields = item.get("fields")
-                if isinstance(raw_fields, dict):
-                    fields = raw_fields
-                else:  # legacy flat shape: fields at the top level
-                    fields = {k: v for k, v in item.items() if k != "id"}
-                entries.append(StreamEntry(id=entry_id, fields=fields))
-        return entries
-    except (json.JSONDecodeError, TypeError):
-        return []
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"STREAM_XRANGE/STREAM_XREAD returned invalid JSON: {raw!r}"
+        ) from exc
+    return _map_stream_entries(data)
+
+
+def _parse_group_entries(raw: str | None) -> list[StreamEntry]:
+    if not raw:
+        raise ValueError(
+            "STREAM_XREADGROUP returned an empty payload; a missing group "
+            "should raise NOGROUP instead"
+        )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"STREAM_XREADGROUP returned invalid JSON: {raw!r}") from exc
+    return _map_stream_entries(data)

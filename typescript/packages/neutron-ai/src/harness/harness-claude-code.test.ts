@@ -172,3 +172,45 @@ test("a missing prompt throws", () => {
   const harness = claudeCode({ spawn });
   assert.throws(() => harness.run({}));
 });
+
+test("an abandoned run settles the result promise and kills the child process", async () => {
+  let releaseStdout: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseStdout = resolve;
+  });
+  let killed = false;
+  const spawn: SpawnFn = () => ({
+    stdout: (async function* () {
+      yield `${JSON.stringify({ type: "system", subtype: "init", session_id: "sess-5" })}\n`;
+      await gate; // the rest of the session never arrives
+    })(),
+    kill() {
+      killed = true;
+      releaseStdout?.();
+    },
+    exited: gate.then(() => 0),
+  });
+  const harness = claudeCode({ spawn });
+  const run = harness.run({ prompt: "long task" });
+
+  for await (const _event of run.events) {
+    break; // abandon mid-session
+  }
+
+  const outcome = await Promise.race([
+    run.result.then(
+      () => "settled",
+      (err: unknown) => {
+        assert.match(err instanceof Error ? err.message : String(err), /abandoned/);
+        return "settled";
+      },
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("hang"), 500)),
+  ]);
+  assert.notEqual(
+    outcome,
+    "hang",
+    "run.result must settle after abandonment; it used to hang forever",
+  );
+  assert.equal(killed, true, "abandoning the run must not leak the child process");
+});

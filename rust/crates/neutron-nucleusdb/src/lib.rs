@@ -15,7 +15,7 @@
 //!
 //! ```rust,ignore
 //! use neutron::prelude::*;
-//! use neutron_nucleus::{Db, NucleusConfig, NucleusPool, migrate};
+//! use neutron_nucleusdb::{Db, NucleusConfig, NucleusPool, migrate};
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -39,14 +39,14 @@
 //!     let users: Vec<serde_json::Value> = rows.iter().map(|r| {
 //!         serde_json::json!({ "id": r.get::<_, i64>(0), "name": r.get::<_, String>(1) })
 //!     }).collect();
-//!     Ok::<_, neutron_nucleus::NucleusError>(Json(users))
+//!     Ok::<_, neutron_nucleusdb::NucleusError>(Json(users))
 //! }
 //! ```
 //!
 //! ## Quick start — NucleusClient (multi-model)
 //!
 //! ```rust,ignore
-//! use neutron_nucleus::{NucleusClient, NucleusConfig};
+//! use neutron_nucleusdb::{NucleusClient, NucleusConfig};
 //!
 //! let client = NucleusClient::connect(NucleusConfig::default()).await?;
 //!
@@ -56,7 +56,7 @@
 //!
 //! // Vector search
 //! let results = client.vector().search("embeddings", &[1.0, 0.0, 0.0],
-//!     neutron_nucleus::models::vector::DistanceMetric::Cosine, 10).await?;
+//!     neutron_nucleusdb::models::vector::DistanceMetric::Cosine, 10).await?;
 //!
 //! // Graph
 //! let node_id = client.graph().add_node("Person", None).await?;

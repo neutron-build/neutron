@@ -21,12 +21,21 @@ pub struct StreamModel {
     pool: NucleusPool,
 }
 
-/// Parse a stream-entries JSON payload. The engine returns an empty string
-/// (not `[]`) when the stream does not exist — treat that as no entries.
+/// Parse a STREAM_XRANGE / STREAM_XREAD payload. The engine returns an empty
+/// string (not `[]`) when the stream does not exist — treat that as no entries.
 fn parse_entries(raw: &str) -> Result<Vec<StreamEntry>, NucleusError> {
     if raw.is_empty() {
         return Ok(Vec::new());
     }
+    serde_json::from_str(raw).map_err(|e| NucleusError::Serde(e.to_string()))
+}
+
+/// Parse a STREAM_XREADGROUP payload. Unlike [`parse_entries`], an empty
+/// string is an error: since Nucleus v0.1.8 a missing group answers NOGROUP
+/// as a statement error (surfaced as [`NucleusError::Query`] by the caller)
+/// and an empty delivery is `"[]"`, so `""` is a contract violation and must
+/// not read as "caught up".
+fn parse_group_entries(raw: &str) -> Result<Vec<StreamEntry>, NucleusError> {
     serde_json::from_str(raw).map_err(|e| NucleusError::Serde(e.to_string()))
 }
 
@@ -138,6 +147,10 @@ impl StreamModel {
     }
 
     /// Read entries from a consumer group.
+    ///
+    /// A missing group (or stream) answers NOGROUP as a statement error since
+    /// Nucleus v0.1.8 and surfaces as [`NucleusError::Query`]; an empty
+    /// delivery is a `"[]"` payload.
     pub async fn xreadgroup(
         &self,
         stream: &str,
@@ -155,7 +168,7 @@ impl StreamModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        parse_entries(&raw)
+        parse_group_entries(&raw)
     }
 
     /// Acknowledge processing of a stream entry in a consumer group.
@@ -245,13 +258,27 @@ mod tests {
 
     #[test]
     fn parse_entries_empty_string_is_empty() {
-        // Engine returns "" (not "[]") for a missing stream.
+        // Engine returns "" (not "[]") for a missing stream on XRANGE/XREAD.
         assert!(parse_entries("").unwrap().is_empty());
     }
 
     #[test]
     fn parse_entries_empty_array() {
         assert!(parse_entries("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_group_entries_empty_delivery_is_empty() {
+        assert!(parse_group_entries("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_group_entries_empty_string_is_error() {
+        // Since Nucleus v0.1.8, "" is not a possible XREADGROUP result: a
+        // missing group answers NOGROUP (a query error, which never reaches
+        // the parser) and an empty delivery is "[]". An empty payload is a
+        // contract violation, not an empty batch.
+        assert!(parse_group_entries("").is_err());
     }
 
     #[test]

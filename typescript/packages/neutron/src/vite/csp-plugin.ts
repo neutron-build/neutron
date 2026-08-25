@@ -270,24 +270,42 @@ export function cspPlugin(config: CspConfig): Plugin {
     };
   }
 
+  let command: 'build' | 'serve' = 'serve';
+  let warnedStaticNonce = false;
+
   return {
     name: 'neutron:csp',
+    configResolved(resolvedConfig) {
+      command = resolvedConfig.command;
+    },
     transformIndexHtml: {
       order: 'post',
       handler(html: string) {
         let finalHtml = html;
         let nonce: string | undefined;
 
-        // Generate nonce if enabled
-        if (config.useNonce) {
+        // Generate nonce if enabled. In dev (`serve`) the handler runs per
+        // request, so the nonce is genuinely per-request. In `build` there is
+        // exactly one nonce baked into the emitted HTML — identical for every
+        // visitor, which protects nothing. Fall back to hashes there (the
+        // plugin's own doc: nonces are "incompatible with static hosting").
+        const useNonce = config.useNonce && command === 'serve';
+        if (config.useNonce && command === 'build' && !warnedStaticNonce) {
+          warnedStaticNonce = true;
+          console.warn(
+            '[neutron:csp] useNonce is ignored in builds: a build-time nonce is ' +
+              'shared by every served copy. Using hash-based CSP instead.'
+          );
+        }
+        if (useNonce) {
           nonce = generateNonce();
           // Inject nonce into inline scripts and styles
           finalHtml = injectNonce(html, nonce);
         }
 
         // Extract hashes from inline scripts and styles (for hash-based CSP)
-        const scriptHashes = config.useNonce ? new Set<string>() : extractScriptHashes(html);
-        const styleHashes = config.useNonce ? new Set<string>() : extractStyleHashes(html);
+        const scriptHashes = useNonce ? new Set<string>() : extractScriptHashes(html);
+        const styleHashes = useNonce ? new Set<string>() : extractStyleHashes(html);
 
         // Build CSP header
         const cspHeader = buildCspHeader(

@@ -218,9 +218,6 @@ defmodule Nucleus.Models.KV do
         {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
           {:ok, decode_json_list(raw)}
 
-        {:ok, _} ->
-          {:ok, []}
-
         {:error, _} = error ->
           error
       end
@@ -315,9 +312,6 @@ defmodule Nucleus.Models.KV do
 
           {:ok, result}
 
-        {:ok, _} ->
-          {:ok, %{}}
-
         {:error, _} = error ->
           error
       end
@@ -366,9 +360,6 @@ defmodule Nucleus.Models.KV do
       case Nucleus.Client.query(client, "SELECT KV_SMEMBERS($1)", [key]) do
         {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
           {:ok, decode_json_list(raw)}
-
-        {:ok, _} ->
-          {:ok, []}
 
         {:error, _} = error ->
           error
@@ -420,9 +411,6 @@ defmodule Nucleus.Models.KV do
         {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
           {:ok, decode_scored_list(raw)}
 
-        {:ok, _} ->
-          {:ok, []}
-
         {:error, _} = error ->
           error
       end
@@ -437,9 +425,6 @@ defmodule Nucleus.Models.KV do
       case Nucleus.Client.query(client, "SELECT KV_ZRANGEBYSCORE($1, $2, $3)", [key, min, max]) do
         {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
           {:ok, decode_scored_list(raw)}
-
-        {:ok, _} ->
-          {:ok, []}
 
         {:error, _} = error ->
           error
@@ -495,11 +480,16 @@ defmodule Nucleus.Models.KV do
 
   # --- Internal ---
 
-  # Engine collection functions return a JSON array as text.
+  # Engine collection functions answer Value::Text on their only Ok arm
+  # (scalar_fns.rs KV_LRANGE/KV_SMEMBERS/KV_HGETALL/KV_ZRANGE/
+  # KV_ZRANGEBYSCORE): serde of a Vec emits at least "[]", so the empty
+  # collection arrives as "[]" — never NULL — and a payload that does not
+  # decode to a JSON array is a contract violation and raises rather than
+  # collapsing to [].
   defp decode_json_list(raw) do
-    case Jason.decode(raw) do
-      {:ok, list} when is_list(list) -> list
-      _ -> []
+    case Jason.decode!(raw) do
+      list when is_list(list) -> list
+      other -> raise ArgumentError, "expected a JSON array payload, got: #{inspect(other)}"
     end
   end
 

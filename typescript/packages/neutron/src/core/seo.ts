@@ -159,8 +159,17 @@ export function renderMetaTags(tags: SeoTag[]): string {
       if (tag.tag === "title") {
         return `<title>${escapeHtml(tag.content)}</title>`;
       }
+      // Attribute names can come from untrusted data (e.g. seo.link entry
+      // keys); sanitize them exactly like renderAttrs — strip invalid
+      // characters and drop event handlers — or a crafted key injects a
+      // second attribute (`href="/x" onclick="..."`).
       const attrs = Object.entries(tag.attrs)
-        .map(([name, value]) => `${name}="${escapeHtml(value)}"`)
+        .map(([name, value]) => {
+          if (/^on/i.test(name)) return "";
+          const safeName = escapeAttrName(name);
+          return safeName ? `${safeName}="${escapeHtml(value)}"` : "";
+        })
+        .filter(Boolean)
         .join(" ");
       return `<${tag.tag} ${attrs}>`;
     })

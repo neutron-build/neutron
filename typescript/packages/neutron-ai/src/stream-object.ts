@@ -46,6 +46,11 @@ export function streamObject<S extends FlexibleSchema<unknown>>(
   return new StreamObjectResultImpl(options, resolveSchema(options.schema), messages);
 }
 
+/** Rejection reason for result promises when the consumer abandons the stream. */
+const ABANDONED_STREAM = new AIError(
+  problemFromStatus(400, "The stream was abandoned before completion; result promises cannot be fulfilled."),
+);
+
 class StreamObjectResultImpl<T> implements StreamObjectResult<T> {
   #options: StreamObjectOptions<FlexibleSchema<unknown>>;
   #schema: Schema<unknown>;
@@ -151,6 +156,14 @@ class StreamObjectResultImpl<T> implements StreamObjectResult<T> {
       this.#objectDeferred.reject(error);
       this.#usageDeferred.reject(error);
       throw error;
+    } finally {
+      // A consumer that breaks out of the stream abandons the generator at a
+      // yield: neither the resolve block nor the catch above runs, and the
+      // result deferreds stay pending forever — `await result.object` hung
+      // with no error and no timeout. Settle them here; on the normal and
+      // error paths they are already settled and rejecting again is a no-op.
+      this.#objectDeferred.reject(ABANDONED_STREAM);
+      this.#usageDeferred.reject(ABANDONED_STREAM);
     }
   }
 

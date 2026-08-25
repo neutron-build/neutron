@@ -20,9 +20,12 @@ defmodule Nucleus.Models.CDC do
   @spec read(client(), integer(), integer()) :: {:ok, [event()]} | {:error, term()}
   def read(client, after_sequence, limit \\ 100) do
     with :ok <- Nucleus.Client.require_nucleus(client, "CDC.read") do
+      # CDC_READ's only Ok arm is Value::Text("[...]") — an empty log
+      # answers "[]", never NULL — and the wire column is TEXT, so Postgrex
+      # always delivers a binary; any other shape raises rather than
+      # collapsing into {:ok, []}.
       case Nucleus.Client.query(client, "SELECT CDC_READ($1, $2)", [after_sequence, limit]) do
         {:ok, %{rows: [[raw]]}} when is_binary(raw) -> {:ok, decode_events(raw)}
-        {:ok, _} -> {:ok, []}
         {:error, _} = error -> error
       end
     end
@@ -44,13 +47,13 @@ defmodule Nucleus.Models.CDC do
           {:ok, [event()]} | {:error, term()}
   def table_read(client, table, after_sequence, limit \\ 100) do
     with :ok <- Nucleus.Client.require_nucleus(client, "CDC.table_read") do
+      # CDC_TABLE_READ answers the same Text-only contract as CDC_READ above.
       case Nucleus.Client.query(client, "SELECT CDC_TABLE_READ($1, $2, $3)", [
              table,
              after_sequence,
              limit
            ]) do
         {:ok, %{rows: [[raw]]}} when is_binary(raw) -> {:ok, decode_events(raw)}
-        {:ok, _} -> {:ok, []}
         {:error, _} = error -> error
       end
     end
@@ -58,11 +61,13 @@ defmodule Nucleus.Models.CDC do
 
   # --- Internal ---
 
-  # Engine returns a JSON array of {"seq","table","change","ts"} events.
+  # Engine returns a JSON array of {"seq","table","change","ts"} events as
+  # Text on its only Ok arm, so a payload that does not decode to a JSON
+  # array is a contract violation and raises rather than collapsing to [].
   defp decode_events(raw) do
-    case Jason.decode(raw) do
-      {:ok, events} when is_list(events) -> events
-      _ -> []
+    case Jason.decode!(raw) do
+      events when is_list(events) -> events
+      other -> raise ArgumentError, "expected a JSON array payload, got: #{inspect(other)}"
     end
   end
 end

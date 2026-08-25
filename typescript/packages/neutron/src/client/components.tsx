@@ -3,6 +3,7 @@ import { useState, useCallback, useRef, useEffect } from "preact/hooks";
 import { decodeLoaderDataPayload } from "./serialization.js";
 import { navigate } from "./navigate.js";
 import { setNavigationState } from "./hooks.js";
+import { hasFreshPrefetch, storePrefetch } from "./prefetch-cache.js";
 import type { RouteHref } from "../core/typed-routes.js";
 
 function toLocalUrl(url: string): string | null {
@@ -52,8 +53,7 @@ export async function prefetch(to: string): Promise<void> {
   const localUrl = toLocalUrl(to);
   if (!localUrl) return;
 
-  window.__NEUTRON_PREFETCH_CACHE__ = window.__NEUTRON_PREFETCH_CACHE__ || {};
-  if (window.__NEUTRON_PREFETCH_CACHE__[localUrl]) {
+  if (hasFreshPrefetch(localUrl)) {
     return;
   }
 
@@ -71,7 +71,9 @@ export async function prefetch(to: string): Promise<void> {
 
   const payload = await response.json();
   const data = decodeLoaderDataPayload(payload);
-  window.__NEUTRON_PREFETCH_CACHE__[localUrl] = data;
+  // Warm the one cache navigation reads (takePrefetch). Writing only the raw
+  // window global made every warmed payload unconsumed — a double fetch.
+  storePrefetch(localUrl, data);
 }
 
 // Keep internal name for backwards compatibility
@@ -185,8 +187,9 @@ export const Form: FunctionalComponent<FormProps> = ({
             }
           } else {
             const currentUrl = window.location.pathname + window.location.search;
-            window.__NEUTRON_PREFETCH_CACHE__ = window.__NEUTRON_PREFETCH_CACHE__ || {};
-            window.__NEUTRON_PREFETCH_CACHE__[currentUrl] = data;
+            // Same contract as useSubmit: post-mutation payloads go through
+            // the expiring prefetch cache, never the raw global (no TTL).
+            storePrefetch(currentUrl, data);
             applyClientData(data);
           }
         } else {
@@ -334,7 +337,9 @@ export const NavLink: FunctionalComponent<NavLinkProps> = ({
       if (end) {
         setIsActive(pathname === to);
       } else {
-        setIsActive(pathname === to || pathname.startsWith(to + "/"));
+        // "/" is the prefix of every path: `to + "/"` is "//", which no
+        // pathname starts with — home would never be active on subpaths.
+        setIsActive(pathname === to || to === "/" || pathname.startsWith(to + "/"));
       }
     };
 

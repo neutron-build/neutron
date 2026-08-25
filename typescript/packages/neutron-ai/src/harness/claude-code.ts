@@ -5,6 +5,11 @@ import { deferred } from "../internal/deferred.js";
 import type { Usage } from "../types.js";
 import type { AgentEvent, AgentHarness, AgentResult, AgentResultStatus, AgentRun, AgentRunOptions } from "./index.js";
 
+/** Rejection reason for the result promise when the consumer abandons the run. */
+const ABANDONED_RUN = new AIError(
+  problemFromStatus(400, "The run was abandoned before completion; the result promise cannot be fulfilled."),
+);
+
 /** Minimal process surface the adapter needs; the test seam. */
 export interface SpawnedProcess {
   stdout: AsyncIterable<Uint8Array | string>;
@@ -227,6 +232,14 @@ class ClaudeCodeRun implements AgentRun {
       result.error = problem;
       result.raw = error;
       this.#resultDeferred.resolve(result);
+    } finally {
+      // A consumer that breaks out of `events` abandons the generator at a
+      // yield: neither the resolve block nor the catch above runs, the result
+      // deferred stays pending forever, and the subprocess leaks. Kill the
+      // child (a no-op once it exited) and settle the deferred here; on the
+      // normal and error paths it is already settled.
+      this.#child?.kill();
+      this.#resultDeferred.reject(ABANDONED_RUN);
     }
   }
 

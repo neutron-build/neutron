@@ -73,6 +73,13 @@ export interface RoundtripOptions {
 export function roundtrip(options: RoundtripOptions): TeamPolicy {
   const maxRounds = options.maxRounds ?? 3;
   const approveToken = options.approveToken ?? "APPROVE";
+  // The reviewer is instructed to REPLY WITH the token. Accept only a reply
+  // that leads with it (optional quote, non-alphanumeric after): a substring
+  // — or even standalone-word — match accepts "I cannot say APPROVE
+  // because...". A compliant reviewer that buries the token gets one more
+  // harmless revision round.
+  const escaped = approveToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const approvePattern = new RegExp(`^["']?${escaped}(?![A-Za-z0-9])`);
   return async (run, input) => {
     let proposal = await run(options.from, input);
     for (let round = 1; round <= maxRounds; round++) {
@@ -80,7 +87,7 @@ export function roundtrip(options: RoundtripOptions): TeamPolicy {
         options.review,
         `Review the following work. Reply with "${approveToken}" if it is acceptable; otherwise give concrete revision feedback.\n\nTask:\n${input}\n\nWork:\n${proposal.text}`,
       );
-      if (review.text.includes(approveToken)) return proposal;
+      if (approvePattern.test(review.text.trimStart())) return proposal;
       // Out of rounds: return what we have rather than producing a
       // revision no reviewer will ever see.
       if (round === maxRounds) break;

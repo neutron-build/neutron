@@ -8,7 +8,7 @@ import {
 } from "./contexts.js";
 import type { LoaderData, NavigationState, RouterState, UIMatch } from "./contexts.js";
 import { decodeLoaderDataPayload } from "./serialization.js";
-import { go, navigate } from "./navigate.js";
+import { go, navigate, registerBlocker, unregisterBlocker } from "./navigate.js";
 import { storePrefetch } from "./prefetch-cache.js";
 import type { RouteHref } from "../core/typed-routes.js";
 import type { SerializeFrom } from "../core/types.js";
@@ -323,8 +323,6 @@ export function useBlocker(
   const blockerIdRef = useRef<number | null>(null);
 
   useEffect(() => {
-    const { registerBlocker, unregisterBlocker } = require('./navigate.js');
-
     if (shouldBlock) {
       const id = registerBlocker(shouldBlock);
       blockerIdRef.current = id;
@@ -352,8 +350,6 @@ export function useBlocker(
 
   const proceed = useCallback(() => {
     if (blockedLocation && blockerIdRef.current !== null) {
-      const { unregisterBlocker } = require('./navigate.js');
-      const { navigate } = require('./navigate.js');
       unregisterBlocker(blockerIdRef.current);
       blockerIdRef.current = null;
       setState("proceeding");

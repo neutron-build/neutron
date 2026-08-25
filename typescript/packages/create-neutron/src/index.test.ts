@@ -826,4 +826,26 @@ describe("scaffoldProject (real export)", () => {
       fs.rmSync(targetDir, { recursive: true, force: true });
     }
   });
+
+  it("sanitizes a project name that would break generated code", async () => {
+    // A directory named my"app substitutes a raw quote into
+    // `title: "__PROJECT_NAME__"` — syntactically broken output.
+    const scratchRoot = scratchPath("quoted-parent");
+    const targetDir = path.join(scratchRoot, 'my"app');
+    try {
+      const result = await scaffoldProject({
+        targetDir,
+        template: "basic",
+        runtime: "preact",
+      });
+      assert.equal(result.projectName, "myapp");
+
+      const home = fs.readFileSync(path.join(targetDir, "src", "routes", "index.tsx"), "utf8");
+      assert.ok(home.includes('"myapp"'));
+      assert.ok(!home.includes('my"app'));
+      assertNoRawTokens(targetDir, "quoted-name");
+    } finally {
+      fs.rmSync(scratchRoot, { recursive: true, force: true });
+    }
+  });
 });

@@ -60,15 +60,18 @@ defmodule Nucleus.Models.Streams do
     with :ok <- Nucleus.Client.require_nucleus(client, "Streams.xrange") do
       end_val = if end_ms == :inf, do: 9_999_999_999_999, else: end_ms
 
+      # The engine answers a missing stream with "" (empty TEXT cell), which
+      # is the reachable empty case. NULL never occurs — both engine arms
+      # return Text — and the wire column is TEXT, so Postgrex always delivers
+      # a binary; any other shape raises rather than collapsing into {:ok, []}.
       case Nucleus.Client.query(client, "SELECT STREAM_XRANGE($1, $2, $3, $4)", [
              stream,
              start_ms,
              end_val,
              count
            ]) do
+        {:ok, %{rows: [[""]]}} -> {:ok, []}
         {:ok, %{rows: [[json]]}} when is_binary(json) -> {:ok, Jason.decode!(json)}
-        {:ok, %{rows: [[list]]}} when is_list(list) -> {:ok, list}
-        {:ok, _} -> {:ok, []}
         {:error, _} = error -> error
       end
     end
@@ -79,14 +82,15 @@ defmodule Nucleus.Models.Streams do
           {:ok, list()} | {:error, term()}
   def xread(client, stream, last_id_ms, count) do
     with :ok <- Nucleus.Client.require_nucleus(client, "Streams.xread") do
+      # Same contract as xrange/5 above: "" means missing stream, the column
+      # is TEXT so only binaries arrive, anything unexpected raises.
       case Nucleus.Client.query(client, "SELECT STREAM_XREAD($1, $2, $3)", [
              stream,
              last_id_ms,
              count
            ]) do
+        {:ok, %{rows: [[""]]}} -> {:ok, []}
         {:ok, %{rows: [[json]]}} when is_binary(json) -> {:ok, Jason.decode!(json)}
-        {:ok, %{rows: [[list]]}} when is_list(list) -> {:ok, list}
-        {:ok, _} -> {:ok, []}
         {:error, _} = error -> error
       end
     end
@@ -110,7 +114,7 @@ defmodule Nucleus.Models.Streams do
 
   @doc "Reads from a stream as part of a consumer group."
   @spec xreadgroup(client(), String.t(), String.t(), String.t(), integer()) ::
-          {:ok, list() | String.t()} | {:error, term()}
+          {:ok, list()} | {:error, term()}
   def xreadgroup(client, stream, group, consumer, count) do
     with :ok <- Nucleus.Client.require_nucleus(client, "Streams.xreadgroup") do
       case Nucleus.Client.query(client, "SELECT STREAM_XREADGROUP($1, $2, $3, $4)", [
@@ -119,17 +123,8 @@ defmodule Nucleus.Models.Streams do
              consumer,
              count
            ]) do
-        {:ok, %{rows: [[json]]}} when is_binary(json) ->
-          case Jason.decode(json) do
-            {:ok, parsed} -> {:ok, parsed}
-            {:error, _} -> {:ok, json}
-          end
-
-        {:ok, _} ->
-          {:ok, []}
-
-        {:error, _} = error ->
-          error
+        {:ok, %{rows: [[json]]}} when is_binary(json) -> {:ok, Jason.decode!(json)}
+        {:error, _} = error -> error
       end
     end
   end

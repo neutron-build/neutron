@@ -4,6 +4,7 @@
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';
 import { requireNucleus } from '../helpers.js';
+import { NucleusQueryError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,7 +35,12 @@ export interface StreamsModel {
   /** Create a consumer group on a stream. */
   xgroupCreate(stream: string, group: string, startId: number): Promise<boolean>;
 
-  /** Read entries from a consumer group. */
+  /**
+   * Read entries from a consumer group.
+   *
+   * A missing group (or stream) answers NOGROUP as a statement error
+   * (SQLSTATE 22000) since Nucleus v0.1.8; an empty delivery is `"[]"`.
+   */
   xreadGroup(stream: string, group: string, consumer: string, count: number): Promise<StreamEntry[]>;
 
   /**
@@ -112,7 +118,17 @@ class StreamsModelImpl implements StreamsModel {
     const raw = await this.transport.fetchval<string>('SELECT STREAM_XREADGROUP($1, $2, $3, $4)', [
       stream, group, consumer, count,
     ]);
-    if (!raw) return [];
+    // Since Nucleus v0.1.8: a missing group answers NOGROUP as a statement
+    // error (SQLSTATE 22000) which the transport throws, and a caught-up
+    // success carries "[]" — never "". An empty payload is a contract
+    // violation, not "caught up": reading it as [] is how a vanished group
+    // silently skips every unprocessed entry, forever.
+    if (!raw) {
+      throw new NucleusQueryError(
+        'STREAM_XREADGROUP returned an empty payload; expected "[]" when caught up ' +
+          'or a NOGROUP error for a missing group',
+      );
+    }
     return JSON.parse(raw) as StreamEntry[];
   }
 

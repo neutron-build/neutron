@@ -2,6 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { h, render, type ComponentChild, type VNode } from "preact";
 import * as hooks from "./hooks.js";
+import { navigate } from "./navigate.js";
 import { MatchesContext } from "./contexts.js";
 import { clearPrefetchCache, hasFreshPrefetch } from "./prefetch-cache.js";
 
@@ -667,5 +668,37 @@ describe("useBeforeUnload", () => {
     await flushEffects(); // let the cleanup effect run
     window.dispatchEvent(new Event("beforeunload"));
     expect(seen.length).toBe(1);
+  });
+});
+
+describe("useBlocker", () => {
+  it("registers a working blocker without CommonJS require (ESM bundle)", async () => {
+    // useBlocker used to call require('./navigate.js') inside its effect —
+    // a ReferenceError in any ESM/browser bundle, so no blocker was ever
+    // registered and navigations sailed through. Registering the blocker is
+    // the observable: navigate() must emit neutron:navigation-blocked.
+    window.history.replaceState(null, "", "/form");
+
+    const blocked: Event[] = [];
+    const onBlocked = (event: Event): void => {
+      blocked.push(event);
+    };
+    window.addEventListener("neutron:navigation-blocked", onBlocked);
+
+    function Probe(): VNode<any> {
+      hooks.useBlocker(true);
+      return h("p", null, "x");
+    }
+    const container = mount(withProviders(h(Probe, null)));
+    await flushEffects(); // let the effect register the blocker
+
+    navigate("/away");
+
+    expect(blocked.length).toBe(1);
+    expect(window.location.pathname).toBe("/form");
+
+    window.removeEventListener("neutron:navigation-blocked", onBlocked);
+    render(null, container);
+    await flushEffects();
   });
 });

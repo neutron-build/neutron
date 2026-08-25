@@ -183,11 +183,10 @@ export function rateLimitMiddleware(
       }
     }
   }, windowMs);
-
-  // Allow cleanup to be stopped (for testing or graceful shutdown)
-  if (typeof process !== "undefined") {
-    process.on("SIGTERM", () => clearInterval(cleanupInterval));
-  }
+  // The interval must not hold the event loop open for the process lifetime
+  // of every middleware instance. Explicit teardown stays available via the
+  // attached .cleanup().
+  (cleanupInterval as unknown as { unref?: () => void }).unref?.();
 
   const middleware: MiddlewareFn = async (request, context, next) => {
     // Skip rate limiting if configured

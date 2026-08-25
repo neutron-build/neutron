@@ -80,4 +80,14 @@ describe("csrfMiddleware", () => {
     const res = await run(csrfMiddleware(), req);
     expect(res.status).toBe(403);
   });
+
+  it("type-augments AppContext with csrfToken", async () => {
+    const ctx: AppContext = {};
+    await run(csrfMiddleware(), new Request("http://localhost/"), ctx);
+    // Compile-time contract: the `declare module` augmentation must target
+    // the interface middleware actually receives (AppContext), so consumer
+    // code gets `string | undefined`, not the index signature's `unknown`.
+    const token: string | undefined = ctx.csrfToken;
+    expect(typeof token).toBe("string");
+  });
 });

@@ -37,11 +37,27 @@ function run() {
 }
 
 function resolveRepoRoot(cwd) {
-  const parent = path.resolve(cwd, "..");
-  if (fs.existsSync(path.join(parent, "ARCHITECTURE.md"))) {
-    return parent;
+  // Walk up to the real repo root instead of guessing one level. The previous
+  // marker (../ARCHITECTURE.md) never existed, which silently resolved the
+  // root to this workspace and made the Rust/Mojo checks iterate zero files
+  // on every run while CI printed a green "0 cargo crates".
+  let dir = cwd;
+  for (;;) {
+    if (
+      fs.existsSync(path.join(dir, ".git")) ||
+      fs.existsSync(path.join(dir, "FRAMEWORK_CONTRACT.md"))
+    ) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      console.error(
+        `[naming] Repository root not found (no .git or FRAMEWORK_CONTRACT.md at or above ${cwd}).`
+      );
+      process.exit(1);
+    }
+    dir = parent;
   }
-  return cwd;
 }
 
 function collectUniqueFiles(roots, basename) {
@@ -183,9 +199,18 @@ function validateLayerMixing(name, rel) {
   // Per the amended naming RFC (Reality note): `@neutron-build` is the
   // brand/org scope, not the platform name `Neutron`. A package whose artifact
   // name within that scope is `nucleus` is therefore the Nucleus client
-  // artifact and does not violate the layer rule.
+  // artifact and does not violate the layer rule. On Cargo the same applies to
+  // `neutron-nucleusdb`: the engine's crate artifact is `nucleusdb` (bare
+  // `nucleus` is taken on crates.io), and the framework's integration crate is
+  // named after its dependency, like `neutron-redis`/`neutron-postgres`.
   const isNeutronBuildNucleus = name === "@neutron-build/nucleus";
-  if (lower.includes("neutron") && lower.includes("nucleus") && !isNeutronBuildNucleus) {
+  const isNeutronNucleusDbIntegration = name === "neutron-nucleusdb";
+  if (
+    lower.includes("neutron") &&
+    lower.includes("nucleus") &&
+    !isNeutronBuildNucleus &&
+    !isNeutronNucleusDbIntegration
+  ) {
     errors.push(`${rel}: name "${name}" mixes platform and subsystem labels.`);
   }
 

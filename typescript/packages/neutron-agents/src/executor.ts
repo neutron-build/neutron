@@ -75,9 +75,38 @@ export interface LocalExecutorOptions {
    * exec — secret scoping for agent workloads sharing the host process
    * (an agent's `env` must not read the operator's tokens). Explicit
    * `env` values (constructor or per-exec) still win over the strip.
+   *
+   * Fail-safe default: a curated list of well-known credential variables is
+   * stripped even when this option is omitted. Pass `[]` to restore full
+   * inheritance.
    */
   envDenylist?: string[];
 }
+
+/**
+ * Well-known credential-carrying env var names stripped by default. Not a
+ * sandbox — but a model-chosen shell command must not read the operator's
+ * tokens just because it shares the host process.
+ */
+const DEFAULT_SECRET_ENV_DENYLIST = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AZURE_CLIENT_SECRET",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GITLAB_TOKEN",
+  "FORGEJO_TOKEN",
+  "NPM_TOKEN",
+  "PYPI_TOKEN",
+  "STRIPE_SECRET_KEY",
+  "DATABASE_URL",
+  "REDIS_URL",
+];
 
 /**
  * Runs commands as child processes under a root directory. Path arguments
@@ -96,7 +125,7 @@ export class LocalExecutor implements AgentExecutor {
     this.#root = resolve(options.root);
     this.#shell = options.shell ?? "/bin/sh";
     if (options.env !== undefined) this.#env = options.env;
-    this.#envDenylist = options.envDenylist ?? [];
+    this.#envDenylist = options.envDenylist ?? DEFAULT_SECRET_ENV_DENYLIST;
   }
 
   #execEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
@@ -126,10 +155,15 @@ export class LocalExecutor implements AgentExecutor {
     const maxBytes = options.maxOutputBytes ?? 1_048_576;
 
     return new Promise<ExecResult>((resolvePromise, rejectPromise) => {
+      // detached: the shell becomes its own process group leader, so the
+      // timeout can SIGKILL the WHOLE group. Killing only the shell pid
+      // orphans background grandchildren while the executor reports
+      // timedOut: true.
       const child = spawn(this.#shell, ["-c", command], {
         cwd,
         env: this.#execEnv(options.env),
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       });
 
       let stdout = "";
@@ -153,7 +187,16 @@ export class LocalExecutor implements AgentExecutor {
 
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        if (child.pid !== undefined) {
+          try {
+            // Negative pid = the whole process group (see detached above).
+            process.kill(-child.pid, "SIGKILL");
+          } catch {
+            child.kill("SIGKILL");
+          }
+        } else {
+          child.kill("SIGKILL");
+        }
       }, timeoutMs);
       timer.unref?.();
 

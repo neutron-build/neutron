@@ -38,9 +38,10 @@ export interface KVModel {
   /**
    * Set the key only if it does not already exist. Returns `true` if set.
    * With `ttl`, value and expiry commit atomically (Redis `SET NX EX`) —
-   * the crash-safe lock acquire.
+   * the crash-safe lock acquire. `namespace` prefixes the key like every
+   * other write, so namespaced callers get namespaced locks.
    */
-  setNX(key: string, value: string, opts?: { ttl?: number }): Promise<boolean>;
+  setNX(key: string, value: string, opts?: { ttl?: number; namespace?: string }): Promise<boolean>;
 
   /** Delete a key. Returns `true` if it existed. */
   delete(key: string): Promise<boolean>;
@@ -210,14 +211,15 @@ class KVModelImpl implements KVModel {
     await this.set(key, JSON.stringify(value), opts);
   }
 
-  async setNX(key: string, value: string, opts?: { ttl?: number }): Promise<boolean> {
+  async setNX(key: string, value: string, opts?: { ttl?: number; namespace?: string }): Promise<boolean> {
     this.require();
+    const k = resolveKey(key, opts?.namespace);
     if (opts?.ttl !== undefined) {
       return (
-        (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2, $3)', [key, value, opts.ttl])) ?? false
+        (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2, $3)', [k, value, opts.ttl])) ?? false
       );
     }
-    return (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2)', [key, value])) ?? false;
+    return (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2)', [k, value])) ?? false;
   }
 
   async delete(key: string): Promise<boolean> {

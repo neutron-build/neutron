@@ -227,3 +227,48 @@ test("RedisRealtimeBus handles different channels independently", async () => {
   assert.deepEqual(ch1Results, [{ id: 1 }]);
   assert.deepEqual(ch2Results, [{ id: 2 }]);
 });
+
+test("a failed subscribe does not drop subscribers registered while it was in flight", async () => {
+  // Deferred subscribe(): the first call rejects, later calls resolve.
+  let failNext = true;
+  const messageListeners: Array<(...args: unknown[]) => void> = [];
+  const subscriber: any = {
+    subscribe: async () => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("connection refused");
+      }
+    },
+    unsubscribe: async () => {},
+    on: (_event: string, listener: (...args: unknown[]) => void) => {
+      messageListeners.push(listener);
+      return subscriber;
+    },
+    removeAllListeners: () => subscriber,
+    quit: async () => {},
+    status: "ready",
+  };
+  const publisher: any = {
+    publish: async () => 1,
+    duplicate: () => subscriber,
+    quit: async () => {},
+    status: "ready",
+  };
+  const bus = new RedisRealtimeBus(publisher);
+
+  const received: string[] = [];
+  bus.subscribe("ch", () => received.push("A")); // subscribe rejects (deferred)
+  // B registers after the first subscribe() was issued but before it failed.
+  bus.subscribe("ch", () => received.push("B"));
+  await new Promise((resolve) => setTimeout(resolve, 0)); // let the rejection land
+
+  // A later subscriber must re-attempt the Redis SUBSCRIBE (and succeed).
+  bus.subscribe("ch", () => received.push("C"));
+
+  for (const listener of messageListeners) {
+    listener("ch", JSON.stringify({ seq: 1 }));
+  }
+
+  assert.ok(received.includes("B"), `B must receive messages, got: ${received.join(",")}`);
+  assert.ok(received.includes("C"), `C must receive messages, got: ${received.join(",")}`);
+});

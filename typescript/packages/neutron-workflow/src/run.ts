@@ -9,7 +9,7 @@ import type {
   RunStartedData,
   WorkflowEvent,
 } from "./events.js";
-import { WIRE_FORMAT_VERSION } from "./events.js";
+import { WIRE_FORMAT_VERSION, EXTERNAL_SEQ_BASE } from "./events.js";
 import type { EventStore } from "./store.js";
 import type { WorkflowDefinition } from "./workflow.js";
 
@@ -155,7 +155,7 @@ export async function cancelRun(store: EventStore, runId: string, reason?: strin
   }
   const raw: WorkflowEvent = {
     v: WIRE_FORMAT_VERSION,
-    seq: events.reduce((max, event) => Math.max(max, event.seq), -1) + 1,
+    seq: nextExternalSeq(events),
     type: "run-cancelled",
     at: new Date().toISOString(),
     data: { reason: reason ?? null } satisfies RunCancelledData,
@@ -213,13 +213,27 @@ async function appendExternal(
 ): Promise<void> {
   const raw: WorkflowEvent = {
     v: WIRE_FORMAT_VERSION,
-    seq: events.reduce((max, event) => Math.max(max, event.seq), -1) + 1,
+    seq: nextExternalSeq(events),
     type,
     at: new Date().toISOString(),
   };
   if (name !== undefined) raw.name = name;
   if (data !== undefined) raw.data = data;
   await store.append(runId, JSON.parse(JSON.stringify(raw)) as WorkflowEvent);
+}
+
+/**
+ * External appends allocate at or above EXTERNAL_SEQ_BASE so they can never
+ * collide with a live pass's dense seqs (see events.ts). Dense allocation —
+ * max over the whole log — is exactly the collision the partition exists to
+ * prevent.
+ */
+function nextExternalSeq(events: WorkflowEvent[]): number {
+  let max = EXTERNAL_SEQ_BASE - 1;
+  for (const event of events) {
+    if (event.seq > max) max = event.seq;
+  }
+  return max + 1;
 }
 
 function outcomeFromTerminal(event: WorkflowEvent): RunOutcome {

@@ -1,7 +1,7 @@
 //! Rust executor for the Nucleus live data-model conformance spec.
 //!
 //! Reads ../../spec.json, runs every case against a live engine through the
-//! real in-repo Rust client (`neutron-nucleus`), and prints one JSON result
+//! real in-repo Rust client (`neutron-nucleusdb`), and prints one JSON result
 //! document to stdout. It asserts nothing a mock could assert: only that a call
 //! reaches the engine, is accepted over the wire, and comes back with the right
 //! value.
@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use neutron_nucleus::{NucleusClient, NucleusConfig, SslMode};
+use neutron_nucleusdb::{NucleusClient, NucleusConfig, SslMode};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};

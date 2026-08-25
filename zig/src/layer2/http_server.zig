@@ -33,6 +33,18 @@ pub const RequestContext = struct {
     trace_id_buf: [32]u8 = undefined,
     trace_id_len: usize = 0,
 
+    // Response headers contributed by middleware before the handler runs
+    // (e.g. x-request-id from the request-id layer). Merged into every
+    // response by respond(). Values must reference storage that outlives
+    // the write — ctx-owned buffers, not middleware frames.
+    extra_headers_buf: [8]Header = undefined,
+    extra_headers_len: usize = 0,
+
+    // The request id assigned by the request-id middleware (§5), stored
+    // ctx-side so the header value outlives the middleware frame.
+    request_id_buf: [48]u8 = undefined,
+    request_id_len: usize = 0,
+
     /// Record a middleware layer name in execution order.
     pub fn traceMiddleware(self: *RequestContext, name: []const u8) void {
         if (self.middleware_trace_len >= self.middleware_trace_buf.len) return;
@@ -64,6 +76,29 @@ pub const RequestContext = struct {
         self.trace_id_len = n;
     }
 
+    /// Queue a response header to be merged into the response regardless of
+    /// which respond* path writes it. Used by middleware that runs before
+    /// the handler (e.g. x-request-id, FRAMEWORK_CONTRACT §5). Values past
+    /// capacity are dropped, never error — the response still goes out.
+    pub fn setResponseHeader(self: *RequestContext, name: []const u8, value: []const u8) void {
+        if (self.extra_headers_len >= self.extra_headers_buf.len) return;
+        self.extra_headers_buf[self.extra_headers_len] = .{ .name = name, .value = value };
+        self.extra_headers_len += 1;
+    }
+
+    /// The request id assigned by the request-id middleware, or "" when
+    /// that layer did not run.
+    pub fn requestId(self: *const RequestContext) []const u8 {
+        return self.request_id_buf[0..self.request_id_len];
+    }
+
+    /// Store the request id (clamped to the fixed buffer).
+    pub fn setRequestId(self: *RequestContext, id: []const u8) void {
+        const n = @min(id.len, self.request_id_buf.len);
+        @memcpy(self.request_id_buf[0..n], id[0..n]);
+        self.request_id_len = n;
+    }
+
     pub fn respondJson(self: *RequestContext, status: u16, body: []const u8) !void {
         const headers = [_]Header{
             .{ .name = "Content-Type", .value = "application/json" },
@@ -89,9 +124,16 @@ pub const RequestContext = struct {
         const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{body_data.len}) catch unreachable;
 
         // Encode response
-        var all_headers_buf: [16]Header = undefined;
+        var all_headers_buf: [24]Header = undefined;
         var n_headers: usize = 0;
         for (headers) |h| {
+            all_headers_buf[n_headers] = h;
+            n_headers += 1;
+        }
+        // Middleware-contributed headers (e.g. x-request-id) ride every
+        // response. Reserve the last slot for Content-Length.
+        for (self.extra_headers_buf[0..self.extra_headers_len]) |h| {
+            if (n_headers + 1 >= all_headers_buf.len) break;
             all_headers_buf[n_headers] = h;
             n_headers += 1;
         }
@@ -164,7 +206,7 @@ pub const HttpServer = struct {
     }
 
     /// Serve a single request (for testing). Returns after handling one request.
-    pub fn serveOne(self: *HttpServer, comptime handler: fn (*RequestContext) anyerror!void) !void {
+    pub fn serveOne(self: *HttpServer, handler: *const fn (*RequestContext) anyerror!void) !void {
         var conn = try self.listener.accept();
         defer conn.close();
 
@@ -200,7 +242,7 @@ pub const HttpServer = struct {
     /// short poll so a shutdown request (e.g. a SIGTERM handler calling
     /// shutdown()) is observed while idle — std's accept auto-retries on
     /// EINTR, so the flag alone would never wake a blocked accept.
-    pub fn serve(self: *HttpServer, comptime handler: fn (*RequestContext) anyerror!void) !void {
+    pub fn serve(self: *HttpServer, handler: *const fn (*RequestContext) anyerror!void) !void {
         self.running = true;
         while (self.running) {
             var poll_fds = [_]std.posix.pollfd{.{
@@ -222,7 +264,7 @@ pub const HttpServer = struct {
         }
     }
 
-    fn handleConnection(self: *HttpServer, conn: *tcp.TcpStream, comptime handler: fn (*RequestContext) anyerror!void) void {
+    fn handleConnection(self: *HttpServer, conn: *tcp.TcpStream, handler: *const fn (*RequestContext) anyerror!void) void {
         _ = self;
         var recv_buf: [8192]u8 = undefined;
         const n = conn.read(&recv_buf) catch return;

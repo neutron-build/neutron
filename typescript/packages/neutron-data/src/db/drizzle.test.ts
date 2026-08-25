@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { resolveDatabaseProfile, type DatabaseProfile } from "./index.js";
+import { createDrizzleDatabase } from "./drizzle.js";
 import type { DataConfigInput } from "../config.js";
 
 test("resolveDatabaseProfile returns sqlite profile from input", () => {
@@ -118,4 +119,37 @@ test("resolveDatabaseProfile sqlite returns file: path format", () => {
 
   assert.equal(profile.provider, "sqlite");
   assert.ok(profile.connectionString.includes("test.db"));
+});
+
+test("createDrizzleDatabase surfaces nucleus connection failures instead of degrading silently", async (t) => {
+  // The optional @neutron-build/nucleus peer must be built for this test to
+  // exercise the connect path; without it the import legitimately falls back
+  // to Drizzle-only mode.
+  try {
+    await import("@neutron-build/nucleus");
+  } catch {
+    t.skip("@neutron-build/nucleus dist not available");
+    return;
+  }
+
+  // Port 1 on loopback refuses connections immediately: a Nucleus profile
+  // pointing at a dead server must reject. The old catch-all swallowed the
+  // connect() failure and resolved with nucleus: null ("Drizzle-only mode").
+  await assert.rejects(
+    () =>
+      createDrizzleDatabase({
+        profile: {
+          provider: "nucleus",
+          connectionString: "postgres://127.0.0.1:1/nucleus",
+        },
+      }),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.ok(
+        !message.includes("Missing optional dependency"),
+        `connect failure must not be masked as a missing-dependency fallback: ${message}`
+      );
+      return true;
+    }
+  );
 });

@@ -4,10 +4,9 @@ Use this checklist before shipping any new package/crate/module or major docs up
 
 ## Required Gate
 
-1. Run `pnpm run ci:naming` from `neutron/`.
-2. Run `pnpm run ci:workspace` from `neutron/`.
-3. Run `pnpm run ci:mirror-sync` from `neutron/` (when `../packages/neutron` mirror exists).
-4. Ensure `pnpm run ci:release` passes.
+1. Run `pnpm run ci:naming` from `typescript/`.
+2. Run `pnpm run ci:workspace` from `typescript/`.
+3. Ensure `pnpm run ci:release` passes.
 
 ## Artifact Naming Checks
 
@@ -19,7 +18,7 @@ Use this checklist before shipping any new package/crate/module or major docs up
 3. No artifact name combines multiple implementation labels in one token.
 4. Ecosystem prefix rules are followed:
    - npm: `@neutron-build/*` (plus `create-neutron`, the only unscoped exception — required by the `npm create <name>` convention). See Reality note in `docs/rfcs/naming.md` for why bare `neutron`/`nucleus` and the `@neutron`/`@nucleus` scopes are not used.
-   - Cargo: `neutron`/`neutron-*` or `nucleus`/`nucleus-*`
+   - Cargo: `neutron`/`neutron-*`; Nucleus subsystem artifacts use `nucleusdb` (engine) / `nucleus-*`, and the framework's integration crate is `neutron-nucleusdb` (dependency-named, like `neutron-redis`). Bare `nucleus` is taken on crates.io — see the Reality note in `docs/rfcs/naming.md`.
    - Mojo project names: `neutron-mojo-*` or `nucleus-*`
 
 ## Docs Naming Checks

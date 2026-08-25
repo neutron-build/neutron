@@ -94,13 +94,12 @@ pub fn requestId(comptime next: HandlerFn) HandlerFn {
                 counter,
             }) catch "req-unknown";
 
-            // We can't easily add headers to the response in the current
-            // architecture without modifying RequestContext, so we log it.
-            std.log.debug("request_id={s} {s} {s}", .{
-                id_str,
-                ctx.method.toString(),
-                ctx.path,
-            });
+            // FRAMEWORK_CONTRACT §5 observable surface: every response
+            // carries the id as x-request-id. The value is copied into the
+            // context (the middleware frame dies before the response is
+            // written) and merged by RequestContext.respond().
+            ctx.setRequestId(id_str);
+            ctx.setResponseHeader("x-request-id", ctx.requestId());
 
             return next(ctx);
         }
@@ -459,6 +458,34 @@ test "default stack order matches FRAMEWORK_CONTRACT §5 (observed, all nine lay
         "request-id,logging,recovery,cors,compression,rate-limit,auth,timeout,otel,route",
         ctx.middlewareTrace(),
     );
+}
+
+test "request-id middleware sets x-request-id on the response (FRAMEWORK_CONTRACT §5)" {
+    // §5's only HTTP-observable RequestID effect: the response carries an
+    // x-request-id header. This reads the raw bytes off the wire — not the
+    // RequestContext — so it fails if any layer stops emitting the header.
+    const routes = [_]order_router.Route{
+        .{ .method = .GET, .path = "/", .handler = &orderRouteHandler },
+    };
+    const R = order_router.Router(&routes);
+    const stack = default(.{});
+    const handler = stack(&R.dispatch);
+
+    var conn = try MockConn.init();
+    defer conn.deinit();
+
+    const raw = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+    var req_buf: [256]u8 = undefined;
+    @memcpy(req_buf[0..raw.len], raw);
+    var response_buf: [8192]u8 = undefined;
+    var ctx = try makeOrderContext(&conn.stream, req_buf[0..raw.len], &response_buf);
+
+    try handler(&ctx);
+    try std.testing.expect(ctx.responded);
+
+    var wire: [4096]u8 = undefined;
+    const n = try conn.peer.read(&wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "x-request-id: req-") != null);
 }
 
 test "trace middleware propagates W3C traceparent trace id" {

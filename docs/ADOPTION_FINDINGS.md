@@ -877,7 +877,7 @@ lane fails if a library that previously rendered stops rendering.
 ## A-012 — Rust Nucleus client had no table-attached FTS
 **Rust SDK · MEDIUM · `SPEC-GAP` · FIXED**
 
-**Where:** `rust/crates/neutron-nucleus/src/models/fts.rs`
+**Where:** `rust/crates/neutron-nucleusdb/src/models/fts.rs`
 
 The client only spoke the doc-id sidecar API (`FTS_INDEX`, `FTS_SEARCH`), which
 returns `(doc_id, score)` pairs rather than rows — not joinable, not
@@ -932,7 +932,7 @@ conflict to application code as a hard error.
 retry helper with jittered exponential backoff — `go/nucleus/retry.go`,
 `python/neutron/nucleus/retry.py`,
 `typescript/packages/neutron-nucleus/src/retry.ts`,
-`rust/crates/neutron-nucleus/src/retry.rs`, `elixir/lib/nucleus/retry.ex`,
+`rust/crates/neutron-nucleusdb/src/retry.rs`, `elixir/lib/nucleus/retry.ex`,
 `zig/src/nucleus/retry.zig`, `julia/src/retry.jl`.
 
 Go needed the most: it had `Begin`/`Commit`/`Rollback` but no managed helper at

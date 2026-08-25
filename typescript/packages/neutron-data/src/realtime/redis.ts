@@ -41,6 +41,8 @@ export class RedisRealtimeBus implements RealtimeBus {
   private readonly publisher: RedisPublisherLike;
   private subscriber: RedisSubscriberLike | null = null;
   private readonly channels = new Map<string, Set<Subscriber>>();
+  /** Channels with a successfully completed Redis SUBSCRIBE. */
+  private readonly subscribed = new Set<string>();
   private readonly channelPrefix: string;
   private closed = false;
 
@@ -79,18 +81,28 @@ export class RedisRealtimeBus implements RealtimeBus {
     }
     subs.add(subscriber);
 
-    // If this is the first subscriber on this channel, tell Redis.
-    if (isNew) {
+    // Tell Redis when this channel has no subscription yet — either because
+    // this is its first subscriber, or because a previous SUBSCRIBE attempt
+    // failed (see the catch below: failed attempts keep the local entry so
+    // subscribers registered mid-flight are not dropped; the next
+    // subscribe() call is what retries them).
+    if (isNew || !this.subscribed.has(prefixedChannel)) {
       const sub = this.ensureSubscriber();
       // Fire-and-forget; the subscriber will buffer messages once acked.
-      sub.subscribe(prefixedChannel).catch((err: unknown) => {
-        // If subscribing fails, clean up to avoid a dangling channel.
-        this.channels.delete(prefixedChannel);
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(
-          `[neutron-data] RedisRealtimeBus: failed to subscribe to "${prefixedChannel}": ${msg}`
-        );
-      });
+      sub.subscribe(prefixedChannel).then(
+        () => {
+          this.subscribed.add(prefixedChannel);
+        },
+        (err: unknown) => {
+          // Keep the channel entry: deleting it wholesale would silently
+          // unregister every subscriber that joined while the SUBSCRIBE was
+          // in flight. A later subscribe() retries (not in `subscribed`).
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(
+            `[neutron-data] RedisRealtimeBus: failed to subscribe to "${prefixedChannel}": ${msg}`
+          );
+        }
+      );
     }
 
     // Return an unsubscribe function (mirrors InMemoryRealtimeBus).
@@ -102,6 +114,7 @@ export class RedisRealtimeBus implements RealtimeBus {
       existing.delete(subscriber);
       if (existing.size === 0) {
         this.channels.delete(prefixedChannel);
+        this.subscribed.delete(prefixedChannel);
         // Unsubscribe from Redis when no local handlers remain.
         if (this.subscriber) {
           this.subscriber.unsubscribe(prefixedChannel).catch(() => {
@@ -119,6 +132,7 @@ export class RedisRealtimeBus implements RealtimeBus {
     }
     this.closed = true;
     this.channels.clear();
+    this.subscribed.clear();
 
     if (this.subscriber) {
       this.subscriber.removeAllListeners("message");

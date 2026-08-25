@@ -142,10 +142,12 @@ defmodule Nucleus.Models.Blob do
           Nucleus.Client.query(client, "SELECT BLOB_LIST()", [])
         end
 
+      # BLOB_LIST's only Ok arm is Value::Text("[...]") — an empty store
+      # answers "[]", never NULL — and the wire column is TEXT, so Postgrex
+      # always delivers a binary; any other shape raises rather than
+      # collapsing into {:ok, []}.
       case result do
         {:ok, %{rows: [[json]]}} when is_binary(json) -> {:ok, Jason.decode!(json)}
-        {:ok, %{rows: [[list]]}} when is_list(list) -> {:ok, list}
-        {:ok, _} -> {:ok, []}
         {:error, _} = error -> error
       end
     end

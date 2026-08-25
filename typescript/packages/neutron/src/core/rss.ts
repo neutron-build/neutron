@@ -75,7 +75,7 @@ export function buildRssFeed(options: RssOptions): string {
 
     if (item.pubDate) {
       itemParts.push(
-        `      <pubDate>${formatPubDate(item.pubDate)}</pubDate>`
+        `      <pubDate>${escapeXml(formatPubDate(item.pubDate))}</pubDate>`
       );
     }
 

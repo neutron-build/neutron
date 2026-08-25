@@ -66,6 +66,11 @@ export function streamText(options: StreamTextOptions): StreamTextResult {
   return new StreamTextResultImpl(options, resolveInitialMessages(options), maxSteps);
 }
 
+/** Rejection reason for result promises when the consumer abandons the stream. */
+const ABANDONED_STREAM = new AIError(
+  problemFromStatus(400, "The stream was abandoned before completion; result promises cannot be fulfilled."),
+);
+
 class StreamTextResultImpl implements StreamTextResult {
   #options: StreamTextOptions;
   #messages: Message[];
@@ -251,6 +256,21 @@ class StreamTextResultImpl implements StreamTextResult {
       this.#messagesDeferred.reject(error);
       this.#approvalsDeferred.reject(error);
       throw error;
+    } finally {
+      // A consumer that breaks out of the stream abandons the generator at a
+      // yield: neither the resolve block nor the catch above runs, and every
+      // result deferred stays pending forever — `await result.text` hung with
+      // no error and no timeout. Settle them here; on the normal and error
+      // paths the deferreds are already settled and rejecting again is a
+      // no-op.
+      this.#textDeferred.reject(ABANDONED_STREAM);
+      this.#toolCallsDeferred.reject(ABANDONED_STREAM);
+      this.#toolResultsDeferred.reject(ABANDONED_STREAM);
+      this.#finishDeferred.reject(ABANDONED_STREAM);
+      this.#usageDeferred.reject(ABANDONED_STREAM);
+      this.#stepsDeferred.reject(ABANDONED_STREAM);
+      this.#messagesDeferred.reject(ABANDONED_STREAM);
+      this.#approvalsDeferred.reject(ABANDONED_STREAM);
     }
   }
 

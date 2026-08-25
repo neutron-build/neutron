@@ -12,10 +12,10 @@ Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vec
 - Vector syntax: `VECTOR('[1,0,0]')` not bare string
 - Port: 5432 (pgwire)
 
-### rs/ — Neutron Rust (Web Framework)
+### rust/ — Neutron Rust (Web Framework)
 High-performance HTTP/1.1, HTTP/2, HTTP/3 web framework in Rust. Hyper 1.x + tokio, middleware pipeline, file-based routing, WebSockets, SSE, multipart, TLS, gRPC, GraphQL. 19 crates including OAuth, WebAuthn, Stripe, SMTP, Redis, OpenTelemetry.
-- Entry: `rs/crates/neutron/src/lib.rs`
-- Tests: `cargo test` in `rs/`
+- Entry: `rust/crates/neutron/src/lib.rs`
+- Tests: `cargo test` in `rust/`
 - Key types: `App`, `Router`, `Request`, `Response`, `Middleware`, `Handler`
 
 ### typescript/ — Neutron TypeScript (UI Framework)
@@ -125,11 +125,11 @@ Formal verification across three tools:
 
 ## File Conventions
 
-- `rs/crates/neutron/src/app.rs` — main App builder
-- `rs/crates/neutron/src/handler.rs` — Request/Response types
-- `rs/crates/neutron/src/router.rs` — routing
+- `rust/crates/neutron/src/app.rs` — main App builder
+- `rust/crates/neutron/src/handler.rs` — Request/Response types
+- `rust/crates/neutron/src/router.rs` — routing
 - `nucleus/src/` — all database engine modules
-- `ts/packages/neutron/src/` — TypeScript framework source
+- `typescript/packages/neutron/src/` — TypeScript framework source
 - `mojo/neutron-mojo/src/` — Mojo tensor library source
 - `go/` — Go framework packages
 - `elixir/lib/` — Elixir framework modules

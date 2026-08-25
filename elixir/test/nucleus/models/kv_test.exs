@@ -160,4 +160,68 @@ defmodule Nucleus.Models.KVTest do
       assert function_exported?(KV, :pfcount, 2)
     end
   end
+
+  # Every KV collection Ok arm is Value::Text(serde_json::to_string(&vec))
+  # (scalar_fns.rs KV_LRANGE/KV_SMEMBERS/KV_HGETALL/KV_ZRANGE/KV_ZRANGEBYSCORE)
+  # — serde of a Vec emits at least "[]", so the empty collection arrives as
+  # "[]" and never NULL; the wire column is TEXT, so Postgrex always delivers
+  # a binary. Any other shape raises rather than collapsing into {:ok, []}.
+  describe "collection payload handling" do
+    test "an empty collection (\"[]\" payload) is empty" do
+      ok = %Postgrex.Result{rows: [["[]"]], num_rows: 1}
+
+      assert {:ok, []} = KV.lrange(fake_client({:ok, ok}), "k", 0, -1)
+      assert {:ok, []} = KV.smembers(fake_client({:ok, ok}), "k")
+      assert {:ok, %{}} = KV.hgetall(fake_client({:ok, ok}), "k")
+      assert {:ok, []} = KV.zrange(fake_client({:ok, ok}), "k", 0, -1)
+      assert {:ok, []} = KV.zrangebyscore(fake_client({:ok, ok}), "k", 0.0, 1.0)
+    end
+
+    test "populated payloads decode" do
+      assert {:ok, ["a", "b"]} =
+               KV.lrange(fake_client(cell(~s(["a","b"]))), "k", 0, -1)
+
+      assert {:ok, ["a"]} =
+               KV.smembers(fake_client(cell(~s(["a"]))), "k")
+
+      assert {:ok, %{"f" => "v"}} =
+               KV.hgetall(fake_client(cell(~s([["f","v"]]))), "k")
+
+      assert {:ok, ["m"]} = KV.zrange(fake_client(cell(~s([["m",1.0]]))), "k", 0, -1)
+    end
+
+    test "a NULL cell is a contract violation, not an empty collection" do
+      null_cell = %Postgrex.Result{rows: [[nil]], num_rows: 1}
+
+      assert_raise CaseClauseError, fn -> KV.lrange(fake_client({:ok, null_cell}), "k", 0, -1) end
+      assert_raise CaseClauseError, fn -> KV.smembers(fake_client({:ok, null_cell}), "k") end
+      assert_raise CaseClauseError, fn -> KV.hgetall(fake_client({:ok, null_cell}), "k") end
+      assert_raise CaseClauseError, fn -> KV.zrange(fake_client({:ok, null_cell}), "k", 0, -1) end
+    end
+
+    test "invalid JSON raises instead of collapsing to empty" do
+      assert_raise Jason.DecodeError, fn ->
+        KV.lrange(fake_client(cell("not json")), "k", 0, -1)
+      end
+    end
+  end
+
+  defp cell(value), do: {:ok, %Postgrex.Result{rows: [[value]], num_rows: 1}}
+
+  # Stands in for the Nucleus.Client GenServer, as in streams_test.exs.
+  defp fake_client(query_reply) do
+    spawn_link(fn -> fake_loop(query_reply) end)
+  end
+
+  defp fake_loop(query_reply) do
+    receive do
+      {:"$gen_call", from, :is_nucleus?} ->
+        GenServer.reply(from, true)
+        fake_loop(query_reply)
+
+      {:"$gen_call", from, {:query, _sql, _params}} ->
+        GenServer.reply(from, query_reply)
+        fake_loop(query_reply)
+    end
+  end
 end

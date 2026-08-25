@@ -8,7 +8,7 @@ import type {
   WorkflowEvent,
   WorkflowEventType,
 } from "./events.js";
-import { WIRE_FORMAT_VERSION, isCursorEvent } from "./events.js";
+import { WIRE_FORMAT_VERSION, EXTERNAL_SEQ_BASE, isCursorEvent } from "./events.js";
 import type { EventStore } from "./store.js";
 
 /**
@@ -121,7 +121,15 @@ export class ReplayContext implements WorkflowContext {
         this.#eventBuffers.set(event.name, buffer);
       }
     }
-    this.#nextSeq = events.reduce((max, event) => Math.max(max, event.seq), -1) + 1;
+    // Stay in the pass seq space even when external events (at or above
+    // EXTERNAL_SEQ_BASE) are already in the log — see events.ts. Allocating
+    // from max(all seqs) would put the pass's next append exactly where the
+    // next external append lands.
+    this.#nextSeq =
+      events.reduce(
+        (max, event) => (event.seq < EXTERNAL_SEQ_BASE ? Math.max(max, event.seq) : max),
+        -1
+      ) + 1;
   }
 
   async step<T>(name: string, fn: () => T | Promise<T>, options: StepOptions = {}): Promise<T> {

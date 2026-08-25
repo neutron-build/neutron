@@ -41,6 +41,7 @@ import { renderToString } from "preact-render-to-string";
 import { h } from "preact";
 import { createRequire } from "node:module";
 import { extractClientEntryScriptSrc } from "../client-entry.js";
+import { isUnsafeResolvedPath, resolvePath } from "./static-paths.js";
 
 export async function build(): Promise<void> {
   const cwd = process.cwd();
@@ -577,6 +578,7 @@ export async function build(): Promise<void> {
             : (result as GetStaticPathsResult).paths;
           for (const { params } of pathList) {
             const resolvedPath = resolvePath(route.path, params);
+            assertSafeResolvedPath(route.path, resolvedPath);
             const request = new Request("http://localhost" + resolvedPath);
             let response: Response | undefined;
             try {
@@ -643,6 +645,7 @@ export async function build(): Promise<void> {
         for (const { params, props } of pathList) {
           // Build the actual path by substituting params
           const resolvedPath = resolvePath(route.path, params);
+          assertSafeResolvedPath(route.path, resolvedPath);
           const context: AppContext = {};
           const request = new Request("http://localhost" + resolvedPath);
 
@@ -845,31 +848,18 @@ export async function build(): Promise<void> {
 }
 
 /**
- * Resolve a route pattern with params to an actual path.
- * Handles both named params and catch-all (splat) params:
- *   "/blog/:slug"  + { slug: "hello" }                → "/blog/hello"
- *   "/docs/*"      + { "*": "getting-started/intro" }  → "/docs/getting-started/intro"
+ * Resolve a route pattern with params to an actual path — see
+ * commands/static-paths.ts (tested from source there).
  */
-function resolvePath(pattern: string, params: Record<string, string>): string {
-  let resolved = pattern;
 
-  for (const [key, value] of Object.entries(params)) {
-    // Named param — :slug or [slug]
-    const bracketReplaced = resolved.replace(`[${key}]`, value);
-    const colonReplaced = resolved.replace(`:${key}`, value);
-
-    if (bracketReplaced !== resolved) {
-      resolved = bracketReplaced;
-    } else if (colonReplaced !== resolved) {
-      resolved = colonReplaced;
-    } else {
-      // Catch-all — replace *paramName (e.g., *slug) or bare *
-      const splatPattern = key === "*" ? "*" : `*${key}`;
-      resolved = resolved.replace(splatPattern, value);
-    }
+/** Security gate for every param-derived static write: reject traversal. */
+function assertSafeResolvedPath(routePath: string, resolvedPath: string): void {
+  if (isUnsafeResolvedPath(resolvedPath)) {
+    throw new Error(
+      `Route ${routePath}: getStaticPaths params resolved to "${resolvedPath}", ` +
+        "which escapes the output directory. Refusing to write outside dist/."
+    );
   }
-
-  return resolved;
 }
 
 function wrapHtml(

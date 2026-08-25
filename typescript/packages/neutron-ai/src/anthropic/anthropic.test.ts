@@ -194,6 +194,24 @@ test("an SSE error event throws a mapped AIError", async () => {
   );
 });
 
+test("a stream that ends without message_stop is truncation, not success", async () => {
+  // A dropped connection just ends the SSE loop — no error event, no
+  // message_stop. Yielding nothing (or a fabricated finish) reports a
+  // truncated response as complete, possibly executing truncated tool calls.
+  const events: Array<[string, unknown]> = [
+    ["message_start", { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 1 } } }],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial answ" } }],
+  ];
+  const { impl } = mockFetch(() => sseResponse(events));
+  const anthropic = createAnthropic({ apiKey: "test-key", fetch: impl });
+  const result = streamText({ model: anthropic("claude-sonnet-5"), prompt: "hi", maxRetries: 0 });
+  await assert.rejects(
+    result.text,
+    (error: unknown) => error instanceof AIError && /truncat/i.test(error.message),
+  );
+});
+
 test("HTTP 429 maps to rate-limited with the provider message", async () => {
   const { impl } = mockFetch(() =>
     jsonResponse({ type: "error", error: { type: "rate_limit_error", message: "Too many requests" } }, 429),
@@ -223,6 +241,36 @@ test("provider 5xx maps to internal", async () => {
       error.problem.detail === "Overloaded",
   );
 });
+
+test("a custom provider label attributes errors to the gateway (parity with the OpenAI adapter)", async () => {
+  const { impl } = mockFetch(() =>
+    jsonResponse({ type: "error", error: { type: "rate_limit_error", message: "Too many requests" } }, 429),
+  );
+  const gateway = createAnthropic({ apiKey: "test-key", provider: "gateway", fetch: impl });
+  const model = gateway("claude-sonnet-5");
+  assert.equal(model.provider, "gateway");
+  await assert.rejects(
+    generateText({ model, prompt: "hi", maxRetries: 0 }),
+    (error: unknown) => error instanceof AIError && error.provider === "gateway",
+  );
+});
+
+test("a custom provider label also attributes pre-flight failures (missing key)", async () => {
+  const { impl, calls } = mockFetch(() => jsonResponse(GENERATE_FIXTURE));
+  const gateway = createAnthropic({ provider: "gateway", fetch: impl });
+  const saved = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  try {
+    await assert.rejects(
+      generateText({ model: gateway("claude-sonnet-5"), prompt: "hi" }),
+      (error: unknown) => error instanceof AIError && error.provider === "gateway",
+    );
+    assert.equal(calls.length, 0);
+  } finally {
+    if (saved !== undefined) process.env.ANTHROPIC_API_KEY = saved;
+  }
+});
+
 
 test("a missing API key throws unauthorized without calling fetch", async () => {
   const { impl, calls } = mockFetch(() => jsonResponse(GENERATE_FIXTURE));

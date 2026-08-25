@@ -98,6 +98,27 @@ test("roundtrip returns the last proposal when rounds run out", async () => {
   assert.equal(result.text, "v2");
 });
 
+test("roundtrip does not accept a reviewer that merely mentions the token", async () => {
+  // "I cannot say APPROVE because..." contains the substring APPROVE — a
+  // substring match would treat rejection as acceptance.
+  const proposer = scriptedModel([say("v1"), say("v2 with fixes")]);
+  const reviewer = scriptedModel([
+    say("I cannot say APPROVE because the numbers are wrong."),
+    say("APPROVE"),
+  ]);
+  const team = defineTeam({
+    name: "qa",
+    members: { author: inlineAgent(proposer.model, "author"), critic: inlineAgent(reviewer.model, "critic") },
+    policy: roundtrip({ from: "author", review: "critic", maxRounds: 2 }),
+  });
+
+  const result = await runTeamTurn(team, { input: "go" });
+  // The first review must NOT have accepted: a revision happened.
+  assert.equal(proposer.calls.length, 2);
+  assert.equal(reviewer.calls.length, 2);
+  assert.equal(result.text, "v2 with fixes");
+});
+
 test("a solo agent is the one-member degenerate team", async () => {
   const solo = scriptedModel([say("done alone")]);
   const team = defineTeam({
@@ -314,4 +335,32 @@ test("SandboxExecutor snapshot lifecycle speaks the daemon contract", async () =
   const del = daemon.requests.at(-1);
   assert.equal(del?.method, "DELETE");
   assert.ok(del?.url.includes("image=teploy-sbx-snap%3A01test"));
+});
+
+test("an exec failure mid-stream cancels the SSE body instead of abandoning it", async () => {
+  // A frame that fails the consumer (malformed exit JSON) unwinds exec's
+  // for-await, which returns the parseSSE generator. Its finally used to
+  // releaseLock() without cancel() — the daemon connection kept streaming
+  // into the void. Same class as neutron-ai's SSE fix.
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  let sent = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) return; // stay open; the consumer breaks before the end
+      sent = true;
+      controller.enqueue(encoder.encode("event: stdout\ndata: hi\n\n"));
+      controller.enqueue(encoder.encode("event: exit\ndata: not-json\n\n"));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const fetch = (async () =>
+    new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof globalThis.fetch;
+
+  const sandbox = SandboxExecutor.attach("01RUN", { baseURL: "http://127.0.0.1:7070", token: "secret", fetch });
+
+  await assert.rejects(sandbox.exec("echo hi"), SyntaxError);
+  assert.equal(cancelled, true, "the SSE body must be canceled when exec unwinds mid-stream");
 });

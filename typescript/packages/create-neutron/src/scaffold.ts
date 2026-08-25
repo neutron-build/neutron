@@ -25,7 +25,7 @@ export interface ScaffoldResult {
 
 export async function scaffoldProject(options: ScaffoldOptions): Promise<ScaffoldResult> {
   const absoluteTargetDir = path.resolve(process.cwd(), options.targetDir);
-  const projectName = path.basename(absoluteTargetDir);
+  const projectName = toProjectName(path.basename(absoluteTargetDir));
   const packageName = toPackageName(projectName);
   const dependencyVersions = resolveDependencyVersions(absoluteTargetDir);
 
@@ -138,6 +138,20 @@ function toPackageName(input: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")
     .replace(/^-+|-+$/g, "");
+
+  return normalized || "neutron-app";
+}
+
+/**
+ * The project name is substituted verbatim into generated TSX string
+ * literals, JSON, HTML and markdown — strip the characters that break
+ * those contexts (quotes, backslash, angle brackets, backticks, control
+ * characters). Unlike the package name, casing and spaces are kept.
+ */
+function toProjectName(input: string): string {
+  const normalized = input
+    .replace(/["'`\\<>]/g, "")
+    .replace(/[\x00-\x1f\x7f]/g, "");
 
   return normalized || "neutron-app";
 }

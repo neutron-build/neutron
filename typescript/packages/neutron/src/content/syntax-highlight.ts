@@ -6,9 +6,13 @@ interface ShikiHighlighter {
   loadLanguage: (...langs: string[]) => Promise<void>;
 }
 
-let highlighterPromise: Promise<ShikiHighlighter | null> | null = null;
+const highlighterPromises = new Map<string, Promise<ShikiHighlighter | null>>();
 
 async function getHighlighter(theme: string): Promise<ShikiHighlighter | null> {
+  // One highlighter per theme: a single cached highlighter would only ever
+  // load the first theme requested, and codeToHtml with an unloaded theme
+  // throws.
+  let highlighterPromise = highlighterPromises.get(theme);
   if (!highlighterPromise) {
     // @ts-ignore -- shiki is an optional peer dependency
     highlighterPromise = import("shiki")
@@ -16,6 +20,7 @@ async function getHighlighter(theme: string): Promise<ShikiHighlighter | null> {
         return shiki.createHighlighter({ themes: [theme], langs: [] }) as Promise<ShikiHighlighter>;
       })
       .catch(() => null);
+    highlighterPromises.set(theme, highlighterPromise);
   }
   return highlighterPromise;
 }
@@ -27,7 +32,7 @@ export async function highlightCode(
 ): Promise<string> {
   const highlighter = await getHighlighter(theme);
   if (!highlighter) {
-    return `<pre><code class="language-${lang}">${escapeHtml(code)}</code></pre>`;
+    return `<pre><code class="language-${escapeHtml(lang)}">${escapeHtml(code)}</code></pre>`;
   }
 
   const loaded = highlighter.getLoadedLanguages();
@@ -35,7 +40,7 @@ export async function highlightCode(
     try {
       await highlighter.loadLanguage(lang as any);
     } catch {
-      return `<pre><code class="language-${lang}">${escapeHtml(code)}</code></pre>`;
+      return `<pre><code class="language-${escapeHtml(lang)}">${escapeHtml(code)}</code></pre>`;
     }
   }
 
@@ -76,7 +81,7 @@ export function markedShikiExtension(theme = "github-dark"): object {
           return cached;
         }
         const lang = token.lang || "text";
-        return `<pre><code class="language-${lang}">${escapeHtml(token.text || "")}</code></pre>`;
+        return `<pre><code class="language-${escapeHtml(lang)}">${escapeHtml(token.text || "")}</code></pre>`;
       },
     },
   };

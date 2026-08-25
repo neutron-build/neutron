@@ -632,7 +632,8 @@ interface PgPool {
 }
 interface PgPoolClient {
   query(sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
-  release(): void;
+  /** node-postgres: release(err) also removes (destroys) the client. */
+  release(err?: Error): void;
 }
 
 let pgModulePromise: Promise<PgModule> | null = null;
@@ -700,25 +701,34 @@ const ISOLATION_SQL: Record<IsolationLevel, string> = {
  */
 export class PgTransport implements Transport {
   private readonly url: string;
-  private pool: PgPool | null = null;
+  // The memoized promise is assigned synchronously, before any await: the
+  // old check-then-`await`-then-assign let two concurrent first queries each
+  // construct a Pool, and the loser's connections were never `.end()`ed.
+  private poolPromise: Promise<PgPool> | null = null;
 
   constructor(url: string) {
     this.url = url;
   }
 
-  private async getPool(): Promise<PgPool> {
-    if (!this.pool) {
-      const pg = await loadPg();
-      configureTypeParsers(pg);
-      const pool = new pg.Pool({ connectionString: this.url, max: 8 });
-      // An idle pooled connection dying (engine restart / accessory upgrade)
-      // emits 'error' on the pool; unhandled, that CRASHES the process. This
-      // handler absorbs the idle death so the pool can mint fresh connections;
-      // in-flight queries still reject through their own promises.
-      pool.on('error', () => {});
-      this.pool = pool;
+  private getPool(): Promise<PgPool> {
+    if (!this.poolPromise) {
+      const creation = loadPg().then((pg) => {
+        configureTypeParsers(pg);
+        const pool = new pg.Pool({ connectionString: this.url, max: 8 });
+        // An idle pooled connection dying (engine restart / accessory upgrade)
+        // emits 'error' on the pool; unhandled, that CRASHES the process. This
+        // handler absorbs the idle death so the pool can mint fresh connections;
+        // in-flight queries still reject through their own promises.
+        pool.on('error', () => {});
+        return pool;
+      });
+      // A failed creation must not be cached — the next call retries.
+      creation.catch(() => {
+        if (this.poolPromise === creation) this.poolPromise = null;
+      });
+      this.poolPromise = creation;
     }
-    return this.pool;
+    return this.poolPromise;
   }
 
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
@@ -761,15 +771,16 @@ export class PgTransport implements Transport {
   }
 
   async close(): Promise<void> {
-    if (this.pool) {
-      await this.pool.end();
-      this.pool = null;
+    if (this.poolPromise) {
+      const pool = await this.poolPromise;
+      this.poolPromise = null;
+      await pool.end();
     }
   }
 }
 
 /** A transaction bound to one checked-out pooled connection. */
-class PgTransactionTransport implements TransactionTransport {
+export class PgTransactionTransport implements TransactionTransport {
   private readonly client: PgPoolClient;
   private finished = false;
 
@@ -809,14 +820,30 @@ class PgTransactionTransport implements TransactionTransport {
 
   async commit(): Promise<void> {
     this.assertOpen();
-    await this.client.query('COMMIT');
+    try {
+      await this.client.query('COMMIT');
+    } catch (err) {
+      // The connection's transaction state is unknown after a failed COMMIT:
+      // hand it back with the error so the pool destroys it instead of
+      // returning a poisoned client (or, worse, leaking it — the pool is
+      // max: 8, so eight leaked clients deadlock the app).
+      this.finished = true;
+      this.client.release(err as Error);
+      throw err;
+    }
     this.finished = true;
     this.client.release();
   }
 
   async rollback(): Promise<void> {
     if (this.finished) return;
-    await this.client.query('ROLLBACK');
+    try {
+      await this.client.query('ROLLBACK');
+    } catch (err) {
+      this.finished = true;
+      this.client.release(err as Error);
+      throw err;
+    }
     this.finished = true;
     this.client.release();
   }

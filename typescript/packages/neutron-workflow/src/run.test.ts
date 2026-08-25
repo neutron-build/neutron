@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { cancelRun, deliverEvent, executeRun } from "./run.js";
+import { cancelRun, completeSleep, deliverEvent, executeRun } from "./run.js";
 import { MemoryEventStore } from "./store.js";
 import { workflow } from "./workflow.js";
 
@@ -62,4 +62,43 @@ test("cancelRun rejects unknown and finished runs", async () => {
   const wf = workflow("w", async () => "ok");
   await executeRun({ workflow: wf, runId: "r3", store, input: null });
   await assert.rejects(() => cancelRun(store, "r3"), /already finished/);
+});
+
+// ── external appends racing a live pass (seq collision) ────────────────
+
+test("an event delivered mid-pass does not corrupt the log (seq collision)", async () => {
+  // deliverEvent computes its seq from a fresh load while a live pass
+  // allocates from its own counter — both used to write the SAME seq, and
+  // load()'s first-writer dedupe silently deleted one of them. When the
+  // deleted event was a step-completed cursor, the next replay hit
+  // NondeterminismError and the run was bricked (deliberately unrecorded).
+  const store = new MemoryEventStore();
+  const runId = "mid-pass-delivery";
+  let stepExecutions = 0;
+
+  const wf = workflow("w", async (ctx) => {
+    await ctx.step("a", async () => {
+      stepExecutions += 1;
+      // The event lands WHILE the pass is live and allocating seqs — the
+      // exact interleaving of an HTTP deliverEvent during a step's I/O.
+      await deliverEvent(store, runId, "wake", "wake-payload");
+      return "a-result";
+    });
+    await ctx.sleep("60s"); // park so the next pass must replay step "a"
+    return await ctx.waitForEvent("wake");
+  });
+
+  const parked = await executeRun({ workflow: wf, runId, store, input: null });
+  assert.equal(parked.status, "sleeping");
+
+  await completeSleep(store, runId);
+  const woken = await executeRun({ workflow: wf, runId, store });
+  assert.equal(woken.status, "completed");
+  assert.equal(woken.output, "wake-payload");
+  assert.equal(stepExecutions, 1, "step side effects must not re-run after a mid-pass delivery");
+
+  // Idempotent from here on.
+  const again = await executeRun({ workflow: wf, runId, store });
+  assert.equal(again.status, "completed");
+  assert.equal(again.output, "wake-payload");
 });

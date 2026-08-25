@@ -113,7 +113,7 @@ Each scaffold is a standalone phased engineering plan (P0 correctness → P1 fun
 - ✅ **P0.6** example middleware order fixed (RequestID before Logging)
 - ✅ **P0.0** TLS-capable Nucleus connections — rustls (aws-lc-rs) + OS trust store + `sslmode` (disable/prefer/require/verify-full), default-on `tls` feature, cached connector, `NucleusError::Tls`. 85 nucleus tests green; builds tls-on/off/all-features. (commit `928021c`)
 - ⏸️ **P0.5** KV collection decode (jsonb, no comma-split) — **DEFERRED (sound reason).** The engine emits comma-joined TEXT from `KV_LRANGE`/`KV_SMEMBERS`/`KV_HGETALL`/`KV_ZRANGE` (`nucleus/src/executor/scalar_fns.rs:2785+`). A client-only change can't fix the corruption (it'd still split); the real fix needs engine item **N-1** to emit `jsonb`, then the client decodes `jsonb`. The engine is under **heavy active concurrent development** (ebad523/4bfc536/af78d19…), so changing its hot-path scalar fns from this stale framework branch would conflict and risk breaking the DB. → Land P0.5 + N-1 together on the nucleus mainline (engine emits jsonb for the 5 collection fns; client `decode_collection`/`decode_hash` helpers parse jsonb, no `split`), verified by the P2.5 testcontainers comma/`=`/newline/unicode round-trip tests.
-- Tests: 651 neutron + 85 neutron-nucleus tests green; clippy `--lib` clean. Pre-existing lints noted for the quality-gates sweep: `extract.rs` (approx_constant PI + dead fields), `handler.rs:23` unused `BufMut`/`BytesMut` under `--no-default-features` (feature-gating gap).
+- Tests: 651 neutron + 85 neutron-nucleusdb tests green; clippy `--lib` clean. Pre-existing lints noted for the quality-gates sweep: `extract.rs` (approx_constant PI + dead fields), `handler.rs:23` unused `BufMut`/`BytesMut` under `--no-default-features` (feature-gating gap).
 
 **P0 status: 6/7 implemented & committed; P0.5 deferred to the nucleus mainline (engine-coupled). The framework P0 surface is shippable.**
 
@@ -129,7 +129,7 @@ Each scaffold is a standalone phased engineering plan (P0 correctness → P1 fun
   - **P1.3** route the server's per-connection `service_fn` through `RouterService` on HTTP/1/2/3 + `nest_service` + collapse `tower_compat` + P1.M internal unification
   - **P1.4** `default_stack()` order-enforcing · **P1.7** `#[debug_handler]` · **P1.9** WS/SSE regression guard (after P1.3)
   - **P2.2** OpenAPI derive · **P2.3** `ValidatedJson` (with P1.5) · **P2.4** conformance suite (needs P1.4) · **P2.5** testcontainers (also lands P0.5/N-1 + TLS round-trip) · **P2.6** benchmarks vs Axum/Actix · **P2.7** `MethodRouter` · **P2.8** won't-do notes
-- Tests: **659 neutron** + 85 neutron-nucleus green; clippy `--lib` clean.
+- Tests: **659 neutron** + 85 neutron-nucleusdb green; clippy `--lib` clean.
 
 **Session tally (Rust): P0 6/7 + P1.1 (keystone) + P1.8 + P1.M(user-facing) + P2.1, all tested & committed, plus 2 critical repo-tracking fixes. Estimated Rust standing now ~8.3/10 (was 7.5). Remaining to 10 = the core-rewrite cluster above.**
 

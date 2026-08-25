@@ -25,7 +25,9 @@ Requires Node ≥ 18 (uses built-in `fetch`/`zlib`). Per-SDK toolchains:
 Go (`go`), Rust (`cargo`), Python (`python3` + `starlette pydantic uvicorn`),
 TypeScript (built `@neutron-build/core` — run `pnpm --filter @neutron-build/core
 build` inside `typescript/` first; the SDK auto-skips until then), Elixir
-(`elixir` + `mix`).
+(`elixir` + `mix`), Zig (0.15.x pinned by `zig/build.zig.zon` — 0.16 cannot
+compile the SDK; the runner prefers `/opt/homebrew/opt/zig@0.15/bin/zig`,
+like `live/executors/zig/run.sh`).
 
 ## Structure
 
@@ -44,6 +46,7 @@ conformance/
     python/conformance_app.py# canonical no-DB Neutron Python app (imports in-repo SDK)
     typescript/              # boots the built SDK headless (conformance_app.mjs + routes/) — see its README.md
     elixir/conformance_app.exs
+    zig/                     # builds the in-repo SDK as a standalone app (build.zig + src/main.zig)
 ```
 
 Each conformance app is **database-free** (the `nucleus` health field reports the
@@ -85,38 +88,42 @@ contract issue (KV comma-split) is documented below (resolved).
 ## Current PASS/FAIL matrix
 
 Produced by `node runner/run.mjs` on this machine (go1.26.6, cargo 1.97.0,
-Python 3.14.7, Node 22.23.2, 2026-08-19). Deterministic across runs.
+Python 3.14.7, Node 22.23.2, Zig 0.15.2, 2026-08-21). Deterministic across runs.
 
 ```
-Dimension            | go      | rust    | python  | ts      | elixir  
------------------------------------------------------------------------
-health.shape         | PASS    | PASS    | PASS    | PASS    | PASS    | 
-health.types         | PASS    | PASS    | PASS    | PASS    | PASS    | 
-error.rfc7807        | PASS    | PASS    | PASS    | PASS    | PASS    | 
-error.contenttype    | PASS    | PASS    | PASS    | PASS    | PASS    | 
-error.codes          | PASS    | PASS    | PASS    | PASS    | PASS    | 
-validation.format    | PASS    | PASS    | PASS    | PASS    | PASS    | 
-feature.detection    | PASS    | PASS    | PASS    | PASS    | PASS    | 
-openapi.present      | PASS    | PASS    | PASS    | PASS    | PASS    | 
-openapi.31           | PASS    | PASS    | PASS    | PASS    | PASS    | 
-mw.requestid         | PASS    | PASS    | PASS    | PASS    | PASS    | 
-mw.cors              | PASS    | PASS    | PASS    | PASS    | PASS    | 
-mw.compression       | PASS    | PASS    | PASS    | PASS    | PASS    | 
------------------------------------------------------------------------
+Dimension            | go      | rust    | python  | ts      | elixir  | zig     
+---------------------------------------------------------------------------------------
+health.shape         | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+health.types         | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+error.rfc7807        | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+error.contenttype    | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+error.codes          | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+validation.format    | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+feature.detection    | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+openapi.present      | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+openapi.31           | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+mw.requestid         | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+mw.cors              | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+mw.compression       | PASS    | PASS    | PASS    | PASS    | PASS    | PASS    | 
+---------------------------------------------------------------------------------------
 
 [go]     12 pass, 0 fail, 0 skip
 [rust]   12 pass, 0 fail, 0 skip
 [python] 12 pass, 0 fail, 0 skip
 [ts]     12 pass, 0 fail, 0 skip
 [elixir] 12 pass, 0 fail, 0 skip
+[zig]    12 pass, 0 fail, 0 skip
 ```
 
-**SDKs booted in this environment:** all five. The TypeScript SDK is a web/SSR
+**SDKs booted in this environment:** all six. The TypeScript SDK is a web/SSR
 meta-framework, but since S81 it implements the full contract surface — RFC 7807
 errors, typed validation and OpenAPI 3.1 included — and boots headless via
-[`adapters/typescript/`](adapters/typescript/) once the package is built. An SDK
-whose toolchain or build is missing is auto-skipped (reported `UNAVAILABLE`), not
-failed.
+[`adapters/typescript/`](adapters/typescript/) once the package is built. The
+Zig adapter landed with S41 (2026-08-21); the SDK changes it required (a real
+`x-request-id` response header, `App.run` actually exiting on SIGTERM, and
+three never-compiled surfaces fixed) are pinned by tests in `zig/src`. An SDK
+whose toolchain or build is missing is auto-skipped (reported `UNAVAILABLE`),
+not failed.
 
 ---
 
@@ -194,7 +201,7 @@ SDK client parsed them with a naive `split(',')`, corrupting any member or value
 containing a literal comma. The engine now returns JSON arrays and every client
 parses structured JSON instead of splitting: Go
 (`go/nucleus/kv.go`, `json.Unmarshal`), Python (`python/neutron/nucleus/kv.py`,
-`json.loads`), Rust (`rust/crates/neutron-nucleus/src/models/kv.rs`,
+`json.loads`), Rust (`rust/crates/neutron-nucleusdb/src/models/kv.rs`,
 `serde_json::from_str`), TypeScript
 (`typescript/packages/neutron-nucleus/src/kv/index.ts`, `JSON.parse`). Not
 exercised by the HTTP runner (no Nucleus DB in CI); recorded as resolved by

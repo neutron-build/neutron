@@ -533,3 +533,70 @@ test "PgClient struct layout" {
     // Verify the struct can be created
     try std.testing.expect(@sizeOf(PgClient) > 0);
 }
+
+// Nucleus v0.1.8: STREAM_XREADGROUP on a missing consumer group is a server
+// ErrorResponse (SQLSTATE 22000, message "NOGROUP No such consumer group ..."),
+// never an empty batch. This pins that the client surfaces it as an error
+// instead of swallowing it into a null/empty scalar.
+test "query: NOGROUP ErrorResponse surfaces as an error with its SQLSTATE" {
+    const allocator = std.testing.allocator;
+
+    // Loopback socket pair: accepted side is the client, peer is the "server".
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var listener = try tcp.TcpListener.bind(addr, .{});
+    defer listener.deinit();
+    const port = listener.getPort();
+    const peer = try std.net.tcpConnectToAddress(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+    defer peer.close();
+    const client_stream = try listener.accept();
+
+    var client = PgClient{
+        .stream = client_stream,
+        .send_buf = try allocator.alloc(u8, 4096),
+        .recv_buf = try allocator.alloc(u8, 8192),
+        .ready = true,
+        .transaction_status = .idle,
+        .server_version = undefined,
+        .server_version_len = 0,
+        .is_nucleus = true,
+        .last_error_code = undefined,
+        .last_error_code_len = 0,
+        .last_error_message = undefined,
+        .last_error_message_len = 0,
+    };
+    defer {
+        client.stream.close();
+        allocator.free(client.send_buf);
+        allocator.free(client.recv_buf);
+    }
+
+    // ErrorResponse the engine sends: 'E', i32 length, then field entries
+    // (type byte + cstring) terminated by a zero byte.
+    var msg_buf: [256]u8 = undefined;
+    var len: usize = 5;
+    const fields = [_][2][]const u8{
+        .{ "S", "ERROR" },
+        .{ "C", "22000" },
+        .{ "M", "NOGROUP No such consumer group 'workers' for stream 'events'" },
+    };
+    for (fields) |f| {
+        msg_buf[len] = f[0][0];
+        len += 1;
+        @memcpy(msg_buf[len .. len + f[1].len], f[1]);
+        len += f[1].len;
+        msg_buf[len] = 0;
+        len += 1;
+    }
+    msg_buf[len] = 0;
+    len += 1;
+    msg_buf[0] = 'E';
+    std.mem.writeInt(u32, msg_buf[1..5], @intCast(len - 1), .big);
+    try peer.writeAll(msg_buf[0..len]);
+
+    try std.testing.expectError(
+        error.ServerError,
+        client.query("SELECT STREAM_XREADGROUP('events', 'workers', 'worker-1', 5)"),
+    );
+    try std.testing.expectEqualStrings("22000", client.lastErrorCode());
+    try std.testing.expect(std.mem.indexOf(u8, client.lastErrorMessage(), "NOGROUP") != null);
+}

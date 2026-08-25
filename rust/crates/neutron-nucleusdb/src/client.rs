@@ -6,7 +6,7 @@
 //! Auto-detects Nucleus vs plain PostgreSQL on construction via `SELECT VERSION()`.
 //!
 //! ```rust,ignore
-//! use neutron_nucleus::{NucleusClient, NucleusConfig};
+//! use neutron_nucleusdb::{NucleusClient, NucleusConfig};
 //!
 //! let client = NucleusClient::connect(NucleusConfig::default()).await?;
 //!

@@ -48,7 +48,9 @@ pub const Config = struct {
     /// e.g., prefix = "NEUTRON" reads NEUTRON_HOST, NEUTRON_PORT, etc.
     pub fn fromEnv(comptime prefix: []const u8) Config {
         var cfg = Config{};
-        const env = std.posix.environ;
+        // Zig 0.15: the environ block is std.os.environ (std.posix has no
+        // environ member in this release).
+        const env = std.os.environ;
 
         for (env) |entry| {
             const kv = std.mem.span(entry);
@@ -105,4 +107,14 @@ test "getEnvValue" {
     try std.testing.expectEqualStrings("8080", getEnvValue("NEUTRON_PORT=8080", "NEUTRON_PORT").?);
     try std.testing.expectEqual(@as(?[]const u8, null), getEnvValue("NEUTRON_PORT=8080", "OTHER_PORT"));
     try std.testing.expectEqual(@as(?[]const u8, null), getEnvValue("SHORT=1", "LONGKEY"));
+}
+
+// fromEnv was never referenced by any test or example, so it silently did
+// not compile between the 0.14→0.15 port and the conformance app (S41).
+// This exercises the real environ path; it asserts only what holds for any
+// environment (a parsable port), because the test process's env is not
+// under the test's control.
+test "Config.fromEnv reads the process environment without failing" {
+    const cfg = Config.fromEnv("NEUTRON");
+    try std.testing.expect(cfg.port > 0);
 }

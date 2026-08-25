@@ -29,6 +29,12 @@ export interface AnthropicSettings {
   /** Point at an AI Gateway or proxy; defaults to the Anthropic API. */
   baseURL?: string;
   headers?: Record<string, string>;
+  /**
+   * Relabel this adapter for error attribution when routing through a
+   * gateway (parity with the OpenAI adapter's `provider`). Default
+   * "anthropic".
+   */
+  provider?: string;
   /** Custom transport; also the test seam for HTTP-boundary mocking. */
   fetch?: typeof globalThis.fetch;
 }
@@ -107,7 +113,7 @@ const SSE_ERROR_STATUS: Record<string, number> = {
 };
 
 class AnthropicAdapter implements ModelAdapter {
-  readonly provider = PROVIDER;
+  readonly provider: string;
   readonly modelId: string;
   readonly #settings: AnthropicSettings;
   readonly #modelOptions: AnthropicModelOptions;
@@ -116,6 +122,7 @@ class AnthropicAdapter implements ModelAdapter {
     this.modelId = modelId;
     this.#settings = settings;
     this.#modelOptions = modelOptions;
+    this.provider = settings.provider ?? PROVIDER;
   }
 
   async doGenerate(options: AdapterCallOptions): Promise<AdapterGenerateResult> {
@@ -137,7 +144,7 @@ class AnthropicAdapter implements ModelAdapter {
   async *doStream(options: AdapterCallOptions): AsyncGenerator<AdapterStreamPart, void, undefined> {
     const response = await this.#post(this.#buildBody(options, true), options);
     if (response.body === null) {
-      throw new AIError(problemFromStatus(500, "Anthropic response had no body."), { provider: PROVIDER });
+      throw new AIError(problemFromStatus(500, "Anthropic response had no body."), { provider: this.provider });
     }
 
     let inputTokens = 0;
@@ -145,6 +152,7 @@ class AnthropicAdapter implements ModelAdapter {
     let cacheRead = 0;
     let cacheWrite = 0;
     let finishReason: FinishReason = "other";
+    let sawMessageStop = false;
     const pendingTools = new Map<number, { id: string; name: string; inputJson: string }>();
     const pendingReasoning = new Map<number, { text: string; signature: string; redactedData?: string }>();
 
@@ -154,7 +162,7 @@ class AnthropicAdapter implements ModelAdapter {
       try {
         payload = JSON.parse(event.data) as AnthropicStreamEvent;
       } catch {
-        throw new AIError(problemFromStatus(500, "Anthropic stream sent a malformed event."), { provider: PROVIDER });
+        throw new AIError(problemFromStatus(500, "Anthropic stream sent a malformed event."), { provider: this.provider });
       }
 
       switch (payload.type) {
@@ -216,7 +224,7 @@ class AnthropicAdapter implements ModelAdapter {
               type: "tool-call",
               toolCallId: pending.id,
               toolName: pending.name,
-              input: parseToolInput(pending.inputJson),
+              input: parseToolInput(pending.inputJson, this.provider),
             };
           }
           const reasoning = pendingReasoning.get(payload.index);
@@ -238,6 +246,7 @@ class AnthropicAdapter implements ModelAdapter {
           }
           break;
         case "message_stop": {
+          sawMessageStop = true;
           const usage: Usage = {
             inputTokens,
             outputTokens,
@@ -252,12 +261,22 @@ class AnthropicAdapter implements ModelAdapter {
           const status = SSE_ERROR_STATUS[payload.error?.type ?? ""] ?? 500;
           throw new AIError(
             problemFromStatus(status, payload.error?.message ?? "Anthropic stream reported an error."),
-            { provider: PROVIDER },
+            { provider: this.provider },
           );
         }
         default:
           break; // ping and future event types
       }
+    }
+
+    // A stream whose connection dropped just ends the loop — no error event,
+    // no message_stop. Ending silently would report a truncated response as
+    // complete (possibly executing truncated tool calls).
+    if (!sawMessageStop) {
+      throw new AIError(
+        problemFromStatus(500, "Anthropic stream ended without message_stop — the response was truncated."),
+        { provider: this.provider },
+      );
     }
   }
 
@@ -266,7 +285,7 @@ class AnthropicAdapter implements ModelAdapter {
     if (apiKey === undefined || apiKey === "") {
       throw new AIError(
         problemFromStatus(401, "Missing Anthropic API key: set ANTHROPIC_API_KEY or pass apiKey to createAnthropic()."),
-        { provider: PROVIDER },
+        { provider: this.provider },
       );
     }
 
@@ -291,13 +310,13 @@ class AnthropicAdapter implements ModelAdapter {
       if (options.abortSignal?.aborted) throw cause;
       const message = cause instanceof Error ? cause.message : String(cause);
       throw new AIError(problemFromStatus(500, `Anthropic request failed: ${message}`), {
-        provider: PROVIDER,
+        provider: this.provider,
         cause,
       });
     }
 
     if (!response.ok) {
-      throw await responseToError(response);
+      throw await responseToError(response, this.provider);
     }
     return response;
   }
@@ -356,7 +375,7 @@ class AnthropicAdapter implements ModelAdapter {
   }
 }
 
-async function responseToError(response: Response): Promise<AIError> {
+async function responseToError(response: Response, provider: string): Promise<AIError> {
   let detail = `Anthropic request failed with status ${response.status}.`;
   try {
     const json = (await response.json()) as { error?: { message?: string } };
@@ -364,7 +383,7 @@ async function responseToError(response: Response): Promise<AIError> {
   } catch {
     // non-JSON error body; keep the status-based detail
   }
-  return new AIError(problemFromStatus(response.status, detail), { provider: PROVIDER });
+  return new AIError(problemFromStatus(response.status, detail), { provider });
 }
 
 function mapToolChoice(toolChoice: ToolChoice): unknown {
@@ -483,14 +502,14 @@ function mapUsage(usage: AnthropicUsage | undefined): Usage {
   };
 }
 
-function parseToolInput(inputJson: string): unknown {
+function parseToolInput(inputJson: string, provider: string): unknown {
   if (inputJson === "") return {};
   try {
     return JSON.parse(inputJson);
   } catch {
     throw new AIError(
       problemFromStatus(500, "Anthropic stream sent unparseable tool input JSON."),
-      { provider: PROVIDER },
+      { provider },
     );
   }
 }

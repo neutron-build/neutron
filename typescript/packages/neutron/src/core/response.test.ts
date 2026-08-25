@@ -67,4 +67,11 @@ describe("response helpers", () => {
     expect(response.status).toBe(404);
     expect(await response.text()).toContain("Page not found");
   });
+
+  it("notFound escapes the message with the shared escapeHtml (including apostrophes)", async () => {
+    const response = notFound("it's <over>");
+    const body = await response.text();
+    expect(body).toContain("it&#39;s &lt;over&gt;");
+    expect(body).not.toContain("it's <over>");
+  });
 });

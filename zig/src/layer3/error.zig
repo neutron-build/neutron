@@ -6,6 +6,8 @@
 
 const std = @import("std");
 
+const http_server = @import("../layer2/http_server.zig");
+
 /// Individual field validation error. `value` (the offending input) is
 /// optional per FRAMEWORK_CONTRACT.md §2 and is omitted when null.
 pub const FieldError = struct {
@@ -103,6 +105,17 @@ pub fn internalError(detail: []const u8) AppError {
     return .{ .status = 500, .code = "internal", .title = "Internal Server Error", .detail = detail };
 }
 
+/// Send an AppError as an RFC 7807 response: `application/problem+json`
+/// with the serialized problem document (FRAMEWORK_CONTRACT §2).
+pub fn sendProblem(ctx: *http_server.RequestContext, err: AppError) !void {
+    var buf: [2048]u8 = undefined;
+    const json = try err.toJson(&buf);
+    const headers = [_]http_server.Header{
+        .{ .name = "Content-Type", .value = "application/problem+json" },
+    };
+    try ctx.respond(err.status, &headers, json);
+}
+
 test "RFC 7807: badRequest" {
     var buf: [512]u8 = undefined;
     const err = badRequest("missing field 'name'");
@@ -168,4 +181,43 @@ test "all error constructors" {
     for (errors_list, statuses) |err, expected_status| {
         try std.testing.expectEqual(expected_status, err.status);
     }
+}
+
+// sendProblem is the §2 wire surface: problem+json content type and the
+// RFC 7807 members on the actual bytes written to the socket.
+test "sendProblem writes problem+json with the RFC 7807 shape (FRAMEWORK_CONTRACT §2)" {
+    const tcp_mod = @import("../layer1/tcp.zig");
+
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var listener = try tcp_mod.TcpListener.bind(addr, .{});
+    defer listener.deinit();
+    const peer = try std.net.tcpConnectToAddress(
+        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, listener.getPort()),
+    );
+    defer peer.close();
+    var stream = try listener.accept();
+
+    const raw = "GET /errors/rate-limited HTTP/1.1\r\nHost: test\r\n\r\n";
+    var req_buf: [256]u8 = undefined;
+    @memcpy(req_buf[0..raw.len], raw);
+    var response_buf: [8192]u8 = undefined;
+    var ctx = http_server.RequestContext{
+        .request = try @import("../layer0/http/parser.zig").parseRequest(req_buf[0..raw.len]),
+        .stream = &stream,
+        .response_buf = &response_buf,
+        .responded = false,
+        .path = "/errors/rate-limited",
+        .method = .GET,
+    };
+
+    try sendProblem(&ctx, rateLimited("forced rate limited"));
+
+    var wire: [4096]u8 = undefined;
+    const n = try peer.read(&wire);
+    const resp = wire[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 429") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Content-Type: application/problem+json") != null);
+    // Contract title is "Rate Limited" — not the HTTP reason "Too Many Requests".
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"title\":\"Rate Limited\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"type\":\"https://neutron.dev/errors/rate-limited\"") != null);
 }

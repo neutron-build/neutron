@@ -526,21 +526,32 @@ function parseHtmlAttributes(attrString: string): Record<string, string> {
   return attrs;
 }
 
+function safeDecodeSegment(segment: string | undefined): string {
+  if (segment === undefined) return "";
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 function extractParams(pattern: string, pathname: string): Record<string, string> {
   const params: Record<string, string> = {};
   const patternParts = pattern.split("/").filter(Boolean);
   const pathParts = pathname.split("/").filter(Boolean);
-  
+
   for (let i = 0; i < patternParts.length; i++) {
     const p = patternParts[i];
     if (p.startsWith(":")) {
-      params[p.slice(1)] = pathParts[i] || "";
+      // Match the server, which decodes the request path before routing —
+      // otherwise useParams differs pre/post hydration for encoded segments.
+      params[p.slice(1)] = safeDecodeSegment(pathParts[i]);
     } else if (p === "*") {
-      params["*"] = pathParts.slice(i).join("/");
+      params["*"] = pathParts.slice(i).map(safeDecodeSegment).join("/");
       break;
     }
   }
-  
+
   return params;
 }
 

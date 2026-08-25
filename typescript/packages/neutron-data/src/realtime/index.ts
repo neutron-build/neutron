@@ -13,8 +13,19 @@ export class InMemoryRealtimeBus implements RealtimeBus {
     if (!subs) {
       return;
     }
+    // Same failure semantics as the Redis bus: one bad subscriber is logged
+    // and skipped, and every remaining subscriber still receives the payload.
+    // Letting the throw escape would abort delivery mid-list and reject a
+    // publish() the publisher cannot fix.
     for (const subscriber of subs) {
-      subscriber(payload);
+      try {
+        subscriber(payload);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[neutron-data] InMemoryRealtimeBus: handler error on "${channel}": ${msg}`
+        );
+      }
     }
   }
 

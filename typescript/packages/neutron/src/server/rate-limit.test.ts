@@ -69,4 +69,39 @@ describe("rateLimitMiddleware", () => {
     expect(r1.status).toBe(200);
     expect(r2.status).toBe(429);
   });
+
+  it("unrefs the cleanup interval so it cannot keep the process alive", () => {
+    const original = globalThis.setInterval;
+    let unrefCalled = false;
+    const wrapped = ((fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+      const handle = original(fn, ms, ...rest) as unknown as { unref?: () => void };
+      if (typeof handle?.unref === "function") {
+        const realUnref = handle.unref.bind(handle);
+        handle.unref = () => {
+          unrefCalled = true;
+          realUnref();
+        };
+      }
+      return handle;
+    }) as typeof setInterval;
+    globalThis.setInterval = wrapped;
+    let mw: ReturnType<typeof rateLimitMiddleware> | undefined;
+    try {
+      mw = rateLimitMiddleware({ maxRequests: 1, windowMs: 60_000 });
+      expect(unrefCalled).toBe(true);
+    } finally {
+      globalThis.setInterval = original;
+      (mw as unknown as { cleanup?: () => void })?.cleanup?.();
+    }
+  });
+
+  it("does not register a per-instance SIGTERM listener", () => {
+    const before = process.listenerCount("SIGTERM");
+    const mw = rateLimitMiddleware({ maxRequests: 1, windowMs: 60_000 });
+    try {
+      expect(process.listenerCount("SIGTERM")).toBe(before);
+    } finally {
+      (mw as unknown as { cleanup?: () => void }).cleanup?.();
+    }
+  });
 });

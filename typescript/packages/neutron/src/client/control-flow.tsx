@@ -56,14 +56,16 @@ export function For<T>({ each, fallback, children }: ForProps<T>) {
     return <>{fallback}</>;
   }
 
-  // Optimize by memoizing items with keys
+  // Optimize by memoizing items with keys. `children` is deliberately NOT a
+  // dependency: inline-arrow children get a new identity every render, which
+  // would make the memo never hit.
   const items = useMemo(() => {
     return each.map((item, i) => {
       // Create stable index accessor
       const getIndex = () => i;
       return children(item, getIndex);
     });
-  }, [each, children]);
+  }, [each]);
 
   return <>{items}</>;
 }

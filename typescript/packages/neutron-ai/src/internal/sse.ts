@@ -25,6 +25,11 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerato
     const trailing = parseEventBlock(buffer);
     if (trailing !== null) yield trailing;
   } finally {
+    // Covers both exits: a consumer that breaks after a terminal event and a
+    // thrown error. releaseLock alone leaves the body unread-but-open — the
+    // provider keeps streaming until GC. cancel() through the reader reaches
+    // the underlying source even while locked, and is a no-op once drained.
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

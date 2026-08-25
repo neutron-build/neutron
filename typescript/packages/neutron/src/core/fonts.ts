@@ -102,7 +102,23 @@ function buildBunnyFontsUrl(fonts: string[], display: string = 'swap'): string {
 }
 
 /**
+ * Splits a preload spec ("Family-Weight", e.g. "Inter-400") into family and
+ * weight. Splits on the LAST dash so hyphenated family names survive.
+ */
+function splitPreloadSpec(preloadSpec: string): { family: string; weight: string } {
+  const dash = preloadSpec.lastIndexOf('-');
+  if (dash === -1) {
+    return { family: preloadSpec, weight: '400' };
+  }
+  return { family: preloadSpec.slice(0, dash), weight: preloadSpec.slice(dash + 1) || '400' };
+}
+
+/**
  * Generates font preload URLs
+ *
+ * Only local fonts are preloaded: their file URLs are known from the config.
+ * Google/Bunny file URLs carry content hashes that are only knowable by
+ * fetching the provider CSS, so fabricating them would 404 every preload.
  */
 function generatePreloads(config: FontConfig): FontPreload[] {
   const preloads: FontPreload[] = [];
@@ -110,22 +126,14 @@ function generatePreloads(config: FontConfig): FontPreload[] {
   if (!config.preload) return preloads;
 
   for (const preloadSpec of config.preload) {
-    // Format: "Family-Weight" e.g. "Inter-400"
-    const [family, weight] = preloadSpec.split('-');
+    const { family, weight } = splitPreloadSpec(preloadSpec);
 
-    // Try to find URL from configured sources
-    // This is simplified - in production you'd fetch actual font URLs
-    if (config.google?.some(f => f.startsWith(family))) {
+    const local = config.local?.find((f) => f.family === family);
+    if (local) {
       preloads.push({
         family,
-        weight: weight || '400',
-        url: `https://fonts.gstatic.com/s/${family.toLowerCase()}/v${weight || '400'}.woff2`,
-      });
-    } else if (config.bunny?.some(f => f.startsWith(family))) {
-      preloads.push({
-        family,
-        weight: weight || '400',
-        url: `https://fonts.bunny.net/${family.toLowerCase()}-v${weight || '400'}.woff2`,
+        weight,
+        url: local.src,
       });
     }
   }
@@ -247,7 +255,7 @@ export function validateFontConfig(config: FontConfig): { valid: boolean; errors
     ];
 
     for (const preload of config.preload) {
-      const [family] = preload.split('-');
+      const { family } = splitPreloadSpec(preload);
       if (!allFamilies.includes(family)) {
         errors.push(`Preload references unknown font family: ${family}`);
       }

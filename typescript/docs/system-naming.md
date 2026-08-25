@@ -85,8 +85,9 @@ TypeScript (npm) — the bare `neutron` and `nucleus` names are taken on npm by 
 Rust (cargo):
 
 - Use `neutron` / `neutron-*` crate names for framework/runtime crates.
-- Use `nucleus` / `nucleus-*` crate names for shared plane/core services.
-- Do not publish crates that mix both prefixes in one crate name.
+- The engine publishes as `nucleusdb` (bare `nucleus` is taken on crates.io — see the Reality note in `docs/rfcs/naming.md`); other subsystem crates use `nucleus-*`.
+- The framework's Nucleus integration crate is `neutron-nucleusdb` — named after its dependency artifact, the same pattern as `neutron-redis`. This is the one sanctioned `neutron`+`nucleus` composite.
+- Do not publish crates that mix both prefixes outside that pattern.
 
 Zig/Mojo:
 

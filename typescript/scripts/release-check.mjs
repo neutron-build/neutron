@@ -8,7 +8,6 @@ const frameworkPackageDir = resolveFrameworkPackageDir();
 const steps = [
   { label: "Naming checks", command: ["pnpm", "run", "ci:naming"] },
   { label: "Workspace graph checks", command: ["pnpm", "run", "ci:workspace"] },
-  { label: "Mirror sync checks", command: ["pnpm", "run", "ci:mirror-sync"] },
   { label: "Build packages", command: ["pnpm", "-r", "build"] },
   { label: "Framework tests", command: ["pnpm", "--dir", frameworkPackageDir, "test"] },
   { label: "Runtime compatibility smoke", command: ["pnpm", "run", "ci:runtime-compat"] },

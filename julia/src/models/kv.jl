@@ -174,10 +174,7 @@ end
 function hgetall(m::KVModel, key::String)::Dict{String, String}
     require_nucleus(m.features, "KV")
     result = LibPQ.execute(m.conn, "SELECT KV_HGETALL(\$1)", [key])
-    raw = first(result)[1]
-    (ismissing(raw) || isempty(raw)) && return Dict{String, String}()
-    # Engine returns a JSON array of [field, value] pairs.
-    return Dict(String(p[1]) => String(p[2]) for p in JSON3.read(raw, Vector{Vector{String}}))
+    return _hash_pairs(first(result)[1])
 end
 
 """KV_HLEN(key) → Int64"""
@@ -256,15 +253,27 @@ end
 # so the ENGINE never had the delimiter problem; each client reintroduced it,
 # making a member containing ':' indistinguishable from the separator. Python,
 # Go, TypeScript and Elixir were fixed 2026-08-15; this is the fifth.
+#
+# KV_ZRANGE/KV_ZRANGEBYSCORE answer Value::Text on every success path — an
+# empty range arrives as "[]", which JSON3.read maps to an empty vector — so
+# a NULL cell is a contract violation, not an empty result.
 function _zentries(raw)::Vector{String}
-    (ismissing(raw) || raw === nothing || isempty(raw)) && return String[]
+    ismissing(raw) && error("KV_ZRANGE/KV_ZRANGEBYSCORE returned NULL; success is always a JSON array of [member, score] pairs")
     return [string(p[1]) for p in JSON3.read(raw, Vector{Vector{Any}})]
 end
 
 """Members with their scores, unambiguous for any member text."""
 function _zentries_scored(raw)::Vector{Tuple{String, Float64}}
-    (ismissing(raw) || raw === nothing || isempty(raw)) && return Tuple{String, Float64}[]
+    ismissing(raw) && error("KV_ZRANGE/KV_ZRANGEBYSCORE returned NULL; success is always a JSON array of [member, score] pairs")
     return [(string(p[1]), Float64(p[2])) for p in JSON3.read(raw, Vector{Vector{Any}})]
+end
+
+# KV_HGETALL answers Value::Text on every success path — an empty hash arrives
+# as "[]" — so a NULL cell is a contract violation, not an empty Dict. The
+# payload is a JSON array of [field, value] pairs.
+function _hash_pairs(raw)::Dict{String, String}
+    ismissing(raw) && error("KV_HGETALL returned NULL; success is always a JSON array of [field, value] pairs")
+    return Dict(String(p[1]) => String(p[2]) for p in JSON3.read(raw, Vector{Vector{String}}))
 end
 
 """KV_ZRANGE(key, start, stop) → Vector of (member, score). Signed indices."""

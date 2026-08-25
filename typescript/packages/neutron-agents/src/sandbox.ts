@@ -15,6 +15,14 @@ export interface SandboxExecutorOptions {
   baseURL: string;
   /** Bearer token minted at daemon start. */
   token: string;
+  /**
+   * Deadline for each HTTP round trip to the daemon (default 300s; exec
+   * requests get at least their own timeout plus 60s of slack). Without a
+   * deadline a hung daemon hangs exec/putFile/destroy forever — the
+   * daemon-side `timeoutSec` only helps when the daemon is alive enough to
+   * enforce it.
+   */
+  requestTimeoutMs?: number;
   /** Custom transport; also the test seam. */
   fetch?: typeof globalThis.fetch;
 }
@@ -77,12 +85,19 @@ export class SandboxExecutor implements AgentExecutor {
 
   async exec(command: string, options: ExecOptions = {}): Promise<ExecResult> {
     const timeoutSec = Math.ceil((options.timeoutMs ?? 120_000) / 1000);
+    // The exec response streams for the whole command, so its deadline must
+    // cover the daemon-enforced timeout plus slack — unless the caller set
+    // an explicit requestTimeoutMs, which then binds.
+    const requestTimeoutMs =
+      this.#options.requestTimeoutMs ??
+      Math.max(300_000, (options.timeoutMs ?? 120_000) + 60_000);
     const response = await request(
       this.#options,
       "POST",
       `/v1/runs/${this.runId}/exec`,
       JSON.stringify({ cmd: command, timeoutSec, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}) }),
       { "content-type": "application/json" },
+      requestTimeoutMs,
     );
     if (response.body === null) {
       throw new AgentError(problemFromStatus(500, "Sandbox exec response had no body."));
@@ -142,24 +157,52 @@ function encodePath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 300_000;
+
 async function request(
   options: SandboxExecutorOptions,
   method: string,
   path: string,
   body?: BodyInit,
   headers: Record<string, string> = {},
+  timeoutMs: number = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<Response> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutError = new Error(`Sandbox request timed out after ${timeoutMs}ms.`);
+  timeoutError.name = "TimeoutError";
   let response: Response;
   try {
-    response = await fetchImpl(`${options.baseURL.replace(/\/+$/, "")}${path}`, {
-      method,
-      headers: { authorization: `Bearer ${options.token}`, ...headers },
-      ...(body !== undefined ? { body } : {}),
-    });
+    // Race the deadline rather than relying on the fetch implementation
+    // honoring the abort signal — a hung (or stubbed) transport must not
+    // hang the executor forever.
+    response = await Promise.race([
+      fetchImpl(`${options.baseURL.replace(/\/+$/, "")}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${options.token}`, ...headers },
+        ...(body !== undefined ? { body } : {}),
+        signal: controller.signal,
+      }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(timeoutError);
+        }, timeoutMs);
+      }),
+    ]);
   } catch (cause) {
+    const aborted = cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError");
+    if (aborted) {
+      throw new AgentError(
+        problemFromStatus(500, `Sandbox request timed out after ${timeoutMs}ms.`),
+        { cause },
+      );
+    }
     const message = cause instanceof Error ? cause.message : String(cause);
     throw new AgentError(problemFromStatus(500, `Sandbox request failed: ${message}`), { cause });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
   if (!response.ok) {
     let detail = `Sandbox request failed with status ${response.status}.`;
@@ -198,6 +241,12 @@ async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<SSEFr
     const trailing = parseFrame(buffer);
     if (trailing !== null) yield trailing;
   } finally {
+    // Covers both exits: a consumer that unwinds mid-stream (exec's frame
+    // handling throwing, or a future early break) and a stream error.
+    // releaseLock alone leaves the daemon connection streaming into the
+    // void; cancel() through the reader reaches the underlying source even
+    // while locked, and is a no-op once drained.
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

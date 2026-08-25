@@ -133,11 +133,16 @@ class OpenAIAdapter implements ModelAdapter {
     }
 
     let finishReason: FinishReason = "other";
+    let sawTerminal = false;
     let usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     const pendingTools = new Map<number, { id: string; name: string; argumentsJson: string }>();
 
     for await (const event of parseSSE(response.body)) {
-      if (event.data === "" || event.data === "[DONE]") continue;
+      if (event.data === "") continue;
+      if (event.data === "[DONE]") {
+        sawTerminal = true;
+        continue;
+      }
       let chunk: OpenAIStreamChunk;
       try {
         chunk = JSON.parse(event.data) as OpenAIStreamChunk;
@@ -175,7 +180,18 @@ class OpenAIAdapter implements ModelAdapter {
       }
       if (choice.finish_reason != null) {
         finishReason = mapFinishReason(choice.finish_reason);
+        sawTerminal = true;
       }
+    }
+
+    // A stream whose connection dropped just ends the loop — no finish_reason,
+    // no [DONE]. Manufacturing a finish event the provider never sent would
+    // report a truncated response as complete.
+    if (!sawTerminal) {
+      throw new AIError(
+        problemFromStatus(500, "Stream ended without a finish_reason or [DONE] — the response was truncated."),
+        { provider: this.provider },
+      );
     }
 
     for (const [, pending] of [...pendingTools.entries()].sort(([a], [b]) => a - b)) {

@@ -275,6 +275,24 @@ describe("content collections", () => {
     expect(hello!.html).toBe("");
   });
 
+  it("sanitizes untrusted HTML through the config path when sanitize: true", async () => {
+    // The config loader used to rebuild collection definitions with only
+    // `type` + `schema`, silently dropping `sanitize` — so a collection
+    // declared untrusted still rendered raw CMS HTML (the markup that lands
+    // in dangerouslySetInnerHTML) with no sanitization.
+    const root = await makeUntrustedHtmlFixtureProject();
+    process.chdir(root);
+
+    const entry = await getEntry("cms", "malicious");
+    expect(entry).toBeTruthy();
+    expect(entry?.sanitize).toBe(true);
+
+    const { html } = await renderEntry(entry!);
+    expect(html).toContain("<p>legit markup</p>");
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("onerror");
+  });
+
   it("renderEntry output matches the docs template's loader data shape", async () => {
     // Type-level check that the data shape produced by switching the docs
     // template's loader to renderEntry() — `const { html } = await renderEntry(entry)`
@@ -473,6 +491,44 @@ export const collections = {
   await fs.writeFile(
     path.join(root, "src", "content", "settings", "flags.md"),
     `enabled: true`,
+    "utf-8"
+  );
+
+  return root;
+}
+
+async function makeUntrustedHtmlFixtureProject(): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "neutron-content-untrusted-"));
+  tempRoots.push(root);
+
+  await fs.mkdir(path.join(root, "src", "content", "cms"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, "src", "content", "config.js"),
+    `
+import { z } from "zod";
+
+export const collections = {
+  cms: {
+    schema: z.object({
+      title: z.string(),
+    }),
+    sanitize: true,
+  },
+};
+`,
+    "utf-8"
+  );
+
+  await fs.writeFile(
+    path.join(root, "src", "content", "cms", "malicious.html"),
+    `---
+title: Malicious
+---
+
+<p>legit markup</p>
+<script>alert(1)</script>
+<img src="x" onerror="alert(2)">
+`,
     "utf-8"
   );
 
