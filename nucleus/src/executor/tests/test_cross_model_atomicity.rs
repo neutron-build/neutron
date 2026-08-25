@@ -1,5 +1,6 @@
-//! S63 slice 1: cross-model atomicity between SQL and Streams, and slice 2
-//! between SQL and the KV strings WAL (`kv.wal`).
+//! S63 slice 1: cross-model atomicity between SQL and Streams, slice 2
+//! between SQL and the KV strings WAL (`kv.wal`), and slice 3 between SQL
+//! and the document WAL (`doc.wal`).
 //!
 //! The mechanism under test, end to end: every streams/KV WAL record written
 //! inside an explicit transaction is tagged with that transaction's
@@ -551,4 +552,194 @@ async fn kv_tagged_ids_do_not_reuse_when_only_kv_wal_holds_the_floor() {
         None,
         "the committed id must not vouch for the stale tagged record"
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// S63 slice 3: the document WAL (doc.wal)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// DOC_INSERT as the assigned id.
+async fn doc_insert(ex: &Executor, json: &str) -> i64 {
+    let r = exec(ex, &format!("SELECT DOC_INSERT('{json}')")).await;
+    match scalar(&r[0]) {
+        Value::Int64(id) => *id,
+        other => panic!("DOC_INSERT returned {other:?}"),
+    }
+}
+
+/// DOC_GET as an Option<JSON text>: `None` means the document is absent.
+async fn doc_get(ex: &Executor, id: i64) -> Option<String> {
+    let r = exec(ex, &format!("SELECT DOC_GET({id})")).await;
+    match scalar(&r[0]) {
+        Value::Text(s) => Some(s.clone()),
+        Value::Null => None,
+        other => panic!("DOC_GET({id}) returned {other:?}"),
+    }
+}
+
+/// The S63 discard direction for documents, no crash injection needed:
+/// dropping the executor mid-transaction is the durable equivalent of dying
+/// before the COMMIT record — the doc.wal record was flushed by its
+/// statement, and nothing vouches for its id. No compensation runs (the
+/// transaction is abandoned, not rolled back), so the only thing standing
+/// between the flushed tagged record and recovery is the filter. The
+/// committed transaction's document in the SAME log survives — the
+/// both-directions proof.
+#[tokio::test]
+async fn uncommitted_doc_insert_is_discarded_and_committed_kept_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+        // Committed: SQL row + document, both tagged with the txn's id,
+        // vouched for by the COMMIT record body.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (1, 'kept')").await;
+        let kept_id = doc_insert(&ex, r#"{"kind":"committed"}"#).await;
+        exec(&ex, "COMMIT").await;
+        // Abandoned: record flushed to doc.wal, COMMIT never happens. No
+        // rollback compensation runs — the filter alone must discard it.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (2, 'lost')").await;
+        let lost_id = doc_insert(&ex, r#"{"kind":"abandoned"}"#).await;
+        // no COMMIT, no ROLLBACK — drop(ex) below abandons it
+        assert_ne!(kept_id, lost_id);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    let kept = doc_get(&ex, 1).await;
+    let lost = doc_get(&ex, 2).await;
+    assert!(
+        kept.as_deref().is_some_and(|j| j.contains("committed")),
+        "the committed transaction's document is vouched for and must survive"
+    );
+    assert_eq!(
+        lost, None,
+        "the abandoned transaction's doc record was flushed to doc.wal and must \
+         be discarded by the filter, not replayed"
+    );
+    let rows = exec(&ex, "SELECT v FROM t ORDER BY id").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the abandoned transaction's SQL row is gone too"
+    );
+    assert_eq!(scalar(&rows[0]), &Value::Text("kept".into()));
+}
+
+/// Autocommit DOC_INSERTs carry XACT_AUTOCOMMIT (0) and never need a commit
+/// record — their durability point is the doc log's own fsync.
+#[tokio::test]
+async fn autocommit_doc_insert_survives_reopen_without_a_commit_record() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        doc_insert(&ex, r#"{"a":1}"#).await;
+        doc_insert(&ex, r#"{"a":2}"#).await;
+        assert!(doc_get(&ex, 1).await.is_some());
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    let got = doc_get(&ex, 1)
+        .await
+        .expect("autocommit doc must survive reopen");
+    // Compare parsed JSON, not bytes: the WAL round-trip may reserialize
+    // (spacing differs between the insert path and replay), which is not a
+    // value change.
+    let got_v: serde_json::Value = serde_json::from_str(&got).unwrap();
+    let want_v: serde_json::Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
+    assert_eq!(
+        got_v, want_v,
+        "autocommit records carry id 0 and must never be filtered"
+    );
+    assert!(doc_get(&ex, 2).await.is_some());
+}
+
+/// A rolled-back transaction's tagged doc records are discarded by the
+/// filter on replay. The rollback's compensating records ALSO handle this
+/// (double protection, deliberately kept — see D4), so the outcome here is
+/// asserted rather than discriminated; the filter-only discriminator is the
+/// abandoned-transaction test above, where no compensation ever runs.
+#[tokio::test]
+async fn rolled_back_doc_writes_are_gone_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        doc_insert(&ex, r#"{"v":"before"}"#).await;
+        exec(&ex, "BEGIN").await;
+        doc_insert(&ex, r#"{"v":"written-then-rolled-back"}"#).await;
+        exec(&ex, "SELECT DOC_UPDATE(1, '{\"v\":\"after\"}')").await;
+        exec(&ex, "ROLLBACK").await;
+        assert!(doc_get(&ex, 1).await.unwrap().contains("before"));
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        doc_get(&ex, 2).await,
+        None,
+        "the rolled-back transaction's insert must not resurrect on reopen"
+    );
+    assert!(
+        doc_get(&ex, 1).await.unwrap().contains("before"),
+        "the overwritten document's before-image must be what replay restores"
+    );
+}
+
+/// The doc half of the id-monotonicity proof (S1a/D2): after a run whose
+/// only surviving tagged record lives in doc.wal — no COMMIT bodies (the
+/// abandoned transaction never wrote one), nothing in kv.wal or streams.wal
+/// — a reopened executor must still mint ids ABOVE the id that record
+/// carries.
+///
+/// This is the resurrection case the seed exists to prevent: an abandoned
+/// record tagged 1 is on disk and unreferenced. If the counter restarted at
+/// 1, the NEXT committed transaction would carry id 1, its COMMIT body
+/// would vouch for id 1, and replay would resurrect the abandoned document
+/// as a side effect of keeping the live one. The seed's doc scan is what
+/// holds the floor here — neither the SQL side nor the other tagged logs
+/// have anything to contribute.
+#[tokio::test]
+async fn doc_tagged_ids_do_not_reuse_when_only_doc_wal_holds_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Run 1: an abandoned transaction tags a doc record with id 1. Nothing
+    // commits, so no COMMIT body exists anywhere afterwards.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "BEGIN").await;
+        doc_insert(&ex, r#"{"kind":"abandoned"}"#).await;
+        // abandon — no COMMIT, no ROLLBACK, no compensation
+    }
+
+    // Run 2: reopen. The committed set is empty and the other tagged logs
+    // hold nothing; only doc.wal's max tagged id (1) can hold the floor
+    // above 1.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        assert_eq!(
+            doc_get(&ex, 1).await,
+            None,
+            "the abandoned record must be discarded on replay"
+        );
+        let next = ex.next_xact_id_probe();
+        assert!(
+            next > 1,
+            "id reuse: the next minted id is {next}, but doc.wal still holds \
+             a tagged record carrying id 1 — a fresh transaction with that id \
+             would resurrect it"
+        );
+        // Prove the resurrection the seed prevents: commit a NEW doc write.
+        // Its id is above 1, so vouching for it must not vouch for the
+        // abandoned record.
+        exec(&ex, "BEGIN").await;
+        doc_insert(&ex, r#"{"kind":"committed-later"}"#).await;
+        exec(&ex, "COMMIT").await;
+    }
+
+    // Run 3: the live document survives, the abandoned one stays dead.
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert!(doc_get(&ex, 1).await.unwrap().contains("committed-later"));
 }

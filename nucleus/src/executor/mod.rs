@@ -1079,13 +1079,14 @@ impl Executor {
                 }
             }
 
-            // Document store: WAL + cold tier
+            // Document store: WAL + cold tier. The committed set filters the
+            // doc.wal replay the same way it filters kv.wal (S63).
             let doc_dir = dir.join("doc");
             std::fs::create_dir_all(&doc_dir).ok();
             if let Some(doc) = Self::open_durable(
                 "Document",
                 &doc_dir,
-                crate::document::DocumentStore::open(&doc_dir),
+                crate::document::DocumentStore::open_with_committed(&doc_dir, &committed_xacts),
             ) {
                 *exec.doc_store.write() = doc;
             }
@@ -1239,6 +1240,7 @@ impl Executor {
             let mut xact_floor = exec
                 .kv_store()
                 .wal_max_xact_id()
+                .max(exec.doc_store().read().wal_max_xact_id())
                 .max(committed_xacts.iter().copied().max().unwrap_or(0));
             if let Some((wal, state)) = Self::open_durable(
                 "Streams",
@@ -1251,13 +1253,14 @@ impl Executor {
                 xact_floor = xact_floor.max(state.max_xact_id);
             }
             // Seed the XactId counter above every id a surviving record
-            // could reference: tagged KV and streams records, and COMMIT-
-            // record bodies. All sources are needed — any one alone is
-            // lowerable by reclaim (segment pruning, log compaction) — and
-            // together they are exactly the ids a future filter decision
-            // can consult. This runs even when a tagged log failed to open
-            // (its records are lost with it, but the surviving ones still
-            // pin the floor). See `executor::enlistment`.
+            // could reference: tagged KV, doc and streams records, and
+            // COMMIT-record bodies. All sources are needed — any one alone
+            // is lowerable by reclaim (segment pruning, log compaction) —
+            // and together they are exactly the ids a future filter
+            // decision can consult. This runs even when a tagged log
+            // failed to open (its records are lost with it, but the
+            // surviving ones still pin the floor). See
+            // `executor::enlistment`.
             exec.next_xact_id
                 .store(xact_floor + 1, std::sync::atomic::Ordering::SeqCst);
 

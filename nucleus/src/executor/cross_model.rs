@@ -193,15 +193,28 @@ impl Executor {
         });
     }
 
-    pub(super) fn cross_model_before_doc(&self, store: &crate::document::DocumentStore) {
+    /// Record that this transaction is about to write the document store,
+    /// capturing the before-image on first use, and return the coordinating
+    /// id the WAL record for that write must carry (S63): the transaction's
+    /// `xid` inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    /// Folding the enlistment into the touch means one lock acquisition
+    /// covers both, and a write path cannot drift between capturing the
+    /// before-image and tagging its record. Must be called *before* the
+    /// mutation, while the caller holds the store's write guard (it takes
+    /// `&store`, not a clone, exactly so it cannot be called any later).
+    pub(super) fn cross_model_before_doc(&self, store: &crate::document::DocumentStore) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Doc);
         for_each_level!(cm, lvl, {
             if lvl.doc.is_none() {
                 lvl.doc = Some(store.txn_snapshot());
             }
         });
+        cm.xid
     }
 
     pub(super) fn cross_model_after_doc(&self, touched: HashSet<u64>) {

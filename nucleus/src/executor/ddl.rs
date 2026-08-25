@@ -1373,8 +1373,7 @@ impl Executor {
                                         count_columns: spec.count_columns.clone(),
                                     },
                                 );
-                                let serving =
-                                    self.table_engines.read().get(&table_name).cloned();
+                                let serving = self.table_engines.read().get(&table_name).cloned();
                                 self.register_engine_runtime(
                                     &table_name,
                                     &spec,
@@ -1400,6 +1399,11 @@ impl Executor {
                                          superseded versions"
                                     );
                                 }
+                                // persist_catalog needs the server feature's
+                                // persistence layer; core-only builds skip
+                                // persisting exactly as every other DDL
+                                // persist site does.
+                                #[cfg(feature = "server")]
                                 if let Err(e) = self.persist_catalog().await {
                                     tracing::warn!(
                                         "adopted engine for '{table_name}' but the catalog \

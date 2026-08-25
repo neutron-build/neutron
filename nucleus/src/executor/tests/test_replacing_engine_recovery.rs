@@ -195,7 +195,9 @@ async fn final_modifier_is_rejected_rather_than_silently_ignored() {
         "the error must name FINAL so the porting mistake is obvious: {msg}"
     );
     // A quoted alias that happens to spell the word is still just an alias.
-    let ok = ex.execute("SELECT COUNT(*) FROM rep_final AS \"FINAL\"").await;
+    let ok = ex
+        .execute("SELECT COUNT(*) FROM rep_final AS \"FINAL\"")
+        .await;
     assert!(ok.is_ok(), "a quoted alias must keep working: {ok:?}");
 }
 

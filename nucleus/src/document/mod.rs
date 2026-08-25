@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use doc_wal::DocWal;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
+
 // ---------------------------------------------------------------------------
 // JsonValue
 // ---------------------------------------------------------------------------
@@ -499,6 +501,14 @@ impl DocumentStore {
             None => Ok(()),
         }
     }
+
+    /// The highest coordinating transaction id this store's `doc.wal`
+    /// recovered (S63) — 0 with no WAL. Seeds the executor's XactId counter
+    /// so a reopened process never mints an id a surviving tagged record
+    /// already carries.
+    pub fn wal_max_xact_id(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |wal| wal.max_xact_id())
+    }
     pub fn new() -> Self {
         Self {
             docs: HashMap::new(),
@@ -527,8 +537,22 @@ impl DocumentStore {
     /// On first call the WAL file is created. On subsequent calls the WAL is
     /// replayed to restore all documents and rebuild the GIN index. The
     /// `next_id` counter is restored from `max(doc_id) + 1`.
+    ///
+    /// Replays with an EMPTY committed set, so every tagged record keeps —
+    /// the pre-S63 contract. The executor opens through
+    /// [`DocumentStore::open_with_committed`] instead, passing the
+    /// coordinating transaction ids the SQL side durably committed so the
+    /// S63 replay filter can discard the rest.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        let (wal, state) = DocWal::open(dir)?;
+        Self::open_with_committed(dir, &HashSet::new())
+    }
+
+    /// Open a WAL-backed document store whose `doc.wal` replay is filtered
+    /// by the S63 committed set: a tagged record whose coordinating
+    /// transaction id is neither `XACT_AUTOCOMMIT` nor in `committed` was
+    /// written inside a transaction that never committed, and is discarded.
+    pub fn open_with_committed(dir: &Path, committed: &HashSet<u64>) -> std::io::Result<Self> {
+        let (wal, state) = DocWal::open_with_committed(dir, committed)?;
         let wal = Arc::new(wal);
 
         // Open cold LsmTree tier for overflow documents
@@ -606,13 +630,24 @@ impl DocumentStore {
     /// Insert a document into `collection` and return its assigned ID.
     ///
     /// An empty `collection` is the default one, which is where every document
-    /// written through the collection-less API lives.
+    /// written through the collection-less API lives. Writes the WAL record
+    /// tagged `XACT_AUTOCOMMIT`; a write inside an explicit transaction wants
+    /// [`DocumentStore::insert_in_xact`].
     pub fn insert_in(&mut self, collection: &str, doc: JsonValue) -> u64 {
+        self.insert_in_xact(collection, doc, XACT_AUTOCOMMIT)
+    }
+
+    /// [`insert_in`](Self::insert_in) carrying the coordinating transaction
+    /// id (S63): the WAL record is tagged with `xact`, so replay discards it
+    /// when its transaction never committed. `XACT_AUTOCOMMIT` marks a write
+    /// outside any explicit transaction, whose durability point is this
+    /// log's own fsync.
+    pub fn insert_in_xact(&mut self, collection: &str, doc: JsonValue, xact: u64) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         if let Some(ref wal) = self.wal {
             let bytes = jsonb_encode(&doc);
-            if let Err(e) = wal.log_insert_in(id, collection, &bytes) {
+            if let Err(e) = wal.log_insert_in(Some(xact), id, collection, &bytes) {
                 eprintln!("document WAL: failed to log insert {id}: {e}");
             }
         }
@@ -636,11 +671,20 @@ impl DocumentStore {
     }
 
     /// [`insert_with_id`](Self::insert_with_id) placing the document in
-    /// `collection`.
+    /// `collection`. Writes the WAL record tagged `XACT_AUTOCOMMIT`; a write
+    /// inside an explicit transaction wants
+    /// [`DocumentStore::insert_with_id_in_xact`].
     pub fn insert_with_id_in(&mut self, id: u64, collection: &str, doc: JsonValue) {
+        self.insert_with_id_in_xact(id, collection, doc, XACT_AUTOCOMMIT);
+    }
+
+    /// [`insert_with_id_in`](Self::insert_with_id_in) carrying the
+    /// coordinating transaction id (S63): the WAL record is tagged with
+    /// `xact`, so replay discards it when its transaction never committed.
+    pub fn insert_with_id_in_xact(&mut self, id: u64, collection: &str, doc: JsonValue, xact: u64) {
         if let Some(ref wal) = self.wal {
             let bytes = jsonb_encode(&doc);
-            if let Err(e) = wal.log_insert_in(id, collection, &bytes) {
+            if let Err(e) = wal.log_insert_in(Some(xact), id, collection, &bytes) {
                 eprintln!("document WAL: failed to log insert_with_id {id}: {e}");
             }
         }
@@ -663,10 +707,12 @@ impl DocumentStore {
     /// Delete a document by ID.
     ///
     /// Returns `true` if the document existed and was removed (from hot or
-    /// cold tier), `false` if the ID was not found.
+    /// cold tier), `false` if the ID was not found. Writes the WAL record
+    /// tagged `XACT_AUTOCOMMIT`; a delete inside an explicit transaction
+    /// wants [`DocumentStore::delete_in_xact`].
     pub fn delete(&mut self, id: u64) -> bool {
         self.collections.remove(&id);
-        self.delete_inner(id)
+        self.delete_inner_xact(id, XACT_AUTOCOMMIT)
     }
 
     /// Delete `id` only if it belongs to `collection`.
@@ -674,14 +720,23 @@ impl DocumentStore {
     /// A document in another collection is reported as absent — the caller must
     /// not be able to learn that an id exists elsewhere, let alone remove it.
     pub fn delete_in(&mut self, collection: &str, id: u64) -> bool {
+        self.delete_in_xact(collection, id, XACT_AUTOCOMMIT)
+    }
+
+    /// [`delete_in`](Self::delete_in) carrying the coordinating transaction
+    /// id (S63): the WAL record is tagged with `xact`, so replay discards it
+    /// when its transaction never committed. `XACT_AUTOCOMMIT` marks a write
+    /// outside any explicit transaction, whose durability point is this
+    /// log's own fsync.
+    pub fn delete_in_xact(&mut self, collection: &str, id: u64, xact: u64) -> bool {
         if !self.in_collection(id, collection) {
             return false;
         }
         self.collections.remove(&id);
-        self.delete_inner(id)
+        self.delete_inner_xact(id, xact)
     }
 
-    fn delete_inner(&mut self, id: u64) -> bool {
+    fn delete_inner_xact(&mut self, id: u64, xact: u64) -> bool {
         // Delete from BOTH tiers regardless of where the doc was found.
         //
         // Eviction is unlogged, so WAL replay/checkpoint restore re-insert
@@ -702,7 +757,7 @@ impl DocumentStore {
         }
         if let Some(old) = self.docs.remove(&id) {
             if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_delete(id)
+                && let Err(e) = wal.log_delete(Some(xact), id)
             {
                 eprintln!("document WAL: failed to log delete {id}: {e}");
             }
@@ -713,7 +768,7 @@ impl DocumentStore {
             // The cold copy was already purged above; only the tombstone and
             // the transaction write-set entry remain.
             if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_delete(id)
+                && let Err(e) = wal.log_delete(Some(xact), id)
             {
                 eprintln!("document WAL: failed to log delete {id}: {e}");
             }
@@ -1035,7 +1090,7 @@ impl DocumentStore {
             self.next_id += 1;
             if let Some(ref wal) = self.wal {
                 let bytes = jsonb_encode(doc);
-                if let Err(e) = wal.log_insert(id, &bytes) {
+                if let Err(e) = wal.log_insert(Some(XACT_AUTOCOMMIT), id, &bytes) {
                     eprintln!("document WAL: failed to log bulk_insert {id}: {e}");
                 }
             }
@@ -1102,8 +1157,15 @@ impl DocumentStore {
     /// before-image. Documents this transaction never wrote are left as they
     /// are, so a ROLLBACK cannot destroy another session's committed inserts.
     ///
-    /// Durable: `insert_with_id`/`delete` append compensating records to the
-    /// document WAL, so a crash after ROLLBACK does not resurrect the writes.
+    /// Durable: `insert_with_id_in`/`delete` append compensating records to
+    /// the document WAL, so a crash after ROLLBACK does not resurrect the
+    /// writes. Those records are tagged `XACT_AUTOCOMMIT` deliberately
+    /// (S63): the rollback is its own durability point, so its compensating
+    /// records must always keep on replay. Double protection by design —
+    /// the recovery filter discards the rolled-back transaction's tagged
+    /// records on its own, so these records only matter for a crash between
+    /// the revert and the next checkpoint of a log replayed by an older
+    /// binary. Do not remove until S6 is proven at scale (D4).
     pub fn txn_restore_scoped(&mut self, snap: &DocTxnSnapshot, touched: &HashSet<u64>) {
         for id in touched {
             match snap.docs.get(id) {

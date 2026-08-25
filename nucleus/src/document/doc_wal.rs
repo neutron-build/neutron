@@ -24,13 +24,29 @@
 //! collection, which is what they were. A document in the default collection is
 //! still logged with the original entry types, so a log only grows the new
 //! shapes once collections are actually used.
+//!
+//! ## Transaction-tagged records (S63)
+//!
+//! Tags `0x07`-`0x09` are the `_XACT` twins of the three mutation records,
+//! each carrying the coordinating transaction id (`u64 LE`) between the tag
+//! and the twin's body. Replay keeps a tagged record only if its id is
+//! `XACT_AUTOCOMMIT` (0 — written outside any explicit transaction, whose
+//! durability point is this log's own fsync) or appears in the committed set
+//! recovered from the SQL side; everything else was written inside a
+//! transaction that never committed and is discarded — absence of a commit
+//! record means discard, always. The untagged tags keep their
+//! keep-unconditionally meaning, so pre-S63 logs replay unchanged. A SNAPSHOT
+//! (either variant) is committed by construction (the S7 checkpoint gate keeps
+//! one from folding an open transaction's writes) and always replays.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 use crate::storage::wal_util::WalSync;
 
 // ─── Entry type tags ────────────────────────────────────────────────────────
@@ -40,6 +56,13 @@ const ENTRY_DELETE: u8 = 0x02;
 const ENTRY_SNAPSHOT: u8 = 0x04;
 const ENTRY_INSERT_COLL: u8 = 0x05;
 const ENTRY_SNAPSHOT_COLL: u8 = 0x06;
+/// S63: INSERT carrying the coordinating transaction id. Body after the id is
+/// byte-identical to [`ENTRY_INSERT`].
+const ENTRY_INSERT_XACT: u8 = 0x07;
+/// S63: collection-scoped INSERT carrying the coordinating transaction id.
+const ENTRY_INSERT_COLL_XACT: u8 = 0x08;
+/// S63: DELETE carrying the coordinating transaction id.
+const ENTRY_DELETE_XACT: u8 = 0x09;
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -55,12 +78,21 @@ pub struct DocWalState {
     /// predates collections yields an empty map — every document defaults, which
     /// is exactly where they were.
     pub collections: Vec<(u64, String)>,
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded. Seeds the XactId
+    /// high-water mark at executor construction (S63): a reopened process
+    /// must never mint an id that a surviving tagged record already carries,
+    /// or the recovery filter could resurrect stale records by matching a
+    /// fresh transaction against them.
+    pub max_xact_id: u64,
 }
 
 /// Append-only document WAL.
 pub struct DocWal {
     path: PathBuf,
     writer: Mutex<File>,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
     /// Append/sync bookkeeping for group commit. Before this existed the
     /// appends below ended in `Write::flush`, which for a bare `std::fs::File`
     /// is documented to do nothing at all -- so an acknowledged document write
@@ -79,35 +111,60 @@ pub struct DocWal {
 }
 
 impl DocWal {
-    /// Open or create the WAL file in `dir`.
+    /// Open or create the WAL file in `dir`, replaying with an EMPTY
+    /// committed set so every tagged record keeps — the pre-S63 contract.
+    /// The executor opens through [`DocWal::open_with_committed`] instead,
+    /// passing the coordinating transaction ids the SQL side durably
+    /// committed so the S63 replay filter can discard the rest.
     ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
-    /// state is empty. Corrupt trailing bytes are silently ignored (best-effort
-    /// recovery).
+    /// state is empty. Corrupt trailing bytes are silently ignored
+    /// (best-effort recovery).
     pub fn open(dir: &Path) -> io::Result<(Self, DocWalState)> {
+        Self::open_with_committed(dir, &HashSet::new())
+    }
+
+    /// Open or create the WAL file in `dir` whose replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &HashSet<u64>,
+    ) -> io::Result<(Self, DocWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("doc.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data)
+            replay(&data, committed)
         } else {
             DocWalState {
                 docs: Vec::new(),
                 collections: Vec::new(),
+                max_xact_id: 0,
             }
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let max_xact_id = state.max_xact_id;
         Ok((
             Self {
                 path,
                 writer: Mutex::new(file),
                 syncer: WalSync::new(),
+                max_xact_id,
                 stranded: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
+    }
+
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    pub fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
     }
 
     /// Re-point the writer at the live log file after a checkpoint replaced
@@ -164,10 +221,15 @@ impl DocWal {
     }
 
     /// Log an INSERT operation (insert or replace).
-    pub fn log_insert(&self, doc_id: u64, json_bytes: &[u8]) -> io::Result<()> {
+    ///
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction,
+    /// `Some(id)` inside one, `None` to write the legacy untagged record
+    /// (kept unconditionally on replay — the pre-S63 compatibility rule).
+    pub fn log_insert(&self, xact: Option<u64>, doc_id: u64, json_bytes: &[u8]) -> io::Result<()> {
         let mut w = self.writer.lock();
         self.reattach_if_stranded(&mut w)?;
-        w.write_all(&[ENTRY_INSERT])?;
+        push_tag(&mut w, xact, ENTRY_INSERT, ENTRY_INSERT_XACT)?;
         w.write_all(&doc_id.to_le_bytes())?;
         w.write_all(&(json_bytes.len() as u32).to_le_bytes())?;
         w.write_all(json_bytes)?;
@@ -181,19 +243,22 @@ impl DocWal {
     /// An empty `collection` is the default one and is logged with the plain
     /// [`ENTRY_INSERT`] shape, so nothing about an existing log changes until a
     /// named collection is used.
+    ///
+    /// `xact` mirrors [`DocWal::log_insert`].
     pub fn log_insert_in(
         &self,
+        xact: Option<u64>,
         doc_id: u64,
         collection: &str,
         json_bytes: &[u8],
     ) -> io::Result<()> {
         if collection.is_empty() {
-            return self.log_insert(doc_id, json_bytes);
+            return self.log_insert(xact, doc_id, json_bytes);
         }
         let coll = collection.as_bytes();
         let mut w = self.writer.lock();
         self.reattach_if_stranded(&mut w)?;
-        w.write_all(&[ENTRY_INSERT_COLL])?;
+        push_tag(&mut w, xact, ENTRY_INSERT_COLL, ENTRY_INSERT_COLL_XACT)?;
         w.write_all(&doc_id.to_le_bytes())?;
         w.write_all(&(coll.len() as u32).to_le_bytes())?;
         w.write_all(coll)?;
@@ -205,10 +270,12 @@ impl DocWal {
     }
 
     /// Log a DELETE operation.
-    pub fn log_delete(&self, doc_id: u64) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`DocWal::log_insert`].
+    pub fn log_delete(&self, xact: Option<u64>, doc_id: u64) -> io::Result<()> {
         let mut w = self.writer.lock();
         self.reattach_if_stranded(&mut w)?;
-        w.write_all(&[ENTRY_DELETE])?;
+        push_tag(&mut w, xact, ENTRY_DELETE, ENTRY_DELETE_XACT)?;
         w.write_all(&doc_id.to_le_bytes())?;
         w.flush()?;
         self.syncer.on_append();
@@ -301,14 +368,34 @@ impl DocWal {
 
 // ─── Replay ─────────────────────────────────────────────────────────────────
 
+/// Emit the tag for one record directly into the locked writer: the `_XACT`
+/// twin plus the id when `xact` is `Some`, the legacy untagged tag when
+/// `None`.
+fn push_tag(w: &mut File, xact: Option<u64>, plain: u8, xact_tagged: u8) -> io::Result<()> {
+    match xact {
+        Some(x) => {
+            w.write_all(&[xact_tagged])?;
+            w.write_all(&x.to_le_bytes())
+        }
+        None => w.write_all(&[plain]),
+    }
+}
+
 /// Replay all entries in `data` to reconstruct document state.
 ///
 /// SNAPSHOT entries reset all state. Only the *last* SNAPSHOT (and subsequent
 /// incremental entries) matter in practice.
-fn replay(data: &[u8]) -> DocWalState {
+///
+/// `committed` is the set of coordinating transaction ids that durably
+/// committed on the SQL side (S63). A tagged record whose id is neither
+/// `XACT_AUTOCOMMIT` nor in it was written inside a transaction that never
+/// committed, and is discarded — its body is still parsed past, because
+/// nothing length-frames these records and the next one must be found.
+fn replay(data: &[u8], committed: &HashSet<u64>) -> DocWalState {
     let mut docs: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
     let mut collections: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut pos = 0usize;
+    let mut max_xact_id: u64 = 0;
 
     while pos < data.len() {
         let Some(&entry_type) = data.get(pos) else {
@@ -316,8 +403,28 @@ fn replay(data: &[u8]) -> DocWalState {
         };
         pos += 1;
 
+        // The tagged records parse their id, then share the body parse with
+        // the untagged twin. `keep_tagged` is the S63 filter in one
+        // expression: an autocommit record is durable by its own fsync, a
+        // committed id was vouched for by a durable COMMIT record, anything
+        // else never happened. Parsing continues either way — the record
+        // must be fully consumed to find the next one, since nothing
+        // length-frames these. Ids feed `max_xact_id` whether kept or
+        // discarded, so the caller can seed the XactId high-water mark.
+        let mut keep_tagged = true;
+        if matches!(
+            entry_type,
+            ENTRY_INSERT_XACT | ENTRY_INSERT_COLL_XACT | ENTRY_DELETE_XACT
+        ) {
+            let Some(xact) = read_u64(data, &mut pos) else {
+                break;
+            };
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
+
         match entry_type {
-            ENTRY_INSERT => {
+            ENTRY_INSERT | ENTRY_INSERT_XACT => {
                 let Some(doc_id) = read_u64(data, &mut pos) else {
                     break;
                 };
@@ -330,11 +437,13 @@ fn replay(data: &[u8]) -> DocWalState {
                 }
                 let jsonb = data[pos..pos + jsonb_len].to_vec();
                 pos += jsonb_len;
-                docs.insert(doc_id, jsonb);
-                // Re-inserting at an id moves it to the default collection.
-                collections.remove(&doc_id);
+                if keep_tagged {
+                    docs.insert(doc_id, jsonb);
+                    // Re-inserting at an id moves it to the default collection.
+                    collections.remove(&doc_id);
+                }
             }
-            ENTRY_INSERT_COLL => {
+            ENTRY_INSERT_COLL | ENTRY_INSERT_COLL_XACT => {
                 let Some(doc_id) = read_u64(data, &mut pos) else {
                     break;
                 };
@@ -347,19 +456,23 @@ fn replay(data: &[u8]) -> DocWalState {
                 let Some(jsonb) = read_bytes(data, &mut pos) else {
                     break;
                 };
-                docs.insert(doc_id, jsonb);
-                if coll.is_empty() {
-                    collections.remove(&doc_id);
-                } else {
-                    collections.insert(doc_id, coll);
+                if keep_tagged {
+                    docs.insert(doc_id, jsonb);
+                    if coll.is_empty() {
+                        collections.remove(&doc_id);
+                    } else {
+                        collections.insert(doc_id, coll);
+                    }
                 }
             }
-            ENTRY_DELETE => {
+            ENTRY_DELETE | ENTRY_DELETE_XACT => {
                 let Some(doc_id) = read_u64(data, &mut pos) else {
                     break;
                 };
-                docs.remove(&doc_id);
-                collections.remove(&doc_id);
+                if keep_tagged {
+                    docs.remove(&doc_id);
+                    collections.remove(&doc_id);
+                }
             }
             ENTRY_SNAPSHOT_COLL => {
                 docs.clear();
@@ -433,6 +546,7 @@ fn replay(data: &[u8]) -> DocWalState {
     DocWalState {
         docs: docs.into_iter().collect(),
         collections: collections.into_iter().collect(),
+        max_xact_id,
     }
 }
 
@@ -467,6 +581,120 @@ fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
 mod tests {
     use super::*;
 
+    // ── S63: the recovery filter ──────────────────────────────────────────
+
+    /// Hand-encode one tagged record, so the filter tests do not depend on
+    /// the writers they are auditing.
+    fn tagged(tag: u8, xact: u64, body: &[u8]) -> Vec<u8> {
+        let mut buf = vec![tag];
+        buf.extend_from_slice(&xact.to_le_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn insert_body(doc_id: u64, jsonb: &[u8]) -> Vec<u8> {
+        let mut buf = doc_id.to_le_bytes().to_vec();
+        buf.extend_from_slice(&(jsonb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(jsonb);
+        buf
+    }
+
+    /// One log exercising every filter decision at once: legacy and
+    /// autocommit records keep, committed ids keep, unknown ids discard —
+    /// and a discarded record in the MIDDLE does not stop the records after
+    /// it (they are parsed past, not abandoned).
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let mut buf = Vec::new();
+        // Legacy untagged INSERT (pre-S63 log): keep unconditionally.
+        buf.push(ENTRY_INSERT);
+        buf.extend_from_slice(&insert_body(1, b"legacy"));
+        // Tagged autocommit (0): keep.
+        buf.extend_from_slice(&tagged(
+            ENTRY_INSERT_XACT,
+            XACT_AUTOCOMMIT,
+            &insert_body(2, b"auto"),
+        ));
+        buf.extend_from_slice(&tagged(ENTRY_INSERT_XACT, 7, &insert_body(3, b"committed")));
+        buf.extend_from_slice(&tagged(
+            ENTRY_INSERT_XACT,
+            8,
+            &insert_body(4, b"never-committed"),
+        )); // discarded, mid-log
+        buf.extend_from_slice(&tagged(
+            ENTRY_INSERT_XACT,
+            9,
+            &insert_body(5, b"committed-late"),
+        ));
+
+        let committed: HashSet<u64> = [7u64, 9u64].into_iter().collect();
+        let state = replay(&buf, &committed);
+        assert_eq!(
+            state.max_xact_id, 9,
+            "discarded records still feed the floor"
+        );
+        let mut ids: Vec<u64> = state.docs.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 5],
+            "id 8 never committed; its record must be discarded, not replayed"
+        );
+    }
+
+    /// DELETE filters the same way: an uncommitted transaction's delete must
+    /// not reach documents that survived it. The collection-scoped insert
+    /// twin carries the same decision.
+    #[test]
+    fn tagged_delete_filters_and_collections_round_trip() {
+        let mut buf = Vec::new();
+        // Autocommit base state: two documents, one in a named collection.
+        buf.extend_from_slice(&tagged(
+            ENTRY_INSERT_XACT,
+            XACT_AUTOCOMMIT,
+            &insert_body(1, b"plain"),
+        ));
+        let mut coll_body = 2u64.to_le_bytes().to_vec();
+        coll_body.extend_from_slice(&(3u32).to_le_bytes());
+        coll_body.extend_from_slice(b"ops");
+        coll_body.extend_from_slice(&(4u32).to_le_bytes());
+        coll_body.extend_from_slice(b"body");
+        buf.extend_from_slice(&tagged(ENTRY_INSERT_COLL_XACT, XACT_AUTOCOMMIT, &coll_body));
+        // Abandoned transaction (id 5): deletes both. Neither may land.
+        for id in [1u64, 2u64] {
+            buf.extend_from_slice(&tagged(ENTRY_DELETE_XACT, 5, &id.to_le_bytes()));
+        }
+
+        let state = replay(&buf, &HashSet::new());
+        assert_eq!(
+            state.docs.len(),
+            2,
+            "the abandoned transaction's deletes must be discarded"
+        );
+        assert_eq!(state.max_xact_id, 5);
+        let colls: std::collections::HashMap<_, _> = state.collections.into_iter().collect();
+        assert_eq!(colls.get(&2).map(String::as_str), Some("ops"));
+    }
+
+    /// A truncation inside a tagged record is a torn tail exactly as for the
+    /// untagged ones: replay keeps the clean prefix and abandons the partial
+    /// record at its boundary.
+    #[test]
+    fn torn_tagged_record_keeps_the_clean_prefix() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&tagged(
+            ENTRY_INSERT_XACT,
+            XACT_AUTOCOMMIT,
+            &insert_body(1, b"ok"),
+        ));
+        let torn_start = buf.len();
+        buf.extend_from_slice(&tagged(ENTRY_INSERT_XACT, 3, &insert_body(2, b"torn")));
+        // Cut inside the second record's id/body.
+        let state = replay(&buf[..torn_start + 6], &[3u64].into_iter().collect());
+        let ids: Vec<u64> = state.docs.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![1], "the partial record must be abandoned");
+    }
+
     /// An append is un-fsynced until `group_sync` covers it. NU-006: these
     /// appends used to end at `Write::flush`, a documented no-op on a bare
     /// `File`, so the write was acked while living only in the page cache.
@@ -475,7 +703,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DocWal::open(dir.path()).unwrap();
         assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
-        wal.log_insert(1, b"a").unwrap();
+        wal.log_insert(None, 1, b"a").unwrap();
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
@@ -487,8 +715,8 @@ mod tests {
         let (wal, state) = DocWal::open(dir.path()).unwrap();
         assert!(state.docs.is_empty());
 
-        wal.log_insert(1, b"hello").unwrap();
-        wal.log_insert(2, b"world").unwrap();
+        wal.log_insert(None, 1, b"hello").unwrap();
+        wal.log_insert(None, 2, b"world").unwrap();
         drop(wal);
 
         let (_wal2, state2) = DocWal::open(dir.path()).unwrap();
@@ -508,12 +736,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (wal, _) = DocWal::open(dir.path()).unwrap();
-            wal.log_insert(1, b"before").unwrap();
+            wal.log_insert(None, 1, b"before").unwrap();
             wal.fail_reopen_once
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             wal.checkpoint(&[(1, b"before".to_vec())])
                 .expect_err("the injected reopen failure must fail the checkpoint");
-            wal.log_insert(2, b"after")
+            wal.log_insert(None, 2, b"after")
                 .expect("a later append must reattach, not strand");
         }
         let (_wal2, state) = DocWal::open(dir.path()).unwrap();
@@ -531,9 +759,9 @@ mod tests {
     fn test_delete_replay() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DocWal::open(dir.path()).unwrap();
-        wal.log_insert(1, b"aaa").unwrap();
-        wal.log_insert(2, b"bbb").unwrap();
-        wal.log_delete(1).unwrap();
+        wal.log_insert(None, 1, b"aaa").unwrap();
+        wal.log_insert(None, 2, b"bbb").unwrap();
+        wal.log_delete(None, 1).unwrap();
         drop(wal);
 
         let (_wal2, state) = DocWal::open(dir.path()).unwrap();
@@ -546,12 +774,12 @@ mod tests {
     fn test_snapshot_replay() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DocWal::open(dir.path()).unwrap();
-        wal.log_insert(1, b"aaa").unwrap();
-        wal.log_insert(2, b"bbb").unwrap();
+        wal.log_insert(None, 1, b"aaa").unwrap();
+        wal.log_insert(None, 2, b"bbb").unwrap();
         // Checkpoint with only doc 2
         wal.checkpoint(&[(2, b"bbb".to_vec())]).unwrap();
         // Insert doc 3 after checkpoint
-        wal.log_insert(3, b"ccc").unwrap();
+        wal.log_insert(None, 3, b"ccc").unwrap();
         drop(wal);
 
         let (_wal2, state) = DocWal::open(dir.path()).unwrap();
@@ -595,7 +823,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DocWal::open(dir.path()).unwrap();
         let big = vec![0x42u8; 100_000];
-        wal.log_insert(1, &big).unwrap();
+        wal.log_insert(None, 1, &big).unwrap();
         drop(wal);
 
         let (_wal2, state) = DocWal::open(dir.path()).unwrap();
@@ -608,8 +836,8 @@ mod tests {
     fn test_replace_via_insert() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DocWal::open(dir.path()).unwrap();
-        wal.log_insert(1, b"first").unwrap();
-        wal.log_insert(1, b"second").unwrap();
+        wal.log_insert(None, 1, b"first").unwrap();
+        wal.log_insert(None, 1, b"second").unwrap();
         drop(wal);
 
         let (_wal2, state) = DocWal::open(dir.path()).unwrap();

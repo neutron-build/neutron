@@ -17,14 +17,15 @@
 //! still reference. The seed is
 //!
 //! ```text
-//! max( xids in surviving COMMIT-record bodies,   (SQL side)
-//!      xids tagged in surviving streams records ) (specialty side)
+//! max( xids in surviving COMMIT-record bodies,      (SQL side)
+//!      xids tagged in surviving kv/doc/streams )    (specialty side)
 //! ```
 //!
 //! which is exactly the set of ids a future filter decision could consult.
-//! After a full reclaim (SQL segments pruned AND streams log snapshotted) the
-//! seed legitimately falls back to 0 and ids restart at 1 — safe, because at
-//! that point no record referencing an old id exists anywhere to be fooled.
+//! After a full reclaim (SQL segments pruned AND every tagged log
+//! snapshotted) the seed legitimately falls back to 0 and ids restart at 1 —
+//! safe, because at that point no record referencing an old id exists
+//! anywhere to be fooled.
 //!
 //! ## The commit-record body
 //!
@@ -44,10 +45,10 @@ pub(crate) const XACT_BODY_LEN: usize = 10;
 /// Which specialty models a transaction enlisted. One bit per model.
 ///
 /// The discriminants are the on-disk contract inside the COMMIT-record body
-/// and may never be renumbered. Only `Streams` is enlisted in the first
-/// slice; the rest arrive one log per S4 slice, so they sit unused until
-/// their slice lands (the alternative — renumbering later — would corrupt
-/// every body written in between).
+/// and may never be renumbered. `Streams`, `Kv` and `Doc` are enlisted by
+/// the landed S63 slices; the rest arrive one log per S4 slice, so they sit
+/// unused until their slice lands (the alternative — renumbering later —
+/// would corrupt every body written in between).
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EnlistedSet(u16);

@@ -1,11 +1,11 @@
-//! Crash proof for cross-model atomicity (S63): SQL + Streams (slice 1) and
-//! SQL + the KV strings WAL (slice 2).
+//! Crash proof for cross-model atomicity (S63): SQL + Streams (slice 1),
+//! SQL + the KV strings WAL (slice 2), and SQL + the document WAL (slice 3).
 //!
 //! The claim under test is the discard half of Option D: a transaction that
 //! spans the SQL engine and a specialty model is atomic across a crash in the
 //! window between its specialty records and its SQL COMMIT record. The child
-//! runs `BEGIN; INSERT (SQL); STREAM_XADD / KV_SET; COMMIT` and dies at
-//! `crossmodel.before_commit_record` — after the specialty record was
+//! runs `BEGIN; INSERT (SQL); STREAM_XADD / KV_SET / DOC_INSERT; COMMIT` and
+//! dies at `crossmodel.before_commit_record` — after the specialty record was
 //! flushed to the WAL, before the COMMIT record (with the coordinating id in
 //! its body) exists. Recovery must discard BOTH halves: the specialty write
 //! because no commit record vouches for its id, the INSERT because it is a
@@ -79,7 +79,8 @@ fn scalar_i64(res: &[ExecResult], sql: &str) -> Result<i64, String> {
 ///   child dies there);
 /// - "commit" lets the streams transaction finish, then adds an autocommit
 ///   XADD;
-/// - "kv_crash"/"kv_commit" are the KV_SET twins of the same two shapes.
+/// - "kv_crash"/"kv_commit" are the KV_SET twins of the same two shapes;
+/// - "doc_crash"/"doc_commit" are the DOC_INSERT twins.
 fn child_main(dir: &str, mode: &str) -> ! {
     std::panic::set_hook(Box::new(|_| {}));
     let rt = tokio::runtime::Runtime::new().expect("child rt");
@@ -106,6 +107,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            "doc_crash" | "doc_commit" => {
+                step("SELECT DOC_INSERT('{\"kind\": \"txn\"}')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             _ => {
                 step("SELECT STREAM_XADD('s', 'kind', 'txn')")
                     .await
@@ -123,6 +129,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
             }
             "kv_commit" => {
                 step("SELECT KV_SET('xm_auto', 'auto')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "doc_commit" => {
+                step("SELECT DOC_INSERT('{\"kind\": \"auto\"}')")
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -206,6 +217,54 @@ fn recover_and_check_kv(
     Ok(())
 }
 
+/// The document twin of `recover_and_check`: `expect` maps doc ids to a
+/// substring their recovered JSON must contain; every other id in 1..=2
+/// must be absent.
+fn recover_and_check_doc(
+    dir: &Path,
+    expect_rows: i64,
+    expect: &[(i64, &str)],
+) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let ex = build_executor(dir)?;
+    let rows = rt.block_on(execute(&ex, "SELECT COUNT(*) FROM t"))?;
+    let rows = scalar_i64(&rows, "COUNT(*)")?;
+    if rows != expect_rows {
+        return Err(format!(
+            "SQL rows: expected {expect_rows}, recovered {rows}"
+        ));
+    }
+    for id in 1i64..=2 {
+        let res = rt.block_on(execute(&ex, &format!("SELECT DOC_GET({id})")))?;
+        let got = match res.first() {
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Text(v)) => Some(v.clone()),
+                Some(Value::Null) | None => None,
+                other => return Err(format!("DOC_GET({id}) returned {other:?}")),
+            },
+            other => return Err(format!("DOC_GET({id}) returned {other:?}")),
+        };
+        match (expect.iter().find(|(eid, _)| *eid == id), got) {
+            (Some((_, want)), Some(json)) => {
+                if !json.contains(want) {
+                    return Err(format!("DOC_GET({id}): expected {want:?} inside {json:?}"));
+                }
+            }
+            (Some((_, want)), None) => {
+                return Err(format!("DOC_GET({id}): expected {want:?}, recovered NULL"));
+            }
+            (None, Some(json)) => {
+                return Err(format!(
+                    "DOC_GET({id}): expected absence after an uncommitted \
+                     transaction, recovered {json:?}"
+                ));
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
 async fn execute(ex: &Executor, sql: &str) -> Result<Vec<ExecResult>, String> {
     ex.execute(sql).await.map_err(|e| e.to_string())
 }
@@ -220,7 +279,7 @@ fn main() {
     let root: PathBuf =
         std::env::temp_dir().join(format!("nucleus-xmodel-s63-{}", std::process::id()));
 
-    println!("== cross-model atomicity crash proof (S63 slices 1+2) ==");
+    println!("== cross-model atomicity crash proof (S63 slices 1+2+3) ==");
     println!("point: {POINT}\n");
 
     let mut findings: Vec<String> = Vec::new();
@@ -264,6 +323,20 @@ fn main() {
             }),
             pass_msg: "commit direction: committed txn (row + tagged KV_SET) and \
                  autocommit KV_SET all survive reopen",
+        },
+        Scenario {
+            mode: "doc_crash",
+            label: "doc",
+            check: Box::new(|dir| recover_and_check_doc(dir, 0, &[])),
+            pass_msg: "crash before the commit record -> SQL row gone AND doc.wal's \
+                 tagged record discarded (atomic discard)",
+        },
+        Scenario {
+            mode: "doc_commit",
+            label: "doc",
+            check: Box::new(|dir| recover_and_check_doc(dir, 1, &[(1, "txn"), (2, "auto")])),
+            pass_msg: "commit direction: committed txn (row + tagged DOC_INSERT) and \
+                 autocommit DOC_INSERT all survive reopen",
         },
     ];
 

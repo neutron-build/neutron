@@ -4696,9 +4696,9 @@ impl Executor {
                     .map_err(|e| ExecError::Unsupported(format!("DOC_INSERT invalid JSON: {e}")))?;
                 let id = {
                     let mut store = self.doc_store.write();
-                    self.cross_model_before_doc(&store);
+                    let xact = self.cross_model_before_doc(&store);
                     store.clear_touched();
-                    let id = store.insert_in(&collection, jv);
+                    let id = store.insert_in_xact(&collection, jv, xact);
                     let touched = store.take_touched();
                     drop(store);
                     self.cross_model_after_doc(touched);
@@ -4741,9 +4741,9 @@ impl Executor {
                 if store.get_in(&collection, id).is_none() {
                     return Ok(Value::Bool(false));
                 }
-                self.cross_model_before_doc(&store);
+                let xact = self.cross_model_before_doc(&store);
                 store.clear_touched();
-                store.insert_with_id_in(id, &collection, jv);
+                store.insert_with_id_in_xact(id, &collection, jv, xact);
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_doc(touched);
@@ -4764,9 +4764,9 @@ impl Executor {
                 };
                 let id = val_to_u64(id_arg, "DOC_DELETE id")?;
                 let mut store = self.doc_store.write();
-                self.cross_model_before_doc(&store);
+                let xact = self.cross_model_before_doc(&store);
                 store.clear_touched();
-                let removed = store.delete_in(&collection, id);
+                let removed = store.delete_in_xact(&collection, id, xact);
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_doc(touched);
