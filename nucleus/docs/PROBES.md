@@ -404,6 +404,7 @@ wrong-answer bug rather than a violated assumption. `rusqlite` required.
 | `probe_kv` | reference | KV strings + lists through the SQL surface. |
 | `probe_kv_coll` | reference | Sets, sorted sets, hashes, HyperLogLog. |
 | `probe_vector` | brute-force f32 | Every distance metric and KNN ordering. |
+| `probe_vector_recall` | brute-force f32 | Two sections. (1) Served-path recall floors through SQL, fresh + post-churn + delete-heavy per index type. (2) **Clustered stability at bench scale** (added 2026-08-25): direct `HnswIndex`, the BENCH_VS_QDRANT shape, 4 corpus seeds swept over `ef` — gates that recall reaches 1.000 by ef ≤ 96 on every seed and that no query returns zero of its true top-10 at ef ≥ 32. This is the gate for the 2026-08-20 finding (first-perfect ef ranged 96 → never → 192 → 96 run to run, one query zero-recall at ef=256); it fails 2/4 seeds pre-fix and passes 4/4 post-fix. |
 | `probe_fts` | reference | `FTS_INDEX` / `FTS_REMOVE` / `FTS_SEARCH` / `FTS_MATCH`. |
 | `probe_fts_rank` | reference | Two ranking invariants specifically. |
 | `probe_geo` | reference | Every geo function. |
@@ -532,4 +533,4 @@ regression lives in a probe.
 |---|---|
 | `repro_txn_delete` | 2,000 single-row DELETEs in one transaction on the paged engine. |
 | `probe_param_vector` | Extended-protocol vector corruption: inline SQL vs bound parameter. |
-| `probe_vector_recall` | Recall regression. Caught the HNSW bug where greedy neighbour selection produced no bridge edges and clustered recall hit **0.000**; fixed by the Alg.4 diversifying heuristic (`e4b8f21`). |
+| `probe_vector_recall` | Promoted out of this table: it is a permanent gate now (see the Vector row in the oracle-coverage table). Born here for the greedy-neighbour-selection bug (clustered recall **0.000**, fixed by the Alg.4 diversifying heuristic, `e4b8f21`); its section 2 (2026-08-25) gates the recall-stability fix for the BENCH_VS_QDRANT findings — deterministic id-keyed layer assignment and beam descent seeding layer 0. |

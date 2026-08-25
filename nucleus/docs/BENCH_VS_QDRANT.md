@@ -1,5 +1,33 @@
 # Nucleus vs Qdrant 1.19.0 — vector search, measured 2026-08-20
 
+> **Postscript 2026-08-25 — the recall findings below are fixed; re-measure
+> before quoting this document's Nucleus recall/latency columns.**
+> Two mechanisms behind "Nucleus has queries its graph cannot reach":
+>
+> 1. **Layer assignment drew from a global RNG** (`rand::random()`), so every
+>    build of identical data was a different graph — the 96/never/192/96
+>    spread was a per-boot lottery. Layers are now derived from the node id
+>    (splitmix64), making the graph a pure function of (ids, vectors,
+>    insertion order).
+> 2. **Query-time descent was greedy ef=1 per upper layer** and handed layer
+>    0 a single entry point. On the clustered corpus a trapped descent parked
+>    that entry 8.6 from the query while every true top-10 sat at ≤1.04; the
+>    beam's admission filter then refused to cross the inter-cluster valley
+>    (measured: valley edge 8.81 vs worst-kept 8.755 at ef=128 — the exact
+>    zero-recall mechanism). Construction had the matching deviation from the
+>    paper's Algorithm 1 (`ep ← W`, not `ep ← closest`). Both fixed: descent
+>    is now a beam, layer 0 is seeded with the full beam, construction
+>    carries the full result set between layers.
+>
+> After the fix (brute-force oracle, same corpus shape, `probe_vector_recall`
+> section 2): first-perfect-ef across seeds 42/7/1234/99999 is
+> **48/48/48/32**, zero-recall queries **0 at every ef on every seed** —
+> Qdrant's stability class. At matched `ef` the beam descent costs roughly
+> 1.5–1.8x more distance evaluations (measured under host contention on the
+> same harness: p50@ef=64 ~230 µs before vs ~420 µs after), but at matched
+> **recall** the comparison flips: 1.000 at ef=48 versus this document's
+> 192/never. The Qdrant/pgvector columns are unaffected.
+
 Reproduce:
 
 ```sh

@@ -195,11 +195,15 @@ Goal: every durable model has proven, deterministic crash behavior.
       collections, document, graph, FTS, geo, vector (+ index_meta.json), time series, columnar,
       datalog, streams, CDC, and blob (+ segments), plus what is explicitly derived and rebuildable.
 - [x] Add subprocess kill points before/after WAL append, fsync, data write, checkpoint, and rename.
-      `storage::crashpoint` declares 11 named boundaries; `NUCLEUS_CRASHPOINT=<name>` makes the
-      process `abort()` there (no unwind, no Drop, no flush — power-loss equivalent at a chosen
-      instruction), with `NUCLEUS_CRASHPOINT_SKIP=n` to hit setup vs deep steady state.
+      `storage::crashpoint` declares 13 named boundaries — 11 at M3 close, plus
+      `commit.after_specialty_before_sql` and `crossmodel.before_commit_record`, added 2026-08-21
+      by the cross-model atomicity work to sit exactly at the commit boundary; `NUCLEUS_CRASHPOINT=<name>`
+      makes the process `abort()` there (no unwind, no Drop, no flush — power-loss equivalent at a
+      chosen instruction), with `NUCLEUS_CRASHPOINT_SKIP=n` to hit setup vs deep steady state.
       `probe_crash_points` walks every point at several skip depths and reports points it could NOT
-      reach rather than counting them as passes.
+      reach rather than counting them as passes. A dedicated kv-cold arm (2026-08-23, STO-2) spills
+      KV keys past the hot budget into the cold LSM tier, checkpoints, aborts, and requires every
+      acknowledged key to read back from disk rather than from the WAL the checkpoint truncated.
 - [x] Test torn headers/records, truncated WALs, invalid checksums, duplicate replay, and corrupt tails.
       `probe_durability_torn`: 0 findings over ~9.5k lossy recoveries — no panics, every recovered
       row was committed, CRC gate honored.
@@ -208,7 +212,12 @@ Goal: every durable model has proven, deterministic crash behavior.
       `wal.append`, `wal.fsync`, and `meta.write`; `probe_io_faults` walks 21 point x kind x depth
       combinations and asserts the failure SURFACES (a write that cannot be made durable must never
       report success), that every acknowledged row survives recovery, and that no corrupt or
-      half-applied record remains. 0 findings. Interrupted checkpoint is covered by
+      half-applied record remains. 0 findings. The declared fault-point set has since grown from
+      three to twenty-three (`ALL_IO_POINTS`): the specialty append points (`datalog`/`vector`/
+      `kv`/`collections`/`streams` `.wal_append`), `kv.wal_fsync` (which makes the
+      specialty-before-SQL commit order directly testable), eleven `*.wal_reopen`
+      checkpoint-strand points (2026-08-21, S31-14), and `lsm.sst_write` (2026-08-23, STO-1/2) —
+      69 combinations walked at 2026-08-23, still 0 findings. Interrupted checkpoint is covered by
       `checkpoint.before/mid_rewrite/after`. Read-only media is simulated via injected
       PermissionDenied rather than an actually read-only mount.
 - [x] Verify replay idempotency through repeated crash/recovery cycles.
@@ -242,17 +251,22 @@ Exit gate:
 
 - The crash matrix yields either the previous committed state or the new committed state, never a
   partial committed state or silent corruption.
-  Status: holds at all 11 crash points (`probe_crash_points`, 0 findings) after fixing a
-  total-data-loss defect the matrix found — see below.
+  Status: holds at all 13 named crash points (`probe_crash_points`, 0 findings — 11 at M3 close,
+  the two cross-model commit-boundary points added 2026-08-21, and the kv-cold arm added
+  2026-08-23) after fixing a total-data-loss defect the matrix found — see below.
 - Recovery failures are actionable errors and do not continue with suspect data.
-  Status: holds across 21 injected I/O-failure combinations (`probe_io_faults`, 0 findings), and a
-  rejected open now provably rewrites/deletes nothing.
+  Status: holds across 21 injected I/O-failure combinations at M3 close — 69 by 2026-08-23
+  (`probe_io_faults`, 0 findings throughout) — and a rejected open now provably rewrites/deletes
+  nothing.
 
-Scope limits on the above, stated plainly (full list in `DURABILITY.md`): named crash points cover
-the SQL/MVCC WAL, catalog rename, and compaction paths — the specialty-model WALs are covered by
-reopen tests and by the same stage-and-rename fix, but not yet by crash points of their own.
-Read-only media is simulated with injected PermissionDenied rather than an actually read-only
-mount. Multi-node/replica crash behavior is out of scope here (M9).
+Scope limits on the above, stated plainly (full list in `DURABILITY.md`): named crash points
+cover the SQL/MVCC WAL, catalog rename, compaction, and — since 2026-08-21 — the two cross-model
+commit boundaries. The specialty-model WALs are still not covered by abort-style crash points of
+their own, because the failure that class exposes is a failing disk rather than power loss at an
+instruction: they gained I/O-fault points instead (eleven `*.wal_reopen` strand points,
+2026-08-21, plus `lsm.sst_write`, 2026-08-23) alongside the reopen tests and the stage-and-rename
+fix. Read-only media is simulated with injected PermissionDenied rather than an actually
+read-only mount. Multi-node/replica crash behavior is out of scope here (M9).
 
 **Defect the crash matrix found (fixed).** WAL compaction truncated the live WAL in place and then
 rewrote it from recovered state, so a crash in that window destroyed the only durable copy — the
@@ -563,6 +577,13 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       `tests/masking_ddl_wire.rs` proves the gate over real pgwire in BOTH protocols -- the
       extended one Parses and Describes before executing, and a non-standard statement has no
       AST to describe.
+      Correction (2026-08-23, SEC-2/TXN-1): the transactionality claim above was overstated until
+      now — masking DDL did not participate in the policy publish gate, so policy changes made
+      inside a transaction could publish at the wrong moment, and a savepoint-only COMMIT could
+      publish a BEGIN-era catalog over another session's committed policy. Masking DDL now marks
+      `policy_dirty` and publishes at COMMIT (`executor/masking_ddl.rs`, `executor/txn.rs`), and
+      `ROLLBACK TO SAVEPOINT` restores the security state it saved — both proven over real pgwire
+      with a crash-copy restart.
 - [ ] Define policy-aware materialized-view refresh and invocation semantics.
 - [x] Add policy alteration/introspection commands or explicitly constrain v1 to create/drop.
       **Closed 2026-08-19 (S61/N14) by shipping alteration, not by constraining v1.**
@@ -703,10 +724,35 @@ Goal: multi-model transactions remain atomic across process crash, not merely in
       documented as read-uncommitted for every non-SQL model and is **not** fixed —
       see the open items below.
 - [ ] Add a shared commit record/coordinator or another proven atomic commit design.
+      Partial (2026-08-24): built for streams (S63 slice 1, 2026-08-21) and KV (slice 2,
+      2026-08-23), and for nothing else. Enlisted writes carry the coordinating transaction id
+      (`executor/enlistment.rs`); a CRC-covered commit record lands on both WAL backends
+      (`DiskEngine`'s recovered committed set, and `TAG_XACT_COMMIT` markers in the MVCC WAL that
+      survive compaction); replay keeps a tagged record only if its transaction committed or it
+      was autocommit. `probe_crossmodel_atomicity` and `probe_crossmodel_commit_order` report 0
+      findings, and `executor/tests/test_cross_model_atomicity.rs` pins the wire behavior. The
+      other twelve models' WALs still append untagged.
 - [ ] Make prepare/commit/abort idempotent across every enlisted WAL.
+      Partial (2026-08-24): replay of the streams and KV logs is idempotent — the
+      keep-if-committed filter plus an id floor seeded from both tagged logs mean a replayed
+      record can be neither reissued nor double-applied. The other enlisted WALs have no
+      transaction records to be idempotent about.
 - [ ] Recover in-doubt transactions deterministically after crash.
+      Partial (2026-08-24): for streams and KV there is no in-doubt state by construction —
+      absence of a commit record means discard, decided from the committed set recovered with the
+      SQL WAL, and named crash points inject exactly there (`commit.after_specialty_before_sql`,
+      `crossmodel.before_commit_record`). The other twelve models have no recovery story.
 - [ ] Coordinate CDC emission, cache invalidation, specialty indexes, and policy metadata with commit.
+      Partial (2026-08-24): the policy-metadata half landed for the security catalog — masking DDL
+      publishes at COMMIT through the `policy_dirty` gate and savepoints restore security state
+      (SEC-2/TXN-1, 2026-08-23, wire-tested with restart; see the M5 correction above). CDC
+      emission (NU-107), cache invalidation, and specialty-index coordination remain
+      uncoordinated.
 - [ ] Add crash injection at every cross-model commit boundary.
+      Partial (2026-08-24): two named crash points sit at the boundary
+      (`commit.after_specialty_before_sql`, `crossmodel.before_commit_record`) and
+      `probe_crossmodel_commit_order` crashes a real child at three boundary points with 0
+      findings — covering the streams/KV enlistment path only, not every enlisted WAL's boundary.
 
 Landed ahead of the commit-record work, because each was live data loss:
 
@@ -718,8 +764,11 @@ Landed ahead of the commit-record work, because each was live data loss:
 - [x] **A ROLLBACK is durable for KV, document, graph, time series, and blob.**
       The revert writes compensating records into each store's own WAL, so a crash
       after a successful `ROLLBACK` no longer resurrects the rolled-back writes on
-      replay. Vector is **not** covered (in-memory revert only); datalog needs no
-      compensation because its WAL is never written at all.
+      replay. Vector is **not** covered (in-memory revert only). Datalog's original
+      exemption — "needs no compensation because its WAL is never written" — stopped being
+      true on 2026-08-17 (NU-013 made the WAL real), and it now checkpoints its log to the
+      restored state on rollback, gated by
+      `a_rolled_back_datalog_assert_does_not_return_after_restart`.
 - [x] **A client disconnect no longer splits a transaction.** `drop_session`
       discarded the uncommitted SQL rows and kept the non-SQL half permanently;
       it now reverts both, matching what the idle-in-transaction sweep already did.
@@ -757,11 +806,16 @@ to fail.
 
 Still open in this milestone:
 
-- No model is crash-atomic with the SQL commit. The commit order was inverted so specialty
-  logs are fsynced BEFORE the SQL WAL (NU-006), which makes the partial deterministically the
-  safe half -- an orphaned specialty write rather than a durable SQL commit referencing
-  records that were never written -- but it is not atomicity. The shared commit record and
-  recovery filter (`M8_CROSS_MODEL_ATOMICITY.md` §3.4, steps S4/S6) are still unbuilt.
+- Streams and KV are now crash-atomic with the SQL commit (2026-08-21/08-23, S63 slices 1-2);
+  the other twelve models are not. The shared commit record and recovery filter of
+  `M8_CROSS_MODEL_ATOMICITY.md` §3.4 (steps S4/S6) are built for those two — transaction-tagged
+  records, the commit record on both WAL backends, keep-if-committed replay with an id floor, and
+  checkpoint ordering plus a retention pin so routine WAL pruning cannot drop acknowledged
+  enlisted writes. For the remaining twelve the NU-006 commit order still governs: specialty logs
+  are fsynced BEFORE the SQL WAL, which makes the partial deterministically the safe half -- an
+  orphaned specialty write rather than a durable SQL commit referencing records that were never
+  written -- but it is not atomicity, and their WALs still append untagged (doc.wal is the next
+  slice; FTS is deliberately not a candidate, NU-295).
 - No isolation on specialty stores: one session reads another's uncommitted
   non-SQL writes, and two sessions writing the same key still conflict
   destructively.
@@ -1162,13 +1216,16 @@ it spreads writes across pages, so only a same-page repro reaches it.
 
 ### Open observations from the storage work, not closed
 
-- **One `SOAK FAILED` on `buffered-disk` that was never attributed.** It occurred on the first run
-  after the VACUUM change; the run's output was truncated before the `FAIL:` line was captured, so
-  the reason is unknown. Error rate was 0 and row counts matched across reopen, which narrows it to
-  coherence or checkpoint. It has not recurred in 37 subsequent runs (21 + 8 by the agent that saw
-  it, 8 more independently, including runs under concurrent build load), and base `0de4495` was 6/6
-  clean. Recorded rather than closed: "not reproducible in 37 runs" is not the same as explained,
-  and it is not claimed to be pre-existing.
+- ~~**One `SOAK FAILED` on `buffered-disk` that was never attributed.**~~ — **ATTRIBUTED AND
+  FIXED 2026-08-22.** It recurred in CI on 2026-08-19 with the failing line scrolled off the
+  visible tail, and the recurrence made it diagnosable: a B-tree leaf-split bug. `split_and_insert`
+  split at the bare midpoint while `find_child` routes key >= separator right, so stale duplicate
+  `(key, RowId)` entries left by best-effort index deletes could straddle a split — a point lookup
+  then landed on the unreachable half and returned 0 rows for a key a range scan returned. Pinned
+  by a deterministic seeded-RNG mixed-op stress test with full invariant checks
+  (`storage/btree.rs`) plus a soak discriminator; 0 of 32 CPU-pressure runs fail post-fix against
+  ~2 of 30 before it. "Not reproducible in 37 runs" was true and insufficient — the second
+  occurrence is what made it reproducible.
 - ~~**`alloc_data_page` takes L4 (`free_list_head`) before L1 (`tables`)**~~ — **FIXED
   2026-07-25.** Verified as recorded first: `reuse_free_page`'s guards drop at its return
   (`disk_engine.rs:1663`) and `tables` was taken afterwards, so L4 and L1 were never held at once
@@ -1244,16 +1301,21 @@ savepoint and isolation-level defects already recorded under M8.
       reproduces reliably and is covered by
       `buffered_update_after_growing_update_keeps_the_later_value`. Worth stating plainly: a
       failed reproduction is evidence about the attempt, not about the claim.
-- [ ] **`update_unique` has no row-identity re-check on the paged engines.** The trait default
-      (`storage/mod.rs:138-145`) is a plain `self.update()` with no expected row, and only
-      `MvccStorageAdapter` overrides it (`mvcc.rs:2304`) — where it is unnecessary, because its
-      positions are stable version indices. `DiskEngine` and `BufferedDiskEngine` inherit the
-      unchecked path. Every UPDATE touching a PK or UNIQUE column routes here
-      (`dml.rs:2049-2062`, `:2242-2263`), so the slot-recycling race that `update_if_unchanged`
-      was added to close is still open on precisely the updates where the resulting corruption is
-      a duplicate primary key. Verified by inspection; the concurrency window is real but was not
-      reproduced here. The branch's own regression test updates a non-PK column, so it exercises
-      only the protected path.
+- [x] **`update_unique` has no row-identity re-check on the paged engines.**
+      **FIXED — the premise no longer holds at HEAD (re-verified 2026-08-24).** UPDATEs touching
+      PK/UNIQUE columns now route through `update_unique_if_value_unchanged`, which both paged
+      engines override (`disk_engine.rs:2946`, `buffered_engine.rs:880`), so the identity re-check
+      runs where the finding said it was inherited. The residual race the finding pointed at —
+      concurrent UPDATEs onto a shared unique key producing duplicate primary keys — was closed at
+      the executor by the key-level `unique_gate` (`executor/unique_gate.rs`, 2026-08-16), held
+      across check-and-write and released at COMMIT/ROLLBACK, negative-tested by removing the
+      update-path gate (the UPDATE arm fails 18/20 rounds without it). The original
+      characterisation follows. The trait default (`storage/mod.rs`) was a plain `self.update()`
+      with no expected row, and only `MvccStorageAdapter` overrode it — where it was unnecessary,
+      because its positions are stable version indices. `DiskEngine` and `BufferedDiskEngine`
+      inherited the unchecked path, so the slot-recycling race that `update_if_unchanged` was
+      added to close stayed open on precisely the updates where the resulting corruption is a
+      duplicate primary key.
 - [ ] **The `insert` fast path can write into another table's page.** `DiskEngine::insert`
       snapshots `meta.last_page` under `tables.read()`, drops the lock, then latches that page;
       the `page::get_page_type(&pg) == PAGE_TYPE_DATA` guard (`disk_engine.rs:2260`) distinguishes
@@ -1283,7 +1345,29 @@ Goal: users can install, operate, upgrade, migrate, and understand the supported
 
 - [ ] Publish versioned binaries/images for supported OS/architectures with checksums and SBOM.
 - [ ] Validate Docker, systemd, and Kubernetes deployment paths.
-- [ ] Add PostgreSQL/SQLite import and export workflows with validation reports.
+      Partial (2026-08-24): the container path is validated for real — `Dockerfile` built, run,
+      and smoke-tested end to end (boots with `NUCLEUS_PASSWORD` alone, serves pgwire DDL/DML,
+      drains gracefully on SIGTERM, data survives a restart on a named volume), and writing it
+      down found four live defects, all fixed the same day: a single-node container could not
+      boot behind `--host 0.0.0.0` (cluster guards are now engagement-gated, and single-node
+      servers no longer listen on the cluster port at all), replication auth was SKIPPED when no
+      cluster token was set (now fail-closed), the deploy README's psql examples used the wrong
+      bootstrap role, and `HEALTHCHECK` is silently dropped in OCI-format images (documented with
+      the workaround). Still unvalidated: `Dockerfile.dist` (never built — it needs Linux release
+      binaries; the 2026-08-24 attempt packaged the host's macOS binary), the systemd unit (flags
+      re-verified statically against `nucleus start --help`; still never loaded by systemd), and
+      the k3s manifests (still never applied). `deploy/README.md` carries the dated verification
+      table.
+- [x] Add PostgreSQL/SQLite import and export workflows with validation reports.
+      **Landed 2026-08-24 (S98).** `nucleus import --from <postgres connection string |
+      file.sqlite | dump.sql> [--report r.json]` and `nucleus export --target postgres|sqlite
+      [--report]`: exit-1 on fatal, human summary always, JSON report optional.
+      `src/import_export/` (runner, report, type map, SQL-text/PG/SQLite readers, export) carries
+      the `ValidationReport` — per-table outcome, column mappings, dropped constraints, totals.
+      Feature-honest rather than kitchen-sink: the PostgreSQL reader needs `server`, the SQLite
+      reader `rusqlite` (both already in-tree, no new dependencies). Smoke-tested end to end: a
+      `.sql` import lands lossless with FKs preserved, then round-trips through a postgres-dialect
+      export. `docs/CLI_REFERENCE.md` regenerated with both commands.
 - [ ] Add upgrade, rollback, backup, restore, PITR, security, cluster, and incident runbooks.
 - [ ] Publish SQL syntax/types/functions and PostgreSQL deviation references.
 - [x] Publish every data model's durability, transaction, policy, and consistency semantics
@@ -1355,13 +1439,14 @@ binaries rather than by compiling under QEMU.
 
 | Path | Status |
 |---|---|
-| `Dockerfile` | Rewritten: non-root uid 10001, `HEALTHCHECK`, BuildKit cache mounts, wider `.dockerignore`. Parses (reaches `STEP 1/5`); **never built or run** — the dev machine's podman VM has a faulting overlay store that rejects *every* image, including `debian:bookworm-slim`. |
-| `Dockerfile.dist` | Multi-arch release path from prebuilt binaries. Parses (`STEP 1/13`); never built. |
-| `deploy/systemd/nucleus.service` | Written against the binary's real behaviour — `Type=simple` because there is no `sd_notify`, and `TimeoutStopSec=120` because the drain budget is a hard 2 s but the flush after it is unbounded. **Never loaded by systemd.** The hardening block is the most likely thing to block first start. |
+| `Dockerfile` | Rewritten: non-root uid 10001, `HEALTHCHECK`, BuildKit cache mounts, wider `.dockerignore`. **Built, run, and smoke-tested 2026-08-24** (podman machine raised to 6 CPU/16 GiB for the in-container release build); four findings fixed the same day — see `deploy/README.md`. Remaining: the multi-arch/QEMU path (single arm64 host). |
+| `Dockerfile.dist` | Multi-arch release path from prebuilt binaries. Parses (`STEP 1/13`); **never built** — it requires Linux release binaries, and the 2026-08-24 attempt packaged the host's macOS binary (`Exec format error`). Documented as the trap in `deploy/README.md`. |
+| `deploy/systemd/nucleus.service` | Written against the binary's real behaviour — `Type=simple` because there is no `sd_notify`, and `TimeoutStopSec=120` because the drain budget is a hard 2 s but the flush after it is unbounded. Flags and `ExecStart` re-verified statically against `nucleus start --help` on 2026-08-24; **never loaded by systemd.** The hardening block is the most likely thing to block first start. |
 | `deploy/k3s/*.yaml` | `kubeconform -strict -kubernetes-version 1.31.0`: 5 resources, 0 invalid. **Never applied.** `replicas: 1` is a hard constraint, not a default — M9 is incomplete, so a second replica would silently disagree with the first. |
 
-`deploy/README.md` carries the acceptance sequence for each path. Until those
-run, this checkbox stays unchecked.
+`deploy/README.md` carries the acceptance sequence for each path, and its verification table is
+dated 2026-08-24. The Docker path has run; until the remaining three do, this checkbox stays
+unchecked.
 
 **Runbooks** (`docs/runbooks/`): backup/restore/PITR, upgrade, rollback,
 security and incident are written, each against measured engine behaviour
@@ -1372,18 +1457,29 @@ replication ships raw SQL strings, so any cluster procedure written today would
 document a system that loses data on restart. Rolling upgrade is blocked on the
 same milestone plus two installable versions.
 
-**Still entirely open:** PostgreSQL/SQLite import-export (12.3), and the
-generated SQL syntax/type/function inventory (12.5 — `compat/pgregress/DEVIATIONS.md`
-and the new `docs/SQL_SEMANTICS.md` cover deviations and designed behaviour,
-but nothing is generated from the parser or catalog yet).
+**Still open:** the generated SQL syntax/type/function inventory (12.5 —
+`compat/pgregress/DEVIATIONS.md` and `docs/SQL_SEMANTICS.md` cover deviations and designed
+behaviour, but nothing is generated from the parser or catalog yet). PostgreSQL/SQLite
+import-export (12.3) is no longer on this list — it landed 2026-08-24, evidence at the
+checkbox above.
 
 ## Final feature-complete audit
 
 - [ ] Re-run the original audit, all current probes, full supported build matrix, and client matrix.
 - [ ] Run crash, restore, cross-model atomicity, and distributed chaos programs from clean state.
 - [ ] Reconcile every public feature claim with active evidence.
+      Partial: 93 public claims were traced to source/test/runner on 2026-08-19 (S97,
+      `docs/CLAIM_RECONCILIATION.md`), and four SDK READMEs that were still pre-implementation
+      design documents were rewritten. The 2026-08-21/24 waves changed behavior after that pass,
+      so the final audit must re-run it rather than cite it.
 - [ ] Remove or explicitly label experimental/deferred interfaces.
-- [ ] Publish the residual battle-hardening risks separately from feature-completion gaps.
+- [x] Publish the residual battle-hardening risks separately from feature-completion gaps.
+      `docs/RESIDUAL_RISKS.md` (2026-08-19, S99): twelve entries at publication — thirteen after
+      the open-enlisted-transaction WAL pin was added — each naming how it was established,
+      several pinned by characterization tests that pass today by asserting the current bad
+      behaviour. Deliberately separate from the release notes. Re-audited row-by-row against the
+      tree on 2026-08-23 (header re-verified, the streams-atomicity row rewritten, the XACK gap
+      retired when XACK landed); it is a living register, not a snapshot.
 - [ ] Mark this program complete only when every milestone exit gate is satisfied.
 
 ## Execution order

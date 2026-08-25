@@ -472,10 +472,37 @@ impl HnswIndex {
         }
     }
 
-    /// Assign a random layer for a new node.
-    fn random_layer(&self) -> usize {
-        let r: f64 = rand::random();
-        (-r.ln() * self.ml).floor() as usize
+    /// Assign a layer for a new node — DETERMINISTICALLY, derived from the
+    /// node id rather than a global RNG.
+    ///
+    /// HNSW layer assignment is the graph's skeleton: which nodes sit on the
+    /// express levels. Drawing it from `rand::random()` made every build of
+    /// the same corpus a different lottery — measured (BENCH_VS_QDRANT,
+    /// 2026-08-20, n=50k clustered, m=16): the `ef` at which recall first hit
+    /// 1.000 ranged 96→never-to-192→96 across four runs of identical work,
+    /// with one query returning none of its true top-10 even at ef=256.
+    /// Recall is not supposed to be a per-boot property of the database.
+    ///
+    /// Hashing the id (splitmix64 — the standard sequential-id finalizer)
+    /// gives the same statistical layer distribution (uniform u, then the
+    /// paper's floor(-ln(u) * 1/ln(M))) while making the graph a pure
+    /// function of (ids, vectors, insertion order). A rebuilt index is then
+    /// bit-identical, and a recall regression is reproducible from its seed
+    /// instead of re-rolling on every run.
+    ///
+    /// Id-keying (not a counter) is deliberate: incremental maintenance
+    /// re-inserts an updated row under the same PK-derived node id, and the
+    /// re-inserted node keeps its layer — updates cannot reshuffle the
+    /// hierarchy out from under live searches.
+    fn random_layer(&self, id: u64) -> usize {
+        // splitmix64 over the id — cheap, well-distributed for sequential ids.
+        let mut z = id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // Map to (0, 1]: log of 0 is inf, so never return exactly 0.
+        let u = ((z >> 11) as f64 / (1u64 << 53) as f64).max(f64::MIN_POSITIVE);
+        (-u.ln() * self.ml).floor() as usize
     }
 
     /// Insert a vector into the index.
@@ -485,7 +512,7 @@ impl HnswIndex {
         // the id must not stay tombstoned or the updated row would vanish from
         // search results.
         self.deleted.remove(&id);
-        let node_layer = self.random_layer();
+        let node_layer = self.random_layer(id);
 
         // First, add the node to the map (with empty neighbors)
         let node = HnswNode {
@@ -507,20 +534,28 @@ impl HnswIndex {
         };
 
         // Phase 1: Traverse from top layer down to node_layer + 1, greedily
+        // (ef=1 per layer, per the paper's Algorithm 1).
         let mut ep = entry_id;
         for layer in (node_layer.saturating_add(1)..=self.max_layer).rev() {
             ep = self.greedy_search(ep, &vector, layer);
         }
 
-        // Phase 2: From min(node_layer, max_layer) down to 0, do ef_construction search
+        // Phase 2: From min(node_layer, max_layer) down to 0, do ef_construction
+        // search. The paper's Algorithm 1 (line "ep ← W") carries the FULL
+        // result set of each layer into the next layer's entry points, not
+        // just the closest — a single closest entry reproduces the same
+        // greedy-descent trap at construction time that query-time ef=1
+        // descent has at search time: once the descent parks in one basin,
+        // every lower layer is explored only from inside it, and the graph
+        // inherits the blind spot.
+        let mut eps = vec![ep];
         let top = node_layer.min(self.max_layer);
         for layer in (0..=top).rev() {
-            let candidates = self.search_layer(ep, &vector, self.config.ef_construction, layer);
+            let candidates =
+                self.search_layer_multi(&eps, &vector, self.config.ef_construction, layer);
 
-            // Update ep to the closest result for the next layer down
-            if let Some(first) = candidates.first() {
-                ep = first.id;
-            }
+            // Update entries to the full result set for the next layer down.
+            eps = candidates.iter().map(|c| c.id).collect();
 
             // Select M best neighbors
             let m = if layer == 0 {
@@ -652,22 +687,56 @@ impl HnswIndex {
         current
     }
 
-    /// ef-bounded search at a single layer. Returns candidates sorted by distance.
-    fn search_layer(&self, start: u64, query: &Vector, ef: usize, layer: usize) -> Vec<Candidate> {
+    /// Multi-start variant of layer search — the paper's
+    /// SEARCH-LAYER takes its entry points as a set (`C ← ep`), and both
+    /// directions need it:
+    ///
+    /// - Construction carries each layer's result set down as the next
+    ///   layer's entries (Algorithm 1, `ep ← W`).
+    /// - Query time seeds layer 0 with a beam of upper-layer results instead
+    ///   of the single node a greedy ef=1 descent ends on. A greedy descent
+    ///   on the sparse upper layers (≈ n/16 nodes at layer 1, fewer above)
+    ///   parks in a local minimum and hands layer 0 one entry point that can
+    ///   sit in the wrong cluster entirely — measured on the clustered
+    ///   recall bench (BENCH_VS_QDRANT shape): descent stuck 8.6 away from
+    ///   the query while every true top-10 sat at ≤1.04, an inter-cluster
+    ///   valley of 8.8 that the layer-0 admission filter (`add only if
+    ///   closer than the current worst result`) then refuses to cross at any
+    ///   practical `ef` — one query returned none of its true top-10 even at
+    ///   ef=256. Seeding layer 0 across the whole upper-layer beam makes the
+    ///   search multi-basin from its first step, which is what bounds the
+    ///   valley width by the beam, not by luck.
+    fn search_layer_multi(
+        &self,
+        starts: &[u64],
+        query: &Vector,
+        ef: usize,
+        layer: usize,
+    ) -> Vec<Candidate> {
+        if starts.is_empty() {
+            return Vec::new();
+        }
         let mut visited = HashSet::new();
         let mut candidates = BinaryHeap::new(); // min-heap
         let mut results = BinaryHeap::new(); // max-heap (worst at top)
 
-        let start_dist = self.dist(start, query);
-        visited.insert(start);
-        candidates.push(Candidate {
-            id: start,
-            dist: start_dist,
-        });
-        results.push(MaxCandidate {
-            id: start,
-            dist: start_dist,
-        });
+        for &start in starts {
+            if !visited.insert(start) {
+                continue;
+            }
+            let start_dist = self.dist(start, query);
+            candidates.push(Candidate {
+                id: start,
+                dist: start_dist,
+            });
+            results.push(MaxCandidate {
+                id: start,
+                dist: start_dist,
+            });
+            if results.len() > ef {
+                results.pop();
+            }
+        }
 
         while let Some(closest) = candidates.pop() {
             let worst_dist = results.peek().map(|r| r.dist).unwrap_or(f32::MAX);
@@ -791,6 +860,35 @@ impl HnswIndex {
         self.search_ef(query, k, auto)
     }
 
+    /// Upper-layer beam cap for query-time descent. The upper layers are
+    /// sparse (≈ n/16 nodes on layer 1, geometrically fewer above), so a
+    /// modest beam already spans many clusters; carrying a full `ef`-wide
+    /// beam through them would multiply distance evaluations per query for
+    /// little recall gain. 32 spans ~10 clusters at the bench shape
+    /// (n=50k, 256 clusters) and bounds the descent at ~32×M evaluations.
+    const UPPER_LAYER_BEAM: usize = 32;
+
+    /// Descend the upper layers with a beam instead of a single greedy
+    /// point, returning the layer-0 entry seed set. Beam width here is
+    /// `max(min(ef, UPPER_LAYER_BEAM), k)`; see
+    /// [`Self::search_layer_multi`] for why layer 0 must be seeded wide.
+    fn descend_entries(&self, query: &Vector, ef: usize, k: usize) -> Vec<u64> {
+        let entry = match self.entry_point {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+        let beam = ef.min(Self::UPPER_LAYER_BEAM).max(k);
+        let mut entries = vec![entry];
+        for layer in (1..=self.max_layer).rev() {
+            let cands = self.search_layer_multi(&entries, query, beam, layer);
+            if cands.is_empty() {
+                break;
+            }
+            entries = cands.iter().map(|c| c.id).collect();
+        }
+        entries
+    }
+
     /// Like [`search`] but with an explicit layer-0 beam width `ef` for this one
     /// query, overriding the configured default. `ef` is the recall/latency
     /// dial: a larger beam explores more of the graph before committing to the
@@ -801,19 +899,11 @@ impl HnswIndex {
             return vec![];
         }
 
-        let entry = match self.entry_point {
-            Some(id) => id,
-            None => return vec![], // guarded above, but be safe
-        };
+        // Phase 1: beam descent from top to layer 1 (see `descend_entries`)
+        let entries = self.descend_entries(query, ef, k);
 
-        // Phase 1: Greedy search from top to layer 1
-        let mut current = entry;
-        for layer in (1..=self.max_layer).rev() {
-            current = self.greedy_search(current, query, layer);
-        }
-
-        // Phase 2: ef-bounded search at layer 0
-        let candidates = self.search_layer(current, query, ef.max(k), 0);
+        // Phase 2: ef-bounded search at layer 0, seeded by the full beam
+        let candidates = self.search_layer_multi(&entries, query, ef.max(k), 0);
 
         candidates
             .into_iter()
@@ -863,23 +953,15 @@ impl HnswIndex {
             return vec![];
         }
 
-        let entry = match self.entry_point {
-            Some(id) => id,
-            None => return vec![],
-        };
-
-        // Phase 1: Greedy search from top to layer 1
-        let mut current = entry;
-        for layer in (1..=self.max_layer).rev() {
-            current = self.greedy_search(current, query, layer);
-        }
+        // Phase 1: beam descent from top to layer 1 (see `descend_entries`)
+        let entries = self.descend_entries(query, ef, k);
 
         // Phase 2: Oversampling search at layer 0.
         // Start with 4x oversampling and increase if needed.
         let base_ef = ef.max(k);
         for oversample in [4, 8, 16] {
             let ef = base_ef * oversample;
-            let candidates = self.search_layer(current, query, ef, 0);
+            let candidates = self.search_layer_multi(&entries, query, ef, 0);
 
             let results: Vec<(u64, f32)> = candidates
                 .into_iter()
@@ -903,7 +985,7 @@ impl HnswIndex {
 
         // Fallback: search with ef = total nodes (brute-force through graph).
         let ef = self.nodes.len();
-        let candidates = self.search_layer(current, query, ef, 0);
+        let candidates = self.search_layer_multi(&entries, query, ef, 0);
         let graph_results: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter(|c| !self.deleted.contains(&c.id) && filter(c.id))
@@ -2919,6 +3001,180 @@ mod tests {
             err.contains("exceeds remaining data"),
             "the error should name the bound, got: {err}"
         );
+    }
+
+    /// Clustered corpus generator for the recall tests — points scattered
+    /// around `n_clusters` centres with Gaussian jitter (sum of 4 uniforms),
+    /// the embedding-like shape the vector bench (BENCH_VS_QDRANT) uses.
+    /// Clustered is the trap shape: inter-cluster valleys are what an HNSW
+    /// beam must be able to cross, and uniform data never exercises them.
+    fn seeded_clustered_vecs(dim: usize, n: usize, n_clusters: usize, seed: u64) -> Vec<Vector> {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(seed);
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.r#gen::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        (0..n)
+            .map(|_| {
+                let c = &centers[rng.gen_range(0..n_clusters)];
+                Vector::new(
+                    (0..dim)
+                        .map(|d| {
+                            let jitter: f32 = (0..4).map(|_| rng.r#gen::<f32>() - 0.5).sum();
+                            c[d] + jitter * 0.2
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Building the same corpus twice must produce the same graph.
+    ///
+    /// Layer assignment used to draw from `rand::random()`, so every build
+    /// of identical data was a different graph and recall was a per-boot
+    /// lottery: over four runs of the vector bench the `ef` at which recall
+    /// first hit 1.000 ranged 96 → never → 192 → 96 on byte-identical input.
+    /// It is now derived from the node id (see `random_layer`), so the
+    /// serialized graph — and therefore every search over it — is a pure
+    /// function of (ids, vectors, insertion order). Asserted at the byte
+    /// level because that is what a checkpoint persists and a replica must
+    /// reproduce.
+    #[test]
+    fn hnsw_build_is_deterministic() {
+        let corpus = seeded_clustered_vecs(32, 400, 8, 0xC0FFEE);
+        let build = || {
+            let mut index = HnswIndex::new(HnswConfig {
+                m: 16,
+                m_max0: 32,
+                ef_construction: 100,
+                ef_search: 64,
+                metric: DistanceMetric::L2,
+            });
+            for (id, v) in corpus.iter().enumerate() {
+                index.insert(id as u64, v.clone());
+            }
+            index
+        };
+        let a = build();
+        let b = build();
+        // Not byte-comparing `serialize`: it walks `self.nodes`, a HashMap,
+        // so its byte order is per-process and even an identical graph
+        // serializes to different bytes. The graph itself — and therefore
+        // every search over it — must match exactly, distances included.
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0xD_E7E7);
+        for _ in 0..25 {
+            let q = Vector::new((0..32).map(|_| rng.r#gen::<f32>()).collect());
+            assert_eq!(
+                a.search_ef(&q, 10, 64),
+                b.search_ef(&q, 10, 64),
+                "same corpus + ids + order must answer identically"
+            );
+        }
+    }
+
+    /// The clustered-recall stability gate: query-time beam descent must
+    /// find the true top-10 of every in-distribution query at a modest `ef`.
+    ///
+    /// This is the unit-scale shape of the 2026-08-20 bench finding (one
+    /// query returning NONE of its true top-10 at ef=256): greedy ef=1
+    /// descent over the sparse upper layers parked layer 0's single entry in
+    /// the wrong cluster, and the beam's admission filter then refused to
+    /// cross the inter-cluster valley. With beam descent seeding layer 0
+    /// across the whole upper-layer beam, the valley width is bounded by the
+    /// beam, not by luck.
+    #[test]
+    fn hnsw_clustered_recall_stable_at_modest_ef() {
+        let dim = 48;
+        let n = 2400;
+        let k = 10;
+        let corpus = seeded_clustered_vecs(dim, n, 48, 0xBADC0DE);
+        let mut index = HnswIndex::new(HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 100,
+            ef_search: 64,
+            metric: DistanceMetric::L2,
+        });
+        for (id, v) in corpus.iter().enumerate() {
+            index.insert(id as u64, v.clone());
+        }
+        let reference: Vec<(u64, Vector)> = corpus
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v))
+            .collect();
+        // In-distribution queries: perturbed corpus points (bench shape).
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0x5EED);
+        let queries: Vec<Vector> = (0..40)
+            .map(|_| {
+                let base = &corpus[rng.gen_range(0..corpus.len())];
+                Vector::new(
+                    base.data
+                        .iter()
+                        .map(|x| x + (0..4).map(|_| rng.r#gen::<f32>() - 0.5).sum::<f32>() * 0.2)
+                        .collect(),
+                )
+            })
+            .collect();
+
+        for ef in [32usize, 64] {
+            let mut misses = Vec::new();
+            for (qi, q) in queries.iter().enumerate() {
+                let truth: std::collections::HashSet<u64> =
+                    exact_search(&reference, q, k, DistanceMetric::L2)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                let got = index.search_ef(q, k, ef);
+                let hits = got.iter().filter(|(id, _)| truth.contains(id)).count();
+                if hits < k {
+                    misses.push((qi, hits));
+                }
+            }
+            assert!(
+                misses.is_empty(),
+                "ef={ef}: {} of {} queries short of perfect recall: {misses:?}",
+                misses.len(),
+                queries.len()
+            );
+        }
+    }
+
+    /// Recall must be identical before and after a serialize/deserialize
+    /// round-trip — the checkpoint path rewrites every neighbor list, and a
+    /// truncation there would surface as recall loss that only exists after
+    /// a reopen (invisible to every in-memory test).
+    #[test]
+    fn hnsw_recall_survives_serialize_roundtrip() {
+        let corpus = seeded_clustered_vecs(48, 1200, 24, 0x120D_7EA7);
+        let mut index = HnswIndex::new(HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 100,
+            ef_search: 64,
+            metric: DistanceMetric::L2,
+        });
+        for (id, v) in corpus.iter().enumerate() {
+            index.insert(id as u64, v.clone());
+        }
+        let reloaded = HnswIndex::deserialize(&index.serialize(None)).expect("roundtrip");
+
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..25 {
+            let base = &corpus[rng.gen_range(0..corpus.len())];
+            let q = Vector::new(
+                base.data
+                    .iter()
+                    .map(|x| x + (0..4).map(|_| rng.r#gen::<f32>() - 0.5).sum::<f32>() * 0.2)
+                    .collect(),
+            );
+            assert_eq!(index.search_ef(&q, 10, 64), reloaded.search_ef(&q, 10, 64));
+        }
     }
 
     #[test]

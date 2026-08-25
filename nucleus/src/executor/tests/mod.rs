@@ -82,6 +82,7 @@ mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_query;
 mod test_read_only_mode; // M10: degraded read-only write admission
 mod test_rename_table_dependents; // CAT-4: RENAME TO must rewrite FK/view/matview dependents
+mod test_replacing_engine_recovery; // replacing_mergetree engine metadata must survive a restart
 mod test_rls;
 mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
 mod test_row_locks;
