@@ -182,7 +182,10 @@ impl Executor {
         })
     }
 
-    pub(super) fn execute_show(&self, variable: Vec<ast::Ident>) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_show(
+        &self,
+        variable: Vec<ast::Ident>,
+    ) -> Result<ExecResult, ExecError> {
         let var_name = variable
             .iter()
             .map(|i| i.value.clone())
@@ -195,16 +198,17 @@ impl Executor {
             return self.execute_show_all();
         }
 
-        // Check user-set values first
+        // Check user-set values first. The value is cloned out so the
+        // settings guard is released before any await below (the executor's
+        // futures must stay Send).
         let sess = self.current_session();
-        let settings = sess.settings.read();
-        if let Some(val) = settings.get(&var_lower) {
+        let user_val = sess.settings.read().get(&var_lower).cloned();
+        if let Some(val) = user_val {
             return Ok(ExecResult::Select {
                 columns: vec![(var_name, DataType::Text)],
-                rows: vec![vec![Value::Text(val.clone())]],
+                rows: vec![vec![Value::Text(val)]],
             });
         }
-        drop(settings);
 
         // Handle special multi-word SHOW commands
         let var_upper = var_name.to_uppercase();
@@ -220,6 +224,12 @@ impl Executor {
             }
             "SUBSYSTEM_HEALTH" | "SUBSYSTEM HEALTH" => {
                 return self.show_subsystem_health();
+            }
+            "WAL_STATUS" | "WAL STATUS" => {
+                return self.show_wal_status();
+            }
+            "TRANSACTIONS" => {
+                return self.show_transactions().await;
             }
             "CACHE_STATS" | "CACHE STATS" => {
                 return self.execute_cache_stats();
@@ -702,6 +712,90 @@ impl Executor {
             columns: vec![
                 ("subsystem".into(), DataType::Text),
                 ("status".into(), DataType::Text),
+            ],
+            rows,
+        })
+    }
+
+    /// WAL/checkpoint status from the storage engine, without needing a
+    /// replication manager. This is the single-node answer to "why is the
+    /// WAL growing": the current LSN, the checkpoint horizon below which
+    /// segments are reclaimable, and the bytes actually on disk. The
+    /// cumulative bytes/syncs counters come from the engine, not the metrics
+    /// registry, so they are exact at statement time rather than up to one
+    /// sync-interval stale.
+    pub(super) fn show_wal_status(&self) -> Result<ExecResult, ExecError> {
+        let current_lsn = self.storage.current_wal_lsn();
+        let checkpoint_lsn = self.storage.wal_checkpoint_lsn();
+        let size_bytes = self.storage.wal_size_bytes();
+        let (bytes_written, syncs) = self.storage.wal_stats();
+        let pair = |k: &str, v: u64| vec![Value::Text(k.to_string()), Value::Text(v.to_string())];
+        Ok(ExecResult::Select {
+            columns: vec![
+                ("metric".into(), DataType::Text),
+                ("value".into(), DataType::Text),
+            ],
+            rows: vec![
+                pair("current_lsn", current_lsn),
+                pair("checkpoint_lsn", checkpoint_lsn),
+                pair("wal_size_bytes", size_bytes),
+                pair("wal_bytes_written_total", bytes_written),
+                pair("wal_syncs_total", syncs),
+            ],
+        })
+    }
+
+    /// Open-transaction state, one row per session with a transaction open,
+    /// oldest first. The aggregate count exists as the
+    /// `nucleus_open_transactions` gauge; this is the drill-down the incident
+    /// runbook's "abandoned BEGIN pins the GC horizon" triage needs — which
+    /// session, and how long it has been idle. There is no separate
+    /// transaction-id allocation at the executor layer to expose: the
+    /// engine's transaction identity IS the session (see `TxnState`), so
+    /// session id + idle age is the honest identifier.
+    pub(super) async fn show_transactions(&self) -> Result<ExecResult, ExecError> {
+        let now = super::session::now_millis();
+        // Snapshot (id, Arc<Session>) under the sync lock; read the tokio
+        // txn locks afterwards so the sessions map is not held across an
+        // await (same shape as the idle-in-transaction sweep).
+        let candidates: Vec<(u64, std::sync::Arc<super::session::Session>)> = self
+            .sessions
+            .read()
+            .iter()
+            .map(|(id, s)| (*id, s.clone()))
+            .collect();
+        let mut open: Vec<(u64, bool, u64)> = Vec::new();
+        for (id, session) in candidates {
+            if session.txn_state.read().await.active {
+                let executing = session.executing.load(std::sync::atomic::Ordering::Relaxed);
+                let idle_ms = now.saturating_sub(
+                    session
+                        .last_activity_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                open.push((id, executing, idle_ms));
+            }
+        }
+        // Oldest idle first: that is the transaction pinning the MVCC
+        // horizon, which is the one an operator is looking for.
+        open.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        let rows: Vec<Row> = open
+            .into_iter()
+            .map(|(id, executing, idle_ms)| {
+                vec![
+                    Value::Int64(id as i64),
+                    Value::Bool(true),
+                    Value::Bool(executing),
+                    Value::Int64(idle_ms as i64),
+                ]
+            })
+            .collect();
+        Ok(ExecResult::Select {
+            columns: vec![
+                ("session_id".into(), DataType::Int64),
+                ("transaction_active".into(), DataType::Bool),
+                ("executing".into(), DataType::Bool),
+                ("idle_ms".into(), DataType::Int64),
             ],
             rows,
         })

@@ -1501,6 +1501,20 @@ impl BufferPool {
         self.wal.as_ref().map_or(0, |w| w.current_lsn())
     }
 
+    /// The most recent checkpoint LSN — the horizon below which WAL segments
+    /// are reclaimable (`0` when no WAL is configured or the backend does not
+    /// track one).
+    pub fn wal_checkpoint_lsn(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.checkpoint_lsn())
+    }
+
+    /// Total bytes the WAL currently occupies on disk (`0` when no WAL is
+    /// configured). This is the number behind the `nucleus_wal_size_bytes`
+    /// gauge and `SHOW WAL_STATUS`.
+    pub fn wal_size_bytes(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.size_on_disk())
+    }
+
     /// Force every WAL record up to and including `lsn` to stable storage.
     pub fn wal_sync_up_to(&self, lsn: u64) -> Result<(), BufferError> {
         match self.wal.as_ref() {

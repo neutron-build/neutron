@@ -227,6 +227,12 @@ pub struct DiskGuard {
     probe_failures: AtomicU64,
     checks: AtomicU64,
     monitor_panics: AtomicU64,
+    /// Mirrors watermark transitions into the fault-subsystem health registry
+    /// ("disk" degrades/recovers) so `SHOW SUBSYSTEM_HEALTH` shows the
+    /// read-only state instead of only 53100 refusals and log lines. Same
+    /// pattern as the RSS watchdog's "memory" marking. `None` in tests that
+    /// do not care.
+    health: RwLock<Option<Arc<RwLock<crate::fault::HealthRegistry>>>>,
 }
 
 impl DiskGuard {
@@ -246,9 +252,29 @@ impl DiskGuard {
             probe_failures: AtomicU64::new(0),
             checks: AtomicU64::new(0),
             monitor_panics: AtomicU64::new(0),
+            health: RwLock::new(None),
         }
     }
 
+    /// Attach the fault-subsystem health registry (the `set_metrics`
+    /// pattern: the registry is built after storage, so it cannot be a
+    /// constructor argument without reordering startup).
+    pub fn set_health_registry(&self, health: Arc<RwLock<crate::fault::HealthRegistry>>) {
+        *self.health.write() = Some(health);
+    }
+
+    /// Mark the "disk" subsystem degraded/healthy to match a service-state
+    /// transition. `mark_degraded` is a no-op for unregistered names, so a
+    /// registry without "disk" simply never shows it.
+    fn mirror_health(&self, degraded: bool, detail: &str) {
+        if let Some(ref health) = *self.health.read() {
+            if degraded {
+                health.write().mark_degraded("disk", detail);
+            } else {
+                health.write().mark_healthy("disk");
+            }
+        }
+    }
     /// Convenience constructor using the real filesystem probe.
     pub fn with_fs_probe(
         data_dir: impl Into<PathBuf>,
@@ -395,6 +421,7 @@ impl DiskGuard {
                     .enter_read_only(DegradeReason::DiskWatermark, detail.clone())
                 {
                     tracing::error!("ALERT disk critical: entering read-only mode — {detail}");
+                    self.mirror_health(true, &detail);
                 }
             }
             DiskLevel::Warning => {
@@ -437,6 +464,7 @@ impl DiskGuard {
         }
         if self.service.resume_if(DegradeReason::DiskWatermark) {
             tracing::warn!("disk pressure cleared: resuming writes — {detail}");
+            self.mirror_health(false, detail);
         }
     }
 }
@@ -749,6 +777,49 @@ mod tests {
         probe.set_available(300 * 1024 * 1024);
         g.evaluate();
         assert!(!service.is_read_only());
+    }
+
+    /// Watermark transitions must be visible in `SHOW SUBSYSTEM_HEALTH`
+    /// ("disk"), not only in 53100 refusals: the guard mirrors its
+    /// degrade/resume into the fault health registry when one is attached.
+    #[test]
+    fn watermark_transitions_mirror_into_the_health_registry() {
+        use crate::fault::{HealthRegistry, SubsystemHealth};
+
+        let probe = FakeProbe::new(100 * GIB, 2 * GIB);
+        let (g, service) = guard(probe.clone(), marks());
+        let mut registry = HealthRegistry::new();
+        registry.register("disk");
+        let health = Arc::new(parking_lot::RwLock::new(registry));
+        g.set_health_registry(health.clone());
+
+        g.evaluate();
+        assert!(service.is_read_only());
+        assert!(
+            matches!(
+                health.read().status("disk"),
+                Some(SubsystemHealth::Degraded(_))
+            ),
+            "crossing the read-only watermark must degrade the disk health row"
+        );
+
+        // Below the resume watermark: still degraded (hysteresis).
+        probe.set_available(4 * GIB);
+        g.evaluate();
+        assert!(
+            matches!(
+                health.read().status("disk"),
+                Some(SubsystemHealth::Degraded(_))
+            ),
+            "hysteresis must keep the degraded row until the resume watermark"
+        );
+
+        probe.set_available(7 * GIB);
+        g.evaluate();
+        assert!(
+            matches!(health.read().status("disk"), Some(SubsystemHealth::Healthy)),
+            "resuming writes must restore the disk health row"
+        );
     }
 
     #[test]

@@ -4997,6 +4997,32 @@ mod tests {
 
     // ── Binary-parameter typed decoding (corruption-class regression) ──
 
+    // ── statement_timeout parsing (M11: query-time limit) ──
+    //
+    // The enforcement wrapper reads the session's `statement_timeout` through
+    // this parser before it can cancel anything, so the PostgreSQL unit
+    // conventions it promises (bare = ms; s/ms/min/h suffixes; garbage =
+    // ignore, which falls back to the server default) are pinned here.
+
+    #[test]
+    fn statement_timeout_parsing_follows_postgres_units() {
+        assert_eq!(parse_timeout_ms("250"), Some(250));
+        assert_eq!(parse_timeout_ms("'250'"), Some(250));
+        assert_eq!(parse_timeout_ms("10s"), Some(10_000));
+        assert_eq!(parse_timeout_ms("10 s"), Some(10_000));
+        assert_eq!(parse_timeout_ms("5ms"), Some(5));
+        assert_eq!(parse_timeout_ms("2min"), Some(120_000));
+        assert_eq!(parse_timeout_ms("1h"), Some(3_600_000));
+        assert_eq!(parse_timeout_ms("0"), Some(0), "0 disables the timeout");
+    }
+
+    #[test]
+    fn statement_timeout_parsing_refuses_garbage_rather_than_guessing() {
+        for bad in ["soon", "10parsecs", "-5", "1.5s", ""] {
+            assert_eq!(parse_timeout_ms(bad), None, "{bad:?} must not parse");
+        }
+    }
+
     // ── Unbounded-preallocation class (NU-385) ──
     //
     // A count read out of a message and handed to `Vec::with_capacity` reserves

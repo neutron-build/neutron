@@ -3341,6 +3341,18 @@ impl StorageEngine for DiskEngine {
         self.pool.wal_current_lsn()
     }
 
+    fn wal_checkpoint_lsn(&self) -> u64 {
+        self.pool.wal_checkpoint_lsn()
+    }
+
+    fn wal_size_bytes(&self) -> u64 {
+        self.pool.wal_size_bytes()
+    }
+
+    fn wal_stats(&self) -> (u64, u64) {
+        self.pool.wal_stats()
+    }
+
     fn log_xact_commit(&self, body: &[u8; 10]) -> Result<(), StorageError> {
         DiskEngine::log_xact_commit(self, body)
     }

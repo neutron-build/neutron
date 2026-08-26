@@ -142,6 +142,24 @@ impl HealthRegistry {
             .map(|(name, _)| name.clone())
             .collect()
     }
+
+    /// Every registered subsystem with its current status, sorted by name so
+    /// operator-facing output is deterministic.
+    ///
+    /// Consumers that report health (e.g. `SHOW SUBSYSTEM_HEALTH`) must use
+    /// this rather than a hand-kept name list: a subsystem registered and
+    /// marked degraded by its monitor but absent from a reporter's list is
+    /// invisible exactly when it matters. That shape shipped once — "memory"
+    /// was degraded by the RSS watchdog and the SHOW stayed all-healthy.
+    pub fn statuses(&self) -> Vec<(String, SubsystemHealth)> {
+        let mut all: Vec<(String, SubsystemHealth)> = self
+            .subsystems
+            .iter()
+            .map(|(name, health)| (name.clone(), health.clone()))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
 }
 
 impl Default for HealthRegistry {
@@ -573,5 +591,26 @@ mod tests {
         reg.mark_degraded("svc", "recovering");
         reg.mark_healthy("svc");
         assert_eq!(reg.status("svc"), Some(&SubsystemHealth::Healthy));
+    }
+
+    #[test]
+    fn test_statuses_enumerates_every_registered_subsystem_sorted() {
+        let mut reg = HealthRegistry::new();
+        reg.register("vector");
+        reg.register("memory");
+        reg.register("fts");
+        reg.mark_degraded("memory", "rss past threshold");
+
+        let all = reg.statuses();
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["fts", "memory", "vector"], "sorted by name");
+        assert!(matches!(
+            all.iter().find(|(n, _)| n == "memory").unwrap().1,
+            SubsystemHealth::Degraded(_)
+        ));
+        // A subsystem registered later by a new monitor appears without the
+        // reporter being rewritten — the fixed-list failure mode.
+        reg.register("disk");
+        assert!(reg.statuses().iter().any(|(n, _)| n == "disk"));
     }
 }

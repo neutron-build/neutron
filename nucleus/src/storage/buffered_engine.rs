@@ -939,6 +939,18 @@ impl StorageEngine for BufferedDiskEngine {
         self.inner.current_wal_lsn()
     }
 
+    fn wal_checkpoint_lsn(&self) -> u64 {
+        self.inner.wal_checkpoint_lsn()
+    }
+
+    fn wal_size_bytes(&self) -> u64 {
+        self.inner.wal_size_bytes()
+    }
+
+    fn wal_stats(&self) -> (u64, u64) {
+        self.inner.wal_stats()
+    }
+
     fn log_xact_commit(&self, body: &[u8; 10]) -> Result<(), StorageError> {
         self.inner.log_xact_commit(body)
     }

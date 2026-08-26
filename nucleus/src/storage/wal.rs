@@ -303,6 +303,19 @@ pub trait WalBackend: Send + Sync {
     fn retention_pin(&self) -> u64 {
         0
     }
+    /// The most recent checkpoint LSN — the horizon below which
+    /// `truncate_before` may reclaim segments. `0` for backends that do not
+    /// track a checkpoint horizon.
+    fn checkpoint_lsn(&self) -> u64 {
+        0
+    }
+    /// Total bytes the WAL currently occupies on disk (all segments plus the
+    /// active one). This is the number a disk-growth investigation wants —
+    /// `wal_stats()` bytes are cumulative-since-open and never shrink.
+    /// `0` when the backend has no on-disk footprint it can measure.
+    fn size_on_disk(&self) -> u64 {
+        0
+    }
 }
 
 /// The write-ahead log.
@@ -597,6 +610,12 @@ impl WalBackend for Wal {
     }
     fn current_lsn(&self) -> u64 {
         Wal::current_lsn(self)
+    }
+    fn size_on_disk(&self) -> u64 {
+        // The single-file WAL is never reclaimed while open, so the file's
+        // length is the on-disk footprint. Checkpoint horizon stays at the
+        // trait default (0): this backend does not track one in memory.
+        std::fs::metadata(&self.path).map_or(0, |m| m.len())
     }
 }
 
@@ -1420,6 +1439,22 @@ impl SegmentedWal {
         self.checkpoint_lsn.load(Ordering::Acquire)
     }
 
+    /// Total bytes of all segment files currently in the WAL directory —
+    /// sealed segments plus the active one. Unlike the cumulative
+    /// `bytes_written_total`, this shrinks when `truncate_before` reclaims
+    /// segments, which is what a disk-growth investigation needs to see.
+    pub fn size_on_disk(&self) -> u64 {
+        let segments = list_segments(&self.dir).unwrap_or_default();
+        segments
+            .iter()
+            .map(|seg| {
+                std::fs::metadata(segment_path(&self.dir, *seg))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
     /// Get the active segment number.
     pub fn active_segment(&self) -> u64 {
         self.active.lock().segment_number
@@ -1601,6 +1636,12 @@ impl WalBackend for SegmentedWal {
     }
     fn current_lsn(&self) -> u64 {
         SegmentedWal::current_lsn(self)
+    }
+    fn checkpoint_lsn(&self) -> u64 {
+        SegmentedWal::checkpoint_lsn(self)
+    }
+    fn size_on_disk(&self) -> u64 {
+        SegmentedWal::size_on_disk(self)
     }
     fn pin_retention(&self, lsn: u64) -> u64 {
         SegmentedWal::pin_retention(self, lsn)
@@ -2589,6 +2630,42 @@ mod tests {
 
         assert!(removed > 0, "should have removed some segments");
         assert!(segs_after < segs_before, "fewer segments after truncation");
+    }
+
+    #[test]
+    fn segmented_wal_size_on_disk_tracks_growth_and_reclaim() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let wal = SegmentedWal::open(&wal_dir, 20_000).unwrap();
+        let page = [0u8; PAGE_SIZE];
+        assert_eq!(
+            wal.size_on_disk(),
+            0,
+            "a fresh WAL with no records occupies no bytes"
+        );
+
+        for i in 0..5 {
+            wal.log_page_write(i, i as u32, &page).unwrap();
+        }
+        wal.sync().unwrap();
+        let grown = wal.size_on_disk();
+        assert!(
+            grown > 5 * PAGE_SIZE as u64 / 2,
+            "five page records must leave page-sized bytes on disk, got {grown}"
+        );
+
+        // Checkpoint + truncate reclaims the sealed segments: the on-disk
+        // footprint must shrink. (The active segment always survives.)
+        let cp_lsn = wal.log_checkpoint().unwrap();
+        wal.sync().unwrap();
+        wal.truncate_before(cp_lsn).unwrap();
+        assert!(
+            wal.size_on_disk() < grown,
+            "truncation must shrink the WAL footprint: {} -> {}",
+            grown,
+            wal.size_on_disk()
+        );
     }
 
     #[test]

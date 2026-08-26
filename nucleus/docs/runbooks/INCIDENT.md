@@ -48,6 +48,14 @@ Act: free space, do not raise the threshold. Note the resume threshold is
 higher than the trip threshold — freeing just enough to clear 3% will **not**
 resume writes; you need 6%.
 
+WAL-specific numbers without shell access to the host: `SHOW WAL_STATUS`
+reports the current LSN, the checkpoint horizon (below which segments are
+reclaimable), and the bytes actually on disk. If `checkpoint_lsn` is far
+behind `current_lsn`, checkpoints are not keeping up — a long backup
+retention pin or a broken archive is why. `CHECKPOINT` is admissible while
+the server is degraded read-only; it is one of the two SQL recovery paths
+(the other is `VACUUM`).
+
 Where the space usually went, in order:
 
 1. **An online backup pinning WAL retention.** While `BACKUP DATABASE TO` runs,
@@ -78,6 +86,13 @@ remove any version newer than it.
 
 ```bash
 curl -s http://127.0.0.1:9100/metrics | grep nucleus_open_transactions
+```
+
+For the drill-down — *which* session is pinning it, and for how long — use
+`SHOW TRANSACTIONS` (open transactions, oldest idle first):
+
+```sql
+SHOW TRANSACTIONS;   -- session_id, transaction_active, executing, idle_ms
 ```
 
 `idle_in_transaction_timeout_secs` defaults to **0, which disables it**. On any

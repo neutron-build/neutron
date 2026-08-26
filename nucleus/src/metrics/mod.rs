@@ -291,6 +291,12 @@ pub struct MetricsRegistry {
     pub buffer_pool_pages: Gauge,
     pub buffer_pool_dirty_pages: Gauge,
     pub wal_size_bytes: Gauge,
+    /// Declared but deliberately unwired. The replication manager tracks lag
+    /// in LSNs (`SHOW REPLICATION_STATUS` reports it), not bytes; feeding the
+    /// LSN number into a gauge named `_bytes` would publish a wrong unit
+    /// with a trustworthy name. Wiring this honestly needs byte-denominated
+    /// lag tracking in the replication stream, which does not exist yet —
+    /// until then `SHOW REPLICATION_STATUS` is the live lag surface.
     pub replication_lag_bytes: Gauge,
     pub open_transactions: Gauge,
     pub memory_rss_bytes: Gauge,

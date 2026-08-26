@@ -75,6 +75,7 @@ mod test_meta_persistence;
 mod test_module_wiring;
 mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
+mod test_observability; // M11: observability ledger surfaces (CHECKPOINT, WAL/txn state, health)
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
 mod test_pk_write_cost;
 mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross sessions

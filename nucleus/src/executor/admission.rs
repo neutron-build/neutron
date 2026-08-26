@@ -227,12 +227,15 @@ impl Executor {
             || cmd.starts_with("SHOW PROCEDURES")
             || cmd.starts_with("SHOW MASKING POLICIES")
             || cmd.starts_with("SHOW MEMORY")
+            || cmd.starts_with("SHOW WAL_STATUS")
+            || cmd.starts_with("SHOW TRANSACTIONS")
             || cmd.starts_with("SHOW BRANCHES")
             || cmd.starts_with("CACHE_GET ")
             || cmd.starts_with("CACHE_GET(")
             || cmd == "CACHE_STATS"
             || cmd == "CACHE_STATS()"
             || cmd == "MEMORY PRESSURE"
+            || cmd == "CHECKPOINT"
             || cmd.starts_with("FETCH SUBSCRIPTION ")
             || cmd.starts_with("UNSUBSCRIBE ");
         if admitted {

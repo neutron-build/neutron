@@ -432,6 +432,14 @@ pub struct Executor {
     subscription_manager: parking_lot::RwLock<SubscriptionManager>,
     /// Shared metrics registry for observability (Tier 1.1).
     metrics: Arc<MetricsRegistry>,
+    /// Monotonic statement id, handed out one per executed statement and
+    /// quoted in slow-query log lines so two slow statements can be told
+    /// apart in a busy log.
+    next_query_id: AtomicU64,
+    /// The most recent statement that crossed the session's
+    /// `slow_query_log_ms` threshold: `(query_id, duration_ms, statement)`.
+    /// Mirrors the WARN log line for tests and embedded introspection.
+    last_slow_query: parking_lot::Mutex<Option<(u64, f64, String)>>,
     /// Index advisor for workload-driven recommendations (Tier 1.8).
     advisor: parking_lot::RwLock<crate::advisor::IndexAdvisor>,
     /// In-memory cache tier with TTL and LRU eviction (Tier 3.6).
@@ -863,6 +871,10 @@ impl Executor {
         health.register("storage");
         health.register("graph");
         health.register("memory");
+        // Marked degraded by the disk-watermark monitor when free space
+        // crosses the read-only watermark, so the degraded state is visible
+        // in SHOW SUBSYSTEM_HEALTH rather than only in 53100 refusals.
+        health.register("disk");
 
         Self {
             self_ref: std::sync::OnceLock::new(),
@@ -921,6 +933,8 @@ impl Executor {
             #[cfg(feature = "server")]
             subscription_manager: parking_lot::RwLock::new(SubscriptionManager::new(1024)),
             metrics: Arc::new(MetricsRegistry::new()),
+            next_query_id: AtomicU64::new(0),
+            last_slow_query: parking_lot::Mutex::new(None),
             advisor: parking_lot::RwLock::new(crate::advisor::IndexAdvisor::new()),
             cache: parking_lot::RwLock::new(CacheTier::new(64 * 1024 * 1024)), // 64 MB default
             btree_indexes: DashMap::new(),
@@ -4179,15 +4193,13 @@ impl Executor {
     }
 
     /// Get the health status of all registered subsystems.
+    ///
+    /// Enumerates the registry itself (name-sorted) rather than a fixed name
+    /// list: "memory" and "disk" are registered and marked degraded by their
+    /// monitors, and a reporter that names subsystems by hand cannot see a
+    /// subsystem added after it was written.
     pub fn subsystem_health(&self) -> Vec<(String, SubsystemHealth)> {
-        let reg = self.health_registry.read();
-        let mut result = Vec::new();
-        for name in &["vector", "fts", "geo", "timeseries", "storage", "graph"] {
-            if let Some(health) = reg.status(name) {
-                result.push((name.to_string(), health.clone()));
-            }
-        }
-        result
+        self.health_registry.read().statuses()
     }
 
     /// Get a reference to the health registry.
@@ -4200,6 +4212,28 @@ impl Executor {
     /// the executor checks it before allowing write operations.
     pub fn memory_critical_flag(&self) -> &Arc<AtomicBool> {
         &self.memory_critical
+    }
+
+    /// The effective slow-query log threshold for the current session, in
+    /// milliseconds. `SET slow_query_log_ms = <n>` enables it (bare integer
+    /// milliseconds, matching `statement_timeout`'s bare-number convention);
+    /// unset or unparseable values mean disabled. Deliberately session-local:
+    /// there is no server-wide config key yet, and a session-scoped knob
+    /// cannot mis-log other sessions while that gap exists.
+    pub fn slow_query_log_ms(&self) -> u64 {
+        self.current_session()
+            .settings
+            .read()
+            .get("slow_query_log_ms")
+            .and_then(|v| v.trim_matches('\'').trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// The most recent statement that crossed the slow-query threshold:
+    /// `(query_id, duration_ms, statement_prefix)`. `None` when nothing has
+    /// crossed it (or the threshold is disabled). Mirrors the WARN log line.
+    pub fn last_slow_query(&self) -> Option<(u64, f64, String)> {
+        self.last_slow_query.lock().clone()
     }
 
     /// Opt in to refusing writes while the RSS watchdog reports critical
@@ -5914,6 +5948,20 @@ impl Executor {
             if upper == "CACHE_STATS" || upper == "CACHE_STATS()" {
                 return Ok(vec![self.execute_cache_stats()?]);
             }
+            // CHECKPOINT — flush dirty pages, write a WAL checkpoint record,
+            // and truncate reclaimed segments, via the storage engine's
+            // existing checkpoint path. Deliberately admissible while the
+            // server is degraded read-only (see `admit_extension`): reclaiming
+            // WAL segments is one of the two recovery paths out of a disk
+            // watermark, which is why the admission docs already promised
+            // this command before it existed.
+            if upper == "CHECKPOINT" || upper == "CHECKPOINT;" {
+                self.storage.checkpoint().await?;
+                return Ok(vec![ExecResult::Command {
+                    tag: "CHECKPOINT".into(),
+                    rows_affected: 0,
+                }]);
+            }
             // REFRESH MATERIALIZED VIEW <name> — re-execute the query and update cached rows.
             // BACKUP DATABASE TO '<path>' [FORCE]
             //
@@ -6418,6 +6466,14 @@ impl Executor {
             _ => QueryType::Other,
         };
         let start = std::time::Instant::now();
+        // Slow-query log bookkeeping, taken before `stmt` is moved into the
+        // dispatch match. The statement text is normalized AST output — the
+        // raw SQL string is not in scope here — and is only materialized
+        // when a threshold is configured, so the default path pays one
+        // atomic-threshold read and nothing else.
+        let query_id = self.next_query_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let slow_query_ms = self.slow_query_log_ms();
+        let statement_text = (slow_query_ms > 0).then(|| stmt.to_string());
 
         // READ COMMITTED: re-take the transaction's read snapshot at the start of
         // each data statement so it observes rows committed by other transactions
@@ -6633,7 +6689,7 @@ impl Executor {
                 self.execute_release_savepoint(&name.value).await
             }
             Statement::Set(set) => self.execute_set(set),
-            Statement::ShowVariable { variable } => self.execute_show(variable),
+            Statement::ShowVariable { variable } => self.execute_show(variable).await,
             Statement::ShowTables { .. } => self.execute_show_tables().await,
             Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
             Statement::AlterTable(alter_table) => self.execute_alter_table(alter_table).await,
@@ -6846,6 +6902,27 @@ impl Executor {
         // Record metrics: query type, duration, and row counts.
         let duration = start.elapsed().as_secs_f64();
         self.metrics.record_query(query_type, duration);
+        // Structured slow-query log: one WARN line per statement over the
+        // session's threshold, carrying the query id (so repeated offenders
+        // are countable in a busy log), duration, threshold, and a
+        // truncated statement body. Disabled unless `SET slow_query_log_ms`.
+        if slow_query_ms > 0 {
+            let duration_ms = duration * 1000.0;
+            if duration_ms >= slow_query_ms as f64 {
+                let preview = statement_text
+                    .as_deref()
+                    .map(|s| s.chars().take(200).collect::<String>())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    query_id,
+                    duration_ms = format!("{duration_ms:.1}"),
+                    threshold_ms = slow_query_ms,
+                    statement = %preview,
+                    "slow query"
+                );
+                *self.last_slow_query.lock() = Some((query_id, duration_ms, preview));
+            }
+        }
         if let Ok(ref res) = result {
             match res {
                 ExecResult::Select { rows, .. } => {

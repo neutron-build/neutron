@@ -42,6 +42,9 @@ sole statement they work; inside a multi-statement batch they fail at parse
 | `CREATE MASKING POLICY` / `DROP MASKING POLICY` / `SHOW MASKING POLICIES` | Superuser-only value redaction |
 | `SHOW MEMORY` / `MEMORY PRESSURE` | Allocator introspection / pressure trigger |
 | `SHOW TABLE STATS <t>` / `SHOW MODELS` / `SHOW PROCEDURES` / `SHOW BRANCHES` | Introspection |
+| `SHOW TRANSACTIONS` | Open-transaction state per session (session id, idle age) — the abandoned-BEGIN drill-down |
+| `SHOW WAL_STATUS` | Current/checkpoint LSN, on-disk WAL bytes, cumulative WAL counters (single node) |
+| `CHECKPOINT` | Flush dirty pages + checkpoint record + truncate reclaimed WAL segments; admissible while degraded read-only |
 | `CREATE MODEL` / `DROP MODEL` | Registered-model inference (`PREDICT`, `EMBED`, `CLASSIFY`) |
 | `CREATE [OR REPLACE] PROCEDURE` / `DROP PROCEDURE` | Stored procedures |
 | `REFRESH MATERIALIZED VIEW` / `DROP MATERIALIZED VIEW` | Materialized views |
@@ -51,6 +54,7 @@ sole statement they work; inside a multi-statement batch they fail at parse
 `SHOW SUBSYSTEM_HEALTH` (tri-state per-subsystem status — see
 `runbooks/07-incident.md`), `SHOW POOL_STATUS`, `SHOW BUFFER_POOL`, `SHOW METRICS`,
 `SHOW CACHE_STATS`, `SHOW CLUSTER_STATUS`, `SHOW REPLICATION_STATUS`,
+`SHOW WAL_STATUS`, `SHOW TRANSACTIONS`,
 `SHOW INDEX_RECOMMENDATIONS` (`src/executor/admin.rs:209-231`).
 
 `CREATE EXTENSION` / `DROP EXTENSION` are parsed and tracked as **catalog no-ops**

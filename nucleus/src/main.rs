@@ -1302,6 +1302,8 @@ async fn cmd_start(cfg: StartConfig) {
             marks,
             executor.service().clone(),
         ));
+        // Mirror watermark transitions into SHOW SUBSYSTEM_HEALTH ("disk").
+        guard.set_health_registry(executor.health_registry().clone());
         // Evaluate once synchronously: starting up on an already-full disk
         // must come up read-only, not accept writes until the first tick.
         let first = guard.evaluate();
@@ -2400,6 +2402,11 @@ async fn cmd_start(cfg: StartConfig) {
                     }
                     prev_wal_bytes = wal_bytes;
                     prev_wal_syncs = wal_syncs;
+                    // Current on-disk WAL footprint. The gauge existed but was
+                    // never set, so the incident runbook's first-three-commands
+                    // grep for it always returned 0 — WAL growth was invisible
+                    // until someone listed the directory by hand.
+                    metrics_sync.wal_size_bytes.set(bp.wal_size_bytes() as i64);
                 }
                 // Connection pool idle count
                 let pool_stats = pool_sync.stats().await;

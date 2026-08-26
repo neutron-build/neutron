@@ -765,6 +765,22 @@ pub trait StorageEngine: Send + Sync {
     fn current_wal_lsn(&self) -> u64 {
         0
     }
+    /// The most recent checkpoint LSN — the horizon below which WAL segments
+    /// are reclaimable (`0` when the engine has no WAL or tracks no horizon).
+    /// Operator surface for `SHOW WAL_STATUS`; not used for reclaim decisions.
+    fn wal_checkpoint_lsn(&self) -> u64 {
+        0
+    }
+    /// Total bytes the WAL currently occupies on disk (`0` when the engine
+    /// has no WAL). Feeds the `nucleus_wal_size_bytes` gauge.
+    fn wal_size_bytes(&self) -> u64 {
+        0
+    }
+    /// Cumulative WAL statistics for this engine: `(bytes_written, syncs)`
+    /// since the engine was opened. Engines without a WAL return `(0, 0)`.
+    fn wal_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
     /// Begin an explicit transaction. Engines that support MVCC will take a
     /// snapshot; simple engines do nothing.
     async fn begin_txn(&self) -> Result<(), StorageError> {
