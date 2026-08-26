@@ -36,6 +36,20 @@ not upgrade a row without running the command in the last column.
    (podman's default): `docker inspect .State.Health.Status` returns nothing.
    Build with `--format docker` if you rely on Docker health status.
 
+Multi-node containers (2026-08-25): the engagement gate above models only the
+OUTBOUND direction (`--join`/`--replicate-from`). The node others join — the
+seed, first up, joining nothing — also has to listen, or every `--join` against
+it fails and the joiners silently serve standalone. A node declares the inbound
+role explicitly; it stays OFF by default so a single-node container still opens
+no cluster port:
+
+- `--cluster-listen` (or `NUCLEUS_CLUSTER_LISTEN=1`): listen on the cluster
+  port (`--cluster-port`, default 5433) so other nodes can `--join` this one.
+- A non-loopback listener still requires `NUCLEUS_CLUSTER_TOKEN` (same refusal
+  as the outbound guards); loopback is exempt for local development.
+- Flag/env naming is provisional — escalate before engraving it in orchestration
+  tooling.
+
 Why the container was not built before 2026-08-24: the development machine's
 podman VM was faulting in July (overlay mount I/O errors — since healed), and in
 August the build was OOM-killed at the final crate: the machine's default 4 GiB

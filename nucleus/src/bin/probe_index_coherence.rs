@@ -603,7 +603,7 @@ fn main_impl() {
     println!("mutations exercised: {total_ops}");
     println!("divergences        : {}", rep.divergences);
     if rep.divergences == 0 {
-        println!("\nNo index-coherence divergences vs brute-force reference. 🎯");
+        println!("\nNo index-coherence divergences vs brute-force reference.");
     } else {
         println!("\nReproduce a run with: --seed {seed} --iterations {iterations} --ops {ops}");
         std::process::exit(1);

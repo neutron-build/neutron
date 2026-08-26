@@ -357,7 +357,7 @@ fn main_impl() {
     println!("KV divergences     : {divergences}");
     println!("PANICS             : {panics}");
     if divergences == 0 && panics == 0 {
-        println!("\nNo KV divergences, no panics vs reference. 🎯");
+        println!("\nNo KV divergences, no panics vs reference.");
     } else {
         std::process::exit(1);
     }

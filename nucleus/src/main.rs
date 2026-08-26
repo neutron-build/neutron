@@ -83,6 +83,14 @@ enum Commands {
         #[arg(long)]
         join: Option<String>,
 
+        /// Listen on the cluster port so other nodes can --join THIS node,
+        /// even when this node itself joins nothing (the seed node of a
+        /// cluster). Off by default: a single-node server opens no cluster
+        /// port. Also settable via NUCLEUS_CLUSTER_LISTEN=1. Non-loopback
+        /// listeners still require NUCLEUS_CLUSTER_TOKEN.
+        #[arg(long)]
+        cluster_listen: bool,
+
         /// Region tag for geo-distributed deployments (e.g., us-east, eu-west).
         #[arg(long)]
         region: Option<String>,
@@ -412,6 +420,7 @@ struct StartConfig {
     config: Option<PathBuf>,
     memory: bool,
     join: Option<String>,
+    cluster_listen: bool,
     region: Option<String>,
     replicate_from: Option<String>,
     replication_port: u16,
@@ -446,6 +455,7 @@ async fn main() {
             config,
             memory,
             join,
+            cluster_listen,
             region,
             replicate_from,
             replication_port,
@@ -470,6 +480,7 @@ async fn main() {
                 config,
                 memory,
                 join,
+                cluster_listen,
                 region,
                 replicate_from,
                 replication_port,
@@ -566,6 +577,7 @@ async fn main() {
                 config: None,
                 memory: false,
                 join: None,
+                cluster_listen: false,
                 region: None,
                 replicate_from: None,
                 replication_port: 5434,
@@ -599,6 +611,7 @@ async fn cmd_start(cfg: StartConfig) {
         data,
         memory,
         join,
+        cluster_listen,
         region,
         replicate_from,
         replication_port,
@@ -840,14 +853,18 @@ async fn cmd_start(cfg: StartConfig) {
     let allow_insecure_cluster = env_var_truthy("NUCLEUS_ALLOW_INSECURE_CLUSTER");
     let allow_insecure_replication = env_var_truthy("NUCLEUS_ALLOW_INSECURE_REPLICATION");
 
-    // Cluster/replication transports only engage when this node actually
-    // joins or replicates. A single-node server bound non-loopback (i.e.
-    // every containerized deployment) must not be refused for lacking
-    // cluster tokens — and per the listener below, must not listen on the
-    // cluster ports at all: an unauthenticated cluster port on every
+    // Cluster/replication transports engage when this node actually joins or
+    // replicates (OUTBOUND), or when the operator declares the inbound role:
+    // a seed node others --join must listen, or cluster formation degrades
+    // to N independent servers (every join fails, every joiner silently
+    // serves standalone). A single-node server bound non-loopback (i.e.
+    // every containerized deployment) still must not be refused for lacking
+    // cluster tokens — and per the listener below, still must not listen on
+    // the cluster ports at all: an unauthenticated cluster port on every
     // containerized server was the real exposure this guard exists for.
+    let cluster_listen = cluster_listen || env_var_truthy("NUCLEUS_CLUSTER_LISTEN");
     let cluster_engaged = join.is_some() || replicate_from.is_some();
-    if cluster_engaged
+    if (cluster_engaged || cluster_listen)
         && !is_loopback_host(&host)
         && cluster_token.is_none()
         && !allow_insecure_cluster
@@ -1482,10 +1499,18 @@ async fn cmd_start(cfg: StartConfig) {
         tracing::info!("Internal node-to-node TLS is enabled (cluster + replication)");
     }
 
-    // Set up cluster transport — listen ONLY when clustering is engaged
-    // (--join / --replicate-from / config-driven replica). A single-node
-    // server gains nothing from an open cluster port, and an unauthenticated
-    // one is a standing hazard in container deployments.
+    // Set up cluster transport — listen when clustering is engaged
+    // (--join / --replicate-from / config-driven replica: the OUTBOUND role,
+    // which also needs to be reachable back) or when this node explicitly
+    // declares the inbound role (--cluster-listen / NUCLEUS_CLUSTER_LISTEN:
+    // the seed node others join). A single-node server gains nothing from an
+    // open cluster port, and an unauthenticated one is a standing hazard in
+    // container deployments — so with neither, it does not listen.
+    let cluster_listen_on = nucleus::transport::should_listen_cluster(
+        join.is_some(),
+        replicate_from.is_some(),
+        cluster_listen,
+    );
     let cluster_listen = format!("{}:{}", host, cluster_port);
     let transport = Arc::new(TcpTransport::new_with_auth_and_tls(
         node_id,
@@ -1493,7 +1518,7 @@ async fn cmd_start(cfg: StartConfig) {
         cluster_token.clone(),
         internal_tls.clone(),
     ));
-    if cluster_engaged {
+    if cluster_listen_on {
         match transport.listen().await {
             Ok(addr) => tracing::info!("Cluster transport on {addr} (node_id={node_id:#x})"),
             Err(e) => tracing::warn!("Failed to bind cluster port {cluster_listen}: {e}"),
@@ -1878,65 +1903,15 @@ async fn cmd_start(cfg: StartConfig) {
                             if let Some(ref engine) = disk_for_workers {
                                 horizon = engine.current_wal_lsn();
                             }
-                            if let Err(e) = executor_for_workers.checkpoint_cdc_wal() {
-                                tracing::warn!("CDC WAL checkpoint failed: {e}");
-                            }
-                            if let Err(e) = executor_for_workers.checkpoint_streams_wal() {
-                                tracing::warn!("Streams WAL checkpoint failed: {e}");
-                            }
-                            if let Err(e) = executor_for_workers.kv_store().checkpoint() {
-                                tracing::warn!("KV WAL checkpoint failed: {e}");
-                            }
-                            if let Err(e) = executor_for_workers.blob_store().read().checkpoint() {
-                                tracing::warn!("Blob WAL checkpoint failed: {e}");
-                            }
-                            if let Err(e) =
-                                executor_for_workers.graph_store().read().checkpoint_wal()
-                            {
-                                tracing::warn!("Graph WAL checkpoint failed: {e}");
-                            }
-                            if let Err(e) = executor_for_workers.doc_store().read().checkpoint() {
-                                tracing::warn!("Document WAL checkpoint failed: {e}");
-                            }
-                            // FTS is checkpoint + tail (NU-014): write
-                            // `fts_index.json` first, which then truncates the tail
-                            // it absorbed, and compact whatever is left. Order
-                            // matters — a crash between them leaves a tail that is
-                            // a subset of the checkpoint, which replays
-                            // idempotently.
-                            executor_for_workers.save_fts_index();
-                            if let Err(e) = executor_for_workers.fts_index().read().checkpoint_wal()
-                            {
-                                tracing::warn!("FTS WAL checkpoint failed: {e}");
-                            }
-                            // Vector index WAL: HNSW inserts/deletes log one record
-                            // each; snapshot every live HNSW index (IvfFlat rebuilds
-                            // from base-table data, never logged here).
-                            if let Err(e) = executor_for_workers.checkpoint_vector_wal() {
-                                tracing::warn!("Vector WAL checkpoint failed: {e}");
-                            }
-                            // TimeSeries retention (T1.3): purge points older than the
-                            // configured TS_RETENTION policy BEFORE snapshotting, so the
-                            // WAL is truncated to the retained state and old data does
-                            // not grow the store forever. No-op when no policy is set.
-                            executor_for_workers.ts_store().write().apply_retention();
-                            // TimeSeries WAL: every insert appends a record; snapshot
-                            // truncates it to the current series state.
-                            executor_for_workers.ts_store().read().snapshot();
-                            // Columnar WAL: every append/create logs a record; snapshot
-                            // truncates it to the current table state.
-                            if let Err(e) =
-                                executor_for_workers.columnar_store().write().checkpoint()
-                            {
-                                tracing::warn!("Columnar WAL checkpoint failed: {e}");
-                            }
-                            // Per-table storage engines (WITH (engine='columnar'
-                            // |'mergetree'|'lsm')): distinct from the columnar
-                            // MODEL checkpointed just above. Each has its own WAL
-                            // that otherwise grows unbounded — see
-                            // `checkpoint_table_engines`'s doc comment.
-                            executor_for_workers.checkpoint_table_engines().await;
-                            executor_for_workers.note_specialty_checkpoint_pass(horizon);
+                            // One full specialty pass. The horizon comes back
+                            // at the last pass that folded EVERY tagged log
+                            // (streams/kv/doc/graph): a tagged checkpoint that
+                            // failed leaves its COMMITTED records unfolded, so
+                            // advancing here would let the SQL prune below
+                            // launder their vouching COMMIT records (S7).
+                            horizon = executor_for_workers
+                                .run_specialty_checkpoint_pass(horizon)
+                                .await;
                         }
                         // SQL disk engine: flush dirty pages, checkpoint the
                         // WAL, and prune fully-checkpointed segments — held at

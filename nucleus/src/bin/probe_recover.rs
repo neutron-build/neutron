@@ -380,7 +380,7 @@ fn main_impl() {
     println!("recovery round-trips: {total}");
     println!("divergences         : {divergences}");
     if divergences == 0 {
-        println!("\nAll committed state recovered exactly; rollbacks honored. 🎯");
+        println!("\nAll committed state recovered exactly; rollbacks honored.");
     } else {
         std::process::exit(1);
     }

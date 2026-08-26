@@ -977,6 +977,28 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::tls::InternalTlsConfig;
 
+/// Whether this node should LISTEN on its cluster port (the inbound role).
+///
+/// Cluster engagement (`--join` / `--replicate-from`) models only the
+/// OUTBOUND direction: a node that joins someone must also be reachable for
+/// the reverse direction. The inbound role — being the node others join —
+/// was unmodeled, so a seed node (first up, joins nothing) never listened,
+/// every `--join` against it failed, and those joiners silently served
+/// standalone: cluster formation degraded to N independent servers.
+///
+/// `declared_inbound` is the operator saying "this node is a cluster member
+/// others reach" (`--cluster-listen` / `NUCLEUS_CLUSTER_LISTEN=1`). It
+/// defaults OFF on purpose: a bare single-node server — including every
+/// containerized deployment bound to 0.0.0.0 — must not open an
+/// (unauthenticated) cluster port it has no use for.
+pub fn should_listen_cluster(
+    joins_outbound: bool,
+    replicates_outbound: bool,
+    declared_inbound: bool,
+) -> bool {
+    joins_outbound || replicates_outbound || declared_inbound
+}
+
 /// Framed TCP transport for cluster communication.
 ///
 /// Messages are length-prefixed (4-byte big-endian length + payload).
@@ -2156,6 +2178,75 @@ mod tests {
         );
         t1.shutdown().await;
         t2.shutdown().await;
+    }
+
+    #[test]
+    fn cluster_listen_gate_covers_both_roles() {
+        // The regression this pins: engagement (outbound only) used to be the
+        // whole gate, so a seed node — first up, joins nothing — never
+        // listened and every --join against it failed while the joiner
+        // silently served standalone.
+        assert!(
+            should_listen_cluster(true, false, false),
+            "a joiner must listen (reverse direction reaches it)"
+        );
+        assert!(
+            should_listen_cluster(false, true, false),
+            "a replica must listen (the primary streams to it)"
+        );
+        assert!(
+            should_listen_cluster(false, false, true),
+            "a node that explicitly declares the inbound role (seed) must listen"
+        );
+        // The deploy-fix contract the default preserves: a bare single-node
+        // server — every containerized deployment — opens no cluster port.
+        assert!(
+            !should_listen_cluster(false, false, false),
+            "a single-node server must not open a cluster port"
+        );
+    }
+
+    // The seed half of finding 3, at transport level: a node that only
+    // LISTENS (joins nothing) must complete the join handshake with a node
+    // that only CONNECTS. main.rs wires `should_listen_cluster` to
+    // `transport.listen()`; this proves the listening seed accepts the join
+    // the way the joiner in main.rs sends it.
+    #[tokio::test]
+    async fn seed_that_only_listens_accepts_a_join() {
+        // The seed: no --join, no --replicate-from; it listens because the
+        // operator declared the inbound role.
+        let seed = TcpTransport::new(1, "127.0.0.1:0");
+        assert!(should_listen_cluster(false, false, true));
+        let addr = seed.listen().await.unwrap();
+
+        // The joiner: exactly the handshake main.rs performs.
+        let joiner = TcpTransport::new(2, "127.0.0.1:0");
+        joiner.register_peer(1, &addr.to_string()).await;
+        joiner
+            .send_message(
+                1,
+                Message::JoinCluster {
+                    node_id: 2,
+                    address: addr.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), seed.recv())
+            .await
+            .expect("a listening seed must receive the join request")
+            .expect("the seed's inbox must yield the envelope");
+        assert_eq!(
+            received.message,
+            Message::JoinCluster {
+                node_id: 2,
+                address: addr.to_string(),
+            },
+            "the join request a seed node receives from a --join node"
+        );
+        joiner.shutdown().await;
+        seed.shutdown().await;
     }
 
     #[tokio::test]

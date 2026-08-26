@@ -175,6 +175,14 @@ impl StreamsWal {
         self.fail_appends
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Arm the one-shot reopen fault in [`StreamsWal::checkpoint`], so the
+    /// next checkpoint fails the way a transient I/O error on the reopen
+    /// does. Test-only.
+    pub fn fail_next_checkpoint_reopen(&self) {
+        self.fail_reopen_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl StreamsWal {

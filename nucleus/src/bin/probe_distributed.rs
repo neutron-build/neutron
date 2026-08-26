@@ -691,7 +691,7 @@ fn main_impl() {
     println!("cluster runs : {total_runs}");
     println!("violations   : {violations}");
     if violations == 0 {
-        println!("\nAll Raft safety invariants held across every fault schedule. 🎯");
+        println!("\nAll Raft safety invariants held across every fault schedule.");
     } else {
         std::process::exit(1);
     }

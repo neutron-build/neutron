@@ -469,7 +469,7 @@ fn main_impl() {
     );
     if findings == 0 {
         println!(
-            "\nEvery SIGKILL recovered an exact committed prefix; no gaps/over-recovery/corruption. 🎯"
+            "\nEvery SIGKILL recovered an exact committed prefix; no gaps/over-recovery/corruption."
         );
     } else {
         std::process::exit(1);

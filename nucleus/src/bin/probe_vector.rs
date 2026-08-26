@@ -332,7 +332,7 @@ fn main_impl() {
     println!("knn divergences    : {knn_div}");
     divergences += knn_div;
     if divergences == 0 {
-        println!("\nNo vector divergences vs brute force. 🎯");
+        println!("\nNo vector divergences vs brute force.");
     } else {
         std::process::exit(1);
     }

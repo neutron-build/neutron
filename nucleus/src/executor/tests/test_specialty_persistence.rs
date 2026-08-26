@@ -573,3 +573,135 @@ async fn failed_insert_wal_append_leaves_no_state_a_checkpoint_can_launder() {
         "only the acknowledged insert may be live after the checkpoint + restart"
     );
 }
+
+// ── S7 horizon vs a partially-failed specialty pass ─────────────────────────
+//
+// The retention horizon must only advance when the TAGGED logs' checkpoints
+// (streams, kv, doc, graph) ALL succeeded in the pass: a tagged log that
+// failed still holds COMMITTED records whose vouching SQL COMMIT records sit
+// below the fresh horizon. Advancing anyway lets checkpoint_retaining prune
+// those COMMIT records, and after a crash the S6 recovery filter discards
+// the acknowledged writes as uncommitted.
+
+/// Open a durable executor whose DiskEngine handle stays reachable, with 1 MB
+/// WAL segments so SQL traffic rotates sealed segments (truncation can only
+/// be observed through SEALED segments it deletes).
+async fn open_executor_with_engine(dir: &Path) -> (Executor, Arc<DiskEngine>) {
+    let catalog_path = dir.join("catalog.json");
+    let db_path = dir.join("nucleus.db");
+    let catalog = Arc::new(Catalog::new());
+
+    let cp = CatalogPersistence::new(&catalog_path);
+    cp.load_catalog(&catalog).await.ok();
+
+    let engine = Arc::new(
+        DiskEngine::open_segmented_with_sync(
+            &db_path,
+            catalog.clone(),
+            64,
+            1,
+            crate::storage::wal::SyncMode::Fsync,
+        )
+        .unwrap(),
+    );
+    let storage: Arc<dyn StorageEngine> = engine.clone();
+
+    let ex = Executor::new_with_persistence(catalog, storage, Some(catalog_path), Some(dir));
+    ex.load_meta().await;
+    ex.rebuild_specialty_indexes().await;
+    (ex, engine)
+}
+
+/// LSNs still present in the executor's SQL WAL directory, ascending.
+/// (`nucleus.db`.with_extension("wal.d") is `nucleus.wal.d`.)
+fn surviving_sql_wal_lsns(dir: &Path) -> Vec<u64> {
+    let wal_dir = dir.join("nucleus.db").with_extension("wal.d");
+    let mut lsns = Vec::new();
+    for entry in std::fs::read_dir(&wal_dir).unwrap_or_else(|e| panic!("read_dir {wal_dir:?}: {e}"))
+    {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("log") {
+            for r in crate::storage::wal::read_wal_records(&path).unwrap() {
+                lsns.push(r.lsn);
+            }
+        }
+    }
+    lsns.sort_unstable();
+    lsns
+}
+
+#[tokio::test]
+async fn specialty_horizon_holds_when_a_tagged_checkpoint_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, engine) = open_executor_with_engine(dir.path()).await;
+    exec(&ex, "CREATE TABLE t (id INT)").await;
+
+    // Enough SQL traffic + flushes to advance the WAL well past one segment.
+    for i in 0..120 {
+        exec(&ex, &format!("INSERT INTO t VALUES ({i})")).await;
+        if i % 4 == 3 {
+            engine.flush().unwrap();
+        }
+    }
+
+    // Pass 1: clean — the horizon advances to the current LSN, and SQL
+    // pruning below it proceeds.
+    let h1 = engine.current_wal_lsn();
+    let effective = ex.run_specialty_checkpoint_pass(h1).await;
+    assert_eq!(effective, h1, "a clean pass advances the horizon");
+    assert_eq!(ex.specialty_checkpoint_horizon(), h1);
+    engine.checkpoint_retaining(h1).unwrap();
+
+    // Traffic above the horizon: its COMMIT records are the ones a failed
+    // tagged log's recovery still needs.
+    for i in 1000..1120 {
+        exec(&ex, &format!("INSERT INTO t VALUES ({i})")).await;
+        if i % 4 == 3 {
+            engine.flush().unwrap();
+        }
+    }
+    let h2 = engine.current_wal_lsn();
+    assert!(h2 > h1);
+
+    // Pass 2 with a TAGGED log's checkpoint faulted (streams, via the
+    // established one-shot reopen fault).
+    ex.streams_wal()
+        .expect("a durable executor opened a streams WAL")
+        .fail_next_checkpoint_reopen();
+    let effective2 = ex.run_specialty_checkpoint_pass(h2).await;
+    assert_eq!(
+        effective2, h1,
+        "a pass with a failed tagged checkpoint must NOT advance the horizon"
+    );
+    assert_eq!(ex.specialty_checkpoint_horizon(), h1);
+
+    // The SQL side prunes only below the held horizon: every record at or
+    // after h1 (the would-be-pruned COMMIT records vouching for the unfolded
+    // tagged writes) must survive.
+    engine.checkpoint_retaining(effective2).unwrap();
+    let surviving: std::collections::HashSet<u64> =
+        surviving_sql_wal_lsns(dir.path()).into_iter().collect();
+    let pruned: Vec<u64> = (h1..=h2).filter(|l| !surviving.contains(l)).collect();
+    assert!(
+        pruned.is_empty(),
+        "SQL WAL records in [h1, h2] were pruned while the tagged log held \
+         unfolded records ({} pruned, first: {:?})",
+        pruned.len(),
+        pruned.first(),
+    );
+
+    // Pass 3: fault consumed (one-shot), everything succeeds — the horizon
+    // advances and pruning below it proceeds.
+    let h3 = engine.current_wal_lsn();
+    let effective3 = ex.run_specialty_checkpoint_pass(h3).await;
+    assert_eq!(effective3, h3, "a clean pass after the fault advances");
+    engine.checkpoint_retaining(h3).unwrap();
+    let after: std::collections::HashSet<u64> =
+        surviving_sql_wal_lsns(dir.path()).into_iter().collect();
+    assert!(
+        after.len() < surviving.len(),
+        "once the horizon advances, pruning below it must proceed ({} -> {})",
+        surviving.len(),
+        after.len(),
+    );
+}

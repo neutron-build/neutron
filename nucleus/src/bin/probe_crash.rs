@@ -344,7 +344,7 @@ const TEXTS: &[&str] = &[
     "''",
     "'a'",
     "'hello world'",
-    "'日本語🎉'",
+    "'日本語'",
     "'with '' quote'",
     "'%_pat%'",
     "'[1,2,3]'",
@@ -539,7 +539,7 @@ fn main_impl() {
     println!("iterations         : {iterations}");
     println!("distinct panics    : {panics}");
     if panics == 0 {
-        println!("\nNo panics across all functions. 🎯");
+        println!("\nNo panics across all functions.");
     } else {
         std::process::exit(1);
     }

@@ -1519,17 +1519,25 @@ impl BufferPool {
     }
 
     /// Hold WAL segments carrying records at or after `lsn` against
-    /// checkpoint truncation (online backup). Returns `false` when the
-    /// backend does not support pinning.
-    pub fn wal_pin_retention(&self, lsn: u64) -> bool {
-        self.wal.as_ref().is_some_and(|w| w.pin_retention(lsn))
+    /// checkpoint truncation (online backup). Returns the owner token to pass
+    /// to [`BufferPool::wal_unpin_retention`]; `0` when the backend does not
+    /// support pinning.
+    pub fn wal_pin_retention(&self, lsn: u64) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.pin_retention(lsn))
     }
 
-    /// Release a WAL retention pin.
-    pub fn wal_unpin_retention(&self) {
+    /// Release the WAL retention pin owned by `token` (other live pins stay
+    /// held).
+    pub fn wal_unpin_retention(&self, token: u64) {
         if let Some(wal) = self.wal.as_ref() {
-            wal.unpin_retention();
+            wal.unpin_retention(token);
         }
+    }
+
+    /// The effective WAL retention floor across all live owner pins (`0`
+    /// when none). Test/introspection hook.
+    pub fn wal_retention_pin(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.retention_pin())
     }
 
     /// Truncate WAL segments before the given LSN to reclaim disk space.

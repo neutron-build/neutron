@@ -224,6 +224,13 @@ pub struct DiskEngine {
     /// the directory save is serialized — the WAL force itself stays
     /// concurrent so group commit keeps batching fsyncs.
     dir_save_lock: parking_lot::Mutex<()>,
+    /// Owner token of the online backup's retention pin (`0` = no backup
+    /// window open). Stashed by `backup_begin` and consumed by
+    /// `backup_release` so the release clears exactly the pin the backup
+    /// took — never one held by a concurrent `checkpoint_retaining` (the
+    /// two used to share one slot, and whichever released first erased the
+    /// other's floor).
+    backup_retention_token: parking_lot::Mutex<u64>,
 }
 
 /// The storage session id of the current execution context (0 = default /
@@ -830,6 +837,7 @@ impl DiskEngine {
             pending_enlistment: parking_lot::RwLock::new(std::collections::HashMap::new()),
             committed_xacts: std::sync::Arc::new(committed_xacts),
             projected_scans: AtomicU64::new(0),
+            backup_retention_token: parking_lot::Mutex::new(0),
         };
 
         // For existing databases, load the table directory from the (potentially recovered) meta page
@@ -1112,11 +1120,20 @@ impl DiskEngine {
     /// writes — only truncation is held back, so the cost of a long-open
     /// enlisted transaction is bounded WAL growth (the idle-in-transaction
     /// sweep closes it), not a durability regression.
+    ///
+    /// The pin taken for `retain_lsn` is token-scoped: it is released at the
+    /// end of THIS call and clears only its own floor, so a concurrent online
+    /// backup window (`backup_begin`..`backup_release`) keeps its pin across
+    /// any number of these checkpoints.
     pub fn checkpoint_retaining(&self, retain_lsn: u64) -> Result<(), StorageError> {
-        let pinned = retain_lsn >= 1 && self.pool.wal_pin_retention(retain_lsn);
+        let token = if retain_lsn >= 1 {
+            self.pool.wal_pin_retention(retain_lsn)
+        } else {
+            0
+        };
         let result = self.checkpoint();
-        if pinned {
-            self.pool.wal_unpin_retention();
+        if token != 0 {
+            self.pool.wal_unpin_retention(token);
         }
         result
     }
@@ -2318,9 +2335,13 @@ impl crate::backup::BackupCoordinator for DiskEngine {
     fn backup_begin(&self) -> std::io::Result<u64> {
         // Pin BEFORE the checkpoint: the checkpoint's own truncate_before must
         // already be clamped when it runs, or it can reclaim the window's
-        // first records before the pin exists.
+        // first records before the pin exists. The token is stashed so
+        // `backup_release` releases exactly this pin — a checkpoint_retaining
+        // pass firing mid-window pins and releases its own token and must
+        // leave this one standing.
         let start = self.pool.wal_current_lsn().max(1);
-        self.pool.wal_pin_retention(start);
+        let token = self.pool.wal_pin_retention(start);
+        *self.backup_retention_token.lock() = token;
         self.checkpoint()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         // Seal, so the window's records begin in a fresh segment.
@@ -2345,7 +2366,14 @@ impl crate::backup::BackupCoordinator for DiskEngine {
     }
 
     fn backup_release(&self) {
-        self.pool.wal_unpin_retention();
+        // Release only the pin this backup's `begin` took. With no window
+        // open (or a release that already ran) the token is 0/unknown and
+        // nothing is cleared — matching the "safe without a matching begin"
+        // contract while never erasing a pin owned by checkpoint_retaining.
+        let token = std::mem::replace(&mut *self.backup_retention_token.lock(), 0);
+        if token != 0 {
+            self.pool.wal_unpin_retention(token);
+        }
     }
 
     fn data_file_path(&self) -> std::path::PathBuf {
@@ -4064,6 +4092,146 @@ mod tests {
     /// Build a simple row for the (id Int32, name Text) schema.
     fn simple_row(id: i32, name: &str) -> Row {
         vec![Value::Int32(id), Value::Text(name.to_string())]
+    }
+
+    /// Every LSN still present in the engine's segmented WAL directory,
+    /// ascending. Reads the segment files directly so the test observes
+    /// exactly what truncation left behind.
+    fn surviving_wal_lsns(wal_dir: &std::path::Path) -> Vec<u64> {
+        let mut lsns = Vec::new();
+        for entry in std::fs::read_dir(wal_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("log") {
+                for r in wal::read_wal_records(&path).unwrap() {
+                    lsns.push(r.lsn);
+                }
+            }
+        }
+        lsns.sort_unstable();
+        lsns
+    }
+
+    /// The retention pin has two independent owners: the online backup window
+    /// (`backup_begin`..`backup_release`) and every `checkpoint_retaining`
+    /// pass the background task runs. A backup copies for minutes; the
+    /// checkpoint task fires every `wal.checkpoint_interval_secs` — the two
+    /// WILL overlap. When they shared one pin slot, the checkpoint's
+    /// unconditional unpin erased the backup's floor mid-copy, the NEXT pass
+    /// then truncated inside the backup window, and the backup reported
+    /// success while being silently unrecoverable.
+    #[tokio::test]
+    async fn checkpoint_retaining_does_not_release_the_backup_retention_pin() {
+        use crate::backup::BackupCoordinator;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("nucleus.db");
+        let wal_dir = db_path.with_extension("wal.d");
+
+        let catalog = Arc::new(Catalog::new());
+        register_simple_table(&catalog, "t").await;
+        // 1 MB segments so a few hundred page images rotate several sealed
+        // segments — truncation must have reclaimable sealed segments to
+        // betray the pin, not just a never-deleted active one.
+        let engine = DiskEngine::open_segmented_with_sync(
+            &db_path,
+            catalog,
+            DEFAULT_POOL_SIZE,
+            1,
+            wal::SyncMode::Fsync,
+        )
+        .unwrap();
+        engine.create_table("t").await.unwrap();
+        // Interleave inserts with flushes so the WAL actually rotates: each
+        // flush logs a full 16 KB page image, so a bare insert loop (which
+        // dirties the same leaf page and only flushes at checkpoint) may
+        // never seal a second 1 MB segment — and truncation can only betray
+        // the pin by deleting SEALED segments.
+        for i in 0..300 {
+            engine
+                .insert("t", simple_row(i, &format!("pre{i}")))
+                .await
+                .unwrap();
+            if i % 4 == 3 {
+                engine.flush().unwrap();
+            }
+        }
+        engine.checkpoint().unwrap();
+
+        // The backup window opens: retention pinned at the current LSN.
+        engine.backup_begin().unwrap();
+
+        // Copy-window traffic — every record here is one the snapshot's WAL
+        // replay needs.
+        for i in 0..300 {
+            engine
+                .insert("t", simple_row(10_000 + i, &format!("win{i}")))
+                .await
+                .unwrap();
+            if i % 4 == 3 {
+                engine.flush().unwrap();
+            }
+        }
+        let window_lsns: std::collections::HashSet<u64> =
+            surviving_wal_lsns(&wal_dir).into_iter().collect();
+        assert!(
+            window_lsns.len() >= 64,
+            "test needs enough in-window records to seal segments (got {})",
+            window_lsns.len()
+        );
+
+        // The background checkpoint task fires mid-backup (its S7 horizon is
+        // the current LSN)...
+        engine
+            .checkpoint_retaining(engine.current_wal_lsn())
+            .unwrap();
+        // ...and again on a later interval, once LSNs have moved past the
+        // window. This is the pass that deletes the window under the bug:
+        // the first pass already cleared the shared slot.
+        for i in 0..300 {
+            engine
+                .insert("t", simple_row(20_000 + i, &format!("post{i}")))
+                .await
+                .unwrap();
+            if i % 4 == 3 {
+                engine.flush().unwrap();
+            }
+        }
+        engine
+            .checkpoint_retaining(engine.current_wal_lsn())
+            .unwrap();
+
+        // Every record the backup window needs must have survived both
+        // passes' truncation.
+        let surviving: std::collections::HashSet<u64> =
+            surviving_wal_lsns(&wal_dir).into_iter().collect();
+        let lost: Vec<u64> = window_lsns.difference(&surviving).copied().collect();
+        assert!(
+            lost.is_empty(),
+            "checkpoint_retaining erased the backup's retention pin: {} of {} \
+             in-window WAL records were reclaimed mid-backup (first lost LSN: {:?})",
+            lost.len(),
+            window_lsns.len(),
+            lost.first(),
+        );
+
+        // Once the backup releases, truncation proceeds past the window —
+        // proving the earlier survival was the pin holding, not segment
+        // inertia.
+        engine.backup_release();
+        engine
+            .checkpoint_retaining(engine.current_wal_lsn())
+            .unwrap();
+        let after_release: std::collections::HashSet<u64> =
+            surviving_wal_lsns(&wal_dir).into_iter().collect();
+        let kept = window_lsns.intersection(&after_release).count();
+        assert!(
+            kept < window_lsns.len(),
+            "releasing the backup pin must let truncation reclaim the window \
+             ({kept} of {} records still held)",
+            window_lsns.len(),
+        );
     }
 
     /// A reopened engine must never mint an LSN at or below one already stamped

@@ -4766,6 +4766,90 @@ impl Executor {
         Ok(())
     }
 
+    /// Run one full specialty-checkpoint pass (the recurring `WalCheckpoint`
+    /// task's specialty block) and return the retention horizon the SQL side
+    /// may prune to afterwards.
+    ///
+    /// Every log is warn-and-continue — one store failing must not stop the
+    /// others reclaiming — EXCEPT that a failure in a TAGGED log (streams,
+    /// KV, document, graph: the four whose replay is filtered against the SQL
+    /// committed set, S63) holds the horizon. A tagged log that failed its
+    /// checkpoint still holds COMMITTED records whose vouching SQL COMMIT
+    /// records sit below `horizon`; advancing anyway would let
+    /// `checkpoint_retaining` prune those COMMIT records, and after a crash
+    /// the recovery filter would discard the acknowledged writes as
+    /// uncommitted. So on any tagged failure the horizon stays at the last
+    /// pass that folded ALL tagged logs, and the SQL side keeps pruning only
+    /// below that floor.
+    pub async fn run_specialty_checkpoint_pass(&self, horizon: u64) -> u64 {
+        let mut tagged_ok = true;
+        #[cfg(feature = "server")]
+        if let Err(e) = self.checkpoint_cdc_wal() {
+            tracing::warn!("CDC WAL checkpoint failed: {e}");
+        }
+        if let Err(e) = self.checkpoint_streams_wal() {
+            tracing::warn!("Streams WAL checkpoint failed: {e}");
+            tagged_ok = false;
+        }
+        #[cfg(feature = "server")]
+        if let Err(e) = self.kv_store().checkpoint() {
+            tracing::warn!("KV WAL checkpoint failed: {e}");
+            tagged_ok = false;
+        }
+        if let Err(e) = self.blob_store().read().checkpoint() {
+            tracing::warn!("Blob WAL checkpoint failed: {e}");
+        }
+        if let Err(e) = self.graph_store().read().checkpoint_wal() {
+            tracing::warn!("Graph WAL checkpoint failed: {e}");
+            tagged_ok = false;
+        }
+        if let Err(e) = self.doc_store().read().checkpoint() {
+            tracing::warn!("Document WAL checkpoint failed: {e}");
+            tagged_ok = false;
+        }
+        // FTS is checkpoint + tail (NU-014): write `fts_index.json` first,
+        // which then truncates the tail it absorbed, and compact whatever is
+        // left. Order matters — a crash between them leaves a tail that is a
+        // subset of the checkpoint, which replays idempotently.
+        self.save_fts_index();
+        if let Err(e) = self.fts_index().read().checkpoint_wal() {
+            tracing::warn!("FTS WAL checkpoint failed: {e}");
+        }
+        // Vector index WAL: HNSW inserts/deletes log one record each;
+        // snapshot every live HNSW index (IvfFlat rebuilds from base-table
+        // data, never logged here).
+        if let Err(e) = self.checkpoint_vector_wal() {
+            tracing::warn!("Vector WAL checkpoint failed: {e}");
+        }
+        // TimeSeries retention (T1.3): purge points older than the configured
+        // TS_RETENTION policy BEFORE snapshotting, so the WAL is truncated to
+        // the retained state and old data does not grow the store forever.
+        // No-op when no policy is set.
+        self.ts_store().write().apply_retention();
+        // TimeSeries WAL: every insert appends a record; snapshot truncates it
+        // to the current series state.
+        self.ts_store().read().snapshot();
+        // Columnar WAL: every append/create logs a record; snapshot truncates
+        // it to the current table state.
+        if let Err(e) = self.columnar_store().write().checkpoint() {
+            tracing::warn!("Columnar WAL checkpoint failed: {e}");
+        }
+        // Per-table storage engines (WITH (engine='columnar'|'mergetree'|'lsm')):
+        // distinct from the columnar MODEL checkpointed just above. Each has
+        // its own WAL that otherwise grows unbounded — see
+        // `checkpoint_table_engines`'s doc comment.
+        self.checkpoint_table_engines().await;
+        if tagged_ok {
+            self.note_specialty_checkpoint_pass(horizon);
+        } else {
+            tracing::warn!(
+                "Specialty checkpoint pass incomplete: a tagged log (streams/kv/doc/graph) \
+                 failed; SQL WAL pruning held at the last fully-folded horizon"
+            );
+        }
+        self.specialty_checkpoint_horizon()
+    }
+
     /// Get a reference to the distributed pub/sub router.
     pub fn dist_pubsub(&self) -> &parking_lot::RwLock<crate::pubsub::DistributedPubSubRouter> {
         &self.dist_pubsub

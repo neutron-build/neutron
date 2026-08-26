@@ -560,7 +560,7 @@ fn main_impl() {
     }
     println!("════ SUMMARY ════\ntotal divergences: {total_div}");
     if total_div == 0 {
-        println!("\nAll engines agree with Mvcc. 🎯");
+        println!("\nAll engines agree with Mvcc.");
     } else {
         std::process::exit(1);
     }

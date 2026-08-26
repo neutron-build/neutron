@@ -878,7 +878,7 @@ fn main_impl() {
         );
     }
     if report.divergences == 0 {
-        println!("\nAll MVCC concurrency invariants held under real-thread contention. 🎯");
+        println!("\nAll MVCC concurrency invariants held under real-thread contention.");
     } else {
         std::process::exit(1);
     }

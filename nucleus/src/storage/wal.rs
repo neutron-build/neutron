@@ -289,14 +289,20 @@ pub trait WalBackend: Send + Sync {
     /// the snapshot's data file may lag the WAL by the whole copy window, so
     /// the records that bring it forward must still exist when the copy
     /// finishes. Without the pin a checkpoint mid-backup silently deletes the
-    /// only records that could repair the snapshot. Returns `false` when the
-    /// backend has nothing to pin (single-file WAL: it is never reclaimed
-    /// while open).
-    fn pin_retention(&self, _lsn: u64) -> bool {
-        false
+    /// only records that could repair the snapshot. Returns an owner token to
+    /// pass to [`WalBackend::unpin_retention`]; `0` when the backend has
+    /// nothing to pin (single-file WAL: it is never reclaimed while open).
+    fn pin_retention(&self, lsn: u64) -> u64 {
+        let _ = lsn;
+        0
     }
-    /// Release a retention pin taken by [`WalBackend::pin_retention`].
-    fn unpin_retention(&self) {}
+    /// Release the retention pin taken by [`WalBackend::pin_retention`] —
+    /// only the floor belonging to `token`; other live pins stay held.
+    fn unpin_retention(&self, _token: u64) {}
+    /// The effective retention floor across all live pins (`0` when none).
+    fn retention_pin(&self) -> u64 {
+        0
+    }
 }
 
 /// The write-ahead log.
@@ -981,10 +987,17 @@ pub struct SegmentedWal {
     /// it — so no WAL segment is ever reclaimed without first being preserved.
     /// `None` (the default) means no archiving and zero behavior change.
     archive_dir: Option<std::path::PathBuf>,
-    /// Retention floor held by an in-progress online backup. `0` = unpinned.
-    /// While non-zero, `truncate_before` never reclaims a segment holding a
-    /// record at or after this LSN — see [`WalBackend::pin_retention`].
-    retention_pin: AtomicU64,
+    /// Live retention pins, keyed by the owner token
+    /// [`SegmentedWal::pin_retention`] handed out (`token -> floor LSN`). The
+    /// effective floor is the minimum value; an empty map means unpinned.
+    /// Independent owners (an online backup window, the specialty checkpoint
+    /// horizon) each hold their own token, so one releasing can never clear
+    /// another's floor — a single shared slot had exactly that failure: the
+    /// 300s checkpoint task ran `unpin` after every pass and silently deleted
+    /// the pin of any backup still copying.
+    retention_pins: Mutex<std::collections::HashMap<u64, u64>>,
+    /// Next owner token to hand out. Starts at 1; `0` is the "no pin" token.
+    next_retention_token: AtomicU64,
 }
 
 struct ActiveSegment {
@@ -1058,7 +1071,8 @@ impl SegmentedWal {
             // (named after this WAL's directory), so multiple databases in one
             // process never collide. Unset → no archiving.
             archive_dir: Self::archive_dir_from_env(dir),
-            retention_pin: AtomicU64::new(0),
+            retention_pins: Mutex::new(std::collections::HashMap::new()),
+            next_retention_token: AtomicU64::new(0),
         })
     }
 
@@ -1294,7 +1308,7 @@ impl SegmentedWal {
     /// `before_lsn`: a checkpoint that fires during an online backup must not
     /// reclaim the records that backup still needs to reach consistency.
     pub fn truncate_before(&self, before_lsn: u64) -> std::io::Result<usize> {
-        let pin = self.retention_pin.load(Ordering::Acquire);
+        let pin = self.retention_pin();
         let before_lsn = if pin == 0 {
             before_lsn
         } else {
@@ -1366,36 +1380,39 @@ impl SegmentedWal {
         self.next_lsn.load(Ordering::Acquire)
     }
 
-    /// Hold every segment carrying a record at or after `lsn` until
-    /// [`SegmentedWal::unpin_retention`]. Idempotent; a lower pin wins, so
-    /// overlapping backups all keep the records they need.
-    pub fn pin_retention(&self, lsn: u64) {
+    /// Hold every segment carrying a record at or after `lsn` until the
+    /// returned token is passed to [`SegmentedWal::unpin_retention`]. Returns
+    /// the owner token (`0` never does — a `0` token means "no pin" and
+    /// unpins nothing). Overlapping pins are independent: the effective floor
+    /// is the minimum live LSN, so a younger pin cannot raise an older
+    /// backup's floor, and each owner releases only its own.
+    pub fn pin_retention(&self, lsn: u64) -> u64 {
         let lsn = lsn.max(1);
-        let mut cur = self.retention_pin.load(Ordering::Acquire);
-        loop {
-            if cur != 0 && cur <= lsn {
-                return;
-            }
-            match self.retention_pin.compare_exchange_weak(
-                cur,
-                lsn,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(observed) => cur = observed,
-            }
+        let token = self.next_retention_token.fetch_add(1, Ordering::SeqCst) + 1;
+        self.retention_pins.lock().insert(token, lsn);
+        token
+    }
+
+    /// Release the retention pin taken by [`SegmentedWal::pin_retention`].
+    /// Only clears the calling owner's floor: another live pin (a backup
+    /// window, the specialty checkpoint horizon) keeps holding its own. A
+    /// `0` or unknown token (no matching begin, or a release that already
+    /// ran) is a no-op.
+    pub fn unpin_retention(&self, token: u64) {
+        if token != 0 {
+            self.retention_pins.lock().remove(&token);
         }
     }
 
-    /// Release the retention pin.
-    pub fn unpin_retention(&self) {
-        self.retention_pin.store(0, Ordering::Release);
-    }
-
-    /// The current retention pin (`0` when unpinned). Test/introspection hook.
+    /// The effective retention floor: the lowest live pin, or `0` when every
+    /// owner has released. Test/introspection hook.
     pub fn retention_pin(&self) -> u64 {
-        self.retention_pin.load(Ordering::Acquire)
+        self.retention_pins
+            .lock()
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(0)
     }
 
     /// Get the most recent checkpoint LSN.
@@ -1585,12 +1602,14 @@ impl WalBackend for SegmentedWal {
     fn current_lsn(&self) -> u64 {
         SegmentedWal::current_lsn(self)
     }
-    fn pin_retention(&self, lsn: u64) -> bool {
-        SegmentedWal::pin_retention(self, lsn);
-        true
+    fn pin_retention(&self, lsn: u64) -> u64 {
+        SegmentedWal::pin_retention(self, lsn)
     }
-    fn unpin_retention(&self) {
-        SegmentedWal::unpin_retention(self);
+    fn unpin_retention(&self, token: u64) {
+        SegmentedWal::unpin_retention(self, token)
+    }
+    fn retention_pin(&self) -> u64 {
+        SegmentedWal::retention_pin(self)
     }
 }
 
@@ -2590,7 +2609,7 @@ mod tests {
 
         // Backup begins here.
         let pin_lsn = wal.current_lsn();
-        wal.pin_retention(pin_lsn);
+        let pin = wal.pin_retention(pin_lsn);
         assert_eq!(wal.retention_pin(), pin_lsn);
 
         // Writes during the copy window — the snapshot needs every one of them.
@@ -2620,7 +2639,7 @@ mod tests {
         }
 
         // Once the backup releases the pin, the same request reclaims freely.
-        wal.unpin_retention();
+        wal.unpin_retention(pin);
         assert_eq!(wal.retention_pin(), 0);
         wal.truncate_before(cp_lsn).unwrap();
         let after: std::collections::HashSet<u64> = wal
@@ -2643,16 +2662,29 @@ mod tests {
         // younger one's begin silently shortens the older one's retention.
         let dir = tempfile::tempdir().unwrap();
         let wal = SegmentedWal::open(&dir.path().join("wal"), 20_000).unwrap();
-        wal.pin_retention(50);
-        wal.pin_retention(90);
+        let t50 = wal.pin_retention(50);
+        let t90 = wal.pin_retention(90);
         assert_eq!(
             wal.retention_pin(),
             50,
             "a later, higher pin must not raise the floor"
         );
-        wal.pin_retention(20);
+        let t20 = wal.pin_retention(20);
         assert_eq!(wal.retention_pin(), 20, "a lower pin must lower the floor");
-        wal.unpin_retention();
+        // Releasing one owner must clear only its own floor — the shared-slot
+        // version of this pin erased every owner's on any release.
+        wal.unpin_retention(t20);
+        assert_eq!(
+            wal.retention_pin(),
+            50,
+            "releasing the lowest pin must expose the next-lowest, not clear all"
+        );
+        wal.unpin_retention(t90);
+        assert_eq!(wal.retention_pin(), 50, "the oldest pin still holds");
+        wal.unpin_retention(t50);
+        assert_eq!(wal.retention_pin(), 0);
+        // A stale or unmatched release is a no-op, never someone else's erase.
+        wal.unpin_retention(t50);
         assert_eq!(wal.retention_pin(), 0);
     }
 

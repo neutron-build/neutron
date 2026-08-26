@@ -1283,7 +1283,7 @@ fn main_impl() {
         }
     }
     if divergences == 0 && panics == 0 {
-        println!("\nNo divergences, no panics vs SQLite. 🎯");
+        println!("\nNo divergences, no panics vs SQLite.");
     } else {
         println!("\nReproduce with: --seed {seed} --iterations <iter+1>");
         std::process::exit(1);

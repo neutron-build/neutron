@@ -609,7 +609,7 @@ fn main_impl() {
     println!("resurrected rows    : {resurrected}");
     println!("total findings      : {findings}");
     if findings == 0 {
-        println!("\nNo panics; every recovered row was committed; CRC gate honored. 🎯");
+        println!("\nNo panics; every recovered row was committed; CRC gate honored.");
     } else {
         std::process::exit(1);
     }
