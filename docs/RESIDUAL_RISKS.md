@@ -27,25 +27,32 @@ the other twelve models.**
 Nucleus has fourteen data models. SQL writes go through the page WAL with a
 commit record. The other thirteen each own an append log.
 
-For **streams, KV strings, and documents**, the fix is implemented end to
-end: every enlisted write is tagged with the coordinating transaction id, the
-commit record is CRC-covered on both WAL backends and survives compaction,
-specialty checkpoints are ordered before the SQL checkpoint with a retention
-pin, and recovery discards tagged records whose transaction never committed —
-absence of a commit record means discard, so there is no in-doubt state and no
-operator call. A crash anywhere between the tagged append and the commit
-record leaves both writes or neither, and rollback retracts what the
-transaction appended. Pinned by `probe_crossmodel_commit_order` and
-`probe_crossmodel_atomicity`.
+For **streams, KV strings, documents, graph, timeseries, datalog, and blob**,
+the fix is implemented end to end: every enlisted write is tagged with the
+coordinating transaction id, the commit record is CRC-covered on both WAL
+backends and survives compaction, specialty checkpoints are ordered before
+the SQL checkpoint with a retention pin, and recovery discards tagged
+records whose transaction never committed — absence of a commit record means
+discard, so there is no in-doubt state and no operator call. A crash anywhere
+between the tagged append and the commit record leaves both writes or
+neither, and rollback retracts what the transaction appended. Pinned by
+`probe_crossmodel_commit_order` and `probe_crossmodel_atomicity`.
 
-The remaining models — FTS, vector, graph, timeseries, geo, columnar,
-datalog, CDC, blob, collections-KV, pub/sub — still append with no notion of
-the transaction that produced a record. A transaction that writes a row and a
-document and crashes between the two fsyncs can leave one without the other,
-and rolling it back does not retract what its specialty writes appended.
+**Columnar and collections-KV** carry the full tagged plumbing but their
+in-transaction writes are refused outright (no rollback before-image yet),
+so no uncommitted record can be produced through SQL — atomic by refusal,
+not by mechanism, until a write-set design lands.
+
+The remaining models — FTS (design-never: the index snapshot beats the WAL
+at startup), vector (its WAL has no statement framing; needs a design),
+geo (writer-less — geo persists as SQL columns and its WAL receives no
+writes), and CDC (determined fire-and-forget: events fire at statement
+time and never enlist; making CDC transactional is the NU-107 product
+call) — still append with no notion of the transaction that produced a
+record.
 
 **If this matters to you:** keep cross-model writes idempotent, or confine a
-transaction to SQL, streams, KV strings, and documents.
+transaction to SQL and the seven atomic specialty surfaces above.
 
 ## 2. Two index paths read the whole table and then narrow the answer
 

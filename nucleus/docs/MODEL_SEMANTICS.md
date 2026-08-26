@@ -82,12 +82,17 @@ fails if enforcement ever lands so the claim is updated with it.
 
 ### The facts that matter most
 
-1. **Nothing outside the relational model is crash-atomic with the SQL
-   transaction.** Specialty stores append to their own WALs at *statement* time,
-   not at COMMIT, and their WAL formats contain no begin/commit/abort record.
-   **[verified]** Killing the server mid-transaction and restarting leaves the
-   SQL row rolled back and the KV/document/graph/time-series writes from the
-   same transaction present and permanent.
+1. **Crash-atomicity across the SQL transaction is per-surface.** The S63
+   programme (2026-08-21..26) made **streams, KV strings, documents, graph,
+   timeseries, datalog, and blob** atomic end to end: their records are
+   tagged with the coordinating transaction id and recovery discards tagged
+   records whose COMMIT never landed (`probe_crossmodel_atomicity`).
+   **Columnar and collections-KV refuse writes inside transactions outright**
+   (no rollback before-image yet), so they cannot produce uncommitted
+   records. **FTS, vector, and CDC** still append at *statement* time with no
+   transaction notion — killing the server mid-transaction leaves the SQL row
+   rolled back and those surfaces' writes from the same transaction present
+   and permanent. (CDC's semantics are the open NU-107 product call.)
 
 2. **~~A ROLLBACK in one session destroys other sessions' committed specialty
    writes.~~ FIXED (M8).** The stores are still process-global, but `BEGIN` no

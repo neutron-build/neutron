@@ -426,11 +426,14 @@ refuses a data directory a live instance holds, unless overridden.
   no fsync) and a parse failure on load is swallowed, so a crash mid-rewrite
   silently starts the server with a stale index.
 - There is no shared commit record between the SQL WAL and the model WALs,
-  **except streams** — since the 2026-08-21 cross-model slice, streams records
+  **except the seven S63 atomic surfaces** — streams, KV strings, documents,
+  graph, timeseries, datalog, and blob (2026-08-21..26 slices): their records
   carry the coordinating transaction id and recovery discards records whose
-  commit record never landed (see `probe_crossmodel_atomicity`). For the other
-  twelve models a transaction spanning both is still not atomic across a crash
-  by construction.
+  commit record never landed (see `probe_crossmodel_atomicity`; columnar and
+  collections-KV carry the plumbing but refuse in-transaction writes until a
+  before-image exists). For the remaining surfaces (FTS, vector, CDC) a
+  transaction spanning both is still not atomic across a crash by
+  construction.
 - **ROLLBACK durability is per-store, and vector is not covered.** A `ROLLBACK`
   used to revert memory only and leave the mutation records in the specialty
   WAL, so a crash after a successful rollback resurrected the rolled-back writes
