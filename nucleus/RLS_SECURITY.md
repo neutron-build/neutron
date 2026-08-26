@@ -310,3 +310,7 @@ is admission to the cluster, which is what the shared token was carrying alone.
   `WHERE` clause — use RLS for row isolation and masking for value redaction, not the reverse.
 - Specialty stores have their own data and policy boundaries. RLS prevents SQL/binary cross-model
   bypasses; it does not reinterpret relational table policies as RESP KV-key or graph-edge policies.
+
+The enumerated side channels behind these — constraint probing shapes, timing oracles,
+administrator-visible metadata, and physical backup exposure — are documented with source
+citations in [docs/SIDE_CHANNELS.md](docs/SIDE_CHANNELS.md).

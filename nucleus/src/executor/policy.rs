@@ -364,21 +364,58 @@ impl Executor {
                 .ok_or_else(|| Self::unsupported_policy_expr(column_expr))?,
             _ => return Err(Self::unsupported_policy_expr(column_expr)),
         };
-        let normalized = value_expr.to_string().to_ascii_lowercase().replace(' ', "");
-        if matches!(
-            normalized.as_str(),
-            "current_user" | "session_user" | "current_user()"
-        ) {
-            return Ok(RlsPredicate::ColumnEqUser {
-                column,
-                column_id: 0,
-            });
-        }
-        if normalized.starts_with("current_setting(") && normalized.contains("nucleus.tenant_id") {
-            return Ok(RlsPredicate::ColumnEqTenant {
-                column,
-                column_id: 0,
-            });
+        // Identity and setting references are matched on the AST, not on the
+        // rendered text. The previous matcher normalized `value_expr` to a
+        // string and accepted any form that STARTED WITH `current_setting(`
+        // and CONTAINED `nucleus.tenant_id`, so
+        // `current_setting('nucleus.tenant_id_x')` (a different, nonexistent
+        // setting) and `current_setting('nucleus.tenant_id') || 'x'` (a
+        // different value) both compiled into plain tenant equality — a
+        // policy accepted with a different meaning than the one written,
+        // which is the fail-open direction: the DDL reads as enforced.
+        match value_expr {
+            Expr::Identifier(id)
+                if matches!(
+                    id.value.to_ascii_lowercase().as_str(),
+                    "current_user" | "session_user"
+                ) =>
+            {
+                return Ok(RlsPredicate::ColumnEqUser {
+                    column,
+                    column_id: 0,
+                });
+            }
+            Expr::Function(f)
+                if f.name.to_string().eq_ignore_ascii_case("current_user")
+                    && matches!(f.args, ast::FunctionArguments::None) =>
+            {
+                return Ok(RlsPredicate::ColumnEqUser {
+                    column,
+                    column_id: 0,
+                });
+            }
+            Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("current_setting") => {
+                let is_tenant_setting = matches!(
+                    &f.args,
+                    ast::FunctionArguments::List(list)
+                        if matches!(
+                            list.args.as_slice(),
+                            [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(Expr::Value(v)))]
+                                if matches!(
+                                    &v.value,
+                            ast::Value::SingleQuotedString(s)
+                                if s.eq_ignore_ascii_case("nucleus.tenant_id")
+                                )
+                        )
+                );
+                if is_tenant_setting {
+                    return Ok(RlsPredicate::ColumnEqTenant {
+                        column,
+                        column_id: 0,
+                    });
+                }
+            }
+            _ => {}
         }
         if let Expr::Value(v) = value_expr {
             let value = match &v.value {

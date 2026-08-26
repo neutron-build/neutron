@@ -84,6 +84,7 @@ mod test_read_only_mode; // M10: degraded read-only write admission
 mod test_rename_table_dependents; // CAT-4: RENAME TO must rewrite FK/view/matview dependents
 mod test_replacing_engine_recovery; // replacing_mergetree engine metadata must survive a restart
 mod test_rls;
+mod test_rls_fail_closed; // M5: unsupported policy expressions / specialty calls fail closed
 mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
 mod test_row_locks;
 mod test_s33_executor_edges; // S33-11/S33-14: hash-join decline + SIMD case-insensitive binding

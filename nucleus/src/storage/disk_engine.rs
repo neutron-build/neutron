@@ -2009,6 +2009,19 @@ impl DiskEngine {
     /// Walk the page chain for a table, collecting all page IDs.
     fn table_pages(&self, table: &str) -> Result<Vec<u32>, StorageError> {
         let tables = self.tables.read();
+        self.table_pages_under(table, &tables)
+    }
+
+    /// [`table_pages`](Self::table_pages) for a caller that already holds the
+    /// `tables` read guard and needs the walk to run under it. Taking a second
+    /// read guard re-entrantly is not safe here: with a writer queued between
+    /// the two acquisitions the inner read blocks behind the writer, which
+    /// blocks on the outer read.
+    fn table_pages_under(
+        &self,
+        table: &str,
+        tables: &parking_lot::RwLockReadGuard<'_, HashMap<String, TableMeta>>,
+    ) -> Result<Vec<u32>, StorageError> {
         let meta = tables
             .get(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
@@ -3871,24 +3884,58 @@ impl DiskEngine {
     /// Synchronous insert of raw tuple data (used by update when row grows).
     /// Returns (page_id, slot_idx) of the inserted tuple for index maintenance.
     fn insert_sync(&self, table: &str, data: &[u8]) -> Result<(u32, u16), StorageError> {
-        // Try existing pages
-        let pages = self.table_pages(table)?;
+        // The `tables` read guard is HELD across the page walk below, for the
+        // same reason the async `insert` fast path holds it: `table_pages`
+        // samples the chain under the guard, and without the guard held the
+        // list is only a snapshot. VACUUM (or DROP TABLE) can free a page from
+        // under this walk, and another table's `alloc_data_page` can then pop
+        // it and re-stamp `PAGE_TYPE_DATA` — the type check alone distinguishes
+        // "on the free list" from "not on the free list", which is strictly
+        // weaker than "still mine". `drop_table` and `alloc_data_page` take L1
+        // exclusively before touching any page, so holding it shared here makes
+        // every page in the captured list this table's for the duration of the
+        // walk. L1 before L6 is the documented order.
+        let tables_guard = self.tables.read();
+        let pages = self.table_pages_under(table, &tables_guard)?;
+        // One-shot probe: can a writer take `tables` here, between the chain
+        // capture and the placement walk? If yes, a concurrent DROP TABLE can
+        // free the walked pages mid-walk and another table can recycle them —
+        // the cross-table write the fast-path fix closed for `insert`. The
+        // guard above must make this fail.
+        #[cfg(test)]
+        if tests::INSERT_SYNC_GUARD_PROBE.swap(false, AtomicOrdering::AcqRel) {
+            let open = self.tables.try_write().is_some();
+            tests::INSERT_SYNC_GUARD_OPEN.store(open, AtomicOrdering::Release);
+        }
+        let mut placed: Option<(u32, u16)> = None;
         for &page_id in &pages {
-            let placed = {
+            let slot = {
                 let mut pg = self
                     .pool
                     .write_guard(page_id)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
+                // With the guard held the page cannot have been freed, so this
+                // is the same cheap assertion the async fast path keeps.
+                if page::get_page_type(&pg) != page::PAGE_TYPE_DATA {
+                    continue;
+                }
                 let slot = page::insert_tuple(&mut pg, data);
                 if slot.is_some() {
                     pg.set_dirty();
                 }
                 slot
             };
-            if let Some(slot_idx) = placed {
+            if let Some(slot_idx) = slot {
                 self.record_dirty_page(page_id);
-                return Ok((page_id, slot_idx));
+                placed = Some((page_id, slot_idx));
+                break;
             }
+        }
+        // `alloc_data_page` takes `tables` exclusively; the shared guard must
+        // be gone first or the same thread deadlocks on the upgrade.
+        drop(tables_guard);
+        if let Some((page_id, slot_idx)) = placed {
+            return Ok((page_id, slot_idx));
         }
 
         // Allocate new page
@@ -4093,6 +4140,21 @@ mod tests {
     fn simple_row(id: i32, name: &str) -> Row {
         vec![Value::Int32(id), Value::Text(name.to_string())]
     }
+
+    /// One-shot probe arming for `insert_sync`'s guard check: when set, the
+    /// next `insert_sync` call records whether a writer could take `tables`
+    /// between its chain capture and its placement walk, then auto-disarms.
+    /// `INSERT_SYNC_GUARD_OPEN` holds the answer for the test that armed it.
+    ///
+    /// The placement walk's pages are only "still mine" if the `tables` read
+    /// guard spans the walk. The window cannot be parked on from outside —
+    /// any page latch held by a test stops the walk inside `table_pages`,
+    /// which holds its own guard — so the walk itself reports whether the
+    /// guard is held.
+    pub(super) static INSERT_SYNC_GUARD_PROBE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(super) static INSERT_SYNC_GUARD_OPEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// Every LSN still present in the engine's segmented WAL directory,
     /// ascending. Reads the segment files directly so the test observes
@@ -7713,6 +7775,230 @@ mod tests {
                 assert_eq!(
                     got, want_sorted,
                     "concurrent same-page inserts corrupted rows"
+                );
+            },
+        )
+        .await;
+    }
+
+    // ── insert-path ownership: a walk must not write into a recycled page ──
+    //
+    // Both insert paths sample the table's page chain and then latch pages one
+    // by one. `table_pages`/`meta.last_page` say which pages the table owned at
+    // sample time; nothing in the page itself records ownership. If VACUUM or
+    // DROP TABLE frees a sampled page and another table's `alloc_data_page`
+    // re-stamps it `PAGE_TYPE_DATA`, a walk that only checks the type writes
+    // this table's row into a page that now belongs to someone else. The fix —
+    // in both paths — is holding the `tables` read guard across the walk, so
+    // every page-freeing path (which takes `tables` exclusively first) is
+    // serialized against the whole walk rather than racing inside it.
+
+    /// Fill `table` with rows big enough that the chain spans several pages,
+    /// leaving room on the last page for one more small tuple. Returns the
+    /// page-chain in link order.
+    async fn multi_page_table(
+        engine: &DiskEngine,
+        catalog: &Catalog,
+        table: &str,
+        rows: i32,
+    ) -> Vec<u32> {
+        register_simple_table(catalog, table).await;
+        engine.create_table(table).await.unwrap();
+        for i in 0..rows {
+            engine
+                .insert(table, simple_row(i, &"x".repeat(3000)))
+                .await
+                .unwrap();
+        }
+        let pages = engine.table_pages(table).unwrap();
+        assert!(
+            pages.len() >= 3,
+            "expected a multi-page chain for {table}, got {pages:?}"
+        );
+        pages
+    }
+
+    /// A DROP TABLE running against a blocked `insert_sync` walk cannot free
+    /// the walked pages. The walker is parked on a held page latch inside the
+    /// chain capture (which holds the `tables` read guard), so the drop must
+    /// stay stuck at `tables.write()` and free nothing until the walk
+    /// finishes — end to end, including the placement phase. The companion
+    /// `insert_sync_placement_walk_runs_under_the_tables_guard` isolates the
+    /// capture-to-placement gap itself, which a parked-latch choreography
+    /// cannot reach.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn insert_sync_walk_is_serialized_against_drop_table() {
+        bounded(
+            120,
+            "insert_sync_walk_is_serialized_against_drop_table",
+            async {
+                let tmp = tempfile::tempdir().unwrap();
+                let (engine, catalog) = setup_engine(tmp.path()).await;
+                let pages = multi_page_table(&engine, &catalog, "a", 24).await;
+                register_simple_table(&catalog, "b").await;
+                engine.create_table("b").await.unwrap();
+                let engine = Arc::new(engine);
+
+                // Block the walk's SECOND page before T1 exists: every chain walk
+                // latches pages[1], so T1 is guaranteed to stop there, holding the
+                // read guard (fix) or nothing (unfixed).
+                let blocker = engine.pool.write_guard(pages[1]).unwrap();
+
+                let (drop_go, drop_go_rx) = std::sync::mpsc::channel::<()>();
+                let (drop_done, drop_done_rx) = std::sync::mpsc::channel::<bool>();
+                let eng2 = engine.clone();
+                let dropper = std::thread::spawn(move || {
+                    drop_go_rx.recv().unwrap();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let r = rt.block_on(eng2.drop_table("a"));
+                    drop_done.send(r.is_ok()).unwrap();
+                });
+
+                let eng1 = engine.clone();
+                let data = vec![0x11u8; 64];
+                let walker = std::thread::spawn(move || eng1.insert_sync("a", &data));
+
+                // Let the walker reach (and block on) pages[1].
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                drop_go.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                assert_eq!(
+                    *engine.free_page_count.lock(),
+                    0,
+                    "drop_table freed pages while insert_sync was mid-walk: the \
+                 walk's page list went stale and its next write can land in a \
+                 recycled page"
+                );
+
+                drop(blocker);
+                let placed = walker.join().unwrap().unwrap();
+                assert!(
+                    pages.contains(&placed.0),
+                    "insert_sync placed a tuple on page {} which table `a` never owned",
+                    placed.0
+                );
+                assert!(drop_done_rx.recv().unwrap(), "drop_table failed");
+                dropper.join().unwrap();
+
+                // The drop happened after the walk: every page went to the free
+                // list, and a fresh insert recycles them cleanly.
+                assert_eq!(*engine.free_page_count.lock(), pages.len() as u32);
+                engine.insert("b", simple_row(1, "b")).await.unwrap();
+                let rows = engine.scan("b").await.unwrap();
+                assert_eq!(ids(&rows), vec![1]);
+            },
+        )
+        .await;
+    }
+
+    /// The async `insert` fast path (last-page append) holds the `tables`
+    /// read guard across the page latch, for the same reason as the
+    /// `insert_sync` walk: DROP TABLE must not free the append target between
+    /// sampling `meta.last_page` and latching it. Same deterministic shape —
+    /// block the append on a held latch and require the drop to wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn insert_fast_path_is_serialized_against_drop_table() {
+        bounded(
+            120,
+            "insert_fast_path_is_serialized_against_drop_table",
+            async {
+                let tmp = tempfile::tempdir().unwrap();
+                let (engine, catalog) = setup_engine(tmp.path()).await;
+                let pages = multi_page_table(&engine, &catalog, "a", 24).await;
+                register_simple_table(&catalog, "b").await;
+                engine.create_table("b").await.unwrap();
+                let engine = Arc::new(engine);
+
+                // The fast path latches meta.last_page; hold it before T1 exists.
+                let last = *pages.last().unwrap();
+                let blocker = engine.pool.write_guard(last).unwrap();
+
+                let (drop_go, drop_go_rx) = std::sync::mpsc::channel::<()>();
+                let (drop_done, drop_done_rx) = std::sync::mpsc::channel::<bool>();
+                let eng2 = engine.clone();
+                let dropper = std::thread::spawn(move || {
+                    drop_go_rx.recv().unwrap();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let r = rt.block_on(eng2.drop_table("a"));
+                    drop_done.send(r.is_ok()).unwrap();
+                });
+
+                let eng1 = engine.clone();
+                let inserter = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    rt.block_on(eng1.insert("a", simple_row(999, "tail")))
+                        .unwrap();
+                });
+
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                drop_go.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                assert_eq!(
+                    *engine.free_page_count.lock(),
+                    0,
+                    "drop_table freed pages while the insert fast path held the \
+                 append target: the page can be recycled under the latch and \
+                 the row lands in another table's page"
+                );
+
+                drop(blocker);
+                inserter.join().unwrap();
+                assert!(drop_done_rx.recv().unwrap(), "drop_table failed");
+                dropper.join().unwrap();
+
+                assert_eq!(*engine.free_page_count.lock(), pages.len() as u32);
+                engine.insert("b", simple_row(1, "b")).await.unwrap();
+                let rows = engine.scan("b").await.unwrap();
+                assert_eq!(ids(&rows), vec![1]);
+            },
+        )
+        .await;
+    }
+
+    /// The placement walk of `insert_sync` runs under the `tables` read
+    /// guard. The window it protects — between capturing the page chain and
+    /// latching each page — cannot be parked on from outside: a test holding
+    /// any page's latch stops the walk inside `table_pages`, whose own guard
+    /// already excludes writers. So the walk reports on itself: with the probe
+    /// armed, `insert_sync` records whether a writer could take `tables` at
+    /// the top of the placement walk. If it could, DROP TABLE can free the
+    /// walked pages there and another table's `alloc_data_page` can recycle
+    /// them — the cross-table write of the fast-path finding, reachable from
+    /// UPDATE of a row that outgrew its page. And a straight end-to-end race
+    /// is not a usable witness here: the walk is faster than a drop-plus-
+    /// realloc, so the interleaving it needs almost never happens under a
+    /// test scheduler — the probe is.
+    #[tokio::test]
+    async fn insert_sync_placement_walk_runs_under_the_tables_guard() {
+        bounded(
+            30,
+            "insert_sync_placement_walk_runs_under_the_tables_guard",
+            async {
+                let tmp = tempfile::tempdir().unwrap();
+                let (engine, catalog) = setup_engine(tmp.path()).await;
+                let pages = multi_page_table(&engine, &catalog, "a", 24).await;
+
+                INSERT_SYNC_GUARD_OPEN.store(false, AtomicOrdering::Release);
+                INSERT_SYNC_GUARD_PROBE.store(true, AtomicOrdering::Release);
+                let (page_id, _slot_idx) = engine.insert_sync("a", &[0x11u8; 64]).unwrap();
+                assert!(pages.contains(&page_id));
+                assert!(
+                    !INSERT_SYNC_GUARD_PROBE.load(AtomicOrdering::Acquire),
+                    "the probe never fired: insert_sync no longer runs the \
+                     guard check between its chain capture and its placement walk"
+                );
+                assert!(
+                    !INSERT_SYNC_GUARD_OPEN.load(AtomicOrdering::Acquire),
+                    "a writer took `tables` between insert_sync's chain capture \
+                     and its placement walk: DROP TABLE can free the walked pages \
+                     there and another table's allocation can recycle them, so the \
+                     walk's tuple can land in another table's page"
                 );
             },
         )
