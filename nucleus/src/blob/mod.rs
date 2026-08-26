@@ -34,6 +34,7 @@ pub mod segment;
 pub mod wal;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -41,6 +42,8 @@ use parking_lot::Mutex;
 
 use segment::SegmentStore;
 use wal::{BlobMetaSnapshot, BlobWal};
+
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 
 // ============================================================================
 // Content-addressable chunk store (BLAKE3)
@@ -554,6 +557,13 @@ pub struct BlobStore {
     /// Blob keys mutated since the last `clear_touched` — the transaction
     /// write-set the executor drains under the same write guard.
     txn_touched: HashSet<String>,
+    /// The coordinating transaction id tagging the WAL records of the
+    /// mutation currently in flight (S63). `XACT_AUTOCOMMIT` outside an
+    /// explicit transaction; the executor brackets each mutating call with
+    /// `set_xact_tag`/`take_xact_tag` while holding the store's write guard,
+    /// the same bracket the time-series store uses. Rollback compensations
+    /// are written outside that bracket and carry `XACT_AUTOCOMMIT`.
+    xact_tag: u64,
 }
 
 impl Default for BlobStore {
@@ -602,6 +612,7 @@ impl BlobStore {
             chunk_size,
             wal: None,
             txn_touched: HashSet::new(),
+            xact_tag: XACT_AUTOCOMMIT,
         }
     }
 
@@ -615,6 +626,21 @@ impl BlobStore {
         std::mem::take(&mut self.txn_touched)
     }
 
+    /// Tag the WAL records of the mutation that follows with the
+    /// coordinating transaction id `xact` (S63). Must be paired with
+    /// [`Self::take_xact_tag`] around exactly one mutating call, under the
+    /// store's executor write guard.
+    pub fn set_xact_tag(&mut self, xact: u64) {
+        self.xact_tag = xact;
+    }
+
+    /// Reset the coordinating tag to `XACT_AUTOCOMMIT`; the bracket-closer of
+    /// [`Self::set_xact_tag`], so a write path cannot drift out of its
+    /// transaction.
+    pub fn take_xact_tag(&mut self) -> u64 {
+        std::mem::replace(&mut self.xact_tag, XACT_AUTOCOMMIT)
+    }
+
     /// Open a disk-tiered, WAL-backed blob store at `dir`.
     ///
     /// Replays the WAL to recover blob manifests (chunk data is read from
@@ -625,24 +651,31 @@ impl BlobStore {
         Self::open_with_chunk_size(dir, DEFAULT_CHUNK_SIZE)
     }
 
-    /// Open a disk-tiered, WAL-backed blob store with a custom chunk size.
-    pub fn open_with_chunk_size(dir: &Path, chunk_size: usize) -> std::io::Result<Self> {
+    /// Open a disk-tiered, WAL-backed blob store with a custom chunk size,
+    /// replaying with an EMPTY committed set so every tagged record keeps —
+    /// the pre-S63 contract. The executor opens through
+    /// [`BlobStore::open_with_committed`] instead.
+    pub fn open_with_chunk_size(dir: &Path, chunk_size: usize) -> io::Result<Self> {
         let cache_limit = std::env::var("NUCLEUS_BLOB_CACHE_BYTES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_BLOB_CACHE_BYTES);
-        Self::open_with_options(dir, chunk_size, cache_limit)
+        Self::open_with_options(dir, chunk_size, cache_limit, &HashSet::new())
     }
 
     /// Open a disk-tiered, WAL-backed blob store with explicit chunk size and
-    /// hot-chunk cache budget (bytes).
+    /// hot-chunk cache budget (bytes), whose WAL replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
     pub fn open_with_options(
         dir: &Path,
         chunk_size: usize,
         cache_limit: usize,
-    ) -> std::io::Result<Self> {
+        committed: &HashSet<u64>,
+    ) -> io::Result<Self> {
         let mut segments = SegmentStore::open(dir)?;
-        let (wal, state) = BlobWal::open(dir)?;
+        let (wal, state) = BlobWal::open_with_committed(dir, committed)?;
         let migrate_legacy = state.legacy_entries_seen;
 
         let mut refs: HashMap<ChunkHash, ChunkRef> = HashMap::new();
@@ -702,6 +735,7 @@ impl BlobStore {
             chunk_size,
             wal: Some(Arc::new(wal)),
             txn_touched: HashSet::new(),
+            xact_tag: XACT_AUTOCOMMIT,
         };
 
         // A legacy WAL embedded chunk data; now that it lives in segments,
@@ -711,6 +745,25 @@ impl BlobStore {
         }
 
         Ok(store)
+    }
+
+    /// Open a disk-tiered, WAL-backed blob store at `dir`, whose WAL replay
+    /// is filtered by the S63 committed set. See
+    /// [`BlobStore::open_with_options`].
+    pub fn open_with_committed(dir: &Path, committed: &HashSet<u64>) -> io::Result<Self> {
+        let cache_limit = std::env::var("NUCLEUS_BLOB_CACHE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_BLOB_CACHE_BYTES);
+        Self::open_with_options(dir, DEFAULT_CHUNK_SIZE, cache_limit, committed)
+    }
+
+    /// The highest coordinating transaction id this store's `blob.wal`
+    /// recovered (S63) — 0 with no WAL. Seeds the executor's XactId counter
+    /// so a reopened process never mints an id a surviving tagged record
+    /// already carries.
+    pub fn wal_max_xact_id(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.max_xact_id())
     }
 
     /// Store a blob. Splits into chunks and deduplicates.
@@ -741,8 +794,14 @@ impl BlobStore {
         // Chunks are on disk (flushed) at this point; the manifest may now be
         // logged — a recovered manifest never references unwritten data.
         if let Some(wal) = &self.wal
-            && let Err(e) =
-                wal.log_store_meta(key, content_type, data.len() as u64, &wal_chunks, &[])
+            && let Err(e) = wal.log_store_meta(
+                Some(self.xact_tag),
+                key,
+                content_type,
+                data.len() as u64,
+                &wal_chunks,
+                &[],
+            )
         {
             eprintln!("blob WAL: failed to log store for '{key}': {e}");
         }
@@ -822,7 +881,14 @@ impl BlobStore {
             .map(|(h, sz)| (*h, *sz as u32))
             .collect();
         if let Some(wal) = &self.wal
-            && let Err(e) = wal.log_store_meta(key, content_type, total_size, &wal_chunks, &[])
+            && let Err(e) = wal.log_store_meta(
+                Some(self.xact_tag),
+                key,
+                content_type,
+                total_size,
+                &wal_chunks,
+                &[],
+            )
         {
             eprintln!("blob WAL: failed to log compose for '{key}': {e}");
         }
@@ -928,7 +994,7 @@ impl BlobStore {
         };
         // Log to WAL before in-memory mutation
         if let Some(wal) = &self.wal
-            && let Err(e) = wal.log_delete(key)
+            && let Err(e) = wal.log_delete(Some(self.xact_tag), key)
         {
             eprintln!("blob WAL: failed to log delete for '{key}': {e}");
         }
@@ -949,7 +1015,7 @@ impl BlobStore {
         if let Some(meta) = self.blobs.get_mut(key) {
             // Log to WAL before in-memory mutation
             if let Some(wal) = &self.wal
-                && let Err(e) = wal.log_tag(key, tag_key, tag_value)
+                && let Err(e) = wal.log_tag(Some(self.xact_tag), key, tag_key, tag_value)
             {
                 eprintln!("blob WAL: failed to log tag for '{key}': {e}");
             }
@@ -1059,8 +1125,13 @@ impl BlobStore {
                     for hash in &meta.chunk_hashes {
                         self.chunks.retain(hash);
                     }
+                    // The rollback's compensating records are written outside
+                    // the set/take bracket, so they carry XACT_AUTOCOMMIT:
+                    // their durability point is their own fsync, and there is
+                    // no commit record and never was one (S63).
                     if let Some(wal) = &self.wal
                         && let Err(e) = wal.log_store_meta(
+                            Some(XACT_AUTOCOMMIT),
                             key,
                             meta.content_type.as_deref(),
                             meta.size,
@@ -1075,7 +1146,7 @@ impl BlobStore {
                 None => {
                     if current.is_some()
                         && let Some(wal) = &self.wal
-                        && let Err(e) = wal.log_delete(key)
+                        && let Err(e) = wal.log_delete(Some(XACT_AUTOCOMMIT), key)
                     {
                         eprintln!("blob WAL: failed to log rollback delete for '{key}': {e}");
                     }
@@ -1094,7 +1165,7 @@ impl BlobStore {
         if let Some(wal) = &self.wal {
             for key in self.blobs.keys() {
                 if !snap.blobs.contains_key(key)
-                    && let Err(e) = wal.log_delete(key)
+                    && let Err(e) = wal.log_delete(Some(XACT_AUTOCOMMIT), key)
                 {
                     eprintln!("blob WAL: failed to log rollback delete for '{key}': {e}");
                 }
@@ -1106,6 +1177,7 @@ impl BlobStore {
                 };
                 if differs
                     && let Err(e) = wal.log_store_meta(
+                        Some(XACT_AUTOCOMMIT),
                         key,
                         meta.content_type.as_deref(),
                         meta.size,
@@ -1925,7 +1997,13 @@ mod tests {
         // most reads must come off disk.
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut store = BlobStore::open_with_options(dir.path(), 64, 128).unwrap();
+            let mut store = BlobStore::open_with_options(
+                dir.path(),
+                64,
+                128,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
             for i in 0..50u8 {
                 store.put(&format!("blob-{i}"), &[i; 100], None);
             }
@@ -1938,7 +2016,9 @@ mod tests {
             }
         }
         // And again after restart (cache starts cold).
-        let store = BlobStore::open_with_options(dir.path(), 64, 128).unwrap();
+        let store =
+            BlobStore::open_with_options(dir.path(), 64, 128, &std::collections::HashSet::new())
+                .unwrap();
         for i in 0..50u8 {
             assert_eq!(store.get(&format!("blob-{i}")).unwrap(), vec![i; 100]);
         }
@@ -1947,7 +2027,9 @@ mod tests {
     #[test]
     fn disk_delete_reclaims_space_after_gc() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = BlobStore::open_with_options(dir.path(), 64, 1024).unwrap();
+        let mut store =
+            BlobStore::open_with_options(dir.path(), 64, 1024, &std::collections::HashSet::new())
+                .unwrap();
         for i in 0..20u8 {
             store.put(&format!("b{i}"), &[i; 200], None);
         }
@@ -1962,7 +2044,9 @@ mod tests {
         store.put("fresh", b"fresh data", None);
         assert_eq!(store.get("fresh").unwrap(), b"fresh data");
         drop(store);
-        let store = BlobStore::open_with_options(dir.path(), 64, 1024).unwrap();
+        let store =
+            BlobStore::open_with_options(dir.path(), 64, 1024, &std::collections::HashSet::new())
+                .unwrap();
         assert_eq!(store.blob_count(), 1);
         assert_eq!(store.get("fresh").unwrap(), b"fresh data");
     }
@@ -2084,7 +2168,9 @@ mod tests {
         // Tiny cache, many interleaved puts/overwrites/deletes/reads; every
         // observable read must match a plain HashMap reference model.
         let dir = tempfile::tempdir().unwrap();
-        let mut store = BlobStore::open_with_options(dir.path(), 16, 256).unwrap();
+        let mut store =
+            BlobStore::open_with_options(dir.path(), 16, 256, &std::collections::HashSet::new())
+                .unwrap();
         let mut model: HashMap<String, Vec<u8>> = HashMap::new();
 
         let mut seed = 0xDEADBEEFu64;
@@ -2138,7 +2224,9 @@ mod tests {
             assert_eq!(store.get(key).unwrap(), *expected, "final get({key})");
         }
         drop(store);
-        let store = BlobStore::open_with_options(dir.path(), 16, 256).unwrap();
+        let store =
+            BlobStore::open_with_options(dir.path(), 16, 256, &std::collections::HashSet::new())
+                .unwrap();
         assert_eq!(store.blob_count(), model.len());
         for (key, expected) in &model {
             assert_eq!(

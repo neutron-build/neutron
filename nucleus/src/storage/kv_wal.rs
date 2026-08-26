@@ -36,7 +36,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -127,6 +127,21 @@ pub struct KvWal {
     /// RESP layer drains this after each command and answers `-MISCONF`
     /// instead of `+OK`.
     write_error: AtomicBool,
+    /// Records appended but whose in-memory effect the caller has not
+    /// applied yet (S63 TOCTOU).
+    ///
+    /// Every KV mutator logs BEFORE it mutates its shard, so between the two
+    /// the log is ahead of memory — and `KvStore::checkpoint_gated` collects
+    /// its snapshot from memory. A checkpoint that snapshotted memory while a
+    /// writer was in that window produced a snapshot missing the record and
+    /// then replaced the whole log with it: an acknowledged write, gone from
+    /// disk, alive only in the memory of the process that had not applied it
+    /// yet. `quiesce_mark` waits for this to reach zero while holding the
+    /// writer lock, which no new writer can pass; the in-flight count is
+    /// taken UNDER that lock (in `begin_op`), so the drain cannot deadlock
+    /// or chase. The same design `CollectionWal` already carries for the
+    /// same reason.
+    in_flight: AtomicU64,
     /// Test-only: fail the next record, to exercise that path without a full
     /// disk. `kv.wal_append` covers the same path out-of-process.
     #[cfg(test)]
@@ -134,6 +149,22 @@ pub struct KvWal {
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
     #[cfg(test)]
     fail_reopen_once: AtomicBool,
+}
+
+/// Outstanding-append guard: alive from the moment a record is about to be
+/// logged until the caller has applied its effect to the shards. A
+/// checkpoint's quiesce may not snapshot memory while any of these exist,
+/// because memory is behind the log by exactly those records.
+#[must_use = "hold this until the record's effect has been applied, or a \
+              checkpoint can snapshot memory that is missing it"]
+pub struct WalOp<'a> {
+    wal: &'a KvWal,
+}
+
+impl Drop for WalOp<'_> {
+    fn drop(&mut self) {
+        self.wal.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl KvWal {
@@ -172,6 +203,7 @@ impl KvWal {
                 max_xact_id,
                 stranded: AtomicBool::new(false),
                 write_error: AtomicBool::new(false),
+                in_flight: AtomicU64::new(0),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
                 #[cfg(test)]
@@ -179,6 +211,55 @@ impl KvWal {
             },
             state,
         ))
+    }
+
+    /// Mark an operation in flight before it is logged; the guard must be
+    /// held until the record's effect is applied to the shards (see
+    /// `in_flight`). The count is taken under the writer lock so a
+    /// concurrently quiescing checkpoint either sees this writer before it
+    /// appends (and waits) or does not (the writer is blocked on the lock and
+    /// its record postdates the checkpoint's mark, which the mark check
+    /// catches).
+    pub fn begin_op(&self) -> WalOp<'_> {
+        let _w = self.writer.lock();
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        WalOp { wal: self }
+    }
+
+    /// Quiesce point for `KvStore::checkpoint_gated` (the TOCTOU fix): wait
+    /// for every in-flight writer to finish applying, then — under the
+    /// writer lock, where no new append or in-flight count can appear —
+    /// capture the append mark. On return, every record this log holds is
+    /// visible in memory (bracketed writers have applied; writers whose
+    /// append+apply are atomic under a shard write lock serialize with the
+    /// collection through that same lock), so a keyspace snapshot taken next
+    /// sees them all — and any record appended afterwards moves the mark,
+    /// which [`Self::checkpoint_retaining`] declines on.
+    ///
+    /// The wait itself is lock-free on purpose: a shard-locked appender needs
+    /// this writer lock to finish its record, while a bracketed writer in
+    /// its apply phase may need that shard — holding the writer lock across
+    /// the wait would close that cycle into a deadlock. Re-checked under the
+    /// lock instead, where the count is stable.
+    pub fn quiesce_mark(&self) -> u64 {
+        let mut spins = 0u32;
+        loop {
+            while self.in_flight.load(Ordering::Acquire) > 0 {
+                // wrapping: a parked writer can legitimately be spun past
+                // u32::MAX here; the count only sets the yield cadence.
+                spins = spins.wrapping_add(1);
+                if spins.is_multiple_of(1024) {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            let w = self.writer.lock();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return self.syncer.current();
+            }
+            drop(w);
+        }
     }
 
     /// The highest coordinating transaction id this log recovered (S63), 0
@@ -403,46 +484,76 @@ impl KvWal {
         self.syncer.is_dirty()
     }
 
+    /// The current append LSN — the number of records this log has taken.
+    /// Captured by `KvStore::checkpoint_gated` before it collects the
+    /// keyspace, so the checkpoint can verify afterwards that no append
+    /// landed in the collection window (the TOCTOU half of
+    /// [`Self::checkpoint_retaining`]).
+    pub fn append_mark(&self) -> u64 {
+        self.syncer.current()
+    }
+
     /// Write the complete current state as a single SNAPSHOT entry and
     /// truncate the log to just that entry.
     ///
     /// `items` is a slice of `(key, value, optional_ttl_absolute_ms)`.
     pub fn checkpoint(&self, items: &[(String, Value, Option<u64>)]) -> io::Result<()> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(items.len() as u32).to_le_bytes());
-        for (key, val, ttl) in items {
-            // key
-            let kb = key.as_bytes();
-            payload.extend_from_slice(&(kb.len() as u32).to_le_bytes());
-            payload.extend_from_slice(kb);
-            // value
-            let mut val_buf = Vec::new();
-            encode_value(val, &mut val_buf);
-            payload.extend_from_slice(&(val_buf.len() as u32).to_le_bytes());
-            payload.extend_from_slice(&val_buf);
-            // TTL
-            match ttl {
-                Some(ms) => {
-                    payload.push(1u8);
-                    payload.extend_from_slice(&ms.to_le_bytes());
-                }
-                None => {
-                    payload.push(0u8);
-                    payload.extend_from_slice(&0u64.to_le_bytes());
-                }
-            }
-        }
+        self.replace_with_snapshot(encode_snapshot_payload(items))
+    }
 
+    /// [`Self::checkpoint`] plus the collect-vs-replace race guard: the
+    /// caller snapshotted the keyspace when the log's append mark was
+    /// `observed_mark`, and the replacement proceeds ONLY if the mark is
+    /// still `observed_mark` — the check and the rename happen under ONE
+    /// hold of the writer lock (the same mutex every append takes), so no
+    /// append can slip between them.
+    ///
+    /// Without this, an autocommit write (RESP `SET`, the fast path — never
+    /// an enlisted transaction, so the S7 gate cannot see it) that landed
+    /// between the keyspace collection and the log replacement was acked and
+    /// then silently truncated away: absent from the snapshot because its
+    /// shard was already read, absent from the log because the rename
+    /// discarded its record. A crash then lost an acknowledged write. A
+    /// moved mark declines with `WouldBlock` so the caller can re-collect.
+    pub fn checkpoint_retaining(
+        &self,
+        observed_mark: u64,
+        items: &[(String, Value, Option<u64>)],
+    ) -> io::Result<()> {
+        let payload = encode_snapshot_payload(items);
+        let w = self.writer.lock();
+        if self.syncer.current() != observed_mark {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "declined: an append landed between the keyspace collection and \
+                 the log replacement; re-collect (KV checkpoint TOCTOU)",
+            ));
+        }
+        self.replace_with_snapshot_locked(w, payload)
+    }
+
+    /// The shared replace half of both checkpoint variants: serialize the
+    /// SNAPSHOT body, then swap the log for it while the caller-held writer
+    /// lock stays held. Holding one guard across `checkpoint_retaining`'s
+    /// mark check and this rename is what serializes them against every
+    /// append — the property that closes the window.
+    fn replace_with_snapshot(&self, payload: Vec<u8>) -> io::Result<()> {
+        let w = self.writer.lock();
+        self.replace_with_snapshot_locked(w, payload)
+    }
+
+    /// The lock-holding body of the replace; `w` must be this log's writer
+    /// guard. No append can run while it executes.
+    fn replace_with_snapshot_locked(
+        &self,
+        mut w: parking_lot::MutexGuard<'_, BufWriter<File>>,
+        payload: Vec<u8>,
+    ) -> io::Result<()> {
         // Serialize the complete new log body (SNAPSHOT tag + payload, no key prefix).
         let mut contents = Vec::with_capacity(payload.len() + 1);
         contents.push(ENTRY_SNAPSHOT);
         contents.extend_from_slice(&payload);
 
-        // Hold the writer lock across the whole checkpoint so no append can interleave
-        // between the flush and the reopen. Replace atomically — temp file + fsync +
-        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
-        // never an empty file.
-        let mut w = self.writer.lock();
         w.flush()?;
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         // The reopen is the hazardous half: the rename above already unlinked
@@ -487,6 +598,36 @@ impl KvWal {
 }
 
 // ─── Record encoding ─────────────────────────────────────────────────────────
+
+/// Encode the SNAPSHOT payload: item count, then per item
+/// key(u32 len + bytes), value(u32 len + encoded), TTL (presence byte + ms).
+fn encode_snapshot_payload(items: &[(String, Value, Option<u64>)]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for (key, val, ttl) in items {
+        // key
+        let kb = key.as_bytes();
+        payload.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+        payload.extend_from_slice(kb);
+        // value
+        let mut val_buf = Vec::new();
+        encode_value(val, &mut val_buf);
+        payload.extend_from_slice(&(val_buf.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&val_buf);
+        // TTL
+        match ttl {
+            Some(ms) => {
+                payload.push(1u8);
+                payload.extend_from_slice(&ms.to_le_bytes());
+            }
+            None => {
+                payload.push(0u8);
+                payload.extend_from_slice(&0u64.to_le_bytes());
+            }
+        }
+    }
+    payload
+}
 
 /// Emit the tag for one record: the `_XACT` twin plus the id when `xact` is
 /// `Some`, the legacy untagged tag when `None`.
@@ -904,6 +1045,94 @@ mod tests {
     /// the pre-S63 replay contract the legacy round-trip tests exercise.
     fn open_keep_all(dir: &Path) -> io::Result<(KvWal, KvWalState)> {
         KvWal::open(dir, &HashSet::new())
+    }
+
+    // ── KV checkpoint TOCTOU: the quiesce and the retain ─────────────────
+
+    /// `quiesce_mark` may only return once every in-flight writer has
+    /// drained, and its mark must then cover those writers' appends — that
+    /// is what lets `KvStore::checkpoint_gated` trust a keyspace snapshot
+    /// taken next. The writer parks between its append and its apply until
+    /// released; a quiesce that returned early would come back before the
+    /// sleep floor and with a mark that misses the record.
+    #[test]
+    fn quiesce_mark_waits_for_in_flight_appends() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = open_keep_all(dir.path()).unwrap();
+        let wal = Arc::new(wal);
+        // Three parties meet at the barrier: the writer (about to park
+        // in flight), the releaser (about to sleep), and the quiescer.
+        let barrier = Arc::new(Barrier::new(3));
+        let release = Arc::new(AtomicBool::new(false));
+
+        let w_wal = Arc::clone(&wal);
+        let w_barrier = Arc::clone(&barrier);
+        let w_release = Arc::clone(&release);
+        let writer = std::thread::spawn(move || {
+            let _op = w_wal.begin_op();
+            w_wal
+                .log_set(Some(XACT_AUTOCOMMIT), "slow", &Value::Text("v".into()))
+                .unwrap();
+            // In flight: the record is in the log, the "apply" (the guard's
+            // drop) has not happened. Park until released.
+            w_barrier.wait();
+            while !w_release.load(AtomicOrdering::Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+
+        let releaser_barrier = Arc::clone(&barrier);
+        let releaser_release = Arc::clone(&release);
+        let releaser = std::thread::spawn(move || {
+            releaser_barrier.wait();
+            std::thread::sleep(Duration::from_millis(150));
+            releaser_release.store(true, AtomicOrdering::Release);
+        });
+
+        barrier.wait();
+        let t0 = Instant::now();
+        let mark = wal.quiesce_mark();
+        let waited = t0.elapsed();
+        writer.join().unwrap();
+        releaser.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(100),
+            "quiesce_mark returned in {waited:?} while a writer was parked \
+             in flight — it must wait for the drain"
+        );
+        assert_eq!(
+            mark, 1,
+            "the mark must cover the in-flight writer's appended record"
+        );
+    }
+
+    /// `checkpoint_retaining` declines when the mark moved after the
+    /// snapshot was taken, and the decline leaves the log untouched — the
+    /// record that landed in the window survives for the retry.
+    #[test]
+    fn checkpoint_retaining_declines_when_the_mark_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = open_keep_all(dir.path()).unwrap();
+        wal.log_set(Some(XACT_AUTOCOMMIT), "a", &Value::Text("one".into()))
+            .unwrap();
+        let stale_mark = wal.append_mark();
+        // The racing append: acked after the snapshot was (pretend-)taken.
+        wal.log_set(Some(XACT_AUTOCOMMIT), "b", &Value::Text("two".into()))
+            .unwrap();
+
+        let err = wal
+            .checkpoint_retaining(stale_mark, &[("a".into(), Value::Text("one".into()), None)])
+            .expect_err("a moved mark must decline the replace");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        drop(wal);
+        let (wal2, state) = open_keep_all(dir.path()).unwrap();
+        assert_eq!(state.items.len(), 2, "the decline left both records live");
+        drop(wal2);
     }
 
     // ── S63: the recovery filter ──────────────────────────────────────────

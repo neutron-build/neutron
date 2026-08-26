@@ -2,12 +2,36 @@
 //!
 //! Provides crash-recovery by recording all collection mutations (Lists, Hashes,
 //! Sets, Sorted Sets, HyperLogLog, Streams) to an append-only log file (`collections.wal`).
-//! On restart the log is replayed to reconstruct in-memory state.
+//! On restart the log is replayed from top to bottom to reconstruct in-memory state.
 //!
 //! ## Log entry binary format
 //! ```text
 //! Each entry: [op: u8] [key_len: u32 LE] [key: bytes] [data_len: u32 LE] [data: bytes]
 //! ```
+//!
+//! ## Transaction-tagged records (S63)
+//!
+//! Every mutation op also has a tagged twin at `op | 0x40`, carrying the
+//! coordinating transaction id (`u64 LE`) between the op byte and the key.
+//! Replay keeps a tagged record only if its id is `XACT_AUTOCOMMIT` (0 —
+//! written outside any explicit transaction, whose durability point is this
+//! log's own fsync) or appears in the committed set recovered from the SQL
+//! side; everything else was written inside a transaction that never
+//! committed and is discarded — absence of a commit record means discard,
+//! always. The untagged ops keep their keep-unconditional meaning, so
+//! pre-S63 logs replay unchanged.
+//!
+//! Today every record this log takes carries `XACT_AUTOCOMMIT`: M8's
+//! fail-loud boundary (`refused_in_transaction`) refuses every SQL
+//! collection mutator inside an explicit transaction — the store has no
+//! rollback before-image — and the RESP writers are autocommit by nature.
+//! The tagging machinery is live anyway (the executor brackets each SQL
+//! mutator with `set_xact_tag`, the replay filter and the XactId floor are
+//! wired) so that if the boundary is ever lifted behind a before-image
+//! design, the records are already tagged and the filter already discards
+//! them; an untagged writer would reintroduce exactly the resurrection
+//! defect S63 exists to close. A SNAPSHOT is committed by construction and
+//! never tagged.
 //!
 //! A SNAPSHOT entry resets all collection state. After `checkpoint()` the file
 //! is truncated to a single SNAPSHOT entry so the log stays small.
@@ -20,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 use crate::kv::{HyperLogLog, SortedSet};
 use crate::types::Value;
 
@@ -63,6 +88,12 @@ const OP_XACK: u8 = 51;
 const OP_XREADGROUP: u8 = 52;
 const OP_GEOADD: u8 = 53;
 const OP_SNAPSHOT: u8 = 60;
+
+/// S63: the tagged twin of op `o` is `o | OP_XACT_FLAG`, carrying the
+/// coordinating transaction id right after the op byte. Every mutation op is
+/// at most 53, so the twins live in 0x41..0x75 and cannot collide with an
+/// existing op — renumbering the ops themselves would corrupt old logs.
+const OP_XACT_FLAG: u8 = 0x40;
 
 // ─── Value encoding (same scheme as kv_wal) ─────────────────────────────────
 
@@ -260,6 +291,13 @@ pub struct CollectionWal {
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
     #[cfg(test)]
     fail_reopen_once: AtomicBool,
+    /// The coordinating transaction id tagging every record written while it
+    /// is set (S63). `XACT_AUTOCOMMIT` by default and, today, always: see the
+    /// module header — the M8 boundary refuses SQL collection mutators inside
+    /// transactions, and RESP writers are autocommit.
+    xact_tag: AtomicU64,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
 }
 
 /// Outstanding-append guard: alive from the moment a record reaches the log
@@ -280,33 +318,44 @@ impl Drop for InFlight<'_> {
 }
 
 impl CollectionWal {
-    /// Open or create the collections WAL file in `dir`.
-    ///
-    /// Returns `(wal, recovered_collections)`. If no WAL file exists a fresh
-    /// `ShardedCollections` is returned. A torn trailing record is still
-    /// ignored — a crash can always half-write the last append, and dropping it
-    /// is correct WAL behaviour.
+    /// Open or create the collections WAL file in `dir`, replaying with an
+    /// EMPTY committed set so every tagged record keeps — the pre-S63
+    /// contract. The executor opens through
+    /// [`CollectionWal::open_with_committed`] instead, passing the
+    /// coordinating transaction ids the SQL side durably committed so the
+    /// S63 replay filter can discard the rest.
+    pub fn open(dir: &Path) -> io::Result<(Self, ShardedCollections)> {
+        Self::open_with_committed(dir, &std::collections::HashSet::new())
+    }
+
+    /// Open or create the collections WAL file in `dir` whose replay is
+    /// filtered by the S63 committed set: a tagged record whose coordinating
+    /// transaction id is neither `XACT_AUTOCOMMIT` nor in `committed` was
+    /// written inside a transaction that never committed, and is discarded.
     ///
     /// **Structural corruption is an error, not an empty result.** This used to
     /// return `Ok` no matter what replay found, so `Executor::open_durable` —
     /// which exists precisely to shout "this model is now VOLATILE" — could
     /// never fire for this store. Recovery could detect corruption and had no
     /// way to say so.
-    pub fn open(dir: &Path) -> io::Result<(Self, ShardedCollections)> {
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &std::collections::HashSet<u64>,
+    ) -> io::Result<(Self, ShardedCollections)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("collections.wal");
-        let collections = if path.exists() {
+        let (collections, max_xact_id) = if path.exists() {
             let data = std::fs::read(&path)?;
-            let outcome = replay(&data);
+            let outcome = replay(&data, committed);
             if let Some(reason) = outcome.corruption {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("{}: {reason}", path.display()),
                 ));
             }
-            outcome.collections
+            (outcome.collections, outcome.max_xact_id)
         } else {
-            ShardedCollections::new()
+            (ShardedCollections::new(), 0)
         };
         let existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -333,9 +382,35 @@ impl CollectionWal {
                 fail_next_append: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_reopen_once: AtomicBool::new(false),
+                xact_tag: AtomicU64::new(XACT_AUTOCOMMIT),
+                max_xact_id,
             },
             collections,
         ))
+    }
+
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    pub fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
+    }
+
+    /// Tag the records written from now on with the coordinating transaction
+    /// id `xact` (S63). Must be paired with [`Self::reset_xact_tag`] around
+    /// exactly one command. Process-global on purpose: today only autocommit
+    /// writers exist (see the module header), so concurrent holders always
+    /// agree on `XACT_AUTOCOMMIT`; making collection writes transactional
+    /// requires a before-image design that must also make this per-session
+    /// or param-threaded.
+    pub fn set_xact_tag(&self, xact: u64) {
+        self.xact_tag.store(xact, Ordering::Release);
+    }
+
+    /// Reset the coordinating tag to `XACT_AUTOCOMMIT`; the bracket-closer of
+    /// [`Self::set_xact_tag`].
+    pub fn reset_xact_tag(&self) {
+        self.xact_tag.store(XACT_AUTOCOMMIT, Ordering::Release);
     }
 
     /// Mark an operation in flight before it is logged.
@@ -374,7 +449,9 @@ impl CollectionWal {
     }
 
     /// Append a WAL entry: op(u8) + key_len(u32) + key + data_len(u32) + data,
-    /// followed on a v2 log by a CRC32C(u32) over all of it.
+    /// followed on a v2 log by a CRC32C(u32) over all of it. The record is
+    /// written as the tagged twin `op | OP_XACT_FLAG` carrying the current
+    /// coordinating transaction id (S63).
     fn append(&self, op: u8, key: &str, data: &[u8]) -> io::Result<InFlight<'_>> {
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
@@ -386,7 +463,8 @@ impl CollectionWal {
             return Err(e);
         }
         let mut buf = Vec::new();
-        buf.push(op);
+        buf.push(op | OP_XACT_FLAG);
+        buf.extend_from_slice(&self.xact_tag.load(Ordering::Acquire).to_le_bytes());
         write_string(key, &mut buf);
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(data);
@@ -1017,6 +1095,11 @@ struct ReplayOutcome {
     /// correct behaviour. What belongs here is a record whose framing is intact
     /// and whose contents are not — which no crash produces.
     corruption: Option<String>,
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded (S63). Seeds the XactId
+    /// high-water mark at executor construction so a reopened process never
+    /// mints an id a surviving tagged record already carries.
+    max_xact_id: u64,
 }
 
 /// Whether a log body opens with the v2 magic.
@@ -1024,9 +1107,10 @@ fn starts_with_magic(data: &[u8]) -> bool {
     data.len() >= WAL_MAGIC_V2.len() && &data[..WAL_MAGIC_V2.len()] == WAL_MAGIC_V2
 }
 
-fn replay(data: &[u8]) -> ReplayOutcome {
+fn replay(data: &[u8], committed: &std::collections::HashSet<u64>) -> ReplayOutcome {
     let collections = ShardedCollections::new();
     let mut corruption: Option<String> = None;
+    let mut max_xact_id: u64 = 0;
     let mut pos = 0usize;
     let checksummed = starts_with_magic(data);
     if checksummed {
@@ -1037,8 +1121,27 @@ fn replay(data: &[u8]) -> ReplayOutcome {
         // Where this record begins, so a corruption report can name the offset
         // rather than just the fact.
         let rec_start = pos;
-        let Some(&op) = data.get(pos) else { break };
+        let Some(&op_raw) = data.get(pos) else { break };
         pos += 1;
+
+        // S63: a tagged record (op | OP_XACT_FLAG) carries the coordinating
+        // transaction id next. The filter decision — keep only autocommit and
+        // committed ids — happens BEFORE the body is interpreted, but the
+        // body is still framed and CRC-checked either way: the record must be
+        // fully consumed to find the next one, and a corrupt discarded record
+        // is still corruption, not a free pass to skip it.
+        let tagged = op_raw & OP_XACT_FLAG != 0;
+        let op = op_raw & !OP_XACT_FLAG;
+        let mut keep_tagged = true;
+        if tagged {
+            let Some(id_bytes) = data.get(pos..pos + 8) else {
+                break;
+            };
+            let xact = u64::from_le_bytes(id_bytes.try_into().unwrap());
+            pos += 8;
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
 
         // Frame the record from its LENGTHS ONLY, without interpreting a byte
         // of it. The checksum has to be verified before anything is decoded:
@@ -1097,6 +1200,12 @@ fn replay(data: &[u8]) -> ReplayOutcome {
                 break;
             }
         };
+
+        // S63: the record is fully framed and verified; discard rather than
+        // apply when its transaction never committed.
+        if tagged && !keep_tagged {
+            continue;
+        }
 
         match op {
             OP_LPUSH | OP_RPUSH => {
@@ -1366,6 +1475,7 @@ fn replay(data: &[u8]) -> ReplayOutcome {
     ReplayOutcome {
         collections,
         corruption,
+        max_xact_id,
     }
 }
 
@@ -1377,6 +1487,77 @@ mod tests {
     #![allow(clippy::approx_constant)]
     use super::*;
     use crate::types::Value;
+
+    // ── S63: the recovery filter ──────────────────────────────────────────
+
+    /// The filter no SQL statement can exercise today (M8's
+    /// `refused_in_transaction` boundary keeps collection mutators out of
+    /// transactions, so no tagged record with a live id can be produced
+    /// through the executor): autocommit records keep, committed ids keep,
+    /// unknown ids discard — and a discarded record in the MIDDLE does not
+    /// stop the records after it. Proven here so the day the boundary lifts
+    /// behind a before-image design, the discard is already correct.
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = CollectionWal::open(dir.path()).unwrap();
+            // Autocommit record: keep.
+            drop(wal.log_hset("h", "auto", &Value::Text("a".into())));
+            // Tagged writers, the shape the executor bracket would produce
+            // the moment the M8 boundary lifts.
+            wal.set_xact_tag(7);
+            drop(wal.log_hset("h", "committed", &Value::Text("c".into())));
+            wal.reset_xact_tag();
+            wal.set_xact_tag(8); // never commits — both records below discard
+            drop(wal.log_hset("h", "never", &Value::Text("n".into())));
+            drop(wal.log_del("h")); // would destroy the hash if replayed
+            wal.reset_xact_tag();
+            wal.set_xact_tag(9);
+            drop(wal.log_hset("h", "late", &Value::Text("l".into())));
+            wal.reset_xact_tag();
+        }
+
+        let committed: std::collections::HashSet<u64> = [7u64, 9u64].into_iter().collect();
+        let (_wal2, colls) = CollectionWal::open_with_committed(dir.path(), &committed).unwrap();
+        let fields = colls
+            .hgetall("h")
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                "auto".to_string(),
+                "committed".to_string(),
+                "late".to_string()
+            ],
+            "id 8 never committed; its HSET and its DEL must both be \
+             discarded, not replayed"
+        );
+    }
+
+    /// `max_xact_id` seeds the executor's XactId floor from discarded
+    /// records too — the whole point of the floor (see `enlistment`).
+    #[test]
+    fn max_xact_id_covers_discarded_records() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = CollectionWal::open(dir.path()).unwrap();
+            wal.set_xact_tag(5);
+            drop(wal.log_hset("h", "f", &Value::Text("v".into())));
+            wal.reset_xact_tag();
+        }
+        let (wal2, colls) =
+            CollectionWal::open_with_committed(dir.path(), &std::collections::HashSet::new())
+                .unwrap();
+        assert_eq!(wal2.max_xact_id(), 5);
+        assert!(
+            colls.hgetall("h").unwrap().is_empty(),
+            "the uncommitted record is discarded but still pins the floor"
+        );
+    }
 
     #[test]
     fn group_sync_marks_clean() {

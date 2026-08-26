@@ -3,9 +3,14 @@
 //! and the document WAL (`doc.wal`), slice 4 between SQL and the
 //! property-graph WAL (`graph.wal`), slices 5-7 between SQL and the
 //! timeseries (`ts_wal.bin`), datalog (`datalog.wal`) and columnar-model
-//! (`columnar.wal`) logs. (The geo WAL is opened but receives zero writes
-//! — see `src/geo/wal.rs`'s header for the determination — so there is
-//! nothing to make atomic on that side.)
+//! (`columnar.wal`) logs, slice 9 between SQL and the blob store
+//! (`blob.wal`). The KV collections WAL (`collections.wal`) is tagged and
+//! filtered but boundary-held: M8 refuses its mutators inside transactions,
+//! so only the autocommit shape is assertable through SQL. (The geo WAL is
+//! opened but receives zero writes — see `src/geo/wal.rs`'s header for the
+//! determination — so there is nothing to make atomic on that side. The CDC
+//! WAL is fire-and-forget by design — see `src/reactive/cdc_wal.rs`'s
+//! header and NU-107 — so it records no coordinating ids to filter.)
 //!
 //! The mechanism under test, end to end: every streams/KV WAL record written
 //! inside an explicit transaction is tagged with that transaction's
@@ -1506,6 +1511,326 @@ async fn autocommit_columnar_insert_survives_reopen_without_a_commit_record() {
 // above), and the WAL-level filter test covers the discard itself.
 // `every_mutating_function_is_enlisted_refused_or_declared` in
 // `test_specialty_surface_guard` is what enforces that the refusal stays.
+
+// ══════════════════════════════════════════════════════════════════════════
+// S63 slice 9: the blob store WAL (blob.wal)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// BLOB_GET as hex `Option<String>`: `None` means the blob is absent.
+async fn blob_get(ex: &Executor, key: &str) -> Option<String> {
+    let r = exec(ex, &format!("SELECT BLOB_GET('{key}')")).await;
+    match scalar(&r[0]) {
+        Value::Text(s) => Some(s.clone()),
+        Value::Null => None,
+        other => panic!("BLOB_GET({key}) returned {other:?}"),
+    }
+}
+
+fn hex(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The S63 discard direction for blob: dropping the executor
+/// mid-transaction is the durable equivalent of dying before the COMMIT
+/// record — the blob manifest was flushed by its statement, and nothing
+/// vouches for its id. No compensation runs (the transaction is abandoned,
+/// not rolled back), so the only thing standing between the flushed tagged
+/// record and recovery is the filter. The committed transaction's blob in
+/// the SAME log survives — the both-directions proof.
+#[tokio::test]
+async fn uncommitted_blob_put_is_discarded_and_committed_kept_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+        // Committed: SQL row + blob manifest, both tagged with the txn's id,
+        // vouched for by the COMMIT record body.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (1, 'kept')").await;
+        exec(
+            &ex,
+            &format!("SELECT BLOB_STORE('kept_b', '{}')", hex("kept")),
+        )
+        .await;
+        exec(&ex, "COMMIT").await;
+        // Abandoned: manifest flushed to blob.wal, COMMIT never happens. No
+        // rollback compensation runs — the filter alone must discard it.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (2, 'lost')").await;
+        exec(
+            &ex,
+            &format!("SELECT BLOB_STORE('lost_b', '{}')", hex("lost")),
+        )
+        .await;
+        // no COMMIT, no ROLLBACK — drop(ex) below abandons it
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        blob_get(&ex, "kept_b").await,
+        Some(hex("kept")),
+        "the committed transaction's blob is vouched for and must survive"
+    );
+    assert_eq!(
+        blob_get(&ex, "lost_b").await,
+        None,
+        "the abandoned transaction's blob record was flushed to blob.wal and \
+         must be discarded by the filter, not replayed"
+    );
+    let rows = exec(&ex, "SELECT v FROM t ORDER BY id").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the abandoned transaction's SQL row is gone too"
+    );
+    assert_eq!(scalar(&rows[0]), &Value::Text("kept".into()));
+}
+
+/// Autocommit BLOB_STOREs carry XACT_AUTOCOMMIT (0) and never need a commit
+/// record — their durability point is the blob log's own fsync.
+#[tokio::test]
+async fn autocommit_blob_put_survives_reopen_without_a_commit_record() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(
+            &ex,
+            &format!("SELECT BLOB_STORE('auto_b', '{}')", hex("one")),
+        )
+        .await;
+        exec(
+            &ex,
+            &format!("SELECT BLOB_STORE('auto_b', '{}')", hex("two")),
+        )
+        .await;
+        assert_eq!(blob_get(&ex, "auto_b").await, Some(hex("two")));
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        blob_get(&ex, "auto_b").await,
+        Some(hex("two")),
+        "autocommit records carry id 0 and must never be filtered"
+    );
+}
+
+/// A rolled-back transaction's tagged blob records are discarded by the
+/// filter on replay, and the rollback's compensating records (written
+/// XACT_AUTOCOMMIT) restore the before-image. The compensations handle this
+/// directly; the outcome is asserted rather than discriminated — the
+/// filter-only discriminator is the abandoned-transaction test above.
+#[tokio::test]
+async fn rolled_back_blob_puts_are_gone_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(
+            &ex,
+            &format!("SELECT BLOB_STORE('pre_b', '{}')", hex("pre")),
+        )
+        .await;
+        exec(&ex, "BEGIN").await;
+        exec(
+            &ex,
+            &format!("SELECT BLOB_STORE('pre_b', '{}')", hex("clobbered")),
+        )
+        .await;
+        exec(&ex, &format!("SELECT BLOB_STORE('rb_b', '{}')", hex("rb"))).await;
+        exec(&ex, "ROLLBACK").await;
+        assert_eq!(blob_get(&ex, "pre_b").await, Some(hex("pre")));
+        assert_eq!(blob_get(&ex, "rb_b").await, None);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        blob_get(&ex, "rb_b").await,
+        None,
+        "the rolled-back transaction's blob must not resurrect on reopen"
+    );
+    assert_eq!(
+        blob_get(&ex, "pre_b").await,
+        Some(hex("pre")),
+        "the overwritten blob's before-image must be what replay restores"
+    );
+}
+
+/// The blob half of the id-monotonicity proof (S1a/D2): after a run whose
+/// only surviving tagged record lives in blob.wal, a reopened executor must
+/// still mint ids ABOVE the id that record carries — otherwise the NEXT
+/// committed transaction would vouch for the abandoned record's id and
+/// resurrect it.
+#[tokio::test]
+async fn blob_tagged_ids_do_not_reuse_when_only_blob_wal_holds_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Run 1: an abandoned transaction tags a blob record with id 1. Nothing
+    // commits, so no COMMIT body exists anywhere afterwards.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "BEGIN").await;
+        exec(
+            &ex,
+            &format!("SELECT BLOB_STORE('abandoned_b', '{}')", hex("x")),
+        )
+        .await;
+        // abandon — no COMMIT, no ROLLBACK, no compensation
+    }
+
+    // Run 2: reopen. Only blob.wal's max tagged id (1) can hold the floor
+    // above 1.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        assert_eq!(
+            blob_get(&ex, "abandoned_b").await,
+            None,
+            "the abandoned record must be discarded on replay"
+        );
+        let next = ex.next_xact_id_probe();
+        assert!(
+            next > 1,
+            "id reuse: the next minted id is {next}, but blob.wal still holds \
+             a tagged record carrying id 1 — a fresh transaction with that id \
+             would resurrect it"
+        );
+        // Prove the resurrection the seed prevents: commit a NEW blob write.
+        // Its id is above 1, so vouching for it must not vouch for the
+        // abandoned record.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, &format!("SELECT BLOB_STORE('live_b', '{}')", hex("y"))).await;
+        exec(&ex, "COMMIT").await;
+    }
+
+    // Run 3: the live blob survives, the abandoned one stays dead.
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(blob_get(&ex, "live_b").await, Some(hex("y")));
+    assert_eq!(
+        blob_get(&ex, "abandoned_b").await,
+        None,
+        "the committed id must not vouch for the stale tagged record"
+    );
+}
+
+/// Blob joined the tagged logs' S7 gate with this slice (it was
+/// warn-and-continue before): a blob-enlisted transaction open at checkpoint
+/// time declines the blob WAL fold, because a SNAPSHOT_META carries no
+/// transaction id and would bake uncommitted manifests into a state the
+/// recovery filter cannot discard.
+#[tokio::test]
+async fn blob_enlistment_trips_the_s7_gate_on_its_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _engine) = open_segmented(dir.path()).await;
+
+    exec(&ex, "BEGIN").await;
+    exec(
+        &ex,
+        &format!("SELECT BLOB_STORE('gated_b', '{}')", hex("x")),
+    )
+    .await;
+    let err = ex
+        .checkpoint_blob_wal()
+        .expect_err("an open blob-enlisted transaction must decline the blob fold");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the decline is the S7 re-check, got {err}"
+    );
+    exec(&ex, "COMMIT").await;
+    ex.checkpoint_blob_wal()
+        .expect("with the transaction closed the fold proceeds");
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// S63: the KV collections WAL (collections.wal) — plumbed, boundary-held
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Why there is no uncommitted-discard test for collections here: M8's
+/// fail-loud boundary REFUSES every KV collection mutator inside an
+/// explicit transaction (the store has no rollback before-image — see
+/// `refused_in_transaction`), so the uncommitted-collections-record shape
+/// cannot be produced through SQL in the first place. The crash window is
+/// empty by construction, and the filter that would close it if the
+/// boundary is ever lifted is proven at the WAL level
+/// (`kv::collections_wal::tests::tagged_records_filter_on_the_committed_set`).
+/// Lifting the boundary additionally requires a before-image design and a
+/// race-free tag attribution (the tag is process-global — see
+/// `CollectionWal::set_xact_tag`); that is the escalation, not this file.
+///
+/// What IS asserted here: the plumbing is live end to end — autocommit
+/// collection writes now leave TAGGED records (id 0), and those replay
+/// across the reopen exactly as the untagged ones always did.
+#[tokio::test]
+async fn autocommit_collections_writes_leave_tagged_records_that_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "SELECT KV_HSET('h', 'f1', 'v1')").await;
+        exec(&ex, "SELECT KV_LPUSH('l', 'head')").await;
+        exec(&ex, "SELECT KV_ZADD('z', 3.5, 'm')").await;
+        exec(&ex, "SELECT KV_HSET('h', 'f2', 'v2')").await;
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    let r = exec(&ex, "SELECT KV_HGET('h', 'f1')").await;
+    assert_eq!(scalar(&r[0]), &Value::Text("v1".into()));
+    let r = exec(&ex, "SELECT KV_HGET('h', 'f2')").await;
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Text("v2".into()),
+        "tagged records replay in order — the second HSET must win"
+    );
+    let r = exec(&ex, "SELECT KV_ZRANGE('z', 0, -1)").await;
+    let zjson = text_of(r.into_iter().next().unwrap());
+    assert!(
+        zjson.contains("\"m\""),
+        "the tagged ZADD must replay: got {zjson}"
+    );
+    assert!(
+        zjson.contains("3.5"),
+        "the tagged ZADD's score must replay: got {zjson}"
+    );
+    let r = exec(&ex, "SELECT KV_LLEN('l')").await;
+    match scalar(&r[0]) {
+        Value::Int64(n) => assert_eq!(*n, 1, "the tagged LPUSH must replay"),
+        other => panic!("KV_LLEN returned {other:?}"),
+    }
+}
+
+/// The refusal itself is the boundary that makes the slice honest; keep a
+/// witness here beside the columnar one, so removing the guard shows up as
+/// a failing test in this file and not only in the surface-guard audit.
+#[tokio::test]
+async fn collections_mutators_are_refused_inside_a_transaction_the_m8_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _engine) = open_segmented(dir.path()).await;
+
+    exec(&ex, "BEGIN").await;
+    let err = ex
+        .execute("SELECT KV_HSET('refused_h', 'f', 'v')")
+        .await
+        .expect_err("the unrevertable collections write must be refused inside a transaction");
+    assert!(
+        err.to_string().contains("rollback"),
+        "the refusal must name the reason, got {err}"
+    );
+    exec(&ex, "ROLLBACK").await;
+
+    // Nothing partial was written: the hash holds nothing live, and the
+    // collections log replays to the same empty state across a reopen.
+    let r = exec(&ex, "SELECT KV_HGET('refused_h', 'f')").await;
+    assert_eq!(*scalar(&r[0]), Value::Null);
+    drop(ex);
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    let r = exec(&ex, "SELECT KV_HGET('refused_h', 'f')").await;
+    assert_eq!(
+        *scalar(&r[0]),
+        Value::Null,
+        "no record from the refused statement may reach recovery"
+    );
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // Slice 8: geo — documentation-only (see src/geo/wal.rs's header)

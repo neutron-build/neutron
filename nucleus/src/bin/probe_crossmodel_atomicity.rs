@@ -1,14 +1,15 @@
 //! Crash proof for cross-model atomicity (S63): SQL + Streams (slice 1),
 //! SQL + the KV strings WAL (slice 2), SQL + the document WAL (slice 3),
 //! SQL + the property-graph WAL (slice 4), SQL + the timeseries WAL
-//! (slice 5) and SQL + the datalog WAL (slice 6).
+//! (slice 5), SQL + the datalog WAL (slice 6) and SQL + the blob store
+//! WAL (slice 9).
 //!
 //! The claim under test is the discard half of Option D: a transaction that
 //! spans the SQL engine and a specialty model is atomic across a crash in the
 //! window between its specialty records and its SQL COMMIT record. The child
 //! runs `BEGIN; INSERT (SQL); STREAM_XADD / KV_SET / DOC_INSERT /
-//! GRAPH_ADD_NODE / TS_INSERT / DATALOG_ASSERT; COMMIT` and dies at
-//! `crossmodel.before_commit_record` — after the specialty record was
+//! GRAPH_ADD_NODE / TS_INSERT / DATALOG_ASSERT / BLOB_STORE; COMMIT` and dies
+//! at `crossmodel.before_commit_record` — after the specialty record was
 //! flushed to the WAL, before the COMMIT record (with the coordinating id
 //! in its body) exists. Recovery must discard BOTH halves: the specialty
 //! write because no commit record vouches for its id, the INSERT because it
@@ -19,12 +20,16 @@
 //! same reopen — a filter that passed the first half by dropping everything
 //! would pass the first assertion and fail this one.
 //!
-//! The columnar model WAL is deliberately absent: M8's fail-loud boundary
-//! (`refused_in_transaction`) refuses `COLUMNAR_INSERT` inside an explicit
+//! The columnar model WAL and the KV collections WAL are deliberately
+//! absent: M8's fail-loud boundary (`refused_in_transaction`) refuses
+//! `COLUMNAR_INSERT` and every collection mutator inside an explicit
 //! transaction, so the crash window this probe dies in cannot be entered
-//! for columnar — there is no child shape to run. The WAL-level filter is
-//! covered by `storage::columnar_wal::tests`. Geo is absent because its WAL
-//! receives zero writes (`src/geo/wal.rs`'s header records the evidence).
+//! for them — there is no child shape to run. Their WAL-level filters are
+//! covered by `storage::columnar_wal::tests` and
+//! `kv::collections_wal::tests`. Geo is absent because its WAL receives
+//! zero writes (`src/geo/wal.rs`'s header records the evidence). CDC is
+//! absent because it is fire-and-forget by design — no coordinating ids to
+//! filter (`src/reactive/cdc_wal.rs`'s header, NU-107).
 //!
 //! This harness runs the SERVED stack (segmented DiskEngine wrapped in
 //! BufferedDiskEngine), not the embedded durable_mvcc one, because that is
@@ -93,7 +98,8 @@ fn scalar_i64(res: &[ExecResult], sql: &str) -> Result<i64, String> {
 /// - "doc_crash"/"doc_commit" are the DOC_INSERT twins;
 /// - "graph_crash"/"graph_commit" are the GRAPH_ADD_NODE twins;
 /// - "ts_crash"/"ts_commit" are the TS_INSERT twins;
-/// - "dl_crash"/"dl_commit" are the DATALOG_ASSERT twins.
+/// - "dl_crash"/"dl_commit" are the DATALOG_ASSERT twins;
+/// - "blob_crash"/"blob_commit" are the BLOB_STORE twins.
 fn child_main(dir: &str, mode: &str) -> ! {
     std::panic::set_hook(Box::new(|_| {}));
     let rt = tokio::runtime::Runtime::new().expect("child rt");
@@ -140,6 +146,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            "blob_crash" | "blob_commit" => {
+                step("SELECT BLOB_STORE('xm_b', '74786e')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             _ => {
                 step("SELECT STREAM_XADD('s', 'kind', 'txn')")
                     .await
@@ -177,6 +188,11 @@ fn child_main(dir: &str, mode: &str) -> ! {
             }
             "dl_commit" => {
                 step("SELECT DATALOG_ASSERT('auto_fact(a, b).')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "blob_commit" => {
+                step("SELECT BLOB_STORE('auto_b', '6175746f')") // hex("auto")
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -424,6 +440,51 @@ fn recover_and_check_graph(
     Ok(())
 }
 
+/// The blob twin of `recover_and_check`: `expect` maps blob ids to the hex
+/// payload that must have recovered; ids in `absent` must be NULL.
+fn recover_and_check_blob(
+    dir: &Path,
+    expect_rows: i64,
+    expect: &[(&str, &str)],
+    absent: &[&str],
+) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let ex = build_executor(dir)?;
+    let rows = rt.block_on(execute(&ex, "SELECT COUNT(*) FROM t"))?;
+    let rows = scalar_i64(&rows, "COUNT(*)")?;
+    if rows != expect_rows {
+        return Err(format!(
+            "SQL rows: expected {expect_rows}, recovered {rows}"
+        ));
+    }
+    let ids: Vec<&str> = expect
+        .iter()
+        .map(|(id, _)| *id)
+        .chain(absent.iter().copied())
+        .collect();
+    for id in ids {
+        let res = rt.block_on(execute(&ex, &format!("SELECT BLOB_GET('{id}')")))?;
+        let got = match res.first() {
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Text(v)) => Some(v.clone()),
+                Some(Value::Null) | None => None,
+                other => return Err(format!("BLOB_GET({id}) returned {other:?}")),
+            },
+            other => return Err(format!("BLOB_GET({id}) returned {other:?}")),
+        };
+        let want = expect
+            .iter()
+            .find(|(wid, _)| *wid == id)
+            .map(|(_, w)| w.to_string());
+        if got != want {
+            return Err(format!(
+                "BLOB_GET('{id}'): expected {want:?}, recovered {got:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     if raw.len() >= 4 && raw[1] == "--child" {
@@ -538,6 +599,22 @@ fn main() {
             }),
             pass_msg: "commit direction: committed txn (row + tagged DATALOG_ASSERT) and \
                  autocommit DATALOG_ASSERT all survive reopen",
+        },
+        Scenario {
+            mode: "blob_crash",
+            label: "blob",
+            check: Box::new(|dir| recover_and_check_blob(dir, 0, &[], &["xm_b", "auto_b"])),
+            pass_msg: "crash before the commit record -> SQL row gone AND blob.wal's \
+                 tagged manifest discarded (atomic discard)",
+        },
+        Scenario {
+            mode: "blob_commit",
+            label: "blob",
+            check: Box::new(|dir| {
+                recover_and_check_blob(dir, 1, &[("xm_b", "74786e"), ("auto_b", "6175746f")], &[])
+            }),
+            pass_msg: "commit direction: committed txn (row + tagged BLOB_STORE) and \
+                 autocommit BLOB_STORE all survive reopen",
         },
     ];
 

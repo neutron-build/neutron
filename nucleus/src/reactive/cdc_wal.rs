@@ -15,16 +15,40 @@
 //!           [n_consumers: u32 LE] [per consumer: name_len(u32) + name + position(u64)]
 //! ```
 //!
+//! ## What CDC records, and why it is not transactional (S63 determination)
+//!
+//! This log records EMITTED CHANGE EVENTS (APPEND) and consumer positions
+//! (CONSUMER) — a change feed, not user data. Emission is fire-and-forget by
+//! design: `notify_change_rows` appends at STATEMENT time, inside explicit
+//! transactions as readily as outside them, is never enlisted in the
+//! transaction's write-set, and is never compensated on ROLLBACK (an aborted
+//! transaction's events stay in the feed — "best-effort", see the call sites
+//! in `dml.rs`). Whether that is the right semantics is NU-107, an open
+//! product call; this file does not decide it.
+//!
+//! The S63 consequence: no CDC record is ever written under a coordinating
+//! transaction id, so tagging production records would be inert. The
+//! forward-correct plumbing is live anyway (twinned tags below, the
+//! committed-set replay filter, the XactId floor feed, and the `xact`
+//! parameters on the log functions) so that if NU-107 lands transactional
+//! CDC — emission at commit, discard on rollback — the records are already
+//! tagged and the filter already discards; an untagged writer would
+//! reintroduce exactly the resurrection defect S63 exists to close. Until
+//! then every record carries `XACT_AUTOCOMMIT` (0), and a failed CDC
+//! checkpoint can never strand a vouching COMMIT record — which is why CDC
+//! stays warn-and-continue in the specialty checkpoint pass.
+//!
 //! A SNAPSHOT resets all state. After `checkpoint()` the file is truncated to
 //! a single SNAPSHOT entry so the log stays small.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 use crate::storage::wal_util::WalSync;
 
 use super::{CdcLog, CdcLogEntry, ChangeType};
@@ -34,6 +58,11 @@ use super::{CdcLog, CdcLogEntry, ChangeType};
 const ENTRY_APPEND: u8 = 0x01;
 const ENTRY_CONSUMER: u8 = 0x02;
 const ENTRY_SNAPSHOT: u8 = 0x03;
+/// S63: APPEND carrying the coordinating transaction id — inert today (see
+/// the module header); live for the day NU-107 lands transactional CDC.
+const ENTRY_APPEND_XACT: u8 = 0x04;
+/// S63: CONSUMER carrying the coordinating transaction id.
+const ENTRY_CONSUMER_XACT: u8 = 0x05;
 
 // ---- Change type encoding ---------------------------------------------------
 
@@ -61,6 +90,10 @@ pub struct CdcWalState {
     pub entries: Vec<CdcLogEntry>,
     pub consumers: HashMap<String, u64>,
     pub next_sequence: u64,
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded. Seeds the XactId
+    /// high-water mark at executor construction (S63).
+    pub max_xact_id: u64,
 }
 
 /// Append-only CDC WAL.
@@ -82,28 +115,47 @@ pub struct CdcWal {
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
     #[cfg(test)]
     fail_reopen_once: std::sync::atomic::AtomicBool,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
 }
 
 impl CdcWal {
-    /// Open or create the WAL file in `dir`.
+    /// Open or create the WAL file in `dir`, replaying with an EMPTY
+    /// committed set so every tagged record keeps — the pre-S63 contract.
+    /// The executor opens through [`CdcWal::open_with_committed`] instead.
     ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
     /// state is empty. Corrupt trailing bytes are silently ignored (best-effort
     /// recovery).
     pub fn open(dir: &Path) -> io::Result<(Self, CdcWalState)> {
+        Self::open_with_committed(dir, &HashSet::new())
+    }
+
+    /// Open or create the WAL file in `dir` whose replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded. (No production
+    /// writer carries a non-zero id today — see the module header; the
+    /// filter is the forward-correct half of the NU-107 plumbing.)
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &HashSet<u64>,
+    ) -> io::Result<(Self, CdcWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("cdc.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data)
+            replay(&data, committed)
         } else {
             CdcWalState {
                 entries: Vec::new(),
                 consumers: HashMap::new(),
                 next_sequence: 1,
+                max_xact_id: 0,
             }
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let max_xact_id = state.max_xact_id;
         Ok((
             Self {
                 path,
@@ -112,9 +164,17 @@ impl CdcWal {
                 stranded: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
+                max_xact_id,
             },
             state,
         ))
+    }
+
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    pub fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
     }
 
     /// Re-point the writer at the live log file after a checkpoint replaced
@@ -171,9 +231,15 @@ impl CdcWal {
     }
 
     /// Log a CDC append operation (new change event).
-    pub fn log_append(&self, entry: &CdcLogEntry) -> io::Result<()> {
+    ///
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction
+    /// (every write today — see the module header), `Some(id)` inside one,
+    /// `None` to write the legacy untagged record (kept unconditionally on
+    /// replay — the pre-S63 compatibility rule).
+    pub fn log_append(&self, xact: Option<u64>, entry: &CdcLogEntry) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(ENTRY_APPEND);
+        push_tag(&mut buf, xact, ENTRY_APPEND, ENTRY_APPEND_XACT);
 
         // sequence
         buf.extend_from_slice(&entry.sequence.to_le_bytes());
@@ -203,9 +269,11 @@ impl CdcWal {
     }
 
     /// Log a consumer position update (acknowledge).
-    pub fn log_consumer(&self, name: &str, position: u64) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`CdcWal::log_append`].
+    pub fn log_consumer(&self, xact: Option<u64>, name: &str, position: u64) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(ENTRY_CONSUMER);
+        push_tag(&mut buf, xact, ENTRY_CONSUMER, ENTRY_CONSUMER_XACT);
         write_str(&mut buf, name);
         buf.extend_from_slice(&position.to_le_bytes());
 
@@ -332,6 +400,18 @@ pub fn rebuild_cdc_log(state: &CdcWalState) -> CdcLog {
 
 // ---- Binary encoding helpers ------------------------------------------------
 
+/// Emit the tag for one record: the `_XACT` twin plus the id when `xact` is
+/// `Some`, the legacy untagged tag when `None`.
+fn push_tag(buf: &mut Vec<u8>, xact: Option<u64>, plain: u8, xact_tagged: u8) {
+    match xact {
+        Some(x) => {
+            buf.push(xact_tagged);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        None => buf.push(plain),
+    }
+}
+
 fn write_str(buf: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -340,10 +420,11 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
 
 // ---- Replay -----------------------------------------------------------------
 
-fn replay(data: &[u8]) -> CdcWalState {
+fn replay(data: &[u8], committed: &HashSet<u64>) -> CdcWalState {
     let mut entries: Vec<CdcLogEntry> = Vec::new();
     let mut consumers: HashMap<String, u64> = HashMap::new();
     let mut next_sequence: u64 = 1;
+    let mut max_xact_id: u64 = 0;
     let mut pos = 0usize;
 
     while pos < data.len() {
@@ -352,24 +433,44 @@ fn replay(data: &[u8]) -> CdcWalState {
         };
         pos += 1;
 
+        // S63: the tagged twins carry the coordinating transaction id next;
+        // the id feeds the floor whether kept or discarded, and the record is
+        // dropped unless it is autocommit or committed. The body is parsed
+        // past either way — nothing length-frames these records and the next
+        // one must be found.
+        let mut keep_tagged = true;
+        if matches!(entry_type, ENTRY_APPEND_XACT | ENTRY_CONSUMER_XACT) {
+            let Some(id_bytes) = data.get(pos..pos + 8) else {
+                break;
+            };
+            let xact = u64::from_le_bytes(id_bytes.try_into().unwrap());
+            pos += 8;
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
+
         match entry_type {
-            ENTRY_APPEND => {
+            ENTRY_APPEND | ENTRY_APPEND_XACT => {
                 let Some(entry) = replay_append(data, &mut pos) else {
                     break;
                 };
                 if entry.sequence >= next_sequence {
                     next_sequence = entry.sequence + 1;
                 }
-                entries.push(entry);
+                if keep_tagged {
+                    entries.push(entry);
+                }
             }
-            ENTRY_CONSUMER => {
+            ENTRY_CONSUMER | ENTRY_CONSUMER_XACT => {
                 let Some(name) = read_string(data, &mut pos) else {
                     break;
                 };
                 let Some(position) = read_u64(data, &mut pos) else {
                     break;
                 };
-                consumers.insert(name, position);
+                if keep_tagged {
+                    consumers.insert(name, position);
+                }
             }
             ENTRY_SNAPSHOT => {
                 entries.clear();
@@ -420,6 +521,7 @@ fn replay(data: &[u8]) -> CdcWalState {
         entries,
         consumers,
         next_sequence,
+        max_xact_id,
     }
 }
 
@@ -480,6 +582,76 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
 mod tests {
     use super::*;
 
+    // ── S63: the recovery filter (NU-107 forward plumbing) ───────────────
+
+    /// Tagged records filter on the committed set: autocommit keeps,
+    /// committed ids keep, unknown ids discard — and a discarded record in
+    /// the MIDDLE does not stop the records after it. No production writer
+    /// carries a non-zero id today (see the module header); this proves the
+    /// filter that a transactional-CDC future will rely on.
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let entry = |seq: u64, table: &str| CdcLogEntry {
+            sequence: seq,
+            table: table.to_string(),
+            change_type: ChangeType::Insert,
+            row_data: make_row(&[("id", "1")]),
+            timestamp: seq * 100,
+        };
+        let mut buf = Vec::new();
+        // Legacy untagged APPEND (pre-S63 log): keep unconditionally.
+        buf.push(ENTRY_APPEND);
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        write_str(&mut buf, "legacy");
+        buf.push(0);
+        buf.extend_from_slice(&100u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let tagged_append = |buf: &mut Vec<u8>, xact: u64, seq: u64, table: &str| {
+            let e = entry(seq, table);
+            let mut rec = Vec::new();
+            push_tag(&mut rec, Some(xact), ENTRY_APPEND, ENTRY_APPEND_XACT);
+            rec.extend_from_slice(&e.sequence.to_le_bytes());
+            write_str(&mut rec, &e.table);
+            rec.push(encode_change_type(&e.change_type));
+            rec.extend_from_slice(&e.timestamp.to_le_bytes());
+            rec.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&rec);
+        };
+        tagged_append(&mut buf, XACT_AUTOCOMMIT, 2, "auto");
+        tagged_append(&mut buf, 7, 3, "committed");
+        tagged_append(&mut buf, 8, 4, "never_committed"); // discarded, mid-log
+        // An uncommitted transaction's consumer ack is discarded too.
+        let mut ack = Vec::new();
+        push_tag(&mut ack, Some(8), ENTRY_CONSUMER, ENTRY_CONSUMER_XACT);
+        write_str(&mut ack, "abandoned_app");
+        ack.extend_from_slice(&9u64.to_le_bytes());
+        buf.extend_from_slice(&ack);
+        tagged_append(&mut buf, 9, 5, "committed_late");
+
+        let committed: HashSet<u64> = [7u64, 9u64].into_iter().collect();
+        let state = replay(&buf, &committed);
+        assert_eq!(
+            state.max_xact_id, 9,
+            "discarded records still feed the floor"
+        );
+        let mut tables: Vec<&str> = state.entries.iter().map(|e| e.table.as_str()).collect();
+        tables.sort_unstable();
+        assert_eq!(
+            tables,
+            vec!["auto", "committed", "committed_late", "legacy"],
+            "id 8 never committed; its event and its consumer ack must be \
+             discarded, not replayed"
+        );
+        assert!(
+            !state.consumers.contains_key("abandoned_app"),
+            "the abandoned CONSUMER record must be discarded"
+        );
+        assert_eq!(
+            state.next_sequence, 6,
+            "a discarded record's sequence still advances the counter floor"
+        );
+    }
+
     fn make_row(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -516,9 +688,9 @@ mod tests {
             timestamp: 3000,
         };
 
-        wal.log_append(&entry1).unwrap();
-        wal.log_append(&entry2).unwrap();
-        wal.log_append(&entry3).unwrap();
+        wal.log_append(Some(XACT_AUTOCOMMIT), &entry1).unwrap();
+        wal.log_append(Some(XACT_AUTOCOMMIT), &entry2).unwrap();
+        wal.log_append(Some(XACT_AUTOCOMMIT), &entry3).unwrap();
         drop(wal);
 
         let (_wal2, state2) = CdcWal::open(dir.path()).unwrap();
@@ -549,9 +721,9 @@ mod tests {
             row_data: make_row(&[("x", "1")]),
             timestamp: 100,
         };
-        wal.log_append(&entry).unwrap();
-        wal.log_consumer("app1", 1).unwrap();
-        wal.log_consumer("app2", 0).unwrap();
+        wal.log_append(Some(XACT_AUTOCOMMIT), &entry).unwrap();
+        wal.log_consumer(Some(XACT_AUTOCOMMIT), "app1", 1).unwrap();
+        wal.log_consumer(Some(XACT_AUTOCOMMIT), "app2", 0).unwrap();
         drop(wal);
 
         let (_wal2, state) = CdcWal::open(dir.path()).unwrap();
@@ -615,7 +787,7 @@ mod tests {
                 row_data: make_row(&[("x", "2")]),
                 timestamp: 200,
             };
-            wal.log_append(&entry)
+            wal.log_append(Some(XACT_AUTOCOMMIT), &entry)
                 .expect("a later append must reattach, not strand");
         }
         let (_wal2, state) = CdcWal::open(dir.path()).unwrap();
@@ -641,7 +813,7 @@ mod tests {
                 row_data: make_row(&[("id", "1")]),
                 timestamp: 500,
             };
-            wal.log_append(&entry).unwrap();
+            wal.log_append(Some(XACT_AUTOCOMMIT), &entry).unwrap();
             drop(wal);
         }
 
@@ -677,9 +849,10 @@ mod tests {
             timestamp: 200,
         };
 
-        wal.log_append(&entry1).unwrap();
-        wal.log_append(&entry2).unwrap();
-        wal.log_consumer("reader1", 1).unwrap();
+        wal.log_append(Some(XACT_AUTOCOMMIT), &entry1).unwrap();
+        wal.log_append(Some(XACT_AUTOCOMMIT), &entry2).unwrap();
+        wal.log_consumer(Some(XACT_AUTOCOMMIT), "reader1", 1)
+            .unwrap();
         drop(wal);
 
         let (_wal2, state) = CdcWal::open(dir.path()).unwrap();
@@ -705,13 +878,16 @@ mod tests {
             (2, ChangeType::Update),
             (3, ChangeType::Delete),
         ] {
-            wal.log_append(&CdcLogEntry {
-                sequence: seq,
-                table: "t".to_string(),
-                change_type: ct,
-                row_data: HashMap::new(),
-                timestamp: seq * 100,
-            })
+            wal.log_append(
+                Some(XACT_AUTOCOMMIT),
+                &CdcLogEntry {
+                    sequence: seq,
+                    table: "t".to_string(),
+                    change_type: ct,
+                    row_data: HashMap::new(),
+                    timestamp: seq * 100,
+                },
+            )
             .unwrap();
         }
         drop(wal);

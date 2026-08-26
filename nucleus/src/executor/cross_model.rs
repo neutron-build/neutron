@@ -322,15 +322,29 @@ impl Executor {
         });
     }
 
-    pub(super) fn cross_model_before_blob(&self, store: &crate::blob::BlobStore) {
+    /// Record that this transaction is about to write the blob store,
+    /// capturing the before-image on first use, and return the coordinating
+    /// id the WAL records for that write must carry (S63): the transaction's
+    /// `xid` inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    /// Folding the enlistment into the touch means one lock acquisition
+    /// covers both, and a write path cannot drift between capturing the
+    /// before-image and tagging its records. Must be called *before* the
+    /// mutation, while the caller holds the store's write guard; the caller
+    /// brackets the mutation with `set_xact_tag`/`take_xact_tag` on the
+    /// store so every WAL record the mutation writes carries the id.
+    pub(super) fn cross_model_before_blob(&self, store: &crate::blob::BlobStore) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Blob);
         for_each_level!(cm, lvl, {
             if lvl.blob.is_none() {
                 lvl.blob = Some(store.txn_snapshot());
             }
         });
+        cm.xid
     }
 
     pub(super) fn cross_model_after_blob(&self, touched: HashSet<String>) {
@@ -346,6 +360,38 @@ impl Executor {
     }
 
     // ── Columnar model store ────────────────────────────────────────────────
+
+    /// Record that this transaction is about to write the KV COLLECTIONS
+    /// store (`collections.wal`: hashes, lists, sets, sorted sets,
+    /// HyperLogLogs, RESP-style streams), and return the coordinating id the
+    /// WAL records for that write must carry (S63): the transaction's `xid`
+    /// inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    ///
+    /// Today this is only ever called OUTSIDE a transaction, exactly like
+    /// [`Self::cross_model_before_columnar`]: M8's fail-loud boundary
+    /// (`refused_in_transaction`) refuses every KV collection mutator inside
+    /// one because the collections store has no rollback before-image — so
+    /// the returned id is always `XACT_AUTOCOMMIT` and nothing enlists in
+    /// practice. The hook exists so that if the boundary is ever lifted
+    /// behind a before-image design, the records are already tagged and the
+    /// recovery filter (`collections_wal::replay`) already discards them; an
+    /// untagged writer would reintroduce exactly the resurrection defect S63
+    /// exists to close. Lifting the boundary additionally requires making
+    /// the store-level tag race-free (the tag is process-global; two
+    /// sessions writing collections inside transactions would mis-attribute
+    /// records) — that is part of the before-image design, not of this hook.
+    ///
+    /// The `_store` parameter exists to enforce the call-before-mutation
+    /// ordering at the type level, as the other touches do.
+    pub(super) fn cross_model_before_collections(&self, _store: &crate::kv::KvStore) -> u64 {
+        let session = self.current_session();
+        let mut guard = session.cross_model.lock();
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Collections);
+        cm.xid
+    }
 
     /// Record that this transaction is about to write the columnar MODEL
     /// store (`COLUMNAR_INSERT`), and return the coordinating id the WAL

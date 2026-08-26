@@ -198,11 +198,32 @@ pub struct KvStore {
     /// Global monotonic version counter, incremented on every write operation.
     /// Used by WATCH/EXEC optimistic locking in the RESP handler.
     global_version: std::sync::atomic::AtomicU64,
+    /// Test-only one-shot hook fired between the checkpoint's item
+    /// collection and its WAL replace — the exact window the TOCTOU fix
+    /// exists to make harmless. See `set_mid_collect_hook`.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    mid_collect_hook: parking_lot::Mutex<Option<Box<dyn Fn(&KvStore) + Send + Sync>>>,
 }
 
 impl Default for KvStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Drop-safe closer of the S63 collections tag bracket; see
+/// [`KvStore::collections_xact_guard`].
+pub struct CollectionsXactGuard<'a> {
+    store: &'a KvStore,
+}
+
+impl Drop for CollectionsXactGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(feature = "server")]
+        if let Some(wal) = self.store.collections.wal() {
+            wal.reset_xact_tag();
+        }
     }
 }
 
@@ -221,7 +242,17 @@ impl KvStore {
             max_hot_entries: 100_000,
             max_hot_bytes: default_max_hot_bytes(),
             global_version: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            mid_collect_hook: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Test-only: arm the one-shot mid-collection hook (see the field). The
+    /// hook runs with full store access, so it can perform the racing
+    /// autocommit write deterministically — no thread hammering required.
+    #[cfg(test)]
+    pub(crate) fn set_mid_collect_hook(&self, f: Box<dyn Fn(&KvStore) + Send + Sync>) {
+        *self.mid_collect_hook.lock() = Some(f);
     }
 
     /// Open a WAL-backed KV store, recovering state from `dir/kv.wal`
@@ -291,8 +322,11 @@ impl KvStore {
             );
         }
 
-        // Open collections WAL and recover collection state
-        let (col_wal, mut col_state) = collections_wal::CollectionWal::open(dir)?;
+        // Open collections WAL and recover collection state. The committed
+        // set filters the replay (S63): a tagged record whose transaction
+        // never committed is discarded.
+        let (col_wal, mut col_state) =
+            collections_wal::CollectionWal::open_with_committed(dir, committed)?;
         let col_wal = Arc::new(col_wal);
         col_state.set_wal(Arc::clone(&col_wal));
 
@@ -325,6 +359,8 @@ impl KvStore {
             max_hot_entries: 100_000,
             max_hot_bytes: default_max_hot_bytes(),
             global_version: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            mid_collect_hook: parking_lot::Mutex::new(None),
         };
         // Replay rebuilds the map directly rather than going through `set`, so
         // nothing has checked the budgets yet. Without this, a store that grew
@@ -399,6 +435,15 @@ impl KvStore {
         let _ = self.set_inner(key, value, ttl_secs, XACT_AUTOCOMMIT, true);
     }
 
+    /// Open the log-ahead-of-memory bracket around one mutation (S63 TOCTOU):
+    /// the guard is held from before the WAL append until the in-memory
+    /// apply completes, so a concurrently quiescing checkpoint cannot fold a
+    /// snapshot that misses an appended record. `None` in memory-only mode.
+    #[cfg(feature = "server")]
+    fn wal_begin_op(&self) -> Option<crate::storage::kv_wal::WalOp<'_>> {
+        self.wal.as_ref().map(|w| w.begin_op())
+    }
+
     /// SET carrying the coordinating transaction id (S63): the WAL record is
     /// tagged with `xact`, so replay discards it when its transaction never
     /// committed. `XACT_AUTOCOMMIT` marks a write outside any explicit
@@ -432,6 +477,8 @@ impl KvStore {
         xact: u64,
         apply_on_wal_error: bool,
     ) -> Result<(), std::io::Error> {
+        #[cfg(feature = "server")]
+        let _wal_op = self.wal_begin_op();
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             // One record carrying the value AND the expiry decided with it.
@@ -502,6 +549,8 @@ impl KvStore {
         xact: u64,
         apply_on_wal_error: bool,
     ) -> Result<bool, std::io::Error> {
+        #[cfg(feature = "server")]
+        let _wal_op = self.wal_begin_op();
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_delete(Some(xact), key)
@@ -927,6 +976,8 @@ impl KvStore {
     /// per-key WAL writes, avoiding per-entry syscall overhead.
     /// Each key is inserted into its own shard for parallel access.
     pub fn mset(&self, pairs: &[(&str, Value)]) {
+        #[cfg(feature = "server")]
+        let _wal_op = self.wal_begin_op();
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             // `SetExact` with no TTL, not `Set`: the in-memory write below
@@ -1914,56 +1965,92 @@ impl KvStore {
     /// an enlisted write already visible when collection starts is caught by
     /// the first check, one that lands in a shard while the items are being
     /// gathered by the second.
+    ///
+    /// The gate cannot see AUTOcommit writers (RESP `SET`, the fast path —
+    /// never enlisted), which used to be able to append between the
+    /// collection and the atomic replace: the record truncated by the
+    /// replace while its key sat outside the snapshot, an acknowledged
+    /// write lost on crash (the wave-20 TOCTOU). Those are covered by the
+    /// WAL's own accounting instead: each attempt quiesces the log
+    /// (`quiesce_mark`) so the snapshot provably contains every record the
+    /// log holds, and the replace (`checkpoint_retaining`) declines if any
+    /// append landed after the quiesce. A decline retries with a fresh
+    /// collection; an exhausted retry bound returns the decline — the
+    /// horizon-holding, lose-nothing direction.
     #[cfg(feature = "server")]
     pub fn checkpoint_gated(&self, gate: &dyn Fn() -> bool) -> std::io::Result<()> {
         let Some(ref wal) = self.wal else {
             return Ok(());
         };
-        if gate() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "declined: an enlisted transaction is open (S7 re-check)",
-            ));
-        }
-        // Flush the cold tier BEFORE snapshotting, and never after.
-        //
-        // The snapshot below covers the hot tier only, and truncates the WAL to
-        // it — so a key that was evicted to cold is, at that instant, losing its
-        // last WAL record. `LsmTree::put` only buffers into an in-memory
-        // memtable until a size threshold is reached, so without this flush an
-        // evicted key can exist in neither the WAL nor on disk, and a crash
-        // loses it outright with nothing reporting a problem.
-        //
-        // Rare while eviction was keyed on entry count and almost never fired.
-        // Making eviction byte-aware made it routine, which is what turned this
-        // from theoretical into the ordering that has to hold.
-        //
-        // STO-2: the flush must also SUCCEED before `wal.checkpoint` truncates
-        // — `flush_memtable` fsyncs the SSTable (and rejects a failed write),
-        // so `?` here means the WAL is never truncated past keys whose only
-        // durable copy is still in RAM.
-        if let Some(ref cold) = self.cold {
-            cold.lock().flush_memtable()?;
-        }
-        let mut items = Vec::new();
-        for shard in &self.data.shards {
-            let data = shard.data.read();
-            for (key, entry) in data.iter() {
-                if !entry.is_expired() {
-                    let ttl = entry.expires_at.map(instant_to_epoch_ms);
-                    items.push((key.clone(), (*entry.value).clone(), ttl));
+        const MAX_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            if gate() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "declined: an enlisted transaction is open (S7 re-check)",
+                ));
+            }
+            // Flush the cold tier BEFORE snapshotting, and never after.
+            //
+            // The snapshot below covers the hot tier only, and truncates the WAL to
+            // it — so a key that was evicted to cold is, at that instant, losing its
+            // last WAL record. `LsmTree::put` only buffers into an in-memory
+            // memtable until a size threshold is reached, so without this flush an
+            // evicted key can exist in neither the WAL nor on disk, and a crash
+            // loses it outright with nothing reporting a problem.
+            //
+            // Rare while eviction was keyed on entry count and almost never fired.
+            // Making eviction byte-aware made it routine, which is what turned this
+            // from theoretical into the ordering that has to hold.
+            //
+            // STO-2: the flush must also SUCCEED before `wal.checkpoint` truncates
+            // — `flush_memtable` fsyncs the SSTable (and rejects a failed write),
+            // so `?` here means the WAL is never truncated past keys whose only
+            // durable copy is still in RAM.
+            if let Some(ref cold) = self.cold {
+                cold.lock().flush_memtable()?;
+            }
+            // TOCTOU half one: after this returns, every record the log
+            // holds is visible in memory, so the collection below sees all
+            // of it.
+            let mark = wal.quiesce_mark();
+            let mut items = Vec::new();
+            for shard in &self.data.shards {
+                let data = shard.data.read();
+                for (key, entry) in data.iter() {
+                    if !entry.is_expired() {
+                        let ttl = entry.expires_at.map(instant_to_epoch_ms);
+                        items.push((key.clone(), (*entry.value).clone(), ttl));
+                    }
                 }
             }
+            // Test-only deterministic interleaving: fire a one-shot
+            // autocommit write exactly in the collect→replace window this
+            // checkpoint exists to make harmless.
+            #[cfg(test)]
+            if let Some(hook) = self.mid_collect_hook.lock().take() {
+                hook(self);
+            }
+            if gate() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "declined: an enlisted transaction is open (S7 re-check)",
+                ));
+            }
+            // TOCTOU half two: replace only if nothing appended since the
+            // quiesce — checked under the writer lock, so no append can slip
+            // between the check and the rename.
+            match wal.checkpoint_retaining(mark, &items) {
+                Ok(()) => return self.collections.checkpoint(),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
         }
-        if gate() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "declined: an enlisted transaction is open (S7 re-check)",
-            ));
-        }
-        wal.checkpoint(&items)?;
-        // Also checkpoint collections
-        self.collections.checkpoint()
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "declined: an autocommit append landed in every checkpoint attempt's \
+             collect-to-replace window (KV checkpoint TOCTOU); retrying next pass",
+        ))
     }
 
     /// Access the underlying WAL (if any).
@@ -1982,6 +2069,35 @@ impl KvStore {
             return wal.max_xact_id();
         }
         0
+    }
+
+    /// The collections twin of [`Self::wal_max_xact_id`]: the highest
+    /// coordinating transaction id recovered from `collections.wal` (S63).
+    pub fn collections_wal_max_xact_id(&self) -> u64 {
+        #[cfg(feature = "server")]
+        if let Some(wal) = self.collections.wal() {
+            return wal.max_xact_id();
+        }
+        0
+    }
+
+    /// Bracket one SQL collections mutation with the coordinating
+    /// transaction id (S63): the guard sets the WAL's tag and resets it on
+    /// drop, so an early `return Err` between the two cannot leak the tag
+    /// onto a later autocommit write.
+    ///
+    /// Today the executor only calls this OUTSIDE explicit transactions (M8's
+    /// `refused_in_transaction` boundary refuses collection mutators inside
+    /// one), so `xact` is always `XACT_AUTOCOMMIT`; the bracket exists so a
+    /// lifted boundary tags its records from the first record onward. See
+    /// `collections_wal`'s header for why lifting also needs a race-free
+    /// attribution design.
+    pub fn collections_xact_guard(&self, xact: u64) -> CollectionsXactGuard<'_> {
+        #[cfg(feature = "server")]
+        if let Some(wal) = self.collections.wal() {
+            wal.set_xact_tag(xact);
+        }
+        CollectionsXactGuard { store: self }
     }
 
     /// Access the collections WAL (if any) — the second durable log this store
@@ -2015,6 +2131,13 @@ impl KvStore {
     /// after a successful ROLLBACK cannot resurrect the rolled-back write on
     /// replay.
     pub fn txn_restore_scoped(&self, snapshot: &KvTxnSnapshot, keys: &HashSet<String>) {
+        // One bracket around the whole restore (S63 TOCTOU): a compensating
+        // record whose restored value a concurrent checkpoint's collection
+        // has not seen would be truncated by that checkpoint's replace, and
+        // the rollback's durability promise with it. Rollbacks are rare;
+        // holding the quiesce for one is the right trade.
+        #[cfg(feature = "server")]
+        let _wal_op = self.wal_begin_op();
         for key in keys {
             let shard = self.data.shard(key);
             let previous = shard.data.write().remove(key);
@@ -3941,6 +4064,45 @@ mod tests {
         }
     }
 
+    /// The wave-20 TOCTOU: an autocommit write acked between the checkpoint's
+    /// item collection and the WAL's atomic replace was truncated by that
+    /// replace while sitting outside the snapshot — lost on crash with
+    /// nothing reporting it. The deterministic interleaving is injected via
+    /// the one-shot mid-collection hook (no thread hammering): without the
+    /// quiesce-and-retain fix the checkpoint below folds {a} over {a, b} and
+    /// the reopen loses "b" — witnessed failing exactly that way before the
+    /// fix. With it, the moved append mark declines the first attempt, the
+    /// retry re-collects, and both keys survive the reopen.
+    #[cfg(feature = "server")]
+    #[test]
+    fn checkpoint_cannot_truncate_an_append_that_landed_mid_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = KvStore::open(dir.path()).unwrap();
+            store.set("a", Value::Text("one".into()), None);
+            store.set_mid_collect_hook(Box::new(|s| {
+                // The racing autocommit write: WAL record appended and acked,
+                // shard updated — but after this checkpoint's collection has
+                // already read every shard.
+                s.set("b", Value::Text("two".into()), None);
+            }));
+            store
+                .checkpoint()
+                .expect("the declined attempt retries and folds both keys");
+        }
+        let store2 = KvStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("a"), Some(Value::Text("one".into())));
+        assert_eq!(
+            store2.get("b"),
+            Some(Value::Text("two".into())),
+            "the mid-collection append was acknowledged; its WAL record must \
+             not have been truncated away by the replace"
+        );
+    }
+
+    /// The quiesce half on its own is covered at the log level
+    /// (`storage::kv_wal::tests::quiesce_mark_waits_for_in_flight_appends`);
+    /// the interleaving above is the end-to-end proof.
     #[cfg(feature = "server")]
     #[test]
     fn test_kv_flushdb_clears_cold_tier_on_disk() {

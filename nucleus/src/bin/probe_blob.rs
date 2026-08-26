@@ -89,7 +89,9 @@ const CACHE: usize = 200; // holds ~a dozen chunks — evicts constantly
 // ─── Phase 1: differential fuzz ──────────────────────────────────────────────
 fn phase_differential(checks: &mut u64) {
     let dir = TempDir::new();
-    let mut store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+    let mut store =
+        BlobStore::open_with_options(dir.path(), CHUNK, CACHE, &std::collections::HashSet::new())
+            .unwrap();
     let mut model: HashMap<String, (Vec<u8>, HashMap<String, String>)> = HashMap::new();
     let mut rng = Rng(0x1234_5678_9ABC_DEF0);
 
@@ -177,7 +179,13 @@ fn phase_differential(checks: &mut u64) {
             18 => {
                 // Restart: drop and reopen from disk.
                 drop(store);
-                store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+                store = BlobStore::open_with_options(
+                    dir.path(),
+                    CHUNK,
+                    CACHE,
+                    &std::collections::HashSet::new(),
+                )
+                .unwrap();
                 assert_eq!(
                     store.blob_count(),
                     model.len(),
@@ -215,7 +223,9 @@ fn phase_differential(checks: &mut u64) {
         *checks += 2;
     }
     drop(store);
-    let store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+    let store =
+        BlobStore::open_with_options(dir.path(), CHUNK, CACHE, &std::collections::HashSet::new())
+            .unwrap();
     for (key, (data, _)) in &model {
         assert_eq!(store.get(key).unwrap(), *data, "post-restart: get({key})");
         *checks += 1;
@@ -235,7 +245,13 @@ fn phase_wal_torn_tail(checks: &mut u64) {
         // Prefix states: state after each mutation, state[0] = empty.
         let mut states: Vec<HashMap<String, Vec<u8>>> = vec![HashMap::new()];
         {
-            let mut store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+            let mut store = BlobStore::open_with_options(
+                dir.path(),
+                CHUNK,
+                CACHE,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
             for _ in 0..rng.below(25) + 5 {
                 let key = format!("k{}", rng.below(8));
                 let mut next = states.last().unwrap().clone();
@@ -263,7 +279,13 @@ fn phase_wal_torn_tail(checks: &mut u64) {
             f.set_len(cut).unwrap();
         }
 
-        let mut store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+        let mut store = BlobStore::open_with_options(
+            dir.path(),
+            CHUNK,
+            CACHE,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let mut recovered: HashMap<String, Vec<u8>> = HashMap::new();
         for key in store.list_keys() {
             recovered.insert(key.to_string(), store.get(key).unwrap());
@@ -284,7 +306,13 @@ fn phase_wal_torn_tail(checks: &mut u64) {
         store.put("post-recovery", &post, None);
         recovered.insert("post-recovery".to_string(), post);
         drop(store);
-        let store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+        let store = BlobStore::open_with_options(
+            dir.path(),
+            CHUNK,
+            CACHE,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         for (key, want) in &recovered {
             assert_eq!(
                 store.get(key).as_ref(),
@@ -306,7 +334,13 @@ fn phase_segment_torn_tail(checks: &mut u64) {
         // Every value ever written per key — a recovered blob must match one.
         let mut history: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         {
-            let mut store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+            let mut store = BlobStore::open_with_options(
+                dir.path(),
+                CHUNK,
+                CACHE,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
             for _ in 0..rng.below(30) + 5 {
                 let key = format!("k{}", rng.below(8));
                 let data = blob_data(&mut rng);
@@ -327,7 +361,13 @@ fn phase_segment_torn_tail(checks: &mut u64) {
 
         // Recovery must never serve corrupt bytes: whatever survives reads
         // back as an exact version from the history; the rest is dropped.
-        let store = BlobStore::open_with_options(dir.path(), CHUNK, CACHE).unwrap();
+        let store = BlobStore::open_with_options(
+            dir.path(),
+            CHUNK,
+            CACHE,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         for key in store.list_keys() {
             if let Some(data) = store.get(key) {
                 let versions = history

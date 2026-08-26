@@ -18,8 +18,8 @@
 //!
 //! ```text
 //! max( xids in surviving COMMIT-record bodies,      (SQL side)
-//!      xids tagged in surviving kv/doc/streams/graph/ts/datalog/columnar )
-//!                                                    (specialty side)
+//!      xids tagged in surviving kv/doc/streams/graph/ts/datalog/columnar/
+//!      blob/collections/cdc records )               (specialty side)
 //! ```
 //!
 //! which is exactly the set of ids a future filter decision could consult.
@@ -47,10 +47,14 @@ pub(crate) const XACT_BODY_LEN: usize = 10;
 ///
 /// The discriminants are the on-disk contract inside the COMMIT-record body
 /// and may never be renumbered. `Streams`, `Kv`, `Doc`, `Graph`, `Ts`,
-/// `Datalog` and `Columnar` are enlisted by the landed S63 slices; the rest
-/// arrive one log per S4 slice, so they sit unused until their slice lands
-/// (the alternative — renumbering later — would corrupt every body written
-/// in between).
+/// `Datalog`, `Columnar` and `Blob` are enlisted by the landed S63 slices
+/// (Blob's write-set rollback predates its slice; the bit now also drives
+/// the tagged `blob.wal` records and its checkpoint gate). `Collections` is
+/// wired but cannot fire today: M8's fail-loud boundary refuses collection
+/// mutators inside a transaction, so its hook only ever returns
+/// `XACT_AUTOCOMMIT` — the bit takes its seat now because renumbering
+/// later would corrupt every body written in between. `Fts`, `Vector` and
+/// `Cdc` sit unused until their slices land (the same reason).
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EnlistedSet(u16);
@@ -72,6 +76,12 @@ pub(crate) enum Model {
     /// `COLUMNAR_INSERT`). Takes the first free bit — 10 — rather than
     /// squeezing between landed slices: renumbering is corruption.
     Columnar = 1 << 10,
+    /// The KV COLLECTIONS store (`kv/collections.wal`, written by
+    /// `KV_HSET`/`KV_ZADD`/`KV_LPUSH`/... and the RESP twins). Distinct from
+    /// [`Model::Kv`], which is the string store's `kv.wal`. Wired by the S63
+    /// slice but unreachable today behind the M8 `refused_in_transaction`
+    /// boundary; see `cross_model_before_collections`.
+    Collections = 1 << 11,
 }
 
 impl EnlistedSet {

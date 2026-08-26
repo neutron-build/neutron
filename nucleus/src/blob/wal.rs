@@ -25,16 +25,32 @@
 //! into segment files on open, after which a checkpoint rewrites the log in
 //! the metadata-only format.
 //!
+//! ## Transaction-tagged records (S63)
+//!
+//! Tags `0x07`-`0x09` are the `_XACT` twins of the three mutation records,
+//! each carrying the coordinating transaction id (`u64 LE`) between the tag
+//! and the twin's body. Replay keeps a tagged record only if its id is
+//! `XACT_AUTOCOMMIT` (0 — written outside any explicit transaction, whose
+//! durability point is this log's own fsync) or appears in the committed set
+//! recovered from the SQL side; everything else was written inside a
+//! transaction that never committed and is discarded — absence of a commit
+//! record means discard, always. The untagged tags keep their
+//! keep-unconditionally meaning, so pre-S63 logs replay unchanged. The
+//! legacy STORE/SNAPSHOT records are replay-only and never tagged. A
+//! SNAPSHOT_META is committed by construction (the S7 checkpoint gate keeps
+//! one from folding an open transaction's writes) and always replays.
+//!
 //! A SNAPSHOT_META resets all state. After `checkpoint()` the file is
 //! truncated to a single SNAPSHOT_META entry so the log stays small.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 use crate::storage::wal_util::WalSync;
 
 // ---- Entry type tags --------------------------------------------------------
@@ -47,6 +63,13 @@ const ENTRY_TAG: u8 = 0x03;
 const ENTRY_SNAPSHOT: u8 = 0x04;
 const ENTRY_STORE_META: u8 = 0x05;
 const ENTRY_SNAPSHOT_META: u8 = 0x06;
+/// S63: STORE_META carrying the coordinating transaction id. Body after the
+/// id is byte-identical to [`ENTRY_STORE_META`]'s record.
+const ENTRY_STORE_META_XACT: u8 = 0x07;
+/// S63: DELETE carrying the coordinating transaction id.
+const ENTRY_DELETE_XACT: u8 = 0x08;
+/// S63: TAG carrying the coordinating transaction id.
+const ENTRY_TAG_XACT: u8 = 0x09;
 
 // ---- Public types -----------------------------------------------------------
 
@@ -76,6 +99,13 @@ pub struct BlobWalState {
     /// Whether any legacy data-carrying entry was replayed (triggers a
     /// checkpoint after migrating the chunk data into segments).
     pub legacy_entries_seen: bool,
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded. Seeds the XactId
+    /// high-water mark at executor construction (S63): a reopened process
+    /// must never mint an id that a surviving tagged record already carries,
+    /// or the recovery filter could resurrect stale records by matching a
+    /// fresh transaction against them.
+    pub max_xact_id: u64,
 }
 
 /// Manifest snapshot data passed to `checkpoint()` — no chunk data.
@@ -100,6 +130,8 @@ pub struct BlobWal {
     /// an acknowledged blob metadata write survived `kill -9` but not power
     /// loss. NU-006.
     syncer: WalSync,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
 }
 
 fn encode_store_meta_body(
@@ -126,18 +158,33 @@ fn encode_store_meta_body(
 }
 
 impl BlobWal {
-    /// Open or create the WAL file in `dir`.
+    /// Open or create the WAL file in `dir`, replaying with an EMPTY
+    /// committed set so every tagged record keeps — the pre-S63 contract.
+    /// The executor opens through [`BlobWal::open_with_committed`] instead,
+    /// passing the coordinating transaction ids the SQL side durably
+    /// committed so the S63 replay filter can discard the rest.
     ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
     /// state is empty. A torn or corrupt tail ends replay and is truncated
     /// away, so subsequent appends land on a valid boundary (they would
     /// otherwise sit behind garbage and be lost to every future replay).
     pub fn open(dir: &Path) -> io::Result<(Self, BlobWalState)> {
+        Self::open_with_committed(dir, &HashSet::new())
+    }
+
+    /// Open or create the WAL file in `dir` whose replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &HashSet<u64>,
+    ) -> io::Result<(Self, BlobWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("blob.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            let (state, valid_end) = replay(&data);
+            let (state, valid_end) = replay(&data, committed);
             if valid_end < data.len() {
                 eprintln!(
                     "blob WAL: truncating {} torn/corrupt trailing bytes",
@@ -151,17 +198,27 @@ impl BlobWal {
             BlobWalState {
                 blobs: HashMap::new(),
                 legacy_entries_seen: false,
+                max_xact_id: 0,
             }
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let max_xact_id = state.max_xact_id;
         Ok((
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 syncer: WalSync::new(),
+                max_xact_id,
             },
             state,
         ))
+    }
+
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    pub fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
     }
 
     /// Flush + `fsync` the log, capturing (under the writer lock) the highest
@@ -187,8 +244,14 @@ impl BlobWal {
 
     /// Log a STORE_META operation (blob put) — manifest only, no chunk data.
     /// Replaces any previous manifest (and tags) for `id` on replay.
+    ///
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction,
+    /// `Some(id)` inside one, `None` to write the legacy untagged record
+    /// (kept unconditionally on replay — the pre-S63 compatibility rule).
     pub fn log_store_meta(
         &self,
+        xact: Option<u64>,
         id: &str,
         content_type: Option<&str>,
         total_size: u64,
@@ -196,7 +259,7 @@ impl BlobWal {
         tags: &[(&str, &str)],
     ) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(ENTRY_STORE_META);
+        push_tag(&mut buf, xact, ENTRY_STORE_META, ENTRY_STORE_META_XACT);
         encode_store_meta_body(&mut buf, id, content_type, total_size, chunks, tags);
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
@@ -206,9 +269,11 @@ impl BlobWal {
     }
 
     /// Log a DELETE operation.
-    pub fn log_delete(&self, id: &str) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`BlobWal::log_store_meta`].
+    pub fn log_delete(&self, xact: Option<u64>, id: &str) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(ENTRY_DELETE);
+        push_tag(&mut buf, xact, ENTRY_DELETE, ENTRY_DELETE_XACT);
         write_str(&mut buf, id);
 
         let mut w = self.writer.lock();
@@ -219,9 +284,11 @@ impl BlobWal {
     }
 
     /// Log a TAG operation.
-    pub fn log_tag(&self, id: &str, key: &str, val: &str) -> io::Result<()> {
+    ///
+    /// `xact` mirrors [`BlobWal::log_store_meta`].
+    pub fn log_tag(&self, xact: Option<u64>, id: &str, key: &str, val: &str) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.push(ENTRY_TAG);
+        push_tag(&mut buf, xact, ENTRY_TAG, ENTRY_TAG_XACT);
         write_str(&mut buf, id);
         write_str(&mut buf, key);
         write_str(&mut buf, val);
@@ -301,6 +368,18 @@ impl BlobWal {
 
 // ---- Binary encoding helpers ------------------------------------------------
 
+/// Emit the tag for one record: the `_XACT` twin plus the id when `xact` is
+/// `Some`, the legacy untagged tag when `None`.
+fn push_tag(buf: &mut Vec<u8>, xact: Option<u64>, plain: u8, xact_tagged: u8) {
+    match xact {
+        Some(x) => {
+            buf.push(xact_tagged);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        None => buf.push(plain),
+    }
+}
+
 fn write_str(buf: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -309,12 +388,19 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
 
 // ---- Replay -----------------------------------------------------------------
 
-/// Replay all entries in `data` to reconstruct blob state.
-/// Replay all entries in `data`. Returns the recovered state and the byte
-/// offset of the first torn/corrupt entry (== `data.len()` when fully valid).
-fn replay(data: &[u8]) -> (BlobWalState, usize) {
+/// Replay all entries in `data`, filtered by the S63 committed set.
+///
+/// `committed` holds the coordinating transaction ids that durably committed
+/// on the SQL side. A tagged record whose id is neither `XACT_AUTOCOMMIT`
+/// nor in `committed` was written inside a transaction that never committed,
+/// and is discarded — its body is still parsed past, because nothing
+/// length-frames these records and the next one must be found. Returns the
+/// recovered state and the byte offset of the first torn/corrupt entry
+/// (== `data.len()` when fully valid).
+fn replay(data: &[u8], committed: &HashSet<u64>) -> (BlobWalState, usize) {
     let mut blobs: HashMap<String, BlobWalEntry> = HashMap::new();
     let mut legacy_entries_seen = false;
+    let mut max_xact_id: u64 = 0;
     let mut pos = 0usize;
 
     while pos < data.len() {
@@ -324,7 +410,7 @@ fn replay(data: &[u8]) -> (BlobWalState, usize) {
         let entry_start = pos;
         macro_rules! torn {
             () => {{
-                let (state, _) = replay(&data[..entry_start]);
+                let (state, _) = replay(&data[..entry_start], committed);
                 return (state, entry_start);
             }};
         }
@@ -334,6 +420,26 @@ fn replay(data: &[u8]) -> (BlobWalState, usize) {
         };
         pos += 1;
 
+        // The tagged records parse their id, then share the body parse with
+        // the untagged twin. `keep_tagged` is the S63 filter: an autocommit
+        // record is durable by its own fsync, a committed id was vouched for
+        // by a durable COMMIT record, anything else never happened. Parsing
+        // continues either way — the record must be fully consumed to find
+        // the next one, since nothing length-frames these. Ids feed
+        // `max_xact_id` whether kept or discarded, so the caller can seed
+        // the XactId high-water mark.
+        let mut keep_tagged = true;
+        if matches!(
+            entry_type,
+            ENTRY_STORE_META_XACT | ENTRY_DELETE_XACT | ENTRY_TAG_XACT
+        ) {
+            let Some(xact) = read_u64(data, &mut pos) else {
+                torn!();
+            };
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
+
         match entry_type {
             ENTRY_STORE => {
                 legacy_entries_seen = true;
@@ -342,19 +448,23 @@ fn replay(data: &[u8]) -> (BlobWalState, usize) {
                 };
                 blobs.insert(entry.0, entry.1);
             }
-            ENTRY_STORE_META => {
+            ENTRY_STORE_META | ENTRY_STORE_META_XACT => {
                 let Some(entry) = replay_store_meta(data, &mut pos) else {
                     torn!();
                 };
-                blobs.insert(entry.0, entry.1);
+                if keep_tagged {
+                    blobs.insert(entry.0, entry.1);
+                }
             }
-            ENTRY_DELETE => {
+            ENTRY_DELETE | ENTRY_DELETE_XACT => {
                 let Some(id) = read_string(data, &mut pos) else {
                     torn!();
                 };
-                blobs.remove(&id);
+                if keep_tagged {
+                    blobs.remove(&id);
+                }
             }
-            ENTRY_TAG => {
+            ENTRY_TAG | ENTRY_TAG_XACT => {
                 let Some(id) = read_string(data, &mut pos) else {
                     torn!();
                 };
@@ -364,7 +474,7 @@ fn replay(data: &[u8]) -> (BlobWalState, usize) {
                 let Some(val) = read_string(data, &mut pos) else {
                     torn!();
                 };
-                if let Some(entry) = blobs.get_mut(&id) {
+                if keep_tagged && let Some(entry) = blobs.get_mut(&id) {
                     entry.tags.insert(key, val);
                 }
             }
@@ -392,6 +502,7 @@ fn replay(data: &[u8]) -> (BlobWalState, usize) {
         BlobWalState {
             blobs,
             legacy_entries_seen,
+            max_xact_id,
         },
         pos,
     )
@@ -624,6 +735,99 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    // ── S63: the recovery filter ──────────────────────────────────────────
+
+    /// One log exercising every filter decision at once: legacy and
+    /// autocommit records keep, committed ids keep, unknown ids discard —
+    /// and a discarded record in the MIDDLE does not stop the records after
+    /// it (they are parsed past, not abandoned).
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let hash = *blake3::hash(b"data").as_bytes();
+        let mut buf = Vec::new();
+        // Legacy untagged STORE_META (pre-S63 log): keep unconditionally.
+        buf.push(ENTRY_STORE_META);
+        encode_store_meta_body(&mut buf, "legacy", None, 4, &[(hash, 4)], &[]);
+        let tagged_store = |buf: &mut Vec<u8>, xact: u64, id: &str| {
+            let mut rec = Vec::new();
+            push_tag(
+                &mut rec,
+                Some(xact),
+                ENTRY_STORE_META,
+                ENTRY_STORE_META_XACT,
+            );
+            encode_store_meta_body(&mut rec, id, None, 4, &[(hash, 4)], &[]);
+            buf.extend_from_slice(&rec);
+        };
+        tagged_store(&mut buf, XACT_AUTOCOMMIT, "auto");
+        tagged_store(&mut buf, 7, "committed");
+        tagged_store(&mut buf, 8, "never_committed"); // discarded, mid-log
+        // An uncommitted transaction's DELETE of the surviving "committed"
+        // blob and TAG on it must be discarded too.
+        let mut del = Vec::new();
+        push_tag(&mut del, Some(8), ENTRY_DELETE, ENTRY_DELETE_XACT);
+        write_str(&mut del, "committed");
+        buf.extend_from_slice(&del);
+        let mut tag = Vec::new();
+        push_tag(&mut tag, Some(8), ENTRY_TAG, ENTRY_TAG_XACT);
+        write_str(&mut tag, "committed");
+        write_str(&mut tag, "touched");
+        write_str(&mut tag, "yes");
+        buf.extend_from_slice(&tag);
+        tagged_store(&mut buf, 9, "committed_late");
+
+        let committed: HashSet<u64> = [7u64, 9u64].into_iter().collect();
+        let (state, end) = replay(&buf, &committed);
+        assert_eq!(end, buf.len(), "the whole log is well-formed");
+        assert_eq!(
+            state.max_xact_id, 9,
+            "discarded records still feed the floor"
+        );
+        let mut ids: Vec<&str> = state.blobs.keys().map(|s| s.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["auto", "committed", "committed_late", "legacy"],
+            "id 8 never committed; its store, delete and tag records must all \
+             be discarded, not replayed"
+        );
+        assert!(
+            !state.blobs["committed"].tags.contains_key("touched"),
+            "the abandoned TAG must be discarded"
+        );
+    }
+
+    /// A truncation inside a tagged record is a torn tail exactly as for the
+    /// untagged ones: replay keeps the clean prefix and abandons the partial
+    /// record at its boundary.
+    #[test]
+    fn torn_tagged_record_keeps_the_clean_prefix() {
+        let hash = *blake3::hash(b"data").as_bytes();
+        let mut buf = Vec::new();
+        push_tag(
+            &mut buf,
+            Some(XACT_AUTOCOMMIT),
+            ENTRY_STORE_META,
+            ENTRY_STORE_META_XACT,
+        );
+        encode_store_meta_body(&mut buf, "first", None, 4, &[(hash, 4)], &[]);
+        let first_len = buf.len();
+        push_tag(&mut buf, Some(3), ENTRY_STORE_META, ENTRY_STORE_META_XACT);
+        encode_store_meta_body(&mut buf, "second", None, 4, &[(hash, 4)], &[]);
+
+        let (state, end) = replay(&buf[..first_len + 6], &[3u64].into_iter().collect());
+        assert_eq!(end, first_len, "the partial record is the torn tail");
+        assert!(
+            state.blobs.contains_key("first"),
+            "the complete record before the cut must replay"
+        );
+        assert!(
+            !state.blobs.contains_key("second"),
+            "the partial record must be abandoned, not half-applied"
+        );
+    }
 
     #[test]
     fn test_store_meta_and_replay() {
@@ -635,6 +839,7 @@ mod tests {
         let hash1 = blake3::hash(b"chunk1");
         let hash2 = blake3::hash(b"chunk2");
         wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
             "blob1",
             Some("text/plain"),
             12,
@@ -693,9 +898,16 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let hash = blake3::hash(b"data");
-        wal.log_store_meta("blob1", None, 4, &[(*hash.as_bytes(), 4)], &[])
-            .unwrap();
-        wal.log_delete("blob1").unwrap();
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "blob1",
+            None,
+            4,
+            &[(*hash.as_bytes(), 4)],
+            &[],
+        )
+        .unwrap();
+        wal.log_delete(Some(XACT_AUTOCOMMIT), "blob1").unwrap();
         drop(wal);
 
         let (_wal2, state) = BlobWal::open(dir.path()).unwrap();
@@ -708,10 +920,19 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let hash = blake3::hash(b"data");
-        wal.log_store_meta("blob1", Some("image/png"), 4, &[(*hash.as_bytes(), 4)], &[])
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "blob1",
+            Some("image/png"),
+            4,
+            &[(*hash.as_bytes(), 4)],
+            &[],
+        )
+        .unwrap();
+        wal.log_tag(Some(XACT_AUTOCOMMIT), "blob1", "author", "Alice")
             .unwrap();
-        wal.log_tag("blob1", "author", "Alice").unwrap();
-        wal.log_tag("blob1", "dept", "Eng").unwrap();
+        wal.log_tag(Some(XACT_AUTOCOMMIT), "blob1", "dept", "Eng")
+            .unwrap();
         drop(wal);
 
         let (_wal2, state) = BlobWal::open(dir.path()).unwrap();
@@ -726,11 +947,20 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let hash = blake3::hash(b"data");
-        wal.log_store_meta("blob1", None, 4, &[(*hash.as_bytes(), 4)], &[])
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "blob1",
+            None,
+            4,
+            &[(*hash.as_bytes(), 4)],
+            &[],
+        )
+        .unwrap();
+        wal.log_tag(Some(XACT_AUTOCOMMIT), "blob1", "stale", "yes")
             .unwrap();
-        wal.log_tag("blob1", "stale", "yes").unwrap();
         // Overwrite resets tags wholesale.
         wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
             "blob1",
             None,
             4,
@@ -754,10 +984,24 @@ mod tests {
         // Store two blobs
         let h1 = blake3::hash(b"aaa");
         let h2 = blake3::hash(b"bbb");
-        wal.log_store_meta("a", None, 3, &[(*h1.as_bytes(), 3)], &[])
-            .unwrap();
-        wal.log_store_meta("b", None, 3, &[(*h2.as_bytes(), 3)], &[])
-            .unwrap();
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "a",
+            None,
+            3,
+            &[(*h1.as_bytes(), 3)],
+            &[],
+        )
+        .unwrap();
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "b",
+            None,
+            3,
+            &[(*h2.as_bytes(), 3)],
+            &[],
+        )
+        .unwrap();
 
         // Checkpoint with only blob "a"
         let snapshot = BlobMetaSnapshot {
@@ -773,8 +1017,15 @@ mod tests {
 
         // Store another blob after checkpoint
         let h3 = blake3::hash(b"ccc");
-        wal.log_store_meta("c", None, 3, &[(*h3.as_bytes(), 3)], &[])
-            .unwrap();
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "c",
+            None,
+            3,
+            &[(*h3.as_bytes(), 3)],
+            &[],
+        )
+        .unwrap();
         drop(wal);
 
         let (_wal2, state) = BlobWal::open(dir.path()).unwrap();
@@ -803,8 +1054,15 @@ mod tests {
         {
             let (wal, _) = BlobWal::open(dir.path()).unwrap();
             let hash = blake3::hash(b"good");
-            wal.log_store_meta("good_blob", None, 4, &[(*hash.as_bytes(), 4)], &[])
-                .unwrap();
+            wal.log_store_meta(
+                Some(XACT_AUTOCOMMIT),
+                "good_blob",
+                None,
+                4,
+                &[(*hash.as_bytes(), 4)],
+                &[],
+            )
+            .unwrap();
             drop(wal);
         }
 
@@ -827,8 +1085,15 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let hash = blake3::hash(b"data");
-        wal.log_store_meta("blob1", None, 4, &[(*hash.as_bytes(), 4)], &[])
-            .unwrap();
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "blob1",
+            None,
+            4,
+            &[(*hash.as_bytes(), 4)],
+            &[],
+        )
+        .unwrap();
         drop(wal);
 
         let (_wal2, state) = BlobWal::open(dir.path()).unwrap();
@@ -841,12 +1106,26 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let h1 = blake3::hash(b"old");
-        wal.log_store_meta("key", Some("text/plain"), 3, &[(*h1.as_bytes(), 3)], &[])
-            .unwrap();
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "key",
+            Some("text/plain"),
+            3,
+            &[(*h1.as_bytes(), 3)],
+            &[],
+        )
+        .unwrap();
 
         let h2 = blake3::hash(b"new");
-        wal.log_store_meta("key", Some("text/html"), 3, &[(*h2.as_bytes(), 3)], &[])
-            .unwrap();
+        wal.log_store_meta(
+            Some(XACT_AUTOCOMMIT),
+            "key",
+            Some("text/html"),
+            3,
+            &[(*h2.as_bytes(), 3)],
+            &[],
+        )
+        .unwrap();
         drop(wal);
 
         let (_wal2, state) = BlobWal::open(dir.path()).unwrap();

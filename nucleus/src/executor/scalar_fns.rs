@@ -3303,6 +3303,8 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let val = args[1].clone();
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.lpush(&key, val) {
@@ -3321,6 +3323,8 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let val = args[1].clone();
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.rpush(&key, val) {
@@ -3338,6 +3342,8 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.lpop(&key) {
@@ -3356,6 +3362,8 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.rpop(&key) {
@@ -3454,6 +3462,8 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let val = args[2].clone();
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.hset(&key, &field, val) {
@@ -3492,6 +3502,8 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.hdel(&key, &field) {
@@ -3567,6 +3579,8 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.sadd(&key, &member) {
@@ -3588,6 +3602,8 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.srem(&key, &member) {
@@ -3682,6 +3698,8 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.col_zadd(&key, &member, score) {
@@ -3703,6 +3721,8 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.col_zrem(&key, &member) {
@@ -3838,6 +3858,8 @@ impl Executor {
                         "KV_PFADD: memory budget exceeded".into(),
                     ));
                 }
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&key);
                 let outcome = match self.kv_store.col_pfadd(&key, &element) {
@@ -3888,6 +3910,8 @@ impl Executor {
                         "KV_PFMERGE: memory budget exceeded".into(),
                     ));
                 }
+                let xact = self.cross_model_before_collections(&self.kv_store);
+                let _collections_xact = self.kv_store.collections_xact_guard(xact);
                 #[cfg(feature = "server")]
                 let before_bytes = self.kv_key_bytes(&dest);
                 let outcome = match self.kv_store.col_pfmerge(&dest, &source_refs) {
@@ -5204,9 +5228,11 @@ impl Executor {
                 };
                 {
                     let mut store = self.blob_store.write();
-                    self.cross_model_before_blob(&store);
+                    let xact = self.cross_model_before_blob(&store);
+                    store.set_xact_tag(xact);
                     store.clear_touched();
                     store.put(&key, &data, content_type.as_deref());
+                    store.take_xact_tag();
                     let touched = store.take_touched();
                     drop(store);
                     self.cross_model_after_blob(touched);
@@ -5247,9 +5273,11 @@ impl Executor {
                     }
                 };
                 let mut store = self.blob_store.write();
-                self.cross_model_before_blob(&store);
+                let xact = self.cross_model_before_blob(&store);
+                store.set_xact_tag(xact);
                 store.clear_touched();
                 let removed = store.delete(&key);
+                store.take_xact_tag();
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_blob(touched);
@@ -5317,9 +5345,11 @@ impl Executor {
                     }
                 };
                 let mut store = self.blob_store.write();
-                self.cross_model_before_blob(&store);
+                let xact = self.cross_model_before_blob(&store);
+                store.set_xact_tag(xact);
                 store.clear_touched();
                 let ok = store.set_tag(&key, &tag_key, &tag_val);
+                store.take_xact_tag();
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_blob(touched);

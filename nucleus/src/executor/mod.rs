@@ -1216,12 +1216,16 @@ impl Executor {
                 *exec.ts_store.write() = ts;
             }
 
-            // Blob store: WAL-backed crash-recovery
+            // Blob store: WAL-backed crash-recovery. The committed set
+            // filters the replay (S63): a tagged record whose transaction
+            // never committed is discarded.
             let blob_dir = dir.join("blob");
             std::fs::create_dir_all(&blob_dir).ok();
-            if let Some(blob) =
-                Self::open_durable("Blob", &blob_dir, crate::blob::BlobStore::open(&blob_dir))
-            {
+            if let Some(blob) = Self::open_durable(
+                "Blob",
+                &blob_dir,
+                crate::blob::BlobStore::open_with_committed(&blob_dir, &committed_xacts),
+            ) {
                 *exec.blob_store.write() = blob;
             }
 
@@ -1251,6 +1255,28 @@ impl Executor {
                 *exec.columnar_store.write() = col;
             }
 
+            // CDC log: WAL-backed crash-recovery. Opened before the XactId
+            // floor is taken so its tagged records can feed the seed (S63).
+            let mut cdc_floor = 0u64;
+            #[cfg(feature = "server")]
+            {
+                let cdc_dir = dir.join("cdc");
+                std::fs::create_dir_all(&cdc_dir).ok();
+                if let Some((wal, state)) = Self::open_durable(
+                    "CDC",
+                    &cdc_dir,
+                    crate::reactive::cdc_wal::CdcWal::open_with_committed(
+                        &cdc_dir,
+                        &committed_xacts,
+                    ),
+                ) {
+                    let rebuilt = crate::reactive::cdc_wal::rebuild_cdc_log(&state);
+                    *exec.cdc_log.write() = rebuilt;
+                    exec.cdc_wal = Some(wal);
+                    cdc_floor = exec.cdc_wal.as_ref().map_or(0, |w| w.max_xact_id());
+                }
+            }
+
             // Streams: WAL-backed crash-recovery. The committed set comes
             // from storage recovery, which ran before this executor was
             // constructed — that ordering is what lets the streams replay
@@ -1260,11 +1286,14 @@ impl Executor {
             let mut xact_floor = exec
                 .kv_store()
                 .wal_max_xact_id()
+                .max(exec.kv_store().collections_wal_max_xact_id())
                 .max(exec.doc_store().read().wal_max_xact_id())
                 .max(exec.graph_store().read().wal_max_xact_id())
                 .max(exec.ts_store.read().wal_max_xact_id())
                 .max(exec.columnar_store.read().wal_max_xact_id())
+                .max(exec.blob_store.read().wal_max_xact_id())
                 .max(exec.datalog_wal.as_ref().map_or(0, |w| w.max_xact_id()))
+                .max(cdc_floor)
                 .max(committed_xacts.iter().copied().max().unwrap_or(0));
             if let Some((wal, state)) = Self::open_durable(
                 "Streams",
@@ -1277,9 +1306,9 @@ impl Executor {
                 xact_floor = xact_floor.max(state.max_xact_id);
             }
             // Seed the XactId counter above every id a surviving record
-            // could reference: tagged KV, doc, graph, timeseries, datalog,
-            // columnar and streams records, and COMMIT-record bodies. All
-            // sources are needed — any one
+            // could reference: tagged KV, collections, doc, graph,
+            // timeseries, datalog, columnar, blob, CDC and streams records,
+            // and COMMIT-record bodies. All sources are needed — any one
             // alone is lowerable by reclaim (segment pruning, log
             // compaction) — and together they are exactly the ids a future
             // filter decision can consult. This runs even when a tagged log
@@ -1288,22 +1317,6 @@ impl Executor {
             // `executor::enlistment`.
             exec.next_xact_id
                 .store(xact_floor + 1, std::sync::atomic::Ordering::SeqCst);
-
-            // CDC log: WAL-backed crash-recovery
-            #[cfg(feature = "server")]
-            {
-                let cdc_dir = dir.join("cdc");
-                std::fs::create_dir_all(&cdc_dir).ok();
-                if let Some((wal, state)) = Self::open_durable(
-                    "CDC",
-                    &cdc_dir,
-                    crate::reactive::cdc_wal::CdcWal::open(&cdc_dir),
-                ) {
-                    let rebuilt = crate::reactive::cdc_wal::rebuild_cdc_log(&state);
-                    *exec.cdc_log.write() = rebuilt;
-                    exec.cdc_wal = Some(wal);
-                }
-            }
 
             // Geo R-tree: WAL-backed crash-recovery
             let geo_dir = dir.join("geo");
@@ -4419,9 +4432,11 @@ impl Executor {
     /// Convenience: put data into the blob store.
     pub fn blob_store_put(&self, key: &str, data: &[u8], content_type: Option<&str>) {
         let mut store = self.blob_store.write();
-        self.cross_model_before_blob(&store);
+        let xact = self.cross_model_before_blob(&store);
+        store.set_xact_tag(xact);
         store.clear_touched();
         store.put(key, data, content_type);
+        store.take_xact_tag();
         let touched = store.take_touched();
         drop(store);
         self.cross_model_after_blob(touched);
@@ -4445,9 +4460,11 @@ impl Executor {
     /// Convenience: delete a blob.
     pub fn blob_store_delete(&self, key: &str) -> bool {
         let mut store = self.blob_store.write();
-        self.cross_model_before_blob(&store);
+        let xact = self.cross_model_before_blob(&store);
+        store.set_xact_tag(xact);
         store.clear_touched();
         let removed = store.delete(key);
+        store.take_xact_tag();
         let touched = store.take_touched();
         drop(store);
         self.cross_model_after_blob(touched);
@@ -4895,14 +4912,29 @@ impl Executor {
         Ok(())
     }
 
+    /// Checkpoint the blob WAL behind the S7 re-check (see
+    /// [`Self::checkpoint_doc_wal`]): the executor's blob-store write guard
+    /// is the mutation gate, so holding the read guard across the check and
+    /// the snapshot closes the window. A SNAPSHOT_META is committed by
+    /// construction, so the checkpoint can never fold an open transaction's
+    /// tagged records into a state the recovery filter cannot discard.
+    pub fn checkpoint_blob_wal(&self) -> std::io::Result<()> {
+        let store = self.blob_store.read();
+        if self.any_open_enlisted_txn_or_busy() {
+            return Err(Self::specialty_checkpoint_declined());
+        }
+        store.checkpoint()
+    }
+
     /// Run one full specialty-checkpoint pass (the recurring `WalCheckpoint`
     /// task's specialty block) and return the retention horizon the SQL side
     /// may prune to afterwards.
     ///
     /// Every log is warn-and-continue — one store failing must not stop the
     /// others reclaiming — EXCEPT that a failure in a TAGGED log (streams,
-    /// KV, document, graph, datalog, timeseries, columnar: the seven whose
-    /// replay is filtered against the SQL committed set, S63) holds the
+    /// KV strings + collections, document, graph, datalog, timeseries,
+    /// columnar, blob: the logs whose replay is filtered against the SQL
+    /// committed set, S63) holds the
     /// horizon. A tagged log that failed its
     /// checkpoint still holds COMMITTED records whose vouching SQL COMMIT
     /// records sit below `horizon`; advancing anyway would let
@@ -4910,7 +4942,10 @@ impl Executor {
     /// the recovery filter would discard the acknowledged writes as
     /// uncommitted. So on any tagged failure the horizon stays at the last
     /// pass that folded ALL tagged logs, and the SQL side keeps pruning only
-    /// below that floor.
+    /// below that floor. (CDC is deliberately NOT in the tagged set: its
+    /// records are all fire-and-forget `XACT_AUTOCOMMIT` appends — see
+    /// `cdc_wal`'s header and NU-107 — so no vouching COMMIT record can ever
+    /// be stranded by a failed CDC checkpoint.)
     pub async fn run_specialty_checkpoint_pass(&self, horizon: u64) -> u64 {
         /// false when the log was neither folded nor truncated — a decline
         /// (S7 re-check saw an open enlisted transaction mid-pass, S95
@@ -4945,9 +4980,9 @@ impl Executor {
         {
             all_tagged_ok &= tagged_ok("KV", self.checkpoint_kv_wal());
         }
-        if let Err(e) = self.blob_store().read().checkpoint() {
-            tracing::warn!("Blob WAL checkpoint failed: {e}");
-        }
+        // Blob WAL: snapshot behind the S7 re-check, in the tagged set since
+        // the S63 blob slice (its replay is committed-set filtered).
+        all_tagged_ok &= tagged_ok("Blob", self.checkpoint_blob_wal());
         all_tagged_ok &= tagged_ok("Graph", self.checkpoint_graph_wal());
         all_tagged_ok &= tagged_ok("Document", self.checkpoint_doc_wal());
         all_tagged_ok &= tagged_ok("Datalog", self.checkpoint_datalog_wal());
@@ -4987,7 +5022,7 @@ impl Executor {
         } else {
             tracing::warn!(
                 "Specialty checkpoint pass incomplete: a tagged log \
-                 (streams/kv/doc/graph/datalog/ts/columnar) failed or declined; SQL WAL \
+                 (streams/kv/doc/graph/datalog/ts/columnar/blob) failed or declined; SQL WAL \
                  pruning held at the last fully-folded horizon"
             );
         }
@@ -5049,7 +5084,14 @@ impl Executor {
                         .unwrap_or_default()
                         .as_millis() as u64,
                 };
-                if let Err(e) = wal.log_append(&entry) {
+                if let Err(e) = wal.log_append(
+                    // Fire-and-forget by design (NU-107): the event is emitted
+                    // at statement time regardless of transaction outcome, so
+                    // it carries XACT_AUTOCOMMIT — see `cdc_wal`'s header for
+                    // the S63 determination.
+                    Some(crate::executor::enlistment::XACT_AUTOCOMMIT),
+                    &entry,
+                ) {
                     // CDC is advertised as durable change capture; a dropped WAL
                     // append breaks that guarantee on crash. Surface it.
                     tracing::error!(
@@ -5189,7 +5231,7 @@ impl Executor {
                     .unwrap_or_default()
                     .as_millis() as u64,
             };
-            let _ = wal.log_append(&entry);
+            let _ = wal.log_append(Some(crate::executor::enlistment::XACT_AUTOCOMMIT), &entry);
         }
     }
 
