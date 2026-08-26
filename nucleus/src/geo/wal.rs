@@ -18,6 +18,20 @@
 //!
 //! A SNAPSHOT resets all state. After `checkpoint()` the file is truncated to
 //! a single SNAPSHOT entry so the log stays small.
+//!
+//! ## S63 determination: no writers, nothing to make atomic
+//!
+//! This log is opened by the executor but receives ZERO writes in a running
+//! server: `GeoWal::log_insert` and `GeoWal::log_delete` (below) have no
+//! callers outside this file's own tests — geo data persists as ordinary SQL
+//! columns, and the executor touches its `geo_wal` handle only for
+//! `is_dirty`/`group_sync` (which over an always-empty log are no-ops).
+//! There is no mutation path to tag with a coordinating transaction id and
+//! no replay to filter, so geo is OUT of the S63 cross-model atomicity
+//! programme by evidence, not omission. If a GeoIndex store that actually
+//! appends here ever lands, it must adopt the tagged-record contract from
+//! `src/graph/wal.rs` first — an untagged writer would reintroduce exactly
+//! the resurrection-on-replay defect S63 exists to close.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

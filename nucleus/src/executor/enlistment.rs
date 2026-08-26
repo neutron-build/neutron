@@ -18,7 +18,8 @@
 //!
 //! ```text
 //! max( xids in surviving COMMIT-record bodies,      (SQL side)
-//!      xids tagged in surviving kv/doc/streams/graph ) (specialty side)
+//!      xids tagged in surviving kv/doc/streams/graph/ts/datalog/columnar )
+//!                                                    (specialty side)
 //! ```
 //!
 //! which is exactly the set of ids a future filter decision could consult.
@@ -45,10 +46,11 @@ pub(crate) const XACT_BODY_LEN: usize = 10;
 /// Which specialty models a transaction enlisted. One bit per model.
 ///
 /// The discriminants are the on-disk contract inside the COMMIT-record body
-/// and may never be renumbered. `Streams`, `Kv`, `Doc` and `Graph` are
-/// enlisted by the landed S63 slices; the rest arrive one log per S4 slice,
-/// so they sit unused until their slice lands (the alternative —
-/// renumbering later — would corrupt every body written in between).
+/// and may never be renumbered. `Streams`, `Kv`, `Doc`, `Graph`, `Ts`,
+/// `Datalog` and `Columnar` are enlisted by the landed S63 slices; the rest
+/// arrive one log per S4 slice, so they sit unused until their slice lands
+/// (the alternative — renumbering later — would corrupt every body written
+/// in between).
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EnlistedSet(u16);
@@ -66,6 +68,10 @@ pub(crate) enum Model {
     Streams = 1 << 7,
     Blob = 1 << 8,
     Cdc = 1 << 9,
+    /// The columnar MODEL store (`columnar/columnar.wal`, written by
+    /// `COLUMNAR_INSERT`). Takes the first free bit — 10 — rather than
+    /// squeezing between landed slices: renumbering is corruption.
+    Columnar = 1 << 10,
 }
 
 impl EnlistedSet {

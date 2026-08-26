@@ -1,21 +1,30 @@
 //! Crash proof for cross-model atomicity (S63): SQL + Streams (slice 1),
-//! SQL + the KV strings WAL (slice 2), SQL + the document WAL (slice 3), and
-//! SQL + the property-graph WAL (slice 4).
+//! SQL + the KV strings WAL (slice 2), SQL + the document WAL (slice 3),
+//! SQL + the property-graph WAL (slice 4), SQL + the timeseries WAL
+//! (slice 5) and SQL + the datalog WAL (slice 6).
 //!
 //! The claim under test is the discard half of Option D: a transaction that
 //! spans the SQL engine and a specialty model is atomic across a crash in the
 //! window between its specialty records and its SQL COMMIT record. The child
 //! runs `BEGIN; INSERT (SQL); STREAM_XADD / KV_SET / DOC_INSERT /
-//! GRAPH_ADD_NODE; COMMIT` and dies at `crossmodel.before_commit_record` —
-//! after the specialty record was flushed to the WAL, before the COMMIT
-//! record (with the coordinating id in its body) exists. Recovery must
-//! discard BOTH halves: the specialty write because no commit record vouches
-//! for its id, the INSERT because it is a loser.
+//! GRAPH_ADD_NODE / TS_INSERT / DATALOG_ASSERT; COMMIT` and dies at
+//! `crossmodel.before_commit_record` — after the specialty record was
+//! flushed to the WAL, before the COMMIT record (with the coordinating id
+//! in its body) exists. Recovery must discard BOTH halves: the specialty
+//! write because no commit record vouches for its id, the INSERT because it
+//! is a loser.
 //!
 //! The converse is asserted in the same run: a transaction that completes its
 //! COMMIT, plus an autocommit specialty write beside it, must survive the
 //! same reopen — a filter that passed the first half by dropping everything
 //! would pass the first assertion and fail this one.
+//!
+//! The columnar model WAL is deliberately absent: M8's fail-loud boundary
+//! (`refused_in_transaction`) refuses `COLUMNAR_INSERT` inside an explicit
+//! transaction, so the crash window this probe dies in cannot be entered
+//! for columnar — there is no child shape to run. The WAL-level filter is
+//! covered by `storage::columnar_wal::tests`. Geo is absent because its WAL
+//! receives zero writes (`src/geo/wal.rs`'s header records the evidence).
 //!
 //! This harness runs the SERVED stack (segmented DiskEngine wrapped in
 //! BufferedDiskEngine), not the embedded durable_mvcc one, because that is
@@ -82,7 +91,9 @@ fn scalar_i64(res: &[ExecResult], sql: &str) -> Result<i64, String> {
 ///   XADD;
 /// - "kv_crash"/"kv_commit" are the KV_SET twins of the same two shapes;
 /// - "doc_crash"/"doc_commit" are the DOC_INSERT twins;
-/// - "graph_crash"/"graph_commit" are the GRAPH_ADD_NODE twins.
+/// - "graph_crash"/"graph_commit" are the GRAPH_ADD_NODE twins;
+/// - "ts_crash"/"ts_commit" are the TS_INSERT twins;
+/// - "dl_crash"/"dl_commit" are the DATALOG_ASSERT twins.
 fn child_main(dir: &str, mode: &str) -> ! {
     std::panic::set_hook(Box::new(|_| {}));
     let rt = tokio::runtime::Runtime::new().expect("child rt");
@@ -119,6 +130,16 @@ fn child_main(dir: &str, mode: &str) -> ! {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            "ts_crash" | "ts_commit" => {
+                step("SELECT TS_INSERT('xm_s', 1000, 1.5)")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "dl_crash" | "dl_commit" => {
+                step("SELECT DATALOG_ASSERT('xm_fact(a, b).')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             _ => {
                 step("SELECT STREAM_XADD('s', 'kind', 'txn')")
                     .await
@@ -146,6 +167,16 @@ fn child_main(dir: &str, mode: &str) -> ! {
             }
             "graph_commit" => {
                 step("SELECT GRAPH_ADD_NODE('Auto')")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "ts_commit" => {
+                step("SELECT TS_INSERT('auto_s', 1000, 2.5)")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            "dl_commit" => {
+                step("SELECT DATALOG_ASSERT('auto_fact(a, b).')")
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -281,6 +312,74 @@ async fn execute(ex: &Executor, sql: &str) -> Result<Vec<ExecResult>, String> {
     ex.execute(sql).await.map_err(|e| e.to_string())
 }
 
+/// The timeseries twin of `recover_and_check`: `expect` maps series names
+/// to the point count that must have recovered.
+fn recover_and_check_ts(
+    dir: &Path,
+    expect_rows: i64,
+    expect: &[(&str, i64)],
+) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let ex = build_executor(dir)?;
+    let rows = rt.block_on(execute(&ex, "SELECT COUNT(*) FROM t"))?;
+    let rows = scalar_i64(&rows, "COUNT(*)")?;
+    if rows != expect_rows {
+        return Err(format!(
+            "SQL rows: expected {expect_rows}, recovered {rows}"
+        ));
+    }
+    for (series, want) in expect {
+        let res = rt.block_on(execute(&ex, &format!("SELECT TS_COUNT('{series}')")))?;
+        let got = scalar_i64(&res, "TS_COUNT")?;
+        if got != *want {
+            return Err(format!(
+                "TS_COUNT('{series}'): expected {want} points, recovered {got}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The datalog twin of `recover_and_check`: every fact literal in `expect`
+/// must have recovered, every one in `absent` must not.
+fn recover_and_check_datalog(
+    dir: &Path,
+    expect_rows: i64,
+    expect: &[&str],
+    absent: &[&str],
+) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("rt: {e}"))?;
+    let ex = build_executor(dir)?;
+    let rows = rt.block_on(execute(&ex, "SELECT COUNT(*) FROM t"))?;
+    let rows = scalar_i64(&rows, "COUNT(*)")?;
+    if rows != expect_rows {
+        return Err(format!(
+            "SQL rows: expected {expect_rows}, recovered {rows}"
+        ));
+    }
+    for fact in expect.iter().chain(absent.iter()) {
+        let res = rt.block_on(execute(&ex, &format!("SELECT DATALOG_QUERY('{fact}')")))?;
+        let json = match res.first() {
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Text(v)) => v.clone(),
+                other => return Err(format!("DATALOG_QUERY({fact}) returned {other:?}")),
+            },
+            other => return Err(format!("DATALOG_QUERY({fact}) returned {other:?}")),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| format!("unparseable {json:?}: {e}"))?;
+        let present = !v.as_array().is_some_and(|a| a.is_empty());
+        let want = expect.contains(fact);
+        if present != want {
+            return Err(format!(
+                "DATALOG_QUERY('{fact}'): expected presence {want}, recovered \
+                 presence {present} ({json})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The graph twin of `recover_and_check`: `expect` maps labels to the node
 /// count that must have recovered; labels mapped through `absent` are
 /// asserted at zero.
@@ -335,7 +434,7 @@ fn main() {
     let root: PathBuf =
         std::env::temp_dir().join(format!("nucleus-xmodel-s63-{}", std::process::id()));
 
-    println!("== cross-model atomicity crash proof (S63 slices 1+2+3+4) ==");
+    println!("== cross-model atomicity crash proof (S63 slices 1-6) ==");
     println!("point: {POINT}\n");
 
     let mut findings: Vec<String> = Vec::new();
@@ -407,6 +506,38 @@ fn main() {
             check: Box::new(|dir| recover_and_check_graph(dir, 1, &[("Txn", 1), ("Auto", 1)])),
             pass_msg: "commit direction: committed txn (row + tagged GRAPH_ADD_NODE) and \
                  autocommit GRAPH_ADD_NODE all survive reopen",
+        },
+        Scenario {
+            mode: "ts_crash",
+            label: "timeseries",
+            check: Box::new(|dir| recover_and_check_ts(dir, 0, &[("xm_s", 0), ("auto_s", 0)])),
+            pass_msg: "crash before the commit record -> SQL row gone AND ts_wal.bin's \
+                 tagged record discarded (atomic discard)",
+        },
+        Scenario {
+            mode: "ts_commit",
+            label: "timeseries",
+            check: Box::new(|dir| recover_and_check_ts(dir, 1, &[("xm_s", 1), ("auto_s", 1)])),
+            pass_msg: "commit direction: committed txn (row + tagged TS_INSERT) and \
+                 autocommit TS_INSERT all survive reopen",
+        },
+        Scenario {
+            mode: "dl_crash",
+            label: "datalog",
+            check: Box::new(|dir| {
+                recover_and_check_datalog(dir, 0, &[], &["xm_fact(a, b)", "auto_fact(a, b)"])
+            }),
+            pass_msg: "crash before the commit record -> SQL row gone AND datalog.wal's \
+                 tagged record discarded (atomic discard)",
+        },
+        Scenario {
+            mode: "dl_commit",
+            label: "datalog",
+            check: Box::new(|dir| {
+                recover_and_check_datalog(dir, 1, &["xm_fact(a, b)", "auto_fact(a, b)"], &[])
+            }),
+            pass_msg: "commit direction: committed txn (row + tagged DATALOG_ASSERT) and \
+                 autocommit DATALOG_ASSERT all survive reopen",
         },
     ];
 

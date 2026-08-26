@@ -244,15 +244,27 @@ impl Executor {
         });
     }
 
-    pub(super) fn cross_model_before_datalog(&self, store: &crate::datalog::DatalogStore) {
+    /// Record that this transaction is about to write the datalog store,
+    /// capturing the before-image on first use, and return the coordinating
+    /// id the WAL record for that write must carry (S63): the transaction's
+    /// `xid` inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    /// Folding the enlistment into the touch means one lock acquisition
+    /// covers both, and a write path cannot drift between capturing the
+    /// before-image and tagging its record. Must be called *before* the
+    /// mutation, while the caller holds the store's write guard.
+    pub(super) fn cross_model_before_datalog(&self, store: &crate::datalog::DatalogStore) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Datalog);
         for_each_level!(cm, lvl, {
             if lvl.datalog.is_none() {
                 lvl.datalog = Some(store.txn_snapshot());
             }
         });
+        cm.xid
     }
 
     pub(super) fn cross_model_after_datalog(
@@ -272,15 +284,30 @@ impl Executor {
         });
     }
 
-    pub(super) fn cross_model_before_ts(&self, store: &crate::timeseries::TimeSeriesStore) {
+    /// Record that this transaction is about to write the time-series
+    /// store, capturing the before-image on first use, and return the
+    /// coordinating id the WAL records for that write must carry (S63): the
+    /// transaction's `xid` inside an explicit transaction,
+    /// `XACT_AUTOCOMMIT` outside one. Folding the enlistment into the touch
+    /// means one lock acquisition covers both, and a write path cannot drift
+    /// between capturing the before-image and tagging its records. Must be
+    /// called *before* the mutation, while the caller holds the store's
+    /// write guard; the caller brackets the batch with
+    /// `set_xact_tag`/`take_xact_tag` on the store so every WAL record the
+    /// batch writes carries the id.
+    pub(super) fn cross_model_before_ts(&self, store: &crate::timeseries::TimeSeriesStore) -> u64 {
         let session = self.current_session();
         let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Ts);
         for_each_level!(cm, lvl, {
             if lvl.ts.is_none() {
                 lvl.ts = Some(store.txn_snapshot());
             }
         });
+        cm.xid
     }
 
     pub(super) fn cross_model_after_ts(&self, touched: HashSet<String>) {
@@ -316,6 +343,38 @@ impl Executor {
         for_each_level!(cm, lvl, {
             lvl.blob_touched.extend(touched.iter().cloned());
         });
+    }
+
+    // ── Columnar model store ────────────────────────────────────────────────
+
+    /// Record that this transaction is about to write the columnar MODEL
+    /// store (`COLUMNAR_INSERT`), and return the coordinating id the WAL
+    /// record for that write must carry (S63): the transaction's `xid`
+    /// inside an explicit transaction, `XACT_AUTOCOMMIT` outside one.
+    ///
+    /// Today this is only ever called OUTSIDE a transaction: M8's
+    /// fail-loud boundary (`refused_in_transaction`) refuses
+    /// `COLUMNAR_INSERT` inside one, because the store has no rollback
+    /// before-image — so the returned id is always `XACT_AUTOCOMMIT` and
+    /// nothing enlists. The hook exists so that if the boundary is ever
+    /// lifted behind a before-image, the records are already tagged and
+    /// the recovery filter (`columnar_wal::replay`) already discards them;
+    /// an untagged writer would reintroduce exactly the resurrection
+    /// defect S63 exists to close. Must be called *before* the mutation,
+    /// while the caller holds the store's write guard (the `_store`
+    /// parameter exists to enforce that ordering at the type level, as the
+    /// other touches do).
+    pub(super) fn cross_model_before_columnar(
+        &self,
+        _store: &crate::columnar::ColumnarStore,
+    ) -> u64 {
+        let session = self.current_session();
+        let mut guard = session.cross_model.lock();
+        let Some(cm) = guard.as_mut() else {
+            return XACT_AUTOCOMMIT;
+        };
+        cm.enlisted.enlist(Model::Columnar);
+        cm.xid
     }
 
     // ── Vector indexes (owned by the executor, not a store type) ────────────
@@ -400,7 +459,7 @@ impl Executor {
     /// session's committed writes survive. Durable: each store writes
     /// compensating records into its own WAL as part of the restore, so a crash
     /// after a successful `ROLLBACK` cannot resurrect the reverted writes on
-    /// replay (datalog excepted — it has no live WAL to compensate).
+    /// replay.
     pub(super) fn cross_model_revert(
         &self,
         level: CrossModelLevel,

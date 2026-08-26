@@ -90,5 +90,9 @@ fail-closed executor enforcement are implemented;
 [`../RLS_SECURITY.md`](../RLS_SECURITY.md) has the supported predicates,
 enforcement coverage and explicit limitations.
 
-**Column masking is not an enforced SQL feature.** There is a persisted
-internal policy engine, no DDL and no executor enforcement. Do not rely on it.
+**Column masking is enforced SQL.** `CREATE MASKING POLICY` DDL exists,
+participates in transactions (published at COMMIT, restored on rollback,
+persisted across restart — since 2026-08-23), and the executor enforces it on
+row-returning paths. See
+[`../RLS_SECURITY.md`](../RLS_SECURITY.md) for the predicate forms and
+coverage; the masking DDL surface is listed in `SQL_REFERENCE.md`.

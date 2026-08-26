@@ -1,5 +1,12 @@
 //! Time-series engine — columnar storage with Gorilla compression, WAL, and aggregation.
 //!
+//! S63: every mutation record (`CREATE_SERIES`/`INSERT`/`DELETE_SERIES`/
+//! `INSERT_BATCH`) has an `_XACT` twin carrying the coordinating transaction
+//! id; replay keeps a tagged record only when its id is autocommit or in the
+//! committed set recovered from the SQL side, so a transaction that never
+//! committed leaves no points behind after a crash. See
+//! `executor::enlistment`.
+//!
 //! Rewritten from row-oriented `Vec<DataPoint>` to genuine columnar layout:
 //!   - Separate timestamp/value/tag columns with 1:1 alignment
 //!   - Time-window B-tree index for O(log P + K) range queries
@@ -931,6 +938,33 @@ const WAL_INSERT: u8 = 0x02;
 const WAL_DELETE_SERIES: u8 = 0x03;
 const WAL_SNAPSHOT: u8 = 0x04;
 const WAL_INSERT_BATCH: u8 = 0x05;
+/// S63: CREATE_SERIES carrying the coordinating transaction id (`u64 LE`
+/// between the tag and the twin's body). Body otherwise identical to
+/// [`WAL_CREATE_SERIES`]'s record.
+const WAL_CREATE_SERIES_XACT: u8 = 0x06;
+/// S63: INSERT carrying the coordinating transaction id.
+const WAL_INSERT_XACT: u8 = 0x07;
+/// S63: DELETE_SERIES carrying the coordinating transaction id.
+const WAL_DELETE_SERIES_XACT: u8 = 0x08;
+/// S63: INSERT_BATCH carrying the coordinating transaction id.
+const WAL_INSERT_BATCH_XACT: u8 = 0x09;
+
+/// The reserved id carried by records written OUTSIDE any explicit
+/// transaction; from `executor::enlistment`. Declared locally so the WAL
+/// layer stays testable without importing the executor.
+const XACT_AUTOCOMMIT: u64 = 0;
+
+/// Emit the tag for one record: the `_XACT` twin plus the id when `xact` is
+/// `Some`, the legacy untagged tag when `None`.
+fn push_tag(buf: &mut Vec<u8>, xact: Option<u64>, plain: u8, xact_tagged: u8) {
+    match xact {
+        Some(x) => {
+            buf.push(xact_tagged);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        None => buf.push(plain),
+    }
+}
 
 /// Write-ahead log for time-series durability.
 struct TsWal {
@@ -946,6 +980,8 @@ struct TsWal {
     /// (logged, never propagated), so a failed reattach is reported the same
     /// way — loudly in the log, and the point is NOT acknowledged as durable.
     stranded: std::sync::atomic::AtomicBool,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
     #[cfg(test)]
     fail_reopen_once: std::sync::atomic::AtomicBool,
@@ -958,21 +994,43 @@ impl std::fmt::Debug for TsWal {
 }
 
 impl TsWal {
-    fn open(dir: &std::path::Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+    /// Open or create the WAL file in `dir` and replay it filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither autocommit nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded. Returns the live
+    /// writer, the recovered series map, and folds the max surviving tagged
+    /// id into the writer (see [`TsWal::max_xact_id`]).
+    fn open_with_committed(
+        dir: &std::path::Path,
+        partition_size: u64,
+        committed: &std::collections::HashSet<u64>,
+    ) -> std::io::Result<(Self, HashMap<String, Series>)> {
+        let (series, max_xact_id) = Self::replay(dir, partition_size, committed)?;
         let wal_path = dir.join("ts_wal.bin");
+        std::fs::create_dir_all(dir)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&wal_path)?;
-        Ok(Self {
-            writer: parking_lot::Mutex::new(Some(std::io::BufWriter::new(file))),
-            dir: dir.to_path_buf(),
-            syncer: crate::storage::wal_util::WalSync::new(),
-            stranded: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
-        })
+        Ok((
+            Self {
+                writer: parking_lot::Mutex::new(Some(std::io::BufWriter::new(file))),
+                dir: dir.to_path_buf(),
+                syncer: crate::storage::wal_util::WalSync::new(),
+                stranded: std::sync::atomic::AtomicBool::new(false),
+                max_xact_id,
+                #[cfg(test)]
+                fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
+            },
+            series,
+        ))
+    }
+
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
     }
 
     fn wal_path(&self) -> std::path::PathBuf {
@@ -1039,7 +1097,11 @@ impl TsWal {
         self.syncer.is_dirty()
     }
 
-    fn log_create_series(&self, name: &str, partition_size: u64) {
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction,
+    /// `Some(id)` inside one, `None` to write the legacy untagged record
+    /// (kept unconditionally on replay — the pre-S63 compatibility rule).
+    fn log_create_series(&self, xact: Option<u64>, name: &str, partition_size: u64) {
         use std::io::Write;
         let mut guard = self.writer.lock();
         if let Err(e) = self.reattach_if_stranded(&mut guard) {
@@ -1047,7 +1109,8 @@ impl TsWal {
             return;
         }
         if let Some(ref mut w) = *guard {
-            let mut buf = vec![WAL_CREATE_SERIES];
+            let mut buf = Vec::new();
+            push_tag(&mut buf, xact, WAL_CREATE_SERIES, WAL_CREATE_SERIES_XACT);
             let name_bytes = name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
@@ -1060,7 +1123,8 @@ impl TsWal {
         }
     }
 
-    fn log_delete_series(&self, name: &str) {
+    /// `xact` mirrors [`TsWal::log_create_series`].
+    fn log_delete_series(&self, xact: Option<u64>, name: &str) {
         use std::io::Write;
         let mut guard = self.writer.lock();
         if let Err(e) = self.reattach_if_stranded(&mut guard) {
@@ -1068,7 +1132,8 @@ impl TsWal {
             return;
         }
         if let Some(ref mut w) = *guard {
-            let mut buf = vec![WAL_DELETE_SERIES];
+            let mut buf = Vec::new();
+            push_tag(&mut buf, xact, WAL_DELETE_SERIES, WAL_DELETE_SERIES_XACT);
             let name_bytes = name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
@@ -1080,7 +1145,15 @@ impl TsWal {
         }
     }
 
-    fn log_insert(&self, name: &str, ts: u64, value: f64, tags: &[(String, String)]) {
+    /// `xact` mirrors [`TsWal::log_create_series`].
+    fn log_insert(
+        &self,
+        xact: Option<u64>,
+        name: &str,
+        ts: u64,
+        value: f64,
+        tags: &[(String, String)],
+    ) {
         use std::io::Write;
         let mut guard = self.writer.lock();
         if let Err(e) = self.reattach_if_stranded(&mut guard) {
@@ -1088,7 +1161,8 @@ impl TsWal {
             return;
         }
         if let Some(ref mut w) = *guard {
-            let mut buf = vec![WAL_INSERT];
+            let mut buf = Vec::new();
+            push_tag(&mut buf, xact, WAL_INSERT, WAL_INSERT_XACT);
             let name_bytes = name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
@@ -1111,8 +1185,14 @@ impl TsWal {
         }
     }
 
+    /// `xact` mirrors [`TsWal::log_create_series`].
     #[allow(clippy::type_complexity)]
-    fn log_insert_batch(&self, name: &str, points: &[(u64, f64, Vec<(String, String)>)]) {
+    fn log_insert_batch(
+        &self,
+        xact: Option<u64>,
+        name: &str,
+        points: &[(u64, f64, Vec<(String, String)>)],
+    ) {
         use std::io::Write;
         let mut guard = self.writer.lock();
         if let Err(e) = self.reattach_if_stranded(&mut guard) {
@@ -1120,7 +1200,8 @@ impl TsWal {
             return;
         }
         if let Some(ref mut w) = *guard {
-            let mut buf = vec![WAL_INSERT_BATCH];
+            let mut buf = Vec::new();
+            push_tag(&mut buf, xact, WAL_INSERT_BATCH, WAL_INSERT_BATCH_XACT);
             let name_bytes = name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
@@ -1147,12 +1228,16 @@ impl TsWal {
     }
 
     /// Checkpoint: write a snapshot and truncate the WAL.
-    fn checkpoint(&self, series_map: &HashMap<String, Series>) {
+    ///
+    /// Fails (after marking the writer stranded, when applicable) rather
+    /// than swallowing, so the S7 gated pass can hold the retention horizon
+    /// on a failed fold; the best-effort callers log the error themselves.
+    fn checkpoint(&self, series_map: &HashMap<String, Series>) -> std::io::Result<()> {
         use std::io::Write;
         let mut guard = self.writer.lock();
         // Flush current writer
         if let Some(ref mut w) = *guard {
-            let _ = w.flush();
+            w.flush()?;
         }
         // Build the complete new log body (snapshot), then replace atomically.
         let wal_path = self.wal_path();
@@ -1189,10 +1274,8 @@ impl TsWal {
             }
         }
         // Replace atomically (temp + fsync + rename) so a crash mid-checkpoint can't
-        // leave an empty file. Best-effort on this background path: log, don't propagate.
-        if let Err(e) = crate::storage::wal_util::atomic_replace_wal(&wal_path, &buf) {
-            tracing::error!("timeseries WAL checkpoint failed: {e}");
-        }
+        // leave an empty file.
+        crate::storage::wal_util::atomic_replace_wal(&wal_path, &buf)?;
         // The reopen is the hazardous half: the rename above already unlinked
         // the inode the writer holds, so a failure here used to leave appends
         // going to a file no future recovery reads — silently, because the
@@ -1220,61 +1303,97 @@ impl TsWal {
                     .store(false, std::sync::atomic::Ordering::Release);
             }
             Err(e) => {
-                tracing::error!("timeseries WAL checkpoint reopen failed: {e}");
                 self.stranded
                     .store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
             }
         }
         // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
         let mark = self.syncer.on_append();
         self.syncer.mark_synced(mark);
+        Ok(())
     }
 
-    /// Replay WAL entries into a store. Returns Ok(()) on success,
-    /// or Ok(()) with partial replay on corruption (graceful recovery).
+    /// Replay WAL entries into a store, filtered by the S63 committed set.
+    /// Returns Ok on success, or Ok with partial replay on corruption
+    /// (graceful recovery), plus the highest coordinating transaction id any
+    /// tagged record carried (kept or discarded) so the caller can seed the
+    /// XactId high-water mark.
     fn replay(
         dir: &std::path::Path,
         partition_size: u64,
-    ) -> std::io::Result<HashMap<String, Series>> {
+        committed: &std::collections::HashSet<u64>,
+    ) -> std::io::Result<(HashMap<String, Series>, u64)> {
         let wal_path = dir.join("ts_wal.bin");
         if !wal_path.exists() {
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), 0));
         }
         let data = std::fs::read(&wal_path)?;
         let mut series_map: HashMap<String, Series> = HashMap::new();
         let mut pos = 0;
+        let mut max_xact_id: u64 = 0;
 
         while pos < data.len() {
             // Try to read entry type
             let entry_type = data[pos];
             pos += 1;
 
+            // The tagged records parse their id, then share the body parse
+            // with the untagged twin. `keep_tagged` is the S63 filter in one
+            // expression: an autocommit record is durable by its own fsync,
+            // a committed id was vouched for by a durable COMMIT record,
+            // anything else never happened. Parsing continues either way —
+            // the record must be fully consumed to find the next one, since
+            // nothing length-frames these. Ids feed `max_xact_id` whether
+            // kept or discarded, so the caller can seed the XactId floor.
+            let mut keep_tagged = true;
+            if matches!(
+                entry_type,
+                WAL_CREATE_SERIES_XACT
+                    | WAL_INSERT_XACT
+                    | WAL_DELETE_SERIES_XACT
+                    | WAL_INSERT_BATCH_XACT
+            ) {
+                let Some((xact, new_pos)) = Self::read_u64(&data, pos) else {
+                    break;
+                };
+                pos = new_pos;
+                max_xact_id = max_xact_id.max(xact);
+                keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+            }
+
             match entry_type {
-                WAL_CREATE_SERIES => {
+                WAL_CREATE_SERIES | WAL_CREATE_SERIES_XACT => {
                     if let Some((name, _ps, new_pos)) = Self::read_create_series(&data, pos) {
-                        series_map
-                            .entry(name.clone())
-                            .or_insert_with(|| Series::new(&name));
+                        if keep_tagged {
+                            series_map
+                                .entry(name.clone())
+                                .or_insert_with(|| Series::new(&name));
+                        }
                         pos = new_pos;
                     } else {
                         // Corrupt — stop replay
                         break;
                     }
                 }
-                WAL_INSERT => {
+                WAL_INSERT | WAL_INSERT_XACT => {
                     if let Some((name, ts, value, tags, new_pos)) = Self::read_insert(&data, pos) {
-                        let series = series_map
-                            .entry(name.clone())
-                            .or_insert_with(|| Series::new(&name));
-                        series.insert(ts, value, &tags, partition_size);
+                        if keep_tagged {
+                            let series = series_map
+                                .entry(name.clone())
+                                .or_insert_with(|| Series::new(&name));
+                            series.insert(ts, value, &tags, partition_size);
+                        }
                         pos = new_pos;
                     } else {
                         break;
                     }
                 }
-                WAL_DELETE_SERIES => {
+                WAL_DELETE_SERIES | WAL_DELETE_SERIES_XACT => {
                     if let Some((name, new_pos)) = Self::read_string(&data, pos) {
-                        series_map.remove(&name);
+                        if keep_tagged {
+                            series_map.remove(&name);
+                        }
                         pos = new_pos;
                     } else {
                         break;
@@ -1291,13 +1410,15 @@ impl TsWal {
                         break;
                     }
                 }
-                WAL_INSERT_BATCH => {
+                WAL_INSERT_BATCH | WAL_INSERT_BATCH_XACT => {
                     if let Some((name, points, new_pos)) = Self::read_insert_batch(&data, pos) {
-                        let series = series_map
-                            .entry(name.clone())
-                            .or_insert_with(|| Series::new(&name));
-                        for (ts, value, tags) in &points {
-                            series.insert(*ts, *value, tags, partition_size);
+                        if keep_tagged {
+                            let series = series_map
+                                .entry(name.clone())
+                                .or_insert_with(|| Series::new(&name));
+                            for (ts, value, tags) in &points {
+                                series.insert(*ts, *value, tags, partition_size);
+                            }
                         }
                         pos = new_pos;
                     } else {
@@ -1311,7 +1432,7 @@ impl TsWal {
             }
         }
 
-        Ok(series_map)
+        Ok((series_map, max_xact_id))
     }
 
     // -- WAL parsing helpers --
@@ -1501,6 +1622,12 @@ pub struct TimeSeriesStore {
     /// Series mutated since the last `clear_touched` — the transaction
     /// write-set the executor drains under the same write guard.
     txn_touched: HashSet<String>,
+    /// The coordinating transaction id every WAL record from the next
+    /// mutation is tagged with (S63). `XACT_AUTOCOMMIT` outside an explicit
+    /// transaction; the executor sets the open transaction's id before the
+    /// mutation and `take_xact_tag` resets it after — a bracketed pair, so
+    /// the tag can never leak into a later write.
+    xact_tag: u64,
 }
 
 impl TimeSeriesStore {
@@ -1512,13 +1639,30 @@ impl TimeSeriesStore {
             last_values: HashMap::new(),
             wal: None,
             txn_touched: HashSet::new(),
+            xact_tag: XACT_AUTOCOMMIT,
         }
     }
 
-    /// Open a WAL-backed store from a directory. Replays any existing WAL.
+    /// Open a WAL-backed store from a directory, replaying with an EMPTY
+    /// committed set so every tagged record keeps — the pre-S63 contract.
+    /// The executor opens through [`TimeSeriesStore::open_with_committed`]
+    /// instead, passing the coordinating transaction ids the SQL side
+    /// durably committed so the S63 replay filter can discard the rest.
     pub fn open(dir: &std::path::Path, partition_bucket: BucketSize) -> std::io::Result<Self> {
+        Self::open_with_committed(dir, partition_bucket, &std::collections::HashSet::new())
+    }
+
+    /// Open a WAL-backed store from a directory whose replay is filtered by
+    /// the S63 committed set: a tagged record whose coordinating transaction
+    /// id is neither autocommit nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &std::path::Path,
+        partition_bucket: BucketSize,
+        committed: &std::collections::HashSet<u64>,
+    ) -> std::io::Result<Self> {
         let partition_size = partition_bucket.millis();
-        let series = TsWal::replay(dir, partition_size)?;
+        let (wal, series) = TsWal::open_with_committed(dir, partition_size, committed)?;
 
         // Reconstruct last_values from each series
         let mut last_values = HashMap::new();
@@ -1550,8 +1694,6 @@ impl TimeSeriesStore {
             }
         }
 
-        let wal = TsWal::open(dir)?;
-
         Ok(Self {
             series,
             partition_size,
@@ -1559,6 +1701,7 @@ impl TimeSeriesStore {
             last_values,
             wal: Some(wal),
             txn_touched: HashSet::new(),
+            xact_tag: XACT_AUTOCOMMIT,
         })
     }
 
@@ -1572,6 +1715,30 @@ impl TimeSeriesStore {
         std::mem::take(&mut self.txn_touched)
     }
 
+    /// Tag every WAL record from the mutation that follows with `xact`
+    /// (S63): inside an explicit transaction that is the transaction's
+    /// coordinating id, so replay discards the records when its transaction
+    /// never commits. Must be paired with [`Self::take_xact_tag`], which
+    /// resets the tag back to `XACT_AUTOCOMMIT`.
+    pub fn set_xact_tag(&mut self, xact: u64) {
+        self.xact_tag = xact;
+    }
+
+    /// Reset the S63 tag to `XACT_AUTOCOMMIT`. The bracketing pair
+    /// (`set_xact_tag` → `take_xact_tag`) delimits the mutation the tag was
+    /// set for, so no later write can inherit a finished transaction's id.
+    pub fn take_xact_tag(&mut self) -> u64 {
+        std::mem::replace(&mut self.xact_tag, XACT_AUTOCOMMIT)
+    }
+
+    /// The highest coordinating transaction id the WAL recovered (S63), 0
+    /// when it holds none or the store is in-memory. Seeds the executor's
+    /// XactId counter so a reopened process never mints an id a surviving
+    /// tagged record already carries.
+    pub fn wal_max_xact_id(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.max_xact_id())
+    }
+
     /// Set retention policy.
     pub fn set_retention(&mut self, policy: RetentionPolicy) {
         self.retention = Some(policy);
@@ -1580,7 +1747,7 @@ impl TimeSeriesStore {
     /// Delete a named series entirely.
     pub fn delete_series(&mut self, series_name: &str) -> bool {
         if let Some(ref wal) = self.wal {
-            wal.log_delete_series(series_name);
+            wal.log_delete_series(Some(self.xact_tag), series_name);
         }
         self.last_values.remove(series_name);
         self.txn_touched.insert(series_name.to_string());
@@ -1594,9 +1761,15 @@ impl TimeSeriesStore {
         // Log to WAL if enabled
         if let Some(ref wal) = self.wal {
             if is_new {
-                wal.log_create_series(series_name, self.partition_size);
+                wal.log_create_series(Some(self.xact_tag), series_name, self.partition_size);
             }
-            wal.log_insert(series_name, point.timestamp, point.value, &point.tags);
+            wal.log_insert(
+                Some(self.xact_tag),
+                series_name,
+                point.timestamp,
+                point.value,
+                &point.tags,
+            );
         }
 
         let series = self
@@ -1696,11 +1869,22 @@ impl TimeSeriesStore {
         self.series.get(series_name)
     }
 
-    /// Write a snapshot to the WAL and truncate the log.
+    /// Write a snapshot to the WAL and truncate the log (best-effort: logs
+    /// failures, the historical contract of the background path).
     pub fn snapshot(&self) {
-        if let Some(ref wal) = self.wal {
-            wal.checkpoint(&self.series);
+        if let Err(e) = self.checkpoint() {
+            tracing::error!("timeseries WAL checkpoint failed: {e}");
         }
+    }
+
+    /// Write a snapshot to the WAL and truncate the log, propagating the
+    /// failure so the S7-gated specialty pass can hold the retention
+    /// horizon on a failed fold.
+    pub fn checkpoint(&self) -> std::io::Result<()> {
+        if let Some(ref wal) = self.wal {
+            wal.checkpoint(&self.series)?;
+        }
+        Ok(())
     }
 
     /// Whether the WAL has appended inserts no completed fsync covers yet.
@@ -2034,13 +2218,13 @@ impl TimeSeriesStore {
             // Log to WAL if enabled (batch)
             if let Some(ref wal) = self.wal {
                 if !self.series.contains_key(*name) {
-                    wal.log_create_series(name, self.partition_size);
+                    wal.log_create_series(Some(self.xact_tag), name, self.partition_size);
                 }
                 let batch: Vec<_> = pts
                     .iter()
                     .map(|&(ts, val)| (ts, val, Vec::<(String, String)>::new()))
                     .collect();
-                wal.log_insert_batch(name, &batch);
+                wal.log_insert_batch(Some(self.xact_tag), name, &batch);
             }
 
             let series = self
@@ -2088,16 +2272,19 @@ impl TimeSeriesStore {
     ///
     /// Durable: each reverted series is rewritten into the WAL as
     /// delete-then-recreate, so replay after a crash reconstructs the restored
-    /// state rather than resurrecting the rolled-back points.
+    /// state rather than resurrecting the rolled-back points. Those
+    /// compensating records are pinned to `XACT_AUTOCOMMIT` (D4): they are
+    /// the rollback's own writes, durable by this log's fsync, and must
+    /// survive the filter no matter which transaction triggered the restore.
     pub fn txn_restore_scoped(&mut self, snap: &TsTxnSnapshot, touched: &HashSet<String>) {
         for name in touched {
             if let Some(ref wal) = self.wal {
-                wal.log_delete_series(name);
+                wal.log_delete_series(Some(XACT_AUTOCOMMIT), name);
             }
             match snap.series.get(name) {
                 Some(series) => {
                     if let Some(ref wal) = self.wal {
-                        wal.log_create_series(name, self.partition_size);
+                        wal.log_create_series(Some(XACT_AUTOCOMMIT), name, self.partition_size);
                         let points: Vec<WalPoint> = (0..series.timestamps.len())
                             .map(|i| {
                                 let tags: Vec<(String, String)> = series
@@ -2111,7 +2298,7 @@ impl TimeSeriesStore {
                             })
                             .collect();
                         if !points.is_empty() {
-                            wal.log_insert_batch(name, &points);
+                            wal.log_insert_batch(Some(XACT_AUTOCOMMIT), name, &points);
                         }
                     }
                     self.series.insert(name.clone(), series.clone());
@@ -2328,6 +2515,111 @@ mod tests {
                 value: (i as f64) * 1.5 + 10.0,
             })
             .collect()
+    }
+
+    // ── S63: the recovery filter ──────────────────────────────────────────
+
+    /// One log exercising every filter decision at once: legacy and
+    /// autocommit records keep, committed ids keep, unknown ids discard —
+    /// and a discarded record in the MIDDLE does not stop the records after
+    /// it (they are parsed past, not abandoned). Also asserts the max
+    /// surviving tagged id (kept or not) is reported for the XactId floor.
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = TimeSeriesStore::open(dir.path(), BucketSize::Hour).unwrap();
+            // Autocommit (id 0) base point: keep.
+            store.insert(
+                "auto",
+                DataPoint {
+                    timestamp: 1_000,
+                    tags: vec![],
+                    value: 1.0,
+                },
+            );
+            // Tagged with ids 7 (committed) and 8 (never committed) inside
+            // explicit transactions, then an autocommit point after them.
+            for (xact, ts, val) in [(7u64, 2_000u64, 2.0f64), (8, 3_000, 3.0)] {
+                store.set_xact_tag(xact);
+                store.insert(
+                    "s",
+                    DataPoint {
+                        timestamp: ts,
+                        tags: vec![],
+                        value: val,
+                    },
+                );
+                store.take_xact_tag();
+            }
+            store.insert(
+                "s",
+                DataPoint {
+                    timestamp: 4_000,
+                    tags: vec![],
+                    value: 4.0,
+                },
+            );
+        }
+
+        let committed: std::collections::HashSet<u64> = [7u64].into_iter().collect();
+        let store =
+            TimeSeriesStore::open_with_committed(dir.path(), BucketSize::Hour, &committed).unwrap();
+        assert_eq!(
+            store.wal_max_xact_id(),
+            8,
+            "discarded records still feed the floor"
+        );
+        assert_eq!(
+            store.query("auto", 0, u64::MAX).len(),
+            1,
+            "autocommit records carry id 0 and must never be filtered"
+        );
+        let kept: Vec<f64> = store
+            .query("s", 0, u64::MAX)
+            .into_iter()
+            .map(|dp| dp.value)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![2.0, 4.0],
+            "id 8 never committed; its record must be discarded, not replayed — and \
+             the autocommit point AFTER it must still land"
+        );
+    }
+
+    /// A rolled-back transaction's tagged points are discarded by the filter
+    /// on replay even though no compensation ran: the id never commits, so
+    /// nothing can ever vouch for the record.
+    #[test]
+    fn tagged_records_of_a_rolled_back_transaction_are_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = TimeSeriesStore::open(dir.path(), BucketSize::Hour).unwrap();
+            store.set_xact_tag(5);
+            store.insert(
+                "rb",
+                DataPoint {
+                    timestamp: 1_000,
+                    tags: vec![],
+                    value: 9.0,
+                },
+            );
+            store.take_xact_tag();
+            // No restore, no compensation — the record is on disk, tagged 5,
+            // and 5 never commits.
+        }
+        let store = TimeSeriesStore::open_with_committed(
+            dir.path(),
+            BucketSize::Hour,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            store.query("rb", 0, u64::MAX).is_empty(),
+            "the never-committed transaction's points must not replay"
+        );
+        assert_eq!(store.wal_max_xact_id(), 5);
     }
 
     // ========================================================================

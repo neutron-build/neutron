@@ -789,8 +789,25 @@ impl ColumnarStore {
     /// Replays the WAL to recover table state, then attaches the WAL for
     /// subsequent mutation logging. Subsequent calls to `create_table`,
     /// `drop_table`, `append`, and `clear` are durably logged.
+    ///
+    /// Replays with an EMPTY committed set so every tagged record keeps —
+    /// the pre-S63 contract. The executor opens through
+    /// [`ColumnarStore::open_with_committed`] instead, passing the
+    /// coordinating transaction ids the SQL side durably committed so the
+    /// S63 replay filter can discard the rest.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        let (wal, state) = ColumnarWal::open(dir)?;
+        Self::open_with_committed(dir, &std::collections::HashSet::new())
+    }
+
+    /// Open a WAL-backed store whose replay is filtered by the S63 committed
+    /// set: a tagged record whose coordinating transaction id is neither
+    /// autocommit nor in `committed` was written inside a transaction that
+    /// never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &std::collections::HashSet<u64>,
+    ) -> std::io::Result<Self> {
+        let (wal, state) = ColumnarWal::open_with_committed(dir, committed)?;
         let wal = Arc::new(wal);
 
         // Spawn background merge worker
@@ -825,6 +842,14 @@ impl ColumnarStore {
         Ok(store)
     }
 
+    /// The highest coordinating transaction id the WAL recovered (S63), 0
+    /// when the store is purely in-memory. Seeds the executor's XactId
+    /// counter so a reopened process never mints an id a surviving tagged
+    /// record already carries.
+    pub fn wal_max_xact_id(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |w| w.max_xact_id())
+    }
+
     /// Append a batch to a table.
     ///
     /// If the table has a MergeTree backing store, the batch is inserted there
@@ -835,7 +860,7 @@ impl ColumnarStore {
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
             let names = column_names(&batch);
-            if let Err(e) = wal.log_insert_rows_named(table, &names, &rows) {
+            if let Err(e) = wal.log_insert_rows_named(None, table, &names, &rows) {
                 eprintln!("columnar WAL: failed to log insert_rows for {table}: {e}");
             }
         }
@@ -944,7 +969,7 @@ impl ColumnarStore {
     /// Ensure a table entry exists (creates an empty table if absent).
     pub fn create_table(&mut self, table: &str) {
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_create_table(table)
+            && let Err(e) = wal.log_create_table(None, table)
         {
             eprintln!("columnar WAL: failed to log create_table {table}: {e}");
         }
@@ -971,7 +996,7 @@ impl ColumnarStore {
         strategy: MergeStrategy,
     ) {
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_create_table(table)
+            && let Err(e) = wal.log_create_table(None, table)
         {
             eprintln!("columnar WAL: failed to log create_table {table}: {e}");
         }
@@ -1051,7 +1076,7 @@ impl ColumnarStore {
         let existed = self.tables.remove(table).is_some();
         if existed
             && let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_drop_table(table)
+            && let Err(e) = wal.log_drop_table(None, table)
         {
             eprintln!("columnar WAL: failed to log drop_table {table}: {e}");
         }
@@ -1077,10 +1102,10 @@ impl ColumnarStore {
         if let Some(v) = self.tables.get_mut(table) {
             v.clear();
             if let Some(ref wal) = self.wal {
-                if let Err(e) = wal.log_drop_table(table) {
+                if let Err(e) = wal.log_drop_table(None, table) {
                     eprintln!("columnar WAL: failed to log clear(drop) {table}: {e}");
                 }
-                if let Err(e) = wal.log_create_table(table) {
+                if let Err(e) = wal.log_create_table(None, table) {
                     eprintln!("columnar WAL: failed to log clear(create) {table}: {e}");
                 }
             }
@@ -2638,18 +2663,34 @@ const DICT_AUTO_MIN_ROWS: usize = 1000;
 
 impl ColumnarStore {
     /// Append a batch to a table, automatically dictionary-encoding eligible
-    /// text columns.
+    /// text columns, with the WAL record tagged by the coordinating
+    /// transaction id `xact` (S63): `XACT_AUTOCOMMIT` outside an explicit
+    /// transaction, the transaction's id inside one — so replay discards the
+    /// rows when that transaction never commits. This is the
+    /// `COLUMNAR_INSERT` path.
     ///
     /// A text column is eligible if the batch has >= `DICT_AUTO_MIN_ROWS` rows
     /// and the column has < `DICT_AUTO_MAX_CARDINALITY` distinct values.
     ///
     /// Dictionary-encoded columns are stored alongside the batch in `dict_columns`.
+    pub fn append_with_dict_in_xact(&mut self, table: &str, batch: ColumnBatch, xact: u64) {
+        self.append_with_dict_tagged(table, batch, Some(xact));
+    }
+
+    /// [`Self::append_with_dict_in_xact`](Self::append_with_dict_in_xact)
+    /// writing the legacy UNTAGGED record: used by callers with no
+    /// transaction identity (the per-table storage engine's in-memory
+    /// store), whose records therefore keep unconditionally on replay.
     pub fn append_with_dict(&mut self, table: &str, batch: ColumnBatch) {
+        self.append_with_dict_tagged(table, batch, None);
+    }
+
+    fn append_with_dict_tagged(&mut self, table: &str, batch: ColumnBatch, xact: Option<u64>) {
         self.poll_all_merge_results();
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
             let names = column_names(&batch);
-            if let Err(e) = wal.log_insert_rows_named(table, &names, &rows) {
+            if let Err(e) = wal.log_insert_rows_named(xact, table, &names, &rows) {
                 eprintln!("columnar WAL: failed to log insert_rows (dict) for {table}: {e}");
             }
         }
@@ -7690,7 +7731,11 @@ mod tests {
         let batches = mt.scan_all();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].row_count, 1, "one row per key");
-        assert_eq!(int_col(&batches[0], "1"), vec![2000], "highest version wins");
+        assert_eq!(
+            int_col(&batches[0], "1"),
+            vec![2000],
+            "highest version wins"
+        );
         assert_eq!(int_col(&batches[0], "2"), vec![20], "and its value");
     }
 

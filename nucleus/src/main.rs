@@ -115,7 +115,8 @@ enum Commands {
         password: Option<String>,
 
         /// SQL authentication method when password auth is enabled.
-        /// Defaults to SCRAM-SHA-256. Use cleartext only for legacy clients.
+        /// Defaults to SCRAM-SHA-256. (Cleartext is refused at startup --
+        /// accepted on the command line only for parser compatibility.)
         #[arg(long, value_enum)]
         auth_method: Option<CliAuthMethod>,
 

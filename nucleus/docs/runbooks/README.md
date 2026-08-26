@@ -13,19 +13,17 @@ cannot drift from the parser.
 | [ROLLBACK.md](ROLLBACK.md) | Going back, and the cases where going back is not possible |
 | [SECURITY.md](SECURITY.md) | Authentication, roles, RLS, encryption at rest, TLS, network exposure, and secret handling |
 | [INCIDENT.md](INCIDENT.md) | Triage for the failure modes this engine actually has: read-only disk watermark, connection exhaustion, memory ceiling, slow recovery, WAL growth, corruption |
+| [06-cluster.md](06-cluster.md) | The cluster surface that exists (flags, tokens, the seed-listen role), why distributed mode is unsupported, and what that means operationally |
 
 ## Runbooks that are deliberately absent
 
-**Cluster operations.** There is no cluster runbook because there is no
-supported cluster. Raft hard state (term, voted-for, log, commit index) is
-never persisted, and replication ships raw SQL strings, so `now()`, `random()`
-and `nextval()` diverge across replicas. Any procedure written today would
-describe a system that loses data on restart. This closes with Milestone 9;
-see `DATABASE_COMPLETION.md`.
-
 **Rolling upgrade.** Requires two installable versions and a cluster to roll
-across. Blocked on the same milestone plus the first tagged release built by
-the versioned-asset release workflow.
+across. Blocked on Milestone 9 plus the first tagged release built by the
+versioned-asset release workflow. The cluster surface that DOES exist today
+(single-node with cluster ports gated off, the `--cluster-listen` seed role,
+token requirements for non-loopback binds) is covered in
+[06-cluster.md](06-cluster.md); the absent runbook is multi-node operations,
+which remain unsupported for the reasons that file documents.
 
 ## Before using any of these
 

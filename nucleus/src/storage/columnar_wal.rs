@@ -20,9 +20,31 @@
 //! | 0x04 | SNAPSHOT     | n_tables(u32) + (name_len + name + n_rows + rows…)… |
 //! | 0x05 | INSERT_ROWS_NAMED | n_cols(u32) + col names + n_rows(u32) + rows… |
 //! | 0x06 | SNAPSHOT_NAMED | n_tables(u32) + (name + n_cols + col names + n_rows + rows…)… |
+//! | 0x07 | CREATE_TABLE_XACT | xact(u64 LE) — S63 twin of 0x01              |
+//! | 0x08 | DROP_TABLE_XACT   | xact(u64 LE) — S63 twin of 0x02              |
+//! | 0x09 | INSERT_ROWS_NAMED_XACT | xact(u64 LE) — S63 twin of 0x05         |
 //!
 //! A SNAPSHOT resets all table state. After `checkpoint()` the file is
 //! truncated to a single SNAPSHOT entry so the log stays small.
+//!
+//! ## Transaction-tagged records (S63)
+//!
+//! Tags `0x07`-`0x09` are the `_XACT` twins of the mutation records, each
+//! carrying the coordinating transaction id (`u64 LE`) between the tag and
+//! the twin's body. Replay keeps a tagged record only if its id is
+//! `XACT_AUTOCOMMIT` (0 — written outside any explicit transaction, whose
+//! durability point is this log's own fsync) or appears in the committed set
+//! recovered from the SQL side; everything else was written inside a
+//! transaction that never committed and is discarded. The untagged tags keep
+//! their keep-unconditionally meaning, so pre-S63 logs replay unchanged. A
+//! SNAPSHOT is committed by construction (the S7 checkpoint gate keeps one
+//! from folding an open transaction's writes) and always replays.
+//!
+//! The per-table storage engines (`WITH (engine='columnar')`) write through
+//! the `StorageEngine` trait, which carries no transaction identity, so
+//! their records stay UNTAGGED — legacy keep-always semantics, the same
+//! behaviour they had before S63. Only the columnar MODEL store (driven by
+//! the executor's `COLUMNAR_INSERT`) tags its records today.
 //!
 //! ## Why the `_NAMED` variants exist
 //!
@@ -46,6 +68,7 @@
 //! An OLDER binary reading a newer log skips the unknown tags and loses the
 //! rows in them — downgrade requires a checkpoint on the old version first.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -53,6 +76,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::executor::enlistment::XACT_AUTOCOMMIT;
 use crate::storage::wal::GroupCommitter;
 use crate::types::{Row, Value};
 
@@ -64,6 +88,12 @@ const ENTRY_INSERT_ROWS: u8 = 0x03;
 const ENTRY_SNAPSHOT: u8 = 0x04;
 const ENTRY_INSERT_ROWS_NAMED: u8 = 0x05;
 const ENTRY_SNAPSHOT_NAMED: u8 = 0x06;
+/// S63: CREATE_TABLE carrying the coordinating transaction id.
+const ENTRY_CREATE_TABLE_XACT: u8 = 0x07;
+/// S63: DROP_TABLE carrying the coordinating transaction id.
+const ENTRY_DROP_TABLE_XACT: u8 = 0x08;
+/// S63: INSERT_ROWS_NAMED carrying the coordinating transaction id.
+const ENTRY_INSERT_ROWS_NAMED_XACT: u8 = 0x09;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -75,6 +105,10 @@ pub struct WalState {
     /// Absent for a table written by a positional caller, or by any writer
     /// predating the `_NAMED` entries.
     pub columns: Vec<(String, Vec<String>)>,
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded. Seeds the XactId
+    /// high-water mark at executor construction (S63).
+    pub max_xact_id: u64,
 }
 
 /// Append-only columnar WAL.
@@ -95,30 +129,49 @@ pub struct ColumnarWal {
     /// checkpoint replaced the log but its reopen failed; cleared by the next
     /// successful reattach (or checkpoint reopen). See `reattach_if_stranded`.
     stranded: AtomicBool,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint_named`.
     #[cfg(test)]
     fail_reopen_once: AtomicBool,
 }
 
 impl ColumnarWal {
-    /// Open or create the WAL file in `dir`.
+    /// Open or create the WAL file in `dir`, replaying with an EMPTY
+    /// committed set so every tagged record keeps — the pre-S63 contract.
+    /// The executor opens through [`ColumnarWal::open_with_committed`]
+    /// instead, passing the coordinating transaction ids the SQL side
+    /// durably committed so the S63 replay filter can discard the rest.
     ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
     /// state is empty (no tables). Corrupt trailing bytes are silently ignored
     /// (best-effort recovery).
     pub fn open(dir: &Path) -> io::Result<(Self, WalState)> {
+        Self::open_with_committed(dir, &HashSet::new())
+    }
+
+    /// Open or create the WAL file in `dir` whose replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &HashSet<u64>,
+    ) -> io::Result<(Self, WalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("columnar.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data)
+            replay(&data, committed)
         } else {
             WalState {
                 tables: Vec::new(),
                 columns: Vec::new(),
+                max_xact_id: 0,
             }
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let max_xact_id = state.max_xact_id;
         Ok((
             Self {
                 path,
@@ -127,11 +180,19 @@ impl ColumnarWal {
                 synced: AtomicU64::new(0),
                 committer: GroupCommitter::new(),
                 stranded: AtomicBool::new(false),
+                max_xact_id,
                 #[cfg(test)]
                 fail_reopen_once: AtomicBool::new(false),
             },
             state,
         ))
+    }
+
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    pub fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
     }
 
     /// Whether appends exist that no completed fsync covers yet.
@@ -170,18 +231,29 @@ impl ColumnarWal {
     }
 
     /// Log a CREATE TABLE operation.
-    pub fn log_create_table(&self, table: &str) -> io::Result<()> {
-        self.append(ENTRY_CREATE_TABLE, table, &[])
+    ///
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction,
+    /// `Some(id)` inside one, `None` to write the legacy untagged record
+    /// (kept unconditionally on replay — the pre-S63 compatibility rule).
+    pub fn log_create_table(&self, xact: Option<u64>, table: &str) -> io::Result<()> {
+        self.append(
+            ENTRY_CREATE_TABLE,
+            ENTRY_CREATE_TABLE_XACT,
+            xact,
+            table,
+            &[],
+        )
     }
 
-    /// Log a DROP TABLE operation.
-    pub fn log_drop_table(&self, table: &str) -> io::Result<()> {
-        self.append(ENTRY_DROP_TABLE, table, &[])
+    /// Log a DROP TABLE operation. `xact` mirrors [`ColumnarWal::log_create_table`].
+    pub fn log_drop_table(&self, xact: Option<u64>, table: &str) -> io::Result<()> {
+        self.append(ENTRY_DROP_TABLE, ENTRY_DROP_TABLE_XACT, xact, table, &[])
     }
 
     /// Log a batch of newly inserted rows whose columns are positional.
     pub fn log_insert_rows(&self, table: &str, rows: &[Row]) -> io::Result<()> {
-        self.log_insert_rows_named(table, &[], rows)
+        self.log_insert_rows_named(None, table, &[], rows)
     }
 
     /// Log a batch of newly inserted rows together with their column names.
@@ -189,9 +261,11 @@ impl ColumnarWal {
     /// An empty `columns` means the caller names columns positionally, which
     /// is `ColumnarStorageEngine`'s convention. Anything that puts real names
     /// on a batch must pass them, or the names do not survive a restart —
-    /// see this module's header.
+    /// see this module's header. `xact` mirrors
+    /// [`ColumnarWal::log_create_table`].
     pub fn log_insert_rows_named(
         &self,
+        xact: Option<u64>,
         table: &str,
         columns: &[String],
         rows: &[Row],
@@ -205,7 +279,13 @@ impl ColumnarWal {
         for row in rows {
             encode_row(row, &mut payload);
         }
-        self.append(ENTRY_INSERT_ROWS_NAMED, table, &payload)
+        self.append(
+            ENTRY_INSERT_ROWS_NAMED,
+            ENTRY_INSERT_ROWS_NAMED_XACT,
+            xact,
+            table,
+            &payload,
+        )
     }
 
     /// Write the complete current state of all tables as a single SNAPSHOT
@@ -247,7 +327,14 @@ impl ColumnarWal {
         // fsync + rename) so a crash between the truncate and the snapshot rewrite
         // can't leave a truncated or empty file.
         let mut contents: Vec<u8> = Vec::new();
-        write_entry(&mut contents, ENTRY_SNAPSHOT_NAMED, "", &payload)?;
+        write_entry(
+            &mut contents,
+            ENTRY_SNAPSHOT_NAMED,
+            ENTRY_SNAPSHOT_NAMED,
+            None,
+            "",
+            &payload,
+        )?;
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
 
         // The reopen is the hazardous half: the rename above already unlinked
@@ -288,10 +375,17 @@ impl ColumnarWal {
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
-    fn append(&self, entry_type: u8, name: &str, payload: &[u8]) -> io::Result<()> {
+    fn append(
+        &self,
+        plain: u8,
+        xact_tagged: u8,
+        xact: Option<u64>,
+        name: &str,
+        payload: &[u8],
+    ) -> io::Result<()> {
         let mut w = self.writer.lock();
         self.reattach_if_stranded(&mut w)?;
-        write_entry(&mut *w, entry_type, name, payload)?;
+        write_entry(&mut *w, plain, xact_tagged, xact, name, payload)?;
         w.flush()?;
         // Counted under the writer lock so sync_covering's mark is exact.
         self.appends.fetch_add(1, Ordering::AcqRel);
@@ -332,13 +426,32 @@ impl ColumnarWal {
 
 // ─── Binary encoding ──────────────────────────────────────────────────────────
 
-fn write_entry<W: Write>(w: &mut W, entry_type: u8, name: &str, payload: &[u8]) -> io::Result<()> {
+fn write_entry<W: Write>(
+    w: &mut W,
+    plain: u8,
+    xact_tagged: u8,
+    xact: Option<u64>,
+    name: &str,
+    payload: &[u8],
+) -> io::Result<()> {
     let nb = name.as_bytes();
-    w.write_all(&[entry_type])?;
+    w.write_all(&[plain_or_tag(plain, xact_tagged, xact)])?;
+    if let Some(x) = xact {
+        w.write_all(&x.to_le_bytes())?;
+    }
     w.write_all(&(nb.len() as u32).to_le_bytes())?;
     w.write_all(nb)?;
     w.write_all(&(payload.len() as u32).to_le_bytes())?;
     w.write_all(payload)
+}
+
+/// The tag byte for one record: the `_XACT` twin when `xact` is `Some`, the
+/// legacy untagged tag when `None`.
+fn plain_or_tag(plain: u8, xact_tagged: u8, xact: Option<u64>) -> u8 {
+    match xact {
+        Some(_) => xact_tagged,
+        None => plain,
+    }
 }
 
 fn encode_names(names: &[String], buf: &mut Vec<u8>) {
@@ -428,11 +541,19 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
 ///
 /// SNAPSHOT entries reset all state to their embedded snapshot, so only the
 /// *last* SNAPSHOT (and subsequent incremental entries) matter in practice.
-fn replay(data: &[u8]) -> WalState {
+///
+/// `committed` is the set of coordinating transaction ids that durably
+/// committed on the SQL side (S63). A tagged record whose id is neither
+/// `XACT_AUTOCOMMIT` nor in it was written inside a transaction that never
+/// committed, and is discarded — its body is still parsed past, and ids feed
+/// `max_xact_id` whether kept or discarded, so the caller can seed the XactId
+/// high-water mark.
+fn replay(data: &[u8], committed: &HashSet<u64>) -> WalState {
     let mut tables: std::collections::HashMap<String, Vec<Row>> = std::collections::HashMap::new();
     let mut columns: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut pos = 0usize;
+    let mut max_xact_id: u64 = 0;
 
     while pos < data.len() {
         // entry_type
@@ -440,6 +561,23 @@ fn replay(data: &[u8]) -> WalState {
             break;
         };
         pos += 1;
+
+        // The tagged records parse their id, then share the body parse with
+        // the untagged twin. `keep_tagged` is the S63 filter in one
+        // expression: an autocommit record is durable by its own fsync, a
+        // committed id was vouched for by a durable COMMIT record, anything
+        // else never happened.
+        let mut keep_tagged = true;
+        if matches!(
+            entry_type,
+            ENTRY_CREATE_TABLE_XACT | ENTRY_DROP_TABLE_XACT | ENTRY_INSERT_ROWS_NAMED_XACT
+        ) {
+            let Some(xact) = read_u64(data, &mut pos) else {
+                break;
+            };
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
 
         // name
         let Some(name_len) = read_u32(data, &mut pos) else {
@@ -467,24 +605,30 @@ fn replay(data: &[u8]) -> WalState {
         pos += payload_len;
 
         match entry_type {
-            ENTRY_CREATE_TABLE => {
-                tables.entry(name).or_default();
+            ENTRY_CREATE_TABLE | ENTRY_CREATE_TABLE_XACT => {
+                if keep_tagged {
+                    tables.entry(name).or_default();
+                }
             }
-            ENTRY_DROP_TABLE => {
-                tables.remove(&name);
+            ENTRY_DROP_TABLE | ENTRY_DROP_TABLE_XACT => {
+                if keep_tagged {
+                    tables.remove(&name);
+                }
             }
             ENTRY_INSERT_ROWS => {
                 let rows = decode_rows(payload);
                 tables.entry(name).or_default().extend(rows);
             }
-            ENTRY_INSERT_ROWS_NAMED => {
+            ENTRY_INSERT_ROWS_NAMED | ENTRY_INSERT_ROWS_NAMED_XACT => {
                 let mut pos = 0usize;
                 let names = decode_names(payload, &mut pos);
                 let rows = decode_rows_at(payload, &mut pos);
-                if !names.is_empty() {
-                    columns.insert(name.clone(), names);
+                if keep_tagged {
+                    if !names.is_empty() {
+                        columns.insert(name.clone(), names);
+                    }
+                    tables.entry(name).or_default().extend(rows);
                 }
-                tables.entry(name).or_default().extend(rows);
             }
             ENTRY_SNAPSHOT => {
                 tables.clear();
@@ -503,6 +647,7 @@ fn replay(data: &[u8]) -> WalState {
     WalState {
         tables: tables.into_iter().collect(),
         columns: columns.into_iter().collect(),
+        max_xact_id,
     }
 }
 
@@ -681,6 +826,10 @@ fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
     ]))
 }
 
+fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
+    read_i64(data, pos).map(|v| v as u64)
+}
+
 fn read_f64(data: &[u8], pos: &mut usize) -> Option<f64> {
     read_i64(data, pos).map(|v| f64::from_bits(v as u64))
 }
@@ -695,13 +844,81 @@ mod tests {
         vec![Value::Int64(id), Value::Float64(v)]
     }
 
+    // ── S63: the recovery filter ──────────────────────────────────────────
+
+    /// One log exercising every filter decision at once: legacy and
+    /// autocommit records keep, committed ids keep, unknown ids discard —
+    /// and a discarded record in the MIDDLE does not stop the records after
+    /// it (they are length-framed, so parsing past is exact). Also asserts
+    /// the max surviving tagged id (kept or not) is reported for the XactId
+    /// floor.
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
+            // Legacy untagged INSERT (pre-S63 log): keep unconditionally.
+            wal.log_insert_rows("legacy", &[int_row(1, 1.0)]).unwrap();
+            wal.log_insert_rows_named(Some(XACT_AUTOCOMMIT), "auto", &[], &[int_row(1, 1.0)])
+                .unwrap();
+            wal.log_insert_rows_named(Some(7), "committed", &[], &[int_row(1, 1.0)])
+                .unwrap();
+            wal.log_insert_rows_named(Some(8), "never", &[], &[int_row(1, 1.0)])
+                .unwrap();
+            // An abandoned transaction's DROP and CREATE must not reach the
+            // state that survived it either.
+            wal.log_drop_table(Some(9), "auto").unwrap();
+            wal.log_create_table(Some(9), "ghost").unwrap();
+            wal.log_insert_rows_named(Some(10), "late", &[], &[int_row(1, 1.0)])
+                .unwrap();
+        }
+
+        let committed: HashSet<u64> = [7u64, 10].into_iter().collect();
+        let (_wal, state) = ColumnarWal::open_with_committed(dir.path(), &committed).unwrap();
+        assert_eq!(
+            state.max_xact_id, 10,
+            "discarded records still feed the floor"
+        );
+        let count = |name: &str| {
+            state
+                .tables
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, rows)| rows.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(count("legacy"), 1, "untagged records keep unconditionally");
+        assert_eq!(count("auto"), 1, "autocommit records carry id 0 and keep");
+        assert_eq!(count("committed"), 1, "a committed id was vouched for");
+        assert_eq!(
+            count("never"),
+            0,
+            "id 8 never committed; its rows must be discarded, not replayed"
+        );
+        assert_eq!(
+            count("auto"),
+            1,
+            "the abandoned DROP (id 9) must not remove a surviving table"
+        );
+        assert_eq!(
+            count("ghost"),
+            0,
+            "the abandoned CREATE (id 9) must not reach recovery"
+        );
+        assert_eq!(
+            count("late"),
+            1,
+            "the record AFTER a discarded one must still land"
+        );
+    }
+
     #[test]
     fn group_sync_covers_prior_appends_and_clears_dirty() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _state) = ColumnarWal::open(dir.path()).unwrap();
         assert!(!wal.is_dirty(), "fresh WAL must start clean");
 
-        wal.log_create_table("t").unwrap();
+        wal.log_create_table(None, "t").unwrap();
         wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
         assert!(wal.is_dirty(), "appends must mark the WAL dirty");
 
@@ -716,7 +933,7 @@ mod tests {
     fn checkpoint_counts_as_covered() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _state) = ColumnarWal::open(dir.path()).unwrap();
-        wal.log_create_table("t").unwrap();
+        wal.log_create_table(None, "t").unwrap();
         wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
         assert!(wal.is_dirty());
         wal.checkpoint(&[("t", vec![int_row(1, 1.0)])]).unwrap();
@@ -736,7 +953,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
-            wal.log_create_table("t").unwrap();
+            wal.log_create_table(None, "t").unwrap();
             wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
             wal.fail_reopen_once.store(true, Ordering::SeqCst);
             wal.checkpoint(&[("t", vec![int_row(1, 1.0)])])
@@ -760,7 +977,7 @@ mod tests {
         let (wal, state) = ColumnarWal::open(dir.path()).unwrap();
         assert!(state.tables.is_empty());
 
-        wal.log_create_table("t").unwrap();
+        wal.log_create_table(None, "t").unwrap();
         wal.log_insert_rows("t", &[int_row(1, 1.0), int_row(2, 2.0)])
             .unwrap();
         drop(wal);
@@ -776,9 +993,9 @@ mod tests {
     fn test_drop_table_replay() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
-        wal.log_create_table("t").unwrap();
+        wal.log_create_table(None, "t").unwrap();
         wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
-        wal.log_drop_table("t").unwrap();
+        wal.log_drop_table(None, "t").unwrap();
         drop(wal);
 
         let (_wal2, state) = ColumnarWal::open(dir.path()).unwrap();
@@ -789,7 +1006,7 @@ mod tests {
     fn test_checkpoint_replay() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
-        wal.log_create_table("t").unwrap();
+        wal.log_create_table(None, "t").unwrap();
         let five: Vec<Row> = (1..=5).map(|i| int_row(i, i as f64)).collect();
         wal.log_insert_rows("t", &five).unwrap();
         // Checkpoint with 5 rows.
@@ -816,8 +1033,8 @@ mod tests {
     fn test_multiple_tables() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
-        wal.log_create_table("a").unwrap();
-        wal.log_create_table("b").unwrap();
+        wal.log_create_table(None, "a").unwrap();
+        wal.log_create_table(None, "b").unwrap();
         wal.log_insert_rows("a", &[int_row(1, 1.0), int_row(2, 2.0)])
             .unwrap();
         wal.log_insert_rows("b", &[int_row(10, 10.0)]).unwrap();

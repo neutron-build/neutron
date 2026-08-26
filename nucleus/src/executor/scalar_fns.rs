@@ -4427,7 +4427,11 @@ impl Executor {
                         estimated, table
                     )));
                 }
-                self.columnar_store.write().append_with_dict(&table, batch);
+                {
+                    let mut store = self.columnar_store.write();
+                    let xact = self.cross_model_before_columnar(&store);
+                    store.append_with_dict_in_xact(&table, batch, xact);
+                }
                 Ok(Value::Text("OK".into()))
             }
             "COLUMNAR_COUNT" => {
@@ -4567,8 +4571,9 @@ impl Executor {
                 };
                 {
                     let mut store = self.ts_store.write();
-                    self.cross_model_before_ts(&store);
+                    let xact = self.cross_model_before_ts(&store);
                     store.clear_touched();
+                    store.set_xact_tag(xact);
                     store.insert(
                         &series,
                         crate::timeseries::DataPoint {
@@ -4577,6 +4582,7 @@ impl Executor {
                             value: val,
                         },
                     );
+                    store.take_xact_tag();
                     let touched = store.take_touched();
                     drop(store);
                     self.cross_model_after_ts(touched);
@@ -5725,26 +5731,28 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let result = {
+                let (result, xact) = {
                     let mut store = self.datalog_store.write();
-                    self.cross_model_before_datalog(&store);
+                    let xact = self.cross_model_before_datalog(&store);
                     store.clear_touched();
                     let result = store.sql_assert(&input);
                     let (touched, rules) = store.take_touched();
                     drop(store);
                     self.cross_model_after_datalog(touched, rules);
-                    result
+                    (result, xact)
                 };
                 match result {
                     Ok(msg) => {
-                        // Append to the Datalog WAL. Startup opens this WAL and
-                        // restores from it, but nothing ever wrote to it, so the
-                        // model looked durable in review, its direct WAL tests
-                        // passed, and every fact asserted through SQL vanished on
-                        // restart. Failing the statement is the point: a silent
+                        // Append to the Datalog WAL, tagged with the
+                        // coordinating transaction id (S63). Startup opens
+                        // this WAL and restores from it, but nothing ever
+                        // wrote to it, so the model looked durable in
+                        // review, its direct WAL tests passed, and every
+                        // fact asserted through SQL vanished on restart.
+                        // Failing the statement is the point: a silent
                         // append failure is the same defect one layer down.
                         // (NU-013)
-                        self.log_datalog(|wal| wal.log_assert(&input))?;
+                        self.log_datalog(|wal| wal.log_assert(Some(xact), &input))?;
                         Ok(Value::Text(msg))
                     }
                     Err(e) => Err(ExecError::Unsupported(e)),
@@ -5757,26 +5765,22 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let result = {
+                let (result, xact) = {
                     let mut store = self.datalog_store.write();
-                    self.cross_model_before_datalog(&store);
+                    let xact = self.cross_model_before_datalog(&store);
                     store.clear_touched();
                     let result = store.sql_rule(&input);
                     let (touched, rules) = store.take_touched();
                     drop(store);
                     self.cross_model_after_datalog(touched, rules);
-                    result
+                    (result, xact)
                 };
                 match result {
                     Ok(msg) => {
-                        // Append to the Datalog WAL. Startup opens this WAL and
-                        // restores from it, but nothing ever wrote to it, so the
-                        // model looked durable in review, its direct WAL tests
-                        // passed, and every fact asserted through SQL vanished on
-                        // restart. Failing the statement is the point: a silent
-                        // append failure is the same defect one layer down.
-                        // (NU-013)
-                        self.log_datalog(|wal| wal.log_rule(&input))?;
+                        // Append to the Datalog WAL, tagged with the
+                        // coordinating transaction id (S63); see the
+                        // DATALOG_ASSERT arm for the NU-013 history.
+                        self.log_datalog(|wal| wal.log_rule(Some(xact), &input))?;
                         Ok(Value::Text(msg))
                     }
                     Err(e) => Err(ExecError::Unsupported(e)),
@@ -5801,26 +5805,22 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let result = {
+                let (result, xact) = {
                     let mut store = self.datalog_store.write();
-                    self.cross_model_before_datalog(&store);
+                    let xact = self.cross_model_before_datalog(&store);
                     store.clear_touched();
                     let result = store.sql_retract(&input);
                     let (touched, rules) = store.take_touched();
                     drop(store);
                     self.cross_model_after_datalog(touched, rules);
-                    result
+                    (result, xact)
                 };
                 match result {
                     Ok(msg) => {
-                        // Append to the Datalog WAL. Startup opens this WAL and
-                        // restores from it, but nothing ever wrote to it, so the
-                        // model looked durable in review, its direct WAL tests
-                        // passed, and every fact asserted through SQL vanished on
-                        // restart. Failing the statement is the point: a silent
-                        // append failure is the same defect one layer down.
-                        // (NU-013)
-                        self.log_datalog(|wal| wal.log_retract(&input))?;
+                        // Append to the Datalog WAL, tagged with the
+                        // coordinating transaction id (S63); see the
+                        // DATALOG_ASSERT arm for the NU-013 history.
+                        self.log_datalog(|wal| wal.log_retract(Some(xact), &input))?;
                         Ok(Value::Text(msg))
                     }
                     Err(e) => Err(ExecError::Unsupported(e)),
@@ -5833,26 +5833,22 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let result = {
+                let (result, xact) = {
                     let mut store = self.datalog_store.write();
-                    self.cross_model_before_datalog(&store);
+                    let xact = self.cross_model_before_datalog(&store);
                     store.clear_touched();
                     let result = store.sql_clear(&pred);
                     let (touched, rules) = store.take_touched();
                     drop(store);
                     self.cross_model_after_datalog(touched, rules);
-                    result
+                    (result, xact)
                 };
                 match result {
                     Ok(msg) => {
-                        // Append to the Datalog WAL. Startup opens this WAL and
-                        // restores from it, but nothing ever wrote to it, so the
-                        // model looked durable in review, its direct WAL tests
-                        // passed, and every fact asserted through SQL vanished on
-                        // restart. Failing the statement is the point: a silent
-                        // append failure is the same defect one layer down.
-                        // (NU-013)
-                        self.log_datalog(|wal| wal.log_clear(&pred))?;
+                        // Append to the Datalog WAL, tagged with the
+                        // coordinating transaction id (S63); see the
+                        // DATALOG_ASSERT arm for the NU-013 history.
+                        self.log_datalog(|wal| wal.log_clear(Some(xact), &pred))?;
                         Ok(Value::Text(msg))
                     }
                     Err(e) => Err(ExecError::Unsupported(e)),

@@ -945,7 +945,7 @@ impl StorageEngine for ColumnarStorageEngine {
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         self.store.write().create_table(table);
         if let Some(wal) = &self.wal {
-            wal.log_create_table(table)
+            wal.log_create_table(None, table)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(())
@@ -959,7 +959,7 @@ impl StorageEngine for ColumnarStorageEngine {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
         if let Some(wal) = &self.wal {
-            wal.log_drop_table(table)
+            wal.log_drop_table(None, table)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         // Remove index entries for this table.

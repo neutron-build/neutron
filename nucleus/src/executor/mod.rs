@@ -1207,9 +1207,10 @@ impl Executor {
             if let Some(ts) = Self::open_durable(
                 "TimeSeries",
                 &ts_dir,
-                crate::timeseries::TimeSeriesStore::open(
+                crate::timeseries::TimeSeriesStore::open_with_committed(
                     &ts_dir,
                     crate::timeseries::BucketSize::Hour,
+                    &committed_xacts,
                 ),
             ) {
                 *exec.ts_store.write() = ts;
@@ -1224,25 +1225,28 @@ impl Executor {
                 *exec.blob_store.write() = blob;
             }
 
-            // Datalog store: WAL-backed crash-recovery
+            // Datalog store: WAL-backed crash-recovery. The committed set
+            // filters the replay (S63): a tagged record whose transaction
+            // never committed is discarded.
             let datalog_dir = dir.join("datalog");
             std::fs::create_dir_all(&datalog_dir).ok();
             if let Some((wal, state)) = Self::open_durable(
                 "Datalog",
                 &datalog_dir,
-                crate::datalog::DatalogWal::open(&datalog_dir),
+                crate::datalog::DatalogWal::open_with_committed(&datalog_dir, &committed_xacts),
             ) {
                 *exec.datalog_store.write() = crate::datalog::restore_from_wal(state);
                 exec.datalog_wal = Some(wal);
             }
 
-            // Columnar store: WAL-backed crash-recovery
+            // Columnar store: WAL-backed crash-recovery, filtered by the
+            // committed set (S63).
             let col_dir = dir.join("columnar");
             std::fs::create_dir_all(&col_dir).ok();
             if let Some(col) = Self::open_durable(
                 "Columnar",
                 &col_dir,
-                crate::columnar::ColumnarStore::open(&col_dir),
+                crate::columnar::ColumnarStore::open_with_committed(&col_dir, &committed_xacts),
             ) {
                 *exec.columnar_store.write() = col;
             }
@@ -1258,6 +1262,9 @@ impl Executor {
                 .wal_max_xact_id()
                 .max(exec.doc_store().read().wal_max_xact_id())
                 .max(exec.graph_store().read().wal_max_xact_id())
+                .max(exec.ts_store.read().wal_max_xact_id())
+                .max(exec.columnar_store.read().wal_max_xact_id())
+                .max(exec.datalog_wal.as_ref().map_or(0, |w| w.max_xact_id()))
                 .max(committed_xacts.iter().copied().max().unwrap_or(0));
             if let Some((wal, state)) = Self::open_durable(
                 "Streams",
@@ -1270,8 +1277,9 @@ impl Executor {
                 xact_floor = xact_floor.max(state.max_xact_id);
             }
             // Seed the XactId counter above every id a surviving record
-            // could reference: tagged KV, doc, graph and streams records,
-            // and COMMIT-record bodies. All sources are needed — any one
+            // could reference: tagged KV, doc, graph, timeseries, datalog,
+            // columnar and streams records, and COMMIT-record bodies. All
+            // sources are needed — any one
             // alone is lowerable by reclaim (segment pruning, log
             // compaction) — and together they are exactly the ids a future
             // filter decision can consult. This runs even when a tagged log
@@ -4748,6 +4756,46 @@ impl Executor {
         store.checkpoint_wal()
     }
 
+    /// Checkpoint the timeseries WAL behind the S7 re-check (see
+    /// [`Self::checkpoint_doc_wal`]): the store's write guard is the
+    /// mutation gate, so holding the read guard across the check and the
+    /// snapshot closes the window.
+    pub fn checkpoint_ts_wal(&self) -> std::io::Result<()> {
+        let store = self.ts_store.read();
+        if self.any_open_enlisted_txn_or_busy() {
+            return Err(Self::specialty_checkpoint_declined());
+        }
+        store.checkpoint()
+    }
+
+    /// Checkpoint the datalog WAL behind the S7 re-check (see
+    /// [`Self::checkpoint_doc_wal`]). Also the periodic fold this log never
+    /// had: before S63 nothing checkpointed `datalog.wal`, so it grew one
+    /// record per mutation forever (the rollback path checkpointed it, but
+    /// rollbacks are rare by definition).
+    pub fn checkpoint_datalog_wal(&self) -> std::io::Result<()> {
+        let store = self.datalog_store.read();
+        if self.any_open_enlisted_txn_or_busy() {
+            return Err(Self::specialty_checkpoint_declined());
+        }
+        if let Some(ref wal) = self.datalog_wal {
+            wal.checkpoint(&store)?;
+        }
+        Ok(())
+    }
+
+    /// Checkpoint the columnar MODEL store's WAL behind the S7 re-check
+    /// (see [`Self::checkpoint_doc_wal`]). The store's write guard is the
+    /// mutation gate, so holding it across the check and the snapshot closes
+    /// the window (checkpoint needs `&mut self`, hence the write guard).
+    pub fn checkpoint_columnar_wal(&self) -> std::io::Result<()> {
+        let mut store = self.columnar_store.write();
+        if self.any_open_enlisted_txn_or_busy() {
+            return Err(Self::specialty_checkpoint_declined());
+        }
+        store.checkpoint()
+    }
+
     /// Checkpoint the on-disk vector-index WAL: writes a snapshot of every
     /// live HNSW index and truncates the WAL file to just that snapshot.
     ///
@@ -4853,8 +4901,9 @@ impl Executor {
     ///
     /// Every log is warn-and-continue — one store failing must not stop the
     /// others reclaiming — EXCEPT that a failure in a TAGGED log (streams,
-    /// KV, document, graph: the four whose replay is filtered against the SQL
-    /// committed set, S63) holds the horizon. A tagged log that failed its
+    /// KV, document, graph, datalog, timeseries, columnar: the seven whose
+    /// replay is filtered against the SQL committed set, S63) holds the
+    /// horizon. A tagged log that failed its
     /// checkpoint still holds COMMITTED records whose vouching SQL COMMIT
     /// records sit below `horizon`; advancing anyway would let
     /// `checkpoint_retaining` prune those COMMIT records, and after a crash
@@ -4901,6 +4950,7 @@ impl Executor {
         }
         all_tagged_ok &= tagged_ok("Graph", self.checkpoint_graph_wal());
         all_tagged_ok &= tagged_ok("Document", self.checkpoint_doc_wal());
+        all_tagged_ok &= tagged_ok("Datalog", self.checkpoint_datalog_wal());
         // FTS is checkpoint + tail (NU-014): write `fts_index.json` first,
         // which then truncates the tail it absorbed, and compact whatever is
         // left. Order matters — a crash between them leaves a tail that is a
@@ -4921,13 +4971,12 @@ impl Executor {
         // No-op when no policy is set.
         self.ts_store().write().apply_retention();
         // TimeSeries WAL: every insert appends a record; snapshot truncates it
-        // to the current series state.
-        self.ts_store().read().snapshot();
-        // Columnar WAL: every append/create logs a record; snapshot truncates
-        // it to the current table state.
-        if let Err(e) = self.columnar_store().write().checkpoint() {
-            tracing::warn!("Columnar WAL checkpoint failed: {e}");
-        }
+        // to the current series state, behind the S7 re-check (S63).
+        all_tagged_ok &= tagged_ok("TimeSeries", self.checkpoint_ts_wal());
+        // Columnar MODEL store WAL: every COLUMNAR_INSERT logs a record;
+        // snapshot truncates it to the current table state, behind the S7
+        // re-check (S63).
+        all_tagged_ok &= tagged_ok("Columnar", self.checkpoint_columnar_wal());
         // Per-table storage engines (WITH (engine='columnar'|'mergetree'|'lsm')):
         // distinct from the columnar MODEL checkpointed just above. Each has
         // its own WAL that otherwise grows unbounded — see
@@ -4937,8 +4986,9 @@ impl Executor {
             self.note_specialty_checkpoint_pass(horizon);
         } else {
             tracing::warn!(
-                "Specialty checkpoint pass incomplete: a tagged log (streams/kv/doc/graph) \
-                 failed or declined; SQL WAL pruning held at the last fully-folded horizon"
+                "Specialty checkpoint pass incomplete: a tagged log \
+                 (streams/kv/doc/graph/datalog/ts/columnar) failed or declined; SQL WAL \
+                 pruning held at the last fully-folded horizon"
             );
         }
         self.specialty_checkpoint_horizon()

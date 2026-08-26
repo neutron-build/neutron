@@ -1658,11 +1658,30 @@ const WAL_RETRACT: u8 = 0x02;
 const WAL_ADD_RULE: u8 = 0x03;
 const WAL_CLEAR_PRED: u8 = 0x04;
 const WAL_SNAPSHOT: u8 = 0x10;
+/// S63: ASSERT carrying the coordinating transaction id (`u64 LE` between
+/// the tag and the length prefix). Body otherwise identical to
+/// [`WAL_ASSERT`]'s record.
+const WAL_ASSERT_XACT: u8 = 0x05;
+/// S63: RETRACT carrying the coordinating transaction id.
+const WAL_RETRACT_XACT: u8 = 0x06;
+/// S63: ADD_RULE carrying the coordinating transaction id.
+const WAL_ADD_RULE_XACT: u8 = 0x07;
+/// S63: CLEAR_PRED carrying the coordinating transaction id.
+const WAL_CLEAR_PRED_XACT: u8 = 0x08;
+
+/// The reserved id carried by records written OUTSIDE any explicit
+/// transaction; from `executor::enlistment`. Declared locally so the WAL
+/// layer stays testable without importing the executor.
+const XACT_AUTOCOMMIT: u64 = 0;
 
 /// Recovered state from a Datalog WAL replay.
 pub struct DatalogWalState {
     pub facts: Vec<(String, Vec<String>)>, // (predicate, args)
     pub rules: Vec<String>,                // rule text
+    /// The highest coordinating transaction id seen on a tagged record,
+    /// whether that record was kept or discarded. Seeds the XactId
+    /// high-water mark at executor construction (S63).
+    pub max_xact_id: u64,
 }
 
 /// Append-only WAL for the Datalog engine.
@@ -1674,35 +1693,55 @@ pub struct DatalogWal {
     /// Set when a checkpoint replaced the log but its reopen failed; cleared
     /// by the next successful reattach. See `reattach_if_stranded`.
     stranded: std::sync::atomic::AtomicBool,
+    /// The highest coordinating transaction id recovered at open (S63).
+    max_xact_id: u64,
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
     #[cfg(test)]
     fail_reopen_once: std::sync::atomic::AtomicBool,
 }
 
 impl DatalogWal {
-    /// Open or create the WAL file in `dir`.
+    /// Open or create the WAL file in `dir`, replaying with an EMPTY
+    /// committed set so every tagged record keeps — the pre-S63 contract.
+    /// The executor opens through [`DatalogWal::open_with_committed`]
+    /// instead, passing the coordinating transaction ids the SQL side
+    /// durably committed so the S63 replay filter can discard the rest.
     ///
     /// Returns `(wal, recovered_state)`. If no WAL file exists the recovered
     /// state is empty. Corrupt trailing bytes are silently ignored
     /// (best-effort recovery).
     pub fn open(dir: &Path) -> io::Result<(Self, DatalogWalState)> {
+        Self::open_with_committed(dir, &std::collections::HashSet::new())
+    }
+
+    /// Open or create the WAL file in `dir` whose replay is filtered by the
+    /// S63 committed set: a tagged record whose coordinating transaction id
+    /// is neither `XACT_AUTOCOMMIT` nor in `committed` was written inside a
+    /// transaction that never committed, and is discarded.
+    pub fn open_with_committed(
+        dir: &Path,
+        committed: &std::collections::HashSet<u64>,
+    ) -> io::Result<(Self, DatalogWalState)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("datalog.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay_wal(&data)
+            replay_wal(&data, committed)
         } else {
             DatalogWalState {
                 facts: Vec::new(),
                 rules: Vec::new(),
+                max_xact_id: 0,
             }
         };
+        let max_xact_id = state.max_xact_id;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
                 stranded: std::sync::atomic::AtomicBool::new(false),
+                max_xact_id,
                 #[cfg(test)]
                 fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
             },
@@ -1710,26 +1749,44 @@ impl DatalogWal {
         ))
     }
 
-    /// Log an ASSERT operation. The text should be parseable as a Datalog fact
-    /// (e.g., `"parent(alice, bob)."`).
-    pub fn log_assert(&self, text: &str) -> io::Result<()> {
-        self.write_entry(WAL_ASSERT, text.as_bytes())
+    /// The highest coordinating transaction id this log recovered (S63), 0
+    /// when it holds none. Seeds the executor's XactId counter so a reopened
+    /// process never mints an id a surviving tagged record already carries.
+    pub fn max_xact_id(&self) -> u64 {
+        self.max_xact_id
     }
 
-    /// Log a RETRACT operation.
-    pub fn log_retract(&self, text: &str) -> io::Result<()> {
-        self.write_entry(WAL_RETRACT, text.as_bytes())
+    /// Log an ASSERT operation. The text should be parseable as a Datalog fact
+    /// (e.g., `"parent(alice, bob)."`).
+    ///
+    /// `xact` is the coordinating transaction id the record is tagged with:
+    /// `Some(XACT_AUTOCOMMIT)` for a write outside any explicit transaction,
+    /// `Some(id)` inside one, `None` to write the legacy untagged record
+    /// (kept unconditionally on replay — the pre-S63 compatibility rule).
+    pub fn log_assert(&self, xact: Option<u64>, text: &str) -> io::Result<()> {
+        self.write_entry(xact, WAL_ASSERT, WAL_ASSERT_XACT, text.as_bytes())
+    }
+
+    /// Log a RETRACT operation. `xact` mirrors [`DatalogWal::log_assert`].
+    pub fn log_retract(&self, xact: Option<u64>, text: &str) -> io::Result<()> {
+        self.write_entry(xact, WAL_RETRACT, WAL_RETRACT_XACT, text.as_bytes())
     }
 
     /// Log an ADD_RULE operation. The text should be parseable as a Datalog rule
-    /// (e.g., `"ancestor(X,Y) :- parent(X,Y)."`).
-    pub fn log_rule(&self, text: &str) -> io::Result<()> {
-        self.write_entry(WAL_ADD_RULE, text.as_bytes())
+    /// (e.g., `"ancestor(X,Y) :- parent(X,Y)."`). `xact` mirrors
+    /// [`DatalogWal::log_assert`].
+    pub fn log_rule(&self, xact: Option<u64>, text: &str) -> io::Result<()> {
+        self.write_entry(xact, WAL_ADD_RULE, WAL_ADD_RULE_XACT, text.as_bytes())
     }
 
-    /// Log a CLEAR_PRED operation.
-    pub fn log_clear(&self, predicate: &str) -> io::Result<()> {
-        self.write_entry(WAL_CLEAR_PRED, predicate.as_bytes())
+    /// Log a CLEAR_PRED operation. `xact` mirrors [`DatalogWal::log_assert`].
+    pub fn log_clear(&self, xact: Option<u64>, predicate: &str) -> io::Result<()> {
+        self.write_entry(
+            xact,
+            WAL_CLEAR_PRED,
+            WAL_CLEAR_PRED_XACT,
+            predicate.as_bytes(),
+        )
     }
 
     /// Write a snapshot of all current facts and rules, then truncate the log
@@ -1868,17 +1925,29 @@ impl DatalogWal {
         Ok(())
     }
 
-    /// Write a single WAL entry.
+    /// Write a single WAL entry, tagged or legacy per `xact`.
     ///
     /// The `datalog.wal_append` fault point exists so a probe can fail exactly
     /// this append: every NU-013 mutation path now treats a failed WAL append
     /// as a failed statement, and `probe_io_faults` proves it stays that way.
-    fn write_entry(&self, entry_type: u8, data: &[u8]) -> io::Result<()> {
+    fn write_entry(
+        &self,
+        xact: Option<u64>,
+        plain: u8,
+        xact_tagged: u8,
+        data: &[u8],
+    ) -> io::Result<()> {
         if let Some(e) = crate::storage::crashpoint::io_fault("datalog.wal_append") {
             return Err(e);
         }
-        let mut buf = Vec::with_capacity(1 + 4 + data.len());
-        buf.push(entry_type);
+        let mut buf = Vec::with_capacity(1 + 8 + 4 + data.len());
+        match xact {
+            Some(x) => {
+                buf.push(xact_tagged);
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            None => buf.push(plain),
+        }
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(data);
 
@@ -1952,12 +2021,25 @@ fn format_literal(lit: &Literal) -> String {
     format!("{prefix}{}({})", lit.predicate, args.join(", "))
 }
 
-/// Replay a Datalog WAL file and reconstruct the state.
-fn replay_wal(data: &[u8]) -> DatalogWalState {
+/// Replay a Datalog WAL file and reconstruct the state, filtered by the S63
+/// committed set.
+///
+/// SNAPSHOT entries reset all state; a snapshot is committed by construction
+/// (the S7 checkpoint gate keeps one from folding an open transaction's
+/// writes) and always replays.
+///
+/// `committed` is the set of coordinating transaction ids that durably
+/// committed on the SQL side. A tagged record whose id is neither
+/// `XACT_AUTOCOMMIT` nor in it was written inside a transaction that never
+/// committed, and is discarded — its body is still parsed past, and ids feed
+/// `max_xact_id` whether kept or discarded, so the caller can seed the XactId
+/// high-water mark.
+fn replay_wal(data: &[u8], committed: &std::collections::HashSet<u64>) -> DatalogWalState {
     let mut facts: Vec<(String, Vec<String>)> = Vec::new();
     let mut rules: Vec<String> = Vec::new();
     // Track facts as a set for retraction
     let mut fact_set: HashMap<String, HashSet<Vec<String>>> = HashMap::new();
+    let mut max_xact_id: u64 = 0;
 
     let mut pos = 0usize;
 
@@ -1966,6 +2048,18 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
             break;
         };
         pos += 1;
+
+        let mut keep_tagged = true;
+        if matches!(
+            entry_type,
+            WAL_ASSERT_XACT | WAL_RETRACT_XACT | WAL_ADD_RULE_XACT | WAL_CLEAR_PRED_XACT
+        ) {
+            let Some(xact) = wal_read_u64(data, &mut pos) else {
+                break;
+            };
+            max_xact_id = max_xact_id.max(xact);
+            keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
+        }
 
         let Some(text_len) = wal_read_u32(data, &mut pos) else {
             break;
@@ -1983,16 +2077,17 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
         };
 
         match entry_type {
-            WAL_ASSERT => {
-                if let Ok(Statement::Fact(fact)) = parse_single_statement(&text) {
+            WAL_ASSERT | WAL_ASSERT_XACT => {
+                if keep_tagged && let Ok(Statement::Fact(fact)) = parse_single_statement(&text) {
                     fact_set
                         .entry(fact.predicate.clone())
                         .or_default()
                         .insert(fact.args.clone());
                 }
             }
-            WAL_RETRACT => {
-                if let Ok(Statement::Fact(fact)) = parse_single_statement(&text)
+            WAL_RETRACT | WAL_RETRACT_XACT => {
+                if keep_tagged
+                    && let Ok(Statement::Fact(fact)) = parse_single_statement(&text)
                     && let Some(set) = fact_set.get_mut(&fact.predicate)
                 {
                     set.remove(&fact.args);
@@ -2001,14 +2096,16 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
                     }
                 }
             }
-            WAL_ADD_RULE => {
+            WAL_ADD_RULE | WAL_ADD_RULE_XACT => {
                 // Verify it parses as a rule
-                if let Ok(Statement::Rule(_)) = parse_single_statement(&text) {
+                if keep_tagged && let Ok(Statement::Rule(_)) = parse_single_statement(&text) {
                     rules.push(text);
                 }
             }
-            WAL_CLEAR_PRED => {
-                fact_set.remove(&text);
+            WAL_CLEAR_PRED | WAL_CLEAR_PRED_XACT => {
+                if keep_tagged {
+                    fact_set.remove(&text);
+                }
             }
             WAL_SNAPSHOT => {
                 // Reset state and parse snapshot payload
@@ -2085,7 +2182,11 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
         }
     }
 
-    DatalogWalState { facts, rules }
+    DatalogWalState {
+        facts,
+        rules,
+        max_xact_id,
+    }
 }
 
 /// Read a u32 from WAL data.
@@ -2093,6 +2194,15 @@ fn wal_read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
     let b = data.get(*pos..*pos + 4)?;
     *pos += 4;
     Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Read a u64 from WAL data.
+fn wal_read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let b = data.get(*pos..*pos + 8)?;
+    *pos += 8;
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 /// Rebuild a DatalogStore from WAL state.
@@ -2125,6 +2235,56 @@ pub fn restore_from_wal(state: DatalogWalState) -> DatalogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── S63: the recovery filter ────────────────────────────────────────────
+
+    /// One log exercising every filter decision at once: legacy and
+    /// autocommit records keep, committed ids keep, unknown ids discard —
+    /// and a discarded record in the MIDDLE does not stop the records after
+    /// it (they are length-framed, so parsing past is exact). Also asserts
+    /// the max surviving tagged id (kept or not) is reported for the XactId
+    /// floor.
+    #[test]
+    fn tagged_records_filter_on_the_committed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = DatalogWal::open(dir.path()).unwrap();
+            wal.log_assert(None, "base(legacy).").unwrap();
+            wal.log_assert(Some(XACT_AUTOCOMMIT), "base(auto).")
+                .unwrap();
+            wal.log_assert(Some(7), "kept(committed).").unwrap();
+            wal.log_assert(Some(8), "dropped(never).").unwrap();
+            // An abandoned transaction's RETRACT, RULE and CLEAR must not
+            // reach the state that survived it either.
+            wal.log_retract(Some(9), "base(auto).").unwrap();
+            wal.log_rule(Some(9), "ghost(X) :- base(X).").unwrap();
+            wal.log_clear(Some(9), "kept").unwrap();
+            wal.log_assert(Some(10), "kept(late).").unwrap();
+        }
+
+        let committed: std::collections::HashSet<u64> = [7u64, 10].into_iter().collect();
+        let (_wal, state) = DatalogWal::open_with_committed(dir.path(), &committed).unwrap();
+        assert_eq!(
+            state.max_xact_id, 10,
+            "discarded records still feed the floor"
+        );
+        let preds: Vec<&str> = state.facts.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(preds.contains(&"base"), "legacy + autocommit keep");
+        assert_eq!(
+            state.facts.iter().filter(|(p, _)| p == "base").count(),
+            2,
+            "the abandoned RETRACT (id 9) must not remove the autocommit fact"
+        );
+        assert!(preds.contains(&"kept"), "committed ids keep: {preds:?}");
+        assert!(
+            !preds.contains(&"dropped"),
+            "id 8 never committed; its fact must be discarded, not replayed"
+        );
+        assert!(
+            state.rules.iter().all(|r| !r.contains("ghost")),
+            "the abandoned RULE (id 9) must not reach recovery"
+        );
+    }
 
     // ─── Parser tests ────────────────────────────────────────────────────────
 
@@ -2973,8 +3133,8 @@ mod tests {
         let (wal, state) = DatalogWal::open(dir.path()).unwrap();
         assert!(state.facts.is_empty());
 
-        wal.log_assert("parent(alice, bob).").unwrap();
-        wal.log_assert("parent(bob, charlie).").unwrap();
+        wal.log_assert(None, "parent(alice, bob).").unwrap();
+        wal.log_assert(None, "parent(bob, charlie).").unwrap();
         drop(wal);
 
         let (_wal2, state2) = DatalogWal::open(dir.path()).unwrap();
@@ -2991,10 +3151,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DatalogWal::open(dir.path()).unwrap();
 
-        wal.log_assert("parent(alice, bob).").unwrap();
-        wal.log_assert("parent(bob, charlie).").unwrap();
-        wal.log_rule("ancestor(X, Y) :- parent(X, Y).").unwrap();
-        wal.log_rule("ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z).")
+        wal.log_assert(None, "parent(alice, bob).").unwrap();
+        wal.log_assert(None, "parent(bob, charlie).").unwrap();
+        wal.log_rule(None, "ancestor(X, Y) :- parent(X, Y).")
+            .unwrap();
+        wal.log_rule(None, "ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z).")
             .unwrap();
         drop(wal);
 
@@ -3012,10 +3173,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DatalogWal::open(dir.path()).unwrap();
 
-        wal.log_assert("edge(a, b).").unwrap();
-        wal.log_assert("edge(b, c).").unwrap();
-        wal.log_rule("path(X, Y) :- edge(X, Y).").unwrap();
-        wal.log_rule("path(X, Z) :- edge(X, Y), path(Y, Z).")
+        wal.log_assert(None, "edge(a, b).").unwrap();
+        wal.log_assert(None, "edge(b, c).").unwrap();
+        wal.log_rule(None, "path(X, Y) :- edge(X, Y).").unwrap();
+        wal.log_rule(None, "path(X, Z) :- edge(X, Y), path(Y, Z).")
             .unwrap();
         drop(wal);
 
@@ -3035,9 +3196,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DatalogWal::open(dir.path()).unwrap();
 
-        wal.log_assert("parent(alice, bob).").unwrap();
-        wal.log_assert("parent(bob, charlie).").unwrap();
-        wal.log_retract("parent(alice, bob).").unwrap();
+        wal.log_assert(None, "parent(alice, bob).").unwrap();
+        wal.log_assert(None, "parent(bob, charlie).").unwrap();
+        wal.log_retract(None, "parent(alice, bob).").unwrap();
         drop(wal);
 
         let (_wal2, state2) = DatalogWal::open(dir.path()).unwrap();
@@ -3061,7 +3222,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = DatalogWal::open(dir.path()).unwrap();
 
-        wal.log_assert("parent(alice, bob).").unwrap();
+        wal.log_assert(None, "parent(alice, bob).").unwrap();
         drop(wal);
 
         // Append garbage bytes to the WAL file
@@ -3085,9 +3246,10 @@ mod tests {
         let (wal, _) = DatalogWal::open(dir.path()).unwrap();
 
         // Write some facts and a rule
-        wal.log_assert("parent(alice, bob).").unwrap();
-        wal.log_assert("parent(bob, charlie).").unwrap();
-        wal.log_rule("ancestor(X, Y) :- parent(X, Y).").unwrap();
+        wal.log_assert(None, "parent(alice, bob).").unwrap();
+        wal.log_assert(None, "parent(bob, charlie).").unwrap();
+        wal.log_rule(None, "ancestor(X, Y) :- parent(X, Y).")
+            .unwrap();
 
         // Build a store from current state
         let mut store = DatalogStore::new();
@@ -3112,7 +3274,7 @@ mod tests {
         wal.checkpoint(&store).unwrap();
 
         // Write more facts after checkpoint
-        wal.log_assert("parent(charlie, dave).").unwrap();
+        wal.log_assert(None, "parent(charlie, dave).").unwrap();
         drop(wal);
 
         // Reopen and verify
@@ -3877,14 +4039,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (wal, _) = DatalogWal::open(dir.path()).unwrap();
-            wal.log_assert("parent(alice, bob).").unwrap();
+            wal.log_assert(None, "parent(alice, bob).").unwrap();
             let mut store = DatalogStore::new();
             store.assert_fact("parent", vec!["alice".into(), "bob".into()]);
             wal.fail_reopen_once
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             wal.checkpoint(&store)
                 .expect_err("the injected reopen failure must fail the checkpoint");
-            wal.log_assert("parent(bob, charlie).")
+            wal.log_assert(None, "parent(bob, charlie).")
                 .expect("a later append must reattach, not strand");
         }
         let (_, state) = DatalogWal::open(dir.path()).unwrap();

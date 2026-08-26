@@ -1,7 +1,11 @@
 //! S63 slice 1: cross-model atomicity between SQL and Streams, slice 2
 //! between SQL and the KV strings WAL (`kv.wal`), slice 3 between SQL
-//! and the document WAL (`doc.wal`), and slice 4 between SQL and the
-//! property-graph WAL (`graph.wal`).
+//! and the document WAL (`doc.wal`), slice 4 between SQL and the
+//! property-graph WAL (`graph.wal`), slices 5-7 between SQL and the
+//! timeseries (`ts_wal.bin`), datalog (`datalog.wal`) and columnar-model
+//! (`columnar.wal`) logs. (The geo WAL is opened but receives zero writes
+//! — see `src/geo/wal.rs`'s header for the determination — so there is
+//! nothing to make atomic on that side.)
 //!
 //! The mechanism under test, end to end: every streams/KV WAL record written
 //! inside an explicit transaction is tagged with that transaction's
@@ -1071,6 +1075,9 @@ async fn tagged_checkpoints_decline_while_an_enlisted_transaction_is_open() {
         ("KV", ex.checkpoint_kv_wal()),
         ("document", ex.checkpoint_doc_wal()),
         ("graph", ex.checkpoint_graph_wal()),
+        ("timeseries", ex.checkpoint_ts_wal()),
+        ("datalog", ex.checkpoint_datalog_wal()),
+        ("columnar", ex.checkpoint_columnar_wal()),
     ] {
         let Err(e) = attempt else {
             panic!("the {name} checkpoint must decline under an open enlisted txn")
@@ -1093,4 +1100,413 @@ async fn tagged_checkpoints_decline_while_an_enlisted_transaction_is_open() {
         .expect("with no enlisted txn the document checkpoint proceeds");
     ex.checkpoint_graph_wal()
         .expect("with no enlisted txn the graph checkpoint proceeds");
+    ex.checkpoint_ts_wal()
+        .expect("with no enlisted txn the timeseries checkpoint proceeds");
+    ex.checkpoint_datalog_wal()
+        .expect("with no enlisted txn the datalog checkpoint proceeds");
+    ex.checkpoint_columnar_wal()
+        .expect("with no enlisted txn the columnar checkpoint proceeds");
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// S63 slice 5: the timeseries WAL (ts_wal.bin)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// TS_COUNT as i64.
+async fn ts_count(ex: &Executor, series: &str) -> i64 {
+    let r = exec(ex, &format!("SELECT TS_COUNT('{series}')")).await;
+    match scalar(&r[0]) {
+        Value::Int64(n) => *n,
+        other => panic!("TS_COUNT returned {other:?}"),
+    }
+}
+
+/// The S63 discard direction for timeseries: dropping the executor
+/// mid-transaction is the durable equivalent of dying before the COMMIT
+/// record — the ts_wal record was flushed by its statement, and nothing
+/// vouches for its id. No compensation runs (the transaction is abandoned,
+/// not rolled back), so the only thing standing between the flushed tagged
+/// record and recovery is the filter. The committed transaction's points in
+/// the SAME log survive — the both-directions proof.
+#[tokio::test]
+async fn uncommitted_ts_insert_is_discarded_and_committed_kept_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+        // Committed: SQL row + ts point, both tagged with the txn's id,
+        // vouched for by the COMMIT record body.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (1, 'kept')").await;
+        exec(&ex, "SELECT TS_INSERT('kept_s', 1000, 1.5)").await;
+        exec(&ex, "COMMIT").await;
+        // Abandoned: record flushed to ts_wal.bin, COMMIT never happens. No
+        // rollback compensation runs — the filter alone must discard it.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (2, 'lost')").await;
+        exec(&ex, "SELECT TS_INSERT('lost_s', 2000, 2.5)").await;
+        // no COMMIT, no ROLLBACK — drop(ex) below abandons it
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        ts_count(&ex, "kept_s").await,
+        1,
+        "the committed transaction's point is vouched for and must survive"
+    );
+    assert_eq!(
+        ts_count(&ex, "lost_s").await,
+        0,
+        "the abandoned transaction's ts record was flushed to ts_wal.bin and \
+         must be discarded by the filter, not replayed"
+    );
+    let rows = exec(&ex, "SELECT v FROM t ORDER BY id").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the abandoned transaction's SQL row is gone too"
+    );
+    assert_eq!(scalar(&rows[0]), &Value::Text("kept".into()));
+}
+
+/// Autocommit TS_INSERTs carry XACT_AUTOCOMMIT (0) and never need a commit
+/// record — their durability point is the ts log's own fsync.
+#[tokio::test]
+async fn autocommit_ts_insert_survives_reopen_without_a_commit_record() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "SELECT TS_INSERT('auto_s', 1000, 1.0)").await;
+        exec(&ex, "SELECT TS_INSERT('auto_s', 2000, 2.0)").await;
+        assert_eq!(ts_count(&ex, "auto_s").await, 2);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        ts_count(&ex, "auto_s").await,
+        2,
+        "autocommit records carry id 0 and must never be filtered"
+    );
+}
+
+/// A rolled-back transaction's tagged ts records are discarded by the
+/// filter on replay. The rollback's compensating records ALSO handle this
+/// (double protection, deliberately kept — see D4), so the outcome here is
+/// asserted rather than discriminated; the filter-only discriminator is the
+/// abandoned-transaction test above, where no compensation ever runs.
+#[tokio::test]
+async fn rolled_back_ts_inserts_are_gone_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "SELECT TS_INSERT('pre_s', 1000, 1.0)").await;
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "SELECT TS_INSERT('rb_s', 2000, 2.0)").await;
+        exec(&ex, "SELECT TS_INSERT('pre_s', 3000, 3.0)").await;
+        exec(&ex, "ROLLBACK").await;
+        assert_eq!(ts_count(&ex, "pre_s").await, 1);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        ts_count(&ex, "rb_s").await,
+        0,
+        "the rolled-back transaction's point must not resurrect on reopen"
+    );
+    assert_eq!(
+        ts_count(&ex, "pre_s").await,
+        1,
+        "the overwritten series' before-image must be what replay restores"
+    );
+}
+
+/// The ts half of the id-monotonicity proof (S1a/D2): after a run whose
+/// only surviving tagged record lives in ts_wal.bin, a reopened executor
+/// must still mint ids ABOVE the id that record carries — otherwise the
+/// NEXT committed transaction would vouch for the abandoned record's id and
+/// resurrect it.
+#[tokio::test]
+async fn ts_tagged_ids_do_not_reuse_when_only_ts_wal_holds_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Run 1: an abandoned transaction tags a ts record with id 1. Nothing
+    // commits, so no COMMIT body exists anywhere afterwards.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "SELECT TS_INSERT('abandoned_s', 1000, 1.0)").await;
+        // abandon — no COMMIT, no ROLLBACK, no compensation
+    }
+
+    // Run 2: reopen. Only ts_wal.bin's max tagged id (1) can hold the floor
+    // above 1.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        assert_eq!(
+            ts_count(&ex, "abandoned_s").await,
+            0,
+            "the abandoned record must be discarded on replay"
+        );
+        let next = ex.next_xact_id_probe();
+        assert!(
+            next > 1,
+            "id reuse: the next minted id is {next}, but ts_wal.bin still holds \
+             a tagged record carrying id 1 — a fresh transaction with that id \
+             would resurrect it"
+        );
+        // Prove the resurrection the seed prevents: commit a NEW ts write.
+        // Its id is above 1, so vouching for it must not vouch for the
+        // abandoned record.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "SELECT TS_INSERT('live_s', 1000, 1.0)").await;
+        exec(&ex, "COMMIT").await;
+    }
+
+    // Run 3: the live point survives, the abandoned one stays dead.
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(ts_count(&ex, "live_s").await, 1);
+    assert_eq!(
+        ts_count(&ex, "abandoned_s").await,
+        0,
+        "the committed id must not vouch for the stale tagged record"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// S63 slice 6: the datalog WAL (datalog.wal)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Whether the exact fact literal `fact` (e.g. `parent(a, b)`) is present,
+/// via DATALOG_QUERY's JSON rows.
+async fn dl_has_fact(ex: &Executor, fact: &str) -> bool {
+    let r = exec(ex, &format!("SELECT DATALOG_QUERY('{fact}')")).await;
+    let json = text_of(r.into_iter().next().unwrap());
+    let v: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("DATALOG_QUERY returned unparseable {json:?}: {e}"));
+    !v.as_array().is_some_and(|a| a.is_empty())
+}
+
+/// The S63 discard direction for datalog: dropping the executor
+/// mid-transaction is the durable equivalent of dying before the COMMIT
+/// record — the datalog.wal record was flushed by its statement, and
+/// nothing vouches for its id. No compensation runs (the transaction is
+/// abandoned, not rolled back), so the only thing standing between the
+/// flushed tagged record and recovery is the filter. The committed
+/// transaction's fact in the SAME log survives — the both-directions proof.
+#[tokio::test]
+async fn uncommitted_datalog_assert_is_discarded_and_committed_kept_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+        // Committed: SQL row + fact, both tagged with the txn's id,
+        // vouched for by the COMMIT record body.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (1, 'kept')").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('kept_fact(a, b).')").await;
+        exec(&ex, "COMMIT").await;
+        // Abandoned: record flushed to datalog.wal, COMMIT never happens. No
+        // rollback compensation runs — the filter alone must discard it.
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "INSERT INTO t (id, v) VALUES (2, 'lost')").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('lost_fact(a, b).')").await;
+        // no COMMIT, no ROLLBACK — drop(ex) below abandons it
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert!(
+        dl_has_fact(&ex, "kept_fact(a, b)").await,
+        "the committed transaction's fact is vouched for and must survive"
+    );
+    assert!(
+        !dl_has_fact(&ex, "lost_fact(a, b)").await,
+        "the abandoned transaction's datalog record was flushed to datalog.wal \
+         and must be discarded by the filter, not replayed"
+    );
+    let rows = exec(&ex, "SELECT v FROM t ORDER BY id").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the abandoned transaction's SQL row is gone too"
+    );
+    assert_eq!(scalar(&rows[0]), &Value::Text("kept".into()));
+}
+
+/// Autocommit DATALOG_ASSERTs carry XACT_AUTOCOMMIT (0) and never need a
+/// commit record — their durability point is the datalog log's own fsync.
+#[tokio::test]
+async fn autocommit_datalog_assert_survives_reopen_without_a_commit_record() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "SELECT DATALOG_ASSERT('auto_fact(a, b).')").await;
+        assert!(dl_has_fact(&ex, "auto_fact(a, b)").await);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert!(
+        dl_has_fact(&ex, "auto_fact(a, b)").await,
+        "autocommit records carry id 0 and must never be filtered"
+    );
+}
+
+/// A rolled-back transaction's tagged datalog records are discarded by the
+/// filter on replay. The rollback's WAL-checkpoint compensation ALSO handles
+/// this (double protection, deliberately kept — see D4), so the outcome here
+/// is asserted rather than discriminated; the filter-only discriminator is
+/// the abandoned-transaction test above, where no compensation ever runs.
+#[tokio::test]
+async fn rolled_back_datalog_asserts_are_gone_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "SELECT DATALOG_ASSERT('pre_fact(a, b).')").await;
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('rb_fact(a, b).')").await;
+        exec(&ex, "SELECT DATALOG_RETRACT('pre_fact(a, b).')").await;
+        exec(&ex, "ROLLBACK").await;
+        assert!(dl_has_fact(&ex, "pre_fact(a, b)").await);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert!(
+        !dl_has_fact(&ex, "rb_fact(a, b)").await,
+        "the rolled-back transaction's fact must not resurrect on reopen"
+    );
+    assert!(
+        dl_has_fact(&ex, "pre_fact(a, b)").await,
+        "the retracted fact's before-image must be what replay restores"
+    );
+}
+
+/// The datalog half of the id-monotonicity proof (S1a/D2).
+#[tokio::test]
+async fn datalog_tagged_ids_do_not_reuse_when_only_datalog_wal_holds_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Run 1: an abandoned transaction tags a datalog record with id 1.
+    // Nothing commits, so no COMMIT body exists anywhere afterwards.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('abandoned_fact(a, b).')").await;
+        // abandon — no COMMIT, no ROLLBACK, no compensation
+    }
+
+    // Run 2: reopen. Only datalog.wal's max tagged id (1) can hold the
+    // floor above 1.
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        assert!(
+            !dl_has_fact(&ex, "abandoned_fact(a, b)").await,
+            "the abandoned record must be discarded on replay"
+        );
+        let next = ex.next_xact_id_probe();
+        assert!(
+            next > 1,
+            "id reuse: the next minted id is {next}, but datalog.wal still holds \
+             a tagged record carrying id 1 — a fresh transaction with that id \
+             would resurrect it"
+        );
+        exec(&ex, "BEGIN").await;
+        exec(&ex, "SELECT DATALOG_ASSERT('live_fact(a, b).')").await;
+        exec(&ex, "COMMIT").await;
+    }
+
+    // Run 3: the live fact survives, the abandoned one stays dead.
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert!(dl_has_fact(&ex, "live_fact(a, b)").await);
+    assert!(
+        !dl_has_fact(&ex, "abandoned_fact(a, b)").await,
+        "the committed id must not vouch for the stale tagged record"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// S63 slice 7: the columnar model WAL (columnar.wal)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// COLUMNAR_COUNT as i64.
+async fn columnar_count(ex: &Executor, table: &str) -> i64 {
+    let r = exec(ex, &format!("SELECT COLUMNAR_COUNT('{table}')")).await;
+    match scalar(&r[0]) {
+        Value::Int64(n) => *n,
+        other => panic!("COLUMNAR_COUNT returned {other:?}"),
+    }
+}
+
+/// Why there is no uncommitted-discard test for columnar here: M8's
+/// fail-loud boundary REFUSES `COLUMNAR_INSERT` inside an explicit
+/// transaction (the store has no rollback before-image — see
+/// `refused_in_transaction`), so the uncommitted-columnar-record shape
+/// this slice exists to make safe cannot be produced through SQL in the
+/// first place. The crash window is empty by construction, and the
+/// filter that would close it if the boundary is ever lifted is proven at
+/// the WAL level (`storage::columnar_wal::tests::
+/// tagged_records_filter_on_the_committed_set`).
+#[tokio::test]
+async fn columnar_insert_is_refused_inside_a_transaction_the_m8_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _engine) = open_segmented(dir.path()).await;
+
+    exec(&ex, "BEGIN").await;
+    let err = ex
+        .execute("SELECT COLUMNAR_INSERT('refused_t', 'v', 1)")
+        .await
+        .expect_err("the unrevertable columnar write must be refused inside a transaction");
+    assert!(
+        err.to_string().contains("rollback"),
+        "the refusal must name the reason, got {err}"
+    );
+    exec(&ex, "ROLLBACK").await;
+
+    // Nothing partial was written: the table holds no rows live, and the
+    // log replays to the same empty state across a reopen.
+    assert_eq!(columnar_count(&ex, "refused_t").await, 0);
+    drop(ex);
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        columnar_count(&ex, "refused_t").await,
+        0,
+        "no record from the refused statement may reach recovery"
+    );
+}
+
+/// Autocommit COLUMNAR_INSERTs carry XACT_AUTOCOMMIT (0) and never need a
+/// commit record — their durability point is the columnar log's own fsync.
+#[tokio::test]
+async fn autocommit_columnar_insert_survives_reopen_without_a_commit_record() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let (ex, _engine) = open_segmented(dir.path()).await;
+        exec(&ex, "SELECT COLUMNAR_INSERT('auto_t', 'v', 1)").await;
+        exec(&ex, "SELECT COLUMNAR_INSERT('auto_t', 'v', 2)").await;
+        assert_eq!(columnar_count(&ex, "auto_t").await, 2);
+    }
+
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    assert_eq!(
+        columnar_count(&ex, "auto_t").await,
+        2,
+        "autocommit records carry id 0 and must never be filtered"
+    );
+}
+
+// A rolled-back transaction's tagged columnar records would be discarded
+// by the filter on replay — but the shape cannot be produced through SQL:
+// the M8 boundary refuses the write inside the transaction
+// (`columnar_insert_is_refused_inside_a_transaction_the_m8_boundary`
+// above), and the WAL-level filter test covers the discard itself.
+// `every_mutating_function_is_enlisted_refused_or_declared` in
+// `test_specialty_surface_guard` is what enforces that the refusal stays.
+
+// ══════════════════════════════════════════════════════════════════════════
+// Slice 8: geo — documentation-only (see src/geo/wal.rs's header)
+// ══════════════════════════════════════════════════════════════════════════
