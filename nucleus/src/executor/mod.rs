@@ -4542,6 +4542,38 @@ impl Executor {
             .is_some_and(|cm| !cm.enlisted.is_empty())
     }
 
+    /// [`any_open_enlisted_txn`](Self::any_open_enlisted_txn), but it never
+    /// WAITS for a session's cross-model lock: a lock that cannot be taken
+    /// without blocking counts as "enlisted open". This is the variant a
+    /// specialty checkpoint must use when it already holds a store's state
+    /// lock and re-checks the S7 gate (S95 finding 5) — a session sitting in
+    /// a `touch_*` is exactly a write that may be enlisting right now, so
+    /// declining this pass is always safe, while blocking under the state
+    /// lock could invert against the touch paths' own lock order.
+    pub fn any_open_enlisted_txn_or_busy(&self) -> bool {
+        fn enlisted_or_busy(cm: &parking_lot::Mutex<Option<cross_model::CrossModelTxn>>) -> bool {
+            match cm.try_lock() {
+                Some(guard) => guard.as_ref().is_some_and(|cm| !cm.enlisted.is_empty()),
+                None => true,
+            }
+        }
+        self.sessions
+            .read()
+            .values()
+            .any(|s| enlisted_or_busy(&s.cross_model))
+            || enlisted_or_busy(&self.default_session.cross_model)
+    }
+
+    /// The error a specialty checkpoint returns when the S7 re-check declined
+    /// it: `WouldBlock` so the pass can tell a decline (retry next pass, hold
+    /// the horizon) apart from an IO failure.
+    fn specialty_checkpoint_declined() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "declined: an enlisted transaction is open (S7 re-check)",
+        )
+    }
+
     /// The WAL LSN horizon of the last completed specialty-checkpoint pass
     /// (S7): everything a specialty log held at or after this LSN may not
     /// have been folded into a snapshot yet, so the SQL side must not prune
@@ -4659,12 +4691,61 @@ impl Executor {
     /// `scalar_fns.rs`) with no consumer required — same unbounded-growth
     /// shape as the CDC WAL this mirrors (`checkpoint_cdc_wal`). Called from
     /// the recurring `WalCheckpoint` background task.
+    ///
+    /// S7 re-check (S95 finding 5): the background task reads the gate in
+    /// `main.rs` BEFORE this runs, and a BEGIN + tagged write landing in that
+    /// window would fold uncommitted state into the snapshot — state the
+    /// recovery filter cannot discard, because a snapshot carries no
+    /// transaction id. So the gate is re-checked HERE, under the streams
+    /// state lock: a writer must hold the write lock to mutate, so any
+    /// mutation already in the snapshot belongs to a transaction enlisted
+    /// before the check (declined), and any later one cannot land until the
+    /// snapshot is done. The busy-variant gate never blocks under the state
+    /// lock.
     pub fn checkpoint_streams_wal(&self) -> std::io::Result<()> {
         if let Some(ref wal) = self.streams_wal {
             let streams = self.streams.read();
+            if self.any_open_enlisted_txn_or_busy() {
+                return Err(Self::specialty_checkpoint_declined());
+            }
             wal.checkpoint(&streams)?;
         }
         Ok(())
+    }
+
+    /// Checkpoint the KV WAL behind the S7 re-check (see
+    /// [`Self::checkpoint_streams_wal`]). The KV keyspace is sharded, so
+    /// there is no single state lock to hold across the snapshot; the gate is
+    /// consulted on both sides of the snapshot collection instead (inside
+    /// [`crate::kv::KvStore::checkpoint_gated`]): an enlisted write already
+    /// visible at the start is caught by the first check, one that lands
+    /// while the items are being collected by the second.
+    #[cfg(feature = "server")]
+    pub fn checkpoint_kv_wal(&self) -> std::io::Result<()> {
+        self.kv_store()
+            .checkpoint_gated(&|| self.any_open_enlisted_txn())
+    }
+
+    /// Checkpoint the document WAL behind the S7 re-check (see
+    /// [`Self::checkpoint_streams_wal`]): the executor's store write guard is
+    /// the mutation gate, so holding the read guard across the check and the
+    /// snapshot closes the window.
+    pub fn checkpoint_doc_wal(&self) -> std::io::Result<()> {
+        let store = self.doc_store.read();
+        if self.any_open_enlisted_txn_or_busy() {
+            return Err(Self::specialty_checkpoint_declined());
+        }
+        store.checkpoint()
+    }
+
+    /// Checkpoint the graph WAL behind the S7 re-check (see
+    /// [`Self::checkpoint_doc_wal`]).
+    pub fn checkpoint_graph_wal(&self) -> std::io::Result<()> {
+        let store = self.graph_store.read();
+        if self.any_open_enlisted_txn_or_busy() {
+            return Err(Self::specialty_checkpoint_declined());
+        }
+        store.checkpoint_wal()
     }
 
     /// Checkpoint the on-disk vector-index WAL: writes a snapshot of every
@@ -4782,31 +4863,44 @@ impl Executor {
     /// pass that folded ALL tagged logs, and the SQL side keeps pruning only
     /// below that floor.
     pub async fn run_specialty_checkpoint_pass(&self, horizon: u64) -> u64 {
-        let mut tagged_ok = true;
+        /// false when the log was neither folded nor truncated — a decline
+        /// (S7 re-check saw an open enlisted transaction mid-pass, S95
+        /// finding 5) or a failure. Both hold the horizon for the same
+        /// reason: the log's committed records stay unfolded, and advancing
+        /// would let the SQL prune below launder their vouching COMMIT
+        /// records.
+        fn tagged_ok(store: &str, r: std::io::Result<()>) -> bool {
+            match r {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tracing::debug!(
+                        target: "nucleus::checkpoint",
+                        "{store} WAL checkpoint declined: an enlisted transaction \
+                         opened mid-pass (S7 re-check)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!("{store} WAL checkpoint failed: {e}");
+                    false
+                }
+            }
+        }
+        let mut all_tagged_ok = true;
         #[cfg(feature = "server")]
         if let Err(e) = self.checkpoint_cdc_wal() {
             tracing::warn!("CDC WAL checkpoint failed: {e}");
         }
-        if let Err(e) = self.checkpoint_streams_wal() {
-            tracing::warn!("Streams WAL checkpoint failed: {e}");
-            tagged_ok = false;
-        }
+        all_tagged_ok &= tagged_ok("Streams", self.checkpoint_streams_wal());
         #[cfg(feature = "server")]
-        if let Err(e) = self.kv_store().checkpoint() {
-            tracing::warn!("KV WAL checkpoint failed: {e}");
-            tagged_ok = false;
+        {
+            all_tagged_ok &= tagged_ok("KV", self.checkpoint_kv_wal());
         }
         if let Err(e) = self.blob_store().read().checkpoint() {
             tracing::warn!("Blob WAL checkpoint failed: {e}");
         }
-        if let Err(e) = self.graph_store().read().checkpoint_wal() {
-            tracing::warn!("Graph WAL checkpoint failed: {e}");
-            tagged_ok = false;
-        }
-        if let Err(e) = self.doc_store().read().checkpoint() {
-            tracing::warn!("Document WAL checkpoint failed: {e}");
-            tagged_ok = false;
-        }
+        all_tagged_ok &= tagged_ok("Graph", self.checkpoint_graph_wal());
+        all_tagged_ok &= tagged_ok("Document", self.checkpoint_doc_wal());
         // FTS is checkpoint + tail (NU-014): write `fts_index.json` first,
         // which then truncates the tail it absorbed, and compact whatever is
         // left. Order matters — a crash between them leaves a tail that is a
@@ -4839,12 +4933,12 @@ impl Executor {
         // its own WAL that otherwise grows unbounded — see
         // `checkpoint_table_engines`'s doc comment.
         self.checkpoint_table_engines().await;
-        if tagged_ok {
+        if all_tagged_ok {
             self.note_specialty_checkpoint_pass(horizon);
         } else {
             tracing::warn!(
                 "Specialty checkpoint pass incomplete: a tagged log (streams/kv/doc/graph) \
-                 failed; SQL WAL pruning held at the last fully-folded horizon"
+                 failed or declined; SQL WAL pruning held at the last fully-folded horizon"
             );
         }
         self.specialty_checkpoint_horizon()

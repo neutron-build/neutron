@@ -17,8 +17,8 @@ mod sql_text;
 mod type_map;
 
 pub use report::{
-    ColumnMapping, DroppedConstraint, ReportTotals, RowRejection, SkippedStatement, TableReport,
-    TableStatus, ValidationReport,
+    ColumnMapping, DroppedConstraint, DroppedValue, ReportTotals, RowRejection, SkippedStatement,
+    TableReport, TableStatus, ValidationReport,
 };
 pub use sql_text::SqlTextSource;
 pub use type_map::{MappedType, map_pg_type, map_sqlite_type};
@@ -130,6 +130,15 @@ pub trait SourceDb: Send {
     /// Statement kinds the reader saw but does not translate (e.g. CREATE
     /// INDEX), so the report can say so instead of dropping them silently.
     fn skipped_statement_kinds(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
+    /// Cell-level value losses the reader noticed while scanning the table
+    /// it scanned LAST (S95 finding 10/11): a SQL-text INSERT naming a
+    /// column the CREATE TABLE lacks, an arity mismatch the row mapping
+    /// would zip away, invalid UTF-8 replaced lossily. Drained by the runner
+    /// after each table so the report can itemize them — "Nothing is dropped
+    /// silently".
+    fn take_value_drops(&mut self) -> Vec<DroppedValue> {
         Vec::new()
     }
     fn scan<'a>(
@@ -304,6 +313,8 @@ pub async fn run_import(
             rows_rejected: 0,
             rejections: Vec::new(),
             rejections_truncated: false,
+            values_dropped: Vec::new(),
+            values_dropped_truncated: false,
         };
         report.totals.tables_seen += 1;
         report.totals.columns += table.columns.len() as u64;
@@ -332,7 +343,20 @@ pub async fn run_import(
         }
         if matches!(tr.status, TableStatus::Imported) {
             import_rows(ex, source, &table, &planned, opts, &mut tr).await;
+            // Merge the source-side value losses the scan recorded, capped
+            // like rejections; the true count always reaches the totals. A
+            // table that ended up skipped never imported its rows, so its
+            // scan notes are merely drained.
+            let drops = source.take_value_drops();
             if matches!(tr.status, TableStatus::Imported) {
+                for drop in drops {
+                    report.totals.values_dropped += 1;
+                    if tr.values_dropped.len() < opts.max_itemized_rejections {
+                        tr.values_dropped.push(drop);
+                    } else {
+                        tr.values_dropped_truncated = true;
+                    }
+                }
                 report.totals.tables_imported += 1;
             } else {
                 report.totals.tables_skipped += 1;

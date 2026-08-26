@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::super::Executor;
-use super::{exec, rows};
+use super::{exec, rows, scalar};
 use crate::catalog::Catalog;
 use crate::storage::persistence::CatalogPersistence;
 use crate::storage::{DiskEngine, StorageEngine};
@@ -703,5 +703,246 @@ async fn specialty_horizon_holds_when_a_tagged_checkpoint_fails() {
         "once the horizon advances, pruning below it must proceed ({} -> {})",
         surviving.len(),
         after.len(),
+    );
+}
+
+// ── ON CONFLICT DO UPDATE vs specialty index maintenance (S95 finding 4) ────
+
+/// The S95 audit's finding 4 claimed an upsert's DO UPDATE arm bypassed all
+/// secondary-index maintenance, leaving the old vector live forever. That was
+/// true when audited against an older tree, but wave 61a755ea ("derived-index
+/// coherence across DDL/DML/txn", 2026-07-15) already routes every
+/// conflict-update through `conflict_updated` → `rebuild_table_derived_state`
+/// → `rebuild_position_indexes_for_table`, which rebuilds vector and encrypted
+/// indexes from base rows AND checkpoints the vector WAL. This test pins the
+/// invariant the audit was after — after an upsert changes a row's vector,
+/// the HNSW index reflects the row the table holds, in memory AND across a
+/// reopen — so the rebuild coverage cannot silently regress.
+#[tokio::test]
+async fn on_conflict_do_update_maintains_the_vector_index() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE upv (id INT PRIMARY KEY, v VECTOR(4))").await;
+        exec(&ex, "CREATE INDEX upv_v ON upv USING HNSW (v)").await;
+        exec(&ex, "INSERT INTO upv VALUES (1, VECTOR('[1,0,0,0]'))").await;
+        exec(&ex, "INSERT INTO upv VALUES (2, VECTOR('[0,1,0,0]'))").await;
+
+        exec(
+            &ex,
+            "INSERT INTO upv VALUES (1, VECTOR('[9,9,9,9]')) \
+             ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+        )
+        .await;
+
+        use super::super::types::VectorIndexKind;
+        let (pk1_node, nearest_new, nearest_old) = {
+            let indexes = ex.vector_indexes.read();
+            let entry = indexes.get("upv_v").expect("the HNSW index is live");
+            let pk1_node = *entry.registry.pk_to_node.get(&1).expect("pk 1 registered");
+            let (nearest_new, nearest_old) = match &entry.kind {
+                VectorIndexKind::Hnsw(h) => (
+                    h.search(&crate::vector::Vector::new(vec![9.0, 9.0, 9.0, 9.0]), 1),
+                    h.search(&crate::vector::Vector::new(vec![1.0, 0.0, 0.0, 0.0]), 1),
+                ),
+                _ => panic!("upv_v must be an HNSW index"),
+            };
+            (pk1_node, nearest_new, nearest_old)
+        };
+        let live = ex.hnsw_index_live_ids("upv_v").unwrap();
+        assert_eq!(live.len(), 2, "one live node per table row: {live:?}");
+        assert!(
+            live.contains(&pk1_node),
+            "pk 1's node must be live: {live:?}, pk 1 node {pk1_node}"
+        );
+        assert_eq!(
+            nearest_new.first().map(|(n, d)| (*n, *d)),
+            Some((pk1_node, 0.0)),
+            "a search for the NEW vector must land on pk 1's node at distance 0 — \
+             the index must describe the row the table holds"
+        );
+        assert_ne!(
+            nearest_old.first().map(|(_, d)| *d),
+            Some(0.0),
+            "a search for the OLD vector must not find it at distance 0 — \\
+             the index must not still hold pk 1's pre-upsert vector: {nearest_old:?}"
+        );
+    }
+
+    // Durable too: reopen and the recovered index still describes the table.
+    let ex = open_executor(dir.path()).await;
+    let live = ex
+        .hnsw_index_live_ids("upv_v")
+        .expect("the index survives reopen");
+    assert_eq!(
+        live.len(),
+        2,
+        "one live node per surviving row after reopen, found {live:?}"
+    );
+    use super::super::types::VectorIndexKind;
+    let (pk1_node, nearest_new, nearest_old) = {
+        let indexes = ex.vector_indexes.read();
+        let entry = indexes.get("upv_v").expect("index recovered");
+        let pk1_node = *entry.registry.pk_to_node.get(&1).expect("pk 1 registered");
+        let (nearest_new, nearest_old) = match &entry.kind {
+            VectorIndexKind::Hnsw(h) => (
+                h.search(&crate::vector::Vector::new(vec![9.0, 9.0, 9.0, 9.0]), 1),
+                h.search(&crate::vector::Vector::new(vec![1.0, 0.0, 0.0, 0.0]), 1),
+            ),
+            _ => panic!("upv_v must be an HNSW index"),
+        };
+        (pk1_node, nearest_new, nearest_old)
+    };
+    assert!(
+        live.contains(&pk1_node),
+        "pk 1's registry node {pk1_node} must be live after reopen: {live:?}"
+    );
+    assert_eq!(
+        nearest_new.first().map(|(n, d)| (*n, *d)),
+        Some((pk1_node, 0.0)),
+        "after reopen, a search for the NEW vector must land on pk 1's node"
+    );
+    assert_ne!(
+        nearest_old.first().map(|(_, d)| *d),
+        Some(0.0),
+        "after reopen, the OLD vector must not be found at distance 0: {nearest_old:?}"
+    );
+}
+
+// ── SQL-path specialty writes vs WAL-append failure (S95 finding 8) ─────────
+
+/// A SQL-path KV write whose WAL append fails must fail the statement and
+/// leave the in-memory store untouched. `set_xact`/`del_xact`/`incr_by_xact`
+/// logged the error and applied the change anyway, so `SELECT kv_set(…)` over
+/// pgwire answered OK for a write that vanishes on restart — the streams path
+/// already had the fail-the-statement shape this mirrors.
+#[tokio::test]
+async fn kv_sql_writes_fail_loudly_when_the_wal_append_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    let wal = ex
+        .kv_store()
+        .wal()
+        .expect("a durable executor opened a KV WAL")
+        .clone();
+
+    // SET: refused, and no in-memory half-state.
+    wal.fail_next_append();
+    let err = ex
+        .execute("SELECT kv_set('doomed', 'value')")
+        .await
+        .expect_err("a KV_SET whose WAL append failed must not succeed");
+    assert!(
+        err.to_string().contains("doomed"),
+        "the error must name the key: {err}"
+    );
+    assert_eq!(
+        ex.kv_store().get("doomed"),
+        None,
+        "a refused write must not mutate the in-memory store"
+    );
+
+    // DEL: refused, and the key survives.
+    exec(&ex, "SELECT kv_set('seed', '1')").await;
+    wal.fail_next_append();
+    let err = ex
+        .execute("SELECT kv_del('seed')")
+        .await
+        .expect_err("a KV_DEL whose WAL append failed must not succeed");
+    assert!(
+        err.to_string().contains("seed"),
+        "the error must name the key: {err}"
+    );
+    assert_eq!(
+        ex.kv_store().get("seed"),
+        Some(crate::types::Value::Text("1".into())),
+        "a refused delete must leave the key in place"
+    );
+
+    // INCR: refused, and the value is unchanged.
+    exec(&ex, "SELECT kv_set('ctr', '5')").await;
+    wal.fail_next_append();
+    ex.execute("SELECT kv_incr('ctr')")
+        .await
+        .expect_err("a KV_INCR whose WAL append failed must not succeed");
+    assert_eq!(
+        ex.kv_store().get("ctr"),
+        Some(crate::types::Value::Text("5".into())),
+        "a refused increment must leave the value unchanged"
+    );
+
+    // The one-shot fault is consumed: the same write now succeeds and must be
+    // durable across a reopen.
+    exec(&ex, "SELECT kv_set('doomed', 'value')").await;
+    drop(ex);
+    let ex = open_executor(dir.path()).await;
+    assert_eq!(
+        ex.kv_store().get("doomed"),
+        Some(crate::types::Value::Text("value".into())),
+        "the acknowledged, unfaulted write must survive the reopen"
+    );
+}
+
+/// The document-store twin of the KV test above: DOC_INSERT and DOC_DELETE
+/// logged WAL failures with `eprintln` and applied the mutation anyway, so a
+/// disk-full acknowledged a write (or a delete) that a restart reverted.
+#[tokio::test]
+async fn doc_sql_writes_fail_loudly_when_the_wal_append_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+    let wal = ex
+        .doc_store
+        .read()
+        .wal()
+        .expect("a durable executor opened a document WAL")
+        .clone();
+
+    // INSERT: refused, and nothing was inserted.
+    wal.fail_next_append();
+    let err = ex
+        .execute("SELECT doc_insert('{\"a\": 1}')")
+        .await
+        .expect_err("a DOC_INSERT whose WAL append failed must not succeed");
+    assert!(
+        err.to_string().contains("DOC_INSERT"),
+        "the error must name the statement: {err}"
+    );
+    assert_eq!(
+        ex.doc_store.read().len_hot(),
+        0,
+        "a refused insert must not mutate the in-memory store"
+    );
+
+    // DELETE: refused, and the document survives.
+    let id = match scalar(&exec(&ex, "SELECT doc_insert('{\"a\": 1}')").await[0]) {
+        Value::Int64(i) => *i,
+        other => panic!("doc_insert returned {other:?}"),
+    };
+    wal.fail_next_append();
+    let err = ex
+        .execute(&format!("SELECT doc_delete({id})"))
+        .await
+        .expect_err("a DOC_DELETE whose WAL append failed must not succeed");
+    assert!(
+        err.to_string().contains("DOC_DELETE"),
+        "the error must name the statement: {err}"
+    );
+    assert!(
+        ex.doc_store.read().get(id as u64).is_some(),
+        "a refused delete must leave the document in place"
+    );
+
+    // Fault consumed: a further insert succeeds and is durable.
+    exec(&ex, "SELECT doc_insert('{\"b\": 2}')").await;
+    drop(ex);
+    let ex = open_executor(dir.path()).await;
+    assert_eq!(
+        ex.doc_store.read().len_hot(),
+        2,
+        "both acknowledged documents must survive the reopen"
+    );
+    assert!(
+        ex.doc_store.read().get(id as u64).is_some(),
+        "the acknowledged document must still exist after reopen"
     );
 }

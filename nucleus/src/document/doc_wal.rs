@@ -108,6 +108,11 @@ pub struct DocWal {
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint_in`.
     #[cfg(test)]
     fail_reopen_once: std::sync::atomic::AtomicBool,
+    /// Test-only: fail the next append, mirroring `KvWal::fail_next_append`,
+    /// so the SQL surface's reaction to a failed document WAL append can be
+    /// exercised without a full disk.
+    #[cfg(test)]
+    fail_next_append: std::sync::atomic::AtomicBool,
 }
 
 impl DocWal {
@@ -155,6 +160,8 @@ impl DocWal {
                 stranded: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_reopen_once: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_append: std::sync::atomic::AtomicBool::new(false),
             },
             state,
         ))
@@ -165,6 +172,26 @@ impl DocWal {
     /// process never mints an id a surviving tagged record already carries.
     pub fn max_xact_id(&self) -> u64 {
         self.max_xact_id
+    }
+
+    /// Test-only: arm a one-shot append failure (mirrors
+    /// `KvWal::fail_next_append`).
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&self) {
+        self.fail_next_append
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: consume the one-shot append fault, if armed.
+    #[cfg(test)]
+    fn consume_append_fault(&self) -> io::Result<()> {
+        if self
+            .fail_next_append
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(io::Error::other("injected document WAL append failure"));
+        }
+        Ok(())
     }
 
     /// Re-point the writer at the live log file after a checkpoint replaced
@@ -227,6 +254,8 @@ impl DocWal {
     /// `Some(id)` inside one, `None` to write the legacy untagged record
     /// (kept unconditionally on replay — the pre-S63 compatibility rule).
     pub fn log_insert(&self, xact: Option<u64>, doc_id: u64, json_bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        self.consume_append_fault()?;
         let mut w = self.writer.lock();
         self.reattach_if_stranded(&mut w)?;
         push_tag(&mut w, xact, ENTRY_INSERT, ENTRY_INSERT_XACT)?;
@@ -255,6 +284,8 @@ impl DocWal {
         if collection.is_empty() {
             return self.log_insert(xact, doc_id, json_bytes);
         }
+        #[cfg(test)]
+        self.consume_append_fault()?;
         let coll = collection.as_bytes();
         let mut w = self.writer.lock();
         self.reattach_if_stranded(&mut w)?;
@@ -273,6 +304,8 @@ impl DocWal {
     ///
     /// `xact` mirrors [`DocWal::log_insert`].
     pub fn log_delete(&self, xact: Option<u64>, doc_id: u64) -> io::Result<()> {
+        #[cfg(test)]
+        self.consume_append_fault()?;
         let mut w = self.writer.lock();
         self.reattach_if_stranded(&mut w)?;
         push_tag(&mut w, xact, ENTRY_DELETE, ENTRY_DELETE_XACT)?;

@@ -3,8 +3,8 @@
 //! constraints are reconstructed from `PRAGMA index_list`/`index_info`.
 
 use super::{
-    BoxFut, RowStream, SourceColumn, SourceConstraint, SourceConstraintKind, SourceDb, SourceError,
-    SourceTable, SourceValue,
+    BoxFut, DroppedValue, RowStream, SourceColumn, SourceConstraint, SourceConstraintKind,
+    SourceDb, SourceError, SourceTable, SourceValue,
 };
 use rusqlite::OpenFlags;
 use rusqlite::types::ValueRef;
@@ -13,6 +13,9 @@ use std::path::Path;
 pub struct SqliteSource {
     conn: rusqlite::Connection,
     detail: String,
+    /// Cell-level losses the last `scan` recorded, drained by the runner
+    /// (S95 finding 11: invalid UTF-8 in TEXT).
+    value_drops: Vec<DroppedValue>,
 }
 
 impl SqliteSource {
@@ -25,6 +28,7 @@ impl SqliteSource {
         Ok(Self {
             conn,
             detail: path.display().to_string(),
+            value_drops: Vec::new(),
         })
     }
 }
@@ -193,6 +197,10 @@ impl SourceDb for SqliteSource {
         })
     }
 
+    fn take_value_drops(&mut self) -> Vec<DroppedValue> {
+        std::mem::take(&mut self.value_drops)
+    }
+
     fn scan<'a>(
         &'a mut self,
         table: &'a SourceTable,
@@ -204,31 +212,73 @@ impl SourceDb for SqliteSource {
                 .prepare(&sql)
                 .map_err(|e| SourceError(format!("reading table {}: {e}", table.name)))?;
             let ncols = stmt.column_count();
+            // Column names captured up front so per-cell losses can name the
+            // column they came from (S95 finding 11).
+            let col_names: Vec<String> = (0..ncols)
+                .filter_map(|i| stmt.column_name(i).ok().map(|n| n.to_string()))
+                .collect();
             let rows = stmt
                 .query_map([], |row| {
-                    (0..ncols)
-                        .map(|i| match row.get_ref(i) {
-                            Ok(ValueRef::Null) => Ok(SourceValue::Null),
-                            Ok(ValueRef::Integer(n)) => Ok(SourceValue::Raw(n.to_string())),
-                            Ok(ValueRef::Real(f)) => Ok(SourceValue::Raw(f.to_string())),
+                    let mut cells = Vec::with_capacity(ncols);
+                    // (column, rendered original, reason) for cells that
+                    // could not be carried intact.
+                    let mut losses: Vec<(String, String, String)> = Vec::new();
+                    for i in 0..ncols {
+                        let cell = match row.get_ref(i) {
+                            Ok(ValueRef::Null) => SourceValue::Null,
+                            Ok(ValueRef::Integer(n)) => SourceValue::Raw(n.to_string()),
+                            Ok(ValueRef::Real(f)) => SourceValue::Raw(f.to_string()),
                             Ok(ValueRef::Text(t)) => {
-                                Ok(SourceValue::Quoted(String::from_utf8_lossy(t).into_owned()))
+                                // S95 finding 11: SQLite TEXT admits bytes
+                                // that are not valid UTF-8. The lossy
+                                // replacement still imports (there is no
+                                // byte-typed fallback for TEXT), but the
+                                // mutation is reported, not silent.
+                                match std::str::from_utf8(t) {
+                                    Ok(s) => SourceValue::Quoted(s.to_string()),
+                                    Err(_) => {
+                                        losses.push((
+                                            col_names.get(i).cloned().unwrap_or_default(),
+                                            format!(
+                                                "\\x{}",
+                                                t.iter()
+                                                    .map(|b| format!("{b:02x}"))
+                                                    .collect::<String>()
+                                            ),
+                                            "TEXT is not valid UTF-8; imported with \
+                                             replacement characters"
+                                                .to_string(),
+                                        ));
+                                        SourceValue::Quoted(String::from_utf8_lossy(t).into_owned())
+                                    }
+                                }
                             }
                             // Bytea columns are imported through the same
                             // '\x' hex text form a logical dump uses.
-                            Ok(ValueRef::Blob(b)) => Ok(SourceValue::Quoted(format!(
+                            Ok(ValueRef::Blob(b)) => SourceValue::Quoted(format!(
                                 "\\x{}",
                                 b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-                            ))),
-                            Err(e) => Err(e),
-                        })
-                        .collect::<Result<Vec<_>, _>>()
+                            )),
+                            Err(e) => return Err(e),
+                        };
+                        cells.push(cell);
+                    }
+                    Ok((cells, losses))
                 })
                 .map_err(|e| SourceError(format!("reading table {}: {e}", table.name)))?;
             let mut materialized = Vec::new();
-            for row in rows {
-                let row = row.map_err(|e| SourceError(format!("decoding row: {e}")))?;
-                materialized.push(row);
+            self.value_drops.clear();
+            for (row_no, row) in rows.enumerate() {
+                let (cells, losses) = row.map_err(|e| SourceError(format!("decoding row: {e}")))?;
+                for (column, value, reason) in losses {
+                    self.value_drops.push(DroppedValue {
+                        row_number: row_no as u64 + 1,
+                        column: Some(column),
+                        value,
+                        reason,
+                    });
+                }
+                materialized.push(cells);
             }
             Ok(Box::new(SqliteRows {
                 rows: materialized,

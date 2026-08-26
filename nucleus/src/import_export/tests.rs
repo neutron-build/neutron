@@ -423,6 +423,41 @@ async fn export_sqlite_dialect_itemizes_losses() {
 mod sqlite_e2e {
     use super::*;
 
+    /// S95 finding 11: invalid UTF-8 in a TEXT cell was silently replaced via
+    /// `from_utf8_lossy` — a byte-level mutation of the client's data with
+    /// nothing in the report. The import must surface it, naming the column
+    /// and the row, while still importing the lossy replacement.
+    #[tokio::test]
+    async fn sqlite_import_reports_invalid_utf8_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("badutf8.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE blobs (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO blobs VALUES (1, 'clean');
+             INSERT INTO blobs VALUES (2, CAST(x'FFFE41' AS TEXT));",
+        )
+        .expect("seed sqlite");
+        drop(conn);
+
+        let ex = mem_executor();
+        let mut src = crate::import_export::SqliteSource::open(&db_path).expect("open source");
+        let outcome = run_import(&ex, &mut src, &ImportOptions::default()).await;
+        assert!(outcome.fatal.is_none(), "fatal: {:?}", outcome.fatal);
+
+        let json = outcome.report.to_json().unwrap();
+        assert!(
+            json.contains("UTF-8"),
+            "a TEXT cell that needed lossy replacement must be reported: {json}"
+        );
+        assert!(
+            json.contains("name"),
+            "the report must name the column: {json}"
+        );
+        // The row still imports, with the replacement characters.
+        assert_eq!(scalar_i64(&ex, "SELECT COUNT(*) FROM blobs").await, 2);
+    }
+
     #[tokio::test]
     async fn sqlite_file_import_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -463,4 +498,107 @@ mod sqlite_e2e {
         .await;
         assert_eq!(n, 2, "FK must survive import");
     }
+}
+
+// ── S95 findings 10-12: nothing is dropped silently, and losses are counted ──
+
+/// S95 finding 10: the SQL-text reader silently dropped values whose column
+/// was absent from the CREATE TABLE, and `zip`-truncated arity mismatches —
+/// against this module's "Nothing is dropped silently" charter. Both must be
+/// itemized in the report, naming the column and the value, and count as a
+/// loss for the exit code.
+#[tokio::test]
+async fn sql_text_import_itemizes_values_it_cannot_place() {
+    let ex = mem_executor();
+    let mut src = sql_source(
+        "CREATE TABLE partial (id BIGINT, name TEXT);
+         INSERT INTO partial (id, name) VALUES (1, 'ada');
+         INSERT INTO partial (id, name, legacy) VALUES (2, 'grace', 'legacy-value');
+         INSERT INTO partial (id, name) VALUES (3, 'eve', 'extra-value');",
+    );
+    let outcome = run_import(&ex, &mut src, &ImportOptions::default()).await;
+    assert!(outcome.fatal.is_none(), "fatal: {:?}", outcome.fatal);
+
+    let json = outcome.report.to_json().unwrap();
+    assert!(
+        json.contains("legacy"),
+        "an INSERT column absent from the CREATE TABLE must be named: {json}"
+    );
+    assert!(
+        json.contains("legacy-value"),
+        "the dropped value itself must be named: {json}"
+    );
+    assert!(
+        json.contains("extra-value"),
+        "a value truncated by an arity mismatch must be named: {json}"
+    );
+    assert!(
+        outcome.report.has_loss(),
+        "dropped values are losses the exit code must surface"
+    );
+    assert_eq!(
+        outcome.report.totals.values_dropped, 2,
+        "one unknown-column value, one truncated value: {json}"
+    );
+    let table = &outcome.report.tables[0];
+    assert_eq!(table.values_dropped.len(), 2);
+    assert!(
+        table
+            .values_dropped
+            .iter()
+            .any(|d| d.column.as_deref() == Some("legacy")),
+        "the unknown column must be named: {:?}",
+        table.values_dropped
+    );
+    // The rows themselves still import — the loss is cell-level.
+    assert_eq!(scalar_i64(&ex, "SELECT COUNT(*) FROM partial").await, 3);
+}
+
+/// S95 finding 12: the SQLite export pushed one DroppedConstraint per
+/// non-finite cell into `constraints_dropped`, so a wide table buried the
+/// real constraint losses under a flood of kind="value" entries. Non-finite
+/// cells move to a rejected-values count instead: constraints_dropped stays
+/// clean, the total is exact, and the loss still surfaces.
+#[tokio::test]
+async fn sqlite_export_counts_nonfinite_values_without_polluting_constraints() {
+    let ex = mem_executor();
+    for stmt in [
+        "CREATE TABLE nanz (id BIGINT PRIMARY KEY, f DOUBLE PRECISION, note TEXT)",
+        "INSERT INTO nanz VALUES (1, 'NaN'::double precision, 'a')",
+        "INSERT INTO nanz VALUES (2, 'Infinity'::double precision, 'b')",
+        "INSERT INTO nanz VALUES (3, 1.5, 'c')",
+    ] {
+        ex.execute(stmt).await.expect("setup failed");
+    }
+    let (sql, rep) = run_export(&ex, ExportTarget::Sqlite).await;
+    let t = &rep.tables[0];
+    assert!(
+        t.constraints_dropped.iter().all(|d| d.kind != "value"),
+        "non-finite cells must not be recorded as dropped constraints: {:?}",
+        t.constraints_dropped
+    );
+    assert_eq!(
+        rep.totals.constraints_dropped, 0,
+        "constraints_dropped must count constraints only"
+    );
+    assert!(
+        sql.contains("NULL"),
+        "the non-finite cells are still exported as NULL: {sql}"
+    );
+    assert_eq!(
+        rep.totals.values_dropped, 2,
+        "exactly the two non-finite cells count as value losses"
+    );
+    assert_eq!(t.values_dropped.len(), 2, "itemized, one entry per cell");
+    assert!(
+        t.values_dropped
+            .iter()
+            .all(|d| d.column.as_deref() == Some("f")),
+        "each entry names its column: {:?}",
+        t.values_dropped
+    );
+    assert!(
+        rep.has_loss(),
+        "exporting NaN/Infinity as NULL is a loss the exit code must surface"
+    );
 }

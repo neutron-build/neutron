@@ -5,8 +5,8 @@
 //! translate are counted in the report, never dropped silently.
 
 use super::{
-    BoxFut, RowStream, SourceColumn, SourceConstraint, SourceConstraintKind, SourceDb, SourceError,
-    SourceTable, SourceValue,
+    BoxFut, DroppedValue, RowStream, SourceColumn, SourceConstraint, SourceConstraintKind,
+    SourceDb, SourceError, SourceTable, SourceValue,
 };
 use sqlparser::ast;
 use std::collections::HashMap;
@@ -18,6 +18,9 @@ pub struct SqlTextSource {
     /// Rows keyed by table name: (optional explicit column list, value rows).
     rows: HashMap<String, TableRows>,
     skipped: Vec<(String, u64)>,
+    /// Cell-level losses the last `scan` recorded, drained by the runner
+    /// (S95 finding 10).
+    value_drops: Vec<DroppedValue>,
 }
 
 /// Parsed rows for one table: per row, the explicit column list (if given)
@@ -32,6 +35,7 @@ impl SqlTextSource {
             tables: Vec::new(),
             rows: HashMap::new(),
             skipped: Vec::new(),
+            value_drops: Vec::new(),
         }
     }
 
@@ -44,6 +48,7 @@ impl SqlTextSource {
             tables: Vec::new(),
             rows: HashMap::new(),
             skipped: Vec::new(),
+            value_drops: Vec::new(),
         })
     }
 
@@ -323,6 +328,10 @@ impl SourceDb for SqlTextSource {
         self.skipped.clone()
     }
 
+    fn take_value_drops(&mut self) -> Vec<DroppedValue> {
+        std::mem::take(&mut self.value_drops)
+    }
+
     fn scan<'a>(
         &'a mut self,
         table: &'a SourceTable,
@@ -331,16 +340,52 @@ impl SourceDb for SqlTextSource {
             self.ensure_parsed()?;
             let column_order: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
             let mut resolved: Vec<Vec<SourceValue>> = Vec::new();
+            self.value_drops.clear();
             if let Some(inserts) = self.rows.get(&table.name) {
                 for (cols, value_rows) in inserts {
                     match cols {
                         None => resolved.extend(value_rows.iter().cloned()),
                         Some(names) => {
                             for row in value_rows {
+                                let row_number = (resolved.len() + 1) as u64;
                                 let mut full = vec![SourceValue::Null; column_order.len()];
+                                // S95 finding 10: "Nothing is dropped
+                                // silently". A named column the CREATE
+                                // TABLE lacks has nowhere to land, and a
+                                // value tuple longer than the column list
+                                // used to be zip-truncated away — both are
+                                // recorded as value losses naming the
+                                // column and the value.
                                 for (name, val) in names.iter().zip(row.iter()) {
-                                    if let Some(i) = column_order.iter().position(|c| c == name) {
-                                        full[i] = val.clone();
+                                    match column_order.iter().position(|c| c == name) {
+                                        Some(idx) => full[idx] = val.clone(),
+                                        None => {
+                                            self.value_drops.push(DroppedValue {
+                                                row_number,
+                                                column: Some(name.clone()),
+                                                value: val.render(),
+                                                reason: format!(
+                                                    "INSERT names column '{name}', which the \
+                                                     CREATE TABLE does not define; the value \
+                                                     was not imported"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                if row.len() > names.len() {
+                                    for extra in &row[names.len()..] {
+                                        self.value_drops.push(DroppedValue {
+                                            row_number,
+                                            column: None,
+                                            value: extra.render(),
+                                            reason: format!(
+                                                "row has {} values for {} columns; the extra \
+                                                 value was not imported",
+                                                row.len(),
+                                                names.len()
+                                            ),
+                                        });
                                     }
                                 }
                                 resolved.push(full);

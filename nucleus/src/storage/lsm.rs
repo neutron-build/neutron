@@ -746,17 +746,22 @@ impl LsmTree {
 /// the heal/preserve paths without a full disk. `lsm.sst_write` covers the
 /// same path out-of-process. Keyed by directory so the injection is
 /// test-local: a process-global flag once leaked into a parallel test that
-/// never asked for it (`loaded_sstable_holds_offsets_not_values` consumed
-/// another test's injection and unwrapped the injected Err).
+/// never asked for it. A MAP, not one slot: two tests arming different
+/// directories in parallel must not overwrite each other's injection (the
+/// single-slot version did exactly that -- the overwritten test's compaction
+/// succeeded and its expect_err panicked, ~1 run in 30).
 #[cfg(test)]
-static FAIL_NEXT_SST_WRITE_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+static FAIL_NEXT_SST_WRITE_DIRS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
-/// Test-only: arm [`FAIL_NEXT_SST_WRITE_DIR`] for `dir`.
+/// Test-only: arm [`FAIL_NEXT_SST_WRITE_DIRS`] for `dir`.
 #[cfg(test)]
 pub(crate) fn fail_next_sst_write(dir: &Path) {
-    *FAIL_NEXT_SST_WRITE_DIR
+    FAIL_NEXT_SST_WRITE_DIRS
         .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(dir.to_path_buf());
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir.to_path_buf());
 }
 
 /// Write an SSTable to disk and repoint it at the file.
@@ -771,11 +776,10 @@ pub(crate) fn fail_next_sst_write(dir: &Path) {
 fn write_sst_to_disk(dir: &Path, sst: &mut SSTable) -> io::Result<()> {
     #[cfg(test)]
     {
-        let mut armed = FAIL_NEXT_SST_WRITE_DIR
+        let mut armed = FAIL_NEXT_SST_WRITE_DIRS
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if armed.as_deref() == Some(dir) {
-            *armed = None;
+        if armed.remove(dir) {
             return Err(io::Error::other("injected SSTable write failure"));
         }
     }

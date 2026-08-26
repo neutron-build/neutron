@@ -4,7 +4,8 @@
 //! or TEXT (PostgreSQL without pgvector) and every such column is itemized.
 
 use super::report::{
-    ColumnMapping, DroppedConstraint, ReportTotals, TableReport, TableStatus, ValidationReport,
+    ColumnMapping, DroppedConstraint, DroppedValue, ReportTotals, TableReport, TableStatus,
+    ValidationReport,
 };
 use crate::catalog::{FkAction, TableConstraint};
 use crate::executor::{ExecResult, Executor};
@@ -157,55 +158,78 @@ fn render_constraint(c: &TableConstraint) -> Option<String> {
     })
 }
 
-fn render_value(v: &Value, target: ExportTarget, out: &mut TableReport) -> String {
+/// Itemization cap for value losses, mirroring the import runner's default
+/// `max_itemized_rejections` (S95 finding 12).
+const MAX_ITEMIZED_VALUE_DROPS: usize = 1000;
+
+/// Render one cell. Returns the SQL text plus, when the value could not be
+/// carried intact (a non-finite float for a target with no such literal), a
+/// [`DroppedValue`] for the report — the count is aggregated by the caller,
+/// so a table full of NaN cells no longer buries real constraint losses
+/// under a flood of per-cell entries (S95 finding 12).
+fn render_value(
+    v: &Value,
+    target: ExportTarget,
+    row_number: u64,
+    column: Option<String>,
+) -> (String, Option<DroppedValue>) {
     let s = |t: &str| format!("'{}'", t.replace('\'', "''"));
     match v {
-        Value::Null => "NULL".to_string(),
+        Value::Null => ("NULL".to_string(), None),
         Value::Bool(b) => match target {
-            ExportTarget::Postgres => bool_lit(*b),
-            ExportTarget::Sqlite => bool_lit(*b),
+            ExportTarget::Postgres => (bool_lit(*b), None),
+            ExportTarget::Sqlite => (bool_lit(*b), None),
         },
-        Value::Int32(i) => i.to_string(),
-        Value::Int64(i) => i.to_string(),
+        Value::Int32(i) => (i.to_string(), None),
+        Value::Int64(i) => (i.to_string(), None),
         Value::Float64(f) => {
             if f.is_finite() {
-                f.to_string()
+                (f.to_string(), None)
             } else {
                 match target {
-                    ExportTarget::Postgres => format!("'{f}'::double precision"),
-                    ExportTarget::Sqlite => {
-                        out.constraints_dropped.push(DroppedConstraint {
-                            kind: "value".to_string(),
-                            name: None,
-                            definition: f.to_string(),
+                    ExportTarget::Postgres => (format!("'{f}'::double precision"), None),
+                    ExportTarget::Sqlite => (
+                        "NULL".to_string(),
+                        Some(DroppedValue {
+                            row_number,
+                            column,
+                            value: f.to_string(),
                             reason: "SQLite REAL cannot represent NaN/Infinity; exported as NULL"
                                 .to_string(),
-                        });
-                        "NULL".to_string()
-                    }
+                        }),
+                    ),
                 }
             }
         }
-        Value::Numeric(n) => n.clone(),
-        Value::Vector(vec) => format!(
-            "'[{}]'",
-            vec.iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
+        Value::Numeric(n) => (n.clone(), None),
+        Value::Vector(vec) => (
+            format!(
+                "'[{}]'",
+                vec.iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            None,
         ),
         Value::Bytea(b) => match target {
-            ExportTarget::Postgres => format!(
-                "'\\x{}'",
-                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            ExportTarget::Postgres => (
+                format!(
+                    "'\\x{}'",
+                    b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                ),
+                None,
             ),
-            ExportTarget::Sqlite => format!(
-                "X'{}'",
-                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            ExportTarget::Sqlite => (
+                format!(
+                    "X'{}'",
+                    b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                ),
+                None,
             ),
         },
-        Value::Text(t) => s(t),
-        other => s(&other.to_string()),
+        Value::Text(t) => (s(t), None),
+        other => (s(&other.to_string()), None),
     }
 }
 
@@ -244,7 +268,10 @@ pub async fn run_export(ex: &Executor, target: ExportTarget) -> (String, Validat
             rows_rejected: 0,
             rejections: Vec::new(),
             rejections_truncated: false,
+            values_dropped: Vec::new(),
+            values_dropped_truncated: false,
         };
+        let mut value_drops_total: u64 = 0;
         report.totals.tables_seen += 1;
         report.totals.columns += t.columns.len() as u64;
 
@@ -298,15 +325,25 @@ pub async fn run_export(ex: &Executor, target: ExportTarget) -> (String, Validat
                     if let ExecResult::Select { rows, .. } = r {
                         for row in rows {
                             tr.rows_read += 1;
-                            let values = row
-                                .iter()
-                                .map(|v| render_value(v, target, &mut tr))
-                                .collect::<Vec<_>>()
-                                .join(", ");
+                            let row_number = tr.rows_read;
+                            let mut rendered = Vec::with_capacity(row.len());
+                            for (i, v) in row.iter().enumerate() {
+                                let column = t.columns.get(i).map(|c| c.name.clone());
+                                let (text, drop) = render_value(v, target, row_number, column);
+                                if let Some(d) = drop {
+                                    value_drops_total += 1;
+                                    if tr.values_dropped.len() < MAX_ITEMIZED_VALUE_DROPS {
+                                        tr.values_dropped.push(d);
+                                    } else {
+                                        tr.values_dropped_truncated = true;
+                                    }
+                                }
+                                rendered.push(text);
+                            }
                             sql.push_str(&format!(
                                 "INSERT INTO \"{}\" VALUES ({});\n",
                                 t.name.replace('"', "\"\""),
-                                values
+                                rendered.join(", ")
                             ));
                         }
                     }
@@ -324,6 +361,7 @@ pub async fn run_export(ex: &Executor, target: ExportTarget) -> (String, Validat
         report.totals.constraints_dropped += tr.constraints_dropped.len() as u64;
         report.totals.rows_read += tr.rows_read;
         report.totals.rows_imported += tr.rows_imported;
+        report.totals.values_dropped += value_drops_total;
         report.tables.push(tr);
     }
     (sql, report)

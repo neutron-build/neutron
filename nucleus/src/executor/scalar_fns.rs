@@ -39,8 +39,13 @@ impl Executor {
         col_meta: &[ColMeta],
     ) -> Result<Value, ExecError> {
         let result = self.eval_scalar_fn_inner(fname, func, row, col_meta);
+        // The flag is drained on every KV-touching call (edge-triggered), but
+        // only converted to an error when the call otherwise SUCCEEDED: the
+        // SQL-path mutators below now fail directly with a specific error
+        // when their own WAL append fails (S95 finding 8), and that error
+        // must not be replaced by the generic one.
         #[cfg(feature = "server")]
-        if touches_kv_logs(fname) && self.kv_write_failed() {
+        if touches_kv_logs(fname) && self.kv_write_failed() && result.is_ok() {
             return Err(ExecError::Runtime(format!(
                 "{fname}: WAL write failed; the value is in memory only and \
                  will not survive a restart"
@@ -3119,7 +3124,9 @@ impl Executor {
                     )));
                 }
                 let xact = self.cross_model_touch_kv(&key);
-                self.kv_store.set_xact(&key, value, ttl, xact);
+                self.kv_store
+                    .set_xact(&key, value, ttl, xact)
+                    .map_err(|e| wal_failure_to_exec_error(&format!("KV_SET '{key}'"), e))?;
                 Ok(Value::Text("OK".into()))
             }
             "KV_DEL" => {
@@ -3131,7 +3138,10 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let xact = self.cross_model_touch_kv(&key);
-                let deleted = self.kv_store.del_xact(&key, xact);
+                let deleted = self
+                    .kv_store
+                    .del_xact(&key, xact)
+                    .map_err(|e| wal_failure_to_exec_error(&format!("KV_DEL '{key}'"), e))?;
                 if deleted {
                     self.memory_allocator.lock().release("kv", key.len() + 96);
                 }
@@ -3174,6 +3184,9 @@ impl Executor {
                 let xact = self.cross_model_touch_kv(&key);
                 match self.kv_store.incr_by_xact(&key, amount, xact) {
                     Ok(v) => Ok(Value::Int64(v)),
+                    Err(crate::kv::KvError::Wal(e)) => {
+                        Err(wal_failure_to_exec_error(&format!("KV_INCR '{key}'"), e))
+                    }
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
             }
@@ -4699,7 +4712,9 @@ impl Executor {
                     let mut store = self.doc_store.write();
                     let xact = self.cross_model_before_doc(&store);
                     store.clear_touched();
-                    let id = store.insert_in_xact(&collection, jv, xact);
+                    let id = store
+                        .insert_in_xact(&collection, jv, xact)
+                        .map_err(|e| wal_failure_to_exec_error("DOC_INSERT", e))?;
                     let touched = store.take_touched();
                     drop(store);
                     self.cross_model_after_doc(touched);
@@ -4744,7 +4759,9 @@ impl Executor {
                 }
                 let xact = self.cross_model_before_doc(&store);
                 store.clear_touched();
-                store.insert_with_id_in_xact(id, &collection, jv, xact);
+                store
+                    .insert_with_id_in_xact(id, &collection, jv, xact)
+                    .map_err(|e| wal_failure_to_exec_error("DOC_UPDATE", e))?;
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_doc(touched);
@@ -4767,7 +4784,9 @@ impl Executor {
                 let mut store = self.doc_store.write();
                 let xact = self.cross_model_before_doc(&store);
                 store.clear_touched();
-                let removed = store.delete_in_xact(&collection, id, xact);
+                let removed = store
+                    .delete_in_xact(&collection, id, xact)
+                    .map_err(|e| wal_failure_to_exec_error("DOC_DELETE", e))?;
                 let touched = store.take_touched();
                 drop(store);
                 self.cross_model_after_doc(touched);
@@ -6750,6 +6769,18 @@ impl Executor {
 /// Text argument for the compliance functions: the extracted Values are
 /// typed, so a Text is taken verbatim (apostrophes intact) — the old
 /// `.replace('\'', "")` stripped legitimate apostrophes out of every value.
+/// Map a specialty-store WAL-append failure to a statement error, the same
+/// way the streams path does: a full disk is `DiskFull` (SQLSTATE 53100) so
+/// clients can tell "free space and retry" apart, everything else is an IO
+/// storage error. S95 finding 8: the SQL surface must not acknowledge a
+/// write whose durable record the log refused.
+fn wal_failure_to_exec_error(what: &str, e: std::io::Error) -> ExecError {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull => ExecError::DiskFull(format!("{what}: {e}")),
+        _ => ExecError::Storage(crate::storage::StorageError::Io(format!("{what}: {e}"))),
+    }
+}
+
 fn compliance_text_arg(v: &Value) -> String {
     match v {
         Value::Text(s) => s.clone(),

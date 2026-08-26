@@ -509,6 +509,12 @@ impl DocumentStore {
     pub fn wal_max_xact_id(&self) -> u64 {
         self.wal.as_ref().map_or(0, |wal| wal.max_xact_id())
     }
+
+    /// The attached WAL, for tests that fault its appends.
+    #[cfg(test)]
+    pub(crate) fn wal(&self) -> Option<&std::sync::Arc<DocWal>> {
+        self.wal.as_ref()
+    }
     pub fn new() -> Self {
         Self {
             docs: HashMap::new(),
@@ -634,7 +640,11 @@ impl DocumentStore {
     /// tagged `XACT_AUTOCOMMIT`; a write inside an explicit transaction wants
     /// [`DocumentStore::insert_in_xact`].
     pub fn insert_in(&mut self, collection: &str, doc: JsonValue) -> u64 {
-        self.insert_in_xact(collection, doc, XACT_AUTOCOMMIT)
+        match self.insert_in_inner(collection, doc, XACT_AUTOCOMMIT, true) {
+            Ok(id) => id,
+            // Unreachable: the apply-anyway flag suppresses the error path.
+            Err(_) => unreachable!("apply_on_wal_error never returns Err"),
+        }
     }
 
     /// [`insert_in`](Self::insert_in) carrying the coordinating transaction
@@ -642,15 +652,41 @@ impl DocumentStore {
     /// when its transaction never committed. `XACT_AUTOCOMMIT` marks a write
     /// outside any explicit transaction, whose durability point is this
     /// log's own fsync.
-    pub fn insert_in_xact(&mut self, collection: &str, doc: JsonValue, xact: u64) -> u64 {
+    ///
+    /// The WAL append happens FIRST, and a failure returns `Err` with
+    /// nothing applied — not even the id counter (S95 finding 8): the SQL
+    /// surface must not acknowledge a write the log refused. The infallible
+    /// [`insert_in`] keeps the historical apply-anyway behavior for its
+    /// callers.
+    pub fn insert_in_xact(
+        &mut self,
+        collection: &str,
+        doc: JsonValue,
+        xact: u64,
+    ) -> Result<u64, std::io::Error> {
+        self.insert_in_inner(collection, doc, xact, false)
+    }
+
+    /// The shared body; `apply_on_wal_error` selects between the SQL
+    /// contract (abort, nothing applied) and the legacy apply-anyway.
+    fn insert_in_inner(
+        &mut self,
+        collection: &str,
+        doc: JsonValue,
+        xact: u64,
+        apply_on_wal_error: bool,
+    ) -> Result<u64, std::io::Error> {
         let id = self.next_id;
-        self.next_id += 1;
         if let Some(ref wal) = self.wal {
             let bytes = jsonb_encode(&doc);
             if let Err(e) = wal.log_insert_in(Some(xact), id, collection, &bytes) {
+                if !apply_on_wal_error {
+                    return Err(e);
+                }
                 eprintln!("document WAL: failed to log insert {id}: {e}");
             }
         }
+        self.next_id += 1;
         if !collection.is_empty() {
             self.collections.insert(id, collection.to_string());
         }
@@ -660,7 +696,7 @@ impl DocumentStore {
         if self.cold.is_some() {
             self.maybe_evict();
         }
-        id
+        Ok(id)
     }
 
     /// Insert a document with a specific ID. Replaces any existing document
@@ -675,16 +711,38 @@ impl DocumentStore {
     /// inside an explicit transaction wants
     /// [`DocumentStore::insert_with_id_in_xact`].
     pub fn insert_with_id_in(&mut self, id: u64, collection: &str, doc: JsonValue) {
-        self.insert_with_id_in_xact(id, collection, doc, XACT_AUTOCOMMIT);
+        let _ = self.insert_with_id_in_inner(id, collection, doc, XACT_AUTOCOMMIT, true);
     }
 
     /// [`insert_with_id_in`](Self::insert_with_id_in) carrying the
     /// coordinating transaction id (S63): the WAL record is tagged with
     /// `xact`, so replay discards it when its transaction never committed.
-    pub fn insert_with_id_in_xact(&mut self, id: u64, collection: &str, doc: JsonValue, xact: u64) {
+    /// A failed append returns `Err` with nothing applied (S95 finding 8).
+    pub fn insert_with_id_in_xact(
+        &mut self,
+        id: u64,
+        collection: &str,
+        doc: JsonValue,
+        xact: u64,
+    ) -> Result<(), std::io::Error> {
+        self.insert_with_id_in_inner(id, collection, doc, xact, false)
+    }
+
+    /// The shared body; see [`DocumentStore::insert_in_inner`].
+    fn insert_with_id_in_inner(
+        &mut self,
+        id: u64,
+        collection: &str,
+        doc: JsonValue,
+        xact: u64,
+        apply_on_wal_error: bool,
+    ) -> Result<(), std::io::Error> {
         if let Some(ref wal) = self.wal {
             let bytes = jsonb_encode(&doc);
             if let Err(e) = wal.log_insert_in(Some(xact), id, collection, &bytes) {
+                if !apply_on_wal_error {
+                    return Err(e);
+                }
                 eprintln!("document WAL: failed to log insert_with_id {id}: {e}");
             }
         }
@@ -702,6 +760,7 @@ impl DocumentStore {
         if id >= self.next_id {
             self.next_id = id + 1;
         }
+        Ok(())
     }
 
     /// Delete a document by ID.
@@ -711,8 +770,11 @@ impl DocumentStore {
     /// tagged `XACT_AUTOCOMMIT`; a delete inside an explicit transaction
     /// wants [`DocumentStore::delete_in_xact`].
     pub fn delete(&mut self, id: u64) -> bool {
-        self.collections.remove(&id);
-        self.delete_inner_xact(id, XACT_AUTOCOMMIT)
+        match self.delete_inner_xact(id, XACT_AUTOCOMMIT, true) {
+            Ok(removed) => removed,
+            // Unreachable: the apply-anyway flag suppresses the error path.
+            Err(_) => unreachable!("apply_on_wal_error never returns Err"),
+        }
     }
 
     /// Delete `id` only if it belongs to `collection`.
@@ -720,25 +782,43 @@ impl DocumentStore {
     /// A document in another collection is reported as absent — the caller must
     /// not be able to learn that an id exists elsewhere, let alone remove it.
     pub fn delete_in(&mut self, collection: &str, id: u64) -> bool {
-        self.delete_in_xact(collection, id, XACT_AUTOCOMMIT)
+        if !self.in_collection(id, collection) {
+            return false;
+        }
+        match self.delete_inner_xact(id, XACT_AUTOCOMMIT, true) {
+            Ok(removed) => removed,
+            // Unreachable: the apply-anyway flag suppresses the error path.
+            Err(_) => unreachable!("apply_on_wal_error never returns Err"),
+        }
     }
 
     /// [`delete_in`](Self::delete_in) carrying the coordinating transaction
     /// id (S63): the WAL record is tagged with `xact`, so replay discards it
-    /// when its transaction never committed. `XACT_AUTOCOMMIT` marks a write
-    /// outside any explicit transaction, whose durability point is this
-    /// log's own fsync.
-    pub fn delete_in_xact(&mut self, collection: &str, id: u64, xact: u64) -> bool {
+    /// when its transaction never committed. A failed WAL append returns
+    /// `Err` with the document untouched (S95 finding 8).
+    pub fn delete_in_xact(
+        &mut self,
+        collection: &str,
+        id: u64,
+        xact: u64,
+    ) -> Result<bool, std::io::Error> {
         if !self.in_collection(id, collection) {
-            return false;
+            return Ok(false);
         }
-        self.collections.remove(&id);
-        self.delete_inner_xact(id, xact)
+        self.delete_inner_xact(id, xact, false)
     }
 
-    fn delete_inner_xact(&mut self, id: u64, xact: u64) -> bool {
-        // Delete from BOTH tiers regardless of where the doc was found.
-        //
+    /// Delete from BOTH tiers regardless of where the doc was found.
+    ///
+    /// Log-first (S95 finding 8): existence is checked read-only, the WAL
+    /// tombstone is appended, and only a successful append mutates — hot map,
+    /// GIN, collections, cold tier — so a refused delete needs no undo.
+    fn delete_inner_xact(
+        &mut self,
+        id: u64,
+        xact: u64,
+        apply_on_wal_error: bool,
+    ) -> Result<bool, std::io::Error> {
         // Eviction is unlogged, so WAL replay/checkpoint restore re-insert
         // docs into hot while cold keeps the copy an earlier eviction left
         // there — a doc can be in both tiers at once. Removing only the hot
@@ -752,30 +832,30 @@ impl DocumentStore {
             .cold
             .as_ref()
             .is_some_and(|c| c.lock().get(&id.to_le_bytes()).is_some());
+        if !self.docs.contains_key(&id) && !cold_hit {
+            return Ok(false);
+        }
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.log_delete(Some(xact), id)
+        {
+            if !apply_on_wal_error {
+                return Err(e);
+            }
+            eprintln!("document WAL: failed to log delete {id}: {e}");
+        }
         if let Some(ref cold) = self.cold {
             cold.lock().delete(id.to_le_bytes().to_vec());
         }
+        self.collections.remove(&id);
         if let Some(old) = self.docs.remove(&id) {
-            if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_delete(Some(xact), id)
-            {
-                eprintln!("document WAL: failed to log delete {id}: {e}");
-            }
             self.gin.remove(id, &old);
             self.txn_touched.insert(id);
-            true
-        } else if cold_hit {
+            Ok(true)
+        } else {
             // The cold copy was already purged above; only the tombstone and
             // the transaction write-set entry remain.
-            if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_delete(Some(xact), id)
-            {
-                eprintln!("document WAL: failed to log delete {id}: {e}");
-            }
             self.txn_touched.insert(id);
-            true
-        } else {
-            false
+            Ok(true)
         }
     }
 

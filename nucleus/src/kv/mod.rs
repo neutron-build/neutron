@@ -396,15 +396,42 @@ impl KvStore {
 
     /// SET — store a value with optional TTL in seconds.
     pub fn set(&self, key: &str, value: Value, ttl_secs: Option<u64>) {
-        self.set_xact(key, value, ttl_secs, XACT_AUTOCOMMIT);
+        let _ = self.set_inner(key, value, ttl_secs, XACT_AUTOCOMMIT, true);
     }
 
     /// SET carrying the coordinating transaction id (S63): the WAL record is
     /// tagged with `xact`, so replay discards it when its transaction never
     /// committed. `XACT_AUTOCOMMIT` marks a write outside any explicit
     /// transaction, whose durability point is this log's own fsync.
+    ///
+    /// The WAL append happens FIRST, and a failure returns `Err` with the
+    /// in-memory store untouched (S95 finding 8): the SQL surface must not
+    /// acknowledge a write the log refused. The RESP surface keeps its
+    /// historical apply-anyway behavior (its `-MISCONF` reply is built on it)
+    /// via the infallible [`set`].
     #[cfg_attr(not(feature = "server"), allow(unused_variables))]
-    pub fn set_xact(&self, key: &str, value: Value, ttl_secs: Option<u64>, xact: u64) {
+    pub fn set_xact(
+        &self,
+        key: &str,
+        value: Value,
+        ttl_secs: Option<u64>,
+        xact: u64,
+    ) -> Result<(), std::io::Error> {
+        self.set_inner(key, value, ttl_secs, xact, false)
+    }
+
+    /// The apply-anyway twin every pre-S95 caller kept: a WAL failure is
+    /// logged and the change applied, so the live view stays usable and the
+    /// reply's honesty is the caller's problem (the RESP layer drains
+    /// `take_write_error` and answers `-MISCONF`).
+    fn set_inner(
+        &self,
+        key: &str,
+        value: Value,
+        ttl_secs: Option<u64>,
+        xact: u64,
+        apply_on_wal_error: bool,
+    ) -> Result<(), std::io::Error> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             // One record carrying the value AND the expiry decided with it.
@@ -417,6 +444,9 @@ impl KvStore {
             if let Err(e) =
                 wal.log_set_with_expiry(Some(xact), key, &value, ttl_secs.map(abs_expiry_ms))
             {
+                if !apply_on_wal_error {
+                    return Err(e);
+                }
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
             }
         }
@@ -448,21 +478,37 @@ impl KvStore {
         if self.cold.is_some() {
             self.maybe_evict();
         }
+        Ok(())
     }
 
     /// DEL — remove a key. Returns true if the key existed (in hot or cold tier).
     pub fn del(&self, key: &str) -> bool {
-        self.del_xact(key, XACT_AUTOCOMMIT)
+        self.del_inner(key, XACT_AUTOCOMMIT, true).unwrap_or(false)
     }
 
     /// DEL carrying the coordinating transaction id (S63); see
-    /// [`KvStore::set_xact`].
+    /// [`KvStore::set_xact`]. A failed WAL append returns `Err` with the key
+    /// untouched (S95 finding 8); the infallible [`del`] keeps the RESP
+    /// surface's apply-anyway behavior.
     #[cfg_attr(not(feature = "server"), allow(unused_variables))]
-    pub fn del_xact(&self, key: &str, xact: u64) -> bool {
+    pub fn del_xact(&self, key: &str, xact: u64) -> Result<bool, std::io::Error> {
+        self.del_inner(key, xact, false)
+    }
+
+    /// The apply-anyway twin of [`del_xact`]; see [`KvStore::set_inner`].
+    fn del_inner(
+        &self,
+        key: &str,
+        xact: u64,
+        apply_on_wal_error: bool,
+    ) -> Result<bool, std::io::Error> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_delete(Some(xact), key)
         {
+            if !apply_on_wal_error {
+                return Err(e);
+            }
             tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
         }
         let shard = self.data.shard(key);
@@ -487,7 +533,7 @@ impl KvStore {
         if hot_removed || cold_removed {
             self.bump_version();
         }
-        hot_removed || cold_removed
+        Ok(hot_removed || cold_removed)
     }
 
     /// EXISTS — check if a key exists and is not expired.
@@ -502,13 +548,27 @@ impl KvStore {
 
     /// INCRBY — increment an integer value by a given amount.
     pub fn incr_by(&self, key: &str, amount: i64) -> Result<i64, KvError> {
-        self.incr_by_xact(key, amount, XACT_AUTOCOMMIT)
+        self.incr_by_inner(key, amount, XACT_AUTOCOMMIT, true)
     }
 
     /// INCRBY carrying the coordinating transaction id (S63); see
-    /// [`KvStore::set_xact`].
-    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    /// [`KvStore::set_xact`]. A failed WAL append aborts with the in-memory
+    /// value unchanged (S95 finding 8).
     pub fn incr_by_xact(&self, key: &str, amount: i64, xact: u64) -> Result<i64, KvError> {
+        self.incr_by_inner(key, amount, xact, false)
+    }
+
+    /// The shared body; `apply_on_wal_error` selects between the SQL
+    /// contract (abort, nothing applied) and the RESP surface's historical
+    /// apply-anyway. See [`KvStore::set_inner`].
+    #[cfg_attr(not(feature = "server"), allow(unused_variables))]
+    fn incr_by_inner(
+        &self,
+        key: &str,
+        amount: i64,
+        xact: u64,
+        apply_on_wal_error: bool,
+    ) -> Result<i64, KvError> {
         let shard = self.data.shard(key);
         let mut data = shard.data.write();
         let entry = data.get(key);
@@ -552,6 +612,10 @@ impl KvStore {
             entry.and_then(|e| e.expires_at)
         };
 
+        // The WAL append happens BEFORE the in-memory insert; on failure the
+        // SQL contract aborts with nothing applied (S95 finding 8) — the
+        // guard above is still held, so nothing else observed the increment —
+        // while the RESP surface keeps applying.
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_set_with_expiry(
@@ -562,7 +626,12 @@ impl KvStore {
             )
         {
             tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+            if !apply_on_wal_error {
+                return Err(KvError::Wal(e));
+            }
         }
+        #[cfg(not(feature = "server"))]
+        let _ = xact;
 
         data.insert(
             key.to_string(),
@@ -1834,9 +1903,28 @@ impl KvStore {
     /// Write a WAL checkpoint (snapshot + truncate). No-op if WAL is disabled.
     #[cfg(feature = "server")]
     pub fn checkpoint(&self) -> std::io::Result<()> {
+        self.checkpoint_gated(&|| false)
+    }
+
+    /// [`checkpoint`](Self::checkpoint) behind the S7 re-check (S95 finding
+    /// 5): `gate` reports whether any enlisted transaction is open, and a
+    /// `true` declines the checkpoint with `WouldBlock` instead of folding.
+    /// The keyspace is sharded so there is no single state lock to hold
+    /// across the snapshot; the gate runs on BOTH sides of the collection —
+    /// an enlisted write already visible when collection starts is caught by
+    /// the first check, one that lands in a shard while the items are being
+    /// gathered by the second.
+    #[cfg(feature = "server")]
+    pub fn checkpoint_gated(&self, gate: &dyn Fn() -> bool) -> std::io::Result<()> {
         let Some(ref wal) = self.wal else {
             return Ok(());
         };
+        if gate() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "declined: an enlisted transaction is open (S7 re-check)",
+            ));
+        }
         // Flush the cold tier BEFORE snapshotting, and never after.
         //
         // The snapshot below covers the hot tier only, and truncates the WAL to
@@ -1866,6 +1954,12 @@ impl KvStore {
                     items.push((key.clone(), (*entry.value).clone(), ttl));
                 }
             }
+        }
+        if gate() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "declined: an enlisted transaction is open (S7 re-check)",
+            ));
         }
         wal.checkpoint(&items)?;
         // Also checkpoint collections
@@ -2116,6 +2210,11 @@ pub enum KvError {
     WrongType,
     #[error("increment or decrement would overflow")]
     Overflow,
+    /// The WAL refused the write; the in-memory store is unchanged (S95
+    /// finding 8). Carries the original error so callers can preserve its
+    /// kind (e.g. `StorageFull`).
+    #[error("WAL write failed: {0}")]
+    Wal(std::io::Error),
 }
 
 // ============================================================================

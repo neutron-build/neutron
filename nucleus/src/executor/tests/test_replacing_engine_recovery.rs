@@ -317,3 +317,85 @@ fn strip_catalog_engines(dir: &Path) {
     json.as_object_mut().unwrap().remove("table_engines");
     std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 }
+
+// ── CREATE TABLE IF NOT EXISTS engine adoption vs the directory (S95 #6) ────
+
+/// Engine ADOPTION recorded whatever engine the re-run statement declared,
+/// with none of the boot path's guards. Adopting `engine='lsm'` onto a table
+/// whose per-table directory holds columnar bytes made the next boot open an
+/// LsmStorageEngine over them — the open fails, the fallback is an empty
+/// in-memory engine, and the table reads as EMPTY. The adoption must refuse a
+/// declaration whose engine kind disagrees with an existing directory.
+#[tokio::test]
+async fn adoption_refuses_an_engine_of_a_different_kind_than_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            "CREATE TABLE colw (id BIGINT, v BIGINT) WITH (engine='columnar')",
+        )
+        .await;
+        exec(&ex, "INSERT INTO colw VALUES (1, 10)").await;
+
+        let err = ex
+            .execute("CREATE TABLE IF NOT EXISTS colw (id BIGINT, v BIGINT) WITH (engine='lsm')")
+            .await
+            .expect_err("adopting lsm over a columnar directory must be refused");
+        assert!(
+            err.to_string().contains("colw"),
+            "the refusal must name the table: {err}"
+        );
+    }
+    // The refusal left the declaration alone, so a reopen still reads rows.
+    let ex = open_executor(dir.path()).await;
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT COUNT(*) FROM colw").await[0]),
+        1,
+        "the table must still read its rows after the refused adoption and a restart"
+    );
+}
+
+/// The compatible adoptions still succeed: a same-kind engine change on a
+/// table with a directory, and any declaration on a table with no per-table
+/// directory at all (rows in the default engine).
+#[tokio::test]
+async fn adoption_accepts_same_kind_or_directoryless_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(
+            &ex,
+            "CREATE TABLE samek (id BIGINT, v BIGINT) WITH (engine='columnar')",
+        )
+        .await;
+        exec(&ex, "INSERT INTO samek VALUES (1, 10)").await;
+        // columnar -> mergetree: same (columnar) kind, different engine.
+        exec(
+            &ex,
+            "CREATE TABLE IF NOT EXISTS samek (id BIGINT, v BIGINT) \
+             WITH (engine='mergetree') ORDER BY (id)",
+        )
+        .await;
+
+        // A default-engine table has no directory: any engine may be adopted.
+        exec(&ex, "CREATE TABLE plaink (id BIGINT, v BIGINT)").await;
+        exec(&ex, "INSERT INTO plaink VALUES (1, 10)").await;
+        exec(
+            &ex,
+            "CREATE TABLE IF NOT EXISTS plaink (id BIGINT, v BIGINT) WITH (engine='lsm')",
+        )
+        .await;
+    }
+    let ex = open_executor(dir.path()).await;
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT COUNT(*) FROM samek").await[0]),
+        1,
+        "a same-kind adoption must keep the table readable"
+    );
+    assert_eq!(
+        i64_of(&exec(&ex, "SELECT COUNT(*) FROM plaink").await[0]),
+        1,
+        "a directory-less adoption must keep the table readable"
+    );
+}

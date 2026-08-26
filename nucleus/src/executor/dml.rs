@@ -555,6 +555,13 @@ impl Executor {
                                         },
                                     )
                                     .await?;
+                                    // Derived-index maintenance for this arm
+                                    // is the full rebuild below (`conflict_updated`
+                                    // → rebuild_table_derived_state →
+                                    // rebuild_position_indexes_for_table, which
+                                    // also checkpoints the vector WAL) — S95
+                                    // audit finding 4 verified that path covers
+                                    // vector/encrypted/FTS in memory AND durably.
                                     self.storage_for_write(&table_name)
                                         .await
                                         .update(&table_name, &[(pos, updated.clone())])

@@ -1361,6 +1361,37 @@ impl Executor {
                         ),
                     };
                     if existing.as_ref() != Some(&spec) {
+                        // The boot reconciliation (restore_table_engines) guards
+                        // what a declaration may open: 'lsm' and the columnar
+                        // family read the SAME per-table directory in different
+                        // formats, so a declaration of the wrong kind over
+                        // existing bytes makes boot fail the open and fall back
+                        // to an empty in-memory engine — the table then reads as
+                        // EMPTY. Adoption must apply the same rule at DDL time
+                        // (S95 finding 6): a table whose directory exists may
+                        // only adopt an engine of the same kind. A table with no
+                        // directory has nothing to disagree with, and a
+                        // directory with no surviving declaration has an
+                        // unknowable writer — decline rather than guess.
+                        if self.table_engine_dir_exists(&table_name) {
+                            let same_kind = existing
+                                .as_ref()
+                                .is_some_and(|s| (s.engine == "lsm") == (requested == "lsm"));
+                            if !same_kind {
+                                return Err(crate::executor::ExecError::Unsupported(format!(
+                                    "cannot adopt engine '{requested}' for table '{table_name}': the \
+                                 table's per-table storage directory already exists{} and holds \
+                                 bytes of a different engine kind. Adopting across kinds would \
+                                 make the next start open the wrong engine over those bytes and \
+                                 read the table as empty. Migrate by re-creating the table, or \
+                                 remove the directory after backing it up.",
+                                    existing
+                                        .as_ref()
+                                        .map(|s| format!(" (declared '{}')", s.engine))
+                                        .unwrap_or_default()
+                                )));
+                            }
+                        }
                         match self.catalog.get_table(&table_name).await {
                             Some(def) => {
                                 self.record_table_engine(

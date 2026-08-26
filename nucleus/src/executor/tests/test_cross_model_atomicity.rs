@@ -1039,3 +1039,58 @@ async fn held_gate_warns_once_per_ten_skipped_passes() {
     exec(&ex, "ROLLBACK").await;
     assert!(ex.open_enlisted_xids().is_empty());
 }
+
+/// S95 finding 5: the S7 gate in `main.rs` is check-then-act — a BEGIN plus
+/// tagged write landing between the gate read and a specialty snapshot bakes
+/// uncommitted state into a snapshot the S6 recovery filter cannot discard.
+/// Each tagged log's checkpoint therefore re-checks the gate itself and
+/// declines this pass while any enlisted transaction is open. Arming an open
+/// enlisted transaction and calling the checkpoint directly is exactly the
+/// interleaving the background thread cannot be made to produce
+/// deterministically.
+#[tokio::test]
+async fn tagged_checkpoints_decline_while_an_enlisted_transaction_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _engine) = open_segmented(dir.path()).await;
+    exec(&ex, "SELECT STREAM_XADD('gate', 'k', 'v')").await;
+
+    // An open transaction enlisted on KV (any model trips the gate).
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "SELECT KV_SET('held', 'uncommitted')").await;
+    assert!(ex.any_open_enlisted_txn(), "the fixture must hold the gate");
+
+    let declined = ex
+        .checkpoint_streams_wal()
+        .expect_err("the streams checkpoint must decline under an open enlisted txn");
+    assert_eq!(
+        declined.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "declines must be distinguishable from IO failures: {declined}"
+    );
+    for (name, attempt) in [
+        ("KV", ex.checkpoint_kv_wal()),
+        ("document", ex.checkpoint_doc_wal()),
+        ("graph", ex.checkpoint_graph_wal()),
+    ] {
+        let Err(e) = attempt else {
+            panic!("the {name} checkpoint must decline under an open enlisted txn")
+        };
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the {name} decline must be distinguishable from IO failures: {e}"
+        );
+    }
+
+    // COMMIT releases the gate; the same checkpoints now fold.
+    exec(&ex, "COMMIT").await;
+    assert!(!ex.any_open_enlisted_txn(), "COMMIT releases the gate");
+    ex.checkpoint_streams_wal()
+        .expect("with no enlisted txn the streams checkpoint proceeds");
+    ex.checkpoint_kv_wal()
+        .expect("with no enlisted txn the KV checkpoint proceeds");
+    ex.checkpoint_doc_wal()
+        .expect("with no enlisted txn the document checkpoint proceeds");
+    ex.checkpoint_graph_wal()
+        .expect("with no enlisted txn the graph checkpoint proceeds");
+}

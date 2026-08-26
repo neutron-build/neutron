@@ -5,12 +5,12 @@
 //! snapshot-isolation layer; otherwise a legacy clone-all-tables approach
 //! is used.
 //!
-//! Eight specialty stores (KV strings, graph, document, datalog, FTS, time
-//! series, blob, vector) are enlisted through the per-session write-set in
-//! `super::cross_model`: before-images are captured lazily at this session's
-//! first write to each store, and ROLLBACK reverts only the entities this
-//! session touched.  KV collections, the columnar analytics store, streams,
-//! and CDC are **not** enlisted and are never rolled back.
+//! Nine specialty stores (KV strings, graph, document, datalog, FTS, time
+//! series, blob, vector, and streams) are enlisted through the per-session
+//! write-set in `super::cross_model`: before-images are captured lazily at
+//! this session's first write to each store, and ROLLBACK reverts only the
+//! entities this session touched.  KV collections, the columnar analytics
+//! store, and CDC are **not** enlisted and are never rolled back.
 
 use std::collections::HashMap;
 

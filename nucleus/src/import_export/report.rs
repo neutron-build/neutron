@@ -24,6 +24,14 @@ pub struct TableReport {
     /// `rows_rejected` is always the true count.
     pub rejections: Vec<RowRejection>,
     pub rejections_truncated: bool,
+    /// Itemized cell-level value losses (S95 findings 10-12), capped like
+    /// `rejections`; the true count is `values_dropped` in
+    /// [`ReportTotals`]. Additive with a default so reports written before
+    /// it existed still deserialize.
+    #[serde(default)]
+    pub values_dropped: Vec<DroppedValue>,
+    #[serde(default)]
+    pub values_dropped_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -56,6 +64,22 @@ pub struct RowRejection {
     pub reason: String,
 }
 
+/// A cell-level value the run could not carry over intact (S95 findings
+/// 10-12): a source value with no column to land in, a truncated arity
+/// mismatch, a lossy UTF-8 replacement, or a non-finite number exported as
+/// NULL. Unlike a [`RowRejection`] the row itself was carried — this records
+/// the loss inside it, naming the column and the value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DroppedValue {
+    /// 1-based ordinal of the row within the table scan.
+    pub row_number: u64,
+    /// The column the value belonged to, when known.
+    pub column: Option<String>,
+    /// The value as the source rendered it.
+    pub value: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ReportTotals {
     pub tables_seen: u64,
@@ -67,6 +91,10 @@ pub struct ReportTotals {
     pub rows_read: u64,
     pub rows_imported: u64,
     pub rows_rejected: u64,
+    /// The true count of cell-level value losses across all tables (S95
+    /// findings 10-12). Defaulted so pre-S95 reports still deserialize.
+    #[serde(default)]
+    pub values_dropped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +124,7 @@ impl ValidationReport {
             || self.totals.lossy_columns > 0
             || self.totals.constraints_dropped > 0
             || self.totals.rows_rejected > 0
+            || self.totals.values_dropped > 0
     }
 
     /// Process exit code: 0 clean, 3 completed-with-losses (unless
@@ -168,6 +197,21 @@ impl ValidationReport {
                     t.rows_rejected
                 ));
             }
+            for v in &t.values_dropped {
+                out.push_str(&format!(
+                    "    VALUE LOST row {} column {}: {} (was: {})\n",
+                    v.row_number,
+                    v.column.as_deref().unwrap_or("<unknown>"),
+                    v.reason,
+                    v.value
+                ));
+            }
+            if t.values_dropped_truncated {
+                out.push_str(&format!(
+                    "    ... {} value losses itemized\n",
+                    t.values_dropped.len()
+                ));
+            }
         }
         let tot = &self.totals;
         for s in &self.skipped_statements {
@@ -180,7 +224,8 @@ impl ValidationReport {
         };
         out.push_str(&format!(
             "totals: tables {}/{} {verb} ({} skipped), columns {} mapped ({} lossy), \
-             constraints_dropped: {}, rows_read: {}, rows_{verb}: {}, rows_rejected: {}\n",
+             constraints_dropped: {}, rows_read: {}, rows_{verb}: {}, rows_rejected: {}, \
+             values_dropped: {}\n",
             tot.tables_imported,
             tot.tables_seen,
             tot.tables_skipped,
@@ -189,7 +234,8 @@ impl ValidationReport {
             tot.constraints_dropped,
             tot.rows_read,
             tot.rows_imported,
-            tot.rows_rejected
+            tot.rows_rejected,
+            tot.values_dropped
         ));
         if self.has_loss() {
             out.push_str(
