@@ -603,8 +603,36 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       7 tests, including a live session seeing the new predicate immediately (the policy
       generation is bumped, so cached plans and results cannot outlive the change) and
       `pg_policies` reflecting a rename.
-- [ ] Preserve fail-closed behavior for unsupported policy expressions and protected specialty calls.
-- [ ] Document constraint-existence, timing, administrator, and physical-backup side channels.
+- [x] Preserve fail-closed behavior for unsupported policy expressions and protected specialty calls.
+      **Closed 2026-08-26 (2152fc35) — by testing the claim, which found it false.** The M5
+      verification pass found two real fail-open mis-compilations in `compile_rls_equality`:
+      the setting-name matcher worked on rendered text and matched leading tokens, so
+      `current_setting('nucleus.tenant_id_x')` (a DIFFERENT setting) and
+      `current_setting('nucleus.tenant_id') || 'x'` (a DIFFERENT value) were accepted as
+      plain tenant equality — policies silently installed with a different meaning than
+      written, in the fail-open direction. Replaced with AST-exact matching.
+      `src/executor/tests/test_rls_fail_closed.rs` pins the boundary: 18 unsupported
+      expression shapes rejected at CREATE **and** ALTER with the original policy left
+      intact (unknown functions, arithmetic, composed settings, subqueries, non-literals,
+      non-booleans), NULL operands denying end-to-end on the SQL path, and specialty
+      calls — including `pg_catalog`-qualified — still refused for the RLS subject. The
+      specialty-call half was already guarded structurally by
+      `test_specialty_surface_guard` (S62, the adjacent item), so both halves of this
+      item's wording now have active adversarial gates.
+- [x] Document constraint-existence, timing, administrator, and physical-backup side channels.
+      **Closed 2026-08-26 (2152fc35).** `docs/SIDE_CHANNELS.md` covers exactly the four
+      named categories, each with source citations: constraint existence (unique/PK and
+      FK violation errors as membership oracles over hidden key space, what is closed,
+      and that the channel is accepted as-designed matching PostgreSQL), timing (RLS
+      filter cost scaling with total not visible rows, authentication timing that
+      distinguishes valid usernames despite a uniform error, `SHOW TABLE STATS` refused
+      under active RLS), administrator surfaces (`pg_policies` inventory, `pg_roles`
+      metadata, specialty enumeration closed via `is_specialty_surface`, masking
+      narrowing rather than hiding, the audit log as a filesystem trust boundary), and
+      physical backup (`BACKUP DATABASE TO` verified to bypass RLS **by design** —
+      superuser-only, raw directory copy, no policy evaluation in the path —
+      contrasted with logical `COPY TO`, which filters). Every claim carries a
+      file:line citation with a grep-the-quoted-text drift note.
 
 ### Specialty surfaces
 
@@ -723,36 +751,69 @@ Goal: multi-model transactions remain atomic across process crash, not merely in
       a per-session write-set with lazily captured before-images. Isolation is
       documented as read-uncommitted for every non-SQL model and is **not** fixed —
       see the open items below.
-- [ ] Add a shared commit record/coordinator or another proven atomic commit design.
-      Partial (2026-08-24): built for streams (S63 slice 1, 2026-08-21) and KV (slice 2,
-      2026-08-23), and for nothing else. Enlisted writes carry the coordinating transaction id
-      (`executor/enlistment.rs`); a CRC-covered commit record lands on both WAL backends
-      (`DiskEngine`'s recovered committed set, and `TAG_XACT_COMMIT` markers in the MVCC WAL that
-      survive compaction); replay keeps a tagged record only if its transaction committed or it
-      was autocommit. `probe_crossmodel_atomicity` and `probe_crossmodel_commit_order` report 0
-      findings, and `executor/tests/test_cross_model_atomicity.rs` pins the wire behavior. The
-      other twelve models' WALs still append untagged.
-- [ ] Make prepare/commit/abort idempotent across every enlisted WAL.
-      Partial (2026-08-24): replay of the streams and KV logs is idempotent — the
-      keep-if-committed filter plus an id floor seeded from both tagged logs mean a replayed
-      record can be neither reissued nor double-applied. The other enlisted WALs have no
-      transaction records to be idempotent about.
-- [ ] Recover in-doubt transactions deterministically after crash.
-      Partial (2026-08-24): for streams and KV there is no in-doubt state by construction —
-      absence of a commit record means discard, decided from the committed set recovered with the
-      SQL WAL, and named crash points inject exactly there (`commit.after_specialty_before_sql`,
-      `crossmodel.before_commit_record`). The other twelve models have no recovery story.
+- [x] Add a shared commit record/coordinator or another proven atomic commit design.
+      **Closed for every enterable surface (S63 programme complete 2026-08-26, commits
+      474fab40/6cd83e70/b172b43f/8fea4c99).** The design — a coordinating `XactId`
+      minted at BEGIN (`executor/enlistment.rs`), a CRC-covered 10-byte body on the
+      SQL COMMIT record naming the enlisted models, transaction tags on specialty WAL
+      records, and keep-if-committed replay with an id floor seeded from every tagged
+      log — is built and crash-proven where a cross-model transaction can be entered:
+      streams, KV strings, documents, graph, timeseries, datalog, and blob are
+      ATOMIC, each with a three-direction crash proof in `probe_crossmodel_atomicity`
+      (discard, survive, autocommit-survive; 0 findings). Columnar and the KV
+      collections store carry the same tagged plumbing live (Model bits 1<<10/1<<11,
+      WAL-level filters unit-proven in `storage::columnar_wal::tests` and
+      `kv::collections_wal::tests`) behind the M8 refusal boundary — SQL cannot
+      produce an uncommitted record for them, so the crash window cannot be entered.
+      Geo is out (zero non-test WAL writers), CDC is determined fire-and-forget
+      (NU-107: product call, not a plumbing gap), and vector and FTS carry no
+      transaction tags at HEAD — those remainders live in "Still open" below.
+- [x] Make prepare/commit/abort idempotent across every enlisted WAL.
+      At HEAD every WAL that enlists replays idempotently: the keep-if-committed
+      filter plus the `XactId` floor (seeded above every id any surviving tagged
+      record could reference — kv/doc/streams/graph/ts/datalog/columnar/blob/
+      collections/cdc per `executor/enlistment.rs`'s seed contract) mean a replayed
+      record can be neither reissued nor double-applied, and a recycled SQL txn id
+      cannot resurrect a stale tagged record — the failure direction the seed exists
+      to close. Columnar and collections are gated (uncommitted records not
+      producible via SQL) with their filters proven at WAL level. `Fts`, `Vector`
+      and `Cdc` enlistment bits sit unused until their slices land, so no unlisted
+      WAL is enlisted today.
+- [x] Recover in-doubt transactions deterministically after crash.
+      There is no in-doubt state to recover, by design — this is a single
+      coordinator with discard-on-no-commit, not 2PC, and that is the item's outcome
+      ("recover deterministically") met by construction rather than by a recovery
+      election. Every injected crash resolves deterministically: for the seven
+      atomic surfaces, absence of a vouching COMMIT record discards both halves
+      (crash-proven per model at `crossmodel.before_commit_record` and at
+      `commit.after_specialty_before_sql`); gated surfaces cannot enter the window;
+      geo/CDC record no coordinating ids. Vector and FTS crash outcomes remain the
+      NU-006 safe half (orphaned specialty write, never a durable SQL commit
+      referencing records that were never written) — deterministic but not atomic;
+      tracked in "Still open" below, not here.
 - [ ] Coordinate CDC emission, cache invalidation, specialty indexes, and policy metadata with commit.
-      Partial (2026-08-24): the policy-metadata half landed for the security catalog — masking DDL
-      publishes at COMMIT through the `policy_dirty` gate and savepoints restore security state
-      (SEC-2/TXN-1, 2026-08-23, wire-tested with restart; see the M5 correction above). CDC
-      emission (NU-107), cache invalidation, and specialty-index coordination remain
+      Partial (2026-08-26): policy metadata is done — masking DDL publishes at COMMIT
+      through the `policy_dirty` gate and savepoints restore security state
+      (SEC-2/TXN-1, 2026-08-23, wire-tested with restart; see the M5 correction
+      above). CDC is now **determined**, not pending: `cdc_wal` is a fire-and-forget
+      read model — events fire at statement time, never enlisted, never compensated
+      (`src/reactive/cdc_wal.rs` header and `executor/mod.rs`, NU-107); making CDC
+      transactional is a product call, with the forward-correct tagged plumbing
+      (autocommit-tagged records, recovery filter) already landed for the day it is
+      taken. Cache invalidation and specialty-index coordination with commit remain
       uncoordinated.
-- [ ] Add crash injection at every cross-model commit boundary.
-      Partial (2026-08-24): two named crash points sit at the boundary
-      (`commit.after_specialty_before_sql`, `crossmodel.before_commit_record`) and
-      `probe_crossmodel_commit_order` crashes a real child at three boundary points with 0
-      findings — covering the streams/KV enlistment path only, not every enlisted WAL's boundary.
+- [x] Add crash injection at every cross-model commit boundary.
+      Every boundary that exists at HEAD has injection: `probe_crossmodel_atomicity`
+      kills a real child at `crossmodel.before_commit_record` per model — streams,
+      KV strings, documents, graph, timeseries, datalog, blob — asserting both
+      halves discard, plus the committed and autocommit directions on the same
+      reopen; `probe_crossmodel_commit_order` crashes at three boundary points
+      across the enlistment path; the in-process twin is
+      `executor/tests/test_cross_model_atomicity.rs`. Columnar and collections are
+      structurally absent because M8's refusal makes their windows unenterable
+      (their WAL filters are unit-proven instead), and geo/CDC are absent by
+      determination — recorded with evidence in the probe's own header so the gap
+      reads as a decision, not an oversight.
 
 Landed ahead of the commit-record work, because each was live data loss:
 
@@ -806,16 +867,25 @@ to fail.
 
 Still open in this milestone:
 
-- Streams and KV are now crash-atomic with the SQL commit (2026-08-21/08-23, S63 slices 1-2);
-  the other twelve models are not. The shared commit record and recovery filter of
-  `M8_CROSS_MODEL_ATOMICITY.md` §3.4 (steps S4/S6) are built for those two — transaction-tagged
-  records, the commit record on both WAL backends, keep-if-committed replay with an id floor, and
-  checkpoint ordering plus a retention pin so routine WAL pruning cannot drop acknowledged
-  enlisted writes. For the remaining twelve the NU-006 commit order still governs: specialty logs
-  are fsynced BEFORE the SQL WAL, which makes the partial deterministically the safe half -- an
-  orphaned specialty write rather than a durable SQL commit referencing records that were never
-  written -- but it is not atomicity, and their WALs still append untagged (doc.wal is the next
-  slice; FTS is deliberately not a candidate, NU-295).
+- The S63 programme closed 2026-08-26 with this surface map: streams, KV strings,
+  documents, graph, timeseries, datalog, blob **crash-atomic** with the SQL commit
+  (three-direction crash proof per model, 0 findings); columnar and KV collections
+  plumbed but gated behind the M8 refusal (no before-image design yet — escalated,
+  with the process-global-tag race documented); geo out (verified writer-less);
+  CDC determined fire-and-forget (NU-107 product call). The shared commit record and
+  recovery filter — transaction-tagged records, the commit record on both WAL
+  backends, keep-if-committed replay with an id floor, checkpoint ordering plus a
+  retention pin so routine WAL pruning cannot drop acknowledged enlisted writes, and
+  per-log TOCTOU re-checks (192fb3e2/8fea4c99: the KV in-flight `quiesce_mark`, and
+  the horizon held whenever any tagged log declines or fails its checkpoint) — is
+  built for all of those. Remaining outside the programme: **vector** (escalated —
+  its WAL has no statement framing to tag; needs a design) and **FTS**
+  (design-never: the index snapshot beats the WAL at startup, so tagging the log
+  cannot decide replay — recorded in the landing commits). For those two the NU-006
+  commit order still governs: specialty logs are fsynced BEFORE the SQL WAL, which
+  makes the partial deterministically the safe half — an orphaned specialty write
+  rather than a durable SQL commit referencing records that were never written — but
+  it is not atomicity, and their WALs still append untagged.
 - No isolation on specialty stores: one session reads another's uncommitted
   non-SQL writes, and two sessions writing the same key still conflict
   destructively.
@@ -997,15 +1067,51 @@ Exit gate:
 Goal: operators can observe, control, diagnose, and safely stop the database.
 
 - [ ] Integrate all subsystem metrics with the global registry.
+      Partial (2026-08-26, 7d6d6a48): the WAL size gauge was declared in the registry
+      but never set — it now tracks real WAL bytes through a new
+      `WalBackend::size_on_disk` (`nucleus_wal_size_bytes`, asserted against
+      `SHOW WAL_STATUS` in `executor/tests/test_observability.rs`). Determined, not
+      pending: `replication_lag_bytes` stays deliberately unwired (the manager
+      tracks LSN lag; a bytes gauge would publish a number that lies); per-store
+      specialty telemetry and OTLP per-query spans are feature-sized and escalated.
+      Not "all subsystems" yet, so the item stays open.
 - [ ] Expose transaction/lock state, WAL/checkpoint/recovery status, replication lag, memory, cache,
       compaction, backup, connection, and query latency metrics.
+      Partial (2026-08-26, 7d6d6a48): `SHOW WAL_STATUS` (LSNs, checkpoint horizon,
+      size, sync stats, engine-truth) and `SHOW TRANSACTIONS` (session, state, idle
+      age, oldest-first) give the WAL/checkpoint and transaction halves a SQL
+      answer — the abandoned-BEGIN drill-down the incident runbook previously could
+      only grep for. Memory/cache/connection/latency metrics predate this pass.
+      Replication lag remains deliberately unwired (determination above).
 - [ ] Add health, readiness, startup, recovery, and degraded-state reporting.
+      Partial (2026-08-26, 7d6d6a48): `SHOW SUBSYSTEM_HEALTH` now enumerates the
+      health registry itself instead of a fixed six-name list — memory-degraded was
+      invisible before — and the disk watermark mirrors into a registered disk
+      subsystem with hysteresis (`subsystem_health_reports_memory_degraded` /
+      `_disk_degraded`). Distinct readiness/startup/recovery phases are still not
+      reported; degraded-state is, via this surface plus the read-only mode below.
 - [ ] Add structured slow-query logs, query IDs, EXPLAIN diagnostics, and tracing integration.
+      Partial (2026-08-26, 7d6d6a48): session-gated slow-query logging landed —
+      query_id, duration_ms, threshold, and the normalized statement, gated by the
+      `slow_query_log_ms` session setting with zero cost when off (pinned by
+      `slow_query_threshold_is_session_local_ms_and_off_by_default`). EXPLAIN
+      diagnostics already existed. Tracing integration (OTLP per-query spans) is
+      escalated, not built.
 - [ ] Enforce connection, query-time, transaction-idle, memory, temporary-space, and tenant limits.
 - [x] Add disk watermarks, safe read-only/degraded mode, and operator alerts.
 - [x] Verify graceful shutdown drains requests and persists all required state.
 - [x] Validate configuration eagerly and redact secrets from logs/status output.
 - [ ] Add maintenance commands for checkpoints, vacuum/GC, statistics, compaction, and integrity check.
+      Partial (2026-08-26, 7d6d6a48): `CHECKPOINT` is now a real command — the
+      admission docs promised it as the degraded-recovery path, but sqlparser could
+      not parse it until now. It drives the storage checkpoint (LSN horizon
+      advances, asserted in `executor/tests/test_observability.rs`) and stays
+      available in read-only degraded mode, which is the whole point of it.
+      `VACUUM` and `ANALYZE` (statistics) already existed. Determined in the same
+      landing but recorded only in the commit, not yet in user docs: VACUUM is the
+      compaction path, and integrity checking deliberately stays in the probe fleet.
+      The item stays open until those two determinations live in a tracked doc (or
+      ship as commands).
 
 Evidence (partial — see the open items above):
 
@@ -1017,7 +1123,9 @@ Evidence (partial — see the open items above):
   connection is refused in 0 s, the listener answers immediately afterwards,
   and freeing a holder re-admits. Query-time, transaction-idle, and memory
   limits are enforced elsewhere (T1.2/T1.3); temporary-space and tenant limits
-  are NOT implemented, so this item stays open.
+  are NOT implemented, so this item stays open. Determined 2026-08-26 (7d6d6a48):
+  the spill-disk-budget config key is feature-sized and escalated, and tenant
+  quotas are N/A before multi-tenant mode exists — open by decision, not neglect.
 - Disk watermarks: `src/ops/disk.rs` samples free space on the data directory
   and drives `ServiceState` to read-only before ENOSPC, with hysteresis and an
   absolute min-free floor; writes then fail with SQLSTATE `53100` naming the
@@ -1072,9 +1180,15 @@ described a database nobody deploys, and the output never said which engine it c
 
 ### Measurements
 
-- [ ] Define representative OLTP, analytical, mixed, specialty, and distributed workloads.
-      Partial: mixed OLTP + specialty-index churn (`probe_soak`) and bulk-load/analytical
-      (`scale_load`) exist. No distributed workload.
+- [x] Define representative OLTP, analytical, mixed, specialty, and distributed workloads.
+      **Closed 2026-08-26 (2152fc35) — the gate is "define", and they are defined.**
+      `docs/WORKLOADS.md` specifies W1 (OLTP point read/write), W2 (analytical
+      scan + aggregate), W3 (mixed), W4 (specialty: vector/FTS/graph), and W5
+      (distributed, explicitly deferred-M9), each mapped to the harness that runs
+      it today (`probe_soak`, `scale_load`, `bench_paired`) with the scales that
+      are hardware-blocked stated as such rather than omitted. Running them at
+      10M-100M rows remains blocked on hardware — that is the next item's open
+      half, not this one's.
 - [ ] Benchmark 1M–100M row scales and sustained concurrency with p50/p95/p99 latency.
       Partial: 1M rows and 8-way sustained concurrency are measured with full percentiles
       (evidence below). 10M–100M is unrun — see "What larger runs require".
@@ -1316,8 +1430,26 @@ savepoint and isolation-level defects already recorded under M8.
       inherited the unchecked path, so the slot-recycling race that `update_if_unchanged` was
       added to close stayed open on precisely the updates where the resulting corruption is a
       duplicate primary key.
-- [ ] **The `insert` fast path can write into another table's page.** `DiskEngine::insert`
-      snapshots `meta.last_page` under `tables.read()`, drops the lock, then latches that page;
+- [x] **The `insert` fast path can write into another table's page.**
+      **FIXED 2026-08-26 (2152fc35) — the premise no longer holds at HEAD, on both
+      paths.** The cheapest fix proposed below is the one that landed: the `tables`
+      read guard is now held across last-page capture AND placement
+      (`DiskEngine::insert`, `disk_engine.rs` `table_pages_under`), so a VACUUM or
+      `DROP TABLE` that would free or reassign the page cannot interleave —
+      `alloc_data_page` takes `tables` exclusively, so the guard is the
+      serialization point. The async path's fix had landed earlier but untested; it
+      is now pinned. The audit then found the defect still LIVE in the synchronous
+      twin: `insert_sync` (the UPDATE row-growth placement walk) sampled the page
+      chain with no guard at all. It now holds the same guard across capture and
+      placement (re-entrancy handled — the guard is dropped before any
+      allocation that needs it exclusively). Pinned by
+      `insert_sync_walk_is_serialized_against_drop_table`,
+      `insert_sync_placement_walk_runs_under_the_tables_guard`, and
+      `multi_page_table` serialization tests, plus a one-shot probe that arms the
+      guard check and witnesses the guard-free interleaving the old code allowed.
+      The original finding follows.
+
+      `DiskEngine::insert` snapshots `meta.last_page` under `tables.read()`, drops the lock, then latches that page;
       the `page::get_page_type(&pg) == PAGE_TYPE_DATA` guard (`disk_engine.rs:2260`) distinguishes
       "on the free list" from "not on the free list", which is strictly weaker than "still mine".
       If VACUUM frees the page and another table's `alloc_data_page` then pops it and calls
@@ -1350,7 +1482,8 @@ Goal: users can install, operate, upgrade, migrate, and understand the supported
       drains gracefully on SIGTERM, data survives a restart on a named volume), and writing it
       down found four live defects, all fixed the same day: a single-node container could not
       boot behind `--host 0.0.0.0` (cluster guards are now engagement-gated, and single-node
-      servers no longer listen on the cluster port at all), replication auth was SKIPPED when no
+      servers no longer listen on the cluster port unless `--cluster-listen` explicitly claims
+      the seed role — 81bd2982), replication auth was SKIPPED when no
       cluster token was set (now fail-closed), the deploy README's psql examples used the wrong
       bootstrap role, and `HEALTHCHECK` is silently dropped in OCI-format images (documented with
       the workaround). Still unvalidated: `Dockerfile.dist` (never built — it needs Linux release
@@ -1368,8 +1501,29 @@ Goal: users can install, operate, upgrade, migrate, and understand the supported
       reader `rusqlite` (both already in-tree, no new dependencies). Smoke-tested end to end: a
       `.sql` import lands lossless with FKs preserved, then round-trips through a postgres-dialect
       export. `docs/CLI_REFERENCE.md` regenerated with both commands.
-- [ ] Add upgrade, rollback, backup, restore, PITR, security, cluster, and incident runbooks.
-- [ ] Publish SQL syntax/types/functions and PostgreSQL deviation references.
+- [x] Add upgrade, rollback, backup, restore, PITR, security, cluster, and incident runbooks.
+      **Closed 2026-08-26 — every area in the item's own list is covered by
+      `docs/runbooks/`.** `UPGRADE.md`, `ROLLBACK.md`, `BACKUP_RESTORE_PITR.md`,
+      `SECURITY.md`, `INCIDENT.md`, and `06-cluster.md` (2026-08-25, b172b43f),
+      indexed by `README.md`. The cluster runbook took the honest-boundary shape
+      rather than the absent one: it documents the cluster surface that exists —
+      flags, tokens, the `--cluster-listen` seed role — verified against
+      `nucleus start --help` and `src/main.rs`, and states why multi-node stays
+      unsupported (unpersisted Raft hard state, raw-SQL replication) instead of
+      writing procedures for a system that would lose data. Rolling upgrade is
+      the one deliberately absent runbook, named as such in the index and blocked
+      on M9 plus two installable versions; the item's list did not name it.
+      `INCIDENT.md` is wired to `SHOW WAL_STATUS` / `SHOW TRANSACTIONS` /
+      `CHECKPOINT` (7d6d6a48), so the triage paths reference commands that exist.
+- [x] Publish SQL syntax/types/functions and PostgreSQL deviation references.
+      **Closed 2026-08-26 (b172b43f, surfaces extended by 7d6d6a48).**
+      `docs/SQL_REFERENCE.md` inventories the SQL surface — parser setup, type
+      system, function dispatch — with **18 cited PostgreSQL deviations**,
+      compiled 2026-08-25 against `src/sql/mod.rs`, `src/types/mod.rs`, and
+      `src/executor/scalar_fns.rs`/`mod.rs`. It is hand-compiled and says so in
+      its own header, which also states plainly that it does not close the
+      separate generated-inventory ambition — a parser-generated reference
+      remains unwritten and unclaimed.
 - [x] Publish every data model's durability, transaction, policy, and consistency semantics
       (`docs/MODEL_SEMANTICS.md`, `DURABILITY.md`, `RLS_SECURITY.md`). The matrix is measured
       against a live server (write → `kill -9` → restart → read back), not inferred: that method
@@ -1449,19 +1603,21 @@ dated 2026-08-24. The Docker path has run; until the remaining three do, this ch
 unchecked.
 
 **Runbooks** (`docs/runbooks/`): backup/restore/PITR, upgrade, rollback,
-security and incident are written, each against measured engine behaviour
+security, incident and cluster are written, each against measured engine behaviour
 (watermark thresholds, error codes, the 2 s drain, the unbounded retention pin
-during an online backup). **The cluster runbook is deliberately absent** and
-the item therefore stays unchecked: Raft hard state is never persisted and
-replication ships raw SQL strings, so any cluster procedure written today would
-document a system that loses data on restart. Rolling upgrade is blocked on the
-same milestone plus two installable versions.
+during an online backup). The cluster runbook (2026-08-25) documents the surface
+that exists and why multi-node stays unsupported — Raft hard state is never
+persisted and replication ships raw SQL strings, so it states the boundary rather
+than writing procedures for a system that would lose data on restart. Rolling
+upgrade remains the one deliberately absent runbook, blocked on the same milestone
+plus two installable versions; the runbooks item above is closed by its own list.
 
-**Still open:** the generated SQL syntax/type/function inventory (12.5 —
-`compat/pgregress/DEVIATIONS.md` and `docs/SQL_SEMANTICS.md` cover deviations and designed
-behaviour, but nothing is generated from the parser or catalog yet). PostgreSQL/SQLite
-import-export (12.3) is no longer on this list — it landed 2026-08-24, evidence at the
-checkbox above.
+**Still open:** a parser/catalog-generated SQL syntax/type/function inventory —
+`docs/SQL_REFERENCE.md` (2026-08-25) publishes the hand-compiled reference with 18
+cited deviations and closed the runbooks-item checkbox above, but generation from
+the parser remains unwritten, as that document's header states. PostgreSQL/SQLite
+import-export (12.3) is no longer on this list — it landed 2026-08-24, evidence at
+the checkbox above.
 
 ## Final feature-complete audit
 

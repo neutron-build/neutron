@@ -1614,6 +1614,123 @@ mod tests {
         }
     }
 
+    /// The soak's `val`-index shape: few distinct keys, MANY RowIds per key
+    /// (probe_soak's `val INT` column has 64 values across thousands of rows),
+    /// under constant delete/reinsert churn.
+    ///
+    /// This is the duplication regime `btree_random_mixed_ops_...` above does
+    /// NOT reach (its 600-key space keeps runs short): here every leaf split
+    /// boundary lands inside or adjacent to a multi-entry key run, which is
+    /// what exercises the duplicate-straddle rule in
+    /// [`BTreeIndex::split_and_insert`] — after a straddle-adjusted split the
+    /// run must be entirely in the right page, reachable by BOTH exact descent
+    /// and the leaf walk. Verified: `lookup(k)` returns exactly the live
+    /// RowIds, `range_scan(k, k)` agrees with `lookup(k)`, and a full
+    /// `range_scan` sees exactly the live entry count.
+    #[test]
+    fn btree_dense_duplicate_keys_keep_lookup_and_range_agreeing() {
+        struct XorShift(u64);
+        impl XorShift {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        for seed in [0x50ACBEEF1234u64, 0xC0FFEE, 0xD15EA5E] {
+            let (mut idx, _dir) = make_test_btree();
+            let mut rng = XorShift(seed);
+            // val-index shape: 64 distinct keys, ~40 rids each at steady state
+            let key_space: usize = 64;
+            let mut live: std::collections::HashMap<i64, Vec<RowId>> =
+                std::collections::HashMap::new();
+            let mut next_page = 1u32;
+
+            for step in 0..60_000 {
+                let choice = rng.below(100);
+                let keys: Vec<i64> = live.keys().copied().collect();
+                if choice < 55 || keys.is_empty() {
+                    let k = rng.below(key_space) as i64;
+                    let rid = RowId {
+                        page_id: next_page,
+                        slot_idx: (step % 7) as u16,
+                    };
+                    next_page += 1;
+                    idx.insert(&int_key(k), rid).unwrap();
+                    live.entry(k).or_default().push(rid);
+                } else if choice < 80 {
+                    let k = keys[rng.below(keys.len())];
+                    let rids = live.get_mut(&k).unwrap();
+                    let pos = rng.below(rids.len());
+                    let rid = rids.swap_remove(pos);
+                    if rids.is_empty() {
+                        live.remove(&k);
+                    }
+                    assert!(
+                        idx.delete(&int_key(k), rid).unwrap(),
+                        "seed {seed:#x} step {step}: delete said entry not present (k={k})"
+                    );
+                } else {
+                    let k = keys[rng.below(keys.len())];
+                    let rids = live.get_mut(&k).unwrap();
+                    let pos = rng.below(rids.len());
+                    let rid = rids.swap_remove(pos);
+                    if rids.is_empty() {
+                        live.remove(&k);
+                    }
+                    idx.delete(&int_key(k), rid).unwrap();
+                    let new_rid = RowId {
+                        page_id: next_page,
+                        slot_idx: (step % 5) as u16,
+                    };
+                    next_page += 1;
+                    idx.insert(&int_key(k), new_rid).unwrap();
+                    live.entry(k).or_default().push(new_rid);
+                }
+
+                if step % 500 == 0 || step == 59_999 {
+                    let mut total = 0usize;
+                    for (k, rids) in &live {
+                        let got = idx.lookup(&int_key(*k)).unwrap();
+                        let mut want = rids.clone();
+                        want.sort_unstable_by_key(|r| (r.page_id, r.slot_idx));
+                        let mut got = got;
+                        got.sort_unstable_by_key(|r| (r.page_id, r.slot_idx));
+                        assert_eq!(
+                            got, want,
+                            "seed {seed:#x} step {step}: lookup(k={k}) diverged"
+                        );
+                        let via_range = idx
+                            .range_scan(Some(&int_key(*k)), Some(&int_key(*k)))
+                            .unwrap();
+                        assert_eq!(
+                            via_range.len(),
+                            want.len(),
+                            "seed {seed:#x} step {step}: range_scan(k={k}) saw {} entries, lookup sees {}",
+                            via_range.len(),
+                            want.len()
+                        );
+                        total += want.len();
+                    }
+                    let all = idx.range_scan(None, None).unwrap();
+                    assert_eq!(
+                        all.len(),
+                        total,
+                        "seed {seed:#x} step {step}: full range_scan count {} != live count {total}",
+                        all.len()
+                    );
+                }
+            }
+        }
+    }
+
     // ====================================================================
     // HashIndex tests
     // ====================================================================
