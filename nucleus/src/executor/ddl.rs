@@ -105,7 +105,7 @@ impl Executor {
             return;
         };
         // Write-then-rename so a crash mid-write can't leave a torn file.
-        let tmp = path.with_extension("json.tmp");
+        let tmp = crate::storage::atomic_write::tmp_sibling(&path);
         if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
             tracing::warn!("failed to persist engines.json: {e}");
         }
@@ -1370,25 +1370,48 @@ impl Executor {
                         // EMPTY. Adoption must apply the same rule at DDL time
                         // (S95 finding 6): a table whose directory exists may
                         // only adopt an engine of the same kind. A table with no
-                        // directory has nothing to disagree with, and a
-                        // directory with no surviving declaration has an
-                        // unknowable writer — decline rather than guess.
+                        // directory has nothing to disagree with. The kind the
+                        // directory holds is whatever record survives — the
+                        // catalog spec, the engines.json sidecar, or the
+                        // serving runtime engine — and DDL is not transactional,
+                        // so a rolled-back CREATE can leave any subset behind
+                        // (the migration-runner races that motivated this hit
+                        // exactly that: table + directory + sidecar present,
+                        // catalog spec absent). First record that names a kind
+                        // decides; only a POSITIVE cross-kind mismatch refuses
+                        // (lsm vs the columnar family read the same directory
+                        // in different formats — adopting across kinds makes
+                        // the next boot open the wrong engine over those bytes
+                        // and read the table as empty).
                         if self.table_engine_dir_exists(&table_name) {
-                            let same_kind = existing
+                            let is_lsm_request = requested == "lsm";
+                            let sidecar_kind = self
+                                .load_engines_meta()
+                                .get(&table_name)
+                                .map(|m| m.engine.clone());
+                            let serving_kind = self
+                                .table_engines
+                                .read()
+                                .get(&table_name)
+                                .map(|e| e.engine_kind().to_string());
+                            let known_kind = existing
                                 .as_ref()
-                                .is_some_and(|s| (s.engine == "lsm") == (requested == "lsm"));
+                                .map(|s| s.engine.clone())
+                                .or(sidecar_kind)
+                                .or(serving_kind);
+                            let same_kind = known_kind
+                                .as_ref()
+                                .is_some_and(|k| (k == "lsm") == is_lsm_request);
                             if !same_kind {
                                 return Err(crate::executor::ExecError::Unsupported(format!(
                                     "cannot adopt engine '{requested}' for table '{table_name}': the \
-                                 table's per-table storage directory already exists{} and holds \
-                                 bytes of a different engine kind. Adopting across kinds would \
-                                 make the next start open the wrong engine over those bytes and \
-                                 read the table as empty. Migrate by re-creating the table, or \
-                                 remove the directory after backing it up.",
-                                    existing
-                                        .as_ref()
-                                        .map(|s| format!(" (declared '{}')", s.engine))
-                                        .unwrap_or_default()
+                                 table's per-table storage directory already exists (recorded \
+                                 kind: {}) and holds bytes of a different engine kind. Adopting \
+                                 across kinds would make the next start open the wrong engine \
+                                 over those bytes and read the table as empty. Migrate by \
+                                 re-creating the table, or remove the directory after backing \
+                                 it up.",
+                                    known_kind.as_deref().unwrap_or("unknown")
                                 )));
                             }
                         }

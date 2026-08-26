@@ -1578,7 +1578,7 @@ impl Executor {
 
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| std::io::Error::other(format!("serialize sequences: {e}")))?;
-        let tmp = path.with_extension("json.tmp");
+        let tmp = crate::storage::atomic_write::tmp_sibling(&path);
         {
             use std::io::Write as _;
             let mut f = std::fs::File::create(&tmp)?;

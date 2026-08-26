@@ -358,6 +358,10 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
 
 #[async_trait]
 impl StorageEngine for LsmStorageEngine {
+    fn engine_kind(&self) -> &'static str {
+        "lsm"
+    }
+
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         let mut tables = self.tables.write();
         if tables.contains_key(table) {

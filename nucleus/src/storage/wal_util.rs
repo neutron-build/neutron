@@ -128,7 +128,11 @@ impl WalSync {
 /// about to be renamed away.
 #[allow(dead_code)]
 pub(crate) fn atomic_replace_wal(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("wal.tmp");
+    // Unique temp sibling: two logs checkpointing into the same directory
+    // (or one log checkpointed from two connections) must not share a temp
+    // name -- the loser's rename fails ENOENT, the catalog-persistence race
+    // class.
+    let tmp = crate::storage::atomic_write::tmp_sibling(path);
     {
         let file = OpenOptions::new()
             .create(true)

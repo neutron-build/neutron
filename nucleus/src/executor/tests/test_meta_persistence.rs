@@ -508,8 +508,13 @@ async fn nextval_refuses_a_value_it_cannot_make_durable() {
         other => panic!("expected Int64, got {other:?}"),
     };
 
-    // Block the atomic-write temp path.
-    std::fs::create_dir(dir.path().join("sequences.json.tmp")).unwrap();
+    // Block every temp sibling at once by making the data directory
+    // read-only (the temp name is now unique per write, so a fixed-name
+    // directory no longer blocks anything).
+    let dir_meta = std::fs::metadata(dir.path()).unwrap();
+    let mut ro = dir_meta.permissions();
+    ro.set_readonly(true);
+    std::fs::set_permissions(dir.path(), ro).unwrap();
 
     let err = ex
         .execute("SELECT NEXTVAL('s165d')")
@@ -521,8 +526,10 @@ async fn nextval_refuses_a_value_it_cannot_make_durable() {
         "the error must say the value was consumed but not durable: {msg}"
     );
 
-    // Unblock it: the burned value is skipped, never reissued.
-    std::fs::remove_dir(dir.path().join("sequences.json.tmp")).unwrap();
+    // Unblock it: the burned value is skipped, never reissued. Restore the
+    // ORIGINAL mode bits (clap-unsafe set_readonly(false) would add write
+    // bits for every class).
+    std::fs::set_permissions(dir.path(), dir_meta.permissions()).unwrap();
     let next = match scalar(&exec(&ex, "SELECT NEXTVAL('s165d')").await[0]) {
         Value::Int64(n) => *n,
         other => panic!("expected Int64, got {other:?}"),

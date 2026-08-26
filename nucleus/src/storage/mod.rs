@@ -4,6 +4,8 @@
 //! All storage access goes through the StorageEngine trait.
 //! Principle 1: subsystems interact through clean abstractions.
 
+pub mod atomic_write;
+
 #[cfg(feature = "server")]
 pub mod btree;
 #[cfg(feature = "server")]
@@ -265,6 +267,15 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(feature = "server")]
     fn as_columnar(&self) -> Option<&columnar_engine::ColumnarStorageEngine> {
         None
+    }
+
+    /// The engine family this instance belongs to, for kind-safety checks that
+    /// must not depend on the concrete type: "default", "lsm", or "columnar"
+    /// (the columnar family: columnar/mergetree/replacing_mergetree). The
+    /// lsm-vs-columnar distinction is the one that matters on disk -- both
+    /// read the SAME per-table directory in different formats.
+    fn engine_kind(&self) -> &'static str {
+        "default"
     }
 
     /// Whether this engine collapses `replacing_mergetree` versions on its own

@@ -1294,7 +1294,7 @@ impl SegmentedWal {
         {
             return Ok(true);
         }
-        let tmp = dst.with_extension("log.tmp");
+        let tmp = crate::storage::atomic_write::tmp_sibling(&dst);
         std::fs::copy(&src, &tmp)?;
         std::fs::rename(&tmp, &dst)?;
         // Record the LSN range + archive time for time-based PITR. The index is
@@ -2006,7 +2006,7 @@ fn rewrite_archive_index(archive_dir: &Path, removed: &[u64]) -> std::io::Result
             }
         }
     }
-    let tmp = idx_path.with_extension("index.tmp");
+    let tmp = crate::storage::atomic_write::tmp_sibling(&idx_path);
     std::fs::write(&tmp, kept.as_bytes())?;
     std::fs::File::open(&tmp)?.sync_all()?;
     std::fs::rename(&tmp, &idx_path)?;

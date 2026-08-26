@@ -316,7 +316,7 @@ impl BlobWal {
 
         // Write the snapshot to a temp file and rename it over the log, so a
         // crash mid-checkpoint can never lose the previous log contents.
-        let tmp_path = self.path.with_extension("wal.tmp");
+        let tmp_path = crate::storage::atomic_write::tmp_sibling(&self.path);
         {
             let file = OpenOptions::new()
                 .create(true)

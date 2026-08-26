@@ -392,16 +392,12 @@ impl CatalogPersistence {
 
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-        // Atomic write: write to .tmp, fsync, then rename over the real file.
-        // This prevents a partial write from corrupting the catalog on power loss.
-        let tmp_path = self.path.with_extension("json.tmp");
-        {
-            let mut f = fs::File::create(&tmp_path).map_err(PersistenceError::Io)?;
-            use std::io::Write;
-            f.write_all(json.as_bytes()).map_err(PersistenceError::Io)?;
-            f.sync_all().map_err(PersistenceError::Io)?;
-        }
-        fs::rename(&tmp_path, &self.path).map_err(PersistenceError::Io)?;
+        // Atomic write via a UNIQUE temp sibling: the fixed `.tmp` name this
+        // used raced under concurrent DDL (two connections persisting the
+        // catalog rename the same temp file; the loser got ENOENT and the
+        // whole DDL statement failed).
+        crate::storage::atomic_write::atomic_write(&self.path, json.as_bytes())
+            .map_err(PersistenceError::Io)?;
         Ok(())
     }
 

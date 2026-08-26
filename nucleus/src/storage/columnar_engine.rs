@@ -938,6 +938,10 @@ impl ColumnarStorageEngine {
 
 #[async_trait]
 impl StorageEngine for ColumnarStorageEngine {
+    fn engine_kind(&self) -> &'static str {
+        "columnar"
+    }
+
     fn as_columnar(&self) -> Option<&ColumnarStorageEngine> {
         Some(self)
     }

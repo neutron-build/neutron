@@ -386,7 +386,9 @@ impl MetaPersistence {
         if let Some(e) = crate::storage::crashpoint::io_fault("meta.write") {
             return Err(format!("meta write: {e}"));
         }
-        let tmp = self.path.with_extension("json.tmp");
+        // Unique temp sibling: a fixed `.tmp` name races under concurrent
+        // DDL (same class as the catalog persistence ENOENT).
+        let tmp = crate::storage::atomic_write::tmp_sibling(&self.path);
         {
             let mut f = std::fs::File::create(&tmp).map_err(|e| format!("meta write tmp: {e}"))?;
             f.write_all(json.as_bytes())

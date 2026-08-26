@@ -654,7 +654,7 @@ impl StatsStore {
 
         let json =
             serde_json::to_string_pretty(&ser).map_err(|e| format!("serialize stats: {e}"))?;
-        let tmp = path.with_extension("json.tmp");
+        let tmp = crate::storage::atomic_write::tmp_sibling(path);
         std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write stats: {e}"))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("rename stats: {e}"))?;
         Ok(())
