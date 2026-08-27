@@ -5,6 +5,7 @@ import { AIError, problemFromStatus } from "./errors.js";
 import { deferred } from "./internal/deferred.js";
 import { parsePartialJson } from "./internal/partial-json.js";
 import { backoff, isRetryableError, retryOptionsFrom } from "./internal/retry.js";
+import { abandonmentSettler, drainEvents } from "./internal/run-to-promise.js";
 import type { FlexibleSchema, InferSchema, Schema } from "./schema.js";
 import { resolveSchema } from "./schema.js";
 import type { Message, Usage } from "./types.js";
@@ -46,11 +47,6 @@ export function streamObject<S extends FlexibleSchema<unknown>>(
   return new StreamObjectResultImpl(options, resolveSchema(options.schema), messages);
 }
 
-/** Rejection reason for result promises when the consumer abandons the stream. */
-const ABANDONED_STREAM = new AIError(
-  problemFromStatus(400, "The stream was abandoned before completion; result promises cannot be fulfilled."),
-);
-
 class StreamObjectResultImpl<T> implements StreamObjectResult<T> {
   #options: StreamObjectOptions<FlexibleSchema<unknown>>;
   #schema: Schema<unknown>;
@@ -58,6 +54,7 @@ class StreamObjectResultImpl<T> implements StreamObjectResult<T> {
   #consumed = false;
   #objectDeferred = deferred<T>();
   #usageDeferred = deferred<Usage>();
+  #settleAbandoned = abandonmentSettler([this.#objectDeferred, this.#usageDeferred]);
 
   constructor(
     options: StreamObjectOptions<FlexibleSchema<unknown>>,
@@ -159,22 +156,15 @@ class StreamObjectResultImpl<T> implements StreamObjectResult<T> {
     } finally {
       // A consumer that breaks out of the stream abandons the generator at a
       // yield: neither the resolve block nor the catch above runs, and the
-      // result deferreds stay pending forever — `await result.object` hung
-      // with no error and no timeout. Settle them here; on the normal and
-      // error paths they are already settled and rejecting again is a no-op.
-      this.#objectDeferred.reject(ABANDONED_STREAM);
-      this.#usageDeferred.reject(ABANDONED_STREAM);
+      // result deferreds stay pending forever. The shared settler rejects
+      // them (a no-op when already settled).
+      this.#settleAbandoned();
     }
   }
 
   #drain(): void {
     if (this.#consumed) return;
-    const parts = this.#start();
-    void (async () => {
-      for await (const _part of parts) {
-        // results surface via the promises
-      }
-    })().catch(() => {});
+    drainEvents(this.#start());
   }
 
   get partialObjectStream(): AsyncIterable<DeepPartial<T>> {

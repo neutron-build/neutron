@@ -52,6 +52,7 @@ import { neutronPlugin } from "../vite/plugin.js";
 import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
+  type NeutronImageConfig,
   type NeutronRoutesConfig,
   type NeutronRuntime,
 } from "../config.js";
@@ -155,6 +156,14 @@ export interface NeutronServerOptions {
    * absolute URLs, links, and cache keys. Unset = accept any Host (unchanged).
    */
   trustedHosts?: string[];
+  /**
+   * Image optimization settings. `images.remotePatterns` is the allowlist
+   * that permits `/_neutron/image` to fetch and optimize remote http(s)
+   * images: an absolute-URL `src` whose origin is not listed is refused
+   * with a 400 that names this config. Absent = only local public-dir
+   * images are optimized.
+   */
+  images?: NeutronImageConfig;
   cache?: NeutronCacheStores;
   routes?: NeutronRoutesConfig;
   hooks?: NeutronServerHooks;
@@ -332,6 +341,7 @@ export async function createServer(
     securityHeaders,
     openapi,
     trustedHosts,
+    images: imageConfig,
     cache,
     routes: routeRules,
     hooks,
@@ -576,6 +586,7 @@ export async function createServer(
         path.join(resolvedDistDir, "public"),
       ],
       cacheDir: path.join(resolvedRootDir, ".neutron", "image-cache"),
+      remotePatterns: imageConfig?.remotePatterns,
     });
     return response;
   });

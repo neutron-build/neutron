@@ -8,6 +8,7 @@ import {
   PgTransport,
   createTransport,
   NucleusConnectionError,
+  NucleusError,
   NucleusQueryError,
 } from "./index.js";
 
@@ -645,6 +646,129 @@ describe("PgTransport lazy pool creation", () => {
       assert.equal(ended, 1, "close() ends the pool");
     } finally {
       pgExports.Pool = RealPool;
+    }
+  });
+});
+
+// =========================================================================
+// PgTransport — headers/timeout honored or rejected at construction
+// =========================================================================
+//
+// createTransport() silently dropped headers/timeout for postgres:// URLs
+// (they were only honored on the HTTP paths). Ratified contract: timeout is
+// honored by mapping it onto the pool's native statement/query/connection
+// timeouts; headers are REJECTED at construction — the PostgreSQL wire
+// protocol has no HTTP headers to carry them on.
+
+async function patchPgPool(): Promise<{
+  configs: Array<Record<string, unknown>>;
+  restore: () => void;
+}> {
+  const mod = (await import("pg")) as unknown as { default?: Record<string, unknown> };
+  const pgExports = (mod.default ?? (mod as unknown as Record<string, unknown>)) as {
+    Pool?: unknown;
+  };
+  const RealPool = pgExports.Pool;
+  const configs: Array<Record<string, unknown>> = [];
+  class CapturingPool {
+    constructor(cfg: Record<string, unknown>) {
+      configs.push(cfg);
+      return {
+        on: () => {},
+        query: async () => ({ rows: [{ result: 1 }], rowCount: 1 }),
+        end: async () => {},
+        connect: async () => {
+          throw new Error("connect not used by this test");
+        },
+      };
+    }
+  }
+  pgExports.Pool = CapturingPool;
+  return {
+    configs,
+    restore: () => {
+      pgExports.Pool = RealPool;
+    },
+  };
+}
+
+describe("PgTransport headers/timeout contract", () => {
+  afterEach(() => {
+    restoreGlobals();
+  });
+
+  it("throws at construction when headers are passed (wire protocol has none)", () => {
+    assert.throws(
+      () => new PgTransport("postgres://nucleus@localhost:5432/nucleus", { headers: { "X-Api-Key": "k" } }),
+      (err: unknown) => {
+        assert(err instanceof NucleusError);
+        assert.equal(err.code, "PG_HEADERS_UNSUPPORTED");
+        assert.match(err.message, /PostgreSQL wire protocol has no HTTP headers/);
+        return true;
+      },
+    );
+  });
+
+  it("createTransport rejects headers for postgres:// URLs instead of silently dropping them", () => {
+    delete (globalThis as Record<string, unknown>).window;
+    delete (globalThis as Record<string, unknown>).navigator;
+    assert.throws(
+      () =>
+        createTransport({
+          url: "postgres://nucleus@localhost:5432/nucleus",
+          headers: { "X-Api-Key": "k" },
+        }),
+      /PostgreSQL wire protocol has no HTTP headers/,
+    );
+  });
+
+  it("maps timeout onto the pool's native statement/query/connection timeouts", async () => {
+    const { configs, restore } = await patchPgPool();
+    try {
+      const transport = new PgTransport("postgres://nucleus@localhost:5432/nucleus", { timeout: 5000 });
+      await transport.ping();
+      assert.equal(configs.length, 1);
+      assert.equal(configs[0].connectionString, "postgres://nucleus@localhost:5432/nucleus");
+      assert.equal(configs[0].max, 8);
+      assert.equal(configs[0].statement_timeout, 5000);
+      assert.equal(configs[0].query_timeout, 5000);
+      assert.equal(configs[0].connectionTimeoutMillis, 5000);
+      await transport.close();
+    } finally {
+      restore();
+    }
+  });
+
+  it("createTransport threads timeout into the PgTransport pool", async () => {
+    delete (globalThis as Record<string, unknown>).window;
+    delete (globalThis as Record<string, unknown>).navigator;
+    const { configs, restore } = await patchPgPool();
+    try {
+      const transport = createTransport({ url: "postgres://nucleus@localhost:5432/nucleus", timeout: 1234 });
+      assert(transport instanceof PgTransport);
+      await transport.ping();
+      assert.equal(configs.length, 1);
+      assert.equal(configs[0].statement_timeout, 1234);
+      assert.equal(configs[0].connectionTimeoutMillis, 1234);
+      await transport.close();
+    } finally {
+      restore();
+    }
+  });
+
+  it("plain construction leaves the pool config untouched", async () => {
+    const { configs, restore } = await patchPgPool();
+    try {
+      const transport = new PgTransport("postgres://nucleus@localhost:5432/nucleus");
+      await transport.ping();
+      assert.equal(configs.length, 1);
+      assert.equal(configs[0].connectionString, "postgres://nucleus@localhost:5432/nucleus");
+      assert.equal("statement_timeout" in configs[0], false);
+      assert.equal("query_timeout" in configs[0], false);
+      assert.equal("connectionTimeoutMillis" in configs[0], false);
+      await transport.close();
+    } finally {
+      restore();
     }
   });
 });

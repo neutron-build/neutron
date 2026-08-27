@@ -787,7 +787,13 @@ async function resolveDevHeadHtml(
     const resolved = await mod.head({ ...args, data: args.loaderData[route.id] });
     if (!resolved) continue;
     if (typeof resolved === "string") {
-      headFragments.push(sanitizeHeadHtml(resolved));
+      // A raw string from head() is developer-authored markup — the explicit
+      // escape hatch, emitted faithfully. This used to run a regex
+      // "sanitizer" over it in dev while prod emitted verbatim: a bypassable
+      // approximation that implied protection the server never had. Prod is
+      // canonical here; use the structured SeoMetaInput return for
+      // data-driven content (escaped at render).
+      headFragments.push(resolved);
       continue;
     }
     mergedSeo = mergeSeoMetaInput(mergedSeo, resolved);
@@ -1462,17 +1468,6 @@ function resolveRouteSourcePath(id: string): string {
 
 function requireSource(filePath: string): string {
   return fs.readFileSync(filePath, "utf-8");
-}
-
-/** Strip <script> tags, event handler attributes, and javascript: URLs from head HTML fragments. */
-function sanitizeHeadHtml(html: string): string {
-  // Strip script tags and their contents
-  html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-  // Strip event handler attributes
-  html = html.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
-  // Strip javascript: URLs
-  html = html.replace(/(?:href|src|action)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')/gi, '');
-  return html;
 }
 
 function isScriptModuleId(id: string): boolean {

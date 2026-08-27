@@ -7,6 +7,9 @@ export interface ImageParams {
   width: number;
   quality: number;
   format: "webp" | "avif" | "jpeg" | "png";
+  /** Present (true) only when `src` is an allowlisted absolute URL fetched
+   *  over the network rather than read from a public dir. */
+  remote?: boolean;
 }
 
 export interface ImageValidationError {
@@ -14,9 +17,18 @@ export interface ImageValidationError {
   status: number;
 }
 
+/** An allowlisted remote image origin (`images.remotePatterns` in the app
+ *  config). `hostname` matches exactly; `protocol` (when set) must match
+ *  the URL's scheme. */
+export interface RemoteImagePattern {
+  hostname: string;
+  protocol?: string;
+}
+
 export interface ImageOptimizerOptions {
   publicDirs: string[];
   cacheDir: string;
+  remotePatterns?: RemoteImagePattern[];
 }
 
 const VALID_FORMATS = new Set(["webp", "avif", "jpeg", "png"]);
@@ -55,7 +67,8 @@ let sharpLoadAttempted = false;
 let sharpWarningLogged = false;
 
 export function validateImageParams(
-  searchParams: URLSearchParams
+  searchParams: URLSearchParams,
+  remotePatterns: RemoteImagePattern[] = []
 ): ImageParams | ImageValidationError {
   const src = searchParams.get("src");
   if (!src) {
@@ -68,6 +81,56 @@ export function validateImageParams(
     decodedSrc = decodeURIComponent(src);
   } catch {
     return { error: "Invalid URL encoding", status: 400 };
+  }
+
+  // Remote images: only http(s) absolute URLs, only origins the app
+  // explicitly allowlisted. Everything else — including any absolute URL
+  // with no allowlist configured — is refused with the config named, so the
+  // failure is fixable instead of a mystery 400.
+  const asUrl = /^https?:\/\//i.test(decodedSrc)
+    ? (() => {
+        try {
+          return new URL(decodedSrc);
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+  if (asUrl) {
+    const allowed = remotePatterns.some(
+      (pattern) =>
+        pattern.hostname === asUrl.hostname &&
+        (pattern.protocol === undefined ||
+          pattern.protocol === asUrl.protocol.replace(":", ""))
+    );
+    if (!allowed) {
+      return {
+        error:
+          `Remote image host "${asUrl.hostname}" is not allowlisted. Add it to ` +
+          `images.remotePatterns in neutron.config.ts (e.g. { hostname: "${asUrl.hostname}" }) ` +
+          `to permit optimization of remote images from this origin.`,
+        status: 400,
+      };
+    }
+    const widthRemote = parseWidth(searchParams);
+    if (typeof widthRemote !== "number") {
+      return widthRemote;
+    }
+    const qualityRemote = parseQuality(searchParams);
+    if (typeof qualityRemote !== "number") {
+      return qualityRemote;
+    }
+    const formatRemote = parseFormat(searchParams);
+    if (typeof formatRemote !== "string") {
+      return formatRemote;
+    }
+    return {
+      src: decodedSrc,
+      width: widthRemote,
+      quality: qualityRemote,
+      format: formatRemote,
+      remote: true,
+    };
   }
 
   if (!decodedSrc.startsWith("/")) {
@@ -93,11 +156,27 @@ export function validateImageParams(
     return { error: "Absolute URLs not allowed", status: 400 };
   }
 
+  const width = parseWidth(searchParams);
+  if (typeof width !== "number") {
+    return width;
+  }
+  const quality = parseQuality(searchParams);
+  if (typeof quality !== "number") {
+    return quality;
+  }
+  const format = parseFormat(searchParams);
+  if (typeof format !== "string") {
+    return format;
+  }
+
+  return { src: normalizedSrc, width, quality, format };
+}
+
+function parseWidth(searchParams: URLSearchParams): number | ImageValidationError {
   const wParam = searchParams.get("w");
   if (!wParam) {
     return { error: "Missing 'w' (width) parameter", status: 400 };
   }
-
   const width = parseInt(wParam, 10);
   if (!Number.isFinite(width) || width < MIN_WIDTH || width > MAX_WIDTH) {
     return {
@@ -105,36 +184,38 @@ export function validateImageParams(
       status: 400,
     };
   }
+  return width;
+}
 
+function parseQuality(searchParams: URLSearchParams): number | ImageValidationError {
   const qParam = searchParams.get("q");
-  let quality = DEFAULT_QUALITY;
-  if (qParam) {
-    quality = parseInt(qParam, 10);
-    if (
-      !Number.isFinite(quality) ||
-      quality < MIN_QUALITY ||
-      quality > MAX_QUALITY
-    ) {
-      return {
-        error: `Quality must be between ${MIN_QUALITY} and ${MAX_QUALITY}`,
-        status: 400,
-      };
-    }
+  if (!qParam) {
+    return DEFAULT_QUALITY;
   }
+  const quality = parseInt(qParam, 10);
+  if (!Number.isFinite(quality) || quality < MIN_QUALITY || quality > MAX_QUALITY) {
+    return {
+      error: `Quality must be between ${MIN_QUALITY} and ${MAX_QUALITY}`,
+      status: 400,
+    };
+  }
+  return quality;
+}
 
+function parseFormat(
+  searchParams: URLSearchParams
+): ImageParams["format"] | ImageValidationError {
   const fmtParam = searchParams.get("fmt");
-  let format = DEFAULT_FORMAT as ImageParams["format"];
-  if (fmtParam) {
-    if (!VALID_FORMATS.has(fmtParam)) {
-      return {
-        error: `Format must be one of: ${[...VALID_FORMATS].join(", ")}`,
-        status: 400,
-      };
-    }
-    format = fmtParam as ImageParams["format"];
+  if (!fmtParam) {
+    return DEFAULT_FORMAT as ImageParams["format"];
   }
-
-  return { src: normalizedSrc, width, quality, format };
+  if (!VALID_FORMATS.has(fmtParam)) {
+    return {
+      error: `Format must be one of: ${[...VALID_FORMATS].join(", ")}`,
+      status: 400,
+    };
+  }
+  return fmtParam as ImageParams["format"];
 }
 
 export function resolveSourceFile(
@@ -216,6 +297,47 @@ const FORMAT_TO_CONTENT_TYPE: Record<string, string> = {
   png: "image/png",
 };
 
+/** Hard caps on fetching a remote image: a slow or huge origin must not pin
+ *  a request or fill the disk-backed cache with attacker-chosen bulk. */
+const REMOTE_FETCH_TIMEOUT_MS = 10_000;
+const REMOTE_FETCH_MAX_BYTES = 20 * 1024 * 1024;
+
+async function fetchRemoteImage(
+  src: string,
+  opts: ImageOptimizerOptions
+): Promise<Buffer | { error: string; status: number }> {
+  let response: Response;
+  try {
+    response = await fetch(src, {
+      signal: AbortSignal.timeout(REMOTE_FETCH_TIMEOUT_MS),
+      redirect: "follow",
+    });
+  } catch {
+    return { error: `Failed to fetch remote image: ${src}`, status: 502 };
+  }
+
+  if (!response.ok) {
+    return { error: `Remote image returned ${response.status}`, status: 502 };
+  }
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.startsWith("image/")) {
+    return {
+      error: `Remote image at ${src} is "${contentType}", not an image`,
+      status: 415,
+    };
+  }
+  const declaredLength = Number(response.headers.get("content-length") || "0");
+  if (declaredLength > REMOTE_FETCH_MAX_BYTES) {
+    return { error: "Remote image exceeds the 20 MB fetch cap", status: 413 };
+  }
+
+  const body = await response.arrayBuffer();
+  if (body.byteLength > REMOTE_FETCH_MAX_BYTES) {
+    return { error: "Remote image exceeds the 20 MB fetch cap", status: 413 };
+  }
+  return Buffer.from(body);
+}
+
 export async function optimizeImage(
   params: ImageParams,
   opts: ImageOptimizerOptions
@@ -233,16 +355,32 @@ export async function optimizeImage(
     // cache miss, continue to optimize
   }
 
-  const sourcePath = resolveSourceFile(params.src, opts.publicDirs);
-  if (!sourcePath) {
-    return { error: "Image not found", status: 404 };
+  // Remote (allowlisted) source: fetch the bytes; the sharp pipeline below
+  // runs on the buffer instead of a local path.
+  let sourceBytes: Buffer | null = null;
+  let sourcePath: string | null = null;
+  if (params.remote) {
+    const remote = await fetchRemoteImage(params.src, opts);
+    if ("error" in remote) {
+      return remote;
+    }
+    sourceBytes = remote;
+  } else {
+    sourcePath = resolveSourceFile(params.src, opts.publicDirs);
+    if (!sourcePath) {
+      return { error: "Image not found", status: 404 };
+    }
   }
 
   const sharp = await loadSharp();
 
   if (!sharp) {
-    const buffer = fs.readFileSync(sourcePath);
-    const ext = path.extname(sourcePath).toLowerCase().slice(1);
+    const buffer =
+      sourceBytes ??
+      Buffer.from(fs.readFileSync(sourcePath as unknown as string));
+    const ext = params.remote
+      ? path.posix.extname(new URL(params.src).pathname).toLowerCase().slice(1)
+      : path.extname(sourcePath as unknown as string).toLowerCase().slice(1);
     const contentType =
       FORMAT_TO_CONTENT_TYPE[ext] ||
       FORMAT_TO_CONTENT_TYPE[params.format] ||
@@ -251,7 +389,7 @@ export async function optimizeImage(
   }
 
   try {
-    let pipeline = sharp(sourcePath).resize(params.width);
+    let pipeline = sharp(sourceBytes ?? sourcePath).resize(params.width);
 
     switch (params.format) {
       case "webp":
@@ -280,8 +418,12 @@ export async function optimizeImage(
     };
   } catch (err) {
     console.error("[neutron] Image optimization failed:", err);
-    const buffer = fs.readFileSync(sourcePath);
-    const ext = path.extname(sourcePath).toLowerCase().slice(1);
+    const buffer =
+      sourceBytes ??
+      Buffer.from(fs.readFileSync(sourcePath as unknown as string));
+    const ext = params.remote
+      ? path.posix.extname(new URL(params.src).pathname).toLowerCase().slice(1)
+      : path.extname(sourcePath as unknown as string).toLowerCase().slice(1);
     const contentType =
       FORMAT_TO_CONTENT_TYPE[ext] ||
       FORMAT_TO_CONTENT_TYPE[params.format] ||
@@ -295,7 +437,7 @@ export async function handleImageRequest(
   opts: ImageOptimizerOptions
 ): Promise<Response> {
   const url = new URL(request.url);
-  const validated = validateImageParams(url.searchParams);
+  const validated = validateImageParams(url.searchParams, opts.remotePatterns ?? []);
 
   if ("error" in validated) {
     return new Response(validated.error, { status: validated.status });

@@ -160,7 +160,7 @@ describe('cache()', () => {
     expect(callCount).toBe(1);
   });
 
-  it('caches errors (deduplication includes failures)', async () => {
+  it('evicts rejected promises so the next call retries (concurrent callers still share the failure)', async () => {
     let callCount = 0;
     const fn = cache(async (shouldFail: boolean) => {
       callCount++;
@@ -170,18 +170,24 @@ describe('cache()', () => {
       return 'success';
     }, { keyPrefix: 'error-test' });
 
-    // First call fails
-    await expect(fn(true)).rejects.toThrow('Test error');
+    // Concurrent calls share the in-flight failure: one invocation, one
+    // rejection handed to every waiter.
+    const [, second] = await Promise.allSettled([
+      fn(true),
+      fn(true),
+    ]);
+    expect(second.status).toBe('rejected');
     expect(callCount).toBe(1);
 
-    // Second call with same args returns cached error (same promise)
+    // After the rejection settles the entry is GONE: the next call retries
+    // rather than being re-served the cached failure for the whole TTL.
     await expect(fn(true)).rejects.toThrow('Test error');
-    expect(callCount).toBe(1); // Not called again - error is cached
+    expect(callCount, 'a settled rejection must not be re-served').toBe(2);
 
-    // Different args - success call works
+    // Different args - success call works and caches normally.
     const result = await fn(false);
     expect(result).toBe('success');
-    expect(callCount).toBe(2);
+    expect(callCount).toBe(3);
   });
 });
 

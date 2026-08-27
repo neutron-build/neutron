@@ -7,7 +7,6 @@ function route(id: string, path = "/"): Route {
     id,
     path,
     file: `src/routes/${id}.tsx`,
-    pattern: /.*/,
     params: [],
     config: { mode: "app" },
     parentId: null,

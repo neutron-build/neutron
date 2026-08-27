@@ -214,6 +214,67 @@ test("an abandoned run settles the result promise instead of hanging", async () 
   );
 });
 
+test("sessions are bounded: the least-recently-used session is evicted", async () => {
+  // The sessions Map held full conversations forever — one Map entry per run,
+  // never evicted, so a long-lived harness leaks the entire history. The
+  // capacity knob caps it with LRU eviction; resuming an evicted session
+  // starts fresh, resuming a resident one keeps its history.
+  const step: AdapterStreamPart[] = [
+    { type: "text-delta", text: "reply" },
+    { type: "finish", finishReason: "stop", usage: usage(5, 2) },
+  ];
+  const { model, calls } = scriptedStreamModel([step, step, step, step, step, step, step]);
+  const agent = localAgent({ model, sessionCapacity: 3 });
+
+  const s1 = await agent.run({ prompt: "one" }).result;
+  const s2 = await agent.run({ prompt: "two" }).result;
+  const s3 = await agent.run({ prompt: "three" }).result;
+  await agent.run({ sessionId: s1.sessionId!, prompt: "touch one" }).result; // s1 recent again
+  const s4 = await agent.run({ prompt: "four" }).result; // evicts s2 (LRU)
+
+  const resumedEvicted = await agent.run({ sessionId: s2.sessionId!, prompt: "resume two" }).result;
+  assert.equal(resumedEvicted.sessionId, s2.sessionId);
+  assert.equal(
+    calls[5]!.messages.some((message) => message.role === "assistant"),
+    false,
+    "an evicted session must resume with no history",
+  );
+
+  const resumedResident = await agent.run({ sessionId: s1.sessionId!, prompt: "resume one" }).result;
+  assert.equal(
+    calls[6]!.messages.some((message) => message.role === "assistant"),
+    true,
+    "a session within capacity must keep its history",
+  );
+  assert.notEqual(s4.sessionId, s1.sessionId);
+});
+
+test("the default session capacity bounds an unconfigured harness", async () => {
+  const step: AdapterStreamPart[] = [
+    { type: "text-delta", text: "reply" },
+    { type: "finish", finishReason: "stop", usage: usage(1, 1) },
+  ];
+  const script = Array.from({ length: 67 }, () => step);
+  const { model, calls } = scriptedStreamModel(script);
+  const agent = localAgent({ model });
+
+  const first = await agent.run({ prompt: "first" }).result;
+  for (let i = 0; i < 64; i++) await agent.run({ prompt: `filler ${i}` }).result;
+  await agent.run({ sessionId: first.sessionId!, prompt: "resume first" }).result;
+
+  assert.equal(
+    calls[65]!.messages.some((message) => message.role === "assistant"),
+    false,
+    "the default capacity must evict the oldest session, not keep every one forever",
+  );
+});
+
+test("sessionCapacity must be a positive integer", () => {
+  const { model } = scriptedStreamModel([]);
+  assert.throws(() => localAgent({ model, sessionCapacity: 0 }), /sessionCapacity/);
+  assert.throws(() => localAgent({ model, sessionCapacity: 1.5 }), /sessionCapacity/);
+});
+
 test("the caller's abort listener is removed when the run settles", async () => {
   // One listener per run, never removed: a caller that starts many runs off
   // one long-lived AbortSignal accumulates listeners for the process lifetime.

@@ -82,6 +82,26 @@ export function cache<TArgs extends any[], TReturn>(
     const expiresAt = Date.now() + ttl;
     globalCache.set(key, { promise, expiresAt, tags });
 
+    // A settled rejection is a failed attempt, not a result: keep the entry
+    // only while the promise is in flight (concurrent callers share the
+    // failure), then evict it so the next call retries instead of being
+    // re-served the cached error for the whole TTL. Tag references go with
+    // the entry, exactly as on TTL expiry.
+    promise.catch(() => {
+      const entry = globalCache.get(key);
+      if (entry && entry.promise === promise) {
+        globalCache.delete(key);
+        if (entry.tags) {
+          for (const tag of entry.tags) {
+            tagCache.get(tag)?.delete(key);
+            if (tagCache.get(tag)?.size === 0) {
+              tagCache.delete(tag);
+            }
+          }
+        }
+      }
+    });
+
     // Register cache key with tags
     if (tags) {
       for (const tag of tags) {

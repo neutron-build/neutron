@@ -152,9 +152,6 @@ describe("manifest", () => {
     const decide = routes.find((r) => r.path === "/api/runs/:id/decide");
 
     expect(decide?.params).toEqual(["id"]);
-    expect(decide?.pattern.test("/api/runs/run_123/decide")).toBe(true);
-    expect(decide?.pattern.test("/api/runs/[id]/decide")).toBe(true);
-    expect(decide?.pattern.test("/api/runs/run_123/other")).toBe(false);
   });
 
   it("rejects a malformed dynamic segment instead of emitting it literally", () => {

@@ -93,7 +93,7 @@ import { h } from "preact";
 
 export const config = { mode: "app" };
 
-// Simulates createCspNonceMiddleware: sets a nonce on context before render.
+// Sets a nonce on the context before render, as app middleware would.
 export const middleware = async (request, context, next) => {
   context.cspNonce = "testnonce123";
   return next();

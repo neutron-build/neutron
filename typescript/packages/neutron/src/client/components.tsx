@@ -3,6 +3,7 @@ import { useState, useCallback, useRef, useEffect } from "preact/hooks";
 import { decodeLoaderDataPayload } from "./serialization.js";
 import { navigate } from "./navigate.js";
 import { setNavigationState } from "./hooks.js";
+import type { SubmitError } from "./hooks.js";
 import { hasFreshPrefetch, storePrefetch } from "./prefetch-cache.js";
 import type { RouteHref } from "../core/typed-routes.js";
 
@@ -79,11 +80,22 @@ export async function prefetch(to: string): Promise<void> {
 // Keep internal name for backwards compatibility
 const prefetchRouteData = prefetch;
 
+/** What a function-children `Form` receives: the live submit state. */
+export interface FormRenderState {
+  submitting: boolean;
+  error: SubmitError | null;
+}
+
 export interface FormProps {
   method?: "get" | "post" | "put" | "patch" | "delete";
   action?: string;
   replace?: boolean;
-  children?: preact.ComponentChildren;
+  /** Plain children render as-is; a function receives the live submit state
+   *  (`submitting`, `error`) so failures are observable in UI. */
+  children?: preact.ComponentChildren | ((state: FormRenderState) => preact.ComponentChildren);
+  /** Called when a submission fails (non-ok response or network error) —
+   *  the observable error surface for plain-children forms. */
+  onError?: (error: SubmitError) => void;
   class?: string;
   className?: string;
   id?: string;
@@ -97,12 +109,14 @@ export const Form: FunctionalComponent<FormProps> = ({
   action,
   replace,
   children,
+  onError,
   encType,
   ...props
 }) => {
   const formRef = useRef<HTMLFormElement>(null);
   const submittingRef = useRef(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<SubmitError | null>(null);
 
   const handleSubmit = useCallback(async (event: Event) => {
     if (!(window as any).__NEUTRON_ROUTER_ACTIVE__) {
@@ -131,6 +145,7 @@ export const Form: FunctionalComponent<FormProps> = ({
 
     submittingRef.current = true;
     setIsSubmitting(true);
+    setError(null);
     setNavigationState({
       state: "submitting",
       formData,
@@ -196,16 +211,29 @@ export const Form: FunctionalComponent<FormProps> = ({
           window.dispatchEvent(new PopStateEvent("popstate"));
         }
       } else {
+        const submitError: SubmitError = {
+          status: response.status,
+          message:
+            response.statusText || `request failed with status ${response.status}`,
+        };
+        setError(submitError);
+        onError?.(submitError);
         console.error("Form submission failed:", response.status);
       }
-    } catch (error) {
-      console.error("Form submission error:", error);
+    } catch (err) {
+      const submitError: SubmitError = {
+        status: 0,
+        message: err instanceof Error ? err.message : String(err),
+      };
+      setError(submitError);
+      onError?.(submitError);
+      console.error("Form submission error:", err);
     } finally {
       submittingRef.current = false;
       setIsSubmitting(false);
       setNavigationState({ state: "idle" });
     }
-  }, [action, method, replace]);
+  }, [action, method, replace, onError]);
 
   return h(
     "form",
@@ -217,8 +245,14 @@ export const Form: FunctionalComponent<FormProps> = ({
       encType,
       onSubmit: handleSubmit,
       "data-submitting": isSubmitting || undefined,
+      "data-submit-error": error ? String(error.status) : undefined,
     },
-    children
+    typeof children === "function"
+      ? (children as (state: FormRenderState) => preact.ComponentChildren)({
+          submitting: isSubmitting,
+          error,
+        })
+      : children
   );
 };
 

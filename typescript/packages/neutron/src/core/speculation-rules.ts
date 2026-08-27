@@ -1,3 +1,4 @@
+import { nonceAttr } from "./escape.js";
 /**
  * Browser-native instant navigation for pages that ship no router.
  *
@@ -76,8 +77,7 @@ export function renderSpeculationRules(
   // except `exclude`, which is escaped below — so it cannot break out of the
   // script element.
   const json = JSON.stringify(rules).replace(/</g, "\\u003c");
-  const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
-  return `<script type="speculationrules"${nonceAttr}>${json}</script>`;
+  return `<script type="speculationrules"${nonceAttr(nonce)}>${json}</script>`;
 }
 
 /**
@@ -111,6 +111,5 @@ export function renderStaticLinkSpeculationRules(
     ],
   };
   const json = JSON.stringify(rules).replace(/</g, "\\u003c");
-  const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
-  return `<script type="speculationrules"${nonceAttr}>${json}</script>`;
+  return `<script type="speculationrules"${nonceAttr(nonce)}>${json}</script>`;
 }

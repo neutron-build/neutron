@@ -126,7 +126,12 @@ export class SandboxExecutor implements AgentExecutor {
       if (frame.event === "stdout") stdout = cap(stdout, frame.data);
       else if (frame.event === "stderr") stderr = cap(stderr, frame.data);
       else if (frame.event === "exit") {
-        const info = JSON.parse(frame.data) as { exitCode?: number; timedOut?: boolean };
+        let info: { exitCode?: number; timedOut?: boolean };
+        try {
+          info = JSON.parse(frame.data) as { exitCode?: number; timedOut?: boolean };
+        } catch (cause) {
+          throw new AgentError(problemFromStatus(500, "Sandbox daemon sent a malformed exit frame."), { cause });
+        }
         exitCode = info.exitCode ?? -1;
         timedOut = info.timedOut === true;
       }

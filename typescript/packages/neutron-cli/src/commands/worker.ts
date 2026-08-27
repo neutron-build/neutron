@@ -10,8 +10,8 @@ import {
   resolveRuntime,
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
-  type NeutronConfig,
 } from "@neutron-build/core";
+import { loadNeutronConfig } from "../lib/config.js";
 
 interface WorkerRunContext {
   mode: string;
@@ -44,7 +44,7 @@ export async function worker(): Promise<void> {
   const cwd = process.cwd();
   const args = parseWorkerArgs(process.argv.slice(3));
   applyEnv(cwd, args.mode);
-  const neutronConfig = await loadNeutronConfig(cwd, args.mode);
+  const neutronConfig = await loadNeutronConfig(cwd, { mode: args.mode });
   const entryPath = resolveWorkerEntry(cwd, args.entry, neutronConfig.worker?.entry);
 
   if (!entryPath) {
@@ -211,29 +211,6 @@ function resolveWorkerEntry(
   }
 
   return null;
-}
-
-async function loadNeutronConfig(cwd: string, mode: string): Promise<NeutronConfig> {
-  const candidates = [
-    "neutron.config.ts",
-    "neutron.config.js",
-    "neutron.config.mjs",
-    "neutron.config.cjs",
-  ];
-
-  for (const file of candidates) {
-    const fullPath = path.resolve(cwd, file);
-    if (!fs.existsSync(fullPath)) {
-      continue;
-    }
-
-    const loaded = await loadConfigFromFile({ command: "serve", mode }, fullPath, cwd);
-    if (loaded?.config) {
-      return loaded.config as NeutronConfig;
-    }
-  }
-
-  return {};
 }
 
 function applyEnv(cwd: string, mode: string): void {

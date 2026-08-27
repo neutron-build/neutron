@@ -9,6 +9,7 @@ import { MemoryEventStore, executeRun, deliverEvent } from "@neutron-build/workf
 import { approvalEventName } from "@neutron-build/workflow/ai";
 
 import type { LoadedAgent } from "./agent.js";
+import { AgentError, LocalExecutor } from "./executor.js";
 import { agentWorkflow, isScheduleDue, loadSchedules } from "./durable/index.js";
 import { jsonSchema } from "@neutron-build/ai";
 import { SandboxExecutor } from "./sandbox.js";
@@ -250,6 +251,75 @@ test("the http channel runs a turn and round-trips the suspension shape", async 
   assert.equal(wrongMethod.status, 400);
 });
 
+test("an exec-backed channel without an auth hook refuses to run", async () => {
+  // Body-supplied toolApprovals self-approve on a bare mount: any caller who
+  // can POST can drive the executor. The default is refuse-loud, not
+  // silently-open — the operator passes `auth` or opts out explicitly.
+  const { model, calls } = scriptedModel([say("ran")]);
+  const executor = new LocalExecutor({ root: await mkdtemp(join(tmpdir(), "exec-auth-")) });
+  const { createAgentHandler } = await import("./channels.js");
+  const handler = createAgentHandler({ agent: inlineAgent(model), executor });
+
+  const response = await handler(
+    new Request("http://x/agent", { method: "POST", body: JSON.stringify({ input: "hi" }) }),
+  );
+  assert.equal(response.status, 500);
+  assert.equal(response.headers.get("content-type"), "application/problem+json");
+  const problem = (await response.json()) as { detail: string };
+  assert.match(problem.detail, /auth/);
+  assert.match(problem.detail, /allowUnauthenticated/);
+  assert.equal(calls.length, 0, "the turn must not run");
+  await executor.destroy();
+});
+
+test("allowUnauthenticated opts an exec-backed channel open for local development", async () => {
+  const { model, calls } = scriptedModel([say("ran")]);
+  const executor = new LocalExecutor({ root: await mkdtemp(join(tmpdir(), "exec-open-")) });
+  const { createAgentHandler } = await import("./channels.js");
+  const handler = createAgentHandler({ agent: inlineAgent(model), executor, allowUnauthenticated: true });
+
+  const response = await handler(
+    new Request("http://x/agent", { method: "POST", body: JSON.stringify({ input: "hi" }) }),
+  );
+  assert.equal(response.status, 200);
+  assert.equal(((await response.json()) as { text: string }).text, "ran");
+  assert.equal(calls.length, 1);
+  await executor.destroy();
+});
+
+test("an auth hook that returns a Response refuses the call; null continues", async () => {
+  const { model, calls } = scriptedModel([say("secret result")]);
+  const { createAgentHandler } = await import("./channels.js");
+  const handler = createAgentHandler({
+    agent: inlineAgent(model),
+    auth: (request) => {
+      const token = request.headers.get("authorization");
+      return Promise.resolve(token === "Bearer good" ? null : new Response("unauthorized", { status: 401 }));
+    },
+  });
+
+  const refused = await handler(
+    new Request("http://x/agent", {
+      method: "POST",
+      headers: { authorization: "Bearer bad" },
+      body: JSON.stringify({ input: "hi" }),
+    }),
+  );
+  assert.equal(refused.status, 401);
+  assert.equal(refused.bodyUsed, false);
+  assert.equal(calls.length, 0, "a refused call must not reach the model");
+
+  const ok = await handler(
+    new Request("http://x/agent", {
+      method: "POST",
+      headers: { authorization: "Bearer good" },
+      body: JSON.stringify({ input: "hi" }),
+    }),
+  );
+  assert.equal(ok.status, 200);
+  assert.equal(calls.length, 1);
+});
+
 // ---------------------------------------------------------------------------
 // M5: SandboxExecutor against the daemon contract
 // ---------------------------------------------------------------------------
@@ -361,6 +431,27 @@ test("an exec failure mid-stream cancels the SSE body instead of abandoning it",
 
   const sandbox = SandboxExecutor.attach("01RUN", { baseURL: "http://127.0.0.1:7070", token: "secret", fetch });
 
-  await assert.rejects(sandbox.exec("echo hi"), SyntaxError);
+  await assert.rejects(sandbox.exec("echo hi"), (err: unknown) => err instanceof AgentError);
   assert.equal(cancelled, true, "the SSE body must be canceled when exec unwinds mid-stream");
+});
+
+test("a malformed exit frame surfaces as a problem, not a raw SyntaxError", async () => {
+  // Every other parse failure in this package wraps in problem-details; the
+  // exit frame's unguarded JSON.parse let a raw SyntaxError escape exec().
+  const fetch = (async () =>
+    new Response("event: exit\ndata: not-json\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })) as typeof globalThis.fetch;
+  const sandbox = SandboxExecutor.attach("01RUN", { baseURL: "http://127.0.0.1:7070", token: "secret", fetch });
+
+  await assert.rejects(
+    sandbox.exec("true"),
+    (err: unknown) => {
+      assert.ok(err instanceof AgentError, `expected AgentError, got ${String((err as Error)?.constructor?.name)}`);
+      assert.match((err as AgentError).problem.detail, /malformed exit frame/);
+      assert.equal((err as AgentError).problem.status, 500);
+      return true;
+    },
+  );
 });

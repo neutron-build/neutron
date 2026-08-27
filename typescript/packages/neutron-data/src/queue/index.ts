@@ -7,16 +7,30 @@ export interface Job<TPayload = unknown> {
 
 export type JobHandler<TPayload = unknown> = (job: Job<TPayload>) => Promise<void> | void;
 
+export interface DeadLetter<TPayload = unknown> {
+  job: Job<TPayload>;
+  attempts: number;
+  error: unknown;
+}
+
 export interface QueueDriver {
   add<TPayload = unknown>(name: string, payload: TPayload): Promise<Job<TPayload>>;
   process<TPayload = unknown>(name: string, handler: JobHandler<TPayload>): Promise<void>;
 }
+
+const MAX_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 10;
 
 export class InMemoryQueueDriver implements QueueDriver {
   private idCounter = 0;
   private handlers = new Map<string, JobHandler<any>>();
   private jobs: Job<any>[] = [];
   private draining = false;
+  private deadLettersInternal: DeadLetter<any>[] = [];
+
+  get deadLetters(): DeadLetter<any>[] {
+    return [...this.deadLettersInternal];
+  }
 
   async add<TPayload = unknown>(name: string, payload: TPayload): Promise<Job<TPayload>> {
     const job: Job<TPayload> = {
@@ -52,10 +66,28 @@ export class InMemoryQueueDriver implements QueueDriver {
           continue;
         }
         this.jobs.splice(i, 1);
-        await handler(job);
+        await this.runWithRetries(job, handler);
       }
     } finally {
       this.draining = false;
+    }
+  }
+
+  private async runWithRetries(
+    job: Job<any>,
+    handler: JobHandler<any>
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await handler(job);
+        return;
+      } catch (error) {
+        if (attempt === MAX_ATTEMPTS) {
+          this.deadLettersInternal.push({ job, attempts: attempt, error });
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS));
+      }
     }
   }
 }

@@ -1,4 +1,4 @@
-import { escapeHtml, escapeXml } from "./escape.js";
+import { escapeHtml, escapeXml, nonceAttr } from "./escape.js";
 
 export interface HeadScript {
   /** Inline JavaScript content. Must not contain </script>. */
@@ -498,17 +498,6 @@ function applyTitleTemplate(title: string, template: string | null | undefined):
     return title;
   }
   return template.replace(/%s/g, title);
-}
-
-/**
- * Render a CSP `nonce` attribute, only for a syntactically safe nonce
- * (base64/base64url charset) so it can never inject extra attributes.
- */
-function nonceAttr(nonce?: string): string {
-  if (!nonce || !/^[A-Za-z0-9+/_=-]+$/.test(nonce)) {
-    return "";
-  }
-  return ` nonce="${nonce}"`;
 }
 
 function renderHeadScripts(

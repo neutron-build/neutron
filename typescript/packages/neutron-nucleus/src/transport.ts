@@ -43,6 +43,18 @@ export interface MobileTransportConfig extends TransportConfig {
   maxQueueSize?: number;
 }
 
+/**
+ * Configuration for the PostgreSQL wire transport. `timeout` is honored via
+ * the pool's native statement/query/connection timeouts; `headers` is
+ * rejected at construction — see `PgTransport`.
+ */
+export interface PgTransportConfig {
+  /** Not supported: the PostgreSQL wire protocol has no HTTP headers. */
+  headers?: Record<string, string>;
+  /** Request timeout in milliseconds, applied to the pool's native timeouts. */
+  timeout?: number;
+}
+
 // ---------------------------------------------------------------------------
 // URL sanitization
 // ---------------------------------------------------------------------------
@@ -621,7 +633,13 @@ class EmbeddedTransactionTransport implements TransactionTransport {
 // use HttpTransport/MobileTransport never pull it. Typed loosely because it
 // is not a compile-time dependency.
 type PgModule = {
-  Pool: new (cfg: { connectionString: string; max?: number }) => PgPool;
+  Pool: new (cfg: {
+    connectionString: string;
+    max?: number;
+    statement_timeout?: number;
+    query_timeout?: number;
+    connectionTimeoutMillis?: number;
+  }) => PgPool;
   types?: { setTypeParser(oid: number, parser: (value: string) => unknown): void };
 };
 interface PgPool {
@@ -701,20 +719,42 @@ const ISOLATION_SQL: Record<IsolationLevel, string> = {
  */
 export class PgTransport implements Transport {
   private readonly url: string;
+  private readonly timeout: number | undefined;
   // The memoized promise is assigned synchronously, before any await: the
   // old check-then-`await`-then-assign let two concurrent first queries each
   // construct a Pool, and the loser's connections were never `.end()`ed.
   private poolPromise: Promise<PgPool> | null = null;
 
-  constructor(url: string) {
+  constructor(url: string, config: PgTransportConfig = {}) {
+    // Honors-or-rejects-at-construction: silently dropping config the caller
+    // believes is applied is the bug this prevents. The wire protocol has no
+    // headers to carry them on — auth belongs in the connection URL.
+    if (config.headers != null) {
+      throw new NucleusError(
+        'PG_HEADERS_UNSUPPORTED',
+        'PgTransport does not accept headers: the PostgreSQL wire protocol ' +
+          'has no HTTP headers. Pass auth via the connection URL instead.',
+      );
+    }
     this.url = url;
+    this.timeout = config.timeout;
   }
 
   private getPool(): Promise<PgPool> {
     if (!this.poolPromise) {
       const creation = loadPg().then((pg) => {
         configureTypeParsers(pg);
-        const pool = new pg.Pool({ connectionString: this.url, max: 8 });
+        // `timeout` maps onto pg's native knobs: statement_timeout and
+        // query_timeout per client, connectionTimeoutMillis for pool checkout.
+        const pool = new pg.Pool({
+          connectionString: this.url,
+          max: 8,
+          ...(this.timeout != null && {
+            statement_timeout: this.timeout,
+            query_timeout: this.timeout,
+            connectionTimeoutMillis: this.timeout,
+          }),
+        });
         // An idle pooled connection dying (engine restart / accessory upgrade)
         // emits 'error' on the pool; unhandled, that CRASHES the process. This
         // handler absorbs the idle death so the pool can mint fresh connections;
@@ -887,7 +927,7 @@ export function createTransport(config: MobileTransportConfig): Transport {
   // to a deployment that fronts Nucleus with such a gateway.
   const isNode = typeof process !== 'undefined' && !!process.versions?.node;
   if (isNode && /^postgres(ql)?:\/\//i.test(config.url)) {
-    return new PgTransport(config.url);
+    return new PgTransport(config.url, { headers: config.headers, timeout: config.timeout });
   }
 
   // Web / http(s) gateway — standard HTTP.

@@ -154,8 +154,35 @@ export function useRevalidator() {
   return { revalidate, state };
 }
 
-export function useSubmit() {
-  return useCallback(
+export interface SubmitOptions {
+  action?: RouteHref;
+  method?: string;
+}
+
+/** Why a submit failed: `status` is the HTTP status, or 0 for a network
+ *  failure (fetch threw before a response existed). */
+export interface SubmitError {
+  status: number;
+  message: string;
+}
+
+function submitErrorFromResponse(response: Response): SubmitError {
+  return {
+    status: response.status,
+    message: response.statusText || `request failed with status ${response.status}`,
+  };
+}
+
+export function useSubmit(): {
+  submit: (
+    form: HTMLFormElement | FormData,
+    options?: SubmitOptions
+  ) => Promise<void>;
+  error: SubmitError | null;
+} {
+  const [error, setError] = useState<SubmitError | null>(null);
+
+  const submit = useCallback(
     async (
       form: HTMLFormElement | FormData,
       options: { action?: string; method?: string } = {}
@@ -171,10 +198,12 @@ export function useSubmit() {
         });
         const queryString = query.toString();
         const destination = queryString ? `${action}?${queryString}` : action;
+        setError(null);
         navigate(destination);
         return;
       }
 
+      setError(null);
       setNavigationState({
         state: "submitting",
         formData,
@@ -206,6 +235,7 @@ export function useSubmit() {
         }
 
         if (!response.ok) {
+          setError(submitErrorFromResponse(response));
           return;
         }
 
@@ -245,12 +275,22 @@ export function useSubmit() {
         } else {
           window.dispatchEvent(new PopStateEvent("popstate"));
         }
+      } catch (error) {
+        // Network-level failure (no response): record it as status 0 and
+        // keep rethrowing — callers awaiting the submit keep their contract.
+        setError({
+          status: 0,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
       } finally {
         setNavigationState({ state: "idle" });
       }
     },
     []
   );
+
+  return { submit, error };
 }
 
 export interface SubmitOptions {

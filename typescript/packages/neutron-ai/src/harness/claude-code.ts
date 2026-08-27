@@ -2,13 +2,9 @@ import { spawn as nodeSpawn } from "node:child_process";
 
 import { AIError, problemFromStatus } from "../errors.js";
 import { deferred } from "../internal/deferred.js";
+import { abandonmentSettler, drainEvents } from "../internal/run-to-promise.js";
 import type { Usage } from "../types.js";
 import type { AgentEvent, AgentHarness, AgentResult, AgentResultStatus, AgentRun, AgentRunOptions } from "./index.js";
-
-/** Rejection reason for the result promise when the consumer abandons the run. */
-const ABANDONED_RUN = new AIError(
-  problemFromStatus(400, "The run was abandoned before completion; the result promise cannot be fulfilled."),
-);
 
 /** Minimal process surface the adapter needs; the test seam. */
 export interface SpawnedProcess {
@@ -84,6 +80,12 @@ class ClaudeCodeRun implements AgentRun {
   #stopped = false;
   #child: SpawnedProcess | null = null;
   #resultDeferred = deferred<AgentResult>();
+  #settleAbandoned = abandonmentSettler(
+    [this.#resultDeferred],
+    // Killing the child is a no-op once it exited; on abandonment it is the
+    // only thing that stops the subprocess from leaking.
+    () => this.#child?.kill(),
+  );
 
   constructor(settings: ClaudeCodeSettings, options: AgentRunOptions) {
     this.#settings = settings;
@@ -235,11 +237,10 @@ class ClaudeCodeRun implements AgentRun {
     } finally {
       // A consumer that breaks out of `events` abandons the generator at a
       // yield: neither the resolve block nor the catch above runs, the result
-      // deferred stays pending forever, and the subprocess leaks. Kill the
-      // child (a no-op once it exited) and settle the deferred here; on the
-      // normal and error paths it is already settled.
-      this.#child?.kill();
-      this.#resultDeferred.reject(ABANDONED_RUN);
+      // deferred stays pending forever, and the subprocess leaks. The shared
+      // settler kills the child (a no-op once it exited) and settles the
+      // deferred; on the normal and error paths it is already settled.
+      this.#settleAbandoned();
     }
   }
 
@@ -270,12 +271,7 @@ class ClaudeCodeRun implements AgentRun {
 
   #drain(): void {
     if (this.#consumed) return;
-    const events = this.#start();
-    void (async () => {
-      for await (const _event of events) {
-        // results surface via the promise
-      }
-    })().catch(() => {});
+    drainEvents(this.#start());
   }
 
   get events(): AsyncIterable<AgentEvent> {

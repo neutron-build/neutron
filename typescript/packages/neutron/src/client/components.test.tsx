@@ -139,3 +139,66 @@ describe("NavLink", () => {
     expect(anchor?.className).toContain("active");
   });
 });
+
+describe("Form error state", () => {
+  function errorResponse(status: number): Response {
+    return {
+      ok: false,
+      status,
+      statusText: "Server Error",
+      redirected: false,
+      url: "http://localhost/unused",
+      headers: new Headers(),
+      json: async () => ({}),
+    } as Response;
+  }
+
+  it("reports a failed submission through onError and data-submit-error", async () => {
+    window.history.replaceState(null, "", "/form");
+    const fetchMock = vi.fn(async () => errorResponse(500));
+    vi.stubGlobal("fetch", fetchMock);
+    const onError = vi.fn();
+
+    mount(h(Form, { method: "post", onError }, h("input", { name: "t", value: "x" })));
+    const form = document.querySelector("form") as HTMLFormElement;
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    await flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect((onError.mock.calls[0][0] as { status: number }).status).toBe(500);
+    expect(form.getAttribute("data-submit-error")).toBe("500");
+  });
+
+  it("function children receive the live error state", async () => {
+    window.history.replaceState(null, "", "/form");
+    let fail = true;
+    const fetchMock = vi.fn(async () =>
+      fail ? errorResponse(422) : jsonResponse({ "route:/form": { ok: true } })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mount(
+      h(
+        Form,
+        { method: "post" },
+        (state: { submitting: boolean; error: { status: number } | null }) =>
+          h("p", { class: "state" }, state.error ? `err ${state.error.status}` : "ok")
+      )
+    );
+    const form = document.querySelector("form") as HTMLFormElement;
+
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    await flush();
+    expect(document.querySelector(".state")?.textContent).toBe("err 422");
+
+    fail = false;
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    await flush();
+    expect(document.querySelector(".state")?.textContent).toBe("ok");
+    expect(form.hasAttribute("data-submit-error")).toBe(false);
+  });
+});

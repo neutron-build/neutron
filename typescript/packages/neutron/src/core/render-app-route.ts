@@ -10,7 +10,7 @@
 import { h } from "preact";
 import type * as preact from "preact";
 
-import { escapeHtml } from "./escape.js";
+import { escapeHtml, nonceAttr } from "./escape.js";
 import {
   renderSpeculationRules,
   renderStaticLinkSpeculationRules,
@@ -658,13 +658,6 @@ function stableEncodeParams(params: Record<string, string>): string {
   return JSON.stringify(sortedEntries);
 }
 
-function nonceAttr(nonce?: string): string {
-  if (!nonce || !/^[A-Za-z0-9+/_=-]+$/.test(nonce)) {
-    return "";
-  }
-  return ` nonce="${nonce}"`;
-}
-
 export async function renderAppRoute(
   request: Request,
   match: RouteMatch,
@@ -999,8 +992,9 @@ export async function renderAppRoute(
     });
 
     const pathname = new URL(request.url).pathname;
-    // Carry the CSP nonce (set by createCspNonceMiddleware) onto head-emitted
-    // scripts (JSON-LD, inline headScripts) so a nonce-based CSP admits them.
+    // Carry the CSP nonce (set by app middleware on `context.cspNonce`)
+    // onto head-emitted scripts (JSON-LD, inline headScripts) so a
+    // nonce-based CSP admits them.
     const cspNonce =
       typeof (context as { cspNonce?: unknown }).cspNonce === "string"
         ? ((context as { cspNonce?: unknown }).cspNonce as string)
@@ -1084,8 +1078,8 @@ export async function renderAppRoute(
         headers: routeHeaders,
         // Outermost layout/route — the most likely author of a stray <html>.
         sourceFile: allRoutes[0]?.file,
-        // Set by createCspNonceMiddleware (if used) before next(); carried onto
-        // the framework's inline scripts so a nonce-based CSP admits them.
+        // Set by app middleware on `context.cspNonce` before next(); carried
+        // onto the framework's inline scripts so a nonce-based CSP admits them.
         nonce:
           typeof (context as { cspNonce?: unknown }).cspNonce === "string"
             ? ((context as { cspNonce?: unknown }).cspNonce as string)

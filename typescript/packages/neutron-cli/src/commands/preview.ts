@@ -11,8 +11,14 @@ import {
   resolveRuntime,
 } from "@neutron-build/core";
 import { startServer } from "@neutron-build/core/server";
-import type { NeutronConfig } from "@neutron-build/core";
-import { loadConfigFromFile, loadEnv } from "vite";
+import { loadEnv } from "vite";
+import { loadNeutronConfig } from "../lib/config.js";
+import {
+  isLoopbackHost,
+  parsePreviewArgs,
+  resolveNetworkHost,
+  resolvePreviewHost,
+} from "../lib/preview-host.js";
 
 export async function preview(): Promise<void> {
   const cwd = process.cwd();
@@ -26,6 +32,8 @@ export async function preview(): Promise<void> {
   const distDir = path.resolve(cwd, "dist");
   const routesDir = path.resolve(cwd, "src/routes");
   const port = neutronConfig.server?.port || 4173;
+  const { host: cliHost } = parsePreviewArgs(process.argv.slice(3));
+  const host = resolvePreviewHost(cliHost, neutronConfig.server?.host);
   const compiledRouteRules = compileRouteRules(neutronConfig.routes);
 
   if (!fs.existsSync(distDir)) {
@@ -52,7 +60,7 @@ export async function preview(): Promise<void> {
       rootDir: cwd,
       distDir: "dist",
       routesDir: "src/routes",
-      host: neutronConfig.server?.host || "0.0.0.0",
+      host,
       port,
     });
     return;
@@ -161,9 +169,18 @@ export async function preview(): Promise<void> {
     }
   });
 
-  server.listen(port, "0.0.0.0", () => {
+  server.listen(port, host, () => {
     console.log(`\n  Preview server running:\n`);
-    console.log(`  Local:   http://localhost:${port}\n`);
+    if (isLoopbackHost(host)) {
+      console.log(`  Local:   http://localhost:${port}\n`);
+    } else {
+      const networkHost = resolveNetworkHost(host);
+      if (networkHost) {
+        console.log(`  Network: http://${networkHost}:${port}\n`);
+      } else {
+        console.log(`  Local:   http://localhost:${port}\n`);
+      }
+    }
     console.log(`  Press Ctrl+C to stop\n`);
   });
 
@@ -187,33 +204,6 @@ function detectAppRoutes(routesDir: string): boolean {
 
   const routes = discoverRoutes({ routesDir });
   return routes.some((route) => !route.file.includes("_layout") && route.config.mode === "app");
-}
-
-async function loadNeutronConfig(cwd: string): Promise<NeutronConfig> {
-  const candidates = [
-    "neutron.config.ts",
-    "neutron.config.js",
-    "neutron.config.mjs",
-    "neutron.config.cjs",
-  ];
-
-  for (const file of candidates) {
-    const fullPath = path.resolve(cwd, file);
-    if (!fs.existsSync(fullPath)) {
-      continue;
-    }
-
-    const loaded = await loadConfigFromFile(
-      { command: "serve", mode: "production" },
-      fullPath,
-      cwd
-    );
-    if (loaded?.config) {
-      return loaded.config as NeutronConfig;
-    }
-  }
-
-  return {};
 }
 
 function applyEnv(cwd: string, mode: string): void {

@@ -4,6 +4,7 @@ import { buildAdapterOptions, resolveInitialMessages } from "./call-options.js";
 import { AIError, problemFromStatus } from "./errors.js";
 import { deferred } from "./internal/deferred.js";
 import { backoff, isRetryableError, retryOptionsFrom } from "./internal/retry.js";
+import { abandonmentSettler, drainEvents } from "./internal/run-to-promise.js";
 import {
   ZERO_USAGE,
   addUsage,
@@ -66,11 +67,6 @@ export function streamText(options: StreamTextOptions): StreamTextResult {
   return new StreamTextResultImpl(options, resolveInitialMessages(options), maxSteps);
 }
 
-/** Rejection reason for result promises when the consumer abandons the stream. */
-const ABANDONED_STREAM = new AIError(
-  problemFromStatus(400, "The stream was abandoned before completion; result promises cannot be fulfilled."),
-);
-
 class StreamTextResultImpl implements StreamTextResult {
   #options: StreamTextOptions;
   #messages: Message[];
@@ -84,6 +80,16 @@ class StreamTextResultImpl implements StreamTextResult {
   #stepsDeferred = deferred<StepResult[]>();
   #messagesDeferred = deferred<Message[]>();
   #approvalsDeferred = deferred<ToolApprovalRequest[]>();
+  #settleAbandoned = abandonmentSettler([
+    this.#textDeferred,
+    this.#toolCallsDeferred,
+    this.#toolResultsDeferred,
+    this.#finishDeferred,
+    this.#usageDeferred,
+    this.#stepsDeferred,
+    this.#messagesDeferred,
+    this.#approvalsDeferred,
+  ]);
 
   constructor(options: StreamTextOptions, messages: Message[], maxSteps: number) {
     this.#options = options;
@@ -259,29 +265,15 @@ class StreamTextResultImpl implements StreamTextResult {
     } finally {
       // A consumer that breaks out of the stream abandons the generator at a
       // yield: neither the resolve block nor the catch above runs, and every
-      // result deferred stays pending forever — `await result.text` hung with
-      // no error and no timeout. Settle them here; on the normal and error
-      // paths the deferreds are already settled and rejecting again is a
-      // no-op.
-      this.#textDeferred.reject(ABANDONED_STREAM);
-      this.#toolCallsDeferred.reject(ABANDONED_STREAM);
-      this.#toolResultsDeferred.reject(ABANDONED_STREAM);
-      this.#finishDeferred.reject(ABANDONED_STREAM);
-      this.#usageDeferred.reject(ABANDONED_STREAM);
-      this.#stepsDeferred.reject(ABANDONED_STREAM);
-      this.#messagesDeferred.reject(ABANDONED_STREAM);
-      this.#approvalsDeferred.reject(ABANDONED_STREAM);
+      // result deferred stays pending forever. The shared settler rejects
+      // them all (a no-op when already settled).
+      this.#settleAbandoned();
     }
   }
 
   #drain(): void {
     if (this.#consumed) return;
-    const parts = this.#start();
-    void (async () => {
-      for await (const _part of parts) {
-        // accumulate only; results surface via the promises
-      }
-    })().catch(() => {});
+    drainEvents(this.#start());
   }
 
   get fullStream(): AsyncIterable<StreamPart> {

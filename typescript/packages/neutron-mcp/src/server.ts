@@ -140,6 +140,113 @@ function errorResult(message: string): ToolResult {
   return { content: textContent(message), isError: true };
 }
 
+function matchesType(type: string, value: unknown): boolean {
+  switch (type) {
+    case "object":
+      return typeof value === "object" && value !== null && !Array.isArray(value);
+    case "array":
+      return Array.isArray(value);
+    case "string":
+      return typeof value === "string";
+    case "boolean":
+      return typeof value === "boolean";
+    case "null":
+      return value === null;
+    case "number":
+      return typeof value === "number" && !Number.isNaN(value);
+    case "integer":
+      return typeof value === "number" && Number.isInteger(value);
+    default:
+      return true; // unknown type words do not constrain
+  }
+}
+
+/**
+ * First violation of a JSON-Schema subset (type, required, properties,
+ * enum, items, additionalProperties: false, and the usual bounds), or null
+ * when the value conforms. Mirrors how @neutron-build/ai's tool loop
+ * validates model-given inputs before execute — name the first problem,
+ * `path: message` — without taking a dependency on that package.
+ */
+function firstArgumentViolation(
+  schema: Record<string, unknown>,
+  value: unknown,
+  path: string,
+): string | null {
+  const type = schema.type;
+  if (typeof type === "string" && !matchesType(type, value)) {
+    return `${path}: expected ${type}`;
+  }
+
+  const options = schema.enum;
+  if (Array.isArray(options) && !options.some((option) => option === value)) {
+    return `${path}: must be one of ${options.map((option) => JSON.stringify(option)).join(", ")}`;
+  }
+
+  if (typeof value === "string") {
+    if (typeof schema.minLength === "number" && value.length < schema.minLength) {
+      return `${path}: shorter than ${schema.minLength} characters`;
+    }
+    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) {
+      return `${path}: longer than ${schema.maxLength} characters`;
+    }
+  }
+
+  if (typeof value === "number") {
+    if (typeof schema.minimum === "number" && value < schema.minimum) {
+      return `${path}: must be >= ${schema.minimum}`;
+    }
+    if (typeof schema.maximum === "number" && value > schema.maximum) {
+      return `${path}: must be <= ${schema.maximum}`;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) {
+      return `${path}: needs at least ${schema.minItems} items`;
+    }
+    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) {
+      return `${path}: allows at most ${schema.maxItems} items`;
+    }
+    const items = schema.items;
+    if (typeof items === "object" && items !== null && !Array.isArray(items)) {
+      for (let i = 0; i < value.length; i++) {
+        const violation = firstArgumentViolation(items as Record<string, unknown>, value[i], `${path}[${i}]`);
+        if (violation !== null) return violation;
+      }
+    }
+  }
+
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (Array.isArray(schema.required)) {
+      for (const key of schema.required) {
+        if (typeof key === "string" && !(key in record)) {
+          return `${path}: missing required property "${key}"`;
+        }
+      }
+    }
+    const properties = schema.properties;
+    if (typeof properties === "object" && properties !== null && !Array.isArray(properties)) {
+      for (const [key, child] of Object.entries(properties)) {
+        if (key in record && typeof child === "object" && child !== null) {
+          const violation = firstArgumentViolation(child as Record<string, unknown>, record[key], `${path}.${key}`);
+          if (violation !== null) return violation;
+        }
+      }
+      if (schema.additionalProperties === false) {
+        for (const key of Object.keys(record)) {
+          if (!(key in properties)) {
+            return `${path}: unexpected property "${key}"`;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Read a stream to text, stopping at `limit` bytes. The bound must bound the
  * read itself: `await request.text()` buffers the whole body first, so a check
@@ -284,6 +391,22 @@ export function createMcpServer(options: McpServerOptions): McpServer {
               id,
               result: errorResult(`"${tool.name}" is not permitted for "${principal.name}"`),
             });
+          }
+
+          // Arguments are validated against the advertised schema before they
+          // reach execute — the same rule the AI SDK's tool loop applies to
+          // model-given inputs. No advertised schema means no validation, the
+          // pre-existing contract.
+          if (tool.inputSchema !== undefined) {
+            const violation = firstArgumentViolation(tool.inputSchema, params.arguments ?? {}, "arguments");
+            if (violation !== null) {
+              log?.warn("neutron-mcp: invalid arguments", { tool: tool.name, principal: principal.name });
+              return json({
+                jsonrpc: "2.0",
+                id,
+                result: errorResult(`Invalid arguments for "${tool.name}": ${violation}`),
+              });
+            }
           }
 
           log?.info("neutron-mcp: tool call", {

@@ -10,7 +10,6 @@ function route(overrides: Partial<Route> & { path: string }): Route {
   return {
     id: `route:${overrides.path}`,
     file: `/src/routes${overrides.path}.tsx`,
-    pattern: /^$/,
     params: [],
     config: { mode: "app" },
     hasLoader: false,

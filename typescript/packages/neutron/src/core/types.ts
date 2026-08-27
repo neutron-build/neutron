@@ -16,7 +16,6 @@ export interface Route {
   id: string;
   path: string;
   file: string;
-  pattern: RegExp;
   params: string[];
   config: RouteConfig;
   /**

@@ -195,7 +195,6 @@ function createRoute(
       id: `route:${relativePath}`,
       path: routePath,
       file: filePath,
-      pattern: new RegExp(`^${routePath === "/" ? "/" : routePath}$`),
       params: [],
       config,
       hasLoader: derived.hasLoader,
@@ -215,7 +214,6 @@ function createRoute(
       id: `route:${relativePath}`,
       path: routePath,
       file: filePath,
-      pattern: new RegExp(`^${routePath === "/" ? "/" : routePath}$`),
       params: [],
       config,
       hasLoader: derived.hasLoader,
@@ -228,13 +226,12 @@ function createRoute(
   }
 
   const routePath = fileToRoutePath(name, parentPath);
-  const { pattern, params } = pathToRegExp(routePath);
+  const { params } = pathToRegExp(routePath);
 
   return {
     id: `route:${relativePath}`,
     path: routePath,
     file: filePath,
-    pattern,
     params,
     config,
     hasLoader: derived.hasLoader,

@@ -55,6 +55,7 @@ export {
   type QueueDriver,
   type Job,
   type JobHandler,
+  type DeadLetter,
 } from "./queue/index.js";
 export {
   BullMqQueueDriver,

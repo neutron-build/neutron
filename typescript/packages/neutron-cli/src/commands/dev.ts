@@ -13,13 +13,13 @@ import {
   resolveRuntimeNoExternal,
   resolvePreactSsr,
   vitePreactAliases,
-  type NeutronConfig,
 } from "@neutron-build/core";
+import { loadNeutronConfig } from "../lib/config.js";
 
 export async function dev(): Promise<void> {
   const cwd = process.cwd();
   const routesDir = path.resolve(cwd, "src/routes");
-  const neutronConfig = await loadNeutronConfig(cwd);
+  const neutronConfig = await loadNeutronConfig(cwd, { mode: "development" });
   const runtime = resolveRuntime(neutronConfig);
   const runtimeAliases = resolveRuntimeAliases(runtime);
   const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
@@ -148,31 +148,4 @@ export async function dev(): Promise<void> {
 
   Press Ctrl+C to stop
 `);
-}
-
-async function loadNeutronConfig(cwd: string): Promise<NeutronConfig> {
-  const candidates = [
-    "neutron.config.ts",
-    "neutron.config.js",
-    "neutron.config.mjs",
-    "neutron.config.cjs",
-  ];
-
-  for (const file of candidates) {
-    const fullPath = path.resolve(cwd, file);
-    if (!fs.existsSync(fullPath)) {
-      continue;
-    }
-
-    const loaded = await loadConfigFromFile(
-      { command: "serve", mode: "development" },
-      fullPath,
-      cwd
-    );
-    if (loaded?.config) {
-      return loaded.config as NeutronConfig;
-    }
-  }
-
-  return {};
 }

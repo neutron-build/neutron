@@ -119,6 +119,41 @@ test("scope is enforced on the call, not only on the listing", async () => {
   assert.equal(calls(), 0, "the refused tool must not have run");
 });
 
+test("tools/call validates arguments against the advertised inputSchema", async () => {
+  const { client, calls } = fixture({ name: "owner", scopes: ["destroy"] });
+
+  await assert.rejects(
+    () => client.callTool("read_thing", { id: 42 }),
+    (err: unknown) => {
+      assert.ok(isToolError(err), "invalid arguments are a tool error, not a transport one");
+      assert.match((err as Error).message, /id/, "the violation must name the offending argument");
+      return true;
+    },
+  );
+  await assert.rejects(() => client.callTool("read_thing"), /id/); // missing required property
+  assert.equal(calls(), 0, "an invalid call must not reach execute");
+
+  assert.equal(await client.callTool("read_thing", { id: "x" }), "read by owner", "valid arguments pass through");
+});
+
+test("a tool without an advertised schema skips argument validation", async () => {
+  // Back-compat: schema-less tools advertise objectSchema() in tools/list but
+  // tools/call must not start rejecting callers that were fine before.
+  const server = createMcpServer({
+    name: "loose",
+    version: "0",
+    authorize: () => ({ name: "x" }),
+    tools: [{ name: "echo_args", readOnly: true, execute: (args) => JSON.stringify(args) }],
+  });
+  const client = createMcpClient({
+    endpoint: "http://mcp.test/",
+    fetch: ((input: RequestInfo | URL, init?: RequestInit) =>
+      server.handler(new Request(String(input), init))) as typeof globalThis.fetch,
+  });
+
+  assert.equal(await client.callTool("echo_args", { anything: "goes" }), JSON.stringify({ anything: "goes" }));
+});
+
 test("a read-only principal cannot mutate even when scoped for it", async () => {
   const { client, calls } = fixture({ name: "readonly", scopes: ["destroy"], readOnly: true });
   await assert.rejects(() => client.callTool("destroy_thing"), isToolError);

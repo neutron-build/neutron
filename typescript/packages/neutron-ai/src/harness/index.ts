@@ -1,6 +1,7 @@
 import { AIError, problemFromStatus } from "../errors.js";
 import type { ProblemDetails } from "../errors.js";
 import { deferred } from "../internal/deferred.js";
+import { abandonmentSettler, drainEvents } from "../internal/run-to-promise.js";
 import type { ModelAdapter } from "../adapter.js";
 import { streamText } from "../stream-text.js";
 import type { StreamTextOptions } from "../stream-text.js";
@@ -14,11 +15,6 @@ import type {
 
 export { claudeCode } from "./claude-code.js";
 export type { ClaudeCodeSettings, SpawnedProcess, SpawnFn } from "./claude-code.js";
-
-/** Rejection reason for the result promise when the consumer abandons the run. */
-const ABANDONED_RUN = new AIError(
-  problemFromStatus(400, "The run was abandoned before completion; the result promise cannot be fulfilled."),
-);
 
 /**
  * The agent-agnostic harness boundary: one interface that an in-process
@@ -85,15 +81,57 @@ export interface LocalAgentOptions {
   system?: string;
   /** Model-call budget per run. */
   maxSteps?: number;
+  /** Session history capacity (default 64); the least-recently-used session is evicted beyond it. */
+  sessionCapacity?: number;
+}
+
+/** Default cap on retained sessions — see LocalAgentOptions.sessionCapacity. */
+const DEFAULT_SESSION_CAPACITY = 64;
+
+/**
+ * Insertion-ordered session store with a capacity: reads and writes refresh
+ * recency, and an insert at capacity evicts the least-recently-used entry.
+ * Without a bound, a long-lived harness accumulated every conversation it
+ * ever ran.
+ */
+class BoundedSessions {
+  #entries = new Map<string, Message[]>();
+  #capacity: number;
+
+  constructor(capacity: number) {
+    this.#capacity = capacity;
+  }
+
+  get(sessionId: string): Message[] | undefined {
+    const messages = this.#entries.get(sessionId);
+    if (messages === undefined) return undefined;
+    this.#entries.delete(sessionId);
+    this.#entries.set(sessionId, messages);
+    return messages;
+  }
+
+  set(sessionId: string, messages: Message[]): void {
+    this.#entries.delete(sessionId);
+    this.#entries.set(sessionId, messages);
+    while (this.#entries.size > this.#capacity) {
+      const oldest = this.#entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.#entries.delete(oldest);
+    }
+  }
 }
 
 /**
  * Reference harness: the SDK's own tool loop behind the AgentHarness
- * interface, with in-memory sessions. Also the executable proof that the
- * interface is agent-agnostic rather than shaped around any one CLI.
+ * interface, with bounded in-memory sessions. Also the executable proof that
+ * the interface is agent-agnostic rather than shaped around any one CLI.
  */
 export function localAgent(options: LocalAgentOptions): AgentHarness {
-  const sessions = new Map<string, Message[]>();
+  const capacity = options.sessionCapacity ?? DEFAULT_SESSION_CAPACITY;
+  if (!Number.isInteger(capacity) || capacity < 1) {
+    throw new AIError(problemFromStatus(400, "`sessionCapacity` must be a positive integer."));
+  }
+  const sessions = new BoundedSessions(capacity);
   return {
     name: "local",
     run(runOptions: AgentRunOptions): AgentRun {
@@ -108,13 +146,19 @@ export function localAgent(options: LocalAgentOptions): AgentHarness {
 class LocalAgentRun implements AgentRun {
   #agent: LocalAgentOptions;
   #options: AgentRunOptions;
-  #sessions: Map<string, Message[]>;
+  #sessions: BoundedSessions;
   #consumed = false;
   #abort = new AbortController();
   #resultDeferred = deferred<AgentResult>();
   #onCallerAbort = () => this.#abort.abort();
+  #settleAbandoned = abandonmentSettler(
+    [this.#resultDeferred],
+    // Every exit path (completion, error, abandonment) drops the caller's
+    // abort listener instead of leaking one per run.
+    () => this.#options.abortSignal?.removeEventListener("abort", this.#onCallerAbort),
+  );
 
-  constructor(agent: LocalAgentOptions, options: AgentRunOptions, sessions: Map<string, Message[]>) {
+  constructor(agent: LocalAgentOptions, options: AgentRunOptions, sessions: BoundedSessions) {
     this.#agent = agent;
     this.#options = options;
     this.#sessions = sessions;
@@ -136,10 +180,7 @@ class LocalAgentRun implements AgentRun {
     try {
       yield* this.#iterateBody();
     } finally {
-      // Every exit path (completion, error, abandonment) lands here: drop
-      // the caller's abort listener instead of leaking one per run.
-      this.#options.abortSignal?.removeEventListener("abort", this.#onCallerAbort);
-      this.#resultDeferred.reject(ABANDONED_RUN);
+      this.#settleAbandoned();
     }
   }
 
@@ -228,12 +269,7 @@ class LocalAgentRun implements AgentRun {
 
   #drain(): void {
     if (this.#consumed) return;
-    const events = this.#start();
-    void (async () => {
-      for await (const _event of events) {
-        // results surface via the promise
-      }
-    })().catch(() => {});
+    drainEvents(this.#start());
   }
 
   get events(): AsyncIterable<AgentEvent> {

@@ -7,7 +7,6 @@ function route(path: string): Route {
     id: `route:${path}`,
     path,
     file: `/tmp/${path.replace(/[/:*]/g, "_")}.tsx`,
-    pattern: /^$/,
     params: [],
     config: { mode: "static" },
     parentId: null,

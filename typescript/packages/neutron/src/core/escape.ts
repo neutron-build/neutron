@@ -24,3 +24,15 @@ export function escapeXml(value: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
 }
+
+/**
+ * Render a CSP `nonce` attribute, only for a syntactically safe nonce
+ * (base64/base64url charset) so it can never inject extra attributes.
+ * Anything else — empty, wrong charset — renders no attribute at all.
+ */
+export function nonceAttr(nonce?: string): string {
+  if (!nonce || !/^[A-Za-z0-9+/_=-]+$/.test(nonce)) {
+    return "";
+  }
+  return ` nonce="${nonce}"`;
+}

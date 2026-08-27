@@ -8,7 +8,7 @@ export {
 // neutron-cli/src/commands/build.ts. See the doc comment in render-static.ts.
 export { renderStatic, renderToString } from "./core/render-static.js";
 export { assertRenderedFragment } from "./core/fragment-guard.js";
-export { redirect, safeRedirect, isSafeRedirect, json, notFound, isResponse, defer, isDeferredData, DeferredData } from "./core/response.js";
+export { redirect, safeRedirect, isSafeRedirect, json, notFound, isResponse } from "./core/response.js";
 export {
   ProblemError,
   isProblemError,
@@ -182,17 +182,6 @@ export {
 export {
   type CorsOptions,
 } from "./server/http-headers.js";
-export {
-  defaultHandle,
-  defaultHandleError,
-  defaultHandleFetch,
-  type HandleHook,
-  type HandleErrorHook,
-  type HandleFetchHook,
-  type GlobalServerHooks,
-  type HookEvent,
-  type ResolveOptions,
-} from "./server/hooks.js";
 export {
   ServerIsland,
   getIslandComponent,

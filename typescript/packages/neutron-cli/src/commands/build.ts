@@ -41,13 +41,14 @@ import { renderToString } from "preact-render-to-string";
 import { h } from "preact";
 import { createRequire } from "node:module";
 import { extractClientEntryScriptSrc } from "../client-entry.js";
+import { loadNeutronConfig } from "../lib/config.js";
 import { isUnsafeResolvedPath, resolvePath } from "./static-paths.js";
 
 export async function build(): Promise<void> {
   const cwd = process.cwd();
   const routesDir = path.resolve(cwd, "src/routes");
   const outputDir = path.resolve(cwd, "dist");
-  const neutronConfig = await loadNeutronConfig(cwd);
+  const neutronConfig = await loadNeutronConfig(cwd, { command: "build" });
   const runtime = resolveRuntime(neutronConfig);
   const runtimeAliases = resolveRuntimeAliases(runtime);
   const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
@@ -1524,32 +1525,4 @@ function relativeImportPath(fromDir: string, filePath: string): string {
 
 function escapeJsString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-async function loadNeutronConfig(cwd: string): Promise<NeutronConfig> {
-  const candidates = [
-    "neutron.config.ts",
-    "neutron.config.js",
-    "neutron.config.mjs",
-    "neutron.config.cjs",
-  ];
-
-  for (const file of candidates) {
-    const fullPath = path.resolve(cwd, file);
-    if (!fs.existsSync(fullPath)) {
-      continue;
-    }
-
-    const loaded = await loadConfigFromFile(
-      { command: "build", mode: "production" },
-      fullPath,
-      cwd
-    );
-
-    if (loaded?.config) {
-      return loaded.config as NeutronConfig;
-    }
-  }
-
-  return {};
 }

@@ -507,7 +507,8 @@ describe("useSubmit", () => {
       ) => Promise<void>;
     } = {};
     function Panel(): VNode<any> {
-      ref.submit = hooks.useSubmit();
+      const { submit } = hooks.useSubmit();
+      ref.submit = submit;
       const nav = hooks.useNavigation();
       return h("p", { class: "nav" }, nav.state);
     }
@@ -700,5 +701,101 @@ describe("useBlocker", () => {
     window.removeEventListener("neutron:navigation-blocked", onBlocked);
     render(null, container);
     await flushEffects();
+  });
+});
+
+describe("useSubmit error state", () => {
+  function mountPanel(): {
+    submit: (
+      form: HTMLFormElement | FormData,
+      options?: hooks.SubmitOptions
+    ) => Promise<void>;
+    error: () => hooks.SubmitError | null;
+    container: HTMLDivElement;
+  } {
+    const ref: {
+      submit?: (
+        form: HTMLFormElement | FormData,
+        options?: hooks.SubmitOptions
+      ) => Promise<void>;
+      error?: hooks.SubmitError | null;
+    } = {};
+    function Panel(): VNode<any> {
+      const { submit, error } = hooks.useSubmit();
+      ref.submit = submit;
+      ref.error = error;
+      return h("p", { class: "err" }, error ? `${error.status}` : "none");
+    }
+    const container = mount(withProviders(h(Panel, null)));
+    return { submit: ref.submit!, error: () => ref.error ?? null, container };
+  }
+
+  function errorResponse(status: number, body: string): Response {
+    return {
+      ok: false,
+      status,
+      statusText: "Server Error",
+      redirected: false,
+      url: "http://localhost/unused",
+      headers: new Headers({ "content-type": "application/json" }),
+      json: async () => body,
+    } as Response;
+  }
+
+  it("a non-ok response is surfaced as an error state, not silence", async () => {
+    window.history.replaceState(null, "", "/form");
+    const fetchMock = vi.fn(async () => errorResponse(500, "boom"));
+    vi.stubGlobal("fetch", fetchMock);
+    const form = makeForm({ title: "hello" });
+
+    const { submit, error, container } = mountPanel();
+    await submit(form);
+    await flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error()).not.toBeNull();
+    expect(error()!.status).toBe(500);
+    expect(container.textContent ?? "").toContain("500");
+  });
+
+  it("a network failure is surfaced as a status-0 error", async () => {
+    window.history.replaceState(null, "", "/form");
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError("network down");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const form = makeForm({ title: "hello" });
+
+    const { submit, error } = mountPanel();
+    // The rejection still propagates to the direct caller; the hook records
+    // it as a status-0 error for everyone rendering off the state.
+    await expect(submit(form)).rejects.toThrow("network down");
+    await flush();
+
+    expect(error()).not.toBeNull();
+    expect(error()!.status).toBe(0);
+    expect(error()!.message).toContain("network down");
+  });
+
+  it("a successful submit clears a previous error", async () => {
+    window.history.replaceState(null, "", "/form");
+    let fail = true;
+    const fetchMock = vi.fn(async () =>
+      fail
+        ? errorResponse(500, "boom")
+        : jsonResponse({ "route:/form": { ok: true } })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const form = makeForm({ title: "hello" });
+
+    const { submit, error } = mountPanel();
+    await submit(form);
+    await flush();
+    expect(error()?.status).toBe(500);
+
+    fail = false;
+    await submit(form);
+    await flush();
+    expect(error()).toBeNull();
   });
 });

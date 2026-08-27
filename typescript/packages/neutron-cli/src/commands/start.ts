@@ -1,8 +1,7 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { createServer, startServer } from "@neutron-build/core/server";
-import { prepareContentCollections, resolveRuntime, type NeutronConfig } from "@neutron-build/core";
-import { loadConfigFromFile, loadEnv } from "vite";
+import { prepareContentCollections, resolveRuntime } from "@neutron-build/core";
+import { loadEnv } from "vite";
+import { loadNeutronConfig } from "../lib/config.js";
 
 export async function start() {
   const cwd = process.cwd();
@@ -44,33 +43,6 @@ export async function start() {
 }
 
 export { createServer };
-
-async function loadNeutronConfig(cwd: string): Promise<NeutronConfig> {
-  const candidates = [
-    "neutron.config.ts",
-    "neutron.config.js",
-    "neutron.config.mjs",
-    "neutron.config.cjs",
-  ];
-
-  for (const file of candidates) {
-    const fullPath = path.resolve(cwd, file);
-    if (!fs.existsSync(fullPath)) {
-      continue;
-    }
-
-    const loaded = await loadConfigFromFile(
-      { command: "serve", mode: "production" },
-      fullPath,
-      cwd
-    );
-    if (loaded?.config) {
-      return loaded.config as NeutronConfig;
-    }
-  }
-
-  return {};
-}
 
 function applyEnv(cwd: string, mode: string): void {
   const env = loadEnv(mode, cwd, "");

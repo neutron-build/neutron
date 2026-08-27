@@ -989,6 +989,108 @@ describe("parseInitArgs", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Preview bind address — imported from source, not mirrored.
+//
+// `neutron preview` must bind loopback by default; the network is an explicit
+// opt-in via --host or server.host in neutron.config. The resolution logic is
+// split into src/lib/preview-host.ts (preview.ts imports vite at load time) so
+// the real implementation is exercised here.
+// ---------------------------------------------------------------------------
+
+import {
+  DEFAULT_PREVIEW_HOST,
+  isLoopbackHost,
+  parsePreviewArgs,
+  resolveNetworkHost,
+  resolvePreviewHost,
+} from "./lib/preview-host.js";
+
+describe("parsePreviewArgs", () => {
+  it("returns no host when no args are provided", () => {
+    const result = parsePreviewArgs([]);
+    assert.equal(result.host, undefined);
+  });
+
+  it("parses --host with space", () => {
+    const result = parsePreviewArgs(["--host", "0.0.0.0"]);
+    assert.equal(result.host, "0.0.0.0");
+  });
+
+  it("parses --host= format", () => {
+    const result = parsePreviewArgs(["--host=192.168.1.10"]);
+    assert.equal(result.host, "192.168.1.10");
+  });
+
+  it("ignores unrelated flags", () => {
+    const result = parsePreviewArgs(["--port", "4173"]);
+    assert.equal(result.host, undefined);
+  });
+});
+
+describe("resolvePreviewHost", () => {
+  it("binds loopback by default (no flag, no config host)", () => {
+    const host = resolvePreviewHost(undefined, undefined);
+    assert.equal(host, "127.0.0.1");
+    assert.equal(isLoopbackHost(host), true);
+  });
+
+  it("defaults to a loopback address", () => {
+    assert.equal(isLoopbackHost(DEFAULT_PREVIEW_HOST), true);
+  });
+
+  it("opts in to a network bind via --host", () => {
+    const host = resolvePreviewHost("0.0.0.0", undefined);
+    assert.equal(host, "0.0.0.0");
+    assert.equal(isLoopbackHost(host), false);
+  });
+
+  it("opts in to a network bind via config server.host", () => {
+    const host = resolvePreviewHost(undefined, "10.0.0.5");
+    assert.equal(host, "10.0.0.5");
+  });
+
+  it("lets --host override config server.host", () => {
+    const host = resolvePreviewHost("192.168.1.10", "10.0.0.5");
+    assert.equal(host, "192.168.1.10");
+  });
+});
+
+describe("isLoopbackHost", () => {
+  it("classifies 127.0.0.1 and the 127.0.0.0/8 range as loopback", () => {
+    assert.equal(isLoopbackHost("127.0.0.1"), true);
+    assert.equal(isLoopbackHost("127.0.0.8"), true);
+  });
+
+  it("classifies localhost and ::1 as loopback", () => {
+    assert.equal(isLoopbackHost("localhost"), true);
+    assert.equal(isLoopbackHost("::1"), true);
+  });
+
+  it("classifies wildcard and LAN addresses as non-loopback", () => {
+    assert.equal(isLoopbackHost("0.0.0.0"), false);
+    assert.equal(isLoopbackHost("::"), false);
+    assert.equal(isLoopbackHost("192.168.1.5"), false);
+  });
+});
+
+describe("resolveNetworkHost", () => {
+  it("returns null (no network URL) when bound to loopback", () => {
+    assert.equal(resolveNetworkHost("127.0.0.1"), null);
+    assert.equal(resolveNetworkHost("localhost"), null);
+  });
+
+  it("returns the bound address itself for an explicit non-loopback host", () => {
+    assert.equal(resolveNetworkHost("10.1.2.3"), "10.1.2.3");
+  });
+
+  it("resolves a LAN address for the wildcard bind", () => {
+    const result = resolveNetworkHost("0.0.0.0");
+    assert.notEqual(result, "0.0.0.0");
+    assert.equal(result === null || isLoopbackHost(result) === false, true);
+  });
+});
+
 function scratchDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "neutron-client-entry-"));
 }
@@ -1066,5 +1168,84 @@ describe("extractClientEntryScriptSrc", () => {
 
     assert.equal(extractClientEntryScriptSrc(dir), "/assets/index-abc123.js");
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared config loader — imported from source.
+//
+// dev/build/start/preview/worker all load neutron.config through this one
+// function. It only imports vite (no build tooling at load time beyond that),
+// so the real implementation is exercised here against fixture config files.
+// ---------------------------------------------------------------------------
+
+import { loadNeutronConfig } from "./lib/config.js";
+
+describe("loadNeutronConfig (shared command loader)", () => {
+  function loaderDir(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "neutron-loader-"));
+  }
+
+  it("returns an empty config when no config file exists", async () => {
+    const dir = loaderDir();
+    try {
+      const config = await loadNeutronConfig(dir);
+      assert.deepEqual(config, {});
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("loads object configs with the fields the commands read", async () => {
+    const dir = loaderDir();
+    fs.writeFileSync(
+      path.join(dir, "neutron.config.mjs"),
+      [
+        "export default {",
+        '  server: { port: 4321, host: "10.0.0.5" },',
+        '  routes: { redirects: [{ source: "/old", destination: "/new" }] },',
+        '  worker: { entry: "jobs.ts" },',
+        "}",
+      ].join("\n")
+    );
+    try {
+      const config = await loadNeutronConfig(dir);
+      assert.equal(config.server?.port, 4321);
+      assert.equal(config.server?.host, "10.0.0.5");
+      assert.equal(config.worker?.entry, "jobs.ts");
+      assert.equal(config.routes?.redirects?.[0]?.source, "/old");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("passes command and mode through to function configs", async () => {
+    const dir = loaderDir();
+    fs.writeFileSync(
+      path.join(dir, "neutron.config.mjs"),
+      'export default ({ command, mode }) => ({ runtime: command + ":" + mode });'
+    );
+    try {
+      const serve = await loadNeutronConfig(dir, { mode: "development" });
+      assert.equal((serve as Record<string, unknown>).runtime, "serve:development");
+      const build = await loadNeutronConfig(dir, { command: "build" });
+      assert.equal((build as Record<string, unknown>).runtime, "build:production");
+      const serveProd = await loadNeutronConfig(dir);
+      assert.equal((serveProd as Record<string, unknown>).runtime, "serve:production");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers .ts over the other config candidates", async () => {
+    const dir = loaderDir();
+    fs.writeFileSync(path.join(dir, "neutron.config.mjs"), "export default { adapter: 'netlify' };");
+    fs.writeFileSync(path.join(dir, "neutron.config.ts"), "export default { adapter: 'vercel' };");
+    try {
+      const config = await loadNeutronConfig(dir);
+      assert.equal(config.adapter, "vercel");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

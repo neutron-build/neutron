@@ -12,14 +12,35 @@ import { runTurn } from "./runtime.js";
  * any Neutron mode:"api" route. Other surfaces (Slack, Discord, ...) are
  * later channels/ adapters behind the same shape — deliberately absent
  * from v1 per the platform plan (Chat SDK territory).
+ *
+ * An optional `auth` hook gates the call before the body is read. Without
+ * one, an exec-backed mount (any executor at all) refuses to run: body-
+ * supplied toolApprovals self-approve, so a bare mount would let anyone
+ * who can POST drive the executor. `allowUnauthenticated: true` opts out
+ * explicitly for local development.
  */
 export function createAgentHandler(options: {
   agent: LoadedAgent;
   executor?: AgentExecutor;
+  /** Return a Response to refuse the call with it, null to continue. Runs before the body is read. */
+  auth?: (request: Request) => Promise<Response | null>;
+  /** Explicit opt-out of the exec-without-auth refusal, for local development. */
+  allowUnauthenticated?: boolean;
 }): (request: Request) => Promise<Response> {
   return async (request: Request): Promise<Response> => {
     if (request.method !== "POST") {
       return problemResponse(problemFromStatus(400, "Use POST with { input, messages?, toolApprovals? }."));
+    }
+    if (options.auth !== undefined) {
+      const refusal = await options.auth(request);
+      if (refusal !== null) return refusal;
+    } else if (options.executor !== undefined && options.allowUnauthenticated !== true) {
+      return problemResponse(
+        problemFromStatus(
+          500,
+          "Refusing to serve an exec-backed agent without authentication: pass an `auth` hook, or set `allowUnauthenticated: true` for local development.",
+        ),
+      );
     }
     let body: { input?: string; messages?: Message[]; toolApprovals?: ToolApprovalDecision[] };
     try {
