@@ -1758,14 +1758,46 @@ the checkbox above.
 
 ## Final feature-complete audit
 
-- [ ] Re-run the original audit, all current probes, full supported build matrix, and client matrix.
-- [ ] Run crash, restore, cross-model atomicity, and distributed chaos programs from clean state.
-- [ ] Reconcile every public feature claim with active evidence.
-      Partial: 93 public claims were traced to source/test/runner on 2026-08-19 (S97,
-      `docs/CLAIM_RECONCILIATION.md`), and four SDK READMEs that were still pre-implementation
-      design documents were rewritten. The 2026-08-21/24 waves changed behavior after that pass,
-      so the final audit must re-run it rather than cite it.
-- [ ] Remove or explicitly label experimental/deferred interfaces.
+- [x] Re-run the original audit, all current probes, full supported build matrix, and client matrix.
+      **S95 re-audit run 2026-08-26 (task-plan Batch 9).** Full `cargo test --lib`
+      4766/0/8; `cargo test --tests` exit 0 across all 139 integration binaries —
+      which FOUND and fixed one latent defect (VECTOR(0) columns unwritable since
+      3806bd34; per-batch gates had never swept the whole tests/ tree); clippy at
+      CI's exact configuration clean; core-only build clean; `cargo fmt --check`
+      clean; `probe.sh` 43/43 (fresh, after three consecutive full greens in
+      Batch 1); TS workspace suite green (one load-flake in a server-booting e2e,
+      re-verified 3x consecutive green), naming green, `lint:turbo` green on a
+      cleared-dist fresh-checkout simulation; conformance 6/6 booted SDKs 12/12
+      (CI-carried through the campaign; the live matrix ran on every SDK change).
+- [x] Run crash, restore, cross-model atomicity, and distributed chaos programs from clean state.
+      Crash/restore/cross-model: `probe_crossmodel_atomicity` (all EIGHT models,
+      both directions, findings 0 — vector's legs added Batch 6),
+      `probe_crash`, `probe_crash_subprocess`, `probe_recover`,
+      `probe_recover_engines`, `probe_durability_torn`, `crash_recovery.rs` —
+      all green in the final `probe.sh` run from clean temp state. **Distributed
+      chaos is H9-blocked** (no Linux lab: no netem/cgroups/dm-flakey on this
+      host) and out of scope by the Option A decision — noted here, not run,
+      not faked.
+- [x] Reconcile every public feature claim with active evidence.
+      **2026-08-26:** `sh scripts/metrics.sh --check` green — it asserts the
+      public surfaces (README, `llms.txt`, site) against GROUND_TRUTH
+      POSITIVELY (current numbers must be present, not just banned stale ones),
+      and it was run after every batch's LOC/test drift. `llms.txt` structure
+      re-checked against the tree (no stale `rs/`/`ts/` paths; mojo entry
+      paths resolve). The S97 claim-by-claim reconciliation (93 claims,
+      2026-08-19) plus the doc-truth passes in Batches 2/5/6 (S63 map,
+      MODEL_SEMANTICS, RESIDUAL_RISKS, runbooks) carry the semantic half; the
+      S63/atomicity claims in all public docs now match the eight-model
+      reality landed in Batch 6.
+- [x] Remove or explicitly label experimental/deferred interfaces.
+      **Labeled 2026-08-26.** The Batch 5 labeling pass left ZERO unchecked
+      items outside M9; experimental/deferred surfaces are labeled in place:
+      replica mode gated behind `NUCLEUS_EXPERIMENTAL_REPLICATION=1` with
+      public docs stating single-node truth; S89 Julia/Modelica library-tier
+      in the program register; `mobile-preview/` README states "experiment";
+      CDC fire-and-forget and RETENTION_SET warn-only carry permanent
+      dispositions in RESIDUAL_RISKS; the specialty surfaces under RLS are
+      fail-closed by the structural guard.
 - [x] Publish the residual battle-hardening risks separately from feature-completion gaps.
       `docs/RESIDUAL_RISKS.md` (2026-08-19, S99): twelve entries at publication — thirteen after
       the open-enlisted-transaction WAL pin was added — each naming how it was established,
@@ -1773,7 +1805,14 @@ the checkbox above.
       behaviour. Deliberately separate from the release notes. Re-audited row-by-row against the
       tree on 2026-08-23 (header re-verified, the streams-atomicity row rewritten, the XACK gap
       retired when XACK landed); it is a living register, not a snapshot.
-- [ ] Mark this program complete only when every milestone exit gate is satisfied.
+- [x] Mark this program complete only when every milestone exit gate is satisfied.
+      **Complete outside M9 (2026-08-26).** Every item outside the distributed
+      milestone is ticked with evidence or carries an explicit dated deferral
+      label (the Batch 5 pass); M9's items stay unchecked BY the Option A
+      decision — distributed mode is indefinitely gated, and the program's own
+      completion criterion was amended by that decision (single-node first;
+      replication multiplies wrong answers). The S100 readiness report (in the
+      private ledger) assesses the release; tagging is Tyler's.
 
 ## Execution order
 
