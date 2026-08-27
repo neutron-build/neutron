@@ -236,3 +236,5 @@ conformance/live/executors/rust/target/
 # Zig conformance executor build output.
 conformance/live/executors/zig/.zig-cache/
 conformance/live/executors/zig/zig-out/
+uuid
+status
