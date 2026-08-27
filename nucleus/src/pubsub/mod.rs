@@ -159,6 +159,13 @@ impl DistributedPubSubRouter {
 
     /// Publish to local hub AND generate forwarding messages for remote nodes
     /// that have subscribers on this channel.
+    ///
+    /// The remote half is DEAD in a single-node deployment (S31-18, decided
+    /// 2026-08-26): nothing drains `outbox` outside the distributed
+    /// programme's gossip layer, `node_subscriptions` stays empty without
+    /// gossip, and messages accumulate only if a caller keeps publishing with
+    /// remote subscribers configured. The outbox exists so the distributed
+    /// programme has a seam to attach a drainer to; it is not a feature.
     pub fn publish(&mut self, channel: &str, payload: String) -> (usize, usize) {
         let local_count = self.local_hub.publish(channel, payload.clone());
 

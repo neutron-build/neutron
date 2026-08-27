@@ -20,6 +20,7 @@ falls back to its default.
 | `idle_in_transaction_timeout_secs` | `u64` | `0` | `-` | Seconds a transaction may sit open with no activity before the server rolls it back, releasing its MVCC snapshot so GC can advance (T1.3). Mirrors Postgres `idle_in_transaction_session_timeout`. 0 disables it (the default) — an abandoned `BEGIN` otherwise pins the GC watermark forever and grows the database without bound. |
 | `query_memory_percent` | `usize` | `75` | `-` | Percent of `max_memory_mb` a single query's working set may reserve.  These were the same number, which made the query budget useless as a guard: one query could reserve the entire RSS cap, so the working-set limit could never fire BEFORE the RSS watchdog did. Keeping it below 100 means an oversized query gets a clean 53200 naming the query, while the rest of the server keeps serving. |
 | `reject_writes_on_memory_critical` | `bool` | `false` | `-` | Reject ALL writes while the RSS watchdog reports critical pressure.  Off by default, and it should stay off. RSS is not the server's working set — it includes the buffer pool and whatever the allocator has not returned to the OS — so the flag can be set while the server is perfectly able to serve a small INSERT. Worse, rejecting writes has no feedback path to RSS (the memory is held by caches and the pool, not by pending writes), so it does not clear the condition it reacts to; it just blocks the workload until something else frees memory. Bounding query working sets is the mechanism that actually limits allocation.  Space-reclaiming statements (DELETE, TRUNCATE) are never rejected even when this is on: refusing the retention job that would free the memory is the exact opposite of the intent. |
+| `slow_query_log_ms` | `u64` | `0` | `-` | Server-wide default for the slow-query log, in milliseconds. Statements running longer are logged at WARN (with query id and duration) on every session, without each session opting in via `SET slow_query_log_ms`. 0 disables the default (sessions can still opt in per-session); a session's explicit SET always wins over this default. |
 
 ## `[storage]`
 
@@ -35,6 +36,7 @@ falls back to its default.
 | `disk_readonly_free_pct` | `f64` | `3.0` | `NUCLEUS_DISK_READONLY_FREE_PCT` | Percentage of free space below which the server refuses writes (SQLSTATE 53100) instead of failing mid-write when the disk fills. |
 | `disk_min_free_mb` | `u64` | `256` | `NUCLEUS_DISK_MIN_FREE_MB` | Absolute free-space floor in MB. A percentage margin is meaningless on a small volume, so this triggers read-only independently. |
 | `disk_resume_free_pct` | `f64` | `6.0` | `NUCLEUS_DISK_RESUME_FREE_PCT` | Free space must climb back above this percentage before writes resume (hysteresis), so the server cannot flap at the watermark. |
+| `spill_budget_mb` | `u64` | `0` | `-` | Disk ceiling in MB for query spill files (external sort and other blocking operators that exceed the in-memory run budget). 0 means unlimited — usage is still tracked and reported, it is just never denied. When the ceiling is hit the spilling query fails with a disk-space error rather than filling the volume. |
 
 ## `[wal]`
 
@@ -47,6 +49,7 @@ falls back to its default.
 | `group_commit_interval_us` | `u64` | `1000` | `NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US` | - |
 | `sync_mode` | `String` | `"fsync"` | `NUCLEUS_WAL_SYNC_MODE` | How the WAL is forced to stable storage. One of:  - `fsync` (default) — `sync_all`. On macOS this is `F_FULLFSYNC`, a true   drive-cache barrier: survives power loss, and costs ~4,253 µs here. - `fdatasync` — `sync_data`. Distinct on Linux; on macOS it is measurably   the same as `fsync` (3,849 vs 3,872 µs), so it is a knob that does   nothing there. - `flush_os` — plain `fsync(2)`, ~41 µs on this host. Survives process   crash, OS panic and `kill -9`; does NOT survive power loss, because the   drive may still hold the data in a volatile cache. This is the   guarantee PostgreSQL gives on macOS with its default   `wal_sync_method`, which is what makes an equal-footing write   comparison possible at all. On Linux `fsync(2)` normally does flush the   device, so the mode is not weaker there. - `none` / `off` — no sync. Loses committed data on any crash.  The default stays `fsync`: durability is not something to trade away by accident, only deliberately. |
 | `synchronous_commit` | `String` | `"on"` | `NUCLEUS_WAL_SYNCHRONOUS_COMMIT` | Commit-time durability: "on" (default) forces the WAL (group commit) before a write statement or COMMIT is acked; "off" defers durability to the next flush/checkpoint (bounded loss window, higher throughput). Sessions can override with `SET synchronous_commit = on|off`. |
+| `specialty_checkpoint_warn_every` | `u64` | `10` | `-` | WARN cadence, in consecutive skipped passes, while an open enlisted (cross-model) transaction holds specialty checkpoints off and their WALs grow one record per write. Every N-th skipped pass logs one WARN naming the open transaction ids. 0 disables the warning; the growth itself is bounded by `server.idle_in_transaction_timeout_secs`. |
 
 ## `[pool]`
 
@@ -126,6 +129,7 @@ probe hooks, not supported configuration.
 | `NUCLEUS_CACHE_ENABLED` | `src/config/mod.rs` |
 | `NUCLEUS_CACHE_MAX_MEMORY_MB` | `src/config/mod.rs` |
 | `NUCLEUS_CACHE_ORACLE_ITERS` | `src/executor/tests/test_cache_coherence.rs` |
+| `NUCLEUS_CLUSTER_LISTEN` | `src/main.rs` |
 | `NUCLEUS_CLUSTER_TOKEN` | `src/main.rs` |
 | `NUCLEUS_CRASHPOINT` | `src/bin/probe_crash_points.rs` |
 | `NUCLEUS_CRASHPOINT_HIT` | `src/bin/probe_crash_points.rs` |

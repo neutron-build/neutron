@@ -66,6 +66,13 @@ pub struct ServerConfig {
     /// is the exact opposite of the intent.
     #[serde(default = "default_reject_writes_on_memory_critical")]
     pub reject_writes_on_memory_critical: bool,
+    /// Server-wide default for the slow-query log, in milliseconds. Statements
+    /// running longer are logged at WARN (with query id and duration) on every
+    /// session, without each session opting in via `SET slow_query_log_ms`.
+    /// 0 disables the default (sessions can still opt in per-session);
+    /// a session's explicit SET always wins over this default.
+    #[serde(default = "default_slow_query_log_ms")]
+    pub slow_query_log_ms: u64,
 }
 
 fn default_host() -> String {
@@ -92,6 +99,9 @@ fn default_query_memory_percent() -> usize {
 fn default_reject_writes_on_memory_critical() -> bool {
     false
 }
+fn default_slow_query_log_ms() -> u64 {
+    0
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -104,6 +114,7 @@ impl Default for ServerConfig {
             idle_in_transaction_timeout_secs: default_idle_in_transaction_timeout_secs(),
             query_memory_percent: default_query_memory_percent(),
             reject_writes_on_memory_critical: default_reject_writes_on_memory_critical(),
+            slow_query_log_ms: default_slow_query_log_ms(),
         }
     }
 }
@@ -141,6 +152,13 @@ pub struct StorageConfig {
     /// (hysteresis), so the server cannot flap at the watermark.
     #[serde(default = "default_disk_resume_free_pct")]
     pub disk_resume_free_pct: f64,
+    /// Disk ceiling in MB for query spill files (external sort and other
+    /// blocking operators that exceed the in-memory run budget). 0 means
+    /// unlimited — usage is still tracked and reported, it is just never
+    /// denied. When the ceiling is hit the spilling query fails with a
+    /// disk-space error rather than filling the volume.
+    #[serde(default = "default_spill_budget_mb")]
+    pub spill_budget_mb: u64,
 }
 
 fn default_disk_check_interval_secs() -> u64 {
@@ -157,6 +175,9 @@ fn default_disk_min_free_mb() -> u64 {
 }
 fn default_disk_resume_free_pct() -> f64 {
     6.0
+}
+fn default_spill_budget_mb() -> u64 {
+    0
 }
 
 fn default_data_dir() -> String {
@@ -182,6 +203,7 @@ impl Default for StorageConfig {
             disk_readonly_free_pct: default_disk_readonly_free_pct(),
             disk_min_free_mb: default_disk_min_free_mb(),
             disk_resume_free_pct: default_disk_resume_free_pct(),
+            spill_budget_mb: default_spill_budget_mb(),
         }
     }
 }
@@ -250,6 +272,13 @@ pub struct WalConfig {
     /// Sessions can override with `SET synchronous_commit = on|off`.
     #[serde(default = "default_synchronous_commit")]
     pub synchronous_commit: String,
+    /// WARN cadence, in consecutive skipped passes, while an open enlisted
+    /// (cross-model) transaction holds specialty checkpoints off and their
+    /// WALs grow one record per write. Every N-th skipped pass logs one WARN
+    /// naming the open transaction ids. 0 disables the warning; the growth
+    /// itself is bounded by `server.idle_in_transaction_timeout_secs`.
+    #[serde(default = "default_specialty_checkpoint_warn_every")]
+    pub specialty_checkpoint_warn_every: u64,
 }
 
 fn default_true() -> bool {
@@ -273,6 +302,9 @@ fn default_sync_mode() -> String {
 fn default_synchronous_commit() -> String {
     "on".to_string()
 }
+fn default_specialty_checkpoint_warn_every() -> u64 {
+    10
+}
 
 impl Default for WalConfig {
     fn default() -> Self {
@@ -284,6 +316,7 @@ impl Default for WalConfig {
             group_commit_interval_us: default_group_commit_interval_us(),
             sync_mode: default_sync_mode(),
             synchronous_commit: default_synchronous_commit(),
+            specialty_checkpoint_warn_every: default_specialty_checkpoint_warn_every(),
         }
     }
 }
@@ -1069,6 +1102,31 @@ mod tests {
         assert_eq!(wc.sync_mode, "fsync");
     }
 
+    /// The Batch 2 config keys parse from TOML and default to the behavior
+    /// that shipped before they existed: slow-query off, spill unlimited,
+    /// WAL-growth WARN every 10th skipped pass.
+    #[test]
+    fn test_batch2_knobs_parse_and_default() {
+        assert_eq!(ServerConfig::default().slow_query_log_ms, 0);
+        assert_eq!(StorageConfig::default().spill_budget_mb, 0);
+        assert_eq!(WalConfig::default().specialty_checkpoint_warn_every, 10);
+
+        let cfg: NucleusConfig = toml::from_str(
+            r#"
+            [server]
+            slow_query_log_ms = 250
+            [storage]
+            spill_budget_mb = 4096
+            [wal]
+            specialty_checkpoint_warn_every = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.slow_query_log_ms, 250);
+        assert_eq!(cfg.storage.spill_budget_mb, 4096);
+        assert_eq!(cfg.wal.specialty_checkpoint_warn_every, 3);
+    }
+
     #[test]
     fn test_pool_config_default() {
         let pc = PoolConfig::default();
@@ -1391,6 +1449,7 @@ port = 5555
                 idle_in_transaction_timeout_secs: 0,
                 query_memory_percent: default_query_memory_percent(),
                 reject_writes_on_memory_critical: false,
+                slow_query_log_ms: 0,
             },
             storage: StorageConfig {
                 data_dir: "/tmp/nucleus".to_string(),

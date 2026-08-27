@@ -125,7 +125,7 @@ pub enum Sensitivity {
 pub struct DiskBudget {
     used_bytes: AtomicU64,
     peak_bytes: AtomicU64,
-    limit_bytes: u64,
+    limit_bytes: AtomicU64,
 }
 
 impl DiskBudget {
@@ -134,7 +134,7 @@ impl DiskBudget {
         Arc::new(Self {
             used_bytes: AtomicU64::new(0),
             peak_bytes: AtomicU64::new(0),
-            limit_bytes,
+            limit_bytes: AtomicU64::new(limit_bytes),
         })
     }
 
@@ -144,17 +144,31 @@ impl DiskBudget {
         Self::new(u64::MAX)
     }
 
+    /// Change the ceiling in place. The limit is read per reservation attempt,
+    /// so a lower ceiling takes effect for the next `grow`, not retroactively:
+    /// bytes already reserved stay reserved until their runs drop. Lowering
+    /// below current usage does not kill live runs — it denies new ones.
+    pub fn set_limit(&self, limit_bytes: u64) {
+        self.limit_bytes.store(limit_bytes, Ordering::Release);
+    }
+
+    /// The configured ceiling.
+    pub fn limit(&self) -> u64 {
+        self.limit_bytes.load(Ordering::Acquire)
+    }
+
     fn try_add(&self, bytes: u64) -> Result<(), SpillError> {
         // CAS loop so concurrent operators can't both pass the check and
         // over-commit past the ceiling.
         loop {
             let current = self.used_bytes.load(Ordering::Acquire);
+            let limit = self.limit_bytes.load(Ordering::Acquire);
             let next = current.saturating_add(bytes);
-            if next > self.limit_bytes {
+            if next > limit {
                 return Err(SpillError::DiskBudgetExceeded {
                     requested: bytes,
                     used: current,
-                    limit: self.limit_bytes,
+                    limit,
                 });
             }
             if self
@@ -515,6 +529,43 @@ mod tests {
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
+
+    /// `set_limit` (config `storage.spill_budget_mb`): a ceiling lowered in
+    /// place denies NEW reservations without killing live runs — the bytes a
+    /// live run already holds stay reserved until it drops.
+    #[test]
+    fn disk_budget_set_limit_denies_new_runs_in_place() {
+        let dir = tmp();
+        let mgr = SpillManager::new(dir.path(), u64::MAX, None).unwrap();
+
+        // Reserve 1000 bytes via a live run that stays open.
+        let mut w1 = mgr.create_run("live", Sensitivity::Plain).unwrap();
+        w1.write_batch(&sample_rows(8)).unwrap();
+        let used_before = mgr.budget().used();
+        assert!(used_before > 0);
+
+        // Lower the ceiling below what the live run already holds: the run
+        // keeps its reservation and can still grow within it is NOT claimed —
+        // growth is a new reservation too, but the run itself is not killed.
+        mgr.budget().set_limit(used_before);
+
+        // A second run requesting any bytes is denied cleanly.
+        let err = mgr
+            .create_run("second", Sensitivity::Plain)
+            .unwrap()
+            .write_batch(&sample_rows(8));
+        assert!(
+            matches!(err, Err(SpillError::DiskBudgetExceeded { .. })),
+            "a new run past the lowered ceiling must be denied, got {err:?}"
+        );
+
+        // The live run's reservation releases on drop, and the ceiling
+        // stays: usage falls, limit unchanged.
+        drop(w1);
+        assert!(mgr.budget().used() == 0);
+        assert_eq!(mgr.budget().limit(), used_before);
+    }
+
 
     fn sample_rows(n: usize) -> Vec<Row> {
         (0..n)

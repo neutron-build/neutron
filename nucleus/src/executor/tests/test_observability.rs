@@ -298,3 +298,28 @@ async fn slow_query_log_records_statement_over_threshold() {
         "statement preview must be the executed statement, got {statement:?}"
     );
 }
+
+/// The server-wide slow-query default (config `server.slow_query_log_ms`,
+/// builder `with_slow_query_default_ms`): a session that has not SET its own
+/// threshold inherits it, and an explicit SET still wins.
+#[tokio::test]
+async fn slow_query_default_arms_sessions_that_never_set_it() {
+    let ex = test_executor().with_slow_query_default_ms(5000);
+
+    // No SET: the session inherits the server default, not 0.
+    assert_eq!(ex.slow_query_log_ms(), 5000);
+
+    // An explicit SET overrides in both directions.
+    exec(&ex, "SET slow_query_log_ms = 250").await;
+    assert_eq!(ex.slow_query_log_ms(), 250);
+    exec(&ex, "SET slow_query_log_ms = 0").await;
+    assert_eq!(
+        ex.slow_query_log_ms(),
+        0,
+        "an explicit 0 must disable even against a server default"
+    );
+
+    // The default stays off unless configured (pre-Batch-2 behavior).
+    let plain = test_executor();
+    assert_eq!(plain.slow_query_log_ms(), 0);
+}

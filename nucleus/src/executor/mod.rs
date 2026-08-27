@@ -502,6 +502,15 @@ pub struct Executor {
     /// How many WAL-growth warnings have been emitted (test hook: the warn
     /// itself goes to tracing, which tests cannot read).
     specialty_checkpoint_warns: AtomicU64,
+    /// The WARN cadence for the skip run above: one warning every N-th
+    /// consecutive skipped pass. Configurable via
+    /// `wal.specialty_checkpoint_warn_every` (0 disables). Starts at
+    /// `SKIP_WARN_EVERY`.
+    specialty_skip_warn_every: AtomicU64,
+    /// Server-wide default for the slow-query threshold, applied to sessions
+    /// that have not SET their own. 0 (the default) keeps the log off until a
+    /// session opts in. Configurable via `server.slow_query_log_ms`.
+    default_slow_query_ms: AtomicU64,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
     /// In-memory key-value store for KV SQL functions (kv_get, kv_set, kv_del, etc.).
@@ -961,6 +970,8 @@ impl Executor {
             specialty_horizon: AtomicU64::new(1),
             specialty_checkpoint_skips: AtomicU64::new(0),
             specialty_checkpoint_warns: AtomicU64::new(0),
+            specialty_skip_warn_every: AtomicU64::new(SKIP_WARN_EVERY),
+            default_slow_query_ms: AtomicU64::new(0),
             default_session: Arc::new(Session::new()),
             kv_store: Arc::new(crate::kv::KvStore::new()),
             columnar_store: parking_lot::RwLock::new(crate::columnar::ColumnarStore::new()),
@@ -2462,6 +2473,34 @@ impl Executor {
     /// Set the query execution memory limit (builder form).
     pub fn with_query_memory_limit(self, limit_bytes: u64) -> Self {
         self.query_memory.set_limit(limit_bytes);
+        self
+    }
+
+    /// Set the server-wide default slow-query threshold, in milliseconds
+    /// (builder form). Sessions without an explicit
+    /// `SET slow_query_log_ms` inherit this; 0 keeps the log off by default.
+    pub fn with_slow_query_default_ms(self, ms: u64) -> Self {
+        self.default_slow_query_ms
+            .store(ms, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    /// Set the WAL-growth WARN cadence, in consecutive skipped specialty
+    /// checkpoints (builder form). 0 disables the warning.
+    pub fn with_specialty_skip_warn_every(self, every: u64) -> Self {
+        self.specialty_skip_warn_every
+            .store(every, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    /// Set the disk ceiling for query spill files (builder form). 0 leaves the
+    /// budget unlimited (still tracked). Applies in place to the live budget,
+    /// so it composes with `with_spill_encryptor` in either order.
+    #[cfg(feature = "server")]
+    pub fn with_spill_budget(self, limit_bytes: u64) -> Self {
+        if let Some(ref mgr) = self.spill_manager {
+            mgr.budget().set_limit(limit_bytes);
+        }
         self
     }
 
@@ -4226,7 +4265,7 @@ impl Executor {
             .read()
             .get("slow_query_log_ms")
             .and_then(|v| v.trim_matches('\'').trim().parse::<u64>().ok())
-            .unwrap_or(0)
+            .unwrap_or_else(|| self.default_slow_query_ms.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// The most recent statement that crossed the slow-query threshold:
@@ -4695,7 +4734,9 @@ impl Executor {
     /// lasts the specialty logs keep every write (the S6 filter's
     /// completeness depends on the tail surviving), so a transaction left
     /// open indefinitely grows them without bound. Every
-    /// [`SKIP_WARN_EVERY`]-th consecutive skip emits one WARN naming the
+    /// `specialty_skip_warn_every`-th consecutive skip (default
+    /// [`SKIP_WARN_EVERY`], configurable via `wal.specialty_checkpoint_warn_every`;
+    /// 0 disables) emits one WARN naming the
     /// open ids and the configured remedy; a completed pass resets the run.
     /// Warning rather than force-checkpointing is the conservative half of
     /// the escalated policy — force-sweeping under an open transaction
@@ -4705,7 +4746,10 @@ impl Executor {
             .specialty_checkpoint_skips
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             + 1;
-        if !skips.is_multiple_of(SKIP_WARN_EVERY) {
+        let warn_every = self
+            .specialty_skip_warn_every
+            .load(std::sync::atomic::Ordering::Acquire);
+        if warn_every == 0 || !skips.is_multiple_of(warn_every) {
             return;
         }
         self.specialty_checkpoint_warns

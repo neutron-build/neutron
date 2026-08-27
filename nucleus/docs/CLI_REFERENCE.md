@@ -65,6 +65,9 @@ Options:
       --join <JOIN>
           Join an existing cluster at this address (e.g., node1:5432)
 
+      --cluster-listen
+          Listen on the cluster port so other nodes can --join THIS node, even when this node itself joins nothing (the seed node of a cluster). Off by default: a single-node server opens no cluster port. Also settable via NUCLEUS_CLUSTER_LISTEN=1. Non-loopback listeners still require NUCLEUS_CLUSTER_TOKEN
+
       --region <REGION>
           Region tag for geo-distributed deployments (e.g., us-east, eu-west)
 
@@ -85,7 +88,7 @@ Options:
           Require password authentication. Can also be set via NUCLEUS_PASSWORD env var
 
       --auth-method <AUTH_METHOD>
-          SQL authentication method when password auth is enabled. Defaults to SCRAM-SHA-256. Use cleartext only for legacy clients
+          SQL authentication method when password auth is enabled. Defaults to SCRAM-SHA-256. (Cleartext is refused at startup -- accepted on the command line only for parser compatibility.)
           
           [possible values: scram-sha256, cleartext]
 

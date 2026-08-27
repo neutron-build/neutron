@@ -1835,3 +1835,50 @@ async fn collections_mutators_are_refused_inside_a_transaction_the_m8_boundary()
 // ══════════════════════════════════════════════════════════════════════════
 // Slice 8: geo — documentation-only (see src/geo/wal.rs's header)
 // ══════════════════════════════════════════════════════════════════════════
+
+/// The WAL-growth WARN cadence is configurable
+/// (`wal.specialty_checkpoint_warn_every`, builder form here): the default 10
+/// is pinned by `held_gate_warns_once_per_ten_skipped_passes` above; this pins
+/// the override — every 2nd skip warns — and 0 silencing entirely.
+#[tokio::test]
+async fn specialty_skip_warn_cadence_is_configurable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ex, _engine) = open_segmented(dir.path()).await;
+
+    exec(&ex, "BEGIN").await;
+    graph_add_node(&ex, "Holder").await;
+    assert!(ex.any_open_enlisted_txn());
+
+    // Default cadence (10): two skips warn nothing.
+    ex.note_specialty_checkpoint_skip(60);
+    ex.note_specialty_checkpoint_skip(60);
+    assert_eq!(ex.specialty_checkpoint_warns(), 0);
+
+    // Override to 2: the reset run's second skip warns.
+    let tuned = {
+        let dir2 = tempfile::tempdir().unwrap();
+        let (ex2, _e2) = open_segmented(dir2.path()).await;
+        (ex2, dir2)
+    };
+    let (ex2, _dir2) = tuned;
+    let ex2 = ex2.with_specialty_skip_warn_every(2);
+    exec(&ex2, "BEGIN").await;
+    graph_add_node(&ex2, "Holder").await;
+    ex2.note_specialty_checkpoint_skip(60);
+    assert_eq!(ex2.specialty_checkpoint_warns(), 0, "first skip of a 2-cadence run");
+    ex2.note_specialty_checkpoint_skip(60);
+    assert_eq!(ex2.specialty_checkpoint_warns(), 1, "second skip of a 2-cadence run");
+
+    // 0 disables the warning entirely; skips still count.
+    let ex2 = ex2.with_specialty_skip_warn_every(0);
+    ex2.note_specialty_checkpoint_pass(1);
+    for _ in 0..5 {
+        ex2.note_specialty_checkpoint_skip(60);
+    }
+    assert_eq!(
+        ex2.specialty_checkpoint_warns(),
+        1,
+        "cadence 0 must not warn further"
+    );
+    assert_eq!(ex2.specialty_checkpoint_skips(), 5);
+}

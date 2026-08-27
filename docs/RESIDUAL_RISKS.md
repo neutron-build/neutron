@@ -11,11 +11,10 @@ today by asserting the current bad behaviour and fail the moment it improves.
 That is deliberate: an unfixed limitation with a test attached cannot quietly
 become folklore.
 
-Last verified: 2026-08-23, against the working tree carrying eight fix waves
-(2026-08-21 → 08-23, documented in the private progress ledger) plus the
-durability pass (LSM SSTable fsync + CRC32C, FLUSHDB cold-tier clearing, blob
-segment fsync) — with 43 of 43 probe harnesses passing. CI counts will be
-re-verified after that tree is committed and the workflows run it.
+Last verified: 2026-08-26, against HEAD after the soak-flake B-tree fix
+(task-plan Batch 1; probes 43/43 across three consecutive full runs) — with
+the standing caveat that CI counts are re-verified when the workflows run the
+tree.
 
 ---
 
@@ -44,12 +43,13 @@ so no uncommitted record can be produced through SQL — atomic by refusal,
 not by mechanism, until a write-set design lands.
 
 The remaining models — FTS (design-never: the index snapshot beats the WAL
-at startup), vector (its WAL has no statement framing; needs a design),
+at startup), vector (its WAL has no statement framing; needs a design), and
 geo (writer-less — geo persists as SQL columns and its WAL receives no
-writes), and CDC (determined fire-and-forget: events fire at statement
-time and never enlist; making CDC transactional is the NU-107 product
-call) — still append with no notion of the transaction that produced a
-record.
+writes) — still append with no notion of the transaction that produced a
+record. CDC is **decided, not pending**: events fire at statement time and
+never enlist — fire-and-forget is the contract (2026-08-26; the NU-107
+product call resolved to keeping it), so a CDC consumer sees events for
+writes that a concurrent crash or rollback may then undo.
 
 **If this matters to you:** keep cross-model writes idempotent, or confine a
 transaction to SQL and the seven atomic specialty surfaces above.
@@ -123,6 +123,10 @@ as every node in it.
 
 ## 6. `RETENTION_SET` accepts a policy that nothing enforces
 
+**Status: decided 2026-08-26 — permanent warn-only through 1.0.** Enforcement
+is not planned and the function will not be removed: pre-1.0 callers correctly
+read the absence of an error as acceptance, and deleting it would break them.
+
 The function parses, validates and registers a retention policy, and no
 component ever acts on it. It now emits a warning saying so, and it is
 documented here rather than removed, because removing it would break callers
@@ -175,7 +179,9 @@ result was **negative and is published as such**: on this machine class the
 worst single-repeat throughput deviation on a green run is 95.4%, and one repeat
 recorded zero requests per second with zero errors. A 10x regression is a 90%
 drop, so no threshold can both survive a green run and catch a real regression.
-No performance gate is wired, and no Python competitive figures are published.
+**Decided 2026-08-26: no Nucleus-engine performance gate is wired on this
+hardware class** — the numbers above are why. The TypeScript SDK's own
+benchmark gate stands; it runs on stable-enough hardware to mean something.
 
 ## 10. "Formally verified" means less than it sounds like
 
@@ -222,6 +228,49 @@ pre-ack and fails the statement when the WAL append fails, like XADD.
 
 **If this matters to you:** set `idle_in_transaction_timeout_secs`, or close
 enlisted transactions promptly.
+
+## 14. There are three disjoint pub/sub fabrics, and they do not bridge
+
+`NOTIFY` (and pgwire `LISTEN`) uses the async notification hub;
+`PUBSUB_PUBLISH` and the embedded API use the synchronous pubsub registry; and
+the RESP `PUBLISH`/`SUBSCRIBE` surface uses a third, separate subscriber
+registry. A message published on one fabric never reaches subscribers on
+another — a client subscribed via RESP cannot hear a `NOTIFY` the SQL side
+sends, and vice versa.
+
+**Decided 2026-08-26: documented, not unified.** Unifying them is a
+post-1.0 redesign (one delivery fabric with three protocol front-ends), not a
+patch; hiding the seams now would produce half-bridged semantics that are
+worse than honestly separate ones. Related: the cluster router's outbox
+(`drain_outbox`) has no production drainer — it exists for the distributed
+programme and is inert in a single-node deployment.
+
+**If this matters to you:** pick one pub/sub fabric per integration and stay
+on it; do not assume `NOTIFY` reaches RESP subscribers.
+
+## 15. Write conflicts under high contention kill and retry by design
+
+Nucleus resolves write-write conflicts wait-die: a younger transaction that
+would block on an older one's lock is killed and must be retried by the
+client. Under adversarial contention this produces a retry storm — the
+correctness-safe choice at the cost of throughput. **Decided 2026-08-26:
+documented behavior**, with a throughput lane (wound-wait or queueing)
+parked post-1.0.
+
+**If this matters to you:** batch contended writes, or expect retriable
+errors (and retry them) on hot keys.
+
+## 16. `synchronous_commit = off` loses committed writes on a hard stop
+
+That is the documented contract of `off`, not a bug: durability is deferred
+to the next flush/checkpoint, so a `kill -9` or OS crash inside that window
+loses recently-acknowledged writes. At the default `on`, 43 controlled trials
+across TERM/INT/KILL, quiescent and under a live writer, lost zero
+acknowledged rows; the one filed loss report reproduced only under `off`,
+and its proposed root cause was disproved.
+
+**If this matters to you:** keep `synchronous_commit` at its default `on`
+(or set it per-session only where the loss window is acceptable).
 
 ---
 

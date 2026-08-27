@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 345796; Source Rust files: 306; Top-level modules: 53.
-- Declared unit tests: 4781; Declared integration tests: 449; Ignored tests: 53.
+- Source LOC: 346115; Source Rust files: 306; Top-level modules: 53.
+- Declared unit tests: 4786; Declared integration tests: 452; Ignored tests: 53.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,622 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -889,7 +889,10 @@ Still open in this milestone:
 - No isolation on specialty stores: one session reads another's uncommitted
   non-SQL writes, and two sessions writing the same key still conflict
   destructively.
-- CDC still publishes change events for transactions that never committed (NU-107). The other
+- CDC still publishes change events for transactions that never committed — **decided
+  2026-08-26 (NU-107): fire-and-forget is the contract, permanently**; events fire at
+  statement time and never enlist, so consumers must treat events as notifications, not
+  commit confirmations. Documented in `docs/RESIDUAL_RISKS.md` entry 1. The other
   non-participating surfaces are now refused rather than silently kept, per the entry above.
 - Vector rollback is not durable (no compensating record in `vector/vector.wal`).
 

@@ -3286,8 +3286,16 @@ impl Executor {
                 Ok(Value::Int64(self.kv_store.dbsize() as i64))
             }
             "KV_FLUSHDB" => {
-                // kv_flushdb() → 'OK'
-                self.cross_model_touch_kv_all();
+                // kv_flushdb() → 'OK' — autocommit only (D3, S63).
+                //
+                // FLUSHDB's WAL effect is an empty snapshot: committed by
+                // construction and untaggable, so inside an explicit
+                // transaction a ROLLBACK cannot be made to undo it — the
+                // wipe launders past the S6 discard filter no matter what
+                // compensation records say. Refused in-txn by the generic
+                // pre-dispatch gate via `refused_in_transaction`; in
+                // autocommit there is no rollback to contradict the
+                // snapshot.
                 self.kv_store.flushdb();
                 Ok(Value::Text("OK".into()))
             }
@@ -5563,6 +5571,38 @@ impl Executor {
                 self.cross_model_after_graph(touched);
                 Ok(Value::Bool(removed))
             }
+            "GRAPH_NODE" => {
+                // graph_node(node_id) → JSON {id, labels, properties} or NULL.
+                // The read half of GRAPH_ADD_NODE: labels and properties were
+                // write-only over SQL until this existed (S69's fourth item).
+                // `get_node_full` serves cold-tier-evicted properties too.
+                let args = self.extract_fn_args(func, row, col_meta)?;
+                if args.is_empty() {
+                    return Err(ExecError::Unsupported(
+                        "GRAPH_NODE requires (node_id)".into(),
+                    ));
+                }
+                let node_id = val_to_u64(&args[0], "GRAPH_NODE node_id")?;
+                let store = self.graph_store.read();
+                let Some(node) = store.get_node_full(node_id) else {
+                    return Ok(Value::Null);
+                };
+                let labels = node
+                    .labels
+                    .iter()
+                    .map(|l| format!("\"{}\"", json_escape(l)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let props = node
+                    .properties
+                    .iter()
+                    .map(|(k, v)| format!("\"{}\":{}", json_escape(k), prop_value_to_json(v)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Ok(Value::Text(format!(
+                    r#"{{"id":{node_id},"labels":[{labels}],"properties":{{{props}}}}}"#
+                )))
+            }
             "GRAPH_NEIGHBORS" => {
                 // graph_neighbors(node_id, direction?) → JSON array of {neighbor_id, edge_id, edge_type}
                 // direction: 'out' (default), 'in', 'both'
@@ -7065,6 +7105,9 @@ pub(crate) fn refused_in_transaction(fname: &str) -> Option<&'static str> {
         );
     }
     match fname {
+        "KV_FLUSHDB" => Some(
+            "its WAL effect is an untaggable whole-keyspace snapshot that rollback              cannot undo; flush outside an explicit transaction",
+        ),
         "COLUMNAR_INSERT" => Some(
             "the columnar store is not covered by transaction rollback; insert outside an              explicit transaction",
         ),
@@ -7246,7 +7289,9 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         "CDC_READ" | "CDC_TABLE_READ" => DataType::Text,
         "DATALOG_QUERY" => DataType::Text,
         "GEO_AREA" => DataType::Float64,
-        "GRAPH_NEIGHBORS" | "GRAPH_QUERY" | "GRAPH_SHORTEST_PATH" => DataType::Text,
+        "GRAPH_NODE" | "GRAPH_NEIGHBORS" | "GRAPH_QUERY" | "GRAPH_SHORTEST_PATH" => {
+            DataType::Text
+        }
         // KV list/sorted-set reads return a JSON array; KV_LINDEX returns the
         // element, which every push path stores as text.
         "KV_LINDEX" | "KV_LRANGE" | "KV_ZRANGE" | "KV_ZRANGEBYSCORE" => DataType::Text,

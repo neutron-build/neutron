@@ -840,6 +840,58 @@ async fn test_e2e_vector_operations() {
 // 12. Graph Operations — nodes, edges, shortest path
 // ======================================================================
 
+/// S69's fourth item (task-plan Batch 2): the GRAPH_* surface could WRITE
+/// node properties but nothing could READ them back — a node's label and
+/// properties were write-only over SQL.
+#[tokio::test]
+async fn test_e2e_graph_node_reads_label_and_properties() {
+    let ex = test_executor();
+
+    let res = exec(
+        &ex,
+        "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Alice\",\"age\":42,\"active\":true}')",
+    )
+    .await;
+    let alice_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
+
+    // GRAPH_NODE(id) returns the label and the properties verbatim.
+    let res = exec(&ex, &format!("SELECT GRAPH_NODE({alice_id})")).await;
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["labels"][0], "Person", "label must read back: {json}");
+    assert_eq!(parsed["properties"]["name"], "Alice", "text prop: {json}");
+    assert_eq!(parsed["properties"]["age"], 42, "int prop: {json}");
+    assert_eq!(parsed["properties"]["active"], true, "bool prop: {json}");
+
+    // A node with no properties reads back an empty object, not NULL.
+    let res = exec(&ex, "SELECT GRAPH_ADD_NODE('Bare')").await;
+    let bare_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
+    let res = exec(&ex, &format!("SELECT GRAPH_NODE({bare_id})")).await;
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["labels"][0], "Bare");
+    assert_eq!(parsed["properties"].as_object().map(|o| o.len()), Some(0));
+
+    // An absent node reads NULL, not an error and not an empty object.
+    let res = exec(&ex, "SELECT GRAPH_NODE(999999)").await;
+    match scalar(&res[0]) {
+        Value::Null => {}
+        ref v => panic!("absent node must be NULL, got {v:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_e2e_graph_operations() {
     let ex = test_executor();

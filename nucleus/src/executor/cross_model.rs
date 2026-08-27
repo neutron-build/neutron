@@ -143,28 +143,12 @@ impl Executor {
         cm.xid
     }
 
-    /// `FLUSHDB` erases the whole keyspace, so its write-set is every key the
-    /// before-image holds. Enlists the KV model for the S7 checkpoint gate;
-    /// the flush's own WAL effect is a snapshot (committed by construction,
-    /// untaggable — see the S63 design's D3), so unlike the keyed touches
-    /// there is no id to hand back.
-    pub(super) fn cross_model_touch_kv_all(&self) {
-        let session = self.current_session();
-        let mut guard = session.cross_model.lock();
-        let Some(cm) = guard.as_mut() else { return };
-        cm.enlisted.enlist(Model::Kv);
-        for_each_level!(cm, lvl, {
-            if lvl.kv.is_none() {
-                lvl.kv = Some(self.kv_store.txn_snapshot());
-            }
-            let keys = lvl
-                .kv
-                .as_ref()
-                .map(crate::kv::KvStore::snapshot_keys)
-                .unwrap_or_default();
-            lvl.kv_touched.extend(keys);
-        });
-    }
+    // `FLUSHDB`'s enlistment helper was removed 2026-08-26 (task-plan Batch 2,
+    // decision 9): KV_FLUSHDB now refuses inside an explicit transaction
+    // because its WAL effect is an untaggable whole-keyspace snapshot —
+    // see `refused_in_transaction` and the KV_FLUSHDB arm in scalar_fns. A
+    // transactional flush, if ever designed, needs a deferrable checkpoint,
+    // not an enlistment.
 
     // ── Stores the executor owns exclusively ────────────────────────────────
     // `*_before` captures the lazy before-image while the caller holds the
