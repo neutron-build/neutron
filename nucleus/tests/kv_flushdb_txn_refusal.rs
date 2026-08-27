@@ -107,7 +107,10 @@ async fn kv_flushdb_refuses_inside_explicit_transaction_and_keeps_keys() {
 
     scalar(&client, "SELECT KV_SET('d3:a', 'one')").await;
     scalar(&client, "SELECT KV_SET('d3:b', 'two')").await;
-    assert_eq!(scalar(&client, "SELECT KV_GET('d3:a')").await.as_deref(), Some("one"));
+    assert_eq!(
+        scalar(&client, "SELECT KV_GET('d3:a')").await.as_deref(),
+        Some("one")
+    );
 
     client.simple_query("BEGIN").await.expect("BEGIN");
 
@@ -171,7 +174,10 @@ async fn kv_flushdb_refusal_leaves_the_session_usable_after_rollback() {
     let client = connect(server.port).await;
 
     scalar(&client, "SELECT KV_SET('d3:e', 'before')").await;
-    assert_eq!(scalar(&client, "SELECT KV_GET('d3:e')").await.as_deref(), Some("before"));
+    assert_eq!(
+        scalar(&client, "SELECT KV_GET('d3:e')").await.as_deref(),
+        Some("before")
+    );
 
     client.simple_query("BEGIN").await.expect("BEGIN");
     let err = client.simple_query("SELECT KV_FLUSHDB()").await;

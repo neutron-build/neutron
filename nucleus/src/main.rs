@@ -1254,7 +1254,8 @@ async fn cmd_start(cfg: StartConfig) {
             .with_slow_query_default_ms(config.server.slow_query_log_ms)
             .with_specialty_skip_warn_every(config.wal.specialty_checkpoint_warn_every);
     if config.storage.spill_budget_mb > 0 {
-        executor_build = executor_build.with_spill_budget(config.storage.spill_budget_mb * 1024 * 1024);
+        executor_build =
+            executor_build.with_spill_budget(config.storage.spill_budget_mb * 1024 * 1024);
     }
     if let Some(enc) = spill_encryptor {
         // Encrypted deployment: spill runs must be ciphertext (fail-closed).

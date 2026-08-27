@@ -1019,11 +1019,7 @@ async fn old_format_sequences_json_without_start_loads_with_minvalue() {
 async fn vector_row_writes_are_transactional() {
     let dir = tempfile::tempdir().unwrap();
     let ex = open_executor(dir.path()).await;
-    exec(
-        &ex,
-        "CREATE TABLE vt (id INT PRIMARY KEY, v VECTOR(4))",
-    )
-    .await;
+    exec(&ex, "CREATE TABLE vt (id INT PRIMARY KEY, v VECTOR(4))").await;
     exec(&ex, "CREATE INDEX vt_hnsw ON vt USING hnsw (v)").await;
 
     // Baseline: one committed row.

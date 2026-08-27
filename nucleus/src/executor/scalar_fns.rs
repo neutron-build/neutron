@@ -7289,9 +7289,7 @@ pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::D
         "CDC_READ" | "CDC_TABLE_READ" => DataType::Text,
         "DATALOG_QUERY" => DataType::Text,
         "GEO_AREA" => DataType::Float64,
-        "GRAPH_NODE" | "GRAPH_NEIGHBORS" | "GRAPH_QUERY" | "GRAPH_SHORTEST_PATH" => {
-            DataType::Text
-        }
+        "GRAPH_NODE" | "GRAPH_NEIGHBORS" | "GRAPH_QUERY" | "GRAPH_SHORTEST_PATH" => DataType::Text,
         // KV list/sorted-set reads return a JSON array; KV_LINDEX returns the
         // element, which every push path stores as text.
         "KV_LINDEX" | "KV_LRANGE" | "KV_ZRANGE" | "KV_ZRANGEBYSCORE" => DataType::Text,

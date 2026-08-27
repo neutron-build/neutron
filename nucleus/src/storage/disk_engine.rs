@@ -5100,7 +5100,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(window.len(), 3, "one row per live id, stale screened: {window:?}");
+        assert_eq!(
+            window.len(),
+            3,
+            "one row per live id, stale screened: {window:?}"
+        );
     }
 
     /// STO-3: index-only scans fabricated a row per B-tree entry without

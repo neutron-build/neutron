@@ -1105,7 +1105,9 @@ async fn refresh_refuses_over_rls_enabled_base_tables() {
     // And the non-admin path still refuses on authority, not silently
     // succeeding either.
     assert!(
-        exec_session(&ex, sid, "REFRESH MATERIALIZED VIEW docs_mv").await.is_err(),
+        exec_session(&ex, sid, "REFRESH MATERIALIZED VIEW docs_mv")
+            .await
+            .is_err(),
         "the non-admin refresh must also fail (authority gate)"
     );
 
@@ -1119,7 +1121,11 @@ async fn refresh_refuses_over_rls_enabled_base_tables() {
     // path) — the guard must not refuse plain materialized views.
     exec(&ex, "CREATE TABLE plain (v INT)").await;
     exec(&ex, "INSERT INTO plain VALUES (1)").await;
-    exec(&ex, "CREATE MATERIALIZED VIEW plain_mv AS SELECT SUM(v) AS s FROM plain").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW plain_mv AS SELECT SUM(v) AS s FROM plain",
+    )
+    .await;
     exec(&ex, "INSERT INTO plain VALUES (2)").await;
     ex.execute("REFRESH MATERIALIZED VIEW plain_mv")
         .await

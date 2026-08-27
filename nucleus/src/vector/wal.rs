@@ -962,7 +962,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
-        wal.log_insert(None, "idx", 1, &[1.0, 2.0, 3.0], "").unwrap();
+        wal.log_insert(None, "idx", 1, &[1.0, 2.0, 3.0], "")
+            .unwrap();
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
@@ -1103,7 +1104,8 @@ mod tests {
             let (wal, state) = VectorWal::open(dir.path(), &Default::default()).unwrap();
             assert!(state.indexes.is_empty());
 
-            wal.log_create_index(None, "idx1", dim as u32, 0, 8, 50).unwrap();
+            wal.log_create_index(None, "idx1", dim as u32, 0, 8, 50)
+                .unwrap();
             for i in 0..n {
                 let v: Vec<f32> = (0..dim)
                     .map(|d| ((i * 73 + d * 37) % 1000) as f32 / 1000.0)
@@ -1163,9 +1165,12 @@ mod tests {
             let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
             wal.log_create_index(None, "a", 4, 0, 8, 50).unwrap();
             wal.log_create_index(None, "b", 4, 1, 16, 100).unwrap();
-            wal.log_insert(None, "a", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert(None, "a", 2, &[0.0, 1.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert(None, "b", 10, &[0.5, 0.5, 0.0, 0.0], "").unwrap();
+            wal.log_insert(None, "a", 1, &[1.0, 0.0, 0.0, 0.0], "")
+                .unwrap();
+            wal.log_insert(None, "a", 2, &[0.0, 1.0, 0.0, 0.0], "")
+                .unwrap();
+            wal.log_insert(None, "b", 10, &[0.5, 0.5, 0.0, 0.0], "")
+                .unwrap();
             drop(wal);
         }
 
@@ -1230,9 +1235,12 @@ mod tests {
             wal.log_create_index(None, "l2", 4, 0, 8, 50).unwrap();
             wal.log_create_index(None, "cos", 4, 1, 8, 50).unwrap();
             wal.log_create_index(None, "ip", 4, 2, 8, 50).unwrap();
-            wal.log_insert(None, "l2", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert(None, "cos", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
-            wal.log_insert(None, "ip", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
+            wal.log_insert(None, "l2", 1, &[1.0, 0.0, 0.0, 0.0], "")
+                .unwrap();
+            wal.log_insert(None, "cos", 1, &[1.0, 0.0, 0.0, 0.0], "")
+                .unwrap();
+            wal.log_insert(None, "ip", 1, &[1.0, 0.0, 0.0, 0.0], "")
+                .unwrap();
             drop(wal);
         }
 
@@ -1264,8 +1272,14 @@ mod tests {
             wal.log_create_index(None, "idx1", 4, 0, 8, 50).unwrap();
             wal.log_insert(None, "idx1", 1, &[1.0, 0.0, 0.0, 0.0], r#"{"color":"red"}"#)
                 .unwrap();
-            wal.log_insert(None, "idx1", 2, &[0.0, 1.0, 0.0, 0.0], r#"{"color":"blue"}"#)
-                .unwrap();
+            wal.log_insert(
+                None,
+                "idx1",
+                2,
+                &[0.0, 1.0, 0.0, 0.0],
+                r#"{"color":"blue"}"#,
+            )
+            .unwrap();
             wal.log_insert(None, "idx1", 3, &[0.0, 0.0, 1.0, 0.0], "")
                 .unwrap();
             drop(wal);
@@ -1340,7 +1354,8 @@ mod tests {
 
         {
             let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
-            wal.log_create_index(None, "big", dim as u32, 0, 16, 50).unwrap();
+            wal.log_create_index(None, "big", dim as u32, 0, 16, 50)
+                .unwrap();
 
             let idx = make_index(n, dim, DistanceMetric::L2);
             // Log all inserts (for completeness, though snapshot will supersede them).
@@ -1453,7 +1468,8 @@ mod tests {
         bytes.extend_from_slice(&blob);
         std::fs::write(dir.path().join("vector.wal"), &bytes).unwrap();
 
-        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).expect("a legacy snapshot must still open");
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default())
+            .expect("a legacy snapshot must still open");
         assert!(
             st.indexes.contains_key("v"),
             "the legacy snapshot's index was lost"
@@ -1542,7 +1558,8 @@ mod tests {
         wal.checkpoint(&snaps).unwrap();
         drop(wal);
 
-        let (_w, st) = VectorWal::open(dir.path(), &Default::default()).expect("a checksummed snapshot must open");
+        let (_w, st) = VectorWal::open(dir.path(), &Default::default())
+            .expect("a checksummed snapshot must open");
         assert_eq!(st.indexes["v"].hnsw.len(), 24);
     }
 }
@@ -1563,9 +1580,12 @@ mod s63_tests {
         let (wal, _) = VectorWal::open(dir.path(), &Default::default()).unwrap();
         wal.log_create_index(None, "v", 4, 0, 8, 48).unwrap();
         // xact 7 committed; xact 9 never did; autocommit (0) always keeps.
-        wal.log_insert(Some(7), "v", 1, &[1.0, 0.0, 0.0, 0.0], "").unwrap();
-        wal.log_insert(Some(9), "v", 2, &[0.0, 1.0, 0.0, 0.0], "").unwrap();
-        wal.log_insert(Some(0), "v", 3, &[0.0, 0.0, 1.0, 0.0], "").unwrap();
+        wal.log_insert(Some(7), "v", 1, &[1.0, 0.0, 0.0, 0.0], "")
+            .unwrap();
+        wal.log_insert(Some(9), "v", 2, &[0.0, 1.0, 0.0, 0.0], "")
+            .unwrap();
+        wal.log_insert(Some(0), "v", 3, &[0.0, 0.0, 1.0, 0.0], "")
+            .unwrap();
         wal.log_delete(Some(9), "v", 1).unwrap();
         wal.group_sync().unwrap();
 
@@ -1574,7 +1594,10 @@ mod s63_tests {
         // Node 1 was inserted by 7 (kept) then DELETED by 9 (discarded) — so
         // it survives the filter race-free: the delete never happened.
         assert!(idx.hnsw.vector_of(1).is_some(), "kept insert");
-        assert!(idx.hnsw.vector_of(2).is_none(), "uncommitted insert discarded");
+        assert!(
+            idx.hnsw.vector_of(2).is_none(),
+            "uncommitted insert discarded"
+        );
         assert!(idx.hnsw.vector_of(3).is_some(), "autocommit insert kept");
         // The floor is pinned by EVERY tagged id, committed or not — a
         // rolled-back id must never be re-minted.

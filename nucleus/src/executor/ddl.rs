@@ -2492,7 +2492,9 @@ impl Executor {
                                 break;
                             }
                             let metadata = pk.map(|p| p.to_string()).unwrap_or_default();
-                            if let Err(e) = wal.log_insert(Some(vec_xact), &index_name, *node, v, &metadata) {
+                            if let Err(e) =
+                                wal.log_insert(Some(vec_xact), &index_name, *node, v, &metadata)
+                            {
                                 wal_err = Some(format!(
                                     "backfill insert for '{index_name}/{node}' ({e})"
                                 ));
@@ -4711,14 +4713,13 @@ impl Executor {
         // is feature-sized, post-1.0; until then, refuse over RLS-enabled
         // base tables rather than launder one context's rows.
         {
-            let protected: Vec<String> = self
-                .with_visible_security(|security| {
-                    source_tables
-                        .iter()
-                        .filter(|t| security.rls.is_enabled(t))
-                        .cloned()
-                        .collect()
-                });
+            let protected: Vec<String> = self.with_visible_security(|security| {
+                source_tables
+                    .iter()
+                    .filter(|t| security.rls.is_enabled(t))
+                    .cloned()
+                    .collect()
+            });
             if !protected.is_empty() {
                 return Err(ExecError::PermissionDenied(format!(
                     "REFRESH MATERIALIZED VIEW {view_name}: base table(s) {} have row-level \

@@ -291,8 +291,7 @@ impl BTreeIndex {
                     return Ok(true);
                 }
                 // Same continuation rule as `lookup`; see the walk there.
-                let ends_at_or_below_key =
-                    last_leaf_key(&pg).is_none_or(|l| l <= key);
+                let ends_at_or_below_key = last_leaf_key(&pg).is_none_or(|l| l <= key);
                 let next = page::read_u32(&pg, IDX_RIGHT_SIBLING);
                 if next == INVALID_PAGE_ID || !ends_at_or_below_key {
                     return Ok(false);

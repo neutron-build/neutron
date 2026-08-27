@@ -566,7 +566,6 @@ mod tests {
         assert_eq!(mgr.budget().limit(), used_before);
     }
 
-
     fn sample_rows(n: usize) -> Vec<Row> {
         (0..n)
             .map(|i| {

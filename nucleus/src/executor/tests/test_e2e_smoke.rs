@@ -864,7 +864,10 @@ async fn test_e2e_graph_node_reads_label_and_properties() {
         ref v => panic!("{v:?}"),
     };
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed["labels"][0], "Person", "label must read back: {json}");
+    assert_eq!(
+        parsed["labels"][0], "Person",
+        "label must read back: {json}"
+    );
     assert_eq!(parsed["properties"]["name"], "Alice", "text prop: {json}");
     assert_eq!(parsed["properties"]["age"], 42, "int prop: {json}");
     assert_eq!(parsed["properties"]["active"], true, "bool prop: {json}");

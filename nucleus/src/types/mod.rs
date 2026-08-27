@@ -672,9 +672,13 @@ impl Value {
             // Vector is NOT an identity cast: a VECTOR(n) column rejects any
             // other length. Downstream consumers (HNSW clamps, IVF used to
             // assert) assume uniform dims, so a mismatched value stored here
-            // is silent wrong answers or a panic later.
+            // is silent wrong answers or a panic later. VECTOR(0) is
+            // "dimension unknown" (a bare `VECTOR` declaration) and accepts
+            // any length — the dimensionless-column regression
+            // (`vector_column_scan_regression`) pins the write side, and the
+            // read side already treats 0 as unconstrained.
             (Value::Vector(v), DataType::Vector(n)) => {
-                if v.len() == *n {
+                if *n == 0 || v.len() == *n {
                     Ok(self.clone())
                 } else {
                     Err(format!(

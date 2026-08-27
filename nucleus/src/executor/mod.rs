@@ -4274,7 +4274,10 @@ impl Executor {
             .read()
             .get("slow_query_log_ms")
             .and_then(|v| v.trim_matches('\'').trim().parse::<u64>().ok())
-            .unwrap_or_else(|| self.default_slow_query_ms.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or_else(|| {
+                self.default_slow_query_ms
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
     }
 
     /// The most recent statement that crossed the slow-query threshold:

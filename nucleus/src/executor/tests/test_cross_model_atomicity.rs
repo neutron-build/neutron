@@ -1865,9 +1865,17 @@ async fn specialty_skip_warn_cadence_is_configurable() {
     exec(&ex2, "BEGIN").await;
     graph_add_node(&ex2, "Holder").await;
     ex2.note_specialty_checkpoint_skip(60);
-    assert_eq!(ex2.specialty_checkpoint_warns(), 0, "first skip of a 2-cadence run");
+    assert_eq!(
+        ex2.specialty_checkpoint_warns(),
+        0,
+        "first skip of a 2-cadence run"
+    );
     ex2.note_specialty_checkpoint_skip(60);
-    assert_eq!(ex2.specialty_checkpoint_warns(), 1, "second skip of a 2-cadence run");
+    assert_eq!(
+        ex2.specialty_checkpoint_warns(),
+        1,
+        "second skip of a 2-cadence run"
+    );
 
     // 0 disables the warning entirely; skips still count.
     let ex2 = ex2.with_specialty_skip_warn_every(0);
