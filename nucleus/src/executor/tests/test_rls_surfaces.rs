@@ -1066,3 +1066,66 @@ async fn schema_qualifying_a_specialty_call_does_not_bypass_the_fail_closed_guar
         .expect("schema-qualified ordinary builtin must still resolve");
     assert_eq!(scalar(&r[0]), &Value::Text("ABC".into()));
 }
+
+// ============================================================================
+// Group G — REFRESH MATERIALIZED VIEW over a policy-protected table
+// ============================================================================
+
+/// 587 (policy-aware refresh semantics): a materialized view stores rows
+/// without policy provenance, and `REFRESH` re-executes the view query under
+/// the CALLING session. Refreshed by a session whose RLS context differs from
+/// the definer's, the MV silently becomes tenant-scoped. Until refresh is
+/// definer-context (feature-sized, post-1.0), it must REFUSE over RLS-enabled
+/// base tables rather than bake one principal's rows in as if they were the
+/// table.
+#[tokio::test]
+async fn refresh_refuses_over_rls_enabled_base_tables() {
+    let ex = test_executor();
+    let sid = setup(&ex).await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW docs_mv AS SELECT * FROM docs",
+    )
+    .await;
+
+    // Base table RLS-enabled (setup() enables docs): the refresh must refuse
+    // even for a session that holds refresh authority, naming the policy
+    // conflict — an admin refreshing under their own RLS context is exactly
+    // the tenant-scoping trap the refusal exists to prevent. (A non-admin
+    // session is refused earlier by the authority gate; that is a different,
+    // already-correct check.)
+    let err = ex
+        .execute("REFRESH MATERIALIZED VIEW docs_mv")
+        .await
+        .expect_err("refresh over an RLS-enabled base table must refuse");
+    assert!(
+        err.to_string().to_lowercase().contains("row-level"),
+        "the refusal must name the policy conflict, got: {err}"
+    );
+    // And the non-admin path still refuses on authority, not silently
+    // succeeding either.
+    assert!(
+        exec_session(&ex, sid, "REFRESH MATERIALIZED VIEW docs_mv").await.is_err(),
+        "the non-admin refresh must also fail (authority gate)"
+    );
+
+    // The stored rows are untouched by the refused refresh.
+    let res = exec(&ex, "SELECT COUNT(*) FROM docs_mv").await;
+    if let ExecResult::Select { rows, .. } = &res[0] {
+        assert_eq!(rows[0][0], Value::Int64(3), "setup loaded 3 docs rows");
+    }
+
+    // Without RLS on the base table, refresh keeps working (the ordinary
+    // path) — the guard must not refuse plain materialized views.
+    exec(&ex, "CREATE TABLE plain (v INT)").await;
+    exec(&ex, "INSERT INTO plain VALUES (1)").await;
+    exec(&ex, "CREATE MATERIALIZED VIEW plain_mv AS SELECT SUM(v) AS s FROM plain").await;
+    exec(&ex, "INSERT INTO plain VALUES (2)").await;
+    ex.execute("REFRESH MATERIALIZED VIEW plain_mv")
+        .await
+        .expect("refresh over a non-RLS base table must still work");
+    let res = exec(&ex, "SELECT s FROM plain_mv").await;
+    if let ExecResult::Select { rows, .. } = &res[0] {
+        assert_eq!(rows[0][0], Value::Int64(3), "refresh must re-execute: 1+2");
+    }
+}

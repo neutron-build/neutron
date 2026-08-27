@@ -13,6 +13,7 @@ cannot drift from the parser.
 | [ROLLBACK.md](ROLLBACK.md) | Going back, and the cases where going back is not possible |
 | [SECURITY.md](SECURITY.md) | Authentication, roles, RLS, encryption at rest, TLS, network exposure, and secret handling |
 | [INCIDENT.md](INCIDENT.md) | Triage for the failure modes this engine actually has: read-only disk watermark, connection exhaustion, memory ceiling, slow recovery, WAL growth, corruption |
+| [MAINTENANCE.md](MAINTENANCE.md) | CHECKPOINT, VACUUM (the compaction path), ANALYZE, why integrity checking lives in the probe fleet, and what is deliberately absent |
 | [06-cluster.md](06-cluster.md) | The cluster surface that exists (flags, tokens, the seed-listen role), why distributed mode is unsupported, and what that means operationally |
 
 ## Runbooks that are deliberately absent

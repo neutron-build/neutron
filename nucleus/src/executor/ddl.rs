@@ -4691,13 +4691,40 @@ impl Executor {
         view_name: &str,
     ) -> Result<ExecResult, ExecError> {
         let view_name = view_name.to_lowercase();
-        let sql = {
+        let (sql, source_tables) = {
             let views = self.materialized_views.read().await;
             let mv = views.get(&view_name).ok_or_else(|| {
                 ExecError::TableNotFound(format!("materialized view '{view_name}' not found"))
             })?;
-            mv.sql.clone()
+            (mv.sql.clone(), mv.source_tables.clone())
         };
+        // Policy-aware refresh (587): a materialized view stores rows without
+        // policy provenance, and refresh re-executes the view query under the
+        // CALLING session. Refreshed by a session whose row-level context
+        // differs from the definer's, the MV silently becomes scoped to that
+        // principal — baked in as if it were the table. Definer-context
+        // refresh (capturing the owner at CREATE) is the real semantics and
+        // is feature-sized, post-1.0; until then, refuse over RLS-enabled
+        // base tables rather than launder one context's rows.
+        {
+            let protected: Vec<String> = self
+                .with_visible_security(|security| {
+                    source_tables
+                        .iter()
+                        .filter(|t| security.rls.is_enabled(t))
+                        .cloned()
+                        .collect()
+                });
+            if !protected.is_empty() {
+                return Err(ExecError::PermissionDenied(format!(
+                    "REFRESH MATERIALIZED VIEW {view_name}: base table(s) {} have row-level \
+                     security enabled, and a refreshed view bakes in the refreshing session's \
+                     policy context instead of the definer's. Disable RLS on the base table, or \
+                     rebuild the view per principal.",
+                    protected.join(", ")
+                )));
+            }
+        }
         let results = self.execute(&sql).await?;
         let result = results.into_iter().next().ok_or_else(|| {
             ExecError::Unsupported("materialized view query returned no result".into())

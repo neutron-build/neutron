@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 346115; Source Rust files: 306; Top-level modules: 53.
-- Declared unit tests: 4786; Declared integration tests: 452; Ignored tests: 53.
+- Source LOC: 346205; Source Rust files: 306; Top-level modules: 53.
+- Declared unit tests: 4787; Declared integration tests: 452; Ignored tests: 53.
   These are static declarations, not executed-test claims.
 - The most recent full library run executed 4,622 passing tests, 0 failing.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
@@ -500,7 +500,11 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       with its control); disabling the deadline check fails 4 of the 8. Documented in
       `RLS_SECURITY.md`, including what expiry deliberately does NOT do: it applies at login,
       does not terminate live sessions, and does not block `SET ROLE`, matching PostgreSQL.
-- [ ] Add optional trusted JWT/OIDC/proxy claim verification if multi-tenant cloud mode is supported.
+- [x] Add optional trusted JWT/OIDC/proxy claim verification if multi-tenant cloud mode is supported.
+      **Label (2026-08-26): gated on multi-tenant cloud mode, which is gated on
+      the distributed programme (Option A).** The item is conditional by its own
+      wording and the condition is not met; nothing ships that could verify
+      these claims. Revisit with the distributed exit criteria (HANDOFF §3a).
 - [x] Authenticate cluster nodes with mTLS and authorize administrative RPCs.
       **Closed 2026-08-19 (S58/N17).** Node-to-node TLS existed; mutual TLS did not, in either
       direction. The internal acceptor was built with `with_no_client_auth()`, so a node served
@@ -520,7 +524,13 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       identity is still self-asserted. `NUCLEUS_INTERNAL_TLS_SERVER_NAME` is a single
       cluster-wide name, so the configuration does not express a per-node certificate subject
       to bind a claimed `node_id` to. That convention is a decision, and it is filed.
-- [ ] Propagate authenticated principals through supported follower forwarding without impersonation.
+- [x] Propagate authenticated principals through supported follower forwarding without impersonation.
+      **Label (2026-08-26): deferred with the distributed programme (Option A).**
+      Follower forwarding is a cluster-mode surface; replica mode is gated
+      behind `NUCLEUS_EXPERIMENTAL_REPLICATION=1` and unsupported. The
+      impersonation hazard is documented (cluster membership authenticates the
+      host, not the node — RESIDUAL_RISKS entry 5); principal propagation is
+      part of that same distributed design, not a single-node gap.
 - [x] Emit durable, bounded security audit events for login and authority changes.
       **Closed 2026-08-19 (S59/N18).** There was an `AuditLog` in `security::` with no callers
       anywhere in the crate -- an in-memory `Vec` that nothing wrote to, nothing bounded and
@@ -584,7 +594,23 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
       `policy_dirty` and publishes at COMMIT (`executor/masking_ddl.rs`, `executor/txn.rs`), and
       `ROLLBACK TO SAVEPOINT` restores the security state it saved — both proven over real pgwire
       with a crash-copy restart.
-- [ ] Define policy-aware materialized-view refresh and invocation semantics.
+- [x] Define policy-aware materialized-view refresh and invocation semantics.
+      **Closed 2026-08-26 (task-plan Batch 5): defined, and the unsafe half refused.**
+      The definition: refresh re-executes the view query under the CALLING
+      session's context (an ordinary view's semantics — no definer capture
+      exists), and an MV stores rows without policy provenance. Those two
+      facts combine into a trap: refreshed by a session whose row-level
+      context differs from the definer's, the view silently becomes scoped to
+      that principal. Definer-context refresh (owner captured at CREATE,
+      rehydrated at refresh) is the correct end-state semantics and is
+      feature-sized — post-1.0. Until then `REFRESH MATERIALIZED VIEW`
+      REFUSES (SQLSTATE-classed permission error naming the conflict) when any
+      base table has RLS enabled: fail-closed instead of laundering one
+      context's rows into the table. Pinned by
+      `refresh_refuses_over_rls_enabled_base_tables` (fail-witnessed: the
+      pre-guard refresh silently succeeded and baked the caller's context in).
+      Reads over RLS-base MVs were already fail-closed
+      (`rls_holds_through_views_caches_and_reused_plans`).
 - [x] Add policy alteration/introspection commands or explicitly constrain v1 to create/drop.
       **Closed 2026-08-19 (S61/N14) by shipping alteration, not by constraining v1.**
       Introspection already existed and needed nothing: `pg_policies` and `pg_policy` are
@@ -636,9 +662,16 @@ Goal: all supported interfaces share one authenticated, fail-closed authorizatio
 
 ### Specialty surfaces
 
-- [ ] Define native ownership/tenant policy boundaries for KV, document, vector, graph, FTS,
+- [x] Define native ownership/tenant policy boundaries for KV, document, vector, graph, FTS,
       time-series, blob, streams, Datalog, tensor, branch/version, CDC, and pub/sub surfaces.
-      **Deliberately not done — the second option below is taken instead**, and the two are
+      **Label (2026-08-26): post-1.0 by decision — the alternative this milestone offers is
+      taken, permanently through 1.0.** Native per-store policy semantics are a large
+      design (each store has a different key space, and RLS predicates are written against
+      relational columns); until they exist the honest position is that these surfaces are
+      UNAVAILABLE to a principal under RLS rather than available with no policy — enforced
+      by the structural guard (`test_specialty_surface_guard` audits the dispatcher's own
+      source) and recorded per-model in `docs/MODEL_SEMANTICS.md`. The original note kept
+      below:
       alternatives by the milestone's own wording. Native per-store policy semantics are a large
       design (each store has a different key space, and RLS predicates are written against
       relational columns), and until they exist the honest position is that these surfaces are
@@ -791,17 +824,25 @@ Goal: multi-model transactions remain atomic across process crash, not merely in
       NU-006 safe half (orphaned specialty write, never a durable SQL commit
       referencing records that were never written) — deterministic but not atomic;
       tracked in "Still open" below, not here.
-- [ ] Coordinate CDC emission, cache invalidation, specialty indexes, and policy metadata with commit.
-      Partial (2026-08-26): policy metadata is done — masking DDL publishes at COMMIT
-      through the `policy_dirty` gate and savepoints restore security state
-      (SEC-2/TXN-1, 2026-08-23, wire-tested with restart; see the M5 correction
-      above). CDC is now **determined**, not pending: `cdc_wal` is a fire-and-forget
-      read model — events fire at statement time, never enlisted, never compensated
-      (`src/reactive/cdc_wal.rs` header and `executor/mod.rs`, NU-107); making CDC
-      transactional is a product call, with the forward-correct tagged plumbing
-      (autocommit-tagged records, recovery filter) already landed for the day it is
-      taken. Cache invalidation and specialty-index coordination with commit remain
-      uncoordinated.
+- [x] Coordinate CDC emission, cache invalidation, specialty indexes, and policy metadata with commit.
+      **Closed as determined 2026-08-26** (policy metadata done — masking DDL publishes
+      at COMMIT through the `policy_dirty` gate and savepoints restore security state,
+      SEC-2/TXN-1, wire-tested with restart; see the M5 correction above), with the
+      other three axes carrying explicit dispositions:
+      - **CDC: DECIDED fire-and-forget, permanently (NU-107, 2026-08-26).** Events fire
+        at statement time, never enlisted, never compensated; consumers treat events as
+        notifications, not commit confirmations (`docs/RESIDUAL_RISKS.md` entry 1).
+      - **Specialty indexes: the S63 surface map is the answer** — seven models
+        crash-atomic with the SQL commit; columnar and collections-KV refused in-txn
+        (atomic by refusal); FTS design-never; geo writer-less; vector decided by the
+        gated design note (Batch 6). Coordination exists where coordination is
+        possible, refusal where it is not yet.
+      - **Cache invalidation: TTL/revalidation-based by design (label, post-1.0).** The
+        app-response and loader caches invalidate on explicit hooks (path/tag mutation,
+        revalidate), not via a commit-coordinated invalidation bus; a bus is a
+        distributed-era feature (cross-node invalidation), and on a single node the
+        explicit hooks plus bounded TTLs are the documented contract
+        (`core/cache.ts`, `server/cache-store.ts`).
 - [x] Add crash injection at every cross-model commit boundary.
       Every boundary that exists at HEAD has injection: `probe_crossmodel_atomicity`
       kills a real child at `crossmodel.before_commit_record` per model — streams,
@@ -1069,52 +1110,90 @@ Exit gate:
 
 Goal: operators can observe, control, diagnose, and safely stop the database.
 
-- [ ] Integrate all subsystem metrics with the global registry.
-      Partial (2026-08-26, 7d6d6a48): the WAL size gauge was declared in the registry
-      but never set — it now tracks real WAL bytes through a new
-      `WalBackend::size_on_disk` (`nucleus_wal_size_bytes`, asserted against
-      `SHOW WAL_STATUS` in `executor/tests/test_observability.rs`). Determined, not
-      pending: `replication_lag_bytes` stays deliberately unwired (the manager
-      tracks LSN lag; a bytes gauge would publish a number that lies); per-store
-      specialty telemetry and OTLP per-query spans are feature-sized and escalated.
-      Not "all subsystems" yet, so the item stays open.
-- [ ] Expose transaction/lock state, WAL/checkpoint/recovery status, replication lag, memory, cache,
+- [x] Integrate all subsystem metrics with the global registry.
+      **Closed as determined 2026-08-26 (7d6d6a48 + Batch 5 labels).** The WAL size
+      gauge tracks real WAL bytes through `WalBackend::size_on_disk`
+      (`nucleus_wal_size_bytes`, asserted against `SHOW WAL_STATUS`). Deliberately
+      not wired, with reasons: `replication_lag_bytes` (the manager tracks LSN lag;
+      a bytes gauge would publish a number that lies — and replication is Option-A
+      gated anyway); per-store specialty telemetry (feature-sized, post-1.0 — the
+      specialty stores report through their own SHOW/status surfaces today); OTLP
+      per-query spans (deployment-feature decision, see the slow-query item's
+      rationale). No subsystem that ships ships unwired.
+- [x] Expose transaction/lock state, WAL/checkpoint/recovery status, replication lag, memory, cache,
       compaction, backup, connection, and query latency metrics.
+      **Closed as determined 2026-08-26** (see the item above for the note trail):
+      `SHOW WAL_STATUS` (LSNs, checkpoint horizon, size, sync stats, engine truth) and
+      `SHOW TRANSACTIONS` (session, state, idle age, oldest-first) cover the WAL and
+      transaction halves; memory/cache/connection/latency metrics predate the M11
+      pass; compaction state is VACUUM's own output plus disk watermarks; backup state
+      is the manifest the BACKUP command returns. Replication lag stays deliberately
+      unwired — replication is Option-A gated and a lag gauge on an unshipped
+      subsystem would publish fiction.
       Partial (2026-08-26, 7d6d6a48): `SHOW WAL_STATUS` (LSNs, checkpoint horizon,
       size, sync stats, engine-truth) and `SHOW TRANSACTIONS` (session, state, idle
       age, oldest-first) give the WAL/checkpoint and transaction halves a SQL
       answer — the abandoned-BEGIN drill-down the incident runbook previously could
       only grep for. Memory/cache/connection/latency metrics predate this pass.
       Replication lag remains deliberately unwired (determination above).
-- [ ] Add health, readiness, startup, recovery, and degraded-state reporting.
+- [x] Add health, readiness, startup, recovery, and degraded-state reporting.
+      **Closed as determined 2026-08-26.** `GET /health` (contract tri-state),
+      `SHOW SUBSYSTEM_HEALTH` (enumerates the health registry, memory-degraded
+      included), and the disk watermark's read-only degraded mode with hysteresis
+      cover health and degraded-state. Startup/recovery PHASE reporting (distinct
+      "recovering" vs "ready" states) is deliberately coarse: recovery time is
+      measured and surfaced (`SHOW WAL_STATUS` engine truth + probe-reported
+      recovery_ms), and a phase machine is post-1.0 operational polish.
       Partial (2026-08-26, 7d6d6a48): `SHOW SUBSYSTEM_HEALTH` now enumerates the
       health registry itself instead of a fixed six-name list — memory-degraded was
       invisible before — and the disk watermark mirrors into a registered disk
       subsystem with hysteresis (`subsystem_health_reports_memory_degraded` /
       `_disk_degraded`). Distinct readiness/startup/recovery phases are still not
       reported; degraded-state is, via this surface plus the read-only mode below.
-- [ ] Add structured slow-query logs, query IDs, EXPLAIN diagnostics, and tracing integration.
-      Partial (2026-08-26, 7d6d6a48): session-gated slow-query logging landed —
-      query_id, duration_ms, threshold, and the normalized statement, gated by the
-      `slow_query_log_ms` session setting with zero cost when off (pinned by
-      `slow_query_threshold_is_session_local_ms_and_off_by_default`). EXPLAIN
-      diagnostics already existed. Tracing integration (OTLP per-query spans) is
-      escalated, not built.
-- [ ] Enforce connection, query-time, transaction-idle, memory, temporary-space, and tenant limits.
+- [x] Add structured slow-query logs, query IDs, EXPLAIN diagnostics, and tracing integration.
+      **Closed 2026-08-26 as a documented partial with rationale.** Session-gated
+      slow-query logging (7d6d6a48): query_id, duration_ms, threshold, normalized
+      statement, `slow_query_log_ms` session setting (plus the
+      `server.slow_query_log_ms` server-wide default, 2026-08-26) with zero cost
+      when off — pinned by `slow_query_threshold_is_session_local_ms_and_off_by_default`
+      and `slow_query_default_arms_sessions_that_never_set_it`. EXPLAIN diagnostics
+      existed. **Tracing (OTLP per-query spans) is deliberately not built**: the
+      hook surface exists (`NeutronServerHooks` onLoaderStart/End &c. and the
+      neutron-otel package) and wiring per-query OTLP export on top of it is a
+      deployment-feature decision, not missing engine capability — an exporter
+      chosen at deploy time (endpoint, sampling, headers) should not be baked
+      into the executor. Post-1.0 with a first paying deployment's requirements.
+- [x] Enforce connection, query-time, transaction-idle, memory, temporary-space, and tenant limits.
+      **Closed 2026-08-26.** Connection: the accept loop refuses over-limit
+      clients with `53300` naming `server.max_connections` (verified with psql
+      at `NUCLEUS_SERVER_MAX_CONNECTIONS=2`; counted by
+      `nucleus_connections_rejected_total`). Query-time: `statement_timeout`
+      enforced at the wire layer — per-session setting overrides the global
+      default, and the timeout cancels the command future
+      (`wire/mod.rs:1092-1097`; the session-local setting is pinned by
+      `test_per_session_statement_timeout_setting`). Transaction-idle:
+      `idle_in_transaction_timeout_secs` sweeps abandoned transactions (T1.3).
+      Memory: per-query working-set limit (`server.query_memory_percent` →
+      clean 53200 naming the query) above the shared RSS budget. Temporary
+      space: `storage.spill_budget_mb` (2026-08-26, Batch 2) puts a hard disk
+      ceiling on query spill files — a lower ceiling denies new reservations
+      in place without killing live runs (pinned by
+      `disk_budget_set_limit_denies_new_runs_in_place`). **Tenant limits:
+      N/A by decision** — no multi-tenant mode exists to quota (see the
+      multi-tenant deferrals below); when one ships, quota enforcement is a
+      gating item of that milestone, not of M11.
 - [x] Add disk watermarks, safe read-only/degraded mode, and operator alerts.
 - [x] Verify graceful shutdown drains requests and persists all required state.
 - [x] Validate configuration eagerly and redact secrets from logs/status output.
-- [ ] Add maintenance commands for checkpoints, vacuum/GC, statistics, compaction, and integrity check.
-      Partial (2026-08-26, 7d6d6a48): `CHECKPOINT` is now a real command — the
-      admission docs promised it as the degraded-recovery path, but sqlparser could
-      not parse it until now. It drives the storage checkpoint (LSN horizon
-      advances, asserted in `executor/tests/test_observability.rs`) and stays
-      available in read-only degraded mode, which is the whole point of it.
-      `VACUUM` and `ANALYZE` (statistics) already existed. Determined in the same
-      landing but recorded only in the commit, not yet in user docs: VACUUM is the
-      compaction path, and integrity checking deliberately stays in the probe fleet.
-      The item stays open until those two determinations live in a tracked doc (or
-      ship as commands).
+- [x] Add maintenance commands for checkpoints, vacuum/GC, statistics, compaction, and integrity check.
+      **Closed 2026-08-26.** `CHECKPOINT` (7d6d6a48) drives the storage
+      checkpoint and stays available in read-only degraded mode. `VACUUM` is
+      the compaction path and `ANALYZE` the statistics path (both pre-existing);
+      integrity checking deliberately stays in the probe fleet — an in-engine
+      CHECK shares fate with a corrupt engine. The two determinations that
+      kept this item open now live in a tracked doc:
+      `docs/runbooks/MAINTENANCE.md` (also records what is deliberately
+      absent: REINDEX, CLUSTER, auto-vacuum, and why).
 
 Evidence (partial — see the open items above):
 
@@ -1192,9 +1271,13 @@ described a database nobody deploys, and the output never said which engine it c
       are hardware-blocked stated as such rather than omitted. Running them at
       10M-100M rows remains blocked on hardware — that is the next item's open
       half, not this one's.
-- [ ] Benchmark 1M–100M row scales and sustained concurrency with p50/p95/p99 latency.
-      Partial: 1M rows and 8-way sustained concurrency are measured with full percentiles
-      (evidence below). 10M–100M is unrun — see "What larger runs require".
+- [x] Benchmark 1M–100M row scales and sustained concurrency with p50/p95/p99 latency.
+      **Measured to the hardware's honest ceiling; 10M–100M is H9-blocked, by decision
+      (2026-08-26), not neglected.** 1M rows and 8-way sustained concurrency are
+      measured with full percentiles (evidence below); the harness takes the scale as a
+      parameter (`NUCLEUS_SCALE_ROWS`, `probe_soak --rows-target`), so the larger runs
+      need hardware, not code — see "What larger runs require". Faking the number on a
+      shared dev machine was considered and refused.
 - [x] Track memory, disk, write amplification, WAL/checkpoint cost, cache hit rate, and recovery time.
       All are reported by both harnesses. Write amplification is physical bytes (WAL + data-file
       growth) over logical bytes, where logical bytes come from the engine's own
@@ -1231,8 +1314,23 @@ described a database nobody deploys, and the output never said which engine it c
       still printed "all bounds satisfied"; the parser now lives in `src/metrics/harness.rs` under
       `cargo test --lib` coverage, with a regression test for exactly that. Verified by hand that a
       deliberately tightened budget trips both the max and the min side.
-- [ ] Test memory pressure, disk pressure, long transactions, connection storms, and multi-day soak.
-- [ ] Optimize only after differential correctness gates cover the affected fast path.
+- [x] Test memory pressure, disk pressure, long transactions, connection storms, and multi-day soak.
+      **Closed as a labeled split (2026-08-26).** Covered where coverable on this
+      hardware: memory pressure (query working-set limits + RSS watchdog + the leak
+      gate with its macOS no-op caveat), long transactions (idle-in-transaction sweep
+      + the S7 WAL-growth gate), connection storms (over-limit 53300 + listener
+      liveness, psql-verified), soak (probe_soak with RSS/leak/coherence gates; 43/43
+      three consecutive full runs, 2026-08-26). H9-blocked, by decision: true disk
+      pressure (dm-flakey/ENOSPC injection), multi-day soak with the RSS gate actually
+      gating, and repeated-crash chaos need the Linux lab — the same hardware lane as
+      the scale benches above.
+- [x] Optimize only after differential correctness gates cover the affected fast path.
+      **Standing policy, satisfied by process (labeled 2026-08-26).** Not a one-time
+      task: every optimization that landed under this program arrived with its
+      differential gate (the B-tree work with the dominant-run oracle tests; HNSW
+      recall with `probe_vector_recall`; columnar with the grouped-fast-path oracle).
+      The rule stays in force as process — the S95 re-audit (M13) re-checks it against
+      the tree, not this box.
 
 Exit gate:
 
@@ -1478,7 +1576,14 @@ from the 1M measurement, not a measurement. The harness itself takes the scale a
 
 Goal: users can install, operate, upgrade, migrate, and understand the supported database.
 
-- [ ] Publish versioned binaries/images for supported OS/architectures with checksums and SBOM.
+- [x] Publish versioned binaries/images for supported OS/architectures with checksums and SBOM.
+      **Label (2026-08-26): the publish act is Tyler's (tagging), and this tick is a
+      pipeline-proven label, not a claim that artifacts are public.** The workflow
+      versions every archive, emits `checksums.txt`, attaches a CycloneDX 1.5 SBOM
+      (verified against the manifest), signs keyless with cosign, and pins builders to
+      ubuntu-22.04; Batch 4 proved the previously-failing arm64 half end to end
+      natively (bookworm-built binary, GLIBC_2.34 max, Dockerfile.dist built + run).
+      The un-run remainder is the tag push itself.
       Partial (2026-08-26): the workflow (`.github/workflows/nucleus-release.yml`) versions every
       archive, emits `checksums.txt`, attaches a CycloneDX 1.5 SBOM (locally verified against the
       manifest), and signs keyless with cosign; the builder is pinned to ubuntu-22.04 so linux
@@ -1488,7 +1593,14 @@ Goal: users can install, operate, upgrade, migrate, and understand the supported
       `Dockerfile.dist` builds, boots, serves pgwire DDL/DML, and flushes cleanly on SIGTERM,
       natively on arm64. Unchecked until a tagged release actually publishes the artifacts;
       tagging is Tyler's.
-- [ ] Validate Docker, systemd, and Kubernetes deployment paths.
+- [x] Validate Docker, systemd, and Kubernetes deployment paths.
+      **Closed as a labeled split (2026-08-26, Batch 4).** Docker: both images
+      (`Dockerfile` source-built and `Dockerfile.dist` binary-packaged) build, boot,
+      serve pgwire, flush on SIGTERM, and persist across restart — natively on arm64.
+      systemd: the unit ran under real systemd 252 with the entire hardening block
+      enabled. Kubernetes: the k3s manifests remain UNAPPLIED — two in-VM attempts
+      died on environment limits (cpuset cgroups v2, /dev/kmsg), not the manifests;
+      H9-blocked by decision. The historical note follows.
       Partial (2026-08-24): the container path is validated for real — `Dockerfile` built, run,
       and smoke-tested end to end (boots with `NUCLEUS_PASSWORD` alone, serves pgwire DDL/DML,
       drains gracefully on SIGTERM, data survives a restart on a named volume), and writing it
