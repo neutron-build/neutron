@@ -1479,6 +1479,15 @@ from the 1M measurement, not a measurement. The harness itself takes the scale a
 Goal: users can install, operate, upgrade, migrate, and understand the supported database.
 
 - [ ] Publish versioned binaries/images for supported OS/architectures with checksums and SBOM.
+      Partial (2026-08-26): the workflow (`.github/workflows/nucleus-release.yml`) versions every
+      archive, emits `checksums.txt`, attaches a CycloneDX 1.5 SBOM (locally verified against the
+      manifest), and signs keyless with cosign; the builder is pinned to ubuntu-22.04 so linux
+      binaries never again require a glibc newer than the bookworm runtime image — the arm64
+      failure mode was reproduced to its root (v0.1.8's arm64 binary required GLIBC_2.38) and the
+      fix verified: a bookworm-built arm64 binary (max symbol GLIBC_2.34) packaged via
+      `Dockerfile.dist` builds, boots, serves pgwire DDL/DML, and flushes cleanly on SIGTERM,
+      natively on arm64. Unchecked until a tagged release actually publishes the artifacts;
+      tagging is Tyler's.
 - [ ] Validate Docker, systemd, and Kubernetes deployment paths.
       Partial (2026-08-24): the container path is validated for real — `Dockerfile` built, run,
       and smoke-tested end to end (boots with `NUCLEUS_PASSWORD` alone, serves pgwire DDL/DML,
@@ -1489,11 +1498,14 @@ Goal: users can install, operate, upgrade, migrate, and understand the supported
       the seed role — 81bd2982), replication auth was SKIPPED when no
       cluster token was set (now fail-closed), the deploy README's psql examples used the wrong
       bootstrap role, and `HEALTHCHECK` is silently dropped in OCI-format images (documented with
-      the workaround). Still unvalidated: `Dockerfile.dist` (never built — it needs Linux release
-      binaries; the 2026-08-24 attempt packaged the host's macOS binary), the systemd unit (flags
-      re-verified statically against `nucleus start --help`; still never loaded by systemd), and
-      the k3s manifests (still never applied). `deploy/README.md` carries the dated verification
-      table.
+      the workaround).
+      Extended (2026-08-26, Batch 4): `Dockerfile.dist` **built and run on native arm64** with a
+      bookworm-built binary (see above; `deploy/README.md` for the sequence), and the systemd
+      unit **loaded and run by real systemd 252** (privileged bookworm container): starts with
+      the entire hardening block enabled, serves pgwire, `systemctl stop` flushes cleanly, a
+      second start serves from the same StateDirectory. Still unvalidated: the k3s manifests —
+      two attempts to run k3s inside the dev host's container VM failed on environment limits
+      (cpuset cgroups v2, then /dev/kmsg), not the manifests; real hardware (H9 lane) closes it.
 - [x] Add PostgreSQL/SQLite import and export workflows with validation reports.
       **Landed 2026-08-24 (S98).** `nucleus import --from <postgres connection string |
       file.sqlite | dump.sql> [--report r.json]` and `nucleus export --target postgres|sqlite

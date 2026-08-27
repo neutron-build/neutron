@@ -1,8 +1,9 @@
 # Nucleus on k3s — single instance.
 #
-# STATUS: WRITTEN, NOT YET APPLIED. No Kubernetes cluster exists to apply it
-# to; see `nucleus/deploy/README.md` for what was and was not checked, and for
-# the acceptance sequence to run on a k3s node.
+# STATUS: WRITTEN, NOT YET APPLIED. Schema-checked (kubeconform, 1.31.0); two
+# attempts to run k3s inside the development host's container VM failed on
+# environment limits (cpuset cgroups v2, then /dev/kmsg) rather than on these
+# manifests — see `nucleus/deploy/README.md`.
 #
 # k3s rather than managed Kubernetes: it installs in one command on a Proxmox
 # VM, ships a working default StorageClass (`local-path`), and — unlike

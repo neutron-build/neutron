@@ -1,8 +1,9 @@
 # Nucleus — systemd unit
 #
-# STATUS: WRITTEN, NOT YET RUN. This file has never been loaded by a systemd
-# instance; the development machine is macOS. `nucleus/deploy/README.md` has
-# the exact verification sequence to run on a Linux host before trusting it.
+# STATUS: RUN. Loaded by a real systemd (252, bookworm, privileged container
+# on the arm64 host) on 2026-08-26: starts with the full hardening block
+# enabled, serves pgwire, and stops with a clean flush. See
+# `nucleus/deploy/README.md` for the verification record.
 #
 # Install:
 #   install -m 0644 nucleus.service /etc/systemd/system/nucleus.service
