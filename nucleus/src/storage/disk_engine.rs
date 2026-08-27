@@ -3771,7 +3771,15 @@ impl DiskEngine {
                 .read_guard(rid.page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             if let Some(row) = Self::read_tuple_at(&pg, rid.slot_idx, &col_types) {
-                rows.push(row);
+                // Stale-entry recheck, the same guard as `index_lookup_inner`:
+                // a stranded entry may name a slot a later insert recycled
+                // into a different row, and returning that occupant verbatim
+                // is `WHERE k = 3` answering with the k = 2 row. The entry's
+                // own key (not the range bounds) is what the occupant must
+                // match — every entry in the window carries its own.
+                if idx.col_idx < row.len() && serialize_index_key(&row[idx.col_idx]) == key {
+                    rows.push(row);
+                }
             }
         }
         Ok(rows)
@@ -5044,6 +5052,55 @@ mod tests {
             "index_positions must apply the same recheck: {positions:?}"
         );
         assert_eq!(positions[0].1, simple_row(3, "u3"));
+    }
+
+    /// STO-3, range arm: the range scan resolves each entry's RowId against
+    /// the heap and must apply the SAME stale-entry recheck as the point
+    /// path — returning the occupant of a recycled slot verbatim is
+    /// `WHERE k = 3` answering with the k = 2 row.
+    #[tokio::test]
+    async fn index_range_lookup_rejects_stale_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "stale3").await;
+        engine.create_table("stale3").await.unwrap();
+        for i in 1..=3 {
+            engine
+                .insert("stale3", simple_row(i, &format!("u{i}")))
+                .await
+                .unwrap();
+        }
+        engine.create_index("stale3", "ix", 0).await.unwrap();
+        strand_stale_entry(&engine).await;
+
+        let range = engine
+            .index_lookup_range(
+                "stale3",
+                "ix",
+                std::ops::Bound::Included(&Value::Int32(3)),
+                std::ops::Bound::Included(&Value::Int32(3)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range,
+            vec![simple_row(3, "u3")],
+            "range arm must not surface the stale entry's occupant as k=3"
+        );
+
+        // A wider window over the stale key must stay clean too.
+        let window = engine
+            .index_lookup_range(
+                "stale3",
+                "ix",
+                std::ops::Bound::Included(&Value::Int32(1)),
+                std::ops::Bound::Included(&Value::Int32(3)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.len(), 3, "one row per live id, stale screened: {window:?}");
     }
 
     /// STO-3: index-only scans fabricated a row per B-tree entry without

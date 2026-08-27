@@ -32,7 +32,12 @@ churn, leak-free steady state, and recovery after the run.
 **Harness.** `probe_soak` is this workload — op classes `insert`, `update`,
 `select` (PK and secondary halves), `kv_set`, `delete`, mixed roughly half
 inserts with the rest split across update/select/kv/delete
-(`src/bin/probe_soak.rs`; workers' op mix at `:215-289`). Defaults:
+(`src/bin/probe_soak.rs`; workers' op mix at `:215-289`). Post-run coherence
+checks PK point lookups against same-key range scans and seq scans (with a
+discriminator that names the failing mechanism), encrypted-index postings, and
+— because the `val` secondary index is the dense duplicate-key regime
+(64 distinct values across every row) — per-value agreement between the index
+path (`WHERE val = v`) and the heap path (`val + 0`). Defaults:
 `--engine buffered-disk` (the engine `nucleus serve` runs), `--concurrency 8`,
 `--duration-secs 20`; `--rows-target N` bulk-loads before the concurrent
 phase; `--json` emits the machine-readable record. Per-op p50/p95/p99,

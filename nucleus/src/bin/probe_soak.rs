@@ -410,20 +410,27 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
                 // _internal/PROBE_SOAK_CI_INVESTIGATION.md §6.2). The point
                 // path (index_lookup_inner) rechecks each fetched row's
                 // serialized key against the probe; the range path
-                // (index_lookup_range_inner) seeks the SAME B-tree but
-                // returns the entry's row verbatim; `id + 0` defeats the
-                // index and reads the heap. So:
-                //   point=0 range=1        -> entry present, recheck dropped it
+                // (index_lookup_range_inner) seeks the SAME B-tree and applies
+                // the same recheck per entry; `id + 0` defeats the index and
+                // reads the heap. So:
                 //   point=0 range=0 seq=1  -> entry lost from the B-tree
                 //   point=0 range=0 seq=0  -> row itself missing (heap loss)
-                let range = db
+                //   point=0 range=1, range's row id != rid
+                //     -> stale entry surfacing another row (slot recycling)
+                //   point=0 range=1, range's row id == rid
+                //     -> entry present and resolving, point descent missed it
+                let range_row = db
                     .query(&format!(
                         "SELECT id FROM soak WHERE id >= {rid} AND id <= {rid}"
                     ))
                     .await
                     .ok()
-                    .map(|r| r.len().to_string())
-                    .unwrap_or_else(|| "err".into());
+                    .and_then(|r| r.first().cloned());
+                let range = range_row.is_some().to_string();
+                let range_id = range_row
+                    .and_then(|r| r.first().cloned())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into());
                 let seq = db
                     .query(&format!("SELECT id FROM soak WHERE id + 0 = {rid}"))
                     .await
@@ -431,7 +438,7 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
                     .map(|r| r.len().to_string())
                     .unwrap_or_else(|| "err".into());
                 fails.push(format!(
-                    "pk id={rid} returned {} rows (expected 1); same-key range-scan rows={range}, seq-scan rows={seq}",
+                    "pk id={rid} returned {} rows (expected 1); same-key range-scan rows={range} (row id={range_id}), seq-scan rows={seq}",
                     rows.len()
                 ));
             }
@@ -454,6 +461,47 @@ async fn coherence_failures(db: &HarnessDb) -> Vec<String> {
         if fails.len() > 10 {
             break;
         }
+    }
+
+    // Val-index coherence: the `soak_val` secondary index lives in the dense
+    // duplicate-key regime (64 distinct values across every row), the shape
+    // where a B-tree duplicate-run defect first appears. For each distinct
+    // val, the index path (`WHERE val = v`) and the heap path (`val + 0`
+    // defeats the index) must agree exactly.
+    let mut val_mismatch = 0usize;
+    for v in 0..64i64 {
+        let via_index = db
+            .query(&format!("SELECT COUNT(*) FROM soak WHERE val = {v}"))
+            .await;
+        let via_heap = db
+            .query(&format!("SELECT COUNT(*) FROM soak WHERE val + 0 = {v}"))
+            .await;
+        match (via_index, via_heap) {
+            (Ok(a), Ok(b)) if !a.is_empty() && !b.is_empty() => {
+                if a[0] != b[0] {
+                    val_mismatch += 1;
+                    if val_mismatch <= 5 {
+                        fails.push(format!(
+                            "val={v}: index path returned {:?} but heap scan returned {:?}",
+                            a[0], b[0]
+                        ));
+                    }
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                fails.push(format!("val={v} coherence query failed: {e}"));
+                break;
+            }
+            _ => {
+                fails.push(format!("val={v} coherence query returned no rows"));
+                break;
+            }
+        }
+    }
+    if val_mismatch > 5 {
+        fails.push(format!(
+            "...and {val_mismatch} more val-index disagreements in total"
+        ));
     }
     fails
 }

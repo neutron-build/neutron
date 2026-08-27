@@ -146,13 +146,49 @@ impl BTreeIndex {
     // ========================================================================
 
     /// Find all RowIds matching the given key.
+    ///
+    /// A key's entries may straddle sibling leaves: when a single key's run
+    /// outgrows a page, splits place it in consecutive pages and the parent
+    /// holds the key as a separator whose left child ends with (and right
+    /// child may begin with) that key. Descent therefore lands on the
+    /// LEFTMOST page that can hold the key, and this walks right through
+    /// siblings for as long as the run continues. Stopping early is how a
+    /// present entry goes missing from `lookup` while `range_scan` (which
+    /// always walks) still returns it.
     pub fn lookup(&self, key: &[u8]) -> Result<Vec<RowId>, BTreeError> {
-        let leaf = self.find_leaf(key)?;
-        let pg = self
-            .pool
-            .read_guard(leaf)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-        Ok(scan_leaf_for_key(&pg, key))
+        let mut page_id = self.find_leaf(key)?;
+        let mut out = Vec::new();
+        loop {
+            let pg = self
+                .pool
+                .read_guard(page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            out.extend(scan_leaf_for_key(&pg, key));
+            // `key`'s run can only continue rightward when this page ends
+            // with `key` (the run spills) or is empty.
+            let ends_at_or_below_key = last_leaf_key(&pg).is_none_or(|l| l <= key);
+            let next = page::read_u32(&pg, IDX_RIGHT_SIBLING);
+            drop(pg);
+            if next == INVALID_PAGE_ID || !ends_at_or_below_key {
+                break;
+            }
+            // A page whose last entry is below `key` can still be followed by
+            // a sibling opening with `key` — the separator above this leaf is
+            // an upper bound on its entries, not the entries themselves — so
+            // the sibling is consulted before stopping. An EMPTY sibling
+            // continues the walk: it bounds no keys, and stopping there would
+            // strand the rest of the run (deletes empty leaves mid-chain).
+            let spg = self
+                .pool
+                .read_guard(next)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            let continues = first_leaf_key(&spg).is_none_or(|f| f <= key);
+            if !continues {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(out)
     }
 
     // ========================================================================
@@ -239,17 +275,41 @@ impl BTreeIndex {
     // ========================================================================
 
     /// Delete a (key, RowId) entry from the B-tree.
+    ///
+    /// Walks the same duplicate-run continuation as [`BTreeIndex::lookup`]:
+    /// the target entry may sit in any page of a run that spans siblings.
     pub fn delete(&self, key: &[u8], row_id: RowId) -> Result<bool, BTreeError> {
-        let leaf = self.find_leaf(key)?;
-        let mut pg = self
-            .pool
-            .write_guard(leaf)
-            .map_err(|e| BTreeError::Io(e.to_string()))?;
-        let deleted = delete_leaf_entry(&mut pg, key, &row_id);
-        if deleted {
-            pg.set_dirty();
+        let mut page_id = self.find_leaf(key)?;
+        loop {
+            let next = {
+                let mut pg = self
+                    .pool
+                    .write_guard(page_id)
+                    .map_err(|e| BTreeError::Io(e.to_string()))?;
+                if delete_leaf_entry(&mut pg, key, &row_id) {
+                    pg.set_dirty();
+                    return Ok(true);
+                }
+                // Same continuation rule as `lookup`; see the walk there.
+                let ends_at_or_below_key =
+                    last_leaf_key(&pg).is_none_or(|l| l <= key);
+                let next = page::read_u32(&pg, IDX_RIGHT_SIBLING);
+                if next == INVALID_PAGE_ID || !ends_at_or_below_key {
+                    return Ok(false);
+                }
+                next
+            };
+            let spg = self
+                .pool
+                .read_guard(next)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
+            // Empty sibling: keep walking (see `lookup`).
+            let continues = first_leaf_key(&spg).is_none_or(|f| f <= key);
+            if !continues {
+                return Ok(false);
+            }
+            page_id = next;
         }
-        Ok(deleted)
     }
 
     // ========================================================================
@@ -330,21 +390,31 @@ impl BTreeIndex {
             ka.cmp(kb)
         });
 
-        // Split at midpoint, with one rule on top of it: duplicate keys must
-        // never straddle the split. Exact descent (`find_child`) routes a key
-        // EQUAL to the separator into the right page, so any copy of the
-        // separator key left in the left page is unreachable by `lookup` —
-        // `WHERE id = K` would miss live rows that `range_scan` (which walks
-        // right through siblings) still finds, the exact post-soak coherence
-        // signature. Duplicate (key, RowId) pairs do occur: deferred index
-        // maintenance strands stale entries when its Remove targets a RowId
-        // the tree no longer holds under that key, and the delete is
-        // best-effort. Move every trailing copy of the split key into the
-        // right page so one leaf holds all copies of a key.
-        let mut mid = entries.len() / 2;
-        while mid > 0 && extract_key(&entries[mid - 1]) == extract_key(&entries[mid]) {
-            mid -= 1;
+        // Split at midpoint. No duplicate-straddle adjustment: descent is
+        // leftmost-for-equal (`find_child`) and `lookup`/`delete` walk right
+        // through the run, so a key's entries are reachable from EITHER half
+        // of a split that lands inside its run. The previous code moved the
+        // whole trailing run into the right page unconditionally, which for a
+        // run filling the entire page decremented the split point to 0 — an
+        // empty left page and a dump-and-refill cycle that kept re-splitting
+        // the same page (and, when the run exceeded a page, wrote past
+        // `PAGE_SIZE` entirely). Left keeps at least one entry; a midpoint
+        // right half of a page that was merely full always fits.
+        let mut mid = (entries.len() / 2).max(1);
+        let fits_from = |from: usize| -> bool {
+            let bytes = entries[from..]
+                .iter()
+                .map(|e| e.len())
+                .sum::<usize>()
+                .saturating_add(IDX_HEADER_SIZE);
+            bytes <= PAGE_SIZE
+        };
+        if !fits_from(mid) {
+            while mid > 1 && !fits_from(mid) {
+                mid -= 1;
+            }
         }
+        debug_assert!(fits_from(mid), "split right half overflows a page");
         let left_entries = &entries[..mid];
         let right_entries = &entries[mid..];
 
@@ -385,7 +455,7 @@ impl BTreeIndex {
                 .map_err(|e| BTreeError::Io(e.to_string()))?;
             init_index_page(&mut rpg, false); // internal node
             page::write_u32(&mut rpg, LEFTMOST_CHILD_OFFSET, leaf_page_id);
-            insert_internal_entry(&mut rpg, &split_key, right_page_id);
+            insert_internal_entry(&mut rpg, &split_key, right_page_id, leaf_page_id);
             rpg.set_dirty();
             drop(rpg);
 
@@ -396,7 +466,7 @@ impl BTreeIndex {
             self.root_page = new_root_id;
         } else {
             // Insert into parent (may cascade splits, but for now we assume parent has space)
-            self.insert_into_parent(parent, &split_key, right_page_id)?;
+            self.insert_into_parent(parent, &split_key, right_page_id, leaf_page_id)?;
         }
 
         Ok(())
@@ -407,6 +477,7 @@ impl BTreeIndex {
         parent_page_id: u32,
         key: &[u8],
         right_child: u32,
+        left_twin: u32,
     ) -> Result<(), BTreeError> {
         // Check if the parent has space for this entry, and insert under the
         // same latch so the answer cannot go stale between the two.
@@ -417,7 +488,7 @@ impl BTreeIndex {
                 .map_err(|e| BTreeError::Io(e.to_string()))?;
             let has_space = internal_has_space(&pg, key.len());
             if has_space {
-                insert_internal_entry(&mut pg, key, right_child);
+                insert_internal_entry(&mut pg, key, right_child, left_twin);
                 pg.set_dirty();
             }
             has_space
@@ -430,7 +501,7 @@ impl BTreeIndex {
         }
 
         // Parent is full — split the internal node
-        self.split_internal_and_insert(parent_page_id, key, right_child)
+        self.split_internal_and_insert(parent_page_id, key, right_child, left_twin)
     }
 
     /// Split a full internal node and insert the new (key, right_child) entry.
@@ -440,23 +511,46 @@ impl BTreeIndex {
         internal_page_id: u32,
         key: &[u8],
         right_child: u32,
+        left_twin: u32,
     ) -> Result<(), BTreeError> {
         // Read all existing entries and the leftmost child from this internal
         // node into local memory, then release the latch.
-        let (mut entries, grandparent) = {
+        let (mut entries, leftmost, grandparent) = {
             let pg = self
                 .pool
                 .read_guard(internal_page_id)
                 .map_err(|e| BTreeError::Io(e.to_string()))?;
             (
                 collect_internal_entries(&pg),
+                page::read_u32(&pg, LEFTMOST_CHILD_OFFSET),
                 page::read_u32(&pg, IDX_PARENT),
             )
         };
 
-        // Add the new entry and sort by key
-        entries.push((key.to_vec(), right_child));
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // Insert the new entry at its chain position: immediately after the
+        // entry whose child is `left_twin` (the page the new right child was
+        // split off from), or at the front when the twin is this node's
+        // leftmost child. Key order alone cannot place an entry whose key
+        // equals existing separators — equal separators must stay ordered by
+        // their children's chain position (see `insert_internal_entry`).
+        let anchored = if leftmost == left_twin {
+            Some(0usize)
+        } else {
+            entries
+                .iter()
+                .position(|(_, child)| *child == left_twin)
+                .map(|i| i + 1)
+        };
+        match anchored {
+            Some(pos) => entries.insert(pos, (key.to_vec(), right_child)),
+            None => {
+                let pos = entries
+                    .iter()
+                    .position(|(k, _)| k.as_slice() > key)
+                    .unwrap_or(entries.len());
+                entries.insert(pos, (key.to_vec(), right_child));
+            }
+        }
 
         // Split at midpoint: left entries stay, middle key promoted, right entries go to new page
         let mid = entries.len() / 2;
@@ -512,7 +606,7 @@ impl BTreeIndex {
                 .map_err(|e| BTreeError::Io(e.to_string()))?;
             init_index_page(&mut rpg, false); // internal node
             page::write_u32(&mut rpg, LEFTMOST_CHILD_OFFSET, internal_page_id);
-            insert_internal_entry(&mut rpg, &promoted_key, right_page_id);
+            insert_internal_entry(&mut rpg, &promoted_key, right_page_id, internal_page_id);
             rpg.set_dirty();
             drop(rpg);
 
@@ -521,8 +615,9 @@ impl BTreeIndex {
 
             self.root_page = new_root_id;
         } else {
-            // Recursively insert into the grandparent (may cascade further)
-            self.insert_into_parent(grandparent, &promoted_key, right_page_id)?;
+            // Recursively insert into the grandparent (may cascade further).
+            // The new right page's left twin is this page.
+            self.insert_into_parent(grandparent, &promoted_key, right_page_id, internal_page_id)?;
         }
 
         Ok(())
@@ -616,6 +711,45 @@ fn scan_leaf_for_key(pg: &PageBuf, key: &[u8]) -> Vec<RowId> {
         pos = next;
     }
     results
+}
+
+/// First key on a leaf page, or `None` when the page holds no entries.
+/// Corrupt entry headers (the same defense as `scan_leaf_for_key`) read as
+/// `None`.
+fn first_leaf_key(pg: &PageBuf) -> Option<&[u8]> {
+    let count = page::read_u16(pg, IDX_ENTRY_COUNT);
+    if count == 0 {
+        return None;
+    }
+    let key_len = page::read_u16(pg, IDX_HEADER_SIZE) as usize;
+    if IDX_HEADER_SIZE + 2 + key_len + 6 > PAGE_SIZE {
+        return None;
+    }
+    let (k, _, _) = read_leaf_entry(pg, IDX_HEADER_SIZE);
+    Some(k)
+}
+
+/// Last key on a leaf page, or `None` when the page holds no entries.
+fn last_leaf_key(pg: &PageBuf) -> Option<&[u8]> {
+    let count = page::read_u16(pg, IDX_ENTRY_COUNT);
+    if count == 0 {
+        return None;
+    }
+    let mut pos = IDX_HEADER_SIZE;
+    let mut last = None;
+    for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
+        let key_len = page::read_u16(pg, pos) as usize;
+        if pos + 2 + key_len + 6 > PAGE_SIZE {
+            break;
+        }
+        let (k, _, next) = read_leaf_entry(pg, pos);
+        last = Some(k);
+        pos = next;
+    }
+    last
 }
 
 /// Insert one entry into a leaf, in place.
@@ -837,7 +971,8 @@ fn find_child(pg: &PageBuf, key: &[u8]) -> u32 {
 
     // Internal node format: leftmost_child, then (separator_key, right_child) pairs.
     // If key < separator[0], go to leftmost_child.
-    // If separator[i-1] <= key < separator[i], go to child[i-1] (= right_child of entry i-1).
+    // If separator[i-1] < key < separator[i], go to child[i-1] (= right_child of entry i-1).
+    // If key == separator[i], ALSO go to child[i-1] — the leftmost page that can hold it.
     // If key >= all separators, go to the last right_child.
 
     let mut prev_child = page::read_u32(pg, LEFTMOST_CHILD_OFFSET);
@@ -859,7 +994,14 @@ fn find_child(pg: &PageBuf, key: &[u8]) -> u32 {
         let child_offset = pos + 2 + key_len;
         let right_child = page::read_u32(pg, child_offset);
 
-        if key < entry_key {
+        // `<=`, not `<`: a key EQUAL to a separator may have entries in the
+        // separator's LEFT child (the page ends with that key's run) as well
+        // as in the right child. Descent must land on the leftmost page that
+        // can hold the key; `lookup`/`delete` walk right from there for the
+        // rest of the run. Routing equal keys right made every left-side
+        // copy unreachable — present in the tree, visible to `range_scan`,
+        // absent from `lookup`.
+        if key <= entry_key {
             return prev_child;
         }
 
@@ -870,7 +1012,24 @@ fn find_child(pg: &PageBuf, key: &[u8]) -> u32 {
     prev_child
 }
 
-fn insert_internal_entry(pg: &mut PageBuf, key: &[u8], child_page_id: u32) {
+/// Insert one (separator, right child) entry into an internal page, in place.
+///
+/// Position is anchored to the child chain, not the key: the new entry goes
+/// immediately after the entry whose right child is `left_twin` — the page
+/// the new child was split off from, and therefore the page immediately to
+/// its left — or at the front when the twin is this node's leftmost child.
+/// Key comparison alone cannot place an entry whose key EQUALS existing
+/// separators: equal separators name consecutive children of one
+/// duplicate-key run, and they must stay ordered by their children's chain
+/// position. `find_child` descends to the child left of the FIRST equal
+/// separator (the run's leftmost page) and lookups walk right from there, so
+/// an equal separator out of chain order strands pages: present in the tree,
+/// visible to `range_scan`, missing from `lookup`. It also misroutes inserts
+/// of the NEXT key after the run, which belong in the run's last page.
+///
+/// `left_twin` not present in this page (a structural inconsistency) falls
+/// back to a sorted position after any equal keys.
+fn insert_internal_entry(pg: &mut PageBuf, key: &[u8], child_page_id: u32, left_twin: u32) {
     let count = page::read_u16(pg, IDX_ENTRY_COUNT) as usize;
 
     // Collect existing entries. Guard against a corrupt key_len / entry_count
@@ -892,14 +1051,21 @@ fn insert_internal_entry(pg: &mut PageBuf, key: &[u8], child_page_id: u32) {
         let ek = pg[pos + 2..pos + 2 + key_len].to_vec();
         let child = page::read_u32(pg, pos + 2 + key_len);
         entries.push((ek, child));
-        pos = pos + 2 + key_len + 4;
+        pos += 2 + key_len + 4;
     }
 
-    // Insert in sorted order
-    let ins_pos = entries
-        .iter()
-        .position(|(k, _)| k.as_slice() >= key)
-        .unwrap_or(entries.len());
+    let leftmost = page::read_u32(pg, LEFTMOST_CHILD_OFFSET);
+    let ins_pos = if leftmost == left_twin {
+        0
+    } else {
+        match entries.iter().position(|(_, child)| *child == left_twin) {
+            Some(i) => i + 1,
+            None => entries
+                .iter()
+                .position(|(k, _)| k.as_slice() > key)
+                .unwrap_or(entries.len()),
+        }
+    };
     entries.insert(ins_pos, (key.to_vec(), child_page_id));
 
     // Rewrite entries
@@ -1724,6 +1890,131 @@ mod tests {
                         all.len(),
                         total,
                         "seed {seed:#x} step {step}: full range_scan count {} != live count {total}",
+                        all.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The dominant-run regime: a key space so small that one key's entry
+    /// run can exceed half a full leaf (key spaces 2/4/8 over a ~1000-entry
+    /// page). Here the duplicate-straddle rule in
+    /// [`BTreeIndex::split_and_insert`] fires on most splits AND re-fires
+    /// for keys already promoted — the shape that can promote the same key
+    /// into a parent twice, leaving two separators with equal keys where
+    /// `find_child` (which routes an equal key right of EVERY matching
+    /// separator) descends into the older, now-wrong child while
+    /// `range_scan` walks siblings and still finds the entries.
+    ///
+    /// Checked after EVERY step (the corruption, once present, is not
+    /// transient): for each key in the space — live or dead —
+    /// `lookup(k)` must return exactly the live RowIds, `range_scan(k, k)`
+    /// must agree with `lookup(k)`, and a full `range_scan` must see
+    /// exactly the live entry count.
+    #[test]
+    fn btree_dominant_duplicate_runs_keep_lookup_and_range_agreeing() {
+        struct XorShift(u64);
+        impl XorShift {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        for key_space in [2usize, 4, 8] {
+            for seed in [0x50ACBEEF1234u64, 0xC0FFEE] {
+                let (mut idx, _dir) = make_test_btree();
+                let mut rng = XorShift(seed ^ key_space as u64);
+                let mut live: std::collections::HashMap<i64, Vec<RowId>> =
+                    std::collections::HashMap::new();
+                let mut next_page = 1u32;
+
+                for step in 0..12_000 {
+                    let choice = rng.below(100);
+                    let keys: Vec<i64> = live.keys().copied().collect();
+                    if choice < 60 || keys.is_empty() {
+                        let k = rng.below(key_space) as i64;
+                        let rid = RowId {
+                            page_id: next_page,
+                            slot_idx: (step % 7) as u16,
+                        };
+                        next_page += 1;
+                        idx.insert(&int_key(k), rid).unwrap();
+                        live.entry(k).or_default().push(rid);
+                    } else if choice < 85 {
+                        let k = keys[rng.below(keys.len())];
+                        let rids = live.get_mut(&k).unwrap();
+                        let pos = rng.below(rids.len());
+                        let rid = rids.swap_remove(pos);
+                        if rids.is_empty() {
+                            live.remove(&k);
+                        }
+                        assert!(
+                            idx.delete(&int_key(k), rid).unwrap(),
+                            "key_space {key_space} seed {seed:#x} step {step}: \
+                             delete said entry not present (k={k})"
+                        );
+                    } else {
+                        let k = keys[rng.below(keys.len())];
+                        let rids = live.get_mut(&k).unwrap();
+                        let pos = rng.below(rids.len());
+                        let rid = rids.swap_remove(pos);
+                        if rids.is_empty() {
+                            live.remove(&k);
+                        }
+                        idx.delete(&int_key(k), rid).unwrap();
+                        let new_rid = RowId {
+                            page_id: next_page,
+                            slot_idx: (step % 5) as u16,
+                        };
+                        next_page += 1;
+                        idx.insert(&int_key(k), new_rid).unwrap();
+                        live.entry(k).or_default().push(new_rid);
+                    }
+
+                    // Per-step full-coherence check across the WHOLE key
+                    // space, including keys with no live entries: a dead
+                    // key whose stale entries still resolve is the other
+                    // half of the agreement invariant.
+                    let mut total = 0usize;
+                    for k in 0..key_space as i64 {
+                        let want = live.get(&k).cloned().unwrap_or_default();
+                        let mut got = idx.lookup(&int_key(k)).unwrap();
+                        got.sort_unstable_by_key(|r| (r.page_id, r.slot_idx));
+                        let mut sorted_want = want.clone();
+                        sorted_want.sort_unstable_by_key(|r| (r.page_id, r.slot_idx));
+                        assert_eq!(
+                            got, sorted_want,
+                            "key_space {key_space} seed {seed:#x} step {step}: \
+                             lookup(k={k}) diverged"
+                        );
+                        let via_range = idx
+                            .range_scan(Some(&int_key(k)), Some(&int_key(k)))
+                            .unwrap();
+                        assert_eq!(
+                            via_range.len(),
+                            want.len(),
+                            "key_space {key_space} seed {seed:#x} step {step}: \
+                             range_scan(k={k}) saw {} entries, lookup sees {}",
+                            via_range.len(),
+                            want.len()
+                        );
+                        total += want.len();
+                    }
+                    let all = idx.range_scan(None, None).unwrap();
+                    assert_eq!(
+                        all.len(),
+                        total,
+                        "key_space {key_space} seed {seed:#x} step {step}: \
+                         full range_scan count {} != live count {total}",
                         all.len()
                     );
                 }
