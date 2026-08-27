@@ -649,7 +649,7 @@ async fn bench_vs_pg(
         for i in 0..w {
             let sql = format!(
                 "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                700_000 + i,
+                10_000_000 + i,
                 i % 1000 + 1
             );
             nc.simple_query(&sql).await.unwrap();
@@ -658,7 +658,7 @@ async fn bench_vs_pg(
             for i in 0..w {
                 let sql = format!(
                     "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                    600_000 + i,
+                    20_000_000 + i,
                     i % 1000 + 1
                 );
                 pg.simple_query(&sql).await.unwrap();
@@ -669,7 +669,7 @@ async fn bench_vs_pg(
         for i in 0..n {
             let sql = format!(
                 "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                900_000 + i,
+                11_000_000 + i,
                 i % 1000 + 1
             );
             let t = Instant::now();
@@ -681,7 +681,7 @@ async fn bench_vs_pg(
             for i in 0..n {
                 let sql = format!(
                     "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                    800_000 + i,
+                    21_000_000 + i,
                     i % 1000 + 1
                 );
                 let t = Instant::now();
@@ -1727,7 +1727,7 @@ async fn bench_vs_cockroach(
         for i in 0..w {
             let sql = format!(
                 "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                700_000 + i,
+                10_000_000 + i,
                 i % 1000 + 1
             );
             nc.simple_query(&sql).await.unwrap();
@@ -1736,7 +1736,7 @@ async fn bench_vs_cockroach(
             for i in 0..w {
                 let sql = format!(
                     "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                    600_000 + i,
+                    20_000_000 + i,
                     i % 1000 + 1
                 );
                 cockroach.simple_query(&sql).await.unwrap();
@@ -1747,7 +1747,7 @@ async fn bench_vs_cockroach(
         for i in 0..n {
             let sql = format!(
                 "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                900_000 + i,
+                11_000_000 + i,
                 i % 1000 + 1
             );
             let t = Instant::now();
@@ -1759,7 +1759,7 @@ async fn bench_vs_cockroach(
             for i in 0..n {
                 let sql = format!(
                     "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
-                    800_000 + i,
+                    21_000_000 + i,
                     i % 1000 + 1
                 );
                 let t = Instant::now();
@@ -2182,7 +2182,7 @@ async fn bench_vs_mongodb(
         for i in 0..warmup {
             let sql = format!(
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
-                700_000 + i,
+                10_000_000 + i,
                 i % 1000 + 1
             );
             nc.simple_query(&sql).await.ok();
@@ -2193,7 +2193,7 @@ async fn bench_vs_mongodb(
         for i in 0..warmup {
             let _ = orders_coll
                 .insert_one(doc! {
-                    "_id": 600_000 + i as i32,
+                    "_id": 20_000_000 + i as i32,
                     "user_id": (i % 1000 + 1) as i32,
                     "amount": 99.0,
                     "status": "pending",
@@ -2206,7 +2206,7 @@ async fn bench_vs_mongodb(
         for i in 0..n {
             let sql = format!(
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
-                900_000 + i,
+                11_000_000 + i,
                 i % 1000 + 1
             );
             let t = Instant::now();
@@ -3009,7 +3009,7 @@ async fn bench_vs_surreal(
         for i in 0..w {
             let sql = format!(
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({}, {}, 99.0, 'pending')",
-                700_000 + i,
+                10_000_000 + i,
                 i % 1000 + 1
             );
             nc.simple_query(&sql).await.unwrap();
@@ -3017,7 +3017,7 @@ async fn bench_vs_surreal(
         for i in 0..w {
             let sql = format!(
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({}, {}, 99.0, 'pending')",
-                600_000 + i,
+                20_000_000 + i,
                 i % 1000 + 1
             );
             surreal.query(&sql).await.ok();
@@ -3027,7 +3027,7 @@ async fn bench_vs_surreal(
         for i in 0..n {
             let sql = format!(
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({}, {}, 99.0, 'pending')",
-                900_000 + i,
+                11_000_000 + i,
                 i % 1000 + 1
             );
             let t = Instant::now();
@@ -3039,7 +3039,7 @@ async fn bench_vs_surreal(
             for i in 0..n {
                 let sql = format!(
                     "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({}, {}, 99.0, 'pending')",
-                    800_000 + i,
+                    21_000_000 + i,
                     i % 1000 + 1
                 );
                 if surreal.query(&sql).await.is_ok() {
@@ -3405,7 +3405,7 @@ async fn bench_vs_tidb(
         for i in 0..w {
             let sql = format!(
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
-                700_000 + i,
+                10_000_000 + i,
                 i % 1000 + 1
             );
             nc.simple_query(&sql).await.ok();
@@ -3414,7 +3414,7 @@ async fn bench_vs_tidb(
             for i in 0..w {
                 let sql = format!(
                     "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
-                    600_000 + i,
+                    20_000_000 + i,
                     i % 1000 + 1
                 );
                 let _ = conn.exec_drop(sql, ()).await;
@@ -3426,7 +3426,7 @@ async fn bench_vs_tidb(
         for i in 0..n {
             let sql = format!(
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
-                900_000 + i,
+                11_000_000 + i,
                 i % 1000 + 1
             );
             let t = Instant::now();
@@ -3439,7 +3439,7 @@ async fn bench_vs_tidb(
             for i in 0..n {
                 let sql = format!(
                     "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
-                    800_000 + i,
+                    21_000_000 + i,
                     i % 1000 + 1
                 );
                 let t = Instant::now();
